@@ -1,0 +1,16 @@
+{
+  "models": {
+    "qwen": {
+      "frame_model": "qwen--qwen3--32b",
+      "base_url": "https://api.groq.com/openai/v1",
+      "served_model": "qwen/qwen3-32b",
+      "api_key_env": "GROQ_API_KEY",
+      "tokenizer_family": "qwen",
+      "price_per_tick": 1000,
+      "capabilities": {
+        "logprobs": true,
+        "top_logprobs": 5
+      }
+    }
+  }
+}

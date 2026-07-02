@@ -1,0 +1,146 @@
+name: build
+
+# Builds the dexdo release binaries on native runners for every supported
+# platform and attaches them to the GitHub Release for the pushed tag.
+#
+# Public repository only: GitHub-hosted runners are free for public repositories
+# within the monthly limits, and native macOS / Windows runners produce native
+# binaries (no cross-compilation).
+
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: 'build-${{ github.ref }}'
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  # Final safety gate: the published tree must carry no authorship markers.
+  guard:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: No AI-authorship markers in the published tree
+        run: |
+          # The character classes keep the literal marker words out of this file
+          # while still matching them at run time.
+          pat='c[l]aude|c[o]dex|g[e]mini|copil[o]t|co-?authored-by|generated (by|with) (c[l]aude|c[o]dex)'
+          if grep -rniE "$pat" \
+               --include='*.rs' --include='*.toml' --include='*.md' --include='*.sol' . ; then
+            echo "authorship markers found in the published tree" >&2
+            exit 1
+          fi
+          echo "clean"
+
+  build:
+    needs: guard
+    name: ${{ matrix.target }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { target: x86_64-unknown-linux-gnu,   os: ubuntu-latest,     ext: tar.gz }
+          - { target: aarch64-unknown-linux-gnu,  os: ubuntu-24.04-arm,  ext: tar.gz }
+          - { target: x86_64-apple-darwin,        os: macos-13,          ext: tar.gz }
+          - { target: aarch64-apple-darwin,       os: macos-latest,      ext: tar.gz }
+          - { target: x86_64-pc-windows-msvc,     os: windows-latest,    ext: zip }
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.target }}
+
+      # The production binary is built WITHOUT the test faucet: `shellnet` only.
+      - name: Build
+        run: cargo build --release --locked -p dexdo --features shellnet --target ${{ matrix.target }}
+
+      # Package the binary together with the runtime configuration it reads
+      # (model config + deployed contract pins) and the docs.
+      - name: Package (unix)
+        if: matrix.os != 'windows-latest'
+        shell: bash
+        run: |
+          VER="${GITHUB_REF_NAME#v}"
+          OS="$(echo '${{ matrix.target }}' | sed -E 's/.*(linux|darwin).*/\1/; s/darwin/macos/')"
+          ARCH="$(echo '${{ matrix.target }}' | cut -d- -f1)"
+          NAME="dexdo-${VER}-${ARCH}-${OS}"
+          mkdir -p "stage/${NAME}"
+          cp "target/${{ matrix.target }}/release/dexdo" "stage/${NAME}/"
+          mkdir -p "stage/${NAME}/contracts"
+          cp contracts/deployed.shellnet.json "stage/${NAME}/contracts/"
+          cp models.json README.md LICENSE "stage/${NAME}/"
+          tar -C stage -czf "${NAME}.tar.gz" "${NAME}"
+          hash="$(shasum -a 256 "${NAME}.tar.gz" | awk '{print $1}')"
+          sh ci/write-sha256-line.sh "$hash" "${NAME}.tar.gz" > "${NAME}.tar.gz.sha256"
+
+      - name: Package (windows)
+        if: matrix.os == 'windows-latest'
+        shell: bash
+        run: |
+          VER="${GITHUB_REF_NAME#v}"
+          NAME="dexdo-${VER}-x86_64-windows"
+          mkdir -p "stage/${NAME}/contracts"
+          cp "target/${{ matrix.target }}/release/dexdo.exe" "stage/${NAME}/"
+          cp contracts/deployed.shellnet.json "stage/${NAME}/contracts/"
+          cp models.json README.md LICENSE "stage/${NAME}/"
+          (cd stage && 7z a -tzip "../${NAME}.zip" "${NAME}" >/dev/null)
+          hash="$(certutil -hashfile "${NAME}.zip" SHA256 | sed -n 2p | tr -d '[:space:]')"
+          sh ci/write-sha256-line.sh "$hash" "${NAME}.zip" > "${NAME}.zip.sha256"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: dexdo-${{ matrix.target }}
+          path: |
+            dexdo-*.tar.gz
+            dexdo-*.zip
+            dexdo-*.sha256
+
+  release:
+    needs: build
+    runs-on: ubuntu-latest
+    if: startsWith(github.ref, 'refs/tags/v')
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+
+      # One combined checksum file over every archive.
+      - name: Combine checksums
+        run: |
+          cd dist
+          cat *.sha256 > SHA256SUMS || true
+          cp ../install.sh ../install.ps1 . 2>/dev/null || true
+          ls -la
+
+      # Release notes: the top section of CHANGELOG.md (generated at publish time).
+      - name: Extract release notes
+        run: |
+          awk '/^## /{n++} n==1{print} n==2{exit}' CHANGELOG.md > NOTES.md 2>/dev/null || echo "dexdo ${GITHUB_REF_NAME}" > NOTES.md
+          cat NOTES.md
+
+      - name: Publish GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          body_path: NOTES.md
+          files: |
+            dist/dexdo-*.tar.gz
+            dist/dexdo-*.zip
+            dist/SHA256SUMS
+            dist/install.sh
+            dist/install.ps1

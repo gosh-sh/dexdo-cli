@@ -1,0 +1,9 @@
+{
+  "network": "shellnet",
+  "superroot": "0:0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c",
+  "dapp_config": "",
+  "dapp_id": "0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c",
+  "seller_probe_commission_bps": 250,
+  "model_registry": "0:19a88a103f949df6ce5532a91e935a04acd708872d4bd4e2e5e446d0d78140b9",
+  "model_registry_after_restart": "0:0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d"
+}

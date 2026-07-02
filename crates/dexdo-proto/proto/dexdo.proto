@@ -1,0 +1,111 @@
+syntax = "proto3";
+
+package dexdo.v1;
+
+// Seller→buyer channel (§3.1.1, §10.3). First a unary challenge (a nonce bound
+// to the token_contract), then server-streaming of canonical chunks AFTER signature verification.
+service Gateway {
+  // Authorization step 1 (§3.1.1): the gateway issues a challenge — a nonce bound to the token_contract.
+  rpc GetChallenge(ChallengeRequest) returns (Challenge);
+
+  // Step 2: the buyer signs the challenge with the note's private key (B18). The gateway verifies
+  // the signature against the pubkey from the token_contract and streams chunks ONLY on a match;
+  // otherwise the connection is closed before forwarding (R16).
+  rpc OpenStream(StreamRequest) returns (stream CanonChunk);
+}
+
+message ChallengeRequest {
+  string token_contract = 1;
+}
+
+message Challenge {
+  // A nonce bound to the deal's token_contract (§3.1.1): cannot be replayed on another session.
+  bytes nonce = 1;
+  string token_contract = 2;
+}
+
+message StreamRequest {
+  string token_contract = 1;
+  // The same nonce the gateway issued.
+  bytes nonce = 2;
+  // ed25519 signature (challenge_bytes) with the buyer's note private key.
+  bytes signature = 3;
+  // Canonical request (OpenAI chat-completions form, §6/§10.6/G, R1): the prompt +
+  // sampling parameters travel in the opening call alongside authorization. The gateway adapts
+  // it to its upstream's format (R1). The `model` field is NOT trusted — the model is forced by the market.
+  CanonRequest request = 4;
+}
+
+// The buyer's canonical request — OpenAI chat-completions form (dexdo-cli §6, §10.6/G).
+message CanonRequest {
+  // Message role/content, as in OpenAI.
+  repeated ChatMessage messages = 1;
+  // Sampling parameters.
+  SamplingParams params = 2;
+}
+
+message ChatMessage {
+  // "system" | "user" | "assistant".
+  string role = 1;
+  string content = 2;
+}
+
+message SamplingParams {
+  // 0 = not set (the upstream default is used).
+  double temperature = 1;
+  // 0 = not set.
+  uint32 max_tokens = 2;
+  // Stop sequences.
+  repeated string stop = 3;
+  // EXPLICIT greedy decode (temperature=0): needed for the B7 full spot-check (§10.1.3), so the seller
+  // decodes deterministically and reconciles against the reference endpoint. Separate from `temperature`,
+  // because there 0 = "not set" (the upstream default), whereas here temp=0 must be FORCED.
+  bool greedy = 4;
+}
+
+// One top-k alternative in a token's distribution (logprobs form, §10.1.2). The token is as
+// the upstream returns it (OpenAI/Groq logprobs are strings; the upstream SSE does not return token-ids, R4).
+message TopLogprob {
+  string token = 1;
+  double logprob = 2;
+}
+
+// Per-token logprobs (§6): the logprob of the chosen token + top-k alternatives for checking
+// the distribution shape (entropy / top-margin / tail, §10.1.2). The index matches token_ids.
+message TokenLogprobs {
+  // Logprob of the chosen token.
+  double logprob = 1;
+  // Top-k alternatives (for the distribution shape; may be empty).
+  repeated TopLogprob top = 2;
+}
+
+// Declaration of the available subset of verification signals (§6, R3): the gateway EXPLICITLY states what
+// it returns and does NOT fabricate what is missing (R3/R4). The buyer degrades by fact (§10.1.2).
+message SignalManifest {
+  // Tokenizer family (the profile for the tokenizer check §10.1.1), e.g. "llama"/"qwen"/"gpt".
+  string tokenizer_family = 1;
+  // The gateway returns token_ids.
+  bool has_token_ids = 2;
+  // The gateway returns logprobs.
+  bool has_logprobs = 3;
+  // The claimed model — NOT trusted blindly (cross-checked with a spot-check §10.1.3).
+  string claimed_model = 4;
+}
+
+// One stream increment to the buyer (dexdo-cli §6, R2/R6). In directive 1 it carries fake tokens.
+message CanonChunk {
+  // Text delta.
+  string text = 1;
+  // token-ids for the tokenizer check (§10.1.1); in directive 1 they are fake.
+  repeated uint32 token_ids = 2;
+  // Sequence number (incrementality, R6).
+  uint64 seq = 3;
+  // Per-token logprobs (§6, where the upstream returns them; empty when has_logprobs=false). Preserved
+  // by lossless normalization (R2); the index matches token_ids.
+  repeated TokenLogprobs logprobs = 4;
+  // Signal declaration (§6, R3) — the gateway states it on the FIRST chunk (seq=0); not repeated afterwards.
+  SignalManifest manifest = 5;
+  // Reasoning/thinking delta from providers that separate it from user-visible content (for verification only).
+  // Consumer OpenAI/Anthropic renderers do not expose this as `content`.
+  string reasoning = 6;
+}
