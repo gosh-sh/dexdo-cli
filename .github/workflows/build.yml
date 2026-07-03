@@ -47,12 +47,20 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
+        # native_run marks legs whose built binary can execute on the runner
+        # (binary arch/os == runner arch/os), so the post-build binary smoke
+        # test can actually run it. Every target below is built on a runner of
+        # its own architecture (no cross-compilation), so all are natively
+        # runnable. If a cross-compiled leg is ever added (a binary whose
+        # arch/os differs from the runner, e.g. building x86_64-apple-darwin on
+        # an arm64 mac runner), set native_run: false so the smoke step is
+        # skipped instead of trying to execute a foreign-arch binary.
         include:
-          - { target: x86_64-unknown-linux-gnu,   os: ubuntu-latest,     ext: tar.gz }
-          - { target: aarch64-unknown-linux-gnu,  os: ubuntu-24.04-arm,  ext: tar.gz }
-          - { target: x86_64-apple-darwin,        os: macos-15-intel,    ext: tar.gz }
-          - { target: aarch64-apple-darwin,       os: macos-latest,      ext: tar.gz }
-          - { target: x86_64-pc-windows-msvc,     os: windows-latest,    ext: zip }
+          - { target: x86_64-unknown-linux-gnu,   os: ubuntu-latest,     ext: tar.gz, native_run: true }
+          - { target: aarch64-unknown-linux-gnu,  os: ubuntu-24.04-arm,  ext: tar.gz, native_run: true }
+          - { target: x86_64-apple-darwin,        os: macos-15-intel,    ext: tar.gz, native_run: true }
+          - { target: aarch64-apple-darwin,       os: macos-latest,      ext: tar.gz, native_run: true }
+          - { target: x86_64-pc-windows-msvc,     os: windows-latest,    ext: zip,    native_run: true }
     steps:
       - uses: actions/checkout@v4
 
@@ -67,6 +75,25 @@ jobs:
       # The production binary is built WITHOUT the test faucet: `shellnet` only.
       - name: Build
         run: cargo build --release --locked -p dexdo --features shellnet --target ${{ matrix.target }}
+
+      # Smoke-test the freshly built release binary by executing it. Runs only
+      # when the binary is natively runnable on this runner (native_run); a
+      # cross-compiled binary for another arch/os cannot execute here and is
+      # skipped. `dexdo` has no --version flag (clap derive, no version
+      # attribute -> --version errors), so --help is the execute-proof: it
+      # fails the leg if the binary cannot start (bad arch, missing loader,
+      # link error, or a panic during startup) before we package or ship it.
+      - name: Smoke test binary (unix)
+        if: matrix.native_run && matrix.os != 'windows-latest'
+        shell: bash
+        run: |
+          "target/${{ matrix.target }}/release/dexdo" --help
+
+      - name: Smoke test binary (windows)
+        if: matrix.native_run && matrix.os == 'windows-latest'
+        shell: bash
+        run: |
+          "target/${{ matrix.target }}/release/dexdo.exe" --help
 
       # Package the binary together with the runtime configuration it reads
       # (model config + deployed contract pins) and the docs.
@@ -144,3 +171,92 @@ jobs:
             dist/SHA256SUMS
             dist/install.sh
             dist/install.ps1
+
+  # Smoke-test the real install path an end user takes: fetch and run the
+  # PUBLISHED install script, which resolves the latest release, downloads this
+  # platform's archive, verifies its SHA256 against the published SHA256SUMS,
+  # unpacks it, and puts `dexdo` on PATH -- then runs the binary. This validates
+  # the release archive naming, the checksum file, and PATH placement end to end
+  # against the release this run just published, so a broken install script, a
+  # misnamed archive, a bad checksum, or a non-runnable binary fails the release.
+  #
+  # Runs only for real tag builds (a published release exists) and after the
+  # `release` job. Scope: a guard step first asserts the API `latest` == the tag
+  # this run published, then it installs via the published scripts, so it always
+  # tests THIS release. macOS is not re-tested here because the per-build binary
+  # smoke test already runs the two macOS binaries natively on their runners;
+  # this job covers the two scripted installers (sh + PowerShell) on clean
+  # linux and windows runners.
+  install-smoke:
+    needs: release
+    if: startsWith(github.ref, 'refs/tags/v')
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      # Prove this job smoke-tests THIS release, not a stale or newer one: the
+      # API `latest` must resolve to the tag that triggered this run before we
+      # install (the published install scripts resolve `latest`). Retry to absorb
+      # release propagation, then fail closed.
+      - name: Assert latest release == this tag
+        shell: bash
+        run: |
+          n=0
+          until [ "$(curl -fsSL https://api.github.com/repos/gosh-sh/dexdo-cli/releases/latest | grep -oE '"tag_name": *"[^"]*"' | head -1 | sed -E 's/.*"([^"]*)"$/\1/')" = "${GITHUB_REF_NAME}" ]; do
+            n=$((n + 1))
+            if [ "$n" -ge 12 ]; then echo "latest is not ${GITHUB_REF_NAME} after retries; refusing to smoke-test a different release" >&2; exit 1; fi
+            echo "latest not yet ${GITHUB_REF_NAME}, retrying ($n) ..."; sleep 10
+          done
+          echo "latest == ${GITHUB_REF_NAME}; proceeding"
+      - name: Install from the published script and run (linux)
+        if: matrix.os == 'ubuntu-latest'
+        shell: bash
+        run: |
+          # The documented user command, wrapped in a short retry to absorb
+          # release/asset propagation delay before failing closed.
+          install_once() {
+            curl -fsSL https://github.com/gosh-sh/dexdo-cli/releases/latest/download/install.sh -o install.sh \
+              && sh install.sh
+          }
+          n=0
+          until install_once; do
+            n=$((n + 1))
+            if [ "$n" -ge 12 ]; then echo "install did not succeed" >&2; exit 1; fi
+            echo "install not ready yet, retrying ($n) ..."; sleep 10
+          done
+          # The linux script installs into ~/.local/bin; put it on PATH and run.
+          export PATH="$HOME/.local/bin:$PATH"
+          command -v dexdo
+          dexdo --help
+
+      - name: Install from the published script and run (windows)
+        if: matrix.os == 'windows-latest'
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          # The documented `irm ... | iex` install, with the same short retry.
+          $ok = $false
+          for ($n = 1; $n -le 12; $n++) {
+            try {
+              $script = Invoke-RestMethod 'https://github.com/gosh-sh/dexdo-cli/releases/latest/download/install.ps1'
+              Invoke-Expression $script
+              $ok = $true
+              break
+            } catch {
+              Write-Host "install not ready yet, retrying ($n) ..."
+              Start-Sleep -Seconds 10
+            }
+          }
+          if (-not $ok) { throw 'install did not succeed' }
+          # The script copies dexdo.exe into %LOCALAPPDATA%\dexdo\bin and adds
+          # that dir to the persistent User PATH (not visible to this process).
+          # Verify both: the User PATH entry was written, and the binary runs.
+          $binDir = Join-Path $env:LOCALAPPDATA 'dexdo\bin'
+          $userPath = [Environment]::GetEnvironmentVariable('Path', 'User')
+          if ($userPath -notlike "*$binDir*") { throw "dexdo bin dir not added to User PATH" }
+          $env:Path = "$binDir;$env:Path"
+          if (-not (Get-Command dexdo -ErrorAction SilentlyContinue)) { throw 'dexdo not found on PATH' }
+          dexdo --help
+          if ($LASTEXITCODE -ne 0) { throw 'dexdo --help failed' }

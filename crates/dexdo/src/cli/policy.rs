@@ -12,7 +12,11 @@ const BUYER_EMPTY_STREAM: &[&str] = &["reclaim", "next_seller", "fail_closed"];
 const BUYER_STALLS: &[&str] = &["accept_delivered_then_reclaim", "dispute"];
 const BUYER_SCAM: &[&str] = &["stop", "dispute", "stop_and_blacklist"];
 const SELLER_AFTER_DONE: &[&str] = &["republish", "republish_with_backoff", "retire"];
-const SELLER_BUYER_NO_SHOW: &[&str] = &["cleanup_and_republish", "cleanup_and_retire"];
+const SELLER_BUYER_NO_SHOW: &[&str] = &[
+    "cleanup_and_republish",
+    "cleanup_and_retire",
+    "retire_gateway",
+];
 const SELLER_DISPUTE: &[&str] = &["release_if_clean", "hold"];
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -260,6 +264,7 @@ impl SellerAfterDealDoneAction {
 pub(crate) enum SellerBuyerNoShowAction {
     CleanupAndRepublish,
     CleanupAndRetire,
+    RetireGateway,
 }
 
 impl SellerBuyerNoShowAction {
@@ -267,6 +272,7 @@ impl SellerBuyerNoShowAction {
         match self {
             Self::CleanupAndRepublish => "cleanup_and_republish",
             Self::CleanupAndRetire => "cleanup_and_retire",
+            Self::RetireGateway => "retire_gateway",
         }
     }
 }
@@ -608,6 +614,7 @@ pub(crate) fn load_seller_runtime_policy(explicit: Option<&Path>) -> Result<Sell
     let buyer_no_show = match choice("seller.on.buyer_no_show") {
         "cleanup_and_republish" => SellerBuyerNoShowAction::CleanupAndRepublish,
         "cleanup_and_retire" => SellerBuyerNoShowAction::CleanupAndRetire,
+        "retire_gateway" => SellerBuyerNoShowAction::RetireGateway,
         _ => unreachable!("validated choice"),
     };
     let dispute_against_me = match choice("seller.on.dispute_against_me") {
@@ -774,10 +781,10 @@ pub(crate) fn dispatch_levers(key: &str, action: &str) -> &'static [&'static str
         ("buyer.on.malformed_handover", "dispute") => &["stream_dispute"],
         ("buyer.on.malformed_handover", "fail_closed") => &["policy_fail_closed"],
         ("buyer.on.dead_gateway", "retry_then_reclaim") => &["retry_gateway", "seller_timeout"],
-        ("buyer.on.dead_gateway", "next_seller") => &["seller_timeout", "place_buy_by_model"],
+        ("buyer.on.dead_gateway", "next_seller") => &["one_shot_policy_fail_closed"],
         ("buyer.on.dead_gateway", "fail_closed") => &["policy_fail_closed"],
         ("buyer.on.empty_stream", "reclaim") => &["seller_timeout"],
-        ("buyer.on.empty_stream", "next_seller") => &["seller_timeout", "place_buy_by_model"],
+        ("buyer.on.empty_stream", "next_seller") => &["one_shot_policy_fail_closed"],
         ("buyer.on.empty_stream", "fail_closed") => &["policy_fail_closed"],
         ("buyer.on.seller_stalls_mid_stream", "accept_delivered_then_reclaim") => {
             &["accept_delivered", "seller_timeout"]
@@ -786,13 +793,14 @@ pub(crate) fn dispatch_levers(key: &str, action: &str) -> &'static [&'static str
         ("buyer.on.bad_output_scam", "stop") => &["stream_stop"],
         ("buyer.on.bad_output_scam", "dispute") => &["stream_dispute"],
         ("buyer.on.bad_output_scam", "stop_and_blacklist") => &["policy_fail_closed_unsupported"],
-        ("seller.on.after_deal_done", "republish") => &["policy_fail_closed_unsupported"],
+        ("seller.on.after_deal_done", "republish") => &["pre_offer_policy_fail_closed"],
         ("seller.on.after_deal_done", "republish_with_backoff") => {
-            &["policy_fail_closed_unsupported"]
+            &["pre_offer_policy_fail_closed"]
         }
         ("seller.on.after_deal_done", "retire") => &["retire_offer"],
-        ("seller.on.buyer_no_show", "cleanup_and_republish") => &["policy_fail_closed_unsupported"],
-        ("seller.on.buyer_no_show", "cleanup_and_retire") => &["cleanup_unopened", "retire_offer"],
+        ("seller.on.buyer_no_show", "cleanup_and_republish") => &["pre_offer_policy_fail_closed"],
+        ("seller.on.buyer_no_show", "cleanup_and_retire") => &["pre_offer_policy_fail_closed"],
+        ("seller.on.buyer_no_show", "retire_gateway") => &["retire_gateway"],
         ("seller.on.dispute_against_me", "release_if_clean") => &["release_dispute"],
         ("seller.on.dispute_against_me", "hold") => &["hold_dispute"],
         _ => &[],
@@ -823,8 +831,8 @@ mod tests {
             },
             "seller": {
                 "on": {
-                    "after_deal_done": "republish",
-                    "buyer_no_show": "cleanup_and_republish",
+                    "after_deal_done": "retire",
+                    "buyer_no_show": "retire_gateway",
                     "dispute_against_me": "release_if_clean"
                 },
                 "max_open_deals": 1
@@ -1033,11 +1041,11 @@ mod tests {
         let seller_policy = load_seller_runtime_policy(Some(&path)).unwrap();
         assert_eq!(
             seller_policy.after_deal_done,
-            SellerAfterDealDoneAction::Republish
+            SellerAfterDealDoneAction::Retire
         );
         assert_eq!(
             seller_policy.buyer_no_show,
-            SellerBuyerNoShowAction::CleanupAndRepublish
+            SellerBuyerNoShowAction::RetireGateway
         );
         assert_eq!(
             seller_policy.dispute_against_me,

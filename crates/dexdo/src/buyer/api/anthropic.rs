@@ -42,6 +42,9 @@ pub async fn messages(
             "active deal budget exhausted; waiting for renewal handover",
         );
     }
+    if let Err(reason) = deal.session.ensure_open_for_serving().await {
+        return reject(StatusCode::BAD_GATEWAY, &reason);
+    }
     // one-per-deal content-identity gate(B8 + B7-full), run ONCE before the first paid stream -- the same
     // gate as the OpenAI path. The inline StreamVerifier only runs B5/B6 + the cheap declared-NAME B7; a seller
     // serving a cheaper model under the correct NAME is caught only here. On a bail the gate closes the deal and

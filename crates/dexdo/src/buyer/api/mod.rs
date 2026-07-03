@@ -16,11 +16,12 @@ mod stream;
 use crate::buyer::verify::Verdict;
 use crate::buyer::Buyer;
 use anyhow::Result;
-use dexdo_core::{ChainBackend, Handover, Note, TokenContract};
+use dexdo_core::{ChainBackend, Handover, Note, TokenContract, MATCH_OPEN_TIMEOUT_SECS};
 use dexdo_proto::CanonChunk;
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
+use std::time::{SystemTime, UNIX_EPOCH};
 use tokio::sync::{Mutex, OnceCell, RwLock};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -488,6 +489,89 @@ impl SessionSettle {
         self.closed.store(true, Ordering::SeqCst);
     }
 
+    /// Fail closed before any user-visible response is rendered unless the chain proves this deal is open.
+    /// A decrypted handover and a reachable gateway are not enough: showed that a stale handover can let the
+    /// local endpoint serve a response while the TokenContract remains funded-but-never-opened and unaccounted.
+    pub async fn ensure_open_for_serving(&self) -> Result<(), String> {
+        let state = match self.chain.deal_state(&self.token_contract).await {
+            Ok(Some(state)) => state,
+            Ok(None) => {
+                let reason = "deal state unavailable before serving user response".to_string();
+                self.fail_closed_before_serving(&reason).await;
+                return Err(reason);
+            }
+            Err(e) => {
+                let reason = format!("deal state unreadable before serving user response: {e}");
+                self.fail_closed_before_serving(&reason).await;
+                return Err(reason);
+            }
+        };
+        if state.funded && state.opened && !state.disputed {
+            return Ok(());
+        }
+
+        let now_secs = unix_now_secs();
+        let cleanup = unopened_cleanup_decision(state, now_secs);
+        let reason = not_safely_open_reason(state, cleanup);
+        self.fail_closed_unopened_before_serving(&reason, cleanup)
+            .await;
+        Err(reason)
+    }
+
+    async fn fail_closed_before_serving(&self, reason: &str) {
+        let _guard = self.settle_lock.lock().await;
+        if self.settled.load(Ordering::SeqCst) {
+            return;
+        }
+        self.close_local_api();
+        tracing::error!(
+            %reason,
+            token_contract = %self.token_contract,
+            result = "policy_fail_closed",
+            "consumer API: refusing to serve user-visible response without by-fact open/accounting"
+        );
+    }
+
+    async fn fail_closed_unopened_before_serving(
+        &self,
+        reason: &str,
+        cleanup: Option<UnopenedCleanupDecision>,
+    ) {
+        let _guard = self.settle_lock.lock().await;
+        if self.settled.load(Ordering::SeqCst) {
+            return;
+        }
+        self.close_local_api();
+        if cleanup == Some(UnopenedCleanupDecision::Ready) {
+            match self.chain.cleanup_unopened(&self.token_contract).await {
+                Ok(s) => {
+                    self.settled.store(true, Ordering::SeqCst);
+                    tracing::warn!(
+                        %reason,
+                        token_contract = %self.token_contract,
+                        settlement = ?s,
+                        "consumer API: refused response before open and cleaned up unopened deal"
+                    );
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        %reason,
+                        token_contract = %self.token_contract,
+                        error = %e,
+                        "consumer API: refused response before open; unopened cleanup not yet available"
+                    );
+                }
+            }
+        } else {
+            tracing::error!(
+                %reason,
+                token_contract = %self.token_contract,
+                result = "policy_fail_closed",
+                "consumer API: refusing to serve user-visible response without by-fact open/accounting"
+            );
+        }
+    }
+
     /// Mark the session terminal after an external recovery path(`streamCleanup` / `streamReclaim`) already
     /// closed or reclaimed the deal. This prevents a later route swap from sending a duplicate STOP to the
     /// recovered TC.
@@ -785,6 +869,66 @@ impl SessionSettle {
     }
 }
 
+fn unix_now_secs() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum UnopenedCleanupDecision {
+    Ready,
+    Wait { wait_secs: u64 },
+    MissingFundedTime,
+}
+
+fn unopened_cleanup_decision(
+    state: dexdo_core::DealChainState,
+    now_secs: u64,
+) -> Option<UnopenedCleanupDecision> {
+    if !(state.funded && !state.opened && !state.disputed && !state.probe_accepted) {
+        return None;
+    }
+    let Some(funded_time) = state.funded_time else {
+        return Some(UnopenedCleanupDecision::MissingFundedTime);
+    };
+    let cleanup_at = funded_time.saturating_add(MATCH_OPEN_TIMEOUT_SECS);
+    if now_secs >= cleanup_at {
+        Some(UnopenedCleanupDecision::Ready)
+    } else {
+        Some(UnopenedCleanupDecision::Wait {
+            wait_secs: cleanup_at.saturating_sub(now_secs),
+        })
+    }
+}
+
+fn not_safely_open_reason(
+    state: dexdo_core::DealChainState,
+    cleanup: Option<UnopenedCleanupDecision>,
+) -> String {
+    let mut reason = format!(
+        "deal is not safely opened/accountable before serving user response: funded={} opened={} \
+         probe_accepted={} disputed={}",
+        state.funded, state.opened, state.probe_accepted, state.disputed
+    );
+    match cleanup {
+        Some(UnopenedCleanupDecision::Ready) => {
+            reason.push_str(" cleanup_ready=true");
+        }
+        Some(UnopenedCleanupDecision::Wait { wait_secs }) => {
+            reason.push_str(&format!(
+                " cleanup_ready=false cleanup_wait_secs={wait_secs}"
+            ));
+        }
+        Some(UnopenedCleanupDecision::MissingFundedTime) => {
+            reason.push_str(" cleanup_ready=false funded_time=<missing>");
+        }
+        None => {}
+    }
+    reason
+}
+
 impl Drop for SessionSettle {
     fn drop(&mut self) {
         // BEST-EFFORT BACKUP ONLY: the awaited terminal(graceful shutdown / bail) is the
@@ -975,9 +1119,36 @@ mod tests {
         stop_calls: std::sync::atomic::AtomicUsize,
         dispute_calls: std::sync::atomic::AtomicUsize,
         seller_timeout_calls: std::sync::atomic::AtomicUsize,
+        cleanup_unopened_calls: std::sync::atomic::AtomicUsize,
         fail_stop: std::sync::atomic::AtomicBool,
         fail_dispute: std::sync::atomic::AtomicBool,
         fail_seller_timeout: std::sync::atomic::AtomicBool,
+        fail_cleanup_unopened: std::sync::atomic::AtomicBool,
+        fail_deal_state: std::sync::atomic::AtomicBool,
+        deal_state: std::sync::Mutex<Option<dexdo_core::DealChainState>>,
+    }
+
+    impl RecordingSettleChain {
+        fn set_deal_state(&self, state: dexdo_core::DealChainState) {
+            *self.deal_state.lock().unwrap() = Some(state);
+        }
+    }
+
+    fn deal_state(
+        funded: bool,
+        opened: bool,
+        disputed: bool,
+        probe_accepted: bool,
+        funded_time: Option<u64>,
+    ) -> dexdo_core::DealChainState {
+        dexdo_core::DealChainState {
+            funded,
+            opened,
+            disputed,
+            probe_accepted,
+            funded_time,
+            last_advance: 0,
+        }
     }
 
     #[async_trait::async_trait]
@@ -1096,6 +1267,41 @@ mod tests {
                 to_buyer_refund: 0,
                 seller_commission_returned: 0,
             })
+        }
+
+        async fn cleanup_unopened(
+            &self,
+            _token_contract: &TokenContract,
+        ) -> Result<dexdo_core::Settlement, dexdo_core::ChainError> {
+            self.cleanup_unopened_calls
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            if self
+                .fail_cleanup_unopened
+                .load(std::sync::atomic::Ordering::SeqCst)
+            {
+                return Err(dexdo_core::ChainError::Chain(
+                    "injected cleanup_unopened failure".to_string(),
+                ));
+            }
+            Ok(dexdo_core::Settlement::SellerNoShow {
+                to_buyer_refund: 0,
+                seller_commission_returned: 0,
+            })
+        }
+
+        async fn deal_state(
+            &self,
+            _token_contract: &TokenContract,
+        ) -> Result<Option<dexdo_core::DealChainState>, dexdo_core::ChainError> {
+            if self
+                .fail_deal_state
+                .load(std::sync::atomic::Ordering::SeqCst)
+            {
+                return Err(dexdo_core::ChainError::Chain(
+                    "injected deal_state failure".to_string(),
+                ));
+            }
+            Ok(*self.deal_state.lock().unwrap())
         }
 
         async fn snapshot(
@@ -1246,6 +1452,112 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn serving_gate_rejects_unopened_deal_before_timeout_without_cleanup() {
+        use std::sync::atomic::Ordering;
+
+        let chain = Arc::new(RecordingSettleChain::default());
+        let funded_time = unix_now_secs().saturating_sub(MATCH_OPEN_TIMEOUT_SECS / 2);
+        chain.set_deal_state(deal_state(true, false, false, false, Some(funded_time)));
+        let session = SessionSettle::new_with_failure_policy(
+            chain.clone(),
+            "tc-not-open".to_string(),
+            Arc::new(dexdo_core::LocalNote::generate()),
+            BuyerApiFailurePolicy::default(),
+        );
+
+        let err = session
+            .ensure_open_for_serving()
+            .await
+            .expect_err("funded-never-opened must fail closed before serving");
+
+        assert!(err.contains("opened=false"), "{err}");
+        assert!(err.contains("cleanup_ready=false"), "{err}");
+        assert!(
+            session.is_closed(),
+            "local API is closed before any response"
+        );
+        assert!(
+            !session.is_settled(),
+            "before MATCH_OPEN_TIMEOUT the session remains recoverable without a cleanup write"
+        );
+        assert_eq!(chain.cleanup_unopened_calls.load(Ordering::SeqCst), 0);
+        assert_eq!(
+            chain.stop_calls.load(Ordering::SeqCst),
+            0,
+            "fail-closed unopened path must not submit STOP"
+        );
+        assert_eq!(
+            chain.seller_timeout_calls.load(Ordering::SeqCst),
+            0,
+            "fail-closed unopened path must not use opened-deal reclaim"
+        );
+    }
+
+    #[tokio::test]
+    async fn serving_gate_rejects_unopened_deal_after_timeout_with_cleanup() {
+        use std::sync::atomic::Ordering;
+
+        let chain = Arc::new(RecordingSettleChain::default());
+        chain.set_deal_state(deal_state(true, false, false, false, Some(0)));
+        let session = SessionSettle::new_with_failure_policy(
+            chain.clone(),
+            "tc-not-open".to_string(),
+            Arc::new(dexdo_core::LocalNote::generate()),
+            BuyerApiFailurePolicy::default(),
+        );
+
+        let err = session
+            .ensure_open_for_serving()
+            .await
+            .expect_err("funded-never-opened must fail closed before serving");
+
+        assert!(err.contains("opened=false"), "{err}");
+        assert!(err.contains("cleanup_ready=true"), "{err}");
+        assert!(
+            session.is_closed(),
+            "local API is closed before any response"
+        );
+        assert!(
+            session.is_settled(),
+            "timeout-ready cleanup marks the session terminal"
+        );
+        assert_eq!(chain.cleanup_unopened_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            chain.stop_calls.load(Ordering::SeqCst),
+            0,
+            "fail-closed unopened path must not submit STOP"
+        );
+        assert_eq!(
+            chain.seller_timeout_calls.load(Ordering::SeqCst),
+            0,
+            "fail-closed unopened path must not use opened-deal reclaim"
+        );
+    }
+
+    #[tokio::test]
+    async fn serving_gate_allows_opened_deal() {
+        use std::sync::atomic::Ordering;
+
+        let chain = Arc::new(RecordingSettleChain::default());
+        chain.set_deal_state(deal_state(true, true, false, false, Some(0)));
+        let session = SessionSettle::new_with_failure_policy(
+            chain.clone(),
+            "tc-open".to_string(),
+            Arc::new(dexdo_core::LocalNote::generate()),
+            BuyerApiFailurePolicy::default(),
+        );
+
+        session
+            .ensure_open_for_serving()
+            .await
+            .expect("opened non-disputed deal can serve");
+
+        assert!(!session.is_closed());
+        assert!(!session.is_settled());
+        assert_eq!(chain.cleanup_unopened_calls.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
     async fn empty_stream_reclaim_uses_seller_timeout() {
         use std::sync::atomic::Ordering;
 
@@ -1371,6 +1683,31 @@ mod tests {
             assert!(
                 !source.contains("deal.session.is_settled()"),
                 "request gate must not use terminal settlement as the local API closed state"
+            );
+        }
+    }
+
+    #[test]
+    fn request_gate_checks_chain_open_before_content_probe_and_upstream() {
+        let openai = include_str!("openai.rs");
+        let anthropic = include_str!("anthropic.rs");
+        for source in [openai, anthropic] {
+            let open_gate = source
+                .find("ensure_open_for_serving")
+                .expect("handler gates by-fact open/accounting before serving");
+            let content_gate = source
+                .find(".content_gate")
+                .expect("handler has content-identity probe");
+            let upstream_open = source
+                .find(".open_canon_stream")
+                .expect("handler opens seller upstream");
+            assert!(
+                open_gate < content_gate,
+                "by-fact open gate must run before content probe can consume gateway tokens"
+            );
+            assert!(
+                open_gate < upstream_open,
+                "by-fact open gate must run before user-visible upstream stream"
             );
         }
     }

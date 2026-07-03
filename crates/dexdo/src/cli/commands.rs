@@ -2699,6 +2699,36 @@ fn enforce_seller_runtime_policy(policy: &policy::SellerRuntimePolicy) -> Result
             policy.max_open_deals
         );
     }
+    let mut unsupported = Vec::new();
+    match policy.after_deal_done {
+        policy::SellerAfterDealDoneAction::Retire => {}
+        policy::SellerAfterDealDoneAction::Republish => {
+            unsupported.push("seller.on.after_deal_done=republish");
+        }
+        policy::SellerAfterDealDoneAction::RepublishWithBackoff => {
+            unsupported.push("seller.on.after_deal_done=republish_with_backoff");
+        }
+    }
+    match policy.buyer_no_show {
+        policy::SellerBuyerNoShowAction::CleanupAndRepublish => {
+            unsupported.push("seller.on.buyer_no_show=cleanup_and_republish");
+        }
+        policy::SellerBuyerNoShowAction::CleanupAndRetire => {
+            unsupported.push("seller.on.buyer_no_show=cleanup_and_retire");
+        }
+        policy::SellerBuyerNoShowAction::RetireGateway => {}
+    }
+    if !unsupported.is_empty() {
+        bail!(
+            "policy_action failure_class=policy_validation action=fail_closed token_contract=<not-posted> \
+             state=pre_offer result=unsupported_policy_choice runtime=seller unsupported_choices={} \
+             next_action=edit_policy diagnostic=seller runtime cannot execute fresh-TC republish or \
+             buyer-side cleanup_unopened from this seller daemon before/following an offer; supported seller \
+             terminal actions today are seller.on.after_deal_done=retire and \
+             seller.on.buyer_no_show=retire_gateway",
+            unsupported.join(",")
+        );
+    }
     Ok(())
 }
 
@@ -2733,8 +2763,86 @@ async fn apply_seller_dispute_policy(
     }
 }
 
+#[derive(Debug)]
 enum SellerTerminalPolicyOutcome {
     StopServing,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum AdvanceFailureDisposition {
+    BenignTerminal { reason: String },
+    Fault { reason: String },
+}
+
+fn is_err_not_open(error: &ChainError) -> bool {
+    match error {
+        ChainError::Chain(msg) => {
+            msg.contains("airegistry::ERR_NOT_OPEN") || msg.contains("exit_code=320")
+        }
+        _ => false,
+    }
+}
+
+async fn classify_by_fact_advance_failure(
+    chain: &dyn ChainBackend,
+    token_contract: &dexdo_core::TokenContract,
+    error: &ChainError,
+) -> Result<AdvanceFailureDisposition> {
+    if !is_err_not_open(error) {
+        return Ok(AdvanceFailureDisposition::Fault {
+            reason: "reason=not_err_not_open".to_string(),
+        });
+    }
+
+    let state = chain.deal_state(token_contract).await?.ok_or_else(|| {
+        anyhow!("reason=state_unavailable cannot prove ERR_NOT_OPEN is terminal/no-money")
+    })?;
+    if state.opened || state.probe_accepted || state.disputed {
+        return Ok(AdvanceFailureDisposition::Fault {
+            reason: format!(
+                "reason=unsafe_lifecycle funded={} opened={} probe_accepted={} disputed={}",
+                state.funded, state.opened, state.probe_accepted, state.disputed
+            ),
+        });
+    }
+
+    let snapshot = chain.snapshot(token_contract).await.ok_or_else(|| {
+        anyhow!("reason=snapshot_unavailable cannot prove ERR_NOT_OPEN has no locked/owed money")
+    })?;
+    if snapshot.buyer_locked != 0
+        || snapshot.seller_locked != 0
+        || snapshot.buyer_lead != 0
+        || snapshot.seller_received != 0
+        || snapshot.burned != 0
+    {
+        return Ok(AdvanceFailureDisposition::Fault {
+            reason: format!(
+                "reason=money_or_locks_present buyer_locked={} buyer_lead={} seller_locked={} \
+                 finalized_owed={} burned={}",
+                snapshot.buyer_locked,
+                snapshot.buyer_lead,
+                snapshot.seller_locked,
+                snapshot.seller_received,
+                snapshot.burned
+            ),
+        });
+    }
+
+    Ok(AdvanceFailureDisposition::BenignTerminal {
+        reason: format!(
+            "reason=err_not_open_unopened_no_money funded={} opened={} probe_accepted={} disputed={} \
+             buyer_locked={} buyer_lead={} seller_locked={} finalized_owed={} burned={}",
+            state.funded,
+            state.opened,
+            state.probe_accepted,
+            state.disputed,
+            snapshot.buyer_locked,
+            snapshot.buyer_lead,
+            snapshot.seller_locked,
+            snapshot.seller_received,
+            snapshot.burned
+        ),
+    })
 }
 
 fn apply_seller_terminal_policy(
@@ -2752,10 +2860,17 @@ fn apply_seller_terminal_policy(
                 );
             }
             policy::SellerBuyerNoShowAction::CleanupAndRetire => {
-                println!(
+                bail!(
                     "policy_action failure_class=buyer_no_show action=cleanup_and_retire \
-                     token_contract={token_contract} state=funded/opened result=retiring_gateway; \
+                     token_contract={token_contract} state=funded/opened result=policy_action_unsupported; \
                      cleanup_unopened is buyer-side and was not submitted by seller"
+                );
+            }
+            policy::SellerBuyerNoShowAction::RetireGateway => {
+                println!(
+                    "policy_action failure_class=buyer_no_show action=retire_gateway \
+                     token_contract={token_contract} state=closed result=retiring_gateway finalized_ticks=0; \
+                     no cleanup_unopened submitted by seller"
                 );
                 return Ok(SellerTerminalPolicyOutcome::StopServing);
             }
@@ -3110,6 +3225,44 @@ pub(crate) async fn run_seller(args: SellerArgs) -> Result<()> {
                         server_task.await?;
                     }
                     Ok(Err(e)) => {
+                        if is_err_not_open(&e) {
+                            match classify_by_fact_advance_failure(
+                                chain.as_ref(),
+                                &token_contract,
+                                &e,
+                            )
+                            .await
+                            {
+                                Ok(AdvanceFailureDisposition::BenignTerminal { reason }) => {
+                                    tracing::info!(
+                                        token_contract = %token_contract,
+                                        %reason,
+                                        "drive_advance: ERR_NOT_OPEN is terminal for this unopened/no-money deal"
+                                    );
+                                    println!(
+                                        "by_fact_advance_terminal token_contract={token_contract} \
+                                         action=retire_gateway {reason}"
+                                    );
+                                    server_task.abort();
+                                    return Ok(());
+                                }
+                                Ok(AdvanceFailureDisposition::Fault { reason }) => {
+                                    return Err(anyhow::anyhow!(
+                                        "--token-contract {token_contract}: by-fact advance failed \
+                                         (money-path fault), stopping the seller: {e}; ERR_NOT_OPEN \
+                                         terminal check: {reason}"
+                                    ));
+                                }
+                                Err(classify_err) => {
+                                    return Err(anyhow::anyhow!(
+                                        "--token-contract {token_contract}: by-fact advance failed \
+                                         (money-path fault), stopping the seller: {e}; ERR_NOT_OPEN \
+                                         terminal check: reason=terminal_classification_failed \
+                                         error={classify_err}"
+                                    ));
+                                }
+                            }
+                        }
                         if let Some(policy) = seller_policy.as_ref() {
                             if apply_seller_dispute_policy(
                                 chain.as_ref(),
@@ -3550,9 +3703,90 @@ enum PolicyCleanupOutcome {
     HandoverOpened,
 }
 
+#[derive(Debug)]
 enum NoHandoverPolicyOutcome {
     RetryCurrent,
     RetryNext(dexdo_core::TokenContract),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum OneShotStreamPolicyOutcome {
+    RetryCurrent,
+    TerminalReport(String),
+}
+
+fn oneshot_stream_policy_report(
+    failure_class: &str,
+    action: &str,
+    token_contract: &dexdo_core::TokenContract,
+    submitted: bool,
+) -> String {
+    let (result, next_action) = match (failure_class, action, submitted) {
+        ("dead_gateway", "retry_then_reclaim", true) => {
+            ("reclaim_submitted", "observe_reclaim_status")
+        }
+        ("dead_gateway", "retry_then_reclaim", false) => (
+            "reclaim_not_submitted",
+            "retry_reclaim_or_run_dexdo_reclaim_after_timeout",
+        ),
+        ("dead_gateway", "next_seller", _) => (
+            "policy_action_unsupported",
+            "recover_current_deal_before_failover",
+        ),
+        ("dead_gateway", "fail_closed", _) => ("no_recovery_submitted", "operator_decision"),
+        ("empty_stream", "reclaim", true) => ("reclaim_submitted", "observe_reclaim_status"),
+        ("empty_stream", "reclaim", false) => (
+            "reclaim_not_submitted",
+            "retry_reclaim_or_run_dexdo_reclaim_after_timeout",
+        ),
+        ("empty_stream", "next_seller", _) => (
+            "policy_action_unsupported",
+            "recover_current_deal_before_failover",
+        ),
+        ("empty_stream", "fail_closed", _) => ("no_recovery_submitted", "operator_decision"),
+        _ => ("policy_action_reported", "operator_decision"),
+    };
+    format!(
+        "policy_action failure_class={failure_class} action={action} token_contract={token_contract} \
+         state=funded/opened result={result} next_action={next_action}"
+    )
+}
+
+async fn apply_oneshot_dead_gateway_policy(
+    session: &dexdo::buyer::api::SessionSettle,
+    token_contract: &dexdo_core::TokenContract,
+    buyer_policy: Option<&policy::BuyerRuntimePolicy>,
+    attempt: u64,
+) -> OneShotStreamPolicyOutcome {
+    let action = buyer_policy
+        .map(|policy| policy.dead_gateway.as_str())
+        .unwrap_or("retry_then_reclaim");
+    if action == "retry_then_reclaim" && attempt == 1 {
+        println!(
+            "policy_action failure_class=dead_gateway action=retry_then_reclaim \
+             token_contract={token_contract} state=funded/opened result=retrying_gateway attempt=2"
+        );
+        return OneShotStreamPolicyOutcome::RetryCurrent;
+    }
+    let submitted = session.settle_dead_gateway("dead-gateway").await;
+    OneShotStreamPolicyOutcome::TerminalReport(oneshot_stream_policy_report(
+        "dead_gateway",
+        action,
+        token_contract,
+        submitted,
+    ))
+}
+
+async fn apply_oneshot_empty_stream_policy(
+    session: &dexdo::buyer::api::SessionSettle,
+    token_contract: &dexdo_core::TokenContract,
+    buyer_policy: Option<&policy::BuyerRuntimePolicy>,
+) -> String {
+    let action = buyer_policy
+        .map(|policy| policy.empty_stream.as_str())
+        .unwrap_or("reclaim");
+    let submitted = session.settle_empty_stream("empty-stream").await;
+    oneshot_stream_policy_report("empty_stream", action, token_contract, submitted)
 }
 
 async fn apply_no_handover_after_match_policy(
@@ -4137,6 +4371,34 @@ fn buyer_machine_error_fixture_from_env() -> Option<anyhow::Error> {
     Some(anyhow::anyhow!(message))
 }
 
+fn validate_buyer_runtime_surface_policy(
+    policy: &policy::BuyerRuntimePolicy,
+    local_listen: Option<std::net::SocketAddr>,
+) -> Result<()> {
+    if local_listen.is_some() {
+        return Ok(());
+    }
+
+    let mut unsupported = Vec::new();
+    if policy.dead_gateway == policy::DeadGatewayAction::NextSeller {
+        unsupported.push("buyer.on.dead_gateway=next_seller");
+    }
+    if policy.empty_stream == policy::EmptyStreamAction::NextSeller {
+        unsupported.push("buyer.on.empty_stream=next_seller");
+    }
+    if unsupported.is_empty() {
+        return Ok(());
+    }
+
+    bail!(
+        "policy_action failure_class=policy_validation action=fail_closed token_contract=<not-placed> \
+         state=pre_order result=unsupported_policy_choice runtime=one-shot unsupported_choices={} \
+         diagnostic=one-shot dead_gateway/empty_stream next_seller failover is not implemented; choose \
+         dead_gateway=retry_then_reclaim|fail_closed and empty_stream=reclaim|fail_closed",
+        unsupported.join(",")
+    );
+}
+
 async fn run_buyer_inner(
     args: BuyerArgs,
     machine_events: &mut Option<machine::BuyerEventWriter>,
@@ -4242,6 +4504,7 @@ async fn run_buyer_inner(
             policy_total_spend_cap_shells = policy.total_spend_cap_shells,
             "buyer policy loaded"
         );
+        validate_buyer_runtime_surface_policy(policy, args.local_listen)?;
     }
     if !args.mock.mock_chain {
         shellnet_doctor_preflight(&args.contracts, args.market.as_deref()).await?;
@@ -4824,24 +5087,39 @@ async fn run_buyer_inner(
         buyer.note.clone(),
         api_failure_policy,
     );
-    let out = match buyer
-        .connect_and_stream(&handover, &token_contract, args.max_tokens)
-        .await
-    {
-        Ok(out) => out,
-        Err(e) => {
-            oneshot_session.settle_dead_gateway("dead-gateway").await;
-            return Err(e.context(format!(
-                "policy_action failure_class=dead_gateway token_contract={token_contract}"
-            )));
+    let mut stream_attempt = 1u64;
+    let out = loop {
+        match buyer
+            .connect_and_stream(&handover, &token_contract, args.max_tokens)
+            .await
+        {
+            Ok(out) => break out,
+            Err(e) => match apply_oneshot_dead_gateway_policy(
+                &oneshot_session,
+                &token_contract,
+                buyer_policy.as_ref(),
+                stream_attempt,
+            )
+            .await
+            {
+                OneShotStreamPolicyOutcome::RetryCurrent => {
+                    stream_attempt = stream_attempt.saturating_add(1);
+                    continue;
+                }
+                OneShotStreamPolicyOutcome::TerminalReport(report) => {
+                    return Err(e.context(report));
+                }
+            },
         }
     };
     if out.received == 0 {
-        oneshot_session.settle_empty_stream("empty-stream").await;
-        bail!(
-            "policy_action failure_class=empty_stream token_contract={token_contract} \
-             state=funded/opened result=zero_tokens_received"
-        );
+        let report = apply_oneshot_empty_stream_policy(
+            &oneshot_session,
+            &token_contract,
+            buyer_policy.as_ref(),
+        )
+        .await;
+        bail!("{report}");
     }
     tracing::info!(received = out.received, "received fake tokens; STOP");
     oneshot_session.settle("one-shot-complete").await;
@@ -6681,11 +6959,11 @@ mod tests {
             "run_buyer must route malformed/decrypt handovers through policy"
         );
         assert!(
-            body.contains("settle_dead_gateway(\"dead-gateway\")"),
+            body.contains("apply_oneshot_dead_gateway_policy"),
             "one-shot buyer stream open/connect errors must route through dead_gateway policy"
         );
         assert!(
-            body.contains("settle_empty_stream(\"empty-stream\")"),
+            body.contains("apply_oneshot_empty_stream_policy"),
             "one-shot buyer zero-token stream must route through empty_stream policy"
         );
     }
@@ -6712,15 +6990,54 @@ mod tests {
             helpers.contains("policy_action_unsupported"),
             "seller unsupported republish/cleanup surfaces must fail closed explicitly"
         );
+        assert!(
+            helpers.contains("action=retire_gateway"),
+            "seller buyer_no_show=retire_gateway must have an explicit runtime terminal action"
+        );
 
         let end = source[run..]
             .find("/// Render the per-model inference order book")
             .map(|offset| run + offset)
             .expect("run_seller end marker present");
         let body = &source[run..end];
-        assert!(body.contains("enforce_seller_runtime_policy(policy)?"));
+        let enforce = body
+            .find("enforce_seller_runtime_policy(policy)?")
+            .expect("seller policy enforcement present");
+        let doctor = body
+            .find("shellnet_doctor_preflight")
+            .expect("real shellnet preflight present");
+        let post_offer = body
+            .find("dexdo::seller::post_offer_with_note")
+            .expect("seller offer post present");
+        assert!(enforce < doctor);
+        assert!(enforce < post_offer);
         assert!(body.contains("apply_seller_dispute_policy"));
         assert!(body.contains("apply_seller_terminal_policy"));
+
+        let advance_error = body
+            .find("Ok(Err(e)) => {")
+            .expect("supervised advance error branch present");
+        let join_error = body[advance_error..]
+            .find("Err(join)")
+            .map(|offset| advance_error + offset)
+            .expect("advance error branch end marker present");
+        let branch = &body[advance_error..join_error];
+        assert!(
+            branch.contains("is_err_not_open(&e)")
+                && branch.contains("classify_by_fact_advance_failure")
+                && branch.contains("by_fact_advance_terminal"),
+            "ERR_NOT_OPEN must be classified before the seller turns it into a process fault"
+        );
+        let classify = branch
+            .find("classify_by_fact_advance_failure")
+            .expect("ERR_NOT_OPEN classifier present");
+        let policy = branch
+            .find("apply_seller_dispute_policy")
+            .expect("non-ERR_NOT_OPEN dispute policy fallback present");
+        assert!(
+            classify < policy,
+            "unsafe ERR_NOT_OPEN must return a money-path fault before generic dispute policy can consume it"
+        );
     }
 
     /// (file or symlink) is not truncated/clobbered before the final atomic rename.
@@ -6941,6 +7258,24 @@ mod tests {
     struct RecordingRecoveryChain {
         cleanup_calls: std::sync::atomic::AtomicUsize,
         reclaim_calls: std::sync::atomic::AtomicUsize,
+        dispute_calls: std::sync::atomic::AtomicUsize,
+        release_calls: std::sync::atomic::AtomicUsize,
+        stop_calls: std::sync::atomic::AtomicUsize,
+        place_next_calls: std::sync::atomic::AtomicUsize,
+        wait_match_calls: std::sync::atomic::AtomicUsize,
+        deal_state: Option<dexdo_core::DealChainState>,
+        snapshot: Option<dexdo_core::StreamSnapshot>,
+        next_match: Option<dexdo_core::TokenContract>,
+    }
+
+    impl RecordingRecoveryChain {
+        fn with_deal_state(state: dexdo_core::DealChainState) -> Self {
+            Self {
+                deal_state: Some(state),
+                next_match: Some("tc-next".to_string()),
+                ..Self::default()
+            }
+        }
     }
 
     #[async_trait::async_trait]
@@ -7010,7 +7345,37 @@ mod tests {
             _token_contract: &dexdo_core::TokenContract,
             _note: &dyn dexdo_core::Note,
         ) -> Result<dexdo_core::Settlement, dexdo_core::ChainError> {
-            unimplemented!("not needed by recovery monitor tests")
+            self.stop_calls
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Ok(dexdo_core::Settlement::AmicableSplit {
+                to_seller_ticks: 0,
+                to_buyer_refund: 0,
+            })
+        }
+
+        async fn dispute(
+            &self,
+            _token_contract: &dexdo_core::TokenContract,
+            _note: &dyn dexdo_core::Note,
+        ) -> Result<dexdo_core::Settlement, dexdo_core::ChainError> {
+            self.dispute_calls
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Ok(dexdo_core::Settlement::AmicableSplit {
+                to_seller_ticks: 0,
+                to_buyer_refund: 0,
+            })
+        }
+
+        async fn release_dispute(
+            &self,
+            _token_contract: &dexdo_core::TokenContract,
+        ) -> Result<dexdo_core::Settlement, dexdo_core::ChainError> {
+            self.release_calls
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Ok(dexdo_core::Settlement::AmicableSplit {
+                to_seller_ticks: 0,
+                to_buyer_refund: 0,
+            })
         }
 
         async fn seller_timeout(
@@ -7037,12 +7402,829 @@ mod tests {
             })
         }
 
+        async fn place_buy_by_model(
+            &self,
+            _note: &dyn dexdo_core::Note,
+            _ticks: u128,
+            _max_price_per_tick: u128,
+            _escrow: u128,
+        ) -> Result<(), dexdo_core::ChainError> {
+            self.place_next_calls
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Ok(())
+        }
+
+        async fn wait_matched_token_contract(
+            &self,
+            _since_unix: i64,
+            _timeout: std::time::Duration,
+        ) -> Result<dexdo_core::TokenContract, dexdo_core::ChainError> {
+            self.wait_match_calls
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Ok(self
+                .next_match
+                .clone()
+                .unwrap_or_else(|| "tc-next".to_string()))
+        }
+
+        async fn deal_state(
+            &self,
+            _token_contract: &dexdo_core::TokenContract,
+        ) -> Result<Option<dexdo_core::DealChainState>, dexdo_core::ChainError> {
+            Ok(self.deal_state)
+        }
+
         async fn snapshot(
             &self,
             _token_contract: &dexdo_core::TokenContract,
         ) -> Option<dexdo_core::StreamSnapshot> {
-            None
+            self.snapshot.clone()
         }
+    }
+
+    fn err_not_open() -> dexdo_core::ChainError {
+        dexdo_core::ChainError::Chain(
+            "block manager rejected message code=TVM_ERROR; exit_code=320 \
+             (airegistry::ERR_NOT_OPEN) stage=data"
+                .to_string(),
+        )
+    }
+
+    fn deal_state(
+        funded: bool,
+        opened: bool,
+        disputed: bool,
+        probe_accepted: bool,
+    ) -> dexdo_core::DealChainState {
+        dexdo_core::DealChainState {
+            funded,
+            opened,
+            disputed,
+            probe_accepted,
+            funded_time: Some(100),
+            last_advance: 0,
+        }
+    }
+
+    fn stream_snapshot(
+        buyer_locked: u64,
+        buyer_lead: u64,
+        seller_locked: u64,
+        seller_received: u64,
+        burned: u64,
+    ) -> dexdo_core::StreamSnapshot {
+        dexdo_core::StreamSnapshot {
+            seller_locked,
+            buyer_locked,
+            buyer_lead,
+            seller_received,
+            buyer_refunded: 0,
+            burned,
+            closed: false,
+        }
+    }
+
+    #[tokio::test]
+    async fn post_reject_err_not_open_never_opened_no_money_is_terminal() {
+        let chain = RecordingRecoveryChain {
+            deal_state: Some(deal_state(true, false, false, false)),
+            snapshot: Some(stream_snapshot(0, 0, 0, 0, 0)),
+            ..Default::default()
+        };
+
+        let disposition = super::classify_by_fact_advance_failure(
+            &chain,
+            &"tc-safe".to_string(),
+            &err_not_open(),
+        )
+        .await
+        .expect("classification reads by-fact state");
+
+        match disposition {
+            super::AdvanceFailureDisposition::BenignTerminal { reason } => {
+                assert!(reason.contains("reason=err_not_open_unopened_no_money"));
+                assert!(reason.contains("opened=false"));
+                assert!(reason.contains("probe_accepted=false"));
+                assert!(reason.contains("disputed=false"));
+                assert!(reason.contains("buyer_locked=0"));
+                assert!(reason.contains("buyer_lead=0"));
+                assert!(reason.contains("seller_locked=0"));
+                assert!(reason.contains("finalized_owed=0"));
+                assert!(reason.contains("burned=0"));
+            }
+            other => panic!("expected benign terminal ERR_NOT_OPEN, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn err_not_open_opened_probe_disputed_or_money_at_risk_remains_fault() {
+        for (name, state) in [
+            ("opened_probe", deal_state(true, true, false, false)),
+            ("streaming", deal_state(true, true, false, true)),
+            ("disputed", deal_state(true, false, true, false)),
+        ] {
+            let chain = RecordingRecoveryChain {
+                deal_state: Some(state),
+                snapshot: Some(stream_snapshot(0, 0, 0, 0, 0)),
+                ..Default::default()
+            };
+
+            let disposition = super::classify_by_fact_advance_failure(
+                &chain,
+                &format!("tc-{name}"),
+                &err_not_open(),
+            )
+            .await
+            .expect("classification reads by-fact state");
+
+            match disposition {
+                super::AdvanceFailureDisposition::Fault { reason } => {
+                    assert!(
+                        reason.contains("reason=unsafe_lifecycle"),
+                        "{name}: {reason}"
+                    );
+                }
+                other => panic!("expected {name} ERR_NOT_OPEN to remain fatal, got {other:?}"),
+            }
+        }
+
+        for (name, snapshot) in [
+            ("buyer_locked", stream_snapshot(1, 0, 0, 0, 0)),
+            ("buyer_lead", stream_snapshot(0, 1, 0, 0, 0)),
+            ("seller_locked", stream_snapshot(0, 0, 1, 0, 0)),
+            ("finalized_owed", stream_snapshot(0, 0, 0, 1, 0)),
+            ("burned", stream_snapshot(0, 0, 0, 0, 1)),
+        ] {
+            let chain = RecordingRecoveryChain {
+                deal_state: Some(deal_state(true, false, false, false)),
+                snapshot: Some(snapshot),
+                ..Default::default()
+            };
+            let disposition = super::classify_by_fact_advance_failure(
+                &chain,
+                &format!("tc-{name}"),
+                &err_not_open(),
+            )
+            .await
+            .expect("classification reads by-fact state");
+
+            match disposition {
+                super::AdvanceFailureDisposition::Fault { reason } => {
+                    assert!(
+                        reason.contains("reason=money_or_locks_present"),
+                        "{name}: {reason}"
+                    );
+                }
+                other => panic!("expected {name} ERR_NOT_OPEN to remain fatal, got {other:?}"),
+            }
+        }
+    }
+
+    fn ready_funded_never_opened_state() -> dexdo_core::DealChainState {
+        dexdo_core::DealChainState {
+            funded: true,
+            opened: false,
+            disputed: false,
+            probe_accepted: false,
+            funded_time: Some(1),
+            last_advance: 0,
+        }
+    }
+
+    fn disputed_deal_state() -> dexdo_core::DealChainState {
+        dexdo_core::DealChainState {
+            funded: true,
+            opened: true,
+            disputed: true,
+            probe_accepted: true,
+            funded_time: Some(1),
+            last_advance: 100,
+        }
+    }
+
+    fn seller_policy(
+        after_deal_done: crate::cli::policy::SellerAfterDealDoneAction,
+        buyer_no_show: crate::cli::policy::SellerBuyerNoShowAction,
+        dispute_against_me: crate::cli::policy::SellerDisputeAgainstMeAction,
+    ) -> crate::cli::policy::SellerRuntimePolicy {
+        crate::cli::policy::SellerRuntimePolicy {
+            after_deal_done,
+            buyer_no_show,
+            dispute_against_me,
+            max_open_deals: 1,
+        }
+    }
+
+    fn assert_seller_policy_startup_fails_closed(
+        policy: crate::cli::policy::SellerRuntimePolicy,
+        expected_choice: &str,
+    ) {
+        let err = super::enforce_seller_runtime_policy(&policy)
+            .unwrap_err()
+            .to_string();
+
+        assert!(err.contains("failure_class=policy_validation"), "{err}");
+        assert!(err.contains("action=fail_closed"), "{err}");
+        assert!(err.contains("token_contract=<not-posted>"), "{err}");
+        assert!(err.contains("state=pre_offer"), "{err}");
+        assert!(err.contains("result=unsupported_policy_choice"), "{err}");
+        assert!(err.contains("next_action=edit_policy"), "{err}");
+        assert!(err.contains(expected_choice), "{err}");
+    }
+
+    #[test]
+    fn policy_seller_after_done_republish_fails_closed_before_offer() {
+        let policy = seller_policy(
+            crate::cli::policy::SellerAfterDealDoneAction::Republish,
+            crate::cli::policy::SellerBuyerNoShowAction::RetireGateway,
+            crate::cli::policy::SellerDisputeAgainstMeAction::ReleaseIfClean,
+        );
+
+        assert_seller_policy_startup_fails_closed(policy, "seller.on.after_deal_done=republish");
+    }
+
+    #[test]
+    fn policy_seller_after_done_republish_with_backoff_fails_closed_before_offer() {
+        let policy = seller_policy(
+            crate::cli::policy::SellerAfterDealDoneAction::RepublishWithBackoff,
+            crate::cli::policy::SellerBuyerNoShowAction::RetireGateway,
+            crate::cli::policy::SellerDisputeAgainstMeAction::ReleaseIfClean,
+        );
+
+        assert_seller_policy_startup_fails_closed(
+            policy,
+            "seller.on.after_deal_done=republish_with_backoff",
+        );
+    }
+
+    #[test]
+    fn policy_seller_buyer_no_show_cleanup_and_republish_fails_closed_before_offer() {
+        let policy = seller_policy(
+            crate::cli::policy::SellerAfterDealDoneAction::Retire,
+            crate::cli::policy::SellerBuyerNoShowAction::CleanupAndRepublish,
+            crate::cli::policy::SellerDisputeAgainstMeAction::ReleaseIfClean,
+        );
+
+        assert_seller_policy_startup_fails_closed(
+            policy,
+            "seller.on.buyer_no_show=cleanup_and_republish",
+        );
+    }
+
+    #[test]
+    fn policy_seller_buyer_no_show_cleanup_and_retire_fails_closed_before_offer() {
+        let policy = seller_policy(
+            crate::cli::policy::SellerAfterDealDoneAction::Retire,
+            crate::cli::policy::SellerBuyerNoShowAction::CleanupAndRetire,
+            crate::cli::policy::SellerDisputeAgainstMeAction::ReleaseIfClean,
+        );
+
+        assert_seller_policy_startup_fails_closed(
+            policy,
+            "seller.on.buyer_no_show=cleanup_and_retire",
+        );
+    }
+
+    #[test]
+    fn policy_seller_complete_supported_policy_passes_startup_before_offer() {
+        let policy = seller_policy(
+            crate::cli::policy::SellerAfterDealDoneAction::Retire,
+            crate::cli::policy::SellerBuyerNoShowAction::RetireGateway,
+            crate::cli::policy::SellerDisputeAgainstMeAction::ReleaseIfClean,
+        );
+
+        super::enforce_seller_runtime_policy(&policy).expect("supported seller policy starts");
+    }
+
+    #[tokio::test]
+    async fn policy_seller_dispute_release_if_clean_executes_release_dispute_lever() {
+        use std::sync::atomic::Ordering;
+
+        let chain = RecordingRecoveryChain::with_deal_state(disputed_deal_state());
+        let policy = seller_policy(
+            crate::cli::policy::SellerAfterDealDoneAction::Retire,
+            crate::cli::policy::SellerBuyerNoShowAction::RetireGateway,
+            crate::cli::policy::SellerDisputeAgainstMeAction::ReleaseIfClean,
+        );
+
+        let handled =
+            super::apply_seller_dispute_policy(&chain, &"tc-disputed".to_string(), &policy, "test")
+                .await
+                .expect("release dispute succeeds");
+
+        assert!(handled);
+        assert_eq!(chain.release_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(chain.dispute_calls.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn policy_seller_dispute_hold_fails_closed_without_release() {
+        use std::sync::atomic::Ordering;
+
+        let chain = RecordingRecoveryChain::with_deal_state(disputed_deal_state());
+        let policy = seller_policy(
+            crate::cli::policy::SellerAfterDealDoneAction::Retire,
+            crate::cli::policy::SellerBuyerNoShowAction::RetireGateway,
+            crate::cli::policy::SellerDisputeAgainstMeAction::Hold,
+        );
+
+        let err =
+            super::apply_seller_dispute_policy(&chain, &"tc-disputed".to_string(), &policy, "test")
+                .await
+                .unwrap_err()
+                .to_string();
+
+        assert!(err.contains("failure_class=dispute_against_me"), "{err}");
+        assert!(err.contains("action=hold"), "{err}");
+        assert!(err.contains("result=no_release_submitted"), "{err}");
+        assert_eq!(chain.release_calls.load(Ordering::SeqCst), 0);
+        assert_eq!(chain.dispute_calls.load(Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn policy_seller_after_done_retire_stops_serving() {
+        let policy = seller_policy(
+            crate::cli::policy::SellerAfterDealDoneAction::Retire,
+            crate::cli::policy::SellerBuyerNoShowAction::RetireGateway,
+            crate::cli::policy::SellerDisputeAgainstMeAction::ReleaseIfClean,
+        );
+
+        let outcome = super::apply_seller_terminal_policy(&"tc-done".to_string(), &policy, 1)
+            .expect("retire stops serving");
+
+        assert!(matches!(
+            outcome,
+            super::SellerTerminalPolicyOutcome::StopServing
+        ));
+    }
+
+    #[test]
+    fn policy_seller_buyer_no_show_retire_gateway_stops_serving_without_cleanup_claim() {
+        let policy = seller_policy(
+            crate::cli::policy::SellerAfterDealDoneAction::Retire,
+            crate::cli::policy::SellerBuyerNoShowAction::RetireGateway,
+            crate::cli::policy::SellerDisputeAgainstMeAction::ReleaseIfClean,
+        );
+
+        let outcome = super::apply_seller_terminal_policy(&"tc-noshow".to_string(), &policy, 0)
+            .expect("retire_gateway stops serving without cleanup");
+
+        assert!(matches!(
+            outcome,
+            super::SellerTerminalPolicyOutcome::StopServing
+        ));
+    }
+
+    #[test]
+    fn policy_seller_buyer_no_show_cleanup_and_retire_fails_closed_if_bypassed() {
+        let policy = seller_policy(
+            crate::cli::policy::SellerAfterDealDoneAction::Retire,
+            crate::cli::policy::SellerBuyerNoShowAction::CleanupAndRetire,
+            crate::cli::policy::SellerDisputeAgainstMeAction::ReleaseIfClean,
+        );
+
+        let err = super::apply_seller_terminal_policy(&"tc-noshow".to_string(), &policy, 0)
+            .unwrap_err()
+            .to_string();
+
+        assert!(err.contains("failure_class=buyer_no_show"), "{err}");
+        assert!(err.contains("action=cleanup_and_retire"), "{err}");
+        assert!(err.contains("result=policy_action_unsupported"), "{err}");
+    }
+
+    fn buyer_policy(
+        no_handover_after_match: crate::cli::policy::NoHandoverAfterMatchAction,
+        malformed_handover: crate::cli::policy::MalformedHandoverAction,
+        dead_gateway: crate::cli::policy::DeadGatewayAction,
+        empty_stream: crate::cli::policy::EmptyStreamAction,
+        seller_stalls_mid_stream: crate::cli::policy::SellerStallsMidStreamAction,
+        bad_output_scam: crate::cli::policy::BadOutputScamAction,
+    ) -> crate::cli::policy::BuyerRuntimePolicy {
+        crate::cli::policy::BuyerRuntimePolicy {
+            no_handover_after_match,
+            malformed_handover,
+            dead_gateway,
+            empty_stream,
+            seller_stalls_mid_stream,
+            bad_output_scam,
+            max_sellers_to_try: 3,
+            total_spend_cap_shells: 1_000_000_000,
+        }
+    }
+
+    fn policy_for_no_handover(
+        action: crate::cli::policy::NoHandoverAfterMatchAction,
+    ) -> crate::cli::policy::BuyerRuntimePolicy {
+        buyer_policy(
+            action,
+            crate::cli::policy::MalformedHandoverAction::FailClosed,
+            crate::cli::policy::DeadGatewayAction::FailClosed,
+            crate::cli::policy::EmptyStreamAction::FailClosed,
+            crate::cli::policy::SellerStallsMidStreamAction::AcceptDeliveredThenReclaim,
+            crate::cli::policy::BadOutputScamAction::Stop,
+        )
+    }
+
+    fn policy_for_malformed(
+        action: crate::cli::policy::MalformedHandoverAction,
+    ) -> crate::cli::policy::BuyerRuntimePolicy {
+        buyer_policy(
+            crate::cli::policy::NoHandoverAfterMatchAction::FailClosed,
+            action,
+            crate::cli::policy::DeadGatewayAction::FailClosed,
+            crate::cli::policy::EmptyStreamAction::FailClosed,
+            crate::cli::policy::SellerStallsMidStreamAction::AcceptDeliveredThenReclaim,
+            crate::cli::policy::BadOutputScamAction::Stop,
+        )
+    }
+
+    fn policy_for_stream_failure(
+        dead_gateway: crate::cli::policy::DeadGatewayAction,
+        empty_stream: crate::cli::policy::EmptyStreamAction,
+    ) -> crate::cli::policy::BuyerRuntimePolicy {
+        buyer_policy(
+            crate::cli::policy::NoHandoverAfterMatchAction::FailClosed,
+            crate::cli::policy::MalformedHandoverAction::FailClosed,
+            dead_gateway,
+            empty_stream,
+            crate::cli::policy::SellerStallsMidStreamAction::AcceptDeliveredThenReclaim,
+            crate::cli::policy::BadOutputScamAction::Stop,
+        )
+    }
+
+    #[test]
+    fn policy_oneshot_dead_gateway_next_seller_fails_closed_before_order() {
+        let policy = policy_for_stream_failure(
+            crate::cli::policy::DeadGatewayAction::NextSeller,
+            crate::cli::policy::EmptyStreamAction::Reclaim,
+        );
+
+        let err = super::validate_buyer_runtime_surface_policy(&policy, None)
+            .unwrap_err()
+            .to_string();
+
+        assert!(err.contains("failure_class=policy_validation"), "{err}");
+        assert!(err.contains("token_contract=<not-placed>"), "{err}");
+        assert!(err.contains("state=pre_order"), "{err}");
+        assert!(err.contains("buyer.on.dead_gateway=next_seller"), "{err}");
+        assert!(
+            err.contains("dead_gateway=retry_then_reclaim|fail_closed"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn policy_oneshot_empty_stream_next_seller_fails_closed_before_order() {
+        let policy = policy_for_stream_failure(
+            crate::cli::policy::DeadGatewayAction::RetryThenReclaim,
+            crate::cli::policy::EmptyStreamAction::NextSeller,
+        );
+
+        let err = super::validate_buyer_runtime_surface_policy(&policy, None)
+            .unwrap_err()
+            .to_string();
+
+        assert!(err.contains("failure_class=policy_validation"), "{err}");
+        assert!(err.contains("token_contract=<not-placed>"), "{err}");
+        assert!(err.contains("state=pre_order"), "{err}");
+        assert!(err.contains("buyer.on.empty_stream=next_seller"), "{err}");
+        assert!(err.contains("empty_stream=reclaim|fail_closed"), "{err}");
+    }
+
+    #[test]
+    fn policy_local_listen_keeps_next_seller_policy_surface() {
+        let policy = policy_for_stream_failure(
+            crate::cli::policy::DeadGatewayAction::NextSeller,
+            crate::cli::policy::EmptyStreamAction::NextSeller,
+        );
+        let bind = "127.0.0.1:0".parse().expect("socket addr");
+
+        super::validate_buyer_runtime_surface_policy(&policy, Some(bind))
+            .expect("local-listen surface handles unsupported actions at runtime");
+    }
+
+    #[tokio::test]
+    async fn policy_no_handover_wait_then_reclaim_executes_cleanup_lever() {
+        use std::sync::atomic::Ordering;
+
+        let chain = RecordingRecoveryChain::with_deal_state(ready_funded_never_opened_state());
+        let buyer =
+            dexdo::buyer::Buyer::from_note(std::sync::Arc::new(dexdo_core::LocalNote::generate()));
+        let policy =
+            policy_for_no_handover(crate::cli::policy::NoHandoverAfterMatchAction::WaitThenReclaim);
+
+        let err = super::apply_no_handover_after_match_policy(
+            &chain,
+            &buyer,
+            &"tc-clean".to_string(),
+            &policy,
+            None,
+            1,
+            "diagnostic",
+        )
+        .await
+        .unwrap_err()
+        .to_string();
+
+        assert!(
+            err.contains("failure_class=no_handover_after_match"),
+            "{err}"
+        );
+        assert!(err.contains("action=wait_then_reclaim"), "{err}");
+        assert!(err.contains("result=money_reclaimed"), "{err}");
+        assert_eq!(chain.cleanup_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(chain.reclaim_calls.load(Ordering::SeqCst), 0);
+        assert_eq!(chain.dispute_calls.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn policy_no_handover_next_seller_cleans_then_places_next_buy() {
+        use std::sync::atomic::Ordering;
+
+        let chain = RecordingRecoveryChain::with_deal_state(ready_funded_never_opened_state());
+        let buyer =
+            dexdo::buyer::Buyer::from_note(std::sync::Arc::new(dexdo_core::LocalNote::generate()));
+        let policy =
+            policy_for_no_handover(crate::cli::policy::NoHandoverAfterMatchAction::NextSeller);
+
+        let outcome = super::apply_no_handover_after_match_policy(
+            &chain,
+            &buyer,
+            &"tc-current".to_string(),
+            &policy,
+            Some((1, 1, 1)),
+            1,
+            "diagnostic",
+        )
+        .await
+        .expect("next_seller dispatch succeeds");
+
+        assert!(matches!(
+            outcome,
+            super::NoHandoverPolicyOutcome::RetryNext(tc) if tc == "tc-next"
+        ));
+        assert_eq!(chain.cleanup_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(chain.place_next_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(chain.wait_match_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(chain.reclaim_calls.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn policy_no_handover_fail_closed_reports_without_recovery_lever() {
+        use std::sync::atomic::Ordering;
+
+        let chain = RecordingRecoveryChain::with_deal_state(ready_funded_never_opened_state());
+        let buyer =
+            dexdo::buyer::Buyer::from_note(std::sync::Arc::new(dexdo_core::LocalNote::generate()));
+        let policy =
+            policy_for_no_handover(crate::cli::policy::NoHandoverAfterMatchAction::FailClosed);
+
+        let err = super::apply_no_handover_after_match_policy(
+            &chain,
+            &buyer,
+            &"tc-fail".to_string(),
+            &policy,
+            None,
+            1,
+            "diagnostic",
+        )
+        .await
+        .unwrap_err()
+        .to_string();
+
+        assert!(err.contains("action=fail_closed"), "{err}");
+        assert!(err.contains("result=no_recovery_submitted"), "{err}");
+        assert_eq!(chain.cleanup_calls.load(Ordering::SeqCst), 0);
+        assert_eq!(chain.reclaim_calls.load(Ordering::SeqCst), 0);
+        assert_eq!(chain.dispute_calls.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn policy_malformed_handover_reclaim_executes_reclaim_lever() {
+        use std::sync::atomic::Ordering;
+
+        let chain = RecordingRecoveryChain::default();
+        let buyer =
+            dexdo::buyer::Buyer::from_note(std::sync::Arc::new(dexdo_core::LocalNote::generate()));
+        let policy = policy_for_malformed(crate::cli::policy::MalformedHandoverAction::Reclaim);
+        let handover_error = anyhow::anyhow!("malformed handover: invalid bytes");
+
+        let err = super::apply_malformed_handover_policy(
+            &chain,
+            &buyer,
+            &"tc-malformed".to_string(),
+            &policy,
+            &handover_error,
+        )
+        .await
+        .unwrap_err()
+        .to_string();
+
+        assert!(err.contains("failure_class=malformed_handover"), "{err}");
+        assert!(err.contains("action=reclaim"), "{err}");
+        assert!(err.contains("result=reclaimed"), "{err}");
+        assert_eq!(chain.reclaim_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(chain.dispute_calls.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn policy_malformed_handover_dispute_executes_dispute_lever() {
+        use std::sync::atomic::Ordering;
+
+        let chain = RecordingRecoveryChain::default();
+        let buyer =
+            dexdo::buyer::Buyer::from_note(std::sync::Arc::new(dexdo_core::LocalNote::generate()));
+        let policy = policy_for_malformed(crate::cli::policy::MalformedHandoverAction::Dispute);
+        let handover_error = anyhow::anyhow!("handover decrypt failed: bad key");
+
+        let err = super::apply_malformed_handover_policy(
+            &chain,
+            &buyer,
+            &"tc-dispute".to_string(),
+            &policy,
+            &handover_error,
+        )
+        .await
+        .unwrap_err()
+        .to_string();
+
+        assert!(err.contains("failure_class=malformed_handover"), "{err}");
+        assert!(err.contains("action=dispute"), "{err}");
+        assert!(err.contains("result=dispute_opened"), "{err}");
+        assert!(err.contains("dispute_locks_buyer_note"), "{err}");
+        assert_eq!(chain.dispute_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(chain.reclaim_calls.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn policy_malformed_handover_fail_closed_reports_without_recovery_lever() {
+        use std::sync::atomic::Ordering;
+
+        let chain = RecordingRecoveryChain::default();
+        let buyer =
+            dexdo::buyer::Buyer::from_note(std::sync::Arc::new(dexdo_core::LocalNote::generate()));
+        let policy = policy_for_malformed(crate::cli::policy::MalformedHandoverAction::FailClosed);
+        let handover_error = anyhow::anyhow!("malformed handover: invalid bytes");
+
+        let err = super::apply_malformed_handover_policy(
+            &chain,
+            &buyer,
+            &"tc-fail".to_string(),
+            &policy,
+            &handover_error,
+        )
+        .await
+        .unwrap_err()
+        .to_string();
+
+        assert!(err.contains("action=fail_closed"), "{err}");
+        assert!(err.contains("result=no_recovery_submitted"), "{err}");
+        assert_eq!(chain.reclaim_calls.load(Ordering::SeqCst), 0);
+        assert_eq!(chain.dispute_calls.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn policy_oneshot_dead_gateway_retry_then_reclaim_retries_once_then_reclaims() {
+        use std::sync::atomic::Ordering;
+
+        let chain = std::sync::Arc::new(RecordingRecoveryChain::default());
+        let policy = policy_for_stream_failure(
+            crate::cli::policy::DeadGatewayAction::RetryThenReclaim,
+            crate::cli::policy::EmptyStreamAction::FailClosed,
+        );
+        let session = dexdo::buyer::api::SessionSettle::new_with_failure_policy(
+            chain.clone(),
+            "tc-dead".to_string(),
+            std::sync::Arc::new(dexdo_core::LocalNote::generate()),
+            policy.as_api_failure_policy(),
+        );
+
+        assert_eq!(
+            super::apply_oneshot_dead_gateway_policy(
+                &session,
+                &"tc-dead".to_string(),
+                Some(&policy),
+                1,
+            )
+            .await,
+            super::OneShotStreamPolicyOutcome::RetryCurrent
+        );
+        assert_eq!(chain.reclaim_calls.load(Ordering::SeqCst), 0);
+
+        let report = match super::apply_oneshot_dead_gateway_policy(
+            &session,
+            &"tc-dead".to_string(),
+            Some(&policy),
+            2,
+        )
+        .await
+        {
+            super::OneShotStreamPolicyOutcome::TerminalReport(report) => report,
+            other => panic!("expected terminal report, got {other:?}"),
+        };
+
+        assert!(report.contains("failure_class=dead_gateway"), "{report}");
+        assert!(report.contains("action=retry_then_reclaim"), "{report}");
+        assert!(report.contains("result=reclaim_submitted"), "{report}");
+        assert_eq!(chain.reclaim_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(chain.stop_calls.load(Ordering::SeqCst), 0);
+        assert_eq!(chain.dispute_calls.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn policy_oneshot_dead_gateway_fail_closed_reports_without_recovery_lever() {
+        use std::sync::atomic::Ordering;
+
+        let chain = std::sync::Arc::new(RecordingRecoveryChain::default());
+        let policy = policy_for_stream_failure(
+            crate::cli::policy::DeadGatewayAction::FailClosed,
+            crate::cli::policy::EmptyStreamAction::FailClosed,
+        );
+        let session = dexdo::buyer::api::SessionSettle::new_with_failure_policy(
+            chain.clone(),
+            "tc-dead-fail".to_string(),
+            std::sync::Arc::new(dexdo_core::LocalNote::generate()),
+            policy.as_api_failure_policy(),
+        );
+
+        let report = match super::apply_oneshot_dead_gateway_policy(
+            &session,
+            &"tc-dead-fail".to_string(),
+            Some(&policy),
+            1,
+        )
+        .await
+        {
+            super::OneShotStreamPolicyOutcome::TerminalReport(report) => report,
+            other => panic!("expected terminal report, got {other:?}"),
+        };
+
+        assert!(report.contains("action=fail_closed"), "{report}");
+        assert!(report.contains("result=no_recovery_submitted"), "{report}");
+        assert_eq!(chain.reclaim_calls.load(Ordering::SeqCst), 0);
+        assert_eq!(chain.stop_calls.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn policy_oneshot_empty_stream_reclaim_executes_reclaim_lever() {
+        use std::sync::atomic::Ordering;
+
+        let chain = std::sync::Arc::new(RecordingRecoveryChain::default());
+        let policy = policy_for_stream_failure(
+            crate::cli::policy::DeadGatewayAction::FailClosed,
+            crate::cli::policy::EmptyStreamAction::Reclaim,
+        );
+        let session = dexdo::buyer::api::SessionSettle::new_with_failure_policy(
+            chain.clone(),
+            "tc-empty".to_string(),
+            std::sync::Arc::new(dexdo_core::LocalNote::generate()),
+            policy.as_api_failure_policy(),
+        );
+
+        let report = super::apply_oneshot_empty_stream_policy(
+            &session,
+            &"tc-empty".to_string(),
+            Some(&policy),
+        )
+        .await;
+
+        assert!(report.contains("failure_class=empty_stream"), "{report}");
+        assert!(report.contains("action=reclaim"), "{report}");
+        assert!(report.contains("result=reclaim_submitted"), "{report}");
+        assert_eq!(chain.reclaim_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(chain.stop_calls.load(Ordering::SeqCst), 0);
+        assert_eq!(chain.dispute_calls.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn policy_oneshot_empty_stream_fail_closed_reports_without_recovery_lever() {
+        use std::sync::atomic::Ordering;
+
+        let chain = std::sync::Arc::new(RecordingRecoveryChain::default());
+        let policy = policy_for_stream_failure(
+            crate::cli::policy::DeadGatewayAction::FailClosed,
+            crate::cli::policy::EmptyStreamAction::FailClosed,
+        );
+        let session = dexdo::buyer::api::SessionSettle::new_with_failure_policy(
+            chain.clone(),
+            "tc-empty-fail".to_string(),
+            std::sync::Arc::new(dexdo_core::LocalNote::generate()),
+            policy.as_api_failure_policy(),
+        );
+
+        let report = super::apply_oneshot_empty_stream_policy(
+            &session,
+            &"tc-empty-fail".to_string(),
+            Some(&policy),
+        )
+        .await;
+
+        assert!(report.contains("failure_class=empty_stream"), "{report}");
+        assert!(report.contains("action=fail_closed"), "{report}");
+        assert!(report.contains("result=no_recovery_submitted"), "{report}");
+        assert_eq!(chain.reclaim_calls.load(Ordering::SeqCst), 0);
+        assert_eq!(chain.stop_calls.load(Ordering::SeqCst), 0);
+        assert_eq!(chain.dispute_calls.load(Ordering::SeqCst), 0);
     }
 
     #[tokio::test]

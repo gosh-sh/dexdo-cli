@@ -42,19 +42,18 @@ trap 'rm -rf "$tmp"' EXIT
 echo "dexdo: downloading ${asset} (${ver})"
 curl -fsSL "${base}/${asset}" -o "${tmp}/${asset}"
 
-# Verify against SHA256SUMS when present.
-if curl -fsSL "${base}/SHA256SUMS" -o "${tmp}/SHA256SUMS" 2>/dev/null; then
-  expected="$(grep " ${asset}\$" "${tmp}/SHA256SUMS" | awk '{print $1}' | head -n1)"
-  if [ -n "$expected" ]; then
-    if command -v sha256sum >/dev/null 2>&1; then
-      actual="$(sha256sum "${tmp}/${asset}" | awk '{print $1}')"
-    else
-      actual="$(shasum -a 256 "${tmp}/${asset}" | awk '{print $1}')"
-    fi
-    [ "$expected" = "$actual" ] || { echo "dexdo: checksum mismatch" >&2; exit 1; }
-    echo "dexdo: checksum verified"
-  fi
+# Verify the archive checksum against SHA256SUMS. Fail closed: a missing
+# SHA256SUMS or a missing entry for this asset aborts the install.
+curl -fsSL "${base}/SHA256SUMS" -o "${tmp}/SHA256SUMS" || { echo "dexdo: could not fetch SHA256SUMS" >&2; exit 1; }
+expected="$(grep " ${asset}\$" "${tmp}/SHA256SUMS" | awk '{print $1}' | head -n1)"
+[ -n "$expected" ] || { echo "dexdo: ${asset} not found in SHA256SUMS" >&2; exit 1; }
+if command -v sha256sum >/dev/null 2>&1; then
+  actual="$(sha256sum "${tmp}/${asset}" | awk '{print $1}')"
+else
+  actual="$(shasum -a 256 "${tmp}/${asset}" | awk '{print $1}')"
 fi
+[ "$expected" = "$actual" ] || { echo "dexdo: checksum mismatch" >&2; exit 1; }
+echo "dexdo: checksum verified"
 
 tar -C "$tmp" -xzf "${tmp}/${asset}"
 mkdir -p "$BINDIR"

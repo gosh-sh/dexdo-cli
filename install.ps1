@@ -23,17 +23,16 @@ try {
   Write-Host "dexdo: downloading $asset ($ver)"
   Invoke-WebRequest "$base/$asset" -OutFile (Join-Path $tmp $asset)
 
-  # Verify against SHA256SUMS when present.
-  try {
-    Invoke-WebRequest "$base/SHA256SUMS" -OutFile (Join-Path $tmp 'SHA256SUMS')
-    $line = Select-String -Path (Join-Path $tmp 'SHA256SUMS') -Pattern ([regex]::Escape($asset)) | Select-Object -First 1
-    if ($line) {
-      $expected = ($line.Line -split '\s+')[0].ToLower()
-      $actual   = (Get-FileHash -Algorithm SHA256 (Join-Path $tmp $asset)).Hash.ToLower()
-      if ($expected -ne $actual) { throw 'dexdo: checksum mismatch' }
-      Write-Host 'dexdo: checksum verified'
-    }
-  } catch { }
+  # Verify the archive checksum against SHA256SUMS. Fail closed: a missing
+  # SHA256SUMS, a missing entry for this asset, or a mismatch aborts the install
+  # ($ErrorActionPreference = 'Stop' + the throws propagate out of the outer try).
+  Invoke-WebRequest "$base/SHA256SUMS" -OutFile (Join-Path $tmp 'SHA256SUMS')
+  $line = Select-String -Path (Join-Path $tmp 'SHA256SUMS') -Pattern ([regex]::Escape($asset)) | Select-Object -First 1
+  if (-not $line) { throw "dexdo: $asset not found in SHA256SUMS" }
+  $expected = ($line.Line -split '\s+')[0].ToLower()
+  $actual   = (Get-FileHash -Algorithm SHA256 (Join-Path $tmp $asset)).Hash.ToLower()
+  if ($expected -ne $actual) { throw 'dexdo: checksum mismatch' }
+  Write-Host 'dexdo: checksum verified'
 
   Expand-Archive -Path (Join-Path $tmp $asset) -DestinationPath $tmp -Force
   New-Item -ItemType Directory -Force -Path $binDir | Out-Null

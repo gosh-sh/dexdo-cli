@@ -495,6 +495,58 @@ impl ChainBackend for MockChainBackend {
         Ok(settlement)
     }
 
+    async fn cleanup_unopened(
+        &self,
+        token_contract: &TokenContract,
+    ) -> Result<Settlement, ChainError> {
+        let _g = self.lock.lock().unwrap();
+        let mut st = self.load_state()?;
+        if st.streams.contains_key(token_contract) {
+            return Err(ChainError::Chain(format!(
+                "cleanup_unopened: {token_contract} is already opened"
+            )));
+        }
+        if !st.matches.contains_key(token_contract) {
+            return Err(ChainError::NoMatch(token_contract.clone()));
+        }
+        st.matches.remove(token_contract);
+        st.matched_offers.remove(token_contract);
+        self.store_state(&st)?;
+        Ok(Settlement::SellerNoShow {
+            to_buyer_refund: 0,
+            seller_commission_returned: 0,
+        })
+    }
+
+    async fn deal_state(
+        &self,
+        token_contract: &TokenContract,
+    ) -> Result<Option<DealChainState>, ChainError> {
+        let _g = self.lock.lock().unwrap();
+        let st = self.load_state()?;
+        if let Some(cell) = st.streams.get(token_contract) {
+            return Ok(Some(DealChainState {
+                funded: true,
+                opened: !cell.closed,
+                disputed: cell.disputed,
+                probe_accepted: cell.seller_received > 0,
+                funded_time: Some(0),
+                last_advance: 0,
+            }));
+        }
+        if st.matches.contains_key(token_contract) {
+            return Ok(Some(DealChainState {
+                funded: true,
+                opened: false,
+                disputed: false,
+                probe_accepted: false,
+                funded_time: Some(0),
+                last_advance: 0,
+            }));
+        }
+        Ok(None)
+    }
+
     async fn snapshot(&self, token_contract: &TokenContract) -> Option<StreamSnapshot> {
         let _g = self.lock.lock().unwrap();
         let st = self.load_state().ok()?;
