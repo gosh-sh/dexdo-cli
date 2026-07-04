@@ -4,12 +4,15 @@
 //! iteration with failover; on scam/no-show -- anti-scam reaction + blacklist + next seller).
 //! The deal+verification itself(stream, D4) lives behind the [`DealRunner`] seam(real -- gateway; test -- script).
 
-use super::verify::{StreamVerifier, Verdict};
+use super::api::content_check_policy;
+use super::verify::{reference_endpoint_for, StreamVerifier, Verdict};
 use super::Buyer;
+use crate::seller::ModelsConfig;
 use async_trait::async_trait;
 use dexdo_core::{ChainBackend, Note, OfferListing};
 use dexdo_proto::CanonRequest;
 use std::collections::{HashMap, HashSet};
+use std::sync::Arc;
 use tokio_stream::StreamExt;
 
 /// Buyer's reaction to a caught scammer. Set **EXPLICITLY** at
@@ -364,6 +367,13 @@ pub struct GatewayDealRunner<'a> {
     expected_model: String,
     /// Budget of accepted canonical chunks for this request.
     max_tokens: u64,
+    /// Loaded model config -- B5/B8/B7 verification data is data-driven from it, and the pre-`Delivered`
+    /// content-identity gate(Path A fail-closed) mirrors the consumer-API `content_check_policy`.
+    models: Arc<ModelsConfig>,
+    /// `--mock-model`: mock tokens are fake by design -> the content gate is skipped.
+    mock_model: bool,
+    /// `--allow-unverified-model`: opt into paying a model with no content-identity check(name-only).
+    allow_unverified: bool,
 }
 
 impl<'a> GatewayDealRunner<'a> {
@@ -373,6 +383,9 @@ impl<'a> GatewayDealRunner<'a> {
         request: CanonRequest,
         expected_model: String,
         max_tokens: u64,
+        models: Arc<ModelsConfig>,
+        mock_model: bool,
+        allow_unverified: bool,
     ) -> Self {
         Self {
             buyer,
@@ -380,8 +393,42 @@ impl<'a> GatewayDealRunner<'a> {
             request,
             expected_model,
             max_tokens,
+            models,
+            mock_model,
+            allow_unverified,
         }
     }
+}
+
+/// Path A fail-closed: mirror the consumer-API `content_check_policy`. A frame model with NO B8
+/// fingerprint AND NO B7 reference key(in env) has no content layer that can catch a substituted model, so we
+/// refuse to complete the deal(seller not paid) unless `--allow-unverified-model` was passed. This closes the
+/// gap where the gateway path used to degrade both content layers to `Pass` and `Deliver` an unverifiable
+/// model. Returns `Some(reason)` when delivery must be blocked, `None` when it may proceed. Pure/offline
+/// (`std::env` read for the reference key only) so it is unit-testable without a live gateway.
+pub(crate) fn gateway_content_refusal(
+    expected_model: &str,
+    models: &ModelsConfig,
+    mock_model: bool,
+    allow_unverified: bool,
+) -> Option<String> {
+    let has_ref_key = reference_endpoint_for(expected_model, models)
+        .map(|e| {
+            std::env::var(&e.api_key_env)
+                .map(|k| !k.is_empty())
+                .unwrap_or(false)
+        })
+        .unwrap_or(false);
+    content_check_policy(
+        expected_model,
+        None,
+        mock_model,
+        allow_unverified,
+        has_ref_key,
+        models,
+    )
+    .err()
+    .map(|e| e.to_string())
 }
 
 #[async_trait]
@@ -405,8 +452,12 @@ impl DealRunner for GatewayDealRunner<'_> {
             Ok(s) => s,
             Err(_) => return DealOutcome::NoShow,
         };
-        // D4: verification BEFORE accepting; Bail -> Scam(bail, exposure <= 2 ticks).
-        let mut verifier = StreamVerifier::with_expected_model(self.expected_model.clone());
+        // D4: verification BEFORE accepting; Bail -> Scam(bail, exposure <= 2 ticks). B5 vocab is data-driven
+        // from the loaded config(falls back to the family mapping for unconfigured families).
+        let mut verifier = StreamVerifier::with_expected_model_and_models(
+            self.expected_model.clone(),
+            self.models.clone(),
+        );
         let mut received = 0u64;
         while let Some(item) = stream.next().await {
             let chunk = match item {
@@ -436,6 +487,7 @@ impl DealRunner for GatewayDealRunner<'_> {
                     &candidate.token_contract,
                     &self.expected_model,
                     self.max_tokens,
+                    &self.models,
                 )
                 .await
             {
@@ -448,11 +500,24 @@ impl DealRunner for GatewayDealRunner<'_> {
                     &candidate.token_contract,
                     &self.expected_model,
                     self.max_tokens,
+                    &self.models,
                 )
                 .await
             {
                 return DealOutcome::Scam(format!("spot-check B8: {reason}"));
             }
+        }
+        // Path A fail-closed: mirror Path B `content_check_policy`. If this frame model has NO content
+        // check available(no B8 fingerprint AND no B7 reference key) and the operator did not opt into
+        // name-only(`--allow-unverified-model`), REFUSE -- do not pay a model whose identity no layer can
+        // verify. The inline B5-B7 name layers above cannot catch a same-name cheaper-model substitution.
+        if let Some(reason) = gateway_content_refusal(
+            &self.expected_model,
+            &self.models,
+            self.mock_model,
+            self.allow_unverified,
+        ) {
+            return DealOutcome::Scam(format!("content-identity refused (fail-closed): {reason}"));
         }
         DealOutcome::Delivered
     }
@@ -461,6 +526,64 @@ impl DealRunner for GatewayDealRunner<'_> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ---- Path A fail-closed content-identity gate ----
+
+    fn qwen_models_for_routing() -> ModelsConfig {
+        ModelsConfig::from_json(
+            r#"{ "models": { "qwen": {
+                "frame_model": "qwen--qwen3--32b",
+                "base_url": "https://api.groq.com/openai/v1",
+                "served_model": "qwen/qwen3-32b",
+                "api_key_env": "GROQ_API_KEY",
+                "tokenizer_family": "qwen",
+                "price_per_tick": 1000,
+                "identity_aliases": ["Qwen/Qwen3-32B"],
+                "vocab_size": 152064,
+                "fingerprints": [ { "probe_prompt": "What is 17*23? Think step by step.", "expected_contains": "<think>", "accepts_reasoning_side_channel": true } ]
+            } } }"#,
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn path_a_refuses_model_with_no_verification_data() {
+        // A real(non-mock) frame model with NO fingerprint(not in config) and NO reference key -> the gate
+        // returns a refusal reason, so `run()` returns Scam(seller-not-paid), NOT Delivered.
+        let cfg = qwen_models_for_routing();
+        let refusal = gateway_content_refusal("meta-llama/llama-3.1-8b", &cfg, false, false);
+        assert!(
+            refusal.is_some(),
+            "unverified model must be refused (fail-closed), got {refusal:?}"
+        );
+        assert!(refusal.unwrap().contains("no exact content-identity check"));
+    }
+
+    #[test]
+    fn path_a_allows_unverified_model_with_opt_in() {
+        // The explicit --allow-unverified-model opt-out lets the same name-only model through(name-only).
+        let cfg = qwen_models_for_routing();
+        assert!(
+            gateway_content_refusal("meta-llama/llama-3.1-8b", &cfg, false, true).is_none(),
+            "--allow-unverified-model opts into name-only delivery"
+        );
+    }
+
+    #[test]
+    fn path_a_allows_model_with_fingerprint() {
+        // qwen HAS a B8 fingerprint in config -> the content gate can run -> delivery may proceed(no refusal).
+        let cfg = qwen_models_for_routing();
+        assert!(gateway_content_refusal("qwen--qwen3--32b", &cfg, false, false).is_none());
+        // The served + registry spellings resolve to the same fingerprint -> also allowed.
+        assert!(gateway_content_refusal("qwen/qwen3-32b", &cfg, false, false).is_none());
+    }
+
+    #[test]
+    fn path_a_mock_model_is_exempt() {
+        // --mock-model: fake tokens by design -> no content gate, delivery allowed even with no fingerprint.
+        let cfg = qwen_models_for_routing();
+        assert!(gateway_content_refusal("dexdo-mock", &cfg, true, false).is_none());
+    }
 
     fn frame(cap: u128, ticks: u128) -> CappedBuy {
         CappedBuy {

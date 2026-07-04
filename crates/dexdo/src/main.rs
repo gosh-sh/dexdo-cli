@@ -13,6 +13,7 @@ use cli::policy;
 #[derive(Parser)]
 #[command(
     name = "dexdo",
+    version,
     about = "dexdo -- private inference market: seller and buyer clients"
 )]
 struct Cli {
@@ -1377,6 +1378,15 @@ mod tests {
             .expect("subcommand exists")
             .render_long_help()
             .to_string()
+    }
+
+    #[test]
+    fn root_version_flag_is_available_for_release_smoke() {
+        let err = Cli::command()
+            .try_get_matches_from(["dexdo", "--version"])
+            .expect_err("--version should render the package version");
+        assert_eq!(err.kind(), clap::error::ErrorKind::DisplayVersion);
+        assert!(err.to_string().contains(env!("CARGO_PKG_VERSION")));
     }
 
     #[test]

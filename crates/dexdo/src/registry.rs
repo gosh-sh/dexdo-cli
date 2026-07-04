@@ -326,22 +326,67 @@ pub async fn resolve_registered_model_identity(
 
 pub fn registry_identity_candidates(model_id: &str) -> Vec<String> {
     let trimmed = model_id.trim();
-    let normalized = trimmed.to_ascii_lowercase();
     let mut out = Vec::new();
-    match normalized.as_str() {
-        "qwen--qwen3--32b" | "qwen/qwen3-32b" => {
-            out.push("Qwen/Qwen3-32B".to_string());
-            out.push("qwen--qwen3--32b".to_string());
-            out.push("qwen/qwen3-32b".to_string());
-        }
-        "openai--gpt-oss--20b" | "openai/gpt-oss-20b" => {
-            out.push("openai/gpt-oss-20b".to_string());
-            out.push("openai--gpt-oss--20b".to_string());
-        }
-        _ => out.push(trimmed.to_string()),
+    push_candidate(&mut out, trimmed);
+
+    let alias = model_id_alias(trimmed);
+    push_candidate(&mut out, &alias);
+
+    if let Some(display_alias) = display_case_served_alias(&alias) {
+        push_candidate(&mut out, &display_alias);
     }
-    out.dedup();
     out
+}
+
+pub fn model_id_alias(model_id: &str) -> String {
+    let normalized = model_id.trim().to_ascii_lowercase();
+    frame_model_to_served_alias(&normalized).unwrap_or(normalized)
+}
+
+fn frame_model_to_served_alias(model_id: &str) -> Option<String> {
+    let (vendor, rest) = model_id.split_once("--")?;
+    if vendor.is_empty() || rest.is_empty() {
+        return None;
+    }
+    let rest = rest.replace("--", "-");
+    if rest.is_empty() {
+        return None;
+    }
+    Some(format!("{vendor}/{rest}"))
+}
+
+fn display_case_served_alias(model_id: &str) -> Option<String> {
+    let (vendor, rest) = model_id.split_once('/')?;
+    if vendor.is_empty() || rest.is_empty() {
+        return None;
+    }
+    Some(format!(
+        "{}/{}",
+        display_case_token(vendor),
+        rest.split('-')
+            .map(display_case_token)
+            .collect::<Vec<_>>()
+            .join("-")
+    ))
+}
+
+fn display_case_token(token: &str) -> String {
+    let mut chars = token.chars();
+    let Some(first) = chars.next() else {
+        return String::new();
+    };
+    if first.is_ascii_digit() {
+        return token.to_ascii_uppercase();
+    }
+    format!("{}{}", first.to_uppercase(), chars.as_str())
+}
+
+fn push_candidate(out: &mut Vec<String>, candidate: &str) {
+    let candidate = candidate.trim();
+    if candidate.is_empty() || out.iter().any(|item| item == candidate) {
+        return;
+    }
+    out.push(candidate.to_string());
 }
 
 pub async fn enforce_model_registry_policy(
@@ -963,6 +1008,24 @@ mod tests {
         );
     }
 
+    #[test]
+    fn registry_identity_candidates_derive_served_aliases() {
+        let cases = [
+            ("qwen--qwen3--32b", "qwen/qwen3-32b"),
+            ("openai--gpt-oss--20b", "openai/gpt-oss-20b"),
+            ("openai--gpt--5.4-mini", "openai/gpt-5.4-mini"),
+            ("vendor--family--variant", "vendor/family-variant"),
+        ];
+        for (input, served) in cases {
+            let candidates = registry_identity_candidates(input);
+            assert!(
+                candidates.contains(&served.to_string()),
+                "{input} candidates must include {served}: {candidates:?}"
+            );
+            assert_eq!(model_id_alias(input), served);
+        }
+    }
+
     #[tokio::test]
     async fn content_identity_rejects_unregistered_qwen_variant_without_family_fallback() {
         let reader = FakeReader::default().with(
@@ -1000,6 +1063,23 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(identity.registry_model, "openai/gpt-oss-20b");
+    }
+
+    #[tokio::test]
+    async fn content_identity_resolves_openai_subscription_dash_id_to_registry_alias() {
+        let reader = FakeReader::default().with(
+            "openai/gpt-5.4-mini",
+            Some(registered_entry("openai/gpt-5.4-mini", ADDR1)),
+        );
+        let identity = resolve_registered_model_identity(
+            &reader,
+            RegistryRole::Buyer,
+            REG,
+            "openai--gpt--5.4-mini",
+        )
+        .await
+        .unwrap();
+        assert_eq!(identity.registry_model, "openai/gpt-5.4-mini");
     }
 
     #[tokio::test]

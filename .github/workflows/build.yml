@@ -56,8 +56,8 @@ jobs:
         # an arm64 mac runner), set native_run: false so the smoke step is
         # skipped instead of trying to execute a foreign-arch binary.
         include:
-          - { target: x86_64-unknown-linux-gnu,   os: ubuntu-latest,     ext: tar.gz, native_run: true }
-          - { target: aarch64-unknown-linux-gnu,  os: ubuntu-24.04-arm,  ext: tar.gz, native_run: true }
+          - { target: x86_64-unknown-linux-musl,  os: ubuntu-latest,     ext: tar.gz, native_run: true }
+          - { target: aarch64-unknown-linux-musl, os: ubuntu-24.04-arm,  ext: tar.gz, native_run: true }
           - { target: x86_64-apple-darwin,        os: macos-15-intel,    ext: tar.gz, native_run: true }
           - { target: aarch64-apple-darwin,       os: macos-latest,      ext: tar.gz, native_run: true }
           - { target: x86_64-pc-windows-msvc,     os: windows-latest,    ext: zip,    native_run: true }
@@ -72,27 +72,63 @@ jobs:
         with:
           key: ${{ matrix.target }}
 
+      - name: Install Linux musl build dependencies
+        if: contains(matrix.target, 'unknown-linux-musl')
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends musl-tools clang cmake nasm perl binutils
+
       # The production binary is built WITHOUT the test faucet: `shellnet` only.
       - name: Build
         run: cargo build --release --locked -p dexdo --features shellnet --target ${{ matrix.target }}
+        env:
+          RUSTFLAGS: ${{ contains(matrix.target, 'unknown-linux-musl') && '-C target-feature=+crt-static' || '' }}
+          CC_x86_64_unknown_linux_musl: musl-gcc
+          CC_aarch64_unknown_linux_musl: musl-gcc
 
       # Smoke-test the freshly built release binary by executing it. Runs only
       # when the binary is natively runnable on this runner (native_run); a
       # cross-compiled binary for another arch/os cannot execute here and is
-      # skipped. `dexdo` has no --version flag (clap derive, no version
-      # attribute -> --version errors), so --help is the execute-proof: it
-      # fails the leg if the binary cannot start (bad arch, missing loader,
-      # link error, or a panic during startup) before we package or ship it.
+      # skipped. --version and --help fail the leg if the binary cannot start
+      # (bad arch, missing loader, link error, or a panic during startup) before
+      # we package or ship it.
       - name: Smoke test binary (unix)
         if: matrix.native_run && matrix.os != 'windows-latest'
         shell: bash
         run: |
+          "target/${{ matrix.target }}/release/dexdo" --version
           "target/${{ matrix.target }}/release/dexdo" --help
+
+      - name: Linux portability smoke (old distros + no GLIBC symbols)
+        if: matrix.target == 'x86_64-unknown-linux-musl'
+        shell: bash
+        run: |
+          set -euo pipefail
+          bin="$PWD/target/${{ matrix.target }}/release/dexdo"
+          for image in ubuntu:22.04 debian:12; do
+            echo "== smoke $image =="
+            docker run --rm -v "$bin:/usr/local/bin/dexdo:ro" "$image" sh -lc 'dexdo --version >/dev/null && dexdo --help >/dev/null'
+          done
+          ldd "$bin" > ldd.txt 2>&1 || true
+          cat ldd.txt
+          if grep -q 'GLIBC_' ldd.txt; then
+            echo "dexdo linux release artifact must not require GLIBC_* symbols" >&2
+            exit 1
+          fi
+          if readelf -V "$bin" 2>/dev/null | grep -q 'GLIBC_'; then
+            echo "readelf found GLIBC_* version symbols" >&2
+            exit 1
+          fi
+          if objdump -T "$bin" 2>/dev/null | grep -q 'GLIBC_'; then
+            echo "objdump found GLIBC_* dynamic symbols" >&2
+            exit 1
+          fi
 
       - name: Smoke test binary (windows)
         if: matrix.native_run && matrix.os == 'windows-latest'
         shell: bash
         run: |
+          "target/${{ matrix.target }}/release/dexdo.exe" --version
           "target/${{ matrix.target }}/release/dexdo.exe" --help
 
       # Package the binary together with the runtime configuration it reads

@@ -116,6 +116,8 @@ struct ChatRequest<'a> {
     #[serde(skip_serializing_if = "Option::is_none")]
     top_logprobs: Option<u32>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    seed: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     reasoning: Option<ReasoningRequest>,
 }
 
@@ -198,7 +200,7 @@ fn build_request<'a>(cfg: &'a OpenAiConfig, req: &CanonRequest) -> ChatRequest<'
             content: m.content.clone(),
         })
         .collect();
-    let (temperature, max_tokens, stop) = match &req.params {
+    let (temperature, max_tokens, stop, seed) = match &req.params {
         Some(p) => (
             // `greedy`(B7 spot-check) forcibly sets temp=0(distinct from 0="not set").
             if p.greedy {
@@ -208,8 +210,11 @@ fn build_request<'a>(cfg: &'a OpenAiConfig, req: &CanonRequest) -> ChatRequest<'
             },
             (p.max_tokens != 0).then_some(p.max_tokens),
             p.stop.clone(),
+            // Groq exposes a random seed even at temperature=0 for some models(notably gpt-oss). Pin the
+            // sampled B7 greedy probe so the seller stream and the reference endpoint compare the same run.
+            p.greedy.then_some(0),
         ),
-        None => (None, None, Vec::new()),
+        None => (None, None, Vec::new(), None),
     };
     // request logprobs only if the model config declared support(capability-aware) --
     // otherwise don't send the field at all(a strict endpoint must not fail with `400`). Don't fabricate(R3/R4):
@@ -228,6 +233,7 @@ fn build_request<'a>(cfg: &'a OpenAiConfig, req: &CanonRequest) -> ChatRequest<'
         stop,
         logprobs,
         top_logprobs,
+        seed,
         reasoning: openrouter_qwen_reasoning(cfg).then_some(ReasoningRequest {
             enabled: true,
             exclude: false,
@@ -613,6 +619,38 @@ mod tests {
         assert_eq!(body.top_logprobs, Some(5));
         let json = serde_json::to_string(&body).unwrap();
         assert!(json.contains("\"logprobs\":true"), "{json}");
+    }
+
+    #[test]
+    fn build_request_pins_seed_only_for_greedy_spotcheck() {
+        let cfg = OpenAiConfig::default();
+        let greedy = CanonRequest {
+            messages: vec![],
+            params: Some(dexdo_proto::SamplingParams {
+                temperature: 0.9,
+                max_tokens: 16,
+                stop: vec![],
+                greedy: true,
+            }),
+        };
+        let body = build_request(&cfg, &greedy);
+        assert_eq!(body.temperature, Some(0.0));
+        assert_eq!(body.seed, Some(0));
+        let json = serde_json::to_string(&body).unwrap();
+        assert!(json.contains("\"seed\":0"), "{json}");
+
+        let regular = CanonRequest {
+            messages: vec![],
+            params: Some(dexdo_proto::SamplingParams {
+                temperature: 0.9,
+                max_tokens: 16,
+                stop: vec![],
+                greedy: false,
+            }),
+        };
+        let body = build_request(&cfg, &regular);
+        assert_eq!(body.temperature, Some(0.9));
+        assert_eq!(body.seed, None);
     }
 
     #[test]

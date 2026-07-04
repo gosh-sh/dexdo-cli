@@ -8,7 +8,10 @@
 //! the verifier captures it and runs the available layers on each chunk. No signals / not declared --
 //! we do not fabricate(R4), we degrade(R3) to the next layers.
 
+use crate::registry::model_id_alias;
+use crate::seller::{ModelConfig, ModelsConfig};
 use dexdo_proto::{CanonChunk, SignalManifest, TokenLogprobs};
+use std::sync::Arc;
 
 /// Stream verification verdict: continue or bail (refuse/bail to the next
 /// eligible seller B3 -- loss <= 2 ticks, without completing the deal).
@@ -30,9 +33,21 @@ enum TokenizerProfile {
     Vocab(u32),
 }
 
-/// Registry of family profiles ( -- at least one profile at start; a full buyer profile
-/// config is an open question). Returns `None` for an undeclared/unknown family.
-fn profile_for(family: &str) -> Option<TokenizerProfile> {
+/// Family profile for B5, **data-driven**: if a configured model declares this
+/// `tokenizer_family` with an explicit `vocab_size`, use it; else fall back to the built-in family
+/// mapping; else `None`(undeclared/unknown family -> nothing to check at this layer). `models = None`
+/// (no config threaded) degrades to the family mapping -- the byte-for-byte pre-config behavior.
+fn profile_for(family: &str, models: Option<&ModelsConfig>) -> Option<TokenizerProfile> {
+    if let Some(models) = models {
+        if let Some(v) = models
+            .models
+            .values()
+            .find(|m| m.tokenizer_family == family)
+            .and_then(|m| m.vocab_size)
+        {
+            return Some(TokenizerProfile::Vocab(v));
+        }
+    }
     match family {
         // Mock: tokens are fake by design, nothing to check.
         "mock" => Some(TokenizerProfile::Permissive),
@@ -48,8 +63,8 @@ fn profile_for(family: &str) -> Option<TokenizerProfile> {
 
 /// Tokenizer-check: `token_ids` against the profile of the declared `family`. An unknown/empty
 /// family -> nothing to check(degradation R3 -- `Pass` at this layer; the next layers/spot-check catch it).
-fn tokenizer_check(family: &str, token_ids: &[u32]) -> Verdict {
-    match profile_for(family) {
+fn tokenizer_check(family: &str, token_ids: &[u32], models: Option<&ModelsConfig>) -> Verdict {
+    match profile_for(family, models) {
         None | Some(TokenizerProfile::Permissive) => Verdict::Pass,
         Some(TokenizerProfile::Vocab(max)) => match token_ids.iter().find(|&&id| id >= max) {
             Some(&bad) => Verdict::Bail(format!(
@@ -119,6 +134,9 @@ pub struct StreamVerifier {
     /// The market frame's model(what the buyer pays for, B2) -- the model declared by the seller
     /// is checked against it. `None` -- the check is disabled.
     expected_model: Option<String>,
+    /// Loaded model config for the **data-driven** B5 vocabulary. `None` -- degrade to the
+    /// built-in family mapping(the pre-config behavior; unit fixtures use this path).
+    models: Option<Arc<ModelsConfig>>,
 }
 
 impl StreamVerifier {
@@ -131,6 +149,17 @@ impl StreamVerifier {
         Self {
             manifest: None,
             expected_model: Some(model),
+            models: None,
+        }
+    }
+
+    /// Like [`with_expected_model`](Self::with_expected_model) but threads the loaded model config so
+    /// B5 uses the per-model `vocab_size`(data-driven) instead of only the built-in family mapping.
+    pub fn with_expected_model_and_models(model: String, models: Arc<ModelsConfig>) -> Self {
+        Self {
+            manifest: None,
+            expected_model: Some(model),
+            models: Some(models),
         }
     }
 
@@ -152,7 +181,11 @@ impl StreamVerifier {
         };
         // B5: tokenizer-check -- only if the gateway declared token_ids(otherwise degradation R3).
         if manifest.has_token_ids {
-            let v = tokenizer_check(&manifest.tokenizer_family, &chunk.token_ids);
+            let v = tokenizer_check(
+                &manifest.tokenizer_family,
+                &chunk.token_ids,
+                self.models.as_deref(),
+            );
             if v != Verdict::Pass {
                 return v;
             }
@@ -171,7 +204,7 @@ impl StreamVerifier {
         if let Some(expected) = &self.expected_model {
             let claimed = manifest.claimed_model.as_str();
             let is_mock = matches!(
-                profile_for(&manifest.tokenizer_family),
+                profile_for(&manifest.tokenizer_family, self.models.as_deref()),
                 Some(TokenizerProfile::Permissive)
             );
             if !claimed.is_empty() && !is_mock && claimed != expected {
@@ -187,94 +220,102 @@ impl StreamVerifier {
 }
 
 /// Behavioral fingerprint of an exact/reference model: a deterministic probe-prompt + a quirk that
-/// the declared model characteristically emits(format/tokenization/refusals). The registry is small and grows
-/// (lead's decision); populated from live verification(temp=0).
+/// the declared model characteristically emits(format/tokenization/refusals). Built from per-model config
+/// ([`crate::seller::FingerprintCfg`]) -- owned `String` so it can be constructed at runtime, not a hardcoded set.
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Fingerprint {
-    pub probe_prompt: &'static str,
+    pub probe_prompt: String,
     /// A quirk marker in the response, characteristic of this exact/reference model.
-    pub expected_contains: &'static str,
+    pub expected_contains: String,
     /// Some providers expose thinking out-of-band instead of embedding this marker in `content`.
     pub accepts_reasoning_side_channel: bool,
 }
 
-fn model_id_alias(model_id: &str) -> &str {
-    match model_id.trim() {
-        "Qwen/Qwen3-32B" => "qwen/qwen3-32b",
-        _ => match model_id.trim().to_ascii_lowercase().as_str() {
-            "qwen/qwen3-32b" | "qwen--qwen3--32b" => "qwen/qwen3-32b",
-            _ => "",
-        },
+/// Resolve the config entry that governs `model_id` for **fingerprint / vocab** purposes. Matches by
+/// config key or `frame_model`(via `ModelsConfig::get`), then exact `served_model`, then the served-form
+/// alias(`model_id_alias`) across `frame_model` / `served_model` / `identity_aliases` -- so the registry
+/// (`Qwen/Qwen3-32B`) and canonical(`qwen--qwen3--32b`) spellings both resolve to the same entry.
+fn resolve_model_cfg<'a>(model_id: &str, models: &'a ModelsConfig) -> Option<&'a ModelConfig> {
+    let id = model_id.trim();
+    if let Ok(m) = models.get(id) {
+        return Some(m);
     }
-}
-
-fn is_registry_qwen3_32b(model_id: &str) -> bool {
-    model_id.trim() == "Qwen/Qwen3-32B"
-}
-
-fn is_qwen3_32b_identity(model_id: &str) -> bool {
-    matches!(model_id_alias(model_id), "qwen/qwen3-32b")
-}
-
-fn qwen3_32b_fingerprints() -> &'static [Fingerprint] {
-    &[Fingerprint {
-        probe_prompt: "What is 17*23? Think step by step.",
-        expected_contains: "<think>",
-        accepts_reasoning_side_channel: true,
-    }]
-}
-
-fn fingerprints_for(model_id: &str) -> &'static [Fingerprint] {
-    if is_qwen3_32b_identity(model_id) {
-        qwen3_32b_fingerprints()
-    } else {
-        &[]
+    if let Some(m) = models.models.values().find(|m| m.served_model == id) {
+        return Some(m);
     }
+    let want = model_id_alias(id);
+    models.models.values().find(|m| {
+        model_id_alias(&m.frame_model) == want
+            || m.served_model.to_ascii_lowercase() == want
+            || m.identity_aliases.iter().any(|a| model_id_alias(a) == want)
+    })
 }
 
-/// The exact model reference for the B7 spot-check. `None` -- no reference -> **degradation**(R3): the full
-/// spot-check does not apply, reliance on the cheap B7(claimed-vs-frame) + B5/B6.
-pub fn reference_endpoint_for(model_id: &str) -> Option<ReferenceEndpoint> {
-    if is_registry_qwen3_32b(model_id) {
-        return None;
-    }
-    match model_id_alias(model_id) {
-        "qwen/qwen3-32b" => Some(ReferenceEndpoint {
-            base_url: "https://api.groq.com/openai/v1",
-            model: "qwen/qwen3-32b",
-            api_key_env: "GROQ_API_KEY",
-        }),
-        _ => None,
-    }
+fn fingerprints_for(model_id: &str, models: &ModelsConfig) -> Vec<Fingerprint> {
+    resolve_model_cfg(model_id, models)
+        .map(|m| {
+            m.fingerprints
+                .iter()
+                .map(|f| Fingerprint {
+                    probe_prompt: f.probe_prompt.clone(),
+                    expected_contains: f.expected_contains.clone(),
+                    accepts_reasoning_side_channel: f.accepts_reasoning_side_channel,
+                })
+                .collect()
+        })
+        .unwrap_or_default()
 }
 
-/// Default probe-prompt of an exact/reference model(B8) -- the first fingerprint in the registry. `None` -- no fingerprint
+/// The exact model reference for the B7 spot-check, **derived** from the configured upstream
+/// (`base_url` + `served_model` + `api_key_env`). Resolves ONLY by config key / `frame_model` /
+/// exact `served_model` -- NOT `identity_aliases`: a provider-neutral registry name (e.g. `Qwen/Qwen3-32B`,
+/// which may be served elsewhere) has no reference here, so we do not compare it against the configured
+/// provider's greedy output. `None` -- no reference -> **degradation**(R3): reliance on the cheap B7 + B5/B6.
+pub fn reference_endpoint_for(model_id: &str, models: &ModelsConfig) -> Option<ReferenceEndpoint> {
+    let id = model_id.trim();
+    let cfg = models
+        .get(id)
+        .ok()
+        .or_else(|| models.models.values().find(|m| m.served_model == id))?;
+    Some(cfg.reference_endpoint())
+}
+
+/// Default probe-prompt of an exact/reference model(B8) -- the first configured fingerprint. `None` -- no fingerprint
 /// (degradation R3: B8 does not apply, reliance on B5/B6/B7).
-pub fn default_probe(model_id: &str) -> Option<&'static str> {
-    fingerprints_for(model_id).first().map(|f| f.probe_prompt)
+pub fn default_probe(model_id: &str, models: &ModelsConfig) -> Option<String> {
+    fingerprints_for(model_id, models)
+        .into_iter()
+        .next()
+        .map(|f| f.probe_prompt)
 }
 
 /// Behavioral probe: the declared model's response to the probe-prompt must carry its quirk.
 /// A mismatch -> the model is not the one declared -> `Bail`. A prompt not in the registry / no fingerprint ->
 /// degradation(`Pass` at this layer).
-pub fn behavioral_check(model_id: &str, probe_prompt: &str, response: &str) -> Verdict {
-    behavioral_check_with_reasoning(model_id, probe_prompt, response, "")
+pub fn behavioral_check(
+    model_id: &str,
+    probe_prompt: &str,
+    response: &str,
+    models: &ModelsConfig,
+) -> Verdict {
+    behavioral_check_with_reasoning(model_id, probe_prompt, response, "", models)
 }
 
 /// Behavioral probe with provider-separated reasoning. OpenRouter can return qwen thinking in
 /// reasoning/reasoning_details while `content` carries only the final answer; that is the same
-/// exact-model signal as the old Groq `<think>` content marker for this fingerprint.
+/// exact-model signal as the Groq `<think>` content marker for this fingerprint. Whether the reasoning
+/// side channel counts is **data-driven** from the matched `Fingerprint.accepts_reasoning_side_channel`.
 pub fn behavioral_check_with_reasoning(
     model_id: &str,
     probe_prompt: &str,
     response: &str,
     reasoning: &str,
+    models: &ModelsConfig,
 ) -> Verdict {
-    for fp in fingerprints_for(model_id) {
+    for fp in fingerprints_for(model_id, models) {
         if fp.probe_prompt == probe_prompt {
-            let has_content_quirk = response.contains(fp.expected_contains);
-            let has_reasoning = fp.accepts_reasoning_side_channel
-                && is_registry_qwen3_32b(model_id)
-                && !reasoning.trim().is_empty();
+            let has_content_quirk = response.contains(&fp.expected_contains);
+            let has_reasoning = fp.accepts_reasoning_side_channel && !reasoning.trim().is_empty();
             return if has_content_quirk || has_reasoning {
                 Verdict::Pass
             } else {
@@ -294,14 +335,14 @@ pub fn behavioral_check_with_reasoning(
 /// yields an almost identical leading prefix, while a different model diverges early. Tuned by the caller.
 pub const DEFAULT_SPOTCHECK_THRESHOLD: f64 = 0.7;
 
-/// The declared model's **official** reference endpoint: the buyer
-/// compares the seller's greedy output against it. The registry grows; `qwen` -> Groq. The key is read from env at
-/// runtime(`api_key_env`) and is NOT stored here(masked in logs).
+/// The declared model's **official** reference endpoint: the buyer compares the
+/// seller's greedy output against it. **Data-driven**(owned `String`) -- built from a model's configured
+/// upstream. The key is read from env at runtime(`api_key_env`) and is NOT stored here(masked in logs).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ReferenceEndpoint {
-    pub base_url: &'static str,
-    pub model: &'static str,
-    pub api_key_env: &'static str,
+    pub base_url: String,
+    pub model: String,
+    pub api_key_env: String,
 }
 
 /// Coarse tokenizer family by model id(`qwen`/`llama`/`gpt`/...). This is for diagnostics/tokenizer profiles only;
@@ -318,11 +359,28 @@ pub fn family_of(model: &str) -> String {
 
 /// Text normalization for comparison: lowercase, words of alphanumerics(punctuation stripped).
 fn normalize_words(s: &str) -> Vec<String> {
-    s.to_lowercase()
-        .split_whitespace()
-        .map(|w| w.trim_matches(|c: char| !c.is_alphanumeric()).to_string())
-        .filter(|w| !w.is_empty())
-        .collect()
+    let mut words = Vec::new();
+    let mut current = String::new();
+    let mut current_is_digit = None;
+    for ch in s.chars().flat_map(char::to_lowercase) {
+        if !ch.is_alphanumeric() {
+            if !current.is_empty() {
+                words.push(std::mem::take(&mut current));
+                current_is_digit = None;
+            }
+            continue;
+        }
+        let is_digit = ch.is_ascii_digit();
+        if current_is_digit.is_some_and(|prev| prev != is_digit) && !current.is_empty() {
+            words.push(std::mem::take(&mut current));
+        }
+        current.push(ch);
+        current_is_digit = Some(is_digit);
+    }
+    if !current.is_empty() {
+        words.push(current);
+    }
+    words
 }
 
 /// Agreement fraction over the **leading word prefix**(B7 spot-check): greedy(temp=0) of the same
@@ -593,14 +651,72 @@ mod tests {
         assert_eq!(v.verify(&c), Verdict::Pass);
     }
 
-    // ---- B8: behavioral probes ----
+    // ---- B8: behavioral probes, data-driven from config ----
+
+    /// The qwen verification data as config -- reproduces the pre-config hardcoded qwen fingerprint/reference
+    /// so the qwen behavior is preserved byte-for-byte through the new data-driven path.
+    fn qwen_models() -> ModelsConfig {
+        ModelsConfig::from_json(
+            r#"{ "models": { "qwen": {
+                "frame_model": "qwen--qwen3--32b",
+                "base_url": "https://api.groq.com/openai/v1",
+                "served_model": "qwen/qwen3-32b",
+                "api_key_env": "GROQ_API_KEY",
+                "tokenizer_family": "qwen",
+                "price_per_tick": 1000,
+                "identity_aliases": ["Qwen/Qwen3-32B"],
+                "vocab_size": 152064,
+                "fingerprints": [ { "probe_prompt": "What is 17*23? Think step by step.", "expected_contains": "<think>", "accepts_reasoning_side_channel": true } ]
+            } } }"#,
+        )
+        .expect("qwen config")
+    }
+
+    /// A TWO-model config(qwen + gpt-oss-20b), both served by Groq -- proves the verification mechanism is
+    /// general: BOTH yield real fingerprints + reference purely from config, no code change. gpt-oss's
+    /// fingerprint sets `accepts_reasoning_side_channel = false`(it is not a reasoning model).
+    fn two_models() -> ModelsConfig {
+        ModelsConfig::from_json(
+            r#"{ "models": {
+              "qwen": {
+                "frame_model": "qwen--qwen3--32b",
+                "base_url": "https://api.groq.com/openai/v1",
+                "served_model": "qwen/qwen3-32b",
+                "api_key_env": "GROQ_API_KEY",
+                "tokenizer_family": "qwen",
+                "price_per_tick": 1000,
+                "identity_aliases": ["Qwen/Qwen3-32B"],
+                "vocab_size": 152064,
+                "fingerprints": [ { "probe_prompt": "What is 17*23? Think step by step.", "expected_contains": "<think>", "accepts_reasoning_side_channel": true } ]
+              },
+              "gpt-oss-20b": {
+                "frame_model": "openai--gpt-oss--20b",
+                "base_url": "https://api.groq.com/openai/v1",
+                "served_model": "openai/gpt-oss-20b",
+                "api_key_env": "GROQ_API_KEY",
+                "tokenizer_family": "gpt",
+                "price_per_tick": 500,
+                "identity_aliases": ["openai/gpt-oss-20b"],
+                "vocab_size": 100352,
+                "fingerprints": [ { "probe_prompt": "Reply with exactly: OSSMARK", "expected_contains": "OSSMARK" } ]
+              }
+            } }"#,
+        )
+        .expect("two-model config")
+    }
 
     #[test]
     fn behavioral_probe_matches_fingerprint_passes() {
         // qwen3-32b's response to the probe carries the <think> quirk -> Pass.
-        let probe = default_probe("qwen--qwen3--32b").unwrap();
+        let cfg = qwen_models();
+        let probe = default_probe("qwen--qwen3--32b", &cfg).unwrap();
         assert_eq!(
-            behavioral_check("qwen--qwen3--32b", probe, "<think>\nOkay...</think> 391"),
+            behavioral_check(
+                "qwen--qwen3--32b",
+                &probe,
+                "<think>\nOkay...</think> 391",
+                &cfg
+            ),
             Verdict::Pass
         );
     }
@@ -608,22 +724,25 @@ mod tests {
     #[test]
     fn behavioral_probe_missing_quirk_bails() {
         // qwen3-32b declared, but the response lacks <think>(substitute model, not reasoning) -> Bail.
-        let probe = default_probe("qwen--qwen3--32b").unwrap();
+        let cfg = qwen_models();
+        let probe = default_probe("qwen--qwen3--32b", &cfg).unwrap();
         assert!(matches!(
-            behavioral_check("qwen--qwen3--32b", probe, "391"),
+            behavioral_check("qwen--qwen3--32b", &probe, "391", &cfg),
             Verdict::Bail(_)
         ));
     }
 
     #[test]
     fn behavioral_probe_openrouter_reasoning_passes_without_content_think() {
-        let probe = default_probe("Qwen/Qwen3-32B").unwrap();
+        let cfg = qwen_models();
+        let probe = default_probe("Qwen/Qwen3-32B", &cfg).unwrap();
         assert_eq!(
             behavioral_check_with_reasoning(
                 "Qwen/Qwen3-32B",
-                probe,
+                &probe,
                 "391",
-                "We need compute 17 * 23 step by step."
+                "We need compute 17 * 23 step by step.",
+                &cfg
             ),
             Verdict::Pass
         );
@@ -631,46 +750,70 @@ mod tests {
 
     #[test]
     fn behavioral_probe_plain_answer_without_reasoning_still_bails() {
-        let probe = default_probe("Qwen/Qwen3-32B").unwrap();
+        let cfg = qwen_models();
+        let probe = default_probe("Qwen/Qwen3-32B", &cfg).unwrap();
         assert!(matches!(
-            behavioral_check_with_reasoning("Qwen/Qwen3-32B", probe, "391", ""),
+            behavioral_check_with_reasoning("Qwen/Qwen3-32B", &probe, "391", "", &cfg),
             Verdict::Bail(_)
         ));
     }
 
     #[test]
-    fn behavioral_probe_reasoning_side_channel_is_registry_identity_only() {
-        let probe = default_probe("qwen/qwen3-32b").unwrap();
-        assert!(matches!(
+    fn reasoning_side_channel_comes_from_fingerprint_flag_not_registry_identity() {
+        // The reasoning side channel is now DATA-DRIVEN from `Fingerprint.accepts_reasoning_side_channel`
+        // (not a hardcoded `is_registry_qwen3_32b` special-case). qwen's fingerprint sets it true, so the
+        // served form ALSO accepts provider-separated reasoning; gpt-oss's fingerprint leaves it false, so a
+        // reasoning-only response is NOT accepted for gpt-oss. This is the intended generalization.
+        let cfg = two_models();
+        let qwen_probe = default_probe("qwen/qwen3-32b", &cfg).unwrap();
+        assert_eq!(
             behavioral_check_with_reasoning(
                 "qwen/qwen3-32b",
-                probe,
+                &qwen_probe,
                 "391",
-                "provider-separated reasoning"
+                "provider-separated reasoning",
+                &cfg
             ),
-            Verdict::Bail(_)
-        ));
+            Verdict::Pass,
+            "flag=true -> reasoning side channel accepted for any spelling that resolves to the entry"
+        );
+        let oss_probe = default_probe("openai--gpt-oss--20b", &cfg).unwrap();
+        assert!(
+            matches!(
+                behavioral_check_with_reasoning(
+                    "openai--gpt-oss--20b",
+                    &oss_probe,
+                    "wrong answer, no mark",
+                    "some reasoning text",
+                    &cfg
+                ),
+                Verdict::Bail(_)
+            ),
+            "flag=false -> reasoning side channel does NOT rescue a missing content quirk"
+        );
     }
 
     #[test]
     fn behavioral_probe_exact_qwen_aliases_preserve_fingerprint() {
-        let canonical_probe = default_probe("qwen--qwen3--32b").unwrap();
-        let served_probe = default_probe("qwen/qwen3-32b").unwrap();
-        let registry_probe = default_probe("Qwen/Qwen3-32B").unwrap();
+        let cfg = qwen_models();
+        let canonical_probe = default_probe("qwen--qwen3--32b", &cfg).unwrap();
+        let served_probe = default_probe("qwen/qwen3-32b", &cfg).unwrap();
+        let registry_probe = default_probe("Qwen/Qwen3-32B", &cfg).unwrap();
         assert_eq!(canonical_probe, served_probe);
         assert_eq!(canonical_probe, registry_probe);
         assert!(matches!(
-            behavioral_check("qwen/qwen3-32b", served_probe, "391"),
+            behavioral_check("qwen/qwen3-32b", &served_probe, "391", &cfg),
             Verdict::Bail(_)
         ));
     }
 
     #[test]
     fn unknown_qwen_variant_does_not_inherit_qwen3_fingerprint() {
-        let qwen3_probe = default_probe("qwen--qwen3--32b").unwrap();
-        assert!(default_probe("qwen--qwen3.6--27b").is_none());
+        let cfg = qwen_models();
+        let qwen3_probe = default_probe("qwen--qwen3--32b", &cfg).unwrap();
+        assert!(default_probe("qwen--qwen3.6--27b", &cfg).is_none());
         assert_eq!(
-            behavioral_check("qwen--qwen3.6--27b", qwen3_probe, "391"),
+            behavioral_check("qwen--qwen3.6--27b", &qwen3_probe, "391", &cfg),
             Verdict::Pass
         );
     }
@@ -678,15 +821,96 @@ mod tests {
     #[test]
     fn behavioral_probe_unknown_family_degrades() {
         // No exact-model fingerprint -> degradation(Pass), we do not fabricate.
-        assert!(default_probe("unknown").is_none());
-        assert_eq!(behavioral_check("unknown", "x", "y"), Verdict::Pass);
+        let cfg = qwen_models();
+        assert!(default_probe("unknown", &cfg).is_none());
+        assert_eq!(behavioral_check("unknown", "x", "y", &cfg), Verdict::Pass);
     }
 
     #[test]
     fn behavioral_probe_non_registered_prompt_skips() {
         // A prompt not in the probe registry -> the layer does not apply(Pass).
+        let cfg = qwen_models();
         assert_eq!(
-            behavioral_check("qwen", "random prompt", "no think here"),
+            behavioral_check("qwen", "random prompt", "no think here", &cfg),
+            Verdict::Pass
+        );
+    }
+
+    #[test]
+    fn second_model_gpt_oss_is_fully_verifiable_from_config() {
+        // Mandatory(Track 2): a config with TWO models yields real fingerprints + reference for BOTH,
+        // and behavioral_check bails a wrong-content response for gpt-oss just like qwen -- purely from data.
+        let cfg = two_models();
+
+        // Fingerprints resolve for BOTH(canonical + served spellings).
+        let qwen_probe = default_probe("qwen--qwen3--32b", &cfg).expect("qwen fingerprint");
+        let oss_probe = default_probe("openai--gpt-oss--20b", &cfg).expect("gpt-oss fingerprint");
+        assert_eq!(
+            default_probe("openai/gpt-oss-20b", &cfg).as_deref(),
+            Some(oss_probe.as_str())
+        );
+        assert_ne!(qwen_probe, oss_probe, "each model has its own probe");
+
+        // References resolve for BOTH(Groq base_url, per-model served id).
+        let rq = reference_endpoint_for("qwen--qwen3--32b", &cfg).expect("qwen reference");
+        assert_eq!(rq.model, "qwen/qwen3-32b");
+        let ro = reference_endpoint_for("openai--gpt-oss--20b", &cfg).expect("gpt-oss reference");
+        assert_eq!(ro.base_url, "https://api.groq.com/openai/v1");
+        assert_eq!(ro.model, "openai/gpt-oss-20b");
+        assert_eq!(ro.api_key_env, "GROQ_API_KEY");
+        assert!(reference_endpoint_for("openai/gpt-oss-20b", &cfg).is_some());
+
+        // Behavioral check bails a wrong-content gpt-oss response, and passes the correct quirk.
+        assert!(
+            matches!(
+                behavioral_check(
+                    "openai--gpt-oss--20b",
+                    &oss_probe,
+                    "totally different",
+                    &cfg
+                ),
+                Verdict::Bail(_)
+            ),
+            "wrong content for gpt-oss -> Bail (same as qwen)"
+        );
+        assert_eq!(
+            behavioral_check(
+                "openai--gpt-oss--20b",
+                &oss_probe,
+                "the mark is OSSMARK here",
+                &cfg
+            ),
+            Verdict::Pass,
+            "correct gpt-oss quirk -> Pass"
+        );
+    }
+
+    #[test]
+    fn config_vocab_size_drives_b5_tokenizer_check() {
+        // B5 is data-driven: a config model declaring `tokenizer_family` with `vocab_size` overrides the
+        // built-in family mapping. Here a "tiny" family with vocab 100 bails a token-id >= 100.
+        let cfg = ModelsConfig::from_json(
+            r#"{ "models": { "tiny": {
+                "frame_model": "vendor--tiny--v1", "base_url": "http://x", "served_model": "vendor/tiny-v1",
+                "api_key_env": "K", "tokenizer_family": "tinyfam", "price_per_tick": 1, "vocab_size": 100
+            } } }"#,
+        )
+        .unwrap();
+        let cfg = Arc::new(cfg);
+        // expected_model "m" matches the `manifest` helper's claimed_model so the B7 name check is a no-op and
+        // this test isolates B5(the `manifest` claimed_model is "m").
+        let mut v = StreamVerifier::with_expected_model_and_models("m".to_string(), cfg.clone());
+        // token-id 150 >= config vocab 100 -> Bail (the built-in mapping has no "tinyfam", so without config
+        // this would degrade to Pass -- proving the config drove the check).
+        let verdict = v.verify(&chunk(0, vec![10, 150], Some(manifest("tinyfam", true))));
+        assert!(
+            matches!(verdict, Verdict::Bail(_)),
+            "config vocab bails out-of-range id"
+        );
+        // Without the config the same "tinyfam" family is unknown -> degradation(Pass).
+        let mut v2 = StreamVerifier::with_expected_model("m".to_string());
+        assert_eq!(
+            v2.verify(&chunk(0, vec![10, 150], Some(manifest("tinyfam", true)))),
             Verdict::Pass
         );
     }
@@ -695,17 +919,20 @@ mod tests {
 
     #[test]
     fn reference_endpoint_registry() {
-        let r = reference_endpoint_for("qwen--qwen3--32b").expect("qwen3-32b has a reference");
+        let cfg = qwen_models();
+        let r =
+            reference_endpoint_for("qwen--qwen3--32b", &cfg).expect("qwen3-32b has a reference");
         assert_eq!(r.base_url, "https://api.groq.com/openai/v1");
         assert_eq!(r.model, "qwen/qwen3-32b");
         assert_eq!(r.api_key_env, "GROQ_API_KEY");
-        assert!(reference_endpoint_for("qwen/qwen3-32b").is_some());
-        // The live ModelRegistry name is provider-neutral; do not compare OpenRouter output to Groq here.
-        assert!(reference_endpoint_for("Qwen/Qwen3-32B").is_none());
+        assert!(reference_endpoint_for("qwen/qwen3-32b", &cfg).is_some());
+        // The live ModelRegistry name is provider-neutral(identity alias only); do not compare its
+        // output against the configured Groq reference here.
+        assert!(reference_endpoint_for("Qwen/Qwen3-32B", &cfg).is_none());
         // No reference -> degradation(R3).
-        assert!(reference_endpoint_for("qwen--qwen3.6--27b").is_none());
-        assert!(reference_endpoint_for("llama").is_none());
-        assert!(reference_endpoint_for("mock").is_none());
+        assert!(reference_endpoint_for("qwen--qwen3.6--27b", &cfg).is_none());
+        assert!(reference_endpoint_for("llama", &cfg).is_none());
+        assert!(reference_endpoint_for("mock", &cfg).is_none());
     }
 
     #[test]
@@ -719,6 +946,8 @@ mod tests {
         assert_eq!(prefix_agreement("the answer", "the answer is 42"), 1.0);
         // Punctuation/case do not matter(normalization).
         assert_eq!(prefix_agreement("Hello,   World!", "hello world"), 1.0);
+        // Streaming providers may emit no whitespace at token boundaries around numbers/operators.
+        assert_eq!(prefix_agreement("compute17 *23", "compute 17 * 23"), 1.0);
     }
 
     #[test]

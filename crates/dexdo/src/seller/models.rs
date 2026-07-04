@@ -26,6 +26,22 @@ pub struct Capabilities {
     pub top_logprobs: Option<u32>,
 }
 
+/// One behavioral-probe fingerprint declared for a model in config: a deterministic
+/// probe prompt and a quirk the exact/reference model characteristically emits. Data-driven so the
+/// content-identity check generalizes to any model, not just a hardcoded qwen registry.
+#[derive(Clone, Debug, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct FingerprintCfg {
+    /// The deterministic probe prompt the buyer sends(B8).
+    pub probe_prompt: String,
+    /// A marker the model's response characteristically contains(e.g. qwen `<think>`).
+    pub expected_contains: String,
+    /// Some providers expose the thinking out-of-band(reasoning side channel) instead of embedding
+    /// the marker in `content`; when true, non-empty provider reasoning is accepted as the same signal.
+    #[serde(default)]
+    pub accepts_reasoning_side_channel: bool,
+}
+
 /// One sellable model entry in the config.
 #[derive(Clone, Debug, Deserialize, PartialEq)]
 #[serde(deny_unknown_fields)]
@@ -46,6 +62,30 @@ pub struct ModelConfig {
     /// Upstream capabilities. By default -- conservative(no `logprobs`).
     #[serde(default)]
     pub capabilities: Capabilities,
+    /// Extra content-identity spellings the served model self-reports(e.g. qwen `["Qwen/Qwen3-32B"]`),
+    /// used to resolve fingerprints/vocab for the registry/provider name. Empty by default.
+    #[serde(default)]
+    pub identity_aliases: Vec<String>,
+    /// Tokenizer vocabulary size for the B5 tokenizer-check. `None` -> fall back to the
+    /// `tokenizer_family` mapping. qwen 152064, llama 128256, gpt 100352.
+    #[serde(default)]
+    pub vocab_size: Option<u32>,
+    /// Behavioral fingerprints for the exact model. Empty -> no B8(degradation R3).
+    #[serde(default)]
+    pub fingerprints: Vec<FingerprintCfg>,
+}
+
+impl ModelConfig {
+    /// The B7-full reference endpoint **derived** from the upstream fields -- the reference IS
+    /// the configured upstream(`base_url` + `served_model` + `api_key_env`). No dedicated config field.
+    /// The key is read from env at runtime by `api_key_env` and is never stored here(masked in logs).
+    pub fn reference_endpoint(&self) -> crate::buyer::verify::ReferenceEndpoint {
+        crate::buyer::verify::ReferenceEndpoint {
+            base_url: self.base_url.clone(),
+            model: self.served_model.clone(),
+            api_key_env: self.api_key_env.clone(),
+        }
+    }
 }
 
 /// The models config file: key(name/alias) -> entry. The key may coincide with `frame_model`.
@@ -56,6 +96,26 @@ pub struct ModelsConfig {
 }
 
 impl ModelsConfig {
+    /// An empty config(no models). Used by the **buyer** when no `--models` file is present: every model then
+    /// has no verification data -> the content-identity policy fails closed(unless `--allow-unverified-model`).
+    /// Distinct from a present-but-empty config file, which [`from_json`](Self::from_json) still rejects.
+    pub fn empty() -> Self {
+        Self {
+            models: BTreeMap::new(),
+        }
+    }
+
+    /// Buyer-side lenient load: an ABSENT `--models` path yields an empty config(fail-closed per model),
+    /// while a present file must parse and be non-empty(**fail-loud** on corrupt/empty). The seller path uses
+    /// the strict [`load`](Self::load) -- it must always have a model to serve.
+    pub fn load_or_empty(path: &Path) -> Result<Self> {
+        if path.exists() {
+            Self::load(path)
+        } else {
+            Ok(Self::empty())
+        }
+    }
+
     /// Load and validate the config -- **fail-loud**(no file / corrupt JSON / empty -> error).
     pub fn load(path: &Path) -> Result<Self> {
         let text = std::fs::read_to_string(path)
@@ -175,5 +235,72 @@ mod tests {
         let mut m2 = m.clone();
         m2.api_key_env = "DEXDO_TEST_NO_SUCH_KEY_ENV_X9".into();
         assert!(m2.require_api_key_present().is_err());
+    }
+
+    #[test]
+    fn verification_fields_default_when_absent_backward_compatible() {
+        // The SAMPLE(and any pre-existing single-model models.json) has no identity_aliases / vocab_size /
+        // fingerprints -- it MUST still load, with the new fields defaulting to empty/None(backward-compat).
+        let cfg = ModelsConfig::from_json(SAMPLE)
+            .expect("legacy config without verification fields loads");
+        let m = cfg.get("qwen").unwrap();
+        assert!(
+            m.identity_aliases.is_empty(),
+            "identity_aliases defaults to empty"
+        );
+        assert_eq!(m.vocab_size, None, "vocab_size defaults to None");
+        assert!(m.fingerprints.is_empty(), "fingerprints defaults to empty");
+    }
+
+    #[test]
+    fn verification_fields_parse_when_present() {
+        let json = r#"{
+          "models": {
+            "qwen": {
+              "frame_model": "qwen--qwen3--32b",
+              "base_url": "https://api.groq.com/openai/v1",
+              "served_model": "qwen/qwen3-32b",
+              "api_key_env": "GROQ_API_KEY",
+              "tokenizer_family": "qwen",
+              "price_per_tick": 1000,
+              "identity_aliases": ["Qwen/Qwen3-32B"],
+              "vocab_size": 152064,
+              "fingerprints": [
+                { "probe_prompt": "What is 17*23? Think step by step.", "expected_contains": "<think>", "accepts_reasoning_side_channel": true }
+              ]
+            }
+          }
+        }"#;
+        let cfg = ModelsConfig::from_json(json).expect("parse");
+        let m = cfg.get("qwen").unwrap();
+        assert_eq!(m.identity_aliases, vec!["Qwen/Qwen3-32B".to_string()]);
+        assert_eq!(m.vocab_size, Some(152_064));
+        assert_eq!(m.fingerprints.len(), 1);
+        assert_eq!(
+            m.fingerprints[0].probe_prompt,
+            "What is 17*23? Think step by step."
+        );
+        assert_eq!(m.fingerprints[0].expected_contains, "<think>");
+        assert!(m.fingerprints[0].accepts_reasoning_side_channel);
+        // The B7-full reference is derived from the upstream fields(no dedicated field).
+        let r = m.reference_endpoint();
+        assert_eq!(r.base_url, "https://api.groq.com/openai/v1");
+        assert_eq!(r.model, "qwen/qwen3-32b");
+        assert_eq!(r.api_key_env, "GROQ_API_KEY");
+    }
+
+    #[test]
+    fn fingerprint_reasoning_flag_defaults_false() {
+        // accepts_reasoning_side_channel is #[serde(default)] -- a fingerprint may omit it.
+        let json = r#"{
+          "models": { "m": {
+            "frame_model": "vendor--fam--v1", "base_url": "http://x", "served_model": "vendor/fam-v1",
+            "api_key_env": "K", "tokenizer_family": "fam", "price_per_tick": 1,
+            "fingerprints": [ { "probe_prompt": "p", "expected_contains": "q" } ]
+          } }
+        }"#;
+        let cfg = ModelsConfig::from_json(json).unwrap();
+        let m = cfg.get("m").unwrap();
+        assert!(!m.fingerprints[0].accepts_reasoning_side_channel);
     }
 }

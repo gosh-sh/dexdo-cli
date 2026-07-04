@@ -256,6 +256,12 @@ pub(crate) struct BuyerArgs {
     /// reference key IS available the content gate runs regardless of this flag(it cannot be opted out of).
     #[arg(long)]
     pub(crate) allow_unverified_model: bool,
+    /// path to the models config(JSON) providing the **per-model verification data** (B5 vocab, B8
+    /// fingerprints, B7-full reference via base_url/served_model/api_key_env). Defaults to `models.json` in the
+    /// working directory. A model absent from this config has no verification data -> the buyer fails closed
+    /// (unless `--allow-unverified-model`).
+    #[arg(long, default_value = "models.json")]
+    pub(crate) models: PathBuf,
     /// How many ticks the buyer purchases. Not used on the mock path.
     #[arg(long, default_value_t = 8)]
     pub(crate) ticks: u128,

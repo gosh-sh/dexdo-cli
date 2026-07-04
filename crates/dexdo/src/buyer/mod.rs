@@ -185,15 +185,16 @@ impl Buyer {
         token_contract: &TokenContract,
         model_id: &str,
         max_tokens: u64,
+        models: &crate::seller::ModelsConfig,
     ) -> Result<crate::buyer::verify::Verdict> {
         use crate::buyer::verify;
-        let Some(probe_prompt) = verify::default_probe(model_id) else {
+        let Some(probe_prompt) = verify::default_probe(model_id, models) else {
             return Ok(verify::Verdict::Pass); // no exact-model fingerprint -> degradation(R3)
         };
         let request = CanonRequest {
             messages: vec![ChatMessage {
                 role: "user".to_string(),
-                content: probe_prompt.to_string(),
+                content: probe_prompt.clone(),
             }],
             params: None,
         };
@@ -204,9 +205,10 @@ impl Buyer {
         let reasoning = outcome.reasoning.join("");
         Ok(verify::behavioral_check_with_reasoning(
             model_id,
-            probe_prompt,
+            &probe_prompt,
             &response,
             &reasoning,
+            models,
         ))
     }
 
@@ -225,15 +227,16 @@ impl Buyer {
         token_contract: &TokenContract,
         model_id: &str,
         max_tokens: u64,
+        models: &crate::seller::ModelsConfig,
     ) -> Result<crate::buyer::verify::Verdict> {
         use crate::buyer::verify::{
             self, prefix_agreement, reference_endpoint_for, spotcheck_verdict,
             DEFAULT_SPOTCHECK_THRESHOLD,
         };
-        let Some(endpoint) = reference_endpoint_for(model_id) else {
+        let Some(endpoint) = reference_endpoint_for(model_id, models) else {
             return Ok(verify::Verdict::Pass); // no exact-model reference -> degradation(R3)
         };
-        let api_key = match std::env::var(endpoint.api_key_env) {
+        let api_key = match std::env::var(&endpoint.api_key_env) {
             Ok(k) if !k.is_empty() => k,
             _ => return Ok(verify::Verdict::Pass), // no reference key -> degradation(R3)
         };
@@ -255,7 +258,9 @@ impl Buyer {
         let outcome = self
             .connect_and_stream_request(handover, token_contract, max_tokens, Some(request))
             .await?;
-        let seller_response = outcome.tokens.join("");
+        let seller_content = outcome.tokens.join("");
+        let seller_reasoning = outcome.reasoning.join("");
+        let seller_response = content_or_reasoning(&seller_content, &seller_reasoning);
 
         // Greedy probe to the reference. Network/endpoint failure -> degradation(our fault, not the seller's).
         let reference_response =
@@ -304,8 +309,10 @@ impl Buyer {
 const SPOTCHECK_PROBE: &str = "What is 17 times 23? Show your step-by-step reasoning.";
 
 /// Greedy(temp=0) request to the official reference endpoint:
-/// non-streaming `chat/completions`, return the response text. The key goes only into the
-/// Authorization header and is NOT logged(secret masking).
+/// non-streaming `chat/completions`, return the comparable text. Some reasoning models return provider-side
+/// reasoning first and visible content only after enough tokens; that reasoning is still a model identity signal
+/// and matches the gateway's `CanonChunk.reasoning` side channel. The key goes only into the Authorization
+/// header and is NOT logged(secret masking).
 async fn reference_completion(
     endpoint: &crate::buyer::verify::ReferenceEndpoint,
     api_key: &str,
@@ -314,11 +321,12 @@ async fn reference_completion(
 ) -> Result<String> {
     let url = format!("{}/chat/completions", endpoint.base_url);
     let body = serde_json::json!({
-        "model": endpoint.model,
+        "model": endpoint.model.clone(),
         "messages": [{ "role": "user", "content": prompt }],
         "temperature": 0.0,
         "max_tokens": max_tokens,
         "stream": false,
+        "seed": 0,
     });
     let resp = reqwest::Client::new()
         .post(&url)
@@ -330,8 +338,70 @@ async fn reference_completion(
         return Err(anyhow!("reference endpoint HTTP {}", resp.status()));
     }
     let v: serde_json::Value = resp.json().await?;
-    Ok(v["choices"][0]["message"]["content"]
-        .as_str()
-        .unwrap_or("")
-        .to_string())
+    let message = &v["choices"][0]["message"];
+    let content = message["content"].as_str().unwrap_or("");
+    let reasoning = reference_reasoning_text(message);
+    Ok(content_or_reasoning(content, &reasoning))
+}
+
+fn content_or_reasoning(content: &str, reasoning: &str) -> String {
+    if content.trim().is_empty() && !reasoning.trim().is_empty() {
+        reasoning.to_string()
+    } else {
+        content.to_string()
+    }
+}
+
+fn reference_reasoning_text(message: &serde_json::Value) -> String {
+    let mut parts = Vec::new();
+    for field in ["reasoning", "reasoning_content"] {
+        if let Some(value) = message[field].as_str().filter(|v| !v.trim().is_empty()) {
+            parts.push(value.to_string());
+        }
+    }
+    if let Some(details) = message["reasoning_details"].as_array() {
+        for detail in details {
+            for field in ["text", "summary"] {
+                if let Some(value) = detail[field].as_str().filter(|v| !v.trim().is_empty()) {
+                    parts.push(value.to_string());
+                }
+            }
+        }
+    }
+    parts.join("\n")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{content_or_reasoning, reference_reasoning_text};
+
+    #[test]
+    fn reference_text_prefers_visible_content() {
+        assert_eq!(content_or_reasoning("answer", "thinking"), "answer");
+    }
+
+    #[test]
+    fn reference_text_falls_back_to_reasoning() {
+        assert_eq!(content_or_reasoning("", "thinking"), "thinking");
+    }
+
+    #[test]
+    fn reference_reasoning_collects_provider_fields() {
+        let message = serde_json::json!({
+            "content": "",
+            "reasoning": "raw",
+            "reasoning_content": "alias",
+            "reasoning_details": [
+                { "text": "detail" },
+                { "summary": "summary" },
+                { "data": "ignored" }
+            ]
+        });
+        let reasoning = reference_reasoning_text(&message);
+        assert!(reasoning.contains("raw"));
+        assert!(reasoning.contains("alias"));
+        assert!(reasoning.contains("detail"));
+        assert!(reasoning.contains("summary"));
+        assert!(!reasoning.contains("ignored"));
+    }
 }

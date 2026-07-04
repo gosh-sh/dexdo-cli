@@ -15,6 +15,7 @@ mod stream;
 
 use crate::buyer::verify::Verdict;
 use crate::buyer::Buyer;
+use crate::seller::ModelsConfig;
 use anyhow::Result;
 use dexdo_core::{ChainBackend, Handover, Note, TokenContract, MATCH_OPEN_TIMEOUT_SECS};
 use dexdo_proto::CanonChunk;
@@ -299,6 +300,50 @@ pub enum ContentCheck {
     Probe { model_id: String },
 }
 
+/// decide the content-identity policy for a frame model BEFORE paying/serving. **Shared by BOTH
+/// buyer paths** -- the consumer API(Path B, `cli`) and the gateway routing runner(Path A, `buyer::routing`) --
+/// so neither silently pays a model that no content layer can verify. Pure w.r.t. env (`has_ref_key` is computed
+/// by the caller). A seller can declare the correct model NAME yet serve a cheaper model; only the CONTENT layers
+/// (B8 fingerprint / B7-full reference) catch that, and they are **data-driven** from `models`. Policy:
+/// - `mock_model` -> `Skip`;
+/// - a model id with a B8 fingerprint OR a B7 reference key in env -> `Probe`(run the content gate);
+/// - otherwise `allow_unverified` -> `Skip` with a loud warning(name-only, operator opted in);
+/// - else **refuse**(fail closed): buying/paying on name-only evidence is rejected.
+pub fn content_check_policy(
+    frame_model: &str,
+    identity_model: Option<&str>,
+    mock_model: bool,
+    allow_unverified: bool,
+    has_ref_key: bool,
+    models: &ModelsConfig,
+) -> Result<ContentCheck> {
+    let family = crate::buyer::verify::family_of(frame_model);
+    let identity_model = identity_model.unwrap_or(frame_model);
+    if mock_model {
+        return Ok(ContentCheck::Skip);
+    }
+    let has_b8 = crate::buyer::verify::default_probe(identity_model, models).is_some();
+    if has_b8 || has_ref_key {
+        return Ok(ContentCheck::Probe {
+            model_id: identity_model.to_string(),
+        });
+    }
+    if allow_unverified {
+        tracing::warn!(
+            %frame_model, %family,
+            "CONTENT IDENTITY UNVERIFIED (name-only): no B8 fingerprint and no B7 reference/key for this \
+             exact model -- proceeding on name-only evidence (--allow-unverified-model). A seller serving a cheaper \
+             model under this name cannot be caught by content checks on this deal."
+        );
+        return Ok(ContentCheck::Skip);
+    }
+    anyhow::bail!(
+        "model `{frame_model}` (family `{family}`) has no exact content-identity check (no B8 fingerprint, no B7 \
+         reference/key); refusing to buy on name-only evidence. Pass --allow-unverified-model to accept \
+         name-only identity."
+    )
+}
+
 /// One-per-deal content-identity gate. The inline [`StreamVerifier`](crate::buyer::verify::StreamVerifier)
 /// on the consumer-API path only runs B5/B6 + the cheap declared-NAME B7; the strong **content** layers (B8
 /// fingerprint + B7-full reference spot-check) were never invoked there, so a seller serving a cheaper model
@@ -308,27 +353,40 @@ pub enum ContentCheck {
 /// attempted.
 pub struct ContentGate {
     check: ContentCheck,
+    /// Loaded model config -- needed for the `Probe` path (B8 fingerprints / B7-full reference are
+    /// data-driven per model). `None` for `Skip`(which never probes).
+    models: Option<Arc<ModelsConfig>>,
     /// Cached definitive verdict: `Ok(())` pass, `Err(reason)` bail. A transport error is the cell's init error
     /// (NOT stored) so the gate retries on the next request.
     verdict: OnceCell<Result<(), String>>,
 }
 
 impl ContentGate {
-    pub fn new(check: ContentCheck) -> Self {
+    pub fn new(check: ContentCheck, models: Arc<ModelsConfig>) -> Self {
         Self {
             check,
+            models: Some(models),
             verdict: OnceCell::new(),
         }
     }
 
-    /// A gate that performs no content check(mock / name-only degradation).
+    /// A gate that performs no content check(mock / name-only degradation). Needs no config.
     pub fn skip() -> Self {
-        Self::new(ContentCheck::Skip)
+        Self {
+            check: ContentCheck::Skip,
+            models: None,
+            verdict: OnceCell::new(),
+        }
     }
 
-    /// A gate that runs the content probe for `model_id`.
-    pub fn probe(model_id: String) -> Self {
-        Self::new(ContentCheck::Probe { model_id })
+    /// A gate that runs the content probe for `model_id`, using `models` for its data-driven
+    /// fingerprint/reference.
+    pub fn probe(model_id: String, models: Arc<ModelsConfig>) -> Self {
+        Self {
+            check: ContentCheck::Probe { model_id },
+            models: Some(models),
+            verdict: OnceCell::new(),
+        }
     }
 
     /// Run the content-identity gate once per deal. `Skip` -> `Ok(())`. `Probe` -> run B8 then B7-full
@@ -344,6 +402,13 @@ impl ContentGate {
         match &self.check {
             ContentCheck::Skip => Ok(()),
             ContentCheck::Probe { model_id } => {
+                let Some(models) = self.models.as_deref() else {
+                    // A Probe gate is only built via `new`/`probe`, both of which carry the config; a missing
+                    // config is a construction bug -- fail closed rather than silently pass a content check.
+                    return Err(
+                        "content gate: Probe selected without a loaded models config".to_string(),
+                    );
+                };
                 // OUTER Err = transport error(NOT cached -> retried next request); INNER `Result<(), String>` =
                 // the cached definitive verdict (`Ok(())` pass, `Err(reason)` bail).
                 let cached: &Result<(), String> = self
@@ -357,6 +422,7 @@ impl ContentGate {
                                 &route.token_contract,
                                 model_id,
                                 CONTENT_PROBE_MAX_TOKENS,
+                                models,
                             )
                             .await
                             .map_err(|e| e.to_string())?;
@@ -373,6 +439,7 @@ impl ContentGate {
                                 &route.token_contract,
                                 model_id,
                                 CONTENT_PROBE_MAX_TOKENS,
+                                models,
                             )
                             .await
                             .map_err(|e| e.to_string())?;
@@ -1035,6 +1102,106 @@ pub async fn serve(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // fail-loud content-identity policy(pure), shared by both buyer paths. A seller can declare the
+    // correct model NAME yet serve a cheaper model; only the CONTENT layers(B8 fingerprint / B7 reference)
+    // catch that. A real model identity with neither must FAIL CLOSED unless the operator opts into name-only.
+    // Data-driven: a config with qwen(fingerprint) but NOT llama exercises probe vs fail-closed.
+    fn policy_models() -> ModelsConfig {
+        ModelsConfig::from_json(
+            r#"{ "models": { "qwen": {
+                "frame_model": "qwen--qwen3--32b",
+                "base_url": "https://api.groq.com/openai/v1",
+                "served_model": "qwen/qwen3-32b",
+                "api_key_env": "GROQ_API_KEY",
+                "tokenizer_family": "qwen",
+                "price_per_tick": 1000,
+                "identity_aliases": ["Qwen/Qwen3-32B"],
+                "vocab_size": 152064,
+                "fingerprints": [ { "probe_prompt": "What is 17*23? Think step by step.", "expected_contains": "<think>", "accepts_reasoning_side_channel": true } ]
+            } } }"#,
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn policy_mock_model_skips() {
+        let cfg = policy_models();
+        assert_eq!(
+            content_check_policy("qwen/qwen3-32b", None, true, false, false, &cfg).unwrap(),
+            ContentCheck::Skip
+        );
+    }
+
+    #[test]
+    fn policy_qwen_b8_fingerprint_probes() {
+        let cfg = policy_models();
+        assert_eq!(
+            content_check_policy("qwen--qwen3--32b", None, false, false, false, &cfg).unwrap(),
+            ContentCheck::Probe {
+                model_id: "qwen--qwen3--32b".to_string()
+            }
+        );
+    }
+
+    #[test]
+    fn policy_registry_backed_qwen_identity_probes_by_registry_model() {
+        let cfg = policy_models();
+        assert_eq!(
+            content_check_policy(
+                "qwen--qwen3--32b",
+                Some("Qwen/Qwen3-32B"),
+                false,
+                false,
+                false,
+                &cfg
+            )
+            .unwrap(),
+            ContentCheck::Probe {
+                model_id: "Qwen/Qwen3-32B".to_string()
+            }
+        );
+    }
+
+    #[test]
+    fn policy_unknown_qwen_variant_does_not_inherit_qwen3_fingerprint() {
+        let cfg = policy_models();
+        assert_eq!(
+            content_check_policy("qwen--qwen3.6--27b", None, false, true, false, &cfg).unwrap(),
+            ContentCheck::Skip
+        );
+    }
+
+    #[test]
+    fn policy_real_family_no_fingerprint_no_key_fails_closed() {
+        // llama: a real model with NO B8 fingerprint(not in config) and NO B7 reference key -> refuse (fail
+        // closed) without --allow-unverified-model.
+        let cfg = policy_models();
+        let r = content_check_policy("meta-llama/llama-3.1-8b", None, false, false, false, &cfg);
+        assert!(r.is_err(), "name-only model must fail closed, got {r:?}");
+    }
+
+    #[test]
+    fn policy_allow_unverified_downgrades_to_skip() {
+        let cfg = policy_models();
+        assert_eq!(
+            content_check_policy("meta-llama/llama-3.1-8b", None, false, true, false, &cfg)
+                .unwrap(),
+            ContentCheck::Skip
+        );
+    }
+
+    #[test]
+    fn policy_reference_key_enables_probe() {
+        let cfg = policy_models();
+        assert_eq!(
+            content_check_policy("meta-llama/llama-3.1-8b", None, false, false, true, &cfg)
+                .unwrap(),
+            ContentCheck::Probe {
+                model_id: "meta-llama/llama-3.1-8b".to_string()
+            }
+        );
+    }
 
     #[test]
     fn request_limit_honors_request_and_caps_by_budget() {

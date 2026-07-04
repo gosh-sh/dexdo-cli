@@ -1,3 +1,31 @@
+## v0.0.3
+
+- fix(): build portable linux musl releases
+- feat(): data-driven per-model verification + Path A fail-closed
+- fix: generalize model registry aliases
+- docs: directive for Linux release portability
+- docs(agents): explicit push targets + private vs public push
+- ci: smoke-test release binaries + install
+- Wire buyer failure policy dispatch
+- Handle post-reject ERR_NOT_OPEN terminally
+- skills: english public seller+buyer skills
+- fix registry-backed qwen content identity
+- Add buyer continuity mode flag
+- : buyer continuity — no auto-reclaim/rebuy on idle (demand-gated + kill-switch)
+- Fix qwen content identity matching
+- Add seller gateway advertise address
+- Shellnet update
+- Coalesce equivalent duplicate TC asks for quote
+- Fix monitor closed state classification
+- Fix demand-driven buyer continuity
+- docs(skills): self-deploy notes, order-book view + price/volume prompt,  watcher, status-authoritative Phase 8
+- docs(skills): self-deploy notes, milestone logging, buyer lifecycle + idle-close invariant
+- Keep buyer API sessions open after upstream request errors
+- Fix concurrent consumer API challenge responses
+- fix active book e2e expectations
+- tighten  failure policy validation
+- Release pipeline: public dexdo-cli, cleanliness scrub gate, native binaries, publish
+
 ## v0.0.2
 
 - docs(agents): explicit push targets + private vs public push

@@ -3970,6 +3970,7 @@ fn spawn_buyer_service_renewal(
     escrow: u128,
     continuity_mode: dexdo::buyer::continuity::ContinuityMode,
     content_check: dexdo::buyer::api::ContentCheck,
+    models_cfg: Arc<dexdo::seller::ModelsConfig>,
     api_failure_policy: dexdo::buyer::api::BuyerApiFailurePolicy,
 ) {
     struct PendingRenewal {
@@ -4284,7 +4285,10 @@ fn spawn_buyer_service_renewal(
                             max_tokens: consumer_api_token_budget(ticks),
                         },
                         session,
-                        Arc::new(dexdo::buyer::api::ContentGate::new(content_check.clone())),
+                        Arc::new(dexdo::buyer::api::ContentGate::new(
+                            content_check.clone(),
+                            models_cfg.clone(),
+                        )),
                     );
                     deals.replace_active(next_deal, "continuity-renewal").await;
                     pending = None;
@@ -4937,19 +4941,25 @@ async fn run_buyer_inner(
         };
         let content_identity_model_ref = content_identity_model.as_deref();
         let content_check_model = content_identity_model_ref.unwrap_or(&frame_model);
-        let has_ref_key = dexdo::buyer::verify::reference_endpoint_for(content_check_model)
-            .map(|e| {
-                std::env::var(e.api_key_env)
-                    .map(|k| !k.is_empty())
-                    .unwrap_or(false)
-            })
-            .unwrap_or(false);
-        let content_check = crate::cli::support::content_check_policy(
+        // verification data is DATA-DRIVEN from `--models`(default `models.json`). An absent file yields
+        // an empty config so a real model with no data fails closed(below); the mock path is exempt.
+        let models_cfg =
+            std::sync::Arc::new(dexdo::seller::ModelsConfig::load_or_empty(&args.models)?);
+        let has_ref_key =
+            dexdo::buyer::verify::reference_endpoint_for(content_check_model, &models_cfg)
+                .map(|e| {
+                    std::env::var(&e.api_key_env)
+                        .map(|k| !k.is_empty())
+                        .unwrap_or(false)
+                })
+                .unwrap_or(false);
+        let content_check = dexdo::buyer::api::content_check_policy(
             &frame_model,
             content_identity_model_ref,
             args.mock.mock_model,
             args.allow_unverified_model,
             has_ref_key,
+            &models_cfg,
         )?;
         let renewal_content_check = content_check.clone();
         let state = ApiState::single(
@@ -4961,7 +4971,10 @@ async fn run_buyer_inner(
             },
             frame_model.clone(),
             session,
-            std::sync::Arc::new(dexdo::buyer::api::ContentGate::new(content_check)),
+            std::sync::Arc::new(dexdo::buyer::api::ContentGate::new(
+                content_check,
+                models_cfg.clone(),
+            )),
         );
         if let Some((ticks, max_price, escrow)) = service_renewal {
             spawn_buyer_service_renewal(
@@ -4973,6 +4986,7 @@ async fn run_buyer_inner(
                 escrow,
                 continuity_mode,
                 renewal_content_check,
+                models_cfg.clone(),
                 api_failure_policy,
             );
         }
