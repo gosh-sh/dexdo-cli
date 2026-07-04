@@ -1,7 +1,7 @@
 ## v0.0.3
 
-- fix(): build portable linux musl releases
-- feat(): data-driven per-model verification + Path A fail-closed
+- fix: build portable linux musl releases
+- feat: data-driven per-model verification + Path A fail-closed
 - fix: generalize model registry aliases
 - docs: directive for Linux release portability
 - docs(agents): explicit push targets + private vs public push
@@ -11,7 +11,7 @@
 - skills: english public seller+buyer skills
 - fix registry-backed qwen content identity
 - Add buyer continuity mode flag
-- : buyer continuity — no auto-reclaim/rebuy on idle (demand-gated + kill-switch)
+- buyer continuity -- no auto-reclaim/rebuy on idle (demand-gated + kill-switch)
 - Fix qwen content identity matching
 - Add seller gateway advertise address
 - Shellnet update
@@ -35,7 +35,7 @@
 - skills: english public seller+buyer skills
 - fix registry-backed qwen content identity
 - Add buyer continuity mode flag
-- : buyer continuity — no auto-reclaim/rebuy on idle (demand-gated + kill-switch)
+- buyer continuity -- no auto-reclaim/rebuy on idle (demand-gated + kill-switch)
 - Fix qwen content identity matching
 - Add seller gateway advertise address
 - Shellnet update
@@ -49,8 +49,8 @@
 - fix active book e2e expectations
 - tighten  failure policy validation
 - Release pipeline: public dexdo-cli, cleanliness scrub gate, native binaries, publish
-- Draft: implement runtime machine JSON contract ()
-- Draft: client registry validation policy ()
+- Draft: implement runtime machine JSON contract 
+- Draft: client registry validation policy 
 - fix seller probe reserve for issue 228
 - Revert duplicate  directive (canonical 214-runtime-failure-policy-design.md already exists)
 
@@ -58,7 +58,7 @@
 
 - fix registry-backed qwen content identity
 - Add buyer continuity mode flag
-- : buyer continuity — no auto-reclaim/rebuy on idle (demand-gated + kill-switch)
+- buyer continuity -- no auto-reclaim/rebuy on idle (demand-gated + kill-switch)
 - Fix qwen content identity matching
 - Add seller gateway advertise address
 - Shellnet update
@@ -72,21 +72,21 @@
 - fix active book e2e expectations
 - tighten  failure policy validation
 - Release pipeline: public dexdo-cli, cleanliness scrub gate, native binaries, publish
-- Draft: implement runtime machine JSON contract ()
-- Draft: client registry validation policy ()
+- Draft: implement runtime machine JSON contract 
+- Draft: client registry validation policy 
 - fix seller probe reserve for issue 228
 - Revert duplicate  directive (canonical 214-runtime-failure-policy-design.md already exists)
-- Canonical Model Registry (): add contract + shellnet deploy record
+- Canonical Model Registry : add contract + shellnet deploy record
 - diagnose TokenContract.open probe funding abort
 - Draft: policy fail-closed checkpoint
-- : buyer/seller failure-policy — persistent policy.json + fail-closed once (wire-only)
+- buyer/seller failure-policy -- persistent policy.json + fail-closed once (wire-only)
 - Add runtime failure policy directive
 
 ## v0.0.1
 
 - fix registry-backed qwen content identity
 - Add buyer continuity mode flag
-- : buyer continuity — no auto-reclaim/rebuy on idle (demand-gated + kill-switch)
+- buyer continuity -- no auto-reclaim/rebuy on idle (demand-gated + kill-switch)
 - Fix qwen content identity matching
 - Add seller gateway advertise address
 - Shellnet update
@@ -100,13 +100,13 @@
 - fix active book e2e expectations
 - tighten  failure policy validation
 - Release pipeline: public dexdo-cli, cleanliness scrub gate, native binaries, publish
-- Draft: implement runtime machine JSON contract ()
-- Draft: client registry validation policy ()
+- Draft: implement runtime machine JSON contract 
+- Draft: client registry validation policy 
 - fix seller probe reserve for issue 228
 - Revert duplicate  directive (canonical 214-runtime-failure-policy-design.md already exists)
-- Canonical Model Registry (): add contract + shellnet deploy record
+- Canonical Model Registry : add contract + shellnet deploy record
 - diagnose TokenContract.open probe funding abort
 - Draft: policy fail-closed checkpoint
-- : buyer/seller failure-policy — persistent policy.json + fail-closed once (wire-only)
+- buyer/seller failure-policy -- persistent policy.json + fail-closed once (wire-only)
 - Add runtime failure policy directive
 
