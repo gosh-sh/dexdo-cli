@@ -6,7 +6,8 @@ description: Install and verify the dexdo CLI so an agent (or a fresh machine) i
 # dexdo -- install and verify the CLI
 
 Goal: end this skill with a working `dexdo` binary on PATH, the deployed-contracts manifest in place,
-`dexdo doctor` green, and a clear list of what the operator must still provide before real trading.
+`dexdo doctor` green (binary, manifest, and network verified), and a clear list of what the operator
+must still provide before real trading (wallet, model key, and a completed failure policy).
 Run each step, show its output, and do not advance until the step succeeds. Secrets (wallet seed/key,
 note owner secret, provider API keys) are never printed, logged, or committed.
 
@@ -68,10 +69,12 @@ A source checkout already ships this file.
 dexdo doctor --contracts contracts/deployed.shellnet.json
 ```
 
-`dexdo doctor` reports the reachable shellnet version, whether your manifest is fresh (matches the
-deployed contracts), and whether your `policy.json` is complete. A green doctor means the binary,
-manifest, and network are ready. If it flags manifest drift, re-download the manifest (Phase 3). If it
-flags shellnet unreachable, check network access to `shellnet.ackinacki.org`.
+`dexdo doctor` reports the reachable shellnet version and whether your manifest is fresh (matches the
+deployed contracts). A green doctor here means the binary, manifest, and network are ready. The failure
+policy is a separate gate -- you set it up in Phase 5, and `dexdo seller` / `dexdo buyer` enforce a
+complete policy when they start (once a policy exists, doctor also flags an incomplete one). If doctor
+flags manifest drift, re-download the manifest (Phase 3). If it flags shellnet unreachable, check
+network access to `shellnet.ackinacki.org`.
 
 ## Phase 5. Prerequisites for real trading (before seller / buyer)
 
