@@ -141,6 +141,11 @@ pub(crate) fn classify_error(operation: &str, err: &anyhow::Error) -> ErrorCode 
     if msg.contains("no executable matching ask")
         || msg.contains("no matchable ask")
         || msg.contains("executable quote depth has no matching")
+        || msg.contains("refusing partial/multi-ask fill")
+        || msg.contains("placeinferencebuy cannot target")
+        || msg.contains("raw order-book matcher")
+        || msg.contains("refusing to send escrow into the wrong deal")
+        || (msg.contains("best ask price") && msg.contains("above buyer max_price_per_tick"))
     {
         return ErrorCode::NoLiquidity;
     }
@@ -570,9 +575,27 @@ mod tests {
             ),
             (
                 anyhow::anyhow!(
+                    "buyer model-only preflight failed for InferenceOrderBook 0:book: best ask price 11 is above buyer max_price_per_tick 10"
+                ),
+                ErrorCode::NoLiquidity,
+            ),
+            (
+                anyhow::anyhow!(
+                    "buyer explicit-token quote preflight: shellnet: buyer target preflight failed for InferenceOrderBook 0:book: refusing partial/multi-ask fill"
+                ),
+                ErrorCode::NoLiquidity,
+            ),
+            (
+                anyhow::anyhow!(
                     "buyer target preflight failed for InferenceOrderBook 0:book: placeInferenceBuy cannot target a TokenContract; refusing to send escrow into the wrong deal"
                 ),
-                ErrorCode::ChainRevert,
+                ErrorCode::NoLiquidity,
+            ),
+            (
+                anyhow::anyhow!(
+                    "buyer model-only preflight failed for InferenceOrderBook 0:book: raw order-book matcher would select order , but executable quote selected order "
+                ),
+                ErrorCode::NoLiquidity,
             ),
             (
                 anyhow::anyhow!(

@@ -23,9 +23,10 @@ use dexdo::registry::{
 };
 use dexdo_core::{
     aggregate_tree, check_buy_deposit_headroom, check_matched_token_contract_state,
-    executable_quote, model_hash_for, required_escrow_for_buy, ChainBackend, ChainError,
-    DealChainState, DobParams, ExecutableQuote, MatchedTokenContractStatus, MockChainBackend,
-    OfferListing, OrderBookOrder, ProtocolConsts, Settlement, MATCH_OPEN_TIMEOUT_SECS,
+    executable_quote, model_hash_for, required_escrow_for_buy, submit_safe_single_ask_quote,
+    ChainBackend, ChainError, DealChainState, DobParams, ExecutableQuote,
+    MatchedTokenContractStatus, MockChainBackend, OfferListing, OrderBookOrder, ProtocolConsts,
+    Settlement, MATCH_OPEN_TIMEOUT_SECS,
 };
 #[cfg(feature = "shellnet")]
 use dexdo_core::{OrderBookSnapshot, OrderBookSubscription};
@@ -710,6 +711,12 @@ async fn buyer_quote_selection(
             .assert_model_buy_matches_executable_quote(ticks, max_price_per_tick)
             .await
             .map_err(|e| anyhow::anyhow!("buyer model-only quote preflight: {e}"))?;
+    } else if let Some(tc) = explicit_tc {
+        let tc_owned = tc.to_string();
+        chain
+            .assert_explicit_buy_matches_executable_quote(&tc_owned, ticks, max_price_per_tick)
+            .await
+            .map_err(|e| anyhow::anyhow!("buyer explicit-token quote preflight: {e}"))?;
     }
     let mut orders = mock_orders_from_offers(chain.discover_offers().await?);
     let order_book = if let Some(tc) = explicit_tc {
@@ -736,8 +743,12 @@ async fn buyer_quote_selection(
         "model_order_book"
     };
     orders.retain(|o| o.price_per_tick <= max_price_per_tick);
-    let quote = executable_quote(&orders, Some(ticks), None)
-        .map_err(|e| anyhow::anyhow!("buyer quote: {e}"))?;
+    let quote = if chain.requires_submit_safe_single_ask_quote() {
+        submit_safe_single_ask_quote(&orders, Some(ticks), None)
+    } else {
+        executable_quote(&orders, Some(ticks), None)
+    }
+    .map_err(|e| anyhow::anyhow!("buyer quote: {e}"))?;
     Ok(BuyerQuoteSelection {
         order_book,
         escrow: escrow.unwrap_or_else(|| required_escrow_for_buy(ticks, max_price_per_tick)),
@@ -1132,7 +1143,7 @@ pub(crate) async fn run_quote(args: QuoteArgs) -> Result<()> {
             args.note_addr.clone(),
         )?
     };
-    let snapshot = read_executable_book_target(&chain, &target).await?;
+    let snapshot = read_book_target(&chain, &target).await?;
     if let Some(policy) = registry_policy.as_ref() {
         enforce_model_registry_policy(
             RegistryRole::Buyer,
@@ -1145,7 +1156,9 @@ pub(crate) async fn run_quote(args: QuoteArgs) -> Result<()> {
         )
         .await?;
     }
-    let q = executable_quote(&snapshot.orders, args.ticks, args.budget)
+    let q = chain
+        .submit_safe_single_ask_quote(&snapshot, args.ticks, args.budget)
+        .await
         .map_err(|e| anyhow::anyhow!("quote: {e}"))?;
     if args.json {
         return machine::print_json(&quote_response_from_quote(
@@ -6429,6 +6442,247 @@ mod tests {
             auto_renew: false,
         })
         .is_err());
+    }
+
+    #[derive(Default)]
+    struct QuotePreflightChain {
+        offers: Vec<dexdo_core::OfferListing>,
+        model_preflight_error: Option<String>,
+        explicit_preflight_error: Option<String>,
+        sell_offer_terms: Option<(u64, u64)>,
+        sell_offer_terms_calls: std::sync::atomic::AtomicUsize,
+        submit_safe_single_ask_quote: bool,
+    }
+
+    impl QuotePreflightChain {
+        fn offer(
+            token_contract: &str,
+            price_per_tick: u64,
+            max_ticks: u64,
+        ) -> dexdo_core::OfferListing {
+            dexdo_core::OfferListing {
+                seller_id: "seller".to_string(),
+                token_contract: token_contract.to_string(),
+                price_per_tick,
+                max_ticks,
+            }
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl dexdo_core::ChainBackend for QuotePreflightChain {
+        async fn discover_offers(
+            &self,
+        ) -> Result<Vec<dexdo_core::OfferListing>, dexdo_core::ChainError> {
+            Ok(self.offers.clone())
+        }
+
+        async fn post_offer(
+            &self,
+            _offer: dexdo_core::SellOffer,
+            _note: &dyn dexdo_core::Note,
+        ) -> Result<(), dexdo_core::ChainError> {
+            unimplemented!("not needed by quote preflight tests")
+        }
+
+        async fn sell_offer_terms(
+            &self,
+            _token_contract: &dexdo_core::TokenContract,
+        ) -> Result<Option<(u64, u64)>, dexdo_core::ChainError> {
+            self.sell_offer_terms_calls
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Ok(self.sell_offer_terms)
+        }
+
+        async fn assert_model_buy_matches_executable_quote(
+            &self,
+            _ticks: u128,
+            _max_price_per_tick: u128,
+        ) -> Result<(), dexdo_core::ChainError> {
+            match &self.model_preflight_error {
+                Some(err) => Err(dexdo_core::ChainError::Chain(err.clone())),
+                None => Ok(()),
+            }
+        }
+
+        async fn assert_explicit_buy_matches_executable_quote(
+            &self,
+            _token_contract: &dexdo_core::TokenContract,
+            _ticks: u128,
+            _max_price_per_tick: u128,
+        ) -> Result<(), dexdo_core::ChainError> {
+            match &self.explicit_preflight_error {
+                Some(err) => Err(dexdo_core::ChainError::Chain(err.clone())),
+                None => Ok(()),
+            }
+        }
+
+        fn requires_submit_safe_single_ask_quote(&self) -> bool {
+            self.submit_safe_single_ask_quote
+        }
+
+        async fn place_buy(
+            &self,
+            _token_contract: &dexdo_core::TokenContract,
+            _note: &dyn dexdo_core::Note,
+        ) -> Result<(), dexdo_core::ChainError> {
+            unimplemented!("not needed by quote preflight tests")
+        }
+
+        async fn read_match(
+            &self,
+            _token_contract: &dexdo_core::TokenContract,
+        ) -> Result<dexdo_core::Match, dexdo_core::ChainError> {
+            unimplemented!("not needed by quote preflight tests")
+        }
+
+        async fn open_stream(
+            &self,
+            _token_contract: &dexdo_core::TokenContract,
+            _enc_endpoint: Vec<u8>,
+            _note: &dyn dexdo_core::Note,
+        ) -> Result<(), dexdo_core::ChainError> {
+            unimplemented!("not needed by quote preflight tests")
+        }
+
+        async fn read_handover(
+            &self,
+            _token_contract: &dexdo_core::TokenContract,
+        ) -> Result<Option<Vec<u8>>, dexdo_core::ChainError> {
+            unimplemented!("not needed by quote preflight tests")
+        }
+
+        async fn advance_tick(
+            &self,
+            _token_contract: &dexdo_core::TokenContract,
+            _note: &dyn dexdo_core::Note,
+        ) -> Result<(), dexdo_core::ChainError> {
+            unimplemented!("not needed by quote preflight tests")
+        }
+
+        async fn accept_probe(
+            &self,
+            _token_contract: &dexdo_core::TokenContract,
+        ) -> Result<(), dexdo_core::ChainError> {
+            unimplemented!("not needed by quote preflight tests")
+        }
+
+        async fn stop(
+            &self,
+            _token_contract: &dexdo_core::TokenContract,
+            _note: &dyn dexdo_core::Note,
+        ) -> Result<dexdo_core::Settlement, dexdo_core::ChainError> {
+            unimplemented!("not needed by quote preflight tests")
+        }
+
+        async fn seller_timeout(
+            &self,
+            _token_contract: &dexdo_core::TokenContract,
+        ) -> Result<dexdo_core::Settlement, dexdo_core::ChainError> {
+            unimplemented!("not needed by quote preflight tests")
+        }
+
+        async fn snapshot(
+            &self,
+            _token_contract: &dexdo_core::TokenContract,
+        ) -> Option<dexdo_core::StreamSnapshot> {
+            None
+        }
+    }
+
+    #[tokio::test]
+    async fn buyer_model_only_quote_selection_surfaces_price_ceiling_preflight() {
+        let offers = vec![QuotePreflightChain::offer("0:best", 11, 1)];
+        let quote = dexdo_core::executable_quote(
+            &super::mock_orders_from_offers(offers.clone()),
+            Some(1),
+            None,
+        )
+        .expect("standalone quote accepts the book without the buyer ceiling");
+        assert!(quote.complete);
+        let chain = QuotePreflightChain {
+            offers,
+            model_preflight_error: Some(
+                "best ask price 11 is above buyer max_price_per_tick 10; requested ticks 1"
+                    .to_string(),
+            ),
+            ..Default::default()
+        };
+
+        let err = match super::buyer_quote_selection(&chain, None, 1, 10, None).await {
+            Ok(_) => panic!("model-only preflight must reject the quote before quote_selected"),
+            Err(err) => err.to_string(),
+        };
+
+        assert!(err.contains("buyer model-only quote preflight"), "{err}");
+        assert!(err.contains("best ask price 11"), "{err}");
+        assert!(err.contains("above buyer max_price_per_tick 10"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn buyer_explicit_quote_selection_runs_target_preflight_before_synthetic_terms() {
+        let chain = QuotePreflightChain {
+            explicit_preflight_error: Some(
+                "buyer target preflight failed for InferenceOrderBook 0:book: no resting ask for expected tokenContract 0:dead"
+                    .to_string(),
+            ),
+            sell_offer_terms: Some((11, 1)),
+            ..Default::default()
+        };
+
+        let err = match super::buyer_quote_selection(&chain, Some("0:dead"), 1, 11, None).await {
+            Ok(_) => panic!("explicit target preflight must reject before quote_selected"),
+            Err(err) => err.to_string(),
+        };
+
+        assert!(
+            err.contains("buyer explicit-token quote preflight"),
+            "{err}"
+        );
+        assert!(err.contains("buyer target preflight failed"), "{err}");
+        assert_eq!(
+            chain
+                .sell_offer_terms_calls
+                .load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "explicit target preflight must fail before synthetic sell_offer_terms can fabricate quote_selected"
+        );
+    }
+
+    #[tokio::test]
+    async fn buyer_model_only_quote_selection_rejects_partial_head_ask() {
+        let chain = QuotePreflightChain {
+            offers: vec![QuotePreflightChain::offer("0:big", 1000, 1024)],
+            submit_safe_single_ask_quote: true,
+            ..Default::default()
+        };
+
+        let selection = super::buyer_quote_selection(&chain, None, 1, 1000, None)
+            .await
+            .expect("selection returns an explicit no-liquidity quote");
+
+        assert_eq!(selection.order_book, "model_order_book");
+        assert!(!selection.quote.complete);
+        assert_eq!(selection.quote.filled_ticks, 0);
+        assert!(selection.quote.fills.is_empty());
+    }
+
+    #[tokio::test]
+    async fn buyer_explicit_quote_selection_rejects_partial_synthetic_terms() {
+        let chain = QuotePreflightChain {
+            sell_offer_terms: Some((1000, 1024)),
+            submit_safe_single_ask_quote: true,
+            ..Default::default()
+        };
+
+        let selection = super::buyer_quote_selection(&chain, Some("0:big"), 1, 1000, None)
+            .await
+            .expect("selection returns an explicit no-liquidity quote");
+
+        assert_eq!(selection.order_book, "explicit_token_contract");
+        assert!(!selection.quote.complete);
+        assert_eq!(selection.quote.filled_ticks, 0);
+        assert!(selection.quote.fills.is_empty());
     }
 
     #[cfg(feature = "shellnet")]

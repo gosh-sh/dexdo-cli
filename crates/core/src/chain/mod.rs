@@ -105,6 +105,23 @@ pub trait ChainBackend: Send + Sync {
     ) -> Result<(), ChainError> {
         Ok(())
     }
+    /// Read-only guard for explicit `--token-contract` buyer selection. A displayed quote is submit-safe only
+    /// if the model-wide `placeInferenceBuy(modelHash,...)` matcher would actually fund this TokenContract,
+    /// and the selected TC is still unused. Default `Ok(())` keeps mock backends simple; real shellnet fails
+    /// closed before the CLI emits `quote_selected` or sends escrow.
+    async fn assert_explicit_buy_matches_executable_quote(
+        &self,
+        _token_contract: &TokenContract,
+        _ticks: u128,
+        _max_price_per_tick: u128,
+    ) -> Result<(), ChainError> {
+        Ok(())
+    }
+    /// The current real shellnet submit path can safely buy only a single whole ask at the raw price-time head.
+    /// Mock/backends without that order-book limitation keep the generic partial-depth quote.
+    fn requires_submit_safe_single_ask_quote(&self) -> bool {
+        false
+    }
     /// After a model-only buy, learn the matched per-deal `TokenContract` from THIS note's owner-facing
     /// `InferenceFilledConfirmed` ext-out -- each side reads only its own note,
     /// no shared-book index. `since_unix` drops a prior deal's fill on a reused note. Default: unsupported;
@@ -515,6 +532,57 @@ mod tests {
         assert!(q.complete);
         assert_eq!(q.filled_ticks, 3);
         assert_eq!(q.total_with_fee, required_escrow_for_buy(3, 1000));
+    }
+
+    #[test]
+    fn submit_safe_single_ask_quote_rejects_partial_head_fill() {
+        let q =
+            submit_safe_single_ask_quote(&[ask(1, "0:one", 1000, 1024)], Some(1), None).unwrap();
+        assert!(!q.complete);
+        assert_eq!(q.filled_ticks, 0);
+        assert!(q.fills.is_empty());
+    }
+
+    #[test]
+    fn submit_safe_single_ask_quote_accepts_exact_whole_head_ask() {
+        let q = submit_safe_single_ask_quote(
+            &[ask(1, "0:one", 900, 1024), ask(2, "0:two", 1000, 1)],
+            Some(1024),
+            None,
+        )
+        .unwrap();
+        assert!(q.complete);
+        assert_eq!(q.filled_ticks, 1024);
+        assert_eq!(q.fills.len(), 1);
+        assert_eq!(q.fills[0].order_id, 1);
+        assert_eq!(q.fills[0].token_contract, "0:one");
+    }
+
+    #[test]
+    fn submit_safe_single_ask_quote_does_not_skip_mismatched_head() {
+        let q = submit_safe_single_ask_quote(
+            &[ask(1, "0:small", 900, 1), ask(2, "0:exact", 1000, 1024)],
+            Some(1024),
+            None,
+        )
+        .unwrap();
+        assert!(!q.complete);
+        assert_eq!(q.filled_ticks, 0);
+        assert!(q.fills.is_empty());
+    }
+
+    #[test]
+    fn submit_safe_single_ask_quote_budget_mode_uses_one_whole_head_ask() {
+        let q =
+            submit_safe_single_ask_quote(&[ask(1, "0:one", 1000, 4)], None, Some(4099)).unwrap();
+        assert!(!q.complete);
+        assert_eq!(q.filled_ticks, 0);
+
+        let q =
+            submit_safe_single_ask_quote(&[ask(1, "0:one", 1000, 4)], None, Some(4100)).unwrap();
+        assert!(q.complete);
+        assert_eq!(q.filled_ticks, 4);
+        assert_eq!(q.total_with_fee, required_escrow_for_buy(4, 1000));
     }
 
     /// Issue(track-1, fail-closed): absurdly large `ticks`/`maxPricePerTick` must NOT panic

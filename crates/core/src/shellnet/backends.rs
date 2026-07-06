@@ -4,8 +4,9 @@ use super::client::{active_check, code_hash_check, is_uninit_account_404, Shelln
 use super::contracts_provision::*;
 use crate::chain::{
     check_buy_deposit_headroom, coalesce_equivalent_resting_asks, ChainBackend, ChainError,
-    DealChainState, DealRole, DealView, Match, MatchWatchCursor, OrderBookOrder, OrderBookSnapshot,
-    OrderBookStats, SellOffer, StreamSnapshot, TokenContract, MATCH_OPEN_TIMEOUT_SECS,
+    DealChainState, DealRole, DealView, ExecutableQuote, Match, MatchWatchCursor, OrderBookOrder,
+    OrderBookSnapshot, OrderBookStats, SellOffer, StreamSnapshot, TokenContract,
+    MATCH_OPEN_TIMEOUT_SECS,
 };
 use crate::machine::Settlement;
 use crate::manifest::model_hash_for;
@@ -882,6 +883,31 @@ fn next_matching_ask(
         .min_by_key(|ask| (ask.price_per_tick, ask.order_id))
 }
 
+fn no_matching_ask_reason(
+    asks: &[OrderBookOrder],
+    max_price_per_tick: u128,
+    ticks: u128,
+) -> String {
+    match asks.iter().min_by_key(|ask| (ask.price_per_tick, ask.order_id)) {
+        Some(best) if best.price_per_tick > max_price_per_tick => format!(
+            "best ask price {} is above buyer max_price_per_tick {max_price_per_tick}; requested ticks {ticks}. \
+             Raise --max-price-per-tick to at least {} or wait for a cheaper ask",
+            best.price_per_tick, best.price_per_tick
+        ),
+        Some(best) => format!(
+            "no matchable ask for max_price_per_tick {max_price_per_tick}, requested ticks {ticks}. \
+             Best ask is order #{} tokenContract {} (price {}, ticks {})",
+            best.order_id,
+            best.token_contract.as_deref().unwrap_or("<none>"),
+            best.price_per_tick,
+            best.ticks
+        ),
+        None => format!(
+            "no resting asks in this model book for max_price_per_tick {max_price_per_tick}, requested ticks {ticks}"
+        ),
+    }
+}
+
 fn check_full_fill_only(ask: &OrderBookOrder, ticks: u128) -> Result<(), String> {
     if ask.ticks == ticks {
         return Ok(());
@@ -912,9 +938,7 @@ fn selected_model_buy_ask(
 ) -> Result<OrderBookOrder, String> {
     let asks = coalesce_equivalent_resting_asks(asks)?;
     let Some(best) = next_matching_ask(&asks, max_price_per_tick, ticks) else {
-        return Err(format!(
-            "no matchable ask for max_price_per_tick {max_price_per_tick}, requested ticks {ticks}"
-        ));
+        return Err(no_matching_ask_reason(&asks, max_price_per_tick, ticks));
     };
     check_full_fill_only(best, ticks)?;
     Ok(best.clone())
@@ -937,18 +961,34 @@ fn selected_model_buy_ask_matching_executable_depth(
     ticks: u128,
 ) -> Result<OrderBookOrder, String> {
     let raw_asks = coalesce_equivalent_resting_asks(raw_asks)?;
-    let raw_selected = selected_model_buy_ask(&raw_asks, max_price_per_tick, ticks).ok();
-    selected_model_buy_ask(executable_asks, max_price_per_tick, ticks).map_err(|e| {
-        let raw = raw_selected
-            .as_ref()
-            .map(describe_buy_ask)
-            .unwrap_or_else(|| "no raw matching ask".to_string());
+    let raw_selected = selected_model_buy_ask(&raw_asks, max_price_per_tick, ticks).map_err(|e| {
         format!(
-            "no executable matching ask after skipping unreadable or already-used TokenContracts: {e}. \
-             raw order-book head candidate: {raw}. Retry after the seller posts a fresh ask, or clean/cancel \
-             the stale order-book rows if you operate this market"
+            "raw order-book matcher has no submit-safe ask: {e}. Retry after the seller posts a fresh whole ask, \
+             or clean/cancel stale order-book rows if you operate this market"
         )
-    })
+    })?;
+    let executable_selected =
+        selected_model_buy_ask(executable_asks, max_price_per_tick, ticks).map_err(|e| {
+            format!(
+                "raw order-book matcher would select {}, but executable-depth check has no matching ask: {e}. \
+                 Refusing to send escrow while stale/unreadable rows block the real matcher",
+                describe_buy_ask(&raw_selected)
+            )
+        })?;
+    let same_tc = raw_selected
+        .token_contract
+        .as_deref()
+        .zip(executable_selected.token_contract.as_deref())
+        .is_some_and(|(raw, executable)| raw.eq_ignore_ascii_case(executable));
+    if !same_tc || raw_selected.order_id != executable_selected.order_id {
+        return Err(format!(
+            "raw order-book matcher would select {}, but executable quote selected {}. \
+             Refusing to send escrow while stale/unreadable rows block the real matcher",
+            describe_buy_ask(&raw_selected),
+            describe_buy_ask(&executable_selected)
+        ));
+    }
+    Ok(executable_selected)
 }
 
 fn orderbook_stats_for_error(snapshot: &OrderBookSnapshot) -> String {
@@ -1226,6 +1266,23 @@ mod offer_rested_match_tests {
     }
 
     #[test]
+    fn model_only_preflight_reports_price_ceiling_below_best_ask() {
+        let asks = vec![parsed_ask(199, "0:best", 11, 1)];
+        let quote = crate::chain::executable_quote(&asks, Some(1), None)
+            .expect("the same book is quoteable without the buyer ceiling");
+        assert!(quote.complete);
+
+        let err = check_model_buy_full_fill(&asks, 10, 1).unwrap_err();
+
+        assert!(err.contains("best ask price 11"), "{err}");
+        assert!(err.contains("above buyer max_price_per_tick 10"), "{err}");
+        assert!(
+            err.contains("Raise --max-price-per-tick to at least 11"),
+            "{err}"
+        );
+    }
+
+    #[test]
     fn model_only_preflight_accepts_equivalent_duplicate_active_tc_asks() {
         let asks = vec![
             parsed_ask(2, "0:DUP", 1000, 1),
@@ -1301,7 +1358,7 @@ mod offer_rested_match_tests {
     }
 
     #[test]
-    fn model_only_buy_preflight_accepts_live_ask_after_stale_head() {
+    fn model_only_buy_preflight_rejects_live_ask_after_stale_head() {
         let closed = "0:5701d680491b6ff787c18db8e3a2ecde799e039c595bee495d14c1a78cb4de57";
         let live = "0:7969c6c6012dce3575c0547857ce83bf8001e3deedd7ea0425af3b13d5b24704";
         let asks = vec![
@@ -1322,15 +1379,16 @@ mod offer_rested_match_tests {
         assert_eq!(q.fills.len(), 1);
         assert_eq!(q.fills[0].order_id, 35);
 
-        let selected =
-            selected_model_buy_ask_matching_executable_depth(&asks, &executable, 100, 1024)
-                .expect("later executable ask remains buyable despite stale raw rows");
-        assert_eq!(selected.order_id, 35);
-        assert_eq!(selected.token_contract.as_deref(), Some(live));
+        let err = selected_model_buy_ask_matching_executable_depth(&asks, &executable, 100, 1024)
+            .expect_err("raw head blocks later executable ask for submit");
+        assert!(err.contains("raw order-book matcher would select"), "{err}");
+        assert!(err.contains("order "), "{err}");
+        assert!(err.contains("executable quote selected order "), "{err}");
+        assert!(err.contains("Refusing to send escrow"), "{err}");
     }
 
     #[test]
-    fn quote_selection_skips_unreadable_raw_row_and_fills_later_live_ask() {
+    fn executable_filter_skips_unreadable_raw_row_but_preflight_rejects_mismatch() {
         let unreadable = "0:1111000000000000000000000000000000000000000000000000000000000000";
         let live = "0:2222000000000000000000000000000000000000000000000000000000000000";
         let raw_asks = vec![
@@ -1358,17 +1416,16 @@ mod offer_rested_match_tests {
         assert_eq!(quote.fills[0].order_id, 11);
         assert_eq!(quote.fills[0].token_contract, live);
 
-        let selected =
+        let err =
             selected_model_buy_ask_matching_executable_depth(&raw_asks, &executable, 100, 1024)
-                .expect(
-                    "quote selection follows executable depth after skipping unreadable raw rows",
-                );
-        assert_eq!(selected.order_id, 11);
-        assert_eq!(selected.token_contract.as_deref(), Some(live));
+                .expect_err("raw unreadable head blocks later executable ask for submit");
+        assert!(err.contains("raw order-book matcher would select"), "{err}");
+        assert!(err.contains("order "), "{err}");
+        assert!(err.contains("executable quote selected order "), "{err}");
     }
 
     #[test]
-    fn model_only_buy_preflight_accepts_skip_only_later_quote_selection() {
+    fn model_only_buy_preflight_rejects_skip_only_later_quote_selection() {
         let closed = "0:5701d680491b6ff787c18db8e3a2ecde799e039c595bee495d14c1a78cb4de57";
         let live = "0:7969c6c6012dce3575c0547857ce83bf8001e3deedd7ea0425af3b13d5b24704";
         let asks = vec![
@@ -1378,15 +1435,16 @@ mod offer_rested_match_tests {
         ];
         let skip_only_executable = vec![parsed_ask(35, live, 100, 1024)];
 
-        let selected = selected_model_buy_ask_matching_executable_depth(
+        let err = selected_model_buy_ask_matching_executable_depth(
             &asks,
             &skip_only_executable,
             100,
             1024,
         )
-        .expect("model-only preflight follows executable quote selection");
-        assert_eq!(selected.order_id, 35);
-        assert_eq!(selected.token_contract.as_deref(), Some(live));
+        .expect_err("model-only preflight must not follow skip-only executable depth");
+        assert!(err.contains("raw order-book matcher would select"), "{err}");
+        assert!(err.contains("order "), "{err}");
+        assert!(err.contains("executable quote selected order "), "{err}");
     }
 
     #[test]
@@ -1896,6 +1954,51 @@ impl RealChainBackend {
             }
         }
         Ok(executable)
+    }
+
+    pub async fn submit_safe_single_ask_quote(
+        &self,
+        snapshot: &OrderBookSnapshot,
+        wanted_ticks: Option<u128>,
+        budget: Option<u128>,
+    ) -> Result<ExecutableQuote> {
+        let asks = coalesce_equivalent_resting_asks(&snapshot.orders).map_err(|e| {
+            anyhow!(
+                "InferenceOrderBook {} exposes unsafe duplicate active sell orders: {e}",
+                snapshot.order_book
+            )
+        })?;
+        let Some(head) = asks.first() else {
+            return crate::chain::submit_safe_single_ask_quote(&asks, wanted_ticks, budget)
+                .map_err(|e| anyhow!("quote: {e}"));
+        };
+        let Some(token_contract) = head.token_contract.as_deref() else {
+            return Ok(ExecutableQuote {
+                filled_ticks: 0,
+                total_with_fee: 0,
+                complete: false,
+                fills: Vec::new(),
+            });
+        };
+        let Ok(tc) = Address::parse(token_contract) else {
+            return Ok(ExecutableQuote {
+                filled_ticks: 0,
+                total_with_fee: 0,
+                complete: false,
+                fills: Vec::new(),
+            });
+        };
+        let state = self.token_contract_state(&tc).await?;
+        if token_contract_non_executable_reason(state.as_ref()).is_some() {
+            return Ok(ExecutableQuote {
+                filled_ticks: 0,
+                total_with_fee: 0,
+                complete: false,
+                fills: Vec::new(),
+            });
+        }
+        crate::chain::submit_safe_single_ask_quote(&asks, wanted_ticks, budget)
+            .map_err(|e| anyhow!("quote: {e}"))
     }
 }
 
@@ -2997,22 +3100,25 @@ impl RealBuyerBackend {
         Ok((snapshot.order_book, selected))
     }
 
-    async fn assert_expected_buy_target(&self, tc: &Address) -> Result<String, ChainError> {
+    async fn assert_expected_buy_target(
+        &self,
+        tc: &Address,
+        ticks: u128,
+        max_price_per_tick: u128,
+    ) -> Result<String, ChainError> {
         let snapshot = self.orderbook_snapshot().await?;
         let asks: Vec<OrderBookOrder> = snapshot.resting_asks().cloned().collect();
         let want = tc.with_workchain().to_ascii_lowercase();
-        check_expected_buy_target(&asks, &want, self.max_price_per_tick, self.ticks).map_err(
-            |e| {
-                ChainError::Chain(format!(
-                    "buyer target preflight failed for InferenceOrderBook {}: {e}. IOB stats {}",
-                    snapshot.order_book,
-                    snapshot
-                        .stats
-                        .map(|s| format!("{s:?}"))
-                        .unwrap_or_else(|| "<book not active>".to_string())
-                ))
-            },
-        )?;
+        check_expected_buy_target(&asks, &want, max_price_per_tick, ticks).map_err(|e| {
+            ChainError::Chain(format!(
+                "buyer target preflight failed for InferenceOrderBook {}: {e}. IOB stats {}",
+                snapshot.order_book,
+                snapshot
+                    .stats
+                    .map(|s| format!("{s:?}"))
+                    .unwrap_or_else(|| "<book not active>".to_string())
+            ))
+        })?;
         Ok(snapshot.order_book)
     }
 
@@ -3078,7 +3184,9 @@ impl ChainBackend for RealBuyerBackend {
             .map_err(map_err)?;
         // `placeInferenceBuy` is model-book-wide and cannot name a target TC. Fail before moving escrow
         // unless the book's price->time matcher would fund the TC from this market manifest.
-        let order_book = self.assert_expected_buy_target(&expected).await?;
+        let order_book = self
+            .assert_expected_buy_target(&expected, self.ticks, self.max_price_per_tick)
+            .await?;
         let expected_tc = expected.with_workchain();
         self.assert_selected_tc_unused(&expected_tc, &order_book)
             .await?;
@@ -3108,6 +3216,34 @@ impl ChainBackend for RealBuyerBackend {
         self.model_buy_preflight_selection(ticks, max_price_per_tick)
             .await
             .map(|_| ())
+    }
+
+    async fn assert_explicit_buy_matches_executable_quote(
+        &self,
+        token_contract: &TokenContract,
+        ticks: u128,
+        max_price_per_tick: u128,
+    ) -> Result<(), ChainError> {
+        let expected = parse_tc(token_contract)?;
+        self.require_tc_gas(&expected).await?;
+        self.chain
+            .assert_note_owner_matches(
+                "buyer explicit-token quote preflight",
+                &self.note,
+                &self.keys,
+            )
+            .await
+            .map_err(map_err)?;
+        let order_book = self
+            .assert_expected_buy_target(&expected, ticks, max_price_per_tick)
+            .await?;
+        let expected_tc = expected.with_workchain();
+        self.assert_selected_tc_unused(&expected_tc, &order_book)
+            .await
+    }
+
+    fn requires_submit_safe_single_ask_quote(&self) -> bool {
+        true
     }
 
     /// Model-only buy(no pre-known TC): the buyer derives the book from `--frame-model` and places a limit

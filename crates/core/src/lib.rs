@@ -41,11 +41,12 @@ pub use chain::{
     check_matched_token_contract_state, check_no_duplicate_resting_asks, check_reclaimable,
     check_recoverable, check_release_disputable, check_seller_pubkey, check_withdrawable_shell,
     deal_anomalies, duplicate_resting_ask_token_contracts, executable_quote, per_model_breakdown,
-    required_escrow_for_buy, ChainBackend, ChainError, CounterpartyTally, DealAnomaly,
-    DealChainState, DealRole, DealView, ExecutableQuote, Match, MatchWatchCursor,
-    MatchedTokenContractStatus, MockChainBackend, ModelBreakdown, NoteSnapshot, OfferListing,
-    OrderBookOrder, OrderBookSnapshot, OrderBookStats, OrderBookSubscription, QuoteFill, SellOffer,
-    StreamSnapshot, TokenContract, TreeSnapshot, MATCH_OPEN_TIMEOUT_SECS, UNKNOWN_MODEL,
+    required_escrow_for_buy, submit_safe_single_ask_quote, ChainBackend, ChainError,
+    CounterpartyTally, DealAnomaly, DealChainState, DealRole, DealView, ExecutableQuote, Match,
+    MatchWatchCursor, MatchedTokenContractStatus, MockChainBackend, ModelBreakdown, NoteSnapshot,
+    OfferListing, OrderBookOrder, OrderBookSnapshot, OrderBookStats, OrderBookSubscription,
+    QuoteFill, SellOffer, StreamSnapshot, TokenContract, TreeSnapshot, MATCH_OPEN_TIMEOUT_SECS,
+    UNKNOWN_MODEL,
 };
 pub use handover::Handover;
 pub use machine::{InvariantError, Settlement, StreamMachine, StreamState, Tick};

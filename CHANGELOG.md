@@ -1,3 +1,31 @@
+## v0.0.5
+
+- release: bump version to 0.0.5
+- fix: align shellnet quote with buyer submit path
+- directive: buyer place_buy fix (for executor)
+- agents(8): fix = regression test + live shellnet proof (owner rule)
+- docs: fix dexdo-install doctor/policy wording
+- release: publish dexdo-install skill (allow-list + normalize)
+- skills: dexdo-install (install the CLI + get an agent working)
+- fix: dexdo --version reports the release version (0.0.4)
+- test: cover quote stale liquidity regression
+- agents(10): /executor never merge; lead-only merge after Section 9 (money-path)
+- fix: skip stale buyer preflight rows
+- Spec/RFC: Attested Seller Relay (dexdo-in-TEE)
+- release: ASCII gate on release notes (close the notes gap)
+- fix: build portable linux musl releases
+- feat: data-driven per-model verification + Path A fail-closed
+- fix: generalize model registry aliases
+- docs: directive for Linux release portability
+- docs(agents): explicit push targets + private vs public push
+- ci: smoke-test release binaries + install
+- Wire buyer failure policy dispatch
+- Handle post-reject ERR_NOT_OPEN terminally
+- skills: english public seller+buyer skills
+- fix registry-backed qwen content identity
+- Add buyer continuity mode flag
+- buyer continuity -- no auto-reclaim/rebuy on idle (demand-gated + kill-switch)
+
 ## v0.0.4
 
 - fix: dexdo --version reports the release version (0.0.4)

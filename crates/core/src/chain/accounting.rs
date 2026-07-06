@@ -94,6 +94,64 @@ pub fn executable_quote(
     })
 }
 
+/// Compute a quote for the current shellnet submit path, which can safely buy only one whole ask.
+/// `executable_quote` remains the generic depth calculator and may partially fill asks. The current
+/// `placeInferenceBuy` client path cannot safely submit partial or multi-ask fills: it places a model-wide
+/// buy with no order id/TC target, so the book's price-time head must be a single ask that exactly matches
+/// the submitted tick count.
+pub fn submit_safe_single_ask_quote(
+    asks: &[OrderBookOrder],
+    wanted_ticks: Option<u128>,
+    budget: Option<u128>,
+) -> Result<ExecutableQuote, String> {
+    if wanted_ticks.is_some() == budget.is_some() {
+        return Err("set exactly one of ticks or budget".to_string());
+    }
+    let asks = coalesce_equivalent_resting_asks(asks)?;
+    let Some(ask) = asks.first() else {
+        return Ok(ExecutableQuote {
+            filled_ticks: 0,
+            total_with_fee: 0,
+            complete: false,
+            fills: Vec::new(),
+        });
+    };
+    let cost = required_escrow_for_buy(ask.ticks, ask.price_per_tick);
+    let Some(token_contract) = ask.token_contract.clone() else {
+        return Ok(ExecutableQuote {
+            filled_ticks: 0,
+            total_with_fee: 0,
+            complete: false,
+            fills: Vec::new(),
+        });
+    };
+    let fits_request = match (wanted_ticks, budget) {
+        (Some(want), None) => ask.ticks == want,
+        (None, Some(limit)) => cost != 0 && cost != u128::MAX && cost <= limit,
+        _ => unreachable!("validated exactly one selector above"),
+    };
+    if !fits_request {
+        return Ok(ExecutableQuote {
+            filled_ticks: 0,
+            total_with_fee: 0,
+            complete: false,
+            fills: Vec::new(),
+        });
+    }
+    Ok(ExecutableQuote {
+        filled_ticks: ask.ticks,
+        total_with_fee: cost,
+        complete: true,
+        fills: vec![QuoteFill {
+            order_id: ask.order_id,
+            token_contract,
+            ticks: ask.ticks,
+            price_per_tick: ask.price_per_tick,
+            cost_with_fee: cost,
+        }],
+    })
+}
+
 /// Coalesce duplicate resting asks for the same `TokenContract` only when they are equivalent candidates.
 /// Legacy live books can contain repeated active SELL rows for one TC. They are not independent liquidity, but
 /// if they expose the same owner/economic state, the order book's deterministic price/time head can still be
