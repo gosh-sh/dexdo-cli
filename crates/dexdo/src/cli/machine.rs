@@ -138,8 +138,24 @@ pub(crate) fn classify_error(operation: &str, err: &anyhow::Error) -> ErrorCode 
     if msg.contains("no liquidity") {
         return ErrorCode::NoLiquidity;
     }
+    if msg.contains("no executable matching ask")
+        || msg.contains("no matchable ask")
+        || msg.contains("executable quote depth has no matching")
+    {
+        return ErrorCode::NoLiquidity;
+    }
     if msg.contains("incomplete quote") || msg.contains("not enough") {
         return ErrorCode::IncompleteQuote;
+    }
+    if msg.contains("selected tokencontract") || msg.contains("refusing to move escrow") {
+        return ErrorCode::ChainRevert;
+    }
+    if msg.contains("buyer model-only preflight failed")
+        || msg.contains("buyer target preflight failed")
+        || msg.contains("placeinferencebuy cannot target")
+        || msg.contains("refusing to send escrow into the wrong deal")
+    {
+        return ErrorCode::ChainRevert;
     }
     if msg.contains("insufficient") || msg.contains("balance") || msg.contains("deposit") {
         return ErrorCode::InsufficientBalance;
@@ -546,6 +562,24 @@ mod tests {
                 ErrorCode::NotRecoverableYet,
             ),
             (anyhow::anyhow!("deal is disputed"), ErrorCode::DisputedDeal),
+            (
+                anyhow::anyhow!(
+                    "buyer model-only preflight failed for InferenceOrderBook 0:book: no executable matching ask after skipping unreadable or already-used TokenContracts"
+                ),
+                ErrorCode::NoLiquidity,
+            ),
+            (
+                anyhow::anyhow!(
+                    "buyer target preflight failed for InferenceOrderBook 0:book: placeInferenceBuy cannot target a TokenContract; refusing to send escrow into the wrong deal"
+                ),
+                ErrorCode::ChainRevert,
+            ),
+            (
+                anyhow::anyhow!(
+                    "selected TokenContract 0:tc is already used by chain state (funded); refusing to move escrow"
+                ),
+                ErrorCode::ChainRevert,
+            ),
         ];
         for (err, code) in cases {
             assert_eq!(classify_error(OP_BUYER_START, &err), code);

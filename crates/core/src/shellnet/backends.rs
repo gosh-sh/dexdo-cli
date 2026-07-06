@@ -930,43 +930,25 @@ fn describe_buy_ask(ask: &OrderBookOrder) -> String {
     )
 }
 
-fn same_buy_target(a: &OrderBookOrder, b: &OrderBookOrder) -> bool {
-    a.order_id == b.order_id
-        && a.price_per_tick == b.price_per_tick
-        && a.ticks == b.ticks
-        && a.token_contract
-            .as_deref()
-            .zip(b.token_contract.as_deref())
-            .is_some_and(|(left, right)| left.eq_ignore_ascii_case(right))
-}
-
 fn selected_model_buy_ask_matching_executable_depth(
     raw_asks: &[OrderBookOrder],
     executable_asks: &[OrderBookOrder],
     max_price_per_tick: u128,
     ticks: u128,
 ) -> Result<OrderBookOrder, String> {
-    let raw_selected = selected_model_buy_ask(raw_asks, max_price_per_tick, ticks)?;
-    let executable_selected =
-        selected_model_buy_ask(executable_asks, max_price_per_tick, ticks).map_err(|e| {
-            format!(
-                "raw on-chain matcher would see {}, but executable quote depth has no matching whole ask: {e}. \
-                 placeInferenceBuy(modelHash, ...) cannot target an order id or TokenContract; operator cleanup \
-                 of stale raw order-book rows is required before this legacy book can be safely bought",
-                describe_buy_ask(&raw_selected)
-            )
-        })?;
-    if same_buy_target(&raw_selected, &executable_selected) {
-        return Ok(raw_selected);
-    }
-    Err(format!(
-        "model-only buy blocked by stale raw order-book head: raw on-chain matcher would see {} before \
-         executable quote selected {}. placeInferenceBuy(modelHash, ...) cannot target an order id or \
-         TokenContract; operator cleanup of stale raw order-book rows is required before this legacy book \
-         can be safely bought",
-        describe_buy_ask(&raw_selected),
-        describe_buy_ask(&executable_selected)
-    ))
+    let raw_asks = coalesce_equivalent_resting_asks(raw_asks)?;
+    let raw_selected = selected_model_buy_ask(&raw_asks, max_price_per_tick, ticks).ok();
+    selected_model_buy_ask(executable_asks, max_price_per_tick, ticks).map_err(|e| {
+        let raw = raw_selected
+            .as_ref()
+            .map(describe_buy_ask)
+            .unwrap_or_else(|| "no raw matching ask".to_string());
+        format!(
+            "no executable matching ask after skipping unreadable or already-used TokenContracts: {e}. \
+             raw order-book head candidate: {raw}. Retry after the seller posts a fresh ask, or clean/cancel \
+             the stale order-book rows if you operate this market"
+        )
+    })
 }
 
 fn orderbook_stats_for_error(snapshot: &OrderBookSnapshot) -> String {
@@ -1267,7 +1249,7 @@ mod offer_rested_match_tests {
     }
 
     #[test]
-    fn executable_filter_stops_at_closed_duplicate_head() {
+    fn executable_filter_skips_closed_duplicate_head() {
         let closed = "0:5701d680491b6ff787c18db8e3a2ecde799e039c595bee495d14c1a78cb4de57";
         let live = "0:7969d680491b6ff787c18db8e3a2ecde799e039c595bee495d14c1a78cb44704";
         let asks = vec![
@@ -1281,16 +1263,16 @@ mod offer_rested_match_tests {
         let executable =
             executable_resting_asks_by_state(&asks, |tc| states.get(&tc.to_ascii_lowercase()))
                 .expect("equivalent stale duplicates are safe to filter");
-        assert!(
-            executable.is_empty(),
-            "a stale raw head blocks later asks because placeInferenceBuy cannot target them"
-        );
+        assert_eq!(executable.len(), 1);
+        assert_eq!(executable[0].order_id, 19);
+        assert_eq!(executable[0].token_contract.as_deref(), Some(live));
 
         let q = crate::chain::executable_quote(&executable, Some(1024), None)
-            .expect("blocked executable depth should still quote as no-liquidity");
-        assert!(!q.complete);
-        assert_eq!(q.filled_ticks, 0);
-        assert!(q.fills.is_empty());
+            .expect("later live ask should remain executable despite stale head");
+        assert!(q.complete);
+        assert_eq!(q.filled_ticks, 1024);
+        assert_eq!(q.fills.len(), 1);
+        assert_eq!(q.fills[0].order_id, 19);
     }
 
     #[test]
@@ -1311,13 +1293,15 @@ mod offer_rested_match_tests {
         let executable =
             executable_resting_asks_by_state(&asks, |tc| states.get(&tc.to_ascii_lowercase()))
                 .expect("live prefix before a stale tail remains executable");
-        assert_eq!(executable.len(), 1);
+        assert_eq!(executable.len(), 2);
         assert_eq!(executable[0].order_id, 35);
         assert_eq!(executable[0].token_contract.as_deref(), Some(live));
+        assert_eq!(executable[1].order_id, 37);
+        assert_eq!(executable[1].token_contract.as_deref(), Some(after));
     }
 
     #[test]
-    fn model_only_buy_preflight_rejects_when_raw_stale_head_blocks_depth() {
+    fn model_only_buy_preflight_accepts_live_ask_after_stale_head() {
         let closed = "0:5701d680491b6ff787c18db8e3a2ecde799e039c595bee495d14c1a78cb4de57";
         let live = "0:7969c6c6012dce3575c0547857ce83bf8001e3deedd7ea0425af3b13d5b24704";
         let asks = vec![
@@ -1329,29 +1313,62 @@ mod offer_rested_match_tests {
         states.insert(live.to_ascii_lowercase(), fresh_tc_state());
         let executable =
             executable_resting_asks_by_state(&asks, |tc| states.get(&tc.to_ascii_lowercase()))
-                .expect("stale raw head is a submit-safety barrier");
-        assert!(executable.is_empty());
+                .expect("stale raw rows are skipped in executable depth");
+        assert_eq!(executable.len(), 1);
+        assert_eq!(executable[0].order_id, 35);
         let q = crate::chain::executable_quote(&executable, Some(1024), None)
-            .expect("blocked executable depth should quote as no-liquidity");
-        assert!(!q.complete);
-        assert!(q.fills.is_empty());
+            .expect("later live ask should quote");
+        assert!(q.complete);
+        assert_eq!(q.fills.len(), 1);
+        assert_eq!(q.fills[0].order_id, 35);
 
-        let err = selected_model_buy_ask_matching_executable_depth(&asks, &executable, 100, 1024)
-            .expect_err("model-only buy cannot safely target the later executable ask");
-        assert!(
-            err.contains("raw on-chain matcher would see order "),
-            "{err}"
-        );
-        assert!(
-            err.contains("executable quote depth has no matching whole ask"),
-            "{err}"
-        );
-        assert!(err.contains("placeInferenceBuy(modelHash"), "{err}");
-        assert!(err.contains("operator cleanup"), "{err}");
+        let selected =
+            selected_model_buy_ask_matching_executable_depth(&asks, &executable, 100, 1024)
+                .expect("later executable ask remains buyable despite stale raw rows");
+        assert_eq!(selected.order_id, 35);
+        assert_eq!(selected.token_contract.as_deref(), Some(live));
     }
 
     #[test]
-    fn model_only_buy_preflight_rejects_skip_only_later_quote_selection() {
+    fn quote_selection_skips_unreadable_raw_row_and_fills_later_live_ask() {
+        let unreadable = "0:1111000000000000000000000000000000000000000000000000000000000000";
+        let live = "0:2222000000000000000000000000000000000000000000000000000000000000";
+        let raw_asks = vec![
+            parsed_ask(10, unreadable, 100, 1024),
+            parsed_ask(11, live, 100, 1024),
+        ];
+        let raw_depth_ticks: u128 = raw_asks.iter().map(|ask| ask.ticks).sum();
+        assert_eq!(raw_asks.len(), 2);
+        assert_eq!(raw_depth_ticks, 2048);
+
+        let mut states = BTreeMap::new();
+        states.insert(live.to_ascii_lowercase(), fresh_tc_state());
+        let executable =
+            executable_resting_asks_by_state(&raw_asks, |tc| states.get(&tc.to_ascii_lowercase()))
+                .expect("unreadable raw rows are skipped in quote executable depth");
+        assert_eq!(executable.len(), 1);
+        assert_eq!(executable[0].order_id, 11);
+        assert_eq!(executable[0].token_contract.as_deref(), Some(live));
+
+        let quote = crate::chain::executable_quote(&executable, Some(1024), None)
+            .expect("quote still fills the later live ask");
+        assert!(quote.complete);
+        assert_eq!(quote.filled_ticks, 1024);
+        assert_eq!(quote.fills.len(), 1);
+        assert_eq!(quote.fills[0].order_id, 11);
+        assert_eq!(quote.fills[0].token_contract, live);
+
+        let selected =
+            selected_model_buy_ask_matching_executable_depth(&raw_asks, &executable, 100, 1024)
+                .expect(
+                    "quote selection follows executable depth after skipping unreadable raw rows",
+                );
+        assert_eq!(selected.order_id, 11);
+        assert_eq!(selected.token_contract.as_deref(), Some(live));
+    }
+
+    #[test]
+    fn model_only_buy_preflight_accepts_skip_only_later_quote_selection() {
         let closed = "0:5701d680491b6ff787c18db8e3a2ecde799e039c595bee495d14c1a78cb4de57";
         let live = "0:7969c6c6012dce3575c0547857ce83bf8001e3deedd7ea0425af3b13d5b24704";
         let asks = vec![
@@ -1361,20 +1378,15 @@ mod offer_rested_match_tests {
         ];
         let skip_only_executable = vec![parsed_ask(35, live, 100, 1024)];
 
-        let err = selected_model_buy_ask_matching_executable_depth(
+        let selected = selected_model_buy_ask_matching_executable_depth(
             &asks,
             &skip_only_executable,
             100,
             1024,
         )
-        .expect_err("model-only buy cannot trust skip-only quote selection");
-        assert!(
-            err.contains("raw on-chain matcher would see order "),
-            "{err}"
-        );
-        assert!(err.contains("executable quote selected order "), "{err}");
-        assert!(err.contains("placeInferenceBuy(modelHash"), "{err}");
-        assert!(err.contains("operator cleanup"), "{err}");
+        .expect("model-only preflight follows executable quote selection");
+        assert_eq!(selected.order_id, 35);
+        assert_eq!(selected.token_contract.as_deref(), Some(live));
     }
 
     #[test]
@@ -1408,7 +1420,7 @@ mod offer_rested_match_tests {
     }
 
     #[test]
-    fn executable_filter_stops_at_used_duplicate_head() {
+    fn executable_filter_skips_used_duplicate_head() {
         let used = "0:1111000000000000000000000000000000000000000000000000000000000000";
         let live = "0:2222000000000000000000000000000000000000000000000000000000000000";
         let asks = vec![
@@ -1423,10 +1435,9 @@ mod offer_rested_match_tests {
         let executable =
             executable_resting_asks_by_state(&asks, |tc| states.get(&tc.to_ascii_lowercase()))
                 .expect("used duplicate rows are non-executable depth");
-        assert!(
-            executable.is_empty(),
-            "used raw head blocks later asks because the matcher cannot target them"
-        );
+        assert_eq!(executable.len(), 1);
+        assert_eq!(executable[0].order_id, 3);
+        assert_eq!(executable[0].token_contract.as_deref(), Some(live));
     }
 
     #[test]
@@ -1567,10 +1578,10 @@ where
     let mut executable = Vec::new();
     for ask in asks {
         let Some(tc) = ask.token_contract.as_deref() else {
-            break;
+            continue;
         };
         if token_contract_non_executable_reason(state_for_tc(tc)).is_some() {
-            break;
+            continue;
         }
         executable.push(ask);
     }
@@ -1873,19 +1884,15 @@ impl RealChainBackend {
         })?;
         let mut executable = Vec::with_capacity(asks.len());
         for ask in asks {
-            // `placeInferenceBuy(modelHash,...)` cannot name a later order. Once the raw matcher would hit a
-            // non-executable ask, later asks are not submit-safe executable depth until the stale row is cleared.
             let Some(token_contract) = ask.token_contract.as_deref() else {
-                break;
+                continue;
             };
             let Ok(tc) = Address::parse(token_contract) else {
-                break;
+                continue;
             };
             let state = self.token_contract_state(&tc).await?;
             if token_contract_non_executable_reason(state.as_ref()).is_none() {
                 executable.push(ask);
-            } else {
-                break;
             }
         }
         Ok(executable)
