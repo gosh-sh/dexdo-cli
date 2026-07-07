@@ -40,7 +40,10 @@ pub async fn chat_completions(
     if let Err(reason) = state.check_model(req.model.as_deref()) {
         return reject(StatusCode::BAD_REQUEST, &reason);
     }
-    let deal = state.current_deal().await;
+    let deal = match state.current_deal().await {
+        Ok(deal) => deal,
+        Err(reason) => return reject(StatusCode::SERVICE_UNAVAILABLE, &reason),
+    };
     let request_guard = deal.begin_request(now_secs());
     // Session-scoped lifecycle: once the local deal is closed (terminal settlement landed or policy
     // recovery is pending) no new request may open a stream on the closed deal.

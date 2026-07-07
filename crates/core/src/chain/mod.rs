@@ -117,8 +117,8 @@ pub trait ChainBackend: Send + Sync {
     ) -> Result<(), ChainError> {
         Ok(())
     }
-    /// The current real shellnet submit path can safely buy only a single whole ask at the raw price-time head.
-    /// Mock/backends without that order-book limitation keep the generic partial-depth quote.
+    /// The current real shellnet submit path requires raw price/time depth with per-fill TC state checks.
+    /// Mock/backends without that order-book limitation keep the generic quote.
     fn requires_submit_safe_single_ask_quote(&self) -> bool {
         false
     }
@@ -535,12 +535,15 @@ mod tests {
     }
 
     #[test]
-    fn submit_safe_single_ask_quote_rejects_partial_head_fill() {
+    fn submit_safe_single_ask_quote_accepts_partial_head_fill() {
         let q =
             submit_safe_single_ask_quote(&[ask(1, "0:one", 1000, 1024)], Some(1), None).unwrap();
-        assert!(!q.complete);
-        assert_eq!(q.filled_ticks, 0);
-        assert!(q.fills.is_empty());
+        assert!(q.complete);
+        assert_eq!(q.filled_ticks, 1);
+        assert_eq!(q.total_with_fee, required_escrow_for_buy(1, 1000));
+        assert_eq!(q.fills.len(), 1);
+        assert_eq!(q.fills[0].order_id, 1);
+        assert_eq!(q.fills[0].ticks, 1);
     }
 
     #[test]
@@ -559,24 +562,37 @@ mod tests {
     }
 
     #[test]
-    fn submit_safe_single_ask_quote_does_not_skip_mismatched_head() {
+    fn submit_safe_single_ask_quote_uses_crossing_depth_without_exact_head_size() {
         let q = submit_safe_single_ask_quote(
             &[ask(1, "0:small", 900, 1), ask(2, "0:exact", 1000, 1024)],
             Some(1024),
             None,
         )
         .unwrap();
-        assert!(!q.complete);
-        assert_eq!(q.filled_ticks, 0);
-        assert!(q.fills.is_empty());
+        assert!(q.complete);
+        assert_eq!(q.filled_ticks, 1024);
+        assert_eq!(q.fills.len(), 2);
+        assert_eq!(q.fills[0].order_id, 1);
+        assert_eq!(q.fills[0].ticks, 1);
+        assert_eq!(q.fills[1].order_id, 2);
+        assert_eq!(q.fills[1].ticks, 1023);
     }
 
     #[test]
-    fn submit_safe_single_ask_quote_budget_mode_uses_one_whole_head_ask() {
+    fn submit_safe_single_ask_quote_reports_fok_incomplete_depth() {
+        let q = submit_safe_single_ask_quote(&[ask(1, "0:small", 900, 1)], Some(2), None).unwrap();
+        assert!(!q.complete);
+        assert_eq!(q.filled_ticks, 1);
+        assert_eq!(q.fills.len(), 1);
+    }
+
+    #[test]
+    fn submit_safe_single_ask_quote_budget_mode_uses_head_ask_only() {
         let q =
             submit_safe_single_ask_quote(&[ask(1, "0:one", 1000, 4)], None, Some(4099)).unwrap();
-        assert!(!q.complete);
-        assert_eq!(q.filled_ticks, 0);
+        assert!(q.complete);
+        assert_eq!(q.filled_ticks, 3);
+        assert_eq!(q.total_with_fee, required_escrow_for_buy(3, 1000));
 
         let q =
             submit_safe_single_ask_quote(&[ask(1, "0:one", 1000, 4)], None, Some(4100)).unwrap();

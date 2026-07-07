@@ -908,14 +908,13 @@ fn no_matching_ask_reason(
     }
 }
 
-fn check_full_fill_only(ask: &OrderBookOrder, ticks: u128) -> Result<(), String> {
-    if ask.ticks == ticks {
+fn check_single_head_capacity(ask: &OrderBookOrder, ticks: u128) -> Result<(), String> {
+    if ask.ticks >= ticks {
         return Ok(());
     }
     Err(format!(
-        "refusing partial/multi-ask fill: order #{} tokenContract {} has {} ticks, buyer requested {ticks}. \
-         Current shellnet must be bought as a whole ask; live  reproduced ticks < ask ticks removing the \
-         ask without funding the TokenContract.",
+        "refusing multi-ask fill: order #{} tokenContract {} has only {} ticks, buyer requested {ticks}. \
+         Current shellnet submit is accepted only when the price/time head ask alone covers the request.",
         ask.order_id,
         ask.token_contract.as_deref().unwrap_or("<none>"),
         ask.ticks,
@@ -940,7 +939,7 @@ fn selected_model_buy_ask(
     let Some(best) = next_matching_ask(&asks, max_price_per_tick, ticks) else {
         return Err(no_matching_ask_reason(&asks, max_price_per_tick, ticks));
     };
-    check_full_fill_only(best, ticks)?;
+    check_single_head_capacity(best, ticks)?;
     Ok(best.clone())
 }
 
@@ -963,7 +962,7 @@ fn selected_model_buy_ask_matching_executable_depth(
     let raw_asks = coalesce_equivalent_resting_asks(raw_asks)?;
     let raw_selected = selected_model_buy_ask(&raw_asks, max_price_per_tick, ticks).map_err(|e| {
         format!(
-            "raw order-book matcher has no submit-safe ask: {e}. Retry after the seller posts a fresh whole ask, \
+            "raw order-book matcher has no submit-safe ask: {e}. Retry after the seller posts a fresh ask with enough ticks, \
              or clean/cancel stale order-book rows if you operate this market"
         )
     })?;
@@ -1029,7 +1028,7 @@ fn check_expected_buy_target(
         .as_deref()
         .is_some_and(|tc| tc.eq_ignore_ascii_case(expected_tc_lower))
     {
-        check_full_fill_only(best, ticks)?;
+        check_single_head_capacity(best, ticks)?;
         return Ok(());
     }
     Err(match expected {
@@ -1243,20 +1242,15 @@ mod offer_rested_match_tests {
     }
 
     #[test]
-    fn buyer_target_preflight_rejects_expected_partial_fill() {
+    fn buyer_target_preflight_accepts_expected_partial_fill() {
         let asks = vec![parsed_ask(1, "0:expected", 1000, 10)];
-        let err = check_expected_buy_target(&asks, "0:expected", 1000, 2).unwrap_err();
-        assert!(err.contains("refusing partial/multi-ask fill"), "{err}");
-        assert!(err.contains("has 10 ticks"), "{err}");
-        assert!(err.contains("buyer requested 2"), "{err}");
+        assert!(check_expected_buy_target(&asks, "0:expected", 1000, 2).is_ok());
     }
 
     #[test]
-    fn model_only_preflight_rejects_partial_fill_before_submit() {
+    fn model_only_preflight_accepts_partial_fill_before_submit() {
         let asks = vec![parsed_ask(1, "0:best", 1000, 2)];
-        let err = check_model_buy_full_fill(&asks, 1000, 1).unwrap_err();
-        assert!(err.contains("refusing partial/multi-ask fill"), "{err}");
-        assert!(err.contains("tokenContract 0:best"), "{err}");
+        assert!(check_model_buy_full_fill(&asks, 1000, 1).is_ok());
     }
 
     #[test]
@@ -1557,7 +1551,8 @@ mod offer_rested_match_tests {
     fn buyer_target_preflight_rejects_unmatchable_expected_ask() {
         let asks = vec![parsed_ask(5, "0:expected", 1000, 1)];
         let err = check_expected_buy_target(&asks, "0:expected", 1000, 2).unwrap_err();
-        assert!(err.contains("refusing partial/multi-ask fill"), "{err}");
+        assert!(err.contains("refusing multi-ask fill"), "{err}");
+        assert!(err.contains("has only 1 ticks"), "{err}");
     }
 
     #[test]
@@ -1968,37 +1963,31 @@ impl RealChainBackend {
                 snapshot.order_book
             )
         })?;
-        let Some(head) = asks.first() else {
-            return crate::chain::submit_safe_single_ask_quote(&asks, wanted_ticks, budget)
-                .map_err(|e| anyhow!("quote: {e}"));
-        };
-        let Some(token_contract) = head.token_contract.as_deref() else {
-            return Ok(ExecutableQuote {
-                filled_ticks: 0,
-                total_with_fee: 0,
-                complete: false,
-                fills: Vec::new(),
-            });
-        };
-        let Ok(tc) = Address::parse(token_contract) else {
-            return Ok(ExecutableQuote {
-                filled_ticks: 0,
-                total_with_fee: 0,
-                complete: false,
-                fills: Vec::new(),
-            });
-        };
-        let state = self.token_contract_state(&tc).await?;
-        if token_contract_non_executable_reason(state.as_ref()).is_some() {
-            return Ok(ExecutableQuote {
-                filled_ticks: 0,
-                total_with_fee: 0,
-                complete: false,
-                fills: Vec::new(),
-            });
+        let quote = crate::chain::submit_safe_single_ask_quote(&asks, wanted_ticks, budget)
+            .map_err(|e| anyhow!("quote: {e}"))?;
+        if !quote.complete {
+            return Ok(quote);
         }
-        crate::chain::submit_safe_single_ask_quote(&asks, wanted_ticks, budget)
-            .map_err(|e| anyhow!("quote: {e}"))
+        for fill in &quote.fills {
+            let Ok(tc) = Address::parse(&fill.token_contract) else {
+                return Ok(ExecutableQuote {
+                    filled_ticks: 0,
+                    total_with_fee: 0,
+                    complete: false,
+                    fills: Vec::new(),
+                });
+            };
+            let state = self.token_contract_state(&tc).await?;
+            if token_contract_non_executable_reason(state.as_ref()).is_some() {
+                return Ok(ExecutableQuote {
+                    filled_ticks: 0,
+                    total_with_fee: 0,
+                    complete: false,
+                    fills: Vec::new(),
+                });
+            }
+        }
+        Ok(quote)
     }
 }
 

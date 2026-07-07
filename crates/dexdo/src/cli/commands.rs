@@ -44,8 +44,6 @@ pub(crate) const DEAL_WAIT_SECS: u64 = 300;
 pub(crate) const RESUME_LOOKBACK_SECS: i64 = 1800;
 #[cfg(feature = "shellnet")]
 const DEFAULT_CONTRACTS_PATH: &str = "contracts/deployed.shellnet.json";
-#[cfg(feature = "shellnet")]
-const MODEL_REGISTRY_ABI_PATH: &str = "contracts/compiled_0.79.3/airegistry/ModelRegistry.abi.json";
 
 #[cfg(feature = "shellnet")]
 struct DealTarget {
@@ -150,16 +148,7 @@ async fn enforce_model_registry_policy(
     buyer_missing_book_policy: BuyerMissingBookPolicy,
 ) -> Result<RegistryBookAction> {
     let registry_address = policy.required_address(role)?;
-    let abi_path = std::path::Path::new(MODEL_REGISTRY_ABI_PATH);
-    if !abi_path.exists() {
-        bail!(
-            "ModelRegistry ABI {MODEL_REGISTRY_ABI_PATH} is not committed in this branch and contracts/deployed.shellnet.json has no usable live reader; cannot validate {} frame_model {} against {} before money moves",
-            role.as_str(),
-            frame_model,
-            registry_address
-        );
-    }
-    let reader = ShellnetModelRegistryReader::from_manifest(contracts, registry_address, abi_path)?;
+    let reader = ShellnetModelRegistryReader::from_manifest(contracts, registry_address)?;
     enforce_model_registry_policy_with_reader(
         &reader,
         role,
@@ -205,14 +194,7 @@ async fn resolve_content_identity_model(
             contracts.display()
         )
     })?;
-    let abi_path = std::path::Path::new(MODEL_REGISTRY_ABI_PATH);
-    if !abi_path.exists() {
-        bail!(
-            "ModelRegistry ABI {MODEL_REGISTRY_ABI_PATH} is not committed in this branch; cannot resolve content identity for frame_model {frame_model}"
-        );
-    }
-    let reader =
-        ShellnetModelRegistryReader::from_manifest(contracts, &registry_address, abi_path)?;
+    let reader = ShellnetModelRegistryReader::from_manifest(contracts, &registry_address)?;
     let identity = resolve_registered_model_identity(
         &reader,
         RegistryRole::Buyer,
@@ -230,6 +212,37 @@ async fn resolve_content_identity_model(
 ) -> Result<String> {
     let _ = (contracts, frame_model);
     bail!("content identity ModelRegistry resolution requires a shellnet build")
+}
+
+fn buyer_content_identity_resolution_result(
+    frame_model: &str,
+    allow_unverified_model: bool,
+    result: Result<String>,
+) -> Result<Option<String>> {
+    match result {
+        Ok(identity_model) => Ok(Some(identity_model)),
+        Err(error) if allow_unverified_model => {
+            tracing::warn!(
+                %frame_model,
+                error = %error,
+                "content identity registry resolution failed; continuing on name-only evidence because --allow-unverified-model was set"
+            );
+            Ok(None)
+        }
+        Err(error) => Err(error),
+    }
+}
+
+async fn resolve_buyer_content_identity_model(
+    contracts: &std::path::Path,
+    frame_model: &str,
+    allow_unverified_model: bool,
+) -> Result<Option<String>> {
+    buyer_content_identity_resolution_result(
+        frame_model,
+        allow_unverified_model,
+        resolve_content_identity_model(contracts, frame_model).await,
+    )
 }
 
 #[cfg(feature = "shellnet")]
@@ -1884,7 +1897,8 @@ fn status_next_for(
     let action = match (role, state, funded, opened, probe_accepted) {
         (_, "closed", _, _, _) => "none",
         (Some("seller"), "stopped", _, _, _) => "destroy",
-        (Some("seller"), _, _, true, _) => "wait_for_buyer_stop",
+        (Some("seller"), _, _, true, false) => "seller_advance_probe_after_timeout",
+        (Some("seller"), _, _, true, true) => "seller_advance_or_wait_buyer_stop",
         (Some("seller"), _, true, false, false) => "buyer_cleanup_after_timeout",
         (Some("buyer"), _, _, true, _) => "stream_stop_or_reclaim_after_timeout",
         (Some("buyer"), _, true, false, false) => "cleanup_unopened_after_timeout",
@@ -1897,6 +1911,8 @@ fn status_next_for(
         retryable_after_unix: None,
         command: if action == "none" {
             "none".to_string()
+        } else if action.starts_with("seller_advance") {
+            "seller".to_string()
         } else {
             "close".to_string()
         },
@@ -2425,11 +2441,9 @@ pub(crate) async fn run_close(args: CloseArgs) -> Result<()> {
             }
             if s.opened {
                 bail!(
-                    "close: seller cannot destroy opened deal {}. Buyer must STOP/recover/reclaim first. Next: \
-                     buyer runs `dexdo close <buyer-handle> --note-key <buyer-key>` or `dexdo reclaim --token-contract {}` \
-                     when timeout permits.",
+                    "close: seller cannot destroy opened deal {}. {}",
                     target.token_contract,
-                    target.token_contract
+                    close_hint(&target, &s)
                 );
             }
             if s.kind != deals::DealStateKind::Stopped {
@@ -2675,9 +2689,14 @@ fn close_hint(target: &DealTarget, s: &deals::DealStateSummary) -> String {
         Some(deals::DealHandleRole::Seller) if s.kind == deals::DealStateKind::Stopped => {
             format!("next=destroy command=`dexdo close {deal} --note-key <seller-key>`")
         }
+        Some(deals::DealHandleRole::Seller) if s.opened && !s.probe_accepted => {
+            format!(
+                "next=seller_advance_probe_after_timeout command=`keep dexdo seller running for {deal}; it calls TokenContract.advance() after PROBE_WINDOW` reason=buyer_silent_probe"
+            )
+        }
         Some(deals::DealHandleRole::Seller) if s.opened => {
             format!(
-                "next=wait_for_buyer_stop command=`dexdo status {deal}`; buyer may run `dexdo close <buyer-handle> --note-key <buyer-key>`"
+                "next=seller_advance_or_wait_buyer_stop command=`keep dexdo seller running for {deal}`; buyer may STOP when done"
             )
         }
         Some(deals::DealHandleRole::Seller) if s.funded && !s.probe_accepted => {
@@ -3582,7 +3601,7 @@ fn matched_state_summary(
 async fn handover_timeout_diagnostic(
     chain: &dyn ChainBackend,
     token_contract: &dexdo_core::TokenContract,
-    last_error: &dyn std::fmt::Display,
+    last_error: &str,
 ) -> String {
     match validate_reported_match_state(chain, token_contract).await {
         Ok(status @ MatchedTokenContractStatus::FundedNeverOpened { .. }) => format!(
@@ -4013,7 +4032,9 @@ fn spawn_buyer_service_renewal(
         let mut prepare_retry: Option<PrepareRetry> = None;
         loop {
             tokio::time::sleep(std::time::Duration::from_secs(1)).await;
-            let active = deals.current().await;
+            let Some(active) = deals.current().await else {
+                continue;
+            };
             let current_tc = active.route.token_contract.clone();
             if prepare_retry
                 .as_ref()
@@ -4416,6 +4437,720 @@ fn validate_buyer_runtime_surface_policy(
     );
 }
 
+type SharedBuyerEvents = Option<Arc<tokio::sync::Mutex<machine::BuyerEventWriter>>>;
+
+async fn emit_shared_buyer_event(
+    events: &SharedBuyerEvents,
+    event: &'static str,
+    operation: &'static str,
+    fields: Value,
+) -> Result<()> {
+    if let Some(events) = events {
+        events.lock().await.event(event, operation, fields)?;
+    }
+    Ok(())
+}
+
+fn require_complete_buyer_quote(selection: &BuyerQuoteSelection) -> Result<()> {
+    if selection.quote.filled_ticks == 0 {
+        bail!("buyer quote: no liquidity");
+    }
+    if !selection.quote.complete {
+        bail!(
+            "buyer quote: incomplete quote filled_ticks={}",
+            selection.quote.filled_ticks
+        );
+    }
+    Ok(())
+}
+
+fn is_replay_protection_error(err: &anyhow::Error) -> bool {
+    let msg = err.to_string().to_ascii_lowercase();
+    msg.contains("exit code 52") || msg.contains("replay protection")
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn prepare_lazy_buyer_api_deal_with_replay_backoff(
+    chain: Arc<dyn ChainBackend>,
+    buyer: Arc<dexdo::buyer::Buyer>,
+    args: Arc<BuyerArgs>,
+    explicit_tc: Option<String>,
+    frame_model: String,
+    buyer_policy: Option<policy::BuyerRuntimePolicy>,
+    api_failure_policy: dexdo::buyer::api::BuyerApiFailurePolicy,
+    events: SharedBuyerEvents,
+) -> Result<dexdo::buyer::api::ApiDeal, String> {
+    const MAX_ATTEMPTS: u64 = 3;
+    let mut attempt = 1u64;
+    loop {
+        let result = prepare_lazy_buyer_api_deal_once(
+            chain.clone(),
+            buyer.clone(),
+            args.clone(),
+            explicit_tc.clone(),
+            frame_model.clone(),
+            buyer_policy.clone(),
+            api_failure_policy,
+            events.clone(),
+            attempt,
+        )
+        .await;
+        match result {
+            Ok(deal) => return Ok(deal),
+            Err(err) if is_replay_protection_error(&err) && attempt < MAX_ATTEMPTS => {
+                let backoff_secs = attempt.saturating_mul(2);
+                let _ = emit_shared_buyer_event(
+                    &events,
+                    "purchase_progress",
+                    machine::OP_BUYER_RUNTIME,
+                    json!({
+                        "stage": "replay_protection_backoff",
+                        "attempt": attempt,
+                        "next_attempt": attempt + 1,
+                        "backoff_secs": backoff_secs,
+                        "diagnostic": "shellnet replay protection exit 52; retrying after backoff"
+                    }),
+                )
+                .await;
+                tokio::time::sleep(std::time::Duration::from_secs(backoff_secs)).await;
+                attempt = attempt.saturating_add(1);
+            }
+            Err(err) if is_replay_protection_error(&err) => {
+                return Err(format!(
+                    "on-demand purchase failed after replay-protection retries: {err}"
+                ));
+            }
+            Err(err) => return Err(err.to_string()),
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn prepare_lazy_buyer_api_deal_once(
+    chain: Arc<dyn ChainBackend>,
+    buyer: Arc<dexdo::buyer::Buyer>,
+    args: Arc<BuyerArgs>,
+    explicit_tc: Option<String>,
+    frame_model: String,
+    buyer_policy: Option<policy::BuyerRuntimePolicy>,
+    api_failure_policy: dexdo::buyer::api::BuyerApiFailurePolicy,
+    events: SharedBuyerEvents,
+    attempt: u64,
+) -> Result<dexdo::buyer::api::ApiDeal> {
+    emit_shared_buyer_event(
+        &events,
+        "purchase_progress",
+        machine::OP_BUYER_RUNTIME,
+        json!({
+            "stage": "started",
+            "attempt": attempt,
+            "frame_model": frame_model.clone()
+        }),
+    )
+    .await?;
+    if !args.mock.mock_chain {
+        emit_shared_buyer_event(
+            &events,
+            "purchase_progress",
+            machine::OP_BUYER_RUNTIME,
+            json!({
+                "stage": "shellnet_preflight",
+                "attempt": attempt,
+                "frame_model": frame_model.clone()
+            }),
+        )
+        .await?;
+        shellnet_doctor_preflight(&args.contracts, args.market.as_deref()).await?;
+        if let Some(policy) = load_enabled_model_registry_policy(
+            RegistryRole::Buyer,
+            &args.registry,
+            &args.contracts,
+        )? {
+            reject_buyer_raw_token_contract_without_registry_book_proof(
+                args.market.as_deref(),
+                args.token_contract.as_deref(),
+                &frame_model,
+            )?;
+            let expected_order_book = if let Some(market) = args.market.as_deref() {
+                load_market(market)?.inference_order_book
+            } else {
+                let note_addr = args.identity.note_addr.as_deref().ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "real shellnet: --note-addr is required to derive the buyer order book"
+                    )
+                })?;
+                expected_order_book_for_note(&args.contracts, note_addr, &frame_model).await?
+            };
+            let order_book_active =
+                order_book_active_from_contracts(&args.contracts, &expected_order_book).await?;
+            enforce_model_registry_policy(
+                RegistryRole::Buyer,
+                &policy,
+                &args.contracts,
+                &frame_model,
+                &expected_order_book,
+                order_book_active,
+                BuyerMissingBookPolicy::Reject,
+            )
+            .await?;
+        }
+    }
+
+    let mut service_renewal: Option<(u128, u128, u128)> = None;
+    let (mut token_contract, buy_ticks) = match explicit_tc.clone() {
+        Some(tc) => {
+            if args.resume {
+                emit_shared_buyer_event(
+                    &events,
+                    "resume_selected",
+                    machine::OP_BUYER_START,
+                    json!({
+                        "token_contract": tc.clone(),
+                        "role": "buyer",
+                        "source": "token_contract",
+                        "deal_handle": deals::make_handle_id(&tc),
+                        "frame_model": frame_model.clone()
+                    }),
+                )
+                .await?;
+            } else {
+                let selection = buyer_quote_selection(
+                    chain.as_ref(),
+                    Some(&tc),
+                    args.ticks,
+                    args.max_price_per_tick,
+                    args.escrow,
+                )
+                .await?;
+                require_complete_buyer_quote(&selection)?;
+                emit_shared_buyer_event(
+                    &events,
+                    "quote_selected",
+                    machine::OP_BUYER_START,
+                    quote_selected_fields(
+                        &frame_model,
+                        &selection,
+                        args.ticks,
+                        args.max_price_per_tick,
+                    ),
+                )
+                .await?;
+                buyer.place_buy(chain.as_ref(), &tc).await?;
+                emit_shared_buyer_event(
+                    &events,
+                    "buy_submitted",
+                    machine::OP_BUYER_START,
+                    json!({
+                        "frame_model": frame_model.clone(),
+                        "order_book": "explicit_token_contract",
+                        "ticks": machine::amount(args.ticks),
+                        "max_price_per_tick": machine::amount(args.max_price_per_tick),
+                        "escrow": machine::amount(selection.escrow)
+                    }),
+                )
+                .await?;
+                emit_shared_buyer_event(
+                    &events,
+                    "matched",
+                    machine::OP_BUYER_START,
+                    json!({
+                        "frame_model": frame_model.clone(),
+                        "order_book": "explicit_token_contract",
+                        "token_contract": tc.clone()
+                    }),
+                )
+                .await?;
+            }
+            (tc, args.ticks)
+        }
+        None if args.resume => {
+            let since_unix = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_secs() as i64)
+                .unwrap_or(0)
+                - RESUME_LOOKBACK_SECS;
+            let tc = chain
+                .wait_matched_token_contract(
+                    since_unix,
+                    std::time::Duration::from_secs(DEAL_WAIT_SECS),
+                )
+                .await?;
+            chain.assert_model_only_resume_target(&tc).await?;
+            emit_shared_buyer_event(
+                &events,
+                "resume_selected",
+                machine::OP_BUYER_START,
+                json!({
+                    "token_contract": tc.clone(),
+                    "role": "buyer",
+                    "source": "note_fill_event",
+                    "deal_handle": deals::make_handle_id(&tc),
+                    "frame_model": frame_model.clone()
+                }),
+            )
+            .await?;
+            (tc, args.ticks)
+        }
+        None => {
+            let ticks = args.ticks;
+            let max_price = args.max_price_per_tick;
+            let escrow = args
+                .escrow
+                .unwrap_or_else(|| dexdo_core::required_escrow_for_buy(ticks, max_price));
+            service_renewal = Some((ticks, max_price, escrow));
+            let selection =
+                buyer_quote_selection(chain.as_ref(), None, ticks, max_price, Some(escrow)).await?;
+            require_complete_buyer_quote(&selection)?;
+            emit_shared_buyer_event(
+                &events,
+                "quote_selected",
+                machine::OP_BUYER_START,
+                quote_selected_fields(&frame_model, &selection, ticks, max_price),
+            )
+            .await?;
+            let since_unix = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_secs() as i64)
+                .unwrap_or(0);
+            chain
+                .place_buy_by_model(buyer.note.as_ref(), ticks, max_price, escrow)
+                .await?;
+            emit_shared_buyer_event(
+                &events,
+                "buy_submitted",
+                machine::OP_BUYER_START,
+                json!({
+                    "frame_model": frame_model.clone(),
+                    "order_book": selection.order_book,
+                    "ticks": machine::amount(ticks),
+                    "max_price_per_tick": machine::amount(max_price),
+                    "escrow": machine::amount(escrow)
+                }),
+            )
+            .await?;
+            let tc = chain
+                .wait_matched_token_contract(
+                    since_unix,
+                    std::time::Duration::from_secs(DEAL_WAIT_SECS),
+                )
+                .await?;
+            validate_reported_match_state(chain.as_ref(), &tc).await?;
+            emit_shared_buyer_event(
+                &events,
+                "matched",
+                machine::OP_BUYER_START,
+                json!({
+                    "frame_model": frame_model.clone(),
+                    "order_book": "model_order_book",
+                    "token_contract": tc.clone()
+                }),
+            )
+            .await?;
+            (tc, ticks)
+        }
+    };
+
+    let mut handover_attempt = 1u64;
+    let handover = 'handover: loop {
+        let hv_deadline =
+            std::time::Instant::now() + std::time::Duration::from_secs(DEAL_WAIT_SECS);
+        let hv_deadline_unix = machine::now_unix()?.saturating_add(DEAL_WAIT_SECS);
+        emit_shared_buyer_event(
+            &events,
+            "handover_waiting",
+            machine::OP_BUYER_START,
+            json!({
+                "token_contract": token_contract.clone(),
+                "deadline_unix": hv_deadline_unix,
+                "poll_interval_ms": 500
+            }),
+        )
+        .await?;
+        loop {
+            match buyer
+                .resolve_endpoint(chain.as_ref(), &token_contract)
+                .await
+            {
+                Ok(h) => break 'handover h,
+                Err(e) => {
+                    if is_malformed_handover_error(&e) {
+                        if let Some(policy) = buyer_policy.as_ref() {
+                            apply_malformed_handover_policy(
+                                chain.as_ref(),
+                                buyer.as_ref(),
+                                &token_contract,
+                                policy,
+                                &e,
+                            )
+                            .await?;
+                        }
+                        anyhow::bail!("buyer: malformed handover for {token_contract}: {e}");
+                    }
+                    if std::time::Instant::now() >= hv_deadline {
+                        let last_error = e.to_string();
+                        let diagnostic = handover_timeout_diagnostic(
+                            chain.as_ref(),
+                            &token_contract,
+                            &last_error,
+                        )
+                        .await;
+                        if let Some(policy) = buyer_policy.as_ref() {
+                            match apply_no_handover_after_match_policy(
+                                chain.as_ref(),
+                                buyer.as_ref(),
+                                &token_contract,
+                                policy,
+                                service_renewal,
+                                handover_attempt,
+                                &diagnostic,
+                            )
+                            .await?
+                            {
+                                NoHandoverPolicyOutcome::RetryCurrent => continue 'handover,
+                                NoHandoverPolicyOutcome::RetryNext(next) => {
+                                    token_contract = next;
+                                    handover_attempt = handover_attempt.saturating_add(1);
+                                    continue 'handover;
+                                }
+                            }
+                        }
+                        anyhow::bail!("{}", diagnostic);
+                    }
+                    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+                }
+            }
+        }
+    };
+
+    let deal_handle = deals::make_handle_id(&token_contract);
+    emit_shared_buyer_event(
+        &events,
+        "handover_received",
+        machine::OP_BUYER_START,
+        json!({
+            "token_contract": token_contract.clone(),
+            "deal_handle": deal_handle.clone(),
+            "handover_anchor": {"kind":"token_contract_state","value":"handover_present"}
+        }),
+    )
+    .await?;
+
+    let should_save_handle = !args.mock.mock_chain || events.is_some();
+    if should_save_handle {
+        let mock_note_addr;
+        let note_addr = if args.mock.mock_chain {
+            mock_note_addr = format!("mock:{}", note_pubkey_id(&buyer.note.pubkey()));
+            mock_note_addr.as_str()
+        } else {
+            args.identity.note_addr.as_deref().ok_or_else(|| {
+                anyhow::anyhow!("real shellnet: --note-addr is required to save the deal handle")
+            })?
+        };
+        let endpoint = args.local_listen.map(|addr| deals::DealEndpointInfo {
+            kind: "local-listen".to_string(),
+            value: addr.to_string(),
+        });
+        let input = RuntimeDealHandleInput {
+            role: deals::DealHandleRole::Buyer,
+            deals_dir: args.deals_dir.as_deref(),
+            token_contract: &token_contract,
+            note_addr,
+            frame_model: &frame_model,
+            market_path: args.market.as_deref(),
+            contracts: &args.contracts,
+            endpoint,
+        };
+        if args.mock.mock_chain {
+            save_mock_runtime_deal_handle(input)?;
+        } else {
+            save_runtime_deal_handle(input, events.is_none())?;
+        }
+    }
+
+    let content_identity_model = if args.mock.mock_chain {
+        None
+    } else {
+        resolve_buyer_content_identity_model(
+            &args.contracts,
+            &frame_model,
+            args.allow_unverified_model,
+        )
+        .await?
+    };
+    let content_identity_model_ref = content_identity_model.as_deref();
+    let content_check_model = content_identity_model_ref.unwrap_or(&frame_model);
+    let models_cfg = std::sync::Arc::new(dexdo::seller::ModelsConfig::load_or_empty(&args.models)?);
+    let has_ref_key =
+        dexdo::buyer::verify::reference_endpoint_for(content_check_model, &models_cfg)
+            .map(|e| {
+                std::env::var(&e.api_key_env)
+                    .map(|k| !k.is_empty())
+                    .unwrap_or(false)
+            })
+            .unwrap_or(false);
+    let content_check = dexdo::buyer::api::content_check_policy(
+        &frame_model,
+        content_identity_model_ref,
+        args.mock.mock_model,
+        args.allow_unverified_model,
+        has_ref_key,
+        &models_cfg,
+    )?;
+    let session = Arc::new(dexdo::buyer::api::SessionSettle::new_with_failure_policy(
+        chain,
+        token_contract.clone(),
+        buyer.note.clone(),
+        api_failure_policy,
+    ));
+    Ok(dexdo::buyer::api::ApiDeal::new(
+        dexdo::buyer::api::Route {
+            handover,
+            token_contract,
+            max_tokens: consumer_api_token_budget(buy_ticks),
+        },
+        session,
+        Arc::new(dexdo::buyer::api::ContentGate::new(
+            content_check,
+            models_cfg,
+        )),
+    ))
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn run_buyer_on_demand_local_api(
+    args: BuyerArgs,
+    chain: Arc<dyn ChainBackend>,
+    buyer: dexdo::buyer::Buyer,
+    explicit_tc: Option<String>,
+    frame_model: String,
+    buyer_policy: Option<policy::BuyerRuntimePolicy>,
+    api_failure_policy: dexdo::buyer::api::BuyerApiFailurePolicy,
+    events: SharedBuyerEvents,
+) -> Result<()> {
+    use dexdo::buyer::api::{self, ApiState};
+
+    let bind = args
+        .local_listen
+        .ok_or_else(|| anyhow::anyhow!("on-demand local API requires --local-listen"))?;
+    let buyer = Arc::new(buyer);
+    let args = Arc::new(args);
+    let pending_token_contract = "pending:on-demand";
+    let pending_deal_handle = "pending:on-demand";
+    emit_shared_buyer_event(
+        &events,
+        "endpoint_binding",
+        machine::OP_BUYER_START,
+        json!({
+            "token_contract": pending_token_contract,
+            "deal_handle": pending_deal_handle,
+            "requested_bind_addr": bind.to_string(),
+            "allow_port_zero": bind.port() == 0
+        }),
+    )
+    .await?;
+
+    let initializer = {
+        let chain = chain.clone();
+        let buyer = buyer.clone();
+        let args = args.clone();
+        let explicit_tc = explicit_tc.clone();
+        let frame_model = frame_model.clone();
+        let buyer_policy = buyer_policy.clone();
+        let events = events.clone();
+        Arc::new(move || {
+            let chain = chain.clone();
+            let buyer = buyer.clone();
+            let args = args.clone();
+            let explicit_tc = explicit_tc.clone();
+            let frame_model = frame_model.clone();
+            let buyer_policy = buyer_policy.clone();
+            let events = events.clone();
+            Box::pin(async move {
+                prepare_lazy_buyer_api_deal_with_replay_backoff(
+                    chain,
+                    buyer,
+                    args,
+                    explicit_tc,
+                    frame_model,
+                    buyer_policy,
+                    api_failure_policy,
+                    events,
+                )
+                .await
+            }) as dexdo::buyer::api::DealInitFuture
+        }) as dexdo::buyer::api::DealInitializer
+    };
+    let state = ApiState::lazy(
+        buyer,
+        frame_model.clone(),
+        initializer,
+        std::time::Duration::from_secs(DEAL_WAIT_SECS),
+    );
+    let deals = state.deals.clone();
+    let (addr, task) = match api::serve(
+        bind,
+        state,
+        args.anthropic_compat,
+        operator_shutdown_signal(),
+    )
+    .await
+    {
+        Ok(ok) => ok,
+        Err(err) => {
+            if let Some(events) = &events {
+                let code = machine::classify_error(machine::OP_BUYER_START, &err);
+                events.lock().await.error(
+                    machine::OP_BUYER_START,
+                    code,
+                    json!({
+                        "network": if args.mock.mock_chain { "mock" } else { "shellnet" },
+                        "frame_model": frame_model.clone(),
+                        "requested_bind_addr": bind.to_string()
+                    }),
+                )?;
+                return Err(machine::printed_error());
+            }
+            return Err(err);
+        }
+    };
+    let base_url = format!("http://{addr}/v1");
+    let models_url = format!("{base_url}/models");
+    let readiness = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(2))
+        .build()?
+        .get(&models_url)
+        .send()
+        .await
+        .and_then(|r| r.error_for_status());
+    let models: serde_json::Value = match readiness {
+        Ok(response) => response.json().await?,
+        Err(err) => {
+            if let Some(events) = &events {
+                events.lock().await.error(
+                    machine::OP_BUYER_START,
+                    machine::ErrorCode::EndpointReadinessFailed,
+                    json!({
+                        "network": if args.mock.mock_chain { "mock" } else { "shellnet" },
+                        "frame_model": frame_model.clone(),
+                        "requested_bind_addr": bind.to_string()
+                    }),
+                )?;
+                return Err(machine::printed_error());
+            }
+            return Err(anyhow::anyhow!(
+                "endpoint readiness /v1/models failed: {err}"
+            ));
+        }
+    };
+    let ready = models["data"].as_array().is_some_and(|items| {
+        items
+            .iter()
+            .any(|item| item["id"].as_str() == Some(frame_model.as_str()))
+    });
+    if !ready {
+        if let Some(events) = &events {
+            events.lock().await.error(
+                machine::OP_BUYER_START,
+                machine::ErrorCode::EndpointReadinessFailed,
+                json!({
+                    "network": if args.mock.mock_chain { "mock" } else { "shellnet" },
+                    "frame_model": frame_model.clone(),
+                    "requested_bind_addr": bind.to_string()
+                }),
+            )?;
+            return Err(machine::printed_error());
+        }
+        bail!("endpoint readiness /v1/models did not include the selected model");
+    }
+    emit_shared_buyer_event(
+        &events,
+        "endpoint_ready",
+        machine::OP_BUYER_RUNTIME,
+        json!({
+            "token_contract": pending_token_contract,
+            "deal_handle": pending_deal_handle,
+            "bind_addr": addr.to_string(),
+            "base_url": base_url,
+            "models_url": models_url,
+            "served_models": [frame_model.clone()],
+            "anthropic_compat": args.anthropic_compat
+        }),
+    )
+    .await?;
+    tracing::info!(
+        %addr,
+        anthropic_compat = args.anthropic_compat,
+        "consumer API listening; on-demand purchase will run on first chat request"
+    );
+    task.await?;
+
+    let active = deals.current().await;
+    let (token_contract, deal_handle) = active
+        .as_ref()
+        .map(|deal| {
+            let tc = deal.route.token_contract.clone();
+            let handle = deals::make_handle_id(&tc);
+            (tc, handle)
+        })
+        .unwrap_or_else(|| {
+            (
+                pending_token_contract.to_string(),
+                pending_deal_handle.to_string(),
+            )
+        });
+    emit_shared_buyer_event(
+        &events,
+        "stopping",
+        machine::OP_BUYER_SHUTDOWN,
+        json!({
+            "token_contract": token_contract.clone(),
+            "deal_handle": deal_handle.clone(),
+            "reason": "signal"
+        }),
+    )
+    .await?;
+    emit_shared_buyer_event(
+        &events,
+        "settlement_submitted",
+        machine::OP_BUYER_SHUTDOWN,
+        json!({
+            "token_contract": token_contract.clone(),
+            "deal_handle": deal_handle.clone(),
+            "role": "buyer",
+            "action": "streamStop",
+            "submitted": active.is_some()
+        }),
+    )
+    .await?;
+    emit_shared_buyer_event(
+        &events,
+        "settled",
+        machine::OP_BUYER_SHUTDOWN,
+        json!({
+            "token_contract": token_contract.clone(),
+            "deal_handle": deal_handle.clone(),
+            "role": "buyer",
+            "action": "streamStop",
+            "state": if active.is_some() { "stopped" } else { "no_deal" },
+            "terminal": false
+        }),
+    )
+    .await?;
+    emit_shared_buyer_event(
+        &events,
+        "exiting",
+        machine::OP_BUYER_SHUTDOWN,
+        json!({
+            "token_contract": token_contract,
+            "deal_handle": deal_handle,
+            "outcome": "settled",
+            "exit_code": 0
+        }),
+    )
+    .await?;
+    Ok(())
+}
+
 async fn run_buyer_inner(
     args: BuyerArgs,
     machine_events: &mut Option<machine::BuyerEventWriter>,
@@ -4523,6 +5258,32 @@ async fn run_buyer_inner(
         );
         validate_buyer_runtime_surface_policy(policy, args.local_listen)?;
     }
+    // The chain is selected by a flag: `--mock-chain` -> mock(as in D1, also requires `--mock-model`), otherwise
+    // real shellnet(per-role buyer backend behind the `shellnet` feature; without the feature -> explicit failure).
+    let (chain, note) = if args.mock.mock_chain {
+        args.mock.require_mock_model()?;
+        let endpoints_file = resolve_endpoints_file(args.endpoints_file.clone())?;
+        mock_chain_and_note(endpoints_file, &args.identity)?
+    } else {
+        buyer_real_backend(&args, &frame_model)?
+    };
+    let buyer = dexdo::buyer::Buyer::from_note(note);
+    if args.local_listen.is_some() && args.continuity_mode == ContinuityModeArg::OnDemand {
+        let events = machine_events
+            .take()
+            .map(|writer| Arc::new(tokio::sync::Mutex::new(writer)));
+        return run_buyer_on_demand_local_api(
+            args,
+            chain,
+            buyer,
+            explicit_tc,
+            frame_model,
+            buyer_policy,
+            api_failure_policy,
+            events,
+        )
+        .await;
+    }
     if !args.mock.mock_chain {
         shellnet_doctor_preflight(&args.contracts, args.market.as_deref()).await?;
         if let Some(policy) = load_enabled_model_registry_policy(
@@ -4559,16 +5320,6 @@ async fn run_buyer_inner(
             .await?;
         }
     }
-    // The chain is selected by a flag: `--mock-chain` -> mock(as in D1, also requires `--mock-model`), otherwise
-    // real shellnet(per-role buyer backend behind the `shellnet` feature; without the feature -> explicit failure).
-    let (chain, note) = if args.mock.mock_chain {
-        args.mock.require_mock_model()?;
-        let endpoints_file = resolve_endpoints_file(args.endpoints_file.clone())?;
-        mock_chain_and_note(endpoints_file, &args.identity)?
-    } else {
-        buyer_real_backend(&args, &frame_model)?
-    };
-    let buyer = dexdo::buyer::Buyer::from_note(note);
     // Resolve the deal `TokenContract`: explicit(flag/manifest) or model-only (book -> choose -> buy -> fill
     // event). `buy_ticks` is the chosen volume(the consumer-API token budget tracks it).
     let mut service_renewal: Option<(u128, u128, u128)> = None;
@@ -4844,8 +5595,13 @@ async fn run_buyer_inner(
                         anyhow::bail!("buyer: malformed handover for {token_contract}: {e}");
                     }
                     if std::time::Instant::now() >= hv_deadline {
-                        let diagnostic =
-                            handover_timeout_diagnostic(chain.as_ref(), &token_contract, &e).await;
+                        let last_error = e.to_string();
+                        let diagnostic = handover_timeout_diagnostic(
+                            chain.as_ref(),
+                            &token_contract,
+                            &last_error,
+                        )
+                        .await;
                         if let Some(policy) = buyer_policy.as_ref() {
                             match apply_no_handover_after_match_policy(
                                 chain.as_ref(),
@@ -4950,7 +5706,12 @@ async fn run_buyer_inner(
         let content_identity_model = if args.mock.mock_chain {
             None
         } else {
-            Some(resolve_content_identity_model(&args.contracts, &frame_model).await?)
+            resolve_buyer_content_identity_model(
+                &args.contracts,
+                &frame_model,
+                args.allow_unverified_model,
+            )
+            .await?
         };
         let content_identity_model_ref = content_identity_model.as_deref();
         let content_check_model = content_identity_model_ref.unwrap_or(&frame_model);
@@ -6384,6 +7145,48 @@ mod tests {
     use crate::cli::args::SubscriptionPlaceArgs;
 
     #[test]
+    fn seller_open_probe_status_points_to_advance_not_buyer_stop() {
+        let next = super::status_next_for(Some("seller"), "probe", true, true, false);
+
+        assert_eq!(next.action, "seller_advance_probe_after_timeout");
+        assert_eq!(next.command, "seller");
+    }
+
+    #[cfg(feature = "shellnet")]
+    #[test]
+    fn seller_open_probe_close_hint_points_to_advance_not_buyer_cleanup() {
+        let target = super::DealTarget {
+            handle: None,
+            token_contract: "0:tc".to_string(),
+            role: Some(crate::cli::deals::DealHandleRole::Seller),
+            note_addr: Some("0:seller".to_string()),
+            market: None,
+        };
+        let summary = crate::cli::deals::DealStateSummary {
+            kind: crate::cli::deals::DealStateKind::Probe,
+            funded: true,
+            opened: true,
+            disputed: false,
+            probe_accepted: false,
+            deposit: 0,
+            prepaid: 0,
+            frozen: 0,
+            finalized_owed: 0,
+            funded_time: Some(1),
+            last_advance: 1,
+        };
+
+        let hint = super::close_hint(&target, &summary);
+
+        assert!(
+            hint.contains("next=seller_advance_probe_after_timeout"),
+            "{hint}"
+        );
+        assert!(hint.contains("TokenContract.advance()"), "{hint}");
+        assert!(!hint.contains("wait_for_buyer_stop"), "{hint}");
+    }
+
+    #[test]
     fn buyer_renewal_threshold_uses_env_override() {
         let old = std::env::var("DEXDO_BUYER_RENEWAL_THRESHOLD_TOKENS").ok();
         std::env::set_var("DEXDO_BUYER_RENEWAL_THRESHOLD_TOKENS", "999999");
@@ -6650,7 +7453,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn buyer_model_only_quote_selection_rejects_partial_head_ask() {
+    async fn buyer_model_only_quote_selection_accepts_partial_head_ask() {
         let chain = QuotePreflightChain {
             offers: vec![QuotePreflightChain::offer("0:big", 1000, 1024)],
             submit_safe_single_ask_quote: true,
@@ -6662,13 +7465,19 @@ mod tests {
             .expect("selection returns an explicit no-liquidity quote");
 
         assert_eq!(selection.order_book, "model_order_book");
-        assert!(!selection.quote.complete);
-        assert_eq!(selection.quote.filled_ticks, 0);
-        assert!(selection.quote.fills.is_empty());
+        assert!(selection.quote.complete);
+        assert_eq!(selection.quote.filled_ticks, 1);
+        assert_eq!(
+            selection.quote.total_with_fee,
+            dexdo_core::required_escrow_for_buy(1, 1000)
+        );
+        assert_eq!(selection.quote.fills.len(), 1);
+        assert_eq!(selection.quote.fills[0].ticks, 1);
+        assert_eq!(selection.quote.fills[0].token_contract, "0:big");
     }
 
     #[tokio::test]
-    async fn buyer_explicit_quote_selection_rejects_partial_synthetic_terms() {
+    async fn buyer_explicit_quote_selection_accepts_partial_synthetic_terms() {
         let chain = QuotePreflightChain {
             sell_offer_terms: Some((1000, 1024)),
             submit_safe_single_ask_quote: true,
@@ -6680,9 +7489,15 @@ mod tests {
             .expect("selection returns an explicit no-liquidity quote");
 
         assert_eq!(selection.order_book, "explicit_token_contract");
-        assert!(!selection.quote.complete);
-        assert_eq!(selection.quote.filled_ticks, 0);
-        assert!(selection.quote.fills.is_empty());
+        assert!(selection.quote.complete);
+        assert_eq!(selection.quote.filled_ticks, 1);
+        assert_eq!(
+            selection.quote.total_with_fee,
+            dexdo_core::required_escrow_for_buy(1, 1000)
+        );
+        assert_eq!(selection.quote.fills.len(), 1);
+        assert_eq!(selection.quote.fills[0].ticks, 1);
+        assert_eq!(selection.quote.fills[0].token_contract, "0:big");
     }
 
     #[cfg(feature = "shellnet")]
@@ -6999,6 +7814,163 @@ mod tests {
                 "qwen--qwen3--32b",
             )
             .is_ok()
+        );
+    }
+
+    /// released-style binaries must not need
+    /// `contracts/compiled_0.79.3/airegistry/ModelRegistry.abi.json` in the current working directory just to
+    /// resolve the buyer's content identity. The ABI source is embedded in `registry.rs`; this guard keeps the
+    /// CLI from reintroducing the old `abi_path.exists()` bail.
+    #[test]
+    fn content_identity_resolution_uses_embedded_model_registry_abi() {
+        let source = include_str!("commands.rs");
+        let start = source
+            .find("async fn resolve_content_identity_model")
+            .expect("content identity resolver present");
+        let end = source[start..]
+            .find("#[cfg(not(feature = \"shellnet\"))]")
+            .map(|offset| start + offset)
+            .expect("resolver end marker present");
+        let body = &source[start..end];
+
+        assert!(
+            body.contains(
+                "ShellnetModelRegistryReader::from_manifest(contracts, &registry_address)"
+            ),
+            "resolver must use the embedded-ABI ModelRegistry reader"
+        );
+        assert!(
+            !body.contains("abi_path") && !body.contains(".exists()"),
+            "resolver must not depend on a cwd/filesystem ABI path"
+        );
+        assert!(
+            !body.contains("not committed in this branch"),
+            "released binaries must not bail because ModelRegistry.abi.json is absent from cwd"
+        );
+    }
+
+    #[test]
+    fn buyer_content_identity_resolution_error_fails_closed_without_allow_flag() {
+        let err = super::buyer_content_identity_resolution_result(
+            "qwen--qwen3--32b",
+            false,
+            Err(anyhow::anyhow!("registry unreachable")),
+        )
+        .expect_err("strict buyer must fail closed on registry resolution failure")
+        .to_string();
+
+        assert!(err.contains("registry unreachable"), "{err}");
+    }
+
+    #[test]
+    fn buyer_allow_unverified_model_degrades_resolution_error_to_name_only() {
+        let identity = super::buyer_content_identity_resolution_result(
+            "qwen--qwen3--32b",
+            true,
+            Err(anyhow::anyhow!("registry unreachable")),
+        )
+        .expect("allow-unverified buyer may continue on name-only evidence");
+
+        assert_eq!(identity, None);
+    }
+
+    #[cfg(feature = "shellnet")]
+    #[tokio::test]
+    #[ignore = "live : read-only released-style content identity resolution via embedded ModelRegistry ABI"]
+    async fn live_content_identity_resolution_works_without_modelregistry_abi_file_in_cwd() {
+        static CWD_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+        let _lock = CWD_LOCK.lock().unwrap();
+
+        struct RestoreCwd {
+            old: std::path::PathBuf,
+            tmp: std::path::PathBuf,
+        }
+
+        impl Drop for RestoreCwd {
+            fn drop(&mut self) {
+                let _ = std::env::set_current_dir(&self.old);
+                let _ = std::fs::remove_dir_all(&self.tmp);
+            }
+        }
+
+        let old = std::env::current_dir().expect("current cwd");
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("system clock before unix epoch")
+            .as_nanos();
+        let tmp = std::env::temp_dir().join(format!(
+            "dexdo-308-release-cwd-{}-{nanos}",
+            std::process::id()
+        ));
+        std::fs::create_dir(&tmp).expect("create release-style cwd");
+        let _restore = RestoreCwd {
+            old,
+            tmp: tmp.clone(),
+        };
+        std::env::set_current_dir(&tmp).expect("enter release-style cwd");
+
+        let cwd_abi = tmp.join("contracts/compiled_0.79.3/airegistry/ModelRegistry.abi.json");
+        assert!(
+            !cwd_abi.exists(),
+            "test cwd must not carry the ModelRegistry ABI file"
+        );
+        let contracts = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../../contracts/deployed.shellnet.json");
+        let identity = super::resolve_content_identity_model(&contracts, "qwen--qwen3--32b")
+            .await
+            .expect("resolve qwen content identity from embedded ModelRegistry ABI");
+        assert_eq!(identity, "Qwen/Qwen3-32B");
+        println!(
+            "live  evidence: release-style cwd={} cwd_abi_absent=true frame_model=qwen--qwen3--32b identity={identity}",
+            tmp.display()
+        );
+    }
+
+    #[cfg(feature = "shellnet")]
+    #[tokio::test]
+    #[ignore = "live -carry: bad ModelRegistry manifest fails strict and downgrades only with --allow-unverified-model"]
+    async fn live_allow_unverified_model_downgrades_unreachable_registry_to_name_only() {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("system clock before unix epoch")
+            .as_nanos();
+        let tmp = std::env::temp_dir().join(format!(
+            "dexdo-307-bad-registry-{}-{nanos}",
+            std::process::id()
+        ));
+        std::fs::create_dir(&tmp).expect("create scratch manifest dir");
+        let _cleanup = TempDirCleanup(tmp.clone());
+
+        let contracts = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../../contracts/deployed.shellnet.json");
+        let mut manifest: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&contracts).expect("read contracts manifest"))
+                .expect("parse contracts manifest");
+        let bad_registry = "0:2222222222222222222222222222222222222222222222222222222222222222";
+        manifest["model_registry"] = serde_json::Value::String(bad_registry.to_string());
+        let scratch = tmp.join("deployed.bad-registry.json");
+        std::fs::write(
+            &scratch,
+            serde_json::to_vec_pretty(&manifest).expect("serialize scratch manifest"),
+        )
+        .expect("write scratch manifest");
+
+        let strict =
+            super::resolve_buyer_content_identity_model(&scratch, "qwen--qwen3--32b", false)
+                .await
+                .expect_err("strict buyer must fail closed when ModelRegistry is unreachable")
+                .to_string();
+        assert!(strict.contains("ModelRegistry"), "{strict}");
+
+        let allowed =
+            super::resolve_buyer_content_identity_model(&scratch, "qwen--qwen3--32b", true)
+                .await
+                .expect("allow-unverified buyer may continue on name-only evidence");
+        assert_eq!(allowed, None);
+        println!(
+            "live -carry evidence: scratch_manifest={} bad_registry={} strict_failed=true allow_unverified_name_only=true",
+            scratch.display(),
+            bad_registry
         );
     }
 
@@ -8580,6 +9552,13 @@ mod tests {
             BuyerAction::IgnoreStale { token_contract } if token_contract == "tc-clean"
         ));
         assert_eq!(chain.cleanup_calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn replay_protection_exit_52_is_retryable_for_lazy_buyer_init() {
+        let err =
+            anyhow::anyhow!("run_tvm getter getDetails exit code 52: Replay protection exception");
+        assert!(super::is_replay_protection_error(&err));
     }
 
     #[cfg(feature = "shellnet")]

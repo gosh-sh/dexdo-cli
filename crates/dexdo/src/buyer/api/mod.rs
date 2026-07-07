@@ -19,11 +19,17 @@ use crate::seller::ModelsConfig;
 use anyhow::Result;
 use dexdo_core::{ChainBackend, Handover, Note, TokenContract, MATCH_OPEN_TIMEOUT_SECS};
 use dexdo_proto::CanonChunk;
+use std::future::Future;
 use std::net::SocketAddr;
+use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tokio::sync::{Mutex, OnceCell, RwLock};
+
+pub type DealInitFuture = Pin<Box<dyn Future<Output = Result<ApiDeal, String>> + Send>>;
+pub type DealInitializer = Arc<dyn Fn() -> DealInitFuture + Send + Sync>;
+const DEFAULT_DEAL_INIT_TIMEOUT: Duration = Duration::from_secs(MATCH_OPEN_TIMEOUT_SECS);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum VerificationBailAction {
@@ -191,30 +197,73 @@ impl Drop for ConsumerRequestGuard {
 /// next handover first, atomically publish that next deal, then STOP the old session. That keeps the local
 /// OpenAI/Anthropic endpoint alive across deal boundaries without serving a request on a closed TC.
 pub struct RouteManager {
-    active: RwLock<ApiDeal>,
+    active: RwLock<Option<ApiDeal>>,
+    initializer: Option<DealInitializer>,
+    initializer_timeout: Duration,
+    initializer_lock: Mutex<()>,
 }
 
 impl RouteManager {
     pub fn new(active: ApiDeal) -> Self {
         Self {
-            active: RwLock::new(active),
+            active: RwLock::new(Some(active)),
+            initializer: None,
+            initializer_timeout: DEFAULT_DEAL_INIT_TIMEOUT,
+            initializer_lock: Mutex::new(()),
         }
     }
 
-    pub async fn current(&self) -> ApiDeal {
+    pub fn lazy(initializer: DealInitializer, initializer_timeout: Duration) -> Self {
+        Self {
+            active: RwLock::new(None),
+            initializer: Some(initializer),
+            initializer_timeout,
+            initializer_lock: Mutex::new(()),
+        }
+    }
+
+    pub async fn current(&self) -> Option<ApiDeal> {
         self.active.read().await.clone()
+    }
+
+    pub async fn current_or_prepare(&self) -> Result<ApiDeal, String> {
+        if let Some(active) = self.current().await {
+            return Ok(active);
+        }
+        let _guard = self.initializer_lock.lock().await;
+        if let Some(active) = self.current().await {
+            return Ok(active);
+        }
+        let initializer = self
+            .initializer
+            .as_ref()
+            .ok_or_else(|| "consumer API has no active deal".to_string())?;
+        let prepared = tokio::time::timeout(self.initializer_timeout, initializer())
+            .await
+            .map_err(|_| {
+                format!(
+                    "on-demand purchase timed out after {}s before a deal became ready",
+                    self.initializer_timeout.as_secs()
+                )
+            })??;
+        *self.active.write().await = Some(prepared.clone());
+        Ok(prepared)
     }
 
     pub async fn replace_active(&self, next: ApiDeal, reason: &str) {
         let previous = {
             let mut active = self.active.write().await;
-            std::mem::replace(&mut *active, next)
+            std::mem::replace(&mut *active, Some(next))
         };
-        previous.session.settle(reason).await;
+        if let Some(previous) = previous {
+            previous.session.settle(reason).await;
+        }
     }
 
     pub async fn settle_active(&self, reason: &str) -> bool {
-        let active = self.current().await;
+        let Some(active) = self.current().await else {
+            return false;
+        };
         active.session.settle(reason).await
     }
 }
@@ -1039,8 +1088,21 @@ impl ApiState {
         }
     }
 
-    pub async fn current_deal(&self) -> ApiDeal {
-        self.deals.current().await
+    pub fn lazy(
+        buyer: Arc<Buyer>,
+        frame_model: String,
+        initializer: DealInitializer,
+        initializer_timeout: Duration,
+    ) -> Self {
+        Self {
+            buyer,
+            frame_model,
+            deals: Arc::new(RouteManager::lazy(initializer, initializer_timeout)),
+        }
+    }
+
+    pub async fn current_deal(&self) -> Result<ApiDeal, String> {
+        self.deals.current_or_prepare().await
     }
 
     /// The model is forced by the market(B2/B19): an empty/None `model` is ok (there is a single
@@ -1161,6 +1223,105 @@ mod tests {
                 model_id: "Qwen/Qwen3-32B".to_string()
             }
         );
+    }
+
+    #[tokio::test]
+    async fn lazy_api_models_respond_before_deal_initializer_runs() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let init_calls = Arc::new(AtomicUsize::new(0));
+        let init_calls_for_state = init_calls.clone();
+        let state = ApiState::lazy(
+            Arc::new(Buyer::from_note(
+                Arc::new(dexdo_core::LocalNote::generate()),
+            )),
+            "qwen--qwen3--32b".to_string(),
+            Arc::new(move || {
+                let init_calls = init_calls_for_state.clone();
+                Box::pin(async move {
+                    init_calls.fetch_add(1, Ordering::SeqCst);
+                    futures::future::pending::<Result<ApiDeal, String>>().await
+                }) as DealInitFuture
+            }),
+            Duration::from_millis(50),
+        );
+        let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel::<()>();
+        let (addr, task) = serve("127.0.0.1:0".parse().unwrap(), state, false, async move {
+            let _ = shutdown_rx.await;
+        })
+        .await
+        .expect("bind lazy API");
+
+        let models: serde_json::Value = reqwest::Client::new()
+            .get(format!("http://{addr}/v1/models"))
+            .send()
+            .await
+            .expect("models request")
+            .error_for_status()
+            .expect("models status")
+            .json()
+            .await
+            .expect("models json");
+        assert_eq!(models["data"][0]["id"], "qwen--qwen3--32b");
+        assert_eq!(
+            init_calls.load(Ordering::SeqCst),
+            0,
+            "/v1/models must not start quote/place_buy/handover work"
+        );
+
+        let _ = shutdown_tx.send(());
+        task.await.expect("server joins");
+    }
+
+    #[tokio::test]
+    async fn lazy_chat_initializer_timeout_returns_error_not_hang() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let init_calls = Arc::new(AtomicUsize::new(0));
+        let init_calls_for_state = init_calls.clone();
+        let state = ApiState::lazy(
+            Arc::new(Buyer::from_note(
+                Arc::new(dexdo_core::LocalNote::generate()),
+            )),
+            "qwen--qwen3--32b".to_string(),
+            Arc::new(move || {
+                let init_calls = init_calls_for_state.clone();
+                Box::pin(async move {
+                    init_calls.fetch_add(1, Ordering::SeqCst);
+                    tokio::time::sleep(Duration::from_secs(60)).await;
+                    Err("slow chain init should have timed out".to_string())
+                }) as DealInitFuture
+            }),
+            Duration::from_millis(50),
+        );
+        let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel::<()>();
+        let (addr, task) = serve("127.0.0.1:0".parse().unwrap(), state, false, async move {
+            let _ = shutdown_rx.await;
+        })
+        .await
+        .expect("bind lazy API");
+
+        let response = reqwest::Client::builder()
+            .timeout(Duration::from_secs(2))
+            .build()
+            .unwrap()
+            .post(format!("http://{addr}/v1/chat/completions"))
+            .json(&serde_json::json!({
+                "model": "qwen--qwen3--32b",
+                "messages": [{"role": "user", "content": "hello"}],
+                "max_tokens": 1,
+                "stream": false
+            }))
+            .send()
+            .await
+            .expect("chat request returns");
+        assert_eq!(response.status(), reqwest::StatusCode::SERVICE_UNAVAILABLE);
+        let body = response.text().await.expect("body");
+        assert!(body.contains("on-demand purchase timed out"), "{body}");
+        assert_eq!(init_calls.load(Ordering::SeqCst), 1);
+
+        let _ = shutdown_tx.send(());
+        task.await.expect("server joins");
     }
 
     #[test]

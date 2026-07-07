@@ -30,7 +30,10 @@ pub async fn messages(
     if let Err(reason) = state.check_model(req.model.as_deref()) {
         return reject(StatusCode::BAD_REQUEST, &reason);
     }
-    let deal = state.current_deal().await;
+    let deal = match state.current_deal().await {
+        Ok(deal) => deal,
+        Err(reason) => return reject(StatusCode::SERVICE_UNAVAILABLE, &reason),
+    };
     let request_guard = deal.begin_request(message_started_secs());
     // Session-scoped lifecycle: no new request once the local deal is closed.
     if deal.session.is_closed() {

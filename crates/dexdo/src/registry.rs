@@ -12,6 +12,8 @@ use std::path::{Path, PathBuf};
 #[cfg(feature = "shellnet")]
 use serde_json::json;
 
+pub const MODEL_REGISTRY_ABI_JSON: &str =
+    include_str!("../../../contracts/compiled_0.79.3/airegistry/ModelRegistry.abi.json");
 pub const MODEL_REGISTRY_VALIDATION_SCHEMA: &str = "dexdo.model_registry_validation.v1";
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -496,15 +498,16 @@ pub struct ShellnetModelRegistryReader {
 
 #[cfg(feature = "shellnet")]
 impl ShellnetModelRegistryReader {
-    pub fn from_manifest(
+    pub fn from_manifest(contracts: &Path, registry_address: &str) -> Result<Self> {
+        Self::from_manifest_abi_json(contracts, registry_address, MODEL_REGISTRY_ABI_JSON)
+    }
+
+    pub fn from_manifest_abi_json(
         contracts: &Path,
         registry_address: &str,
-        abi_path: &Path,
+        abi_json: &str,
     ) -> Result<Self> {
-        let abi_json = std::fs::read_to_string(abi_path)
-            .with_context(|| format!("read ModelRegistry ABI {}", abi_path.display()))?;
-        validate_model_registry_abi_getters(&abi_json)
-            .with_context(|| format!("ModelRegistry ABI {}", abi_path.display()))?;
+        validate_model_registry_abi_getters(abi_json).context("embedded ModelRegistry ABI")?;
         let registry_address = dexdo_core::Address::parse(registry_address)
             .map_err(|e| anyhow::anyhow!("ModelRegistry address {registry_address}: {e}"))?;
         let chain = dexdo_core::RealChainBackend::connect(contracts)
@@ -512,7 +515,7 @@ impl ShellnetModelRegistryReader {
         Ok(Self {
             chain,
             registry_address,
-            abi_json,
+            abi_json: abi_json.to_string(),
         })
     }
 
@@ -878,11 +881,10 @@ mod tests {
 
     #[test]
     fn model_registry_abi_getter_shape_matches_4_0_18() {
-        let abi_path = repo_path("contracts/compiled_0.79.3/airegistry/ModelRegistry.abi.json");
-        let abi = std::fs::read_to_string(abi_path).unwrap();
-        validate_model_registry_abi_getters(&abi).unwrap();
+        let abi = MODEL_REGISTRY_ABI_JSON;
+        validate_model_registry_abi_getters(abi).unwrap();
 
-        let parsed: Value = serde_json::from_str(&abi).unwrap();
+        let parsed: Value = serde_json::from_str(abi).unwrap();
         let functions = parsed["functions"].as_array().unwrap();
         for removed in ["getModel", "getAll"] {
             assert!(
@@ -900,19 +902,43 @@ mod tests {
         assert!(err.contains("modelHashOf"), "{err}");
     }
 
+    #[test]
+    fn model_registry_reader_uses_embedded_abi_not_filesystem_path() {
+        let source = include_str!("registry.rs");
+        let reader_impl = source
+            .find("impl ShellnetModelRegistryReader")
+            .expect("reader impl present");
+        let impl_end = source[reader_impl..]
+            .find("#[cfg(feature = \"shellnet\")]\n#[async_trait]")
+            .map(|offset| reader_impl + offset)
+            .expect("reader impl end marker present");
+        let body = &source[reader_impl..impl_end];
+
+        assert!(
+            source.contains("include_str!(\"../../../contracts/compiled_0.79.3/airegistry/ModelRegistry.abi.json\")"),
+            "ModelRegistry ABI must be embedded"
+        );
+        assert!(
+            body.contains("pub fn from_manifest(contracts: &Path, registry_address: &str)"),
+            "released binary constructor must not require an ABI path"
+        );
+        assert!(
+            !body.contains("read_to_string(abi_path)"),
+            "released binary reader must not read the ModelRegistry ABI from cwd/filesystem"
+        );
+    }
+
     #[cfg(feature = "shellnet")]
     #[tokio::test]
     #[ignore = "read-only live shellnet evidence; requires current deployed.shellnet.json endpoint"]
     async fn live_shellnet_model_registry_reader_reads_seeded_model() {
         let contracts = repo_path("contracts/deployed.shellnet.json");
-        let abi_path = repo_path("contracts/compiled_0.79.3/airegistry/ModelRegistry.abi.json");
-        let abi = std::fs::read_to_string(&abi_path).unwrap();
         let registry = default_registry_address(&contracts).unwrap();
         let registry_addr = dexdo_core::Address::parse(&registry).unwrap();
         let chain = dexdo_core::RealChainBackend::connect(&contracts).unwrap();
         let count = chain
             .client()
-            .run_getter(&registry_addr, &abi, "count", json!({}))
+            .run_getter(&registry_addr, MODEL_REGISTRY_ABI_JSON, "count", json!({}))
             .await
             .expect("read live ModelRegistry count")
             .expect("ModelRegistry account active for count");
@@ -927,7 +953,12 @@ mod tests {
         assert!(count_n > 0, "live ModelRegistry count must be nonzero");
         let code = chain
             .client()
-            .run_getter(&registry_addr, &abi, "inferenceOrderBookCode", json!({}))
+            .run_getter(
+                &registry_addr,
+                MODEL_REGISTRY_ABI_JSON,
+                "inferenceOrderBookCode",
+                json!({}),
+            )
             .await
             .expect("read live ModelRegistry inferenceOrderBookCode")
             .expect("ModelRegistry account active for inferenceOrderBookCode");
@@ -939,7 +970,7 @@ mod tests {
         // display refs such as normalized producer--model--version strings.
         let frame_models = ["Qwen/Qwen3-32B", "openai/gpt-oss-20b"];
 
-        let reader = ShellnetModelRegistryReader::from_manifest(&contracts, &registry, &abi_path)
+        let reader = ShellnetModelRegistryReader::from_manifest(&contracts, &registry)
             .expect("shellnet ModelRegistry reader");
         let mut found = None;
         for frame_model in frame_models {

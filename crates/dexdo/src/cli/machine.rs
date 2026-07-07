@@ -141,7 +141,7 @@ pub(crate) fn classify_error(operation: &str, err: &anyhow::Error) -> ErrorCode 
     if msg.contains("no executable matching ask")
         || msg.contains("no matchable ask")
         || msg.contains("executable quote depth has no matching")
-        || msg.contains("refusing partial/multi-ask fill")
+        || msg.contains("refusing multi-ask fill")
         || msg.contains("placeinferencebuy cannot target")
         || msg.contains("raw order-book matcher")
         || msg.contains("refusing to send escrow into the wrong deal")
@@ -581,7 +581,7 @@ mod tests {
             ),
             (
                 anyhow::anyhow!(
-                    "buyer explicit-token quote preflight: shellnet: buyer target preflight failed for InferenceOrderBook 0:book: refusing partial/multi-ask fill"
+                    "buyer explicit-token quote preflight: shellnet: buyer target preflight failed for InferenceOrderBook 0:book: refusing multi-ask fill"
                 ),
                 ErrorCode::NoLiquidity,
             ),

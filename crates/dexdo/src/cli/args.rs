@@ -194,7 +194,7 @@ impl SellerArgs {
     }
 }
 
-#[derive(Args)]
+#[derive(Args, Clone)]
 pub(crate) struct BuyerArgs {
     #[command(flatten)]
     pub(crate) mock: MockFlags,

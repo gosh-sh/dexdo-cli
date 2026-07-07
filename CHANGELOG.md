@@ -1,3 +1,31 @@
+## v0.0.6
+
+- release: bump version to 0.0.6
+- fix: carry unverified model fallback onto current dev
+- directive: carry PR307 unverified-model fallback onto post-
+- fix: point seller abandoned Probe recovery to advance
+- directive: seller guidance on buyer-abandoned deal
+- fix: allow submit-safe partial quote
+- fix: embed ModelRegistry ABI
+- agents(10): merge only on owner's direct permission (LGTM is not a merge invitation)
+- directives: quote partial-take + embed ModelRegistry ABI
+- fix: bind buyer API before on-demand chain work
+- directive: buyer bind-first (fix silent hang)
+- release: bump version to 0.0.5
+- fix: align shellnet quote with buyer submit path
+- directive: buyer place_buy fix (for executor)
+- agents(8): fix = regression test + live shellnet proof (owner rule)
+- docs: fix dexdo-install doctor/policy wording
+- release: publish dexdo-install skill (allow-list + normalize)
+- skills: dexdo-install (install the CLI + get an agent working)
+- fix: dexdo --version reports the release version (0.0.4)
+- test: cover quote stale liquidity regression
+- agents(10): /executor never merge; lead-only merge after Section 9 (money-path)
+- fix: skip stale buyer preflight rows
+- Spec/RFC: Attested Seller Relay (dexdo-in-TEE)
+- release: ASCII gate on release notes (close the notes gap)
+- fix: build portable linux musl releases
+
 ## v0.0.5
 
 - release: bump version to 0.0.5
