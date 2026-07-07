@@ -245,6 +245,51 @@ async fn resolve_buyer_content_identity_model(
     )
 }
 
+async fn build_buyer_content_policy(
+    args: &BuyerArgs,
+    frame_model: &str,
+) -> Result<(
+    dexdo::buyer::api::ContentCheck,
+    Arc<dexdo::seller::ModelsConfig>,
+)> {
+    let content_identity_model = if args.mock.mock_chain {
+        None
+    } else {
+        resolve_buyer_content_identity_model(
+            &args.contracts,
+            frame_model,
+            args.allow_unverified_model,
+        )
+        .await?
+    };
+    let content_identity_model_ref = content_identity_model.as_deref();
+    let content_check_model = content_identity_model_ref.unwrap_or(frame_model);
+    let models_cfg = Arc::new(dexdo::seller::ModelsConfig::load_or_empty(&args.models)?);
+    let has_ref_key =
+        dexdo::buyer::verify::reference_endpoint_for(content_check_model, &models_cfg)
+            .map(|e| {
+                std::env::var(&e.api_key_env)
+                    .map(|k| !k.is_empty())
+                    .unwrap_or(false)
+            })
+            .unwrap_or(false);
+    let content_check = dexdo::buyer::api::content_check_policy(
+        frame_model,
+        content_identity_model_ref,
+        args.mock.mock_model,
+        args.allow_unverified_model,
+        has_ref_key,
+        &models_cfg,
+    )
+    .map_err(|e| {
+        anyhow!(
+            "buyer content-identity preflight failed before buy: \
+             missing_or_unset=allow_unverified_model_or_models_data; {e}"
+        )
+    })?;
+    Ok((content_check, models_cfg))
+}
+
 #[cfg(feature = "shellnet")]
 fn role_arg_to_handle(role: DealRoleArg) -> deals::DealHandleRole {
     match role {
@@ -4364,6 +4409,8 @@ struct BuyerMachineErrorContext {
     order_book: Option<String>,
     token_contract: Option<String>,
     deal_handle: Option<String>,
+    failure_class: Option<String>,
+    missing_or_unset: Option<String>,
 }
 
 impl BuyerMachineErrorContext {
@@ -4388,6 +4435,12 @@ impl BuyerMachineErrorContext {
         }
         if let Some(v) = &self.deal_handle {
             obj.insert("deal_handle".to_string(), json!(v));
+        }
+        if let Some(v) = &self.failure_class {
+            obj.insert("failure_class".to_string(), json!(v));
+        }
+        if let Some(v) = &self.missing_or_unset {
+            obj.insert("missing_or_unset".to_string(), json!(v));
         }
         Value::Object(obj)
     }
@@ -4476,6 +4529,8 @@ async fn prepare_lazy_buyer_api_deal_with_replay_backoff(
     args: Arc<BuyerArgs>,
     explicit_tc: Option<String>,
     frame_model: String,
+    content_check: dexdo::buyer::api::ContentCheck,
+    models_cfg: Arc<dexdo::seller::ModelsConfig>,
     buyer_policy: Option<policy::BuyerRuntimePolicy>,
     api_failure_policy: dexdo::buyer::api::BuyerApiFailurePolicy,
     events: SharedBuyerEvents,
@@ -4489,6 +4544,8 @@ async fn prepare_lazy_buyer_api_deal_with_replay_backoff(
             args.clone(),
             explicit_tc.clone(),
             frame_model.clone(),
+            content_check.clone(),
+            models_cfg.clone(),
             buyer_policy.clone(),
             api_failure_policy,
             events.clone(),
@@ -4532,6 +4589,8 @@ async fn prepare_lazy_buyer_api_deal_once(
     args: Arc<BuyerArgs>,
     explicit_tc: Option<String>,
     frame_model: String,
+    content_check: dexdo::buyer::api::ContentCheck,
+    models_cfg: Arc<dexdo::seller::ModelsConfig>,
     buyer_policy: Option<policy::BuyerRuntimePolicy>,
     api_failure_policy: dexdo::buyer::api::BuyerApiFailurePolicy,
     events: SharedBuyerEvents,
@@ -4867,35 +4926,6 @@ async fn prepare_lazy_buyer_api_deal_once(
         }
     }
 
-    let content_identity_model = if args.mock.mock_chain {
-        None
-    } else {
-        resolve_buyer_content_identity_model(
-            &args.contracts,
-            &frame_model,
-            args.allow_unverified_model,
-        )
-        .await?
-    };
-    let content_identity_model_ref = content_identity_model.as_deref();
-    let content_check_model = content_identity_model_ref.unwrap_or(&frame_model);
-    let models_cfg = std::sync::Arc::new(dexdo::seller::ModelsConfig::load_or_empty(&args.models)?);
-    let has_ref_key =
-        dexdo::buyer::verify::reference_endpoint_for(content_check_model, &models_cfg)
-            .map(|e| {
-                std::env::var(&e.api_key_env)
-                    .map(|k| !k.is_empty())
-                    .unwrap_or(false)
-            })
-            .unwrap_or(false);
-    let content_check = dexdo::buyer::api::content_check_policy(
-        &frame_model,
-        content_identity_model_ref,
-        args.mock.mock_model,
-        args.allow_unverified_model,
-        has_ref_key,
-        &models_cfg,
-    )?;
     let session = Arc::new(dexdo::buyer::api::SessionSettle::new_with_failure_policy(
         chain,
         token_contract.clone(),
@@ -4923,6 +4953,8 @@ async fn run_buyer_on_demand_local_api(
     buyer: dexdo::buyer::Buyer,
     explicit_tc: Option<String>,
     frame_model: String,
+    content_check: dexdo::buyer::api::ContentCheck,
+    models_cfg: Arc<dexdo::seller::ModelsConfig>,
     buyer_policy: Option<policy::BuyerRuntimePolicy>,
     api_failure_policy: dexdo::buyer::api::BuyerApiFailurePolicy,
     events: SharedBuyerEvents,
@@ -4955,6 +4987,8 @@ async fn run_buyer_on_demand_local_api(
         let args = args.clone();
         let explicit_tc = explicit_tc.clone();
         let frame_model = frame_model.clone();
+        let content_check = content_check.clone();
+        let models_cfg = models_cfg.clone();
         let buyer_policy = buyer_policy.clone();
         let events = events.clone();
         Arc::new(move || {
@@ -4963,6 +4997,8 @@ async fn run_buyer_on_demand_local_api(
             let args = args.clone();
             let explicit_tc = explicit_tc.clone();
             let frame_model = frame_model.clone();
+            let content_check = content_check.clone();
+            let models_cfg = models_cfg.clone();
             let buyer_policy = buyer_policy.clone();
             let events = events.clone();
             Box::pin(async move {
@@ -4972,6 +5008,8 @@ async fn run_buyer_on_demand_local_api(
                     args,
                     explicit_tc,
                     frame_model,
+                    content_check,
+                    models_cfg,
                     buyer_policy,
                     api_failure_policy,
                     events,
@@ -5268,16 +5306,33 @@ async fn run_buyer_inner(
         buyer_real_backend(&args, &frame_model)?
     };
     let buyer = dexdo::buyer::Buyer::from_note(note);
+    let buyer_content_policy = if args.local_listen.is_some() {
+        match build_buyer_content_policy(&args, &frame_model).await {
+            Ok(policy) => Some(policy),
+            Err(err) => {
+                machine_context.failure_class = Some("content_identity_preflight".to_string());
+                machine_context.missing_or_unset =
+                    Some("allow_unverified_model_or_models_data".to_string());
+                return Err(err);
+            }
+        }
+    } else {
+        None
+    };
     if args.local_listen.is_some() && args.continuity_mode == ContinuityModeArg::OnDemand {
         let events = machine_events
             .take()
             .map(|writer| Arc::new(tokio::sync::Mutex::new(writer)));
+        let (content_check, models_cfg) = buyer_content_policy
+            .expect("local-listen buyer content policy is preflighted before on-demand");
         return run_buyer_on_demand_local_api(
             args,
             chain,
             buyer,
             explicit_tc,
             frame_model,
+            content_check,
+            models_cfg,
             buyer_policy,
             api_failure_policy,
             events,
@@ -5699,42 +5754,8 @@ async fn run_buyer_inner(
             buyer.note.clone(),
             api_failure_policy,
         ));
-        // pick the content-identity policy for this frame model and build the one-per-deal content gate.
-        // A B7-full reference key present in env for this exact frame model enables the gate even when the
-        // model has no B8 fingerprint; `content_check_policy` fails closed for a name-only model unless
-        // `--allow-unverified-model` was passed.
-        let content_identity_model = if args.mock.mock_chain {
-            None
-        } else {
-            resolve_buyer_content_identity_model(
-                &args.contracts,
-                &frame_model,
-                args.allow_unverified_model,
-            )
-            .await?
-        };
-        let content_identity_model_ref = content_identity_model.as_deref();
-        let content_check_model = content_identity_model_ref.unwrap_or(&frame_model);
-        // verification data is DATA-DRIVEN from `--models`(default `models.json`). An absent file yields
-        // an empty config so a real model with no data fails closed(below); the mock path is exempt.
-        let models_cfg =
-            std::sync::Arc::new(dexdo::seller::ModelsConfig::load_or_empty(&args.models)?);
-        let has_ref_key =
-            dexdo::buyer::verify::reference_endpoint_for(content_check_model, &models_cfg)
-                .map(|e| {
-                    std::env::var(&e.api_key_env)
-                        .map(|k| !k.is_empty())
-                        .unwrap_or(false)
-                })
-                .unwrap_or(false);
-        let content_check = dexdo::buyer::api::content_check_policy(
-            &frame_model,
-            content_identity_model_ref,
-            args.mock.mock_model,
-            args.allow_unverified_model,
-            has_ref_key,
-            &models_cfg,
-        )?;
+        let (content_check, models_cfg) = buyer_content_policy
+            .expect("local-listen buyer content policy is preflighted before buy");
         let renewal_content_check = content_check.clone();
         let state = ApiState::single(
             buyer,
@@ -7872,6 +7893,62 @@ mod tests {
         .expect("allow-unverified buyer may continue on name-only evidence");
 
         assert_eq!(identity, None);
+    }
+
+    #[test]
+    fn buyer_local_api_content_identity_preflights_before_any_buy() {
+        let source = include_str!("commands.rs");
+        let start = source
+            .find("let buyer_content_policy = if args.local_listen.is_some()")
+            .expect("buyer content preflight present");
+        let body = &source[start..];
+        let preflight = body
+            .find("build_buyer_content_policy")
+            .expect("content policy helper called");
+        let on_demand = body
+            .find("run_buyer_on_demand_local_api")
+            .expect("on-demand branch present");
+        let direct_buy = body
+            .find("buyer.place_buy(chain.as_ref(), &tc)")
+            .expect("direct buy path present");
+        let model_buy = body
+            .find(".place_buy_by_model(")
+            .expect("model-only buy path present");
+
+        assert!(
+            preflight < on_demand,
+            "on-demand buyer must reject missing content-identity inputs before lazy buy/handover"
+        );
+        assert!(
+            preflight < direct_buy && preflight < model_buy,
+            "local API buyer must reject missing content-identity inputs before escrow/place_buy"
+        );
+    }
+
+    #[test]
+    fn buyer_content_identity_preflight_error_names_operator_input() {
+        let err = dexdo::buyer::api::content_check_policy(
+            "qwen--qwen3--32b",
+            None,
+            false,
+            false,
+            false,
+            &dexdo::seller::ModelsConfig::empty(),
+        )
+        .map_err(|e| {
+            anyhow::anyhow!(
+                "buyer content-identity preflight failed before buy: \
+                 missing_or_unset=allow_unverified_model_or_models_data; {e}"
+            )
+        })
+        .expect_err("strict name-only content identity must fail closed")
+        .to_string();
+
+        assert!(
+            err.contains("missing_or_unset=allow_unverified_model_or_models_data"),
+            "{err}"
+        );
+        assert!(err.contains("before buy"), "{err}");
     }
 
     #[cfg(feature = "shellnet")]
