@@ -1,3 +1,31 @@
+## v0.0.8
+
+- chore: bump version to 0.0.8
+- fix: accept matched seller offer outcomes
+- directive: seller TC Uninit / offer never rests
+- fix: recover note deploy after interrupted pool write
+- fix: TC pool recovery and CLI nitpicks
+- Buyer executable book and auto-match
+- directive: note deploy money-safety (persist key before spend)
+- directives: remaining + buyer view-book/auto-match
+- Guard note deploy key mismatches
+- precheck withdrawn seller notes
+- Bound direct shellnet read commands
+- directive: keypair check + pool-key mismatch + 101 guidance
+- directives: seller postSellOffer root + read timeout
+- agents(8): e2e = happy + every negative case, each to the very end
+- agents(8): ban crafted/isolated live proofs; lead must inspect proof setup ( lesson)
+- fix: reject one-tick on-demand buys before escrow
+- directive: v0.0.7 on-demand endpoint_binding INTERNAL
+- release: bump version to 0.0.7
+- agents(8): e2e test must drive the full flow to completion (the lesson)
+- fix: preflight on-demand buyer content policy
+- directive: on-demand buyer INVALID_ARGUMENT after handover
+- release: bump version to 0.0.6
+- fix: carry unverified model fallback onto current dev
+- directive: carry PR307 unverified-model fallback onto post-
+- fix: point seller abandoned Probe recovery to advance
+
 ## v0.0.7
 
 - release: bump version to 0.0.7

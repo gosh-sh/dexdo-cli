@@ -4,12 +4,15 @@
 //! live here.
 
 use anyhow::{anyhow, bail, Result};
-use serde::Deserialize;
+use ed25519_dalek::SigningKey;
+use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::fmt::Write as _;
+use std::path::{Path, PathBuf};
 
 const UNIT_SCALE: u128 = 1_000_000_000;
 const SHELL_ECC_ID: u32 = 2;
+const NOTE_DEPLOY_RECOVERY_VERSION: u32 = 1;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct NoteAccountSnapshot {
@@ -223,12 +226,737 @@ fn parse_u128_value(value: &Value) -> Option<u128> {
     })
 }
 
+pub(crate) fn normalize_owner_pubkey_hex(raw: &str, label: &str) -> Result<String> {
+    let key = raw.trim().trim_start_matches("0x").trim_start_matches("0X");
+    if key.len() != 64 || !key.bytes().all(|b| b.is_ascii_hexdigit()) {
+        bail!("{label} must be a 32-byte hex public key, got `{raw}`");
+    }
+    Ok(key.to_ascii_lowercase())
+}
+
+pub(crate) fn derive_owner_pubkey_from_secret_hex(secret_hex: &str) -> Result<String> {
+    let secret = secret_hex
+        .trim()
+        .trim_start_matches("0x")
+        .trim_start_matches("0X");
+    let bytes = hex::decode(secret)
+        .map_err(|e| anyhow!("owner_secret_key_hex must be 32-byte hex: {e}"))?;
+    let seed: [u8; 32] = bytes
+        .as_slice()
+        .try_into()
+        .map_err(|_| anyhow!("owner_secret_key_hex must be exactly 32 bytes"))?;
+    let signing = SigningKey::from_bytes(&seed);
+    Ok(hex::encode(signing.verifying_key().as_bytes()))
+}
+
+pub(crate) fn ensure_pool_note_keypair_matches(
+    note_addr: &str,
+    owner_public_key_hex: &str,
+    owner_secret_key_hex: &str,
+) -> Result<String> {
+    let recorded = normalize_owner_pubkey_hex(owner_public_key_hex, "owner_public_key_hex")?;
+    let derived = derive_owner_pubkey_from_secret_hex(owner_secret_key_hex)?;
+    if recorded != derived {
+        bail!(
+            "note deploy aborted before writing DEXDO_PN_POOL: stored owner_secret_key_hex derives pubkey \
+             0x{derived}, but the pool entry for PrivateNote {note_addr} records owner_public_key_hex \
+             0x{recorded}. That note would later fail owner-signed writes with ERR_INVALID_SENDER 101 \
+             because --note-key does not match the note owner. Deploy into a fresh --pool <new_file> or use \
+             the correct pool/key material."
+        );
+    }
+    Ok(derived)
+}
+
+pub(crate) fn ensure_onchain_owner_matches_pool_key(
+    role: &str,
+    note_addr: &str,
+    onchain_owner_pubkey: Option<&str>,
+    derived_owner_pubkey: &str,
+) -> Result<()> {
+    let derived = normalize_owner_pubkey_hex(derived_owner_pubkey, "derived owner pubkey")?;
+    let Some(onchain_raw) = onchain_owner_pubkey else {
+        bail!(
+            "{role} aborted before writing DEXDO_PN_POOL: PrivateNote {note_addr} getDetails exposes no \
+             ephemeralPubkey. Refusing to leave a pool entry that may fail later with ERR_INVALID_SENDER 101. \
+             Deploy a fresh note with --pool <new_file> after verifying shellnet contracts."
+        );
+    };
+    let onchain =
+        normalize_owner_pubkey_hex(onchain_raw, "PrivateNote.getDetails().ephemeralPubkey")?;
+    if onchain != derived {
+        bail!(
+            "{role} aborted before writing DEXDO_PN_POOL: PrivateNote {note_addr} on-chain owner key \
+             _ephemeralPubkey 0x{onchain} does not match the stored owner_secret_key_hex-derived pubkey \
+             0x{derived}. The --note-key would not match this note's owner and provision/sell/withdraw would \
+             fail with ERR_INVALID_SENDER 101. Deploy a fresh note with --pool <new_file> and do not reuse the \
+             stale/mismatched pool."
+        );
+    }
+    Ok(())
+}
+
+/// crash-safe state for wallet-funded note deploy. This file carries the randomly generated note owner
+/// secret and is written before any wallet spend. Later deploy steps add the on-chain note identifiers so
+/// `dexdo note recover` can finalize the pool without repeating an already completed deploy.
+#[cfg_attr(not(feature = "shellnet"), allow(dead_code))]
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub(crate) struct NoteDeployRecoveryState {
+    pub version: u32,
+    pub endpoint: String,
+    pub nominal: String,
+    pub token_type: u32,
+    pub raw_value: u64,
+    pub ecc_shell_deposit: u64,
+    pub funding_multisig_address: String,
+    pub owner_public_key_hex: String,
+    pub owner_secret_key_hex: String,
+    pub pn_address: Option<String>,
+    pub deposit_identifier_hash: Option<String>,
+    pub deployed_at_unix: Option<u64>,
+    #[serde(default)]
+    pub deposit_voucher: Option<NoteDeployVoucherCheckpoint>,
+    #[serde(default)]
+    pub shell_voucher: Option<NoteDeployVoucherCheckpoint>,
+    pub shell_funded: bool,
+    pub sanity_checked: bool,
+}
+
+#[cfg_attr(not(feature = "shellnet"), allow(dead_code))]
+#[derive(Clone, Copy)]
+pub(crate) struct NoteDeployRecoveryRequest<'a> {
+    pub endpoint: &'a str,
+    pub nominal: &'a str,
+    pub token_type: u32,
+    pub raw_value: u64,
+    pub ecc_shell_deposit: u64,
+    pub funding_multisig_address: &'a str,
+}
+
+#[cfg_attr(not(feature = "shellnet"), allow(dead_code))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum NoteDeployVoucherKind {
+    Deposit,
+    ShellGas,
+}
+
+#[cfg_attr(not(feature = "shellnet"), allow(dead_code))]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub(crate) struct NoteDeployVoucherCheckpoint {
+    pub sk_u_hex: String,
+    pub sk_u_commit_hex: String,
+    pub recipient_ephemeral_pubkey_hex: String,
+    pub token_type: u32,
+    pub raw_value: u64,
+    pub is_fee: bool,
+    #[serde(default)]
+    pub submit_maybe_sent: bool,
+    #[serde(default)]
+    pub event: Option<NoteDeployVoucherEvent>,
+    #[serde(default)]
+    pub proof: Option<NoteDeployVoucherProof>,
+}
+
+#[cfg_attr(not(feature = "shellnet"), allow(dead_code))]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub(crate) struct NoteDeployVoucherEvent {
+    pub id: String,
+    pub boc: String,
+    pub body: String,
+    pub dst: String,
+    pub created_at: u64,
+    pub block_id: Option<String>,
+}
+
+#[cfg_attr(not(feature = "shellnet"), allow(dead_code))]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub(crate) struct NoteDeployVoucherProof {
+    pub proof: String,
+    pub deposit_identifier_hash_hex: String,
+    pub final_layer_historical_hash_root_hex: String,
+    pub voucher_nominal_fr_hex: String,
+    pub token_type_fr_hex: String,
+    pub ephemeral_pubkey_hex: String,
+    pub voucher_value: u64,
+    pub voucher_token_type: u32,
+    pub layer_number: u8,
+    pub sk_u_hex: String,
+    pub sk_u_commit_hex: String,
+}
+
+#[cfg_attr(not(feature = "shellnet"), allow(dead_code))]
+impl NoteDeployVoucherKind {
+    pub(crate) fn label(self) -> &'static str {
+        match self {
+            Self::Deposit => "deposit",
+            Self::ShellGas => "SHELL gas",
+        }
+    }
+
+    fn field_name(self) -> &'static str {
+        match self {
+            Self::Deposit => "deposit_voucher",
+            Self::ShellGas => "shell_voucher",
+        }
+    }
+}
+
+#[cfg_attr(not(feature = "shellnet"), allow(dead_code))]
+impl NoteDeployVoucherCheckpoint {
+    pub(crate) fn new(
+        recipient_ephemeral_pubkey_hex: &str,
+        token_type: u32,
+        raw_value: u64,
+        is_fee: bool,
+        sk_u_hex: String,
+        sk_u_commit_hex: String,
+    ) -> Result<Self> {
+        let checkpoint = Self {
+            sk_u_hex: normalize_secret_like_hex(&sk_u_hex, "sk_u_hex")?,
+            sk_u_commit_hex: normalize_secret_like_hex(&sk_u_commit_hex, "sk_u_commit_hex")?,
+            recipient_ephemeral_pubkey_hex: normalize_secret_like_hex(
+                recipient_ephemeral_pubkey_hex,
+                "recipient_ephemeral_pubkey_hex",
+            )?,
+            token_type,
+            raw_value,
+            is_fee,
+            submit_maybe_sent: false,
+            event: None,
+            proof: None,
+        };
+        checkpoint.validate("voucher checkpoint")?;
+        Ok(checkpoint)
+    }
+
+    pub(crate) fn validate(&self, label: &str) -> Result<()> {
+        normalize_secret_like_hex(&self.sk_u_hex, "sk_u_hex")
+            .map_err(|e| anyhow!("{label}: {e}"))?;
+        normalize_secret_like_hex(&self.sk_u_commit_hex, "sk_u_commit_hex")
+            .map_err(|e| anyhow!("{label}: {e}"))?;
+        normalize_secret_like_hex(
+            &self.recipient_ephemeral_pubkey_hex,
+            "recipient_ephemeral_pubkey_hex",
+        )
+        .map_err(|e| anyhow!("{label}: {e}"))?;
+        if self.raw_value == 0 {
+            bail!("{label}: raw_value must be positive");
+        }
+        if !self.submit_maybe_sent && (self.event.is_some() || self.proof.is_some()) {
+            bail!("{label}: event/proof cannot exist before voucher submit is marked uncertain");
+        }
+        if let Some(event) = &self.event {
+            event.validate(label)?;
+        }
+        if let Some(proof) = &self.proof {
+            proof.validate(label)?;
+            if proof.sk_u_hex != self.sk_u_hex {
+                bail!("{label}: proof sk_u_hex does not match checkpoint");
+            }
+            if proof.sk_u_commit_hex != self.sk_u_commit_hex {
+                bail!("{label}: proof sk_u_commit_hex does not match checkpoint");
+            }
+            if proof.ephemeral_pubkey_hex != self.recipient_ephemeral_pubkey_hex {
+                bail!("{label}: proof ephemeral_pubkey_hex does not match checkpoint");
+            }
+            if proof.voucher_value != self.raw_value {
+                bail!("{label}: proof voucher_value does not match checkpoint");
+            }
+            if proof.voucher_token_type != self.token_type {
+                bail!("{label}: proof voucher_token_type does not match checkpoint");
+            }
+        }
+        Ok(())
+    }
+
+    pub(crate) fn ensure_matches(
+        &self,
+        kind: NoteDeployVoucherKind,
+        recipient_ephemeral_pubkey_hex: &str,
+        token_type: u32,
+        raw_value: u64,
+        is_fee: bool,
+    ) -> Result<()> {
+        self.validate(kind.field_name())?;
+        let recipient_ephemeral_pubkey_hex = normalize_secret_like_hex(
+            recipient_ephemeral_pubkey_hex,
+            "recipient_ephemeral_pubkey_hex",
+        )?;
+        if self.recipient_ephemeral_pubkey_hex != recipient_ephemeral_pubkey_hex
+            || self.token_type != token_type
+            || self.raw_value != raw_value
+            || self.is_fee != is_fee
+        {
+            bail!(
+                "note deploy recovery {} does not match this {} voucher request; refusing to mix \
+                 voucher recovery state with a different owner/value/token/isFee.",
+                kind.field_name(),
+                kind.label()
+            );
+        }
+        Ok(())
+    }
+}
+
+#[cfg_attr(not(feature = "shellnet"), allow(dead_code))]
+impl NoteDeployVoucherEvent {
+    pub(crate) fn validate(&self, label: &str) -> Result<()> {
+        if self.id.trim().is_empty() {
+            bail!("{label}: VoucherGenerated event id is empty");
+        }
+        if self.boc.trim().is_empty() {
+            bail!("{label}: VoucherGenerated event boc is empty");
+        }
+        if self.body.trim().is_empty() {
+            bail!("{label}: VoucherGenerated event body is empty");
+        }
+        if self.dst.trim().is_empty() {
+            bail!("{label}: VoucherGenerated event dst is empty");
+        }
+        Ok(())
+    }
+}
+
+#[cfg(feature = "shellnet")]
+impl NoteDeployVoucherEvent {
+    pub(crate) fn from_sdk(
+        event: dexdo_core::private_note::voucher_event::VoucherExtoutMessage,
+    ) -> Self {
+        Self {
+            id: event.id,
+            boc: event.boc,
+            body: event.body,
+            dst: event.dst,
+            created_at: event.created_at,
+            block_id: event.block_id,
+        }
+    }
+
+    pub(crate) fn to_sdk(&self) -> dexdo_core::private_note::voucher_event::VoucherExtoutMessage {
+        dexdo_core::private_note::voucher_event::VoucherExtoutMessage {
+            id: self.id.clone(),
+            boc: self.boc.clone(),
+            body: self.body.clone(),
+            dst: self.dst.clone(),
+            created_at: self.created_at,
+            block_id: self.block_id.clone(),
+        }
+    }
+}
+
+#[cfg_attr(not(feature = "shellnet"), allow(dead_code))]
+impl NoteDeployVoucherProof {
+    pub(crate) fn validate(&self, label: &str) -> Result<()> {
+        if self.proof.trim().is_empty() {
+            bail!("{label}: halo2 proof is empty");
+        }
+        validate_hex_u256(
+            &self.deposit_identifier_hash_hex,
+            "deposit_identifier_hash_hex",
+        )
+        .map_err(|e| anyhow!("{label}: {e}"))?;
+        validate_hex_u256(
+            &self.final_layer_historical_hash_root_hex,
+            "final_layer_historical_hash_root_hex",
+        )
+        .map_err(|e| anyhow!("{label}: {e}"))?;
+        validate_hex_u256(&self.voucher_nominal_fr_hex, "voucher_nominal_fr_hex")
+            .map_err(|e| anyhow!("{label}: {e}"))?;
+        validate_hex_u256(&self.token_type_fr_hex, "token_type_fr_hex")
+            .map_err(|e| anyhow!("{label}: {e}"))?;
+        normalize_secret_like_hex(&self.ephemeral_pubkey_hex, "ephemeral_pubkey_hex")
+            .map_err(|e| anyhow!("{label}: {e}"))?;
+        normalize_secret_like_hex(&self.sk_u_hex, "sk_u_hex")
+            .map_err(|e| anyhow!("{label}: {e}"))?;
+        normalize_secret_like_hex(&self.sk_u_commit_hex, "sk_u_commit_hex")
+            .map_err(|e| anyhow!("{label}: {e}"))?;
+        if self.voucher_value == 0 {
+            bail!("{label}: voucher_value must be positive");
+        }
+        if self.layer_number == 0 {
+            bail!("{label}: layer_number must be positive");
+        }
+        Ok(())
+    }
+}
+
+#[cfg(feature = "shellnet")]
+impl NoteDeployVoucherProof {
+    pub(crate) fn from_halo2(proof: &dexdo_core::private_note::halo2::live::Halo2Proof) -> Self {
+        Self {
+            proof: proof.proof.clone(),
+            deposit_identifier_hash_hex: proof.deposit_identifier_hash_hex.clone(),
+            final_layer_historical_hash_root_hex: proof
+                .final_layer_historical_hash_root_hex
+                .clone(),
+            voucher_nominal_fr_hex: proof.voucher_nominal_fr_hex.clone(),
+            token_type_fr_hex: proof.token_type_fr_hex.clone(),
+            ephemeral_pubkey_hex: proof.ephemeral_pubkey_hex.clone(),
+            voucher_value: proof.voucher_value,
+            voucher_token_type: proof.voucher_token_type,
+            layer_number: proof.layer_number,
+            sk_u_hex: proof.sk_u_hex.clone(),
+            sk_u_commit_hex: proof.sk_u_commit_hex.clone(),
+        }
+    }
+
+    pub(crate) fn to_halo2(&self) -> dexdo_core::private_note::halo2::live::Halo2Proof {
+        dexdo_core::private_note::halo2::live::Halo2Proof {
+            proof: self.proof.clone(),
+            deposit_identifier_hash_hex: self.deposit_identifier_hash_hex.clone(),
+            final_layer_historical_hash_root_hex: self.final_layer_historical_hash_root_hex.clone(),
+            voucher_nominal_fr_hex: self.voucher_nominal_fr_hex.clone(),
+            token_type_fr_hex: self.token_type_fr_hex.clone(),
+            ephemeral_pubkey_hex: self.ephemeral_pubkey_hex.clone(),
+            voucher_value: self.voucher_value,
+            voucher_token_type: self.voucher_token_type,
+            layer_number: self.layer_number,
+            sk_u_hex: self.sk_u_hex.clone(),
+            sk_u_commit_hex: self.sk_u_commit_hex.clone(),
+        }
+    }
+}
+
+#[cfg_attr(not(feature = "shellnet"), allow(dead_code))]
+impl NoteDeployRecoveryState {
+    pub(crate) fn new(
+        request: NoteDeployRecoveryRequest<'_>,
+        owner_public_key_hex: &str,
+        owner_secret_key_hex: &str,
+    ) -> Result<Self> {
+        let funding_multisig_address =
+            dexdo_core::normalize_wallet_address(request.funding_multisig_address)
+                .map_err(|e| anyhow!("{e}"))?;
+        let owner_public_key_hex =
+            normalize_owner_pubkey_hex(owner_public_key_hex, "owner_public_key_hex")?;
+        let owner_secret_key_hex = normalize_secret_hex(owner_secret_key_hex)?;
+        let state = Self {
+            version: NOTE_DEPLOY_RECOVERY_VERSION,
+            endpoint: request.endpoint.to_string(),
+            nominal: request.nominal.to_string(),
+            token_type: request.token_type,
+            raw_value: request.raw_value,
+            ecc_shell_deposit: request.ecc_shell_deposit,
+            funding_multisig_address,
+            owner_public_key_hex,
+            owner_secret_key_hex,
+            pn_address: None,
+            deposit_identifier_hash: None,
+            deployed_at_unix: None,
+            deposit_voucher: None,
+            shell_voucher: None,
+            shell_funded: false,
+            sanity_checked: false,
+        };
+        state.validate()?;
+        Ok(state)
+    }
+
+    pub(crate) fn validate(&self) -> Result<()> {
+        if self.version != NOTE_DEPLOY_RECOVERY_VERSION {
+            bail!(
+                "note deploy recovery file version {} is unsupported; expected {}",
+                self.version,
+                NOTE_DEPLOY_RECOVERY_VERSION
+            );
+        }
+        if self.endpoint.trim().is_empty() {
+            bail!("note deploy recovery file has empty endpoint");
+        }
+        if self.nominal.trim().is_empty() {
+            bail!("note deploy recovery file has empty nominal");
+        }
+        let normalized_wallet =
+            dexdo_core::normalize_wallet_address(&self.funding_multisig_address)
+                .map_err(|e| anyhow!("note deploy recovery funding_multisig_address: {e}"))?;
+        if normalized_wallet != self.funding_multisig_address {
+            bail!(
+                "note deploy recovery funding_multisig_address must be normalized as {normalized_wallet}"
+            );
+        }
+        ensure_pool_note_keypair_matches(
+            self.pn_address.as_deref().unwrap_or("pending"),
+            &self.owner_public_key_hex,
+            &self.owner_secret_key_hex,
+        )?;
+        if self.pn_address.is_some() && self.deposit_identifier_hash.is_none() {
+            bail!(
+                "note deploy recovery file has pn_address but no deposit_identifier_hash; refusing to guess"
+            );
+        }
+        if let Some(voucher) = &self.deposit_voucher {
+            voucher.ensure_matches(
+                NoteDeployVoucherKind::Deposit,
+                &self.owner_public_key_hex,
+                self.token_type,
+                self.raw_value,
+                false,
+            )?;
+        }
+        if let Some(voucher) = &self.shell_voucher {
+            voucher.ensure_matches(
+                NoteDeployVoucherKind::ShellGas,
+                &self.owner_public_key_hex,
+                SHELL_ECC_ID,
+                self.ecc_shell_deposit,
+                true,
+            )?;
+        }
+        Ok(())
+    }
+
+    pub(crate) fn ensure_matches_request(
+        &self,
+        request: NoteDeployRecoveryRequest<'_>,
+    ) -> Result<()> {
+        let funding_multisig_address =
+            dexdo_core::normalize_wallet_address(request.funding_multisig_address)
+                .map_err(|e| anyhow!("{e}"))?;
+        if self.endpoint != request.endpoint
+            || self.nominal != request.nominal
+            || self.token_type != request.token_type
+            || self.raw_value != request.raw_value
+            || self.ecc_shell_deposit != request.ecc_shell_deposit
+            || self.funding_multisig_address != funding_multisig_address
+        {
+            bail!(
+                "note deploy recovery file does not match this deploy request. Refusing to mix recovery state \
+                 with a different wallet/endpoint/nominal/token-type; pass the matching --recovery file or \
+                 deploy into a fresh --pool/--recovery pair."
+            );
+        }
+        Ok(())
+    }
+
+    pub(crate) fn mark_private_note_deployed(
+        &mut self,
+        pn_address: String,
+        deposit_identifier_hash: String,
+        deployed_at_unix: u64,
+    ) -> Result<()> {
+        self.pn_address = Some(pn_address);
+        self.deposit_identifier_hash = Some(deposit_identifier_hash);
+        self.deployed_at_unix = Some(deployed_at_unix);
+        self.validate()
+    }
+
+    pub(crate) fn voucher_checkpoint(
+        &self,
+        kind: NoteDeployVoucherKind,
+    ) -> Option<&NoteDeployVoucherCheckpoint> {
+        match kind {
+            NoteDeployVoucherKind::Deposit => self.deposit_voucher.as_ref(),
+            NoteDeployVoucherKind::ShellGas => self.shell_voucher.as_ref(),
+        }
+    }
+
+    pub(crate) fn set_voucher_checkpoint(
+        &mut self,
+        kind: NoteDeployVoucherKind,
+        checkpoint: NoteDeployVoucherCheckpoint,
+    ) -> Result<()> {
+        let (token_type, raw_value, is_fee) = match kind {
+            NoteDeployVoucherKind::Deposit => (self.token_type, self.raw_value, false),
+            NoteDeployVoucherKind::ShellGas => (SHELL_ECC_ID, self.ecc_shell_deposit, true),
+        };
+        checkpoint.ensure_matches(
+            kind,
+            &self.owner_public_key_hex,
+            token_type,
+            raw_value,
+            is_fee,
+        )?;
+        match kind {
+            NoteDeployVoucherKind::Deposit => self.deposit_voucher = Some(checkpoint),
+            NoteDeployVoucherKind::ShellGas => self.shell_voucher = Some(checkpoint),
+        }
+        self.validate()
+    }
+
+    pub(crate) fn mark_shell_funded_and_checked(&mut self) -> Result<()> {
+        self.shell_funded = true;
+        self.sanity_checked = true;
+        self.validate()
+    }
+
+    pub(crate) fn ensure_ready_for_pool(&self) -> Result<()> {
+        if self.pn_address.is_none() || self.deposit_identifier_hash.is_none() {
+            bail!(
+                "note deploy recovery state contains the owner key but no deployed PrivateNote address yet; \
+                 refusing to write a pool entry or guess. Re-run `dexdo note deploy --recovery <this-file> \
+                 --pool <pool>` to continue with the persisted owner key."
+            );
+        }
+        if !self.shell_funded || !self.sanity_checked {
+            bail!(
+                "note deploy recovery state is not finalized for pooling (shell_funded={}, sanity_checked={}); \
+                 re-run `dexdo note deploy --recovery <this-file> --pool <pool>` to resume before using \
+                 `dexdo note recover`.",
+                self.shell_funded,
+                self.sanity_checked
+            );
+        }
+        Ok(())
+    }
+
+    pub(crate) fn to_onboard_state(&self) -> Result<OnboardPnState> {
+        self.validate()?;
+        Ok(OnboardPnState {
+            endpoint: self.endpoint.clone(),
+            nominal: self.nominal.clone(),
+            token_type: self.token_type,
+            raw_value: self.raw_value,
+            ecc_shell_deposit: self.ecc_shell_deposit,
+            pn_address: self.pn_address.clone(),
+            deposit_identifier_hash: self.deposit_identifier_hash.clone(),
+            owner_public_key_hex: Some(self.owner_public_key_hex.clone()),
+            owner_secret_key_hex: Some(self.owner_secret_key_hex.clone()),
+            deployed_at_unix: self.deployed_at_unix,
+            shell_funded: self.shell_funded,
+            sanity_checked: self.sanity_checked,
+        })
+    }
+}
+
+#[cfg_attr(not(feature = "shellnet"), allow(dead_code))]
+pub(crate) fn default_note_deploy_recovery_path(pool: &Path) -> PathBuf {
+    let mut path = pool.as_os_str().to_os_string();
+    path.push(".recovery.json");
+    PathBuf::from(path)
+}
+
+#[cfg_attr(not(feature = "shellnet"), allow(dead_code))]
+pub(crate) fn load_note_deploy_recovery(path: &Path) -> Result<Option<NoteDeployRecoveryState>> {
+    let bytes = match std::fs::read(path) {
+        Ok(bytes) => bytes,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => bail!("read note deploy recovery {}: {e}", path.display()),
+    };
+    let state: NoteDeployRecoveryState = serde_json::from_slice(&bytes).map_err(|e| {
+        anyhow!(
+            "note deploy recovery {} is not valid JSON: {e}",
+            path.display()
+        )
+    })?;
+    state.validate()?;
+    Ok(Some(state))
+}
+
+#[cfg_attr(not(feature = "shellnet"), allow(dead_code))]
+pub(crate) fn write_note_deploy_recovery(
+    path: &Path,
+    state: &NoteDeployRecoveryState,
+) -> Result<()> {
+    state.validate()?;
+    let json = serde_json::to_vec_pretty(state)?;
+    write_private_atomic(path, &json)
+        .map_err(|e| anyhow!("write note deploy recovery {}: {e}", path.display()))
+}
+
+#[cfg_attr(not(feature = "shellnet"), allow(dead_code))]
+pub(crate) fn recovery_owner_key_written_message(path: &Path) -> String {
+    format!(
+        "note deploy recovery: owner key persisted to {} (0600) before wallet spend. If interrupted before \
+         recovery is finalized, rerun `dexdo note deploy --recovery {} --pool <pool>`; if recovery is already \
+         finalized but pn_pool.json is missing, run `dexdo note recover --recovery {} --pool <pool>`.",
+        path.display(),
+        path.display(),
+        path.display()
+    )
+}
+
+#[cfg_attr(not(feature = "shellnet"), allow(dead_code))]
+pub(crate) fn write_private_atomic(path: &Path, bytes: &[u8]) -> Result<()> {
+    let dir = path
+        .parent()
+        .filter(|p| !p.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    let name = path
+        .file_name()
+        .and_then(|s| s.to_str())
+        .unwrap_or("secret.json");
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_err(|e| anyhow!("system clock before epoch: {e}"))?
+        .as_nanos();
+    let tmp = dir.join(format!(".{name}.tmp.{}.{nanos}", std::process::id()));
+    write_private_atomic_via_temp(path, &tmp, bytes)
+}
+
+#[cfg_attr(not(feature = "shellnet"), allow(dead_code))]
+pub(crate) fn write_private_atomic_via_temp(path: &Path, tmp: &Path, bytes: &[u8]) -> Result<()> {
+    use std::io::Write;
+    let mut opts = std::fs::OpenOptions::new();
+    opts.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        opts.mode(0o600);
+    }
+    let mut f = opts
+        .open(tmp)
+        .map_err(|e| anyhow!("create temp secret file {}: {e}", tmp.display()))?;
+    if let Err(e) = f.write_all(bytes).and_then(|()| f.sync_all()) {
+        let _ = std::fs::remove_file(tmp);
+        return Err(anyhow!("write temp secret file {}: {e}", tmp.display()));
+    }
+    std::fs::rename(tmp, path).map_err(|e| {
+        let _ = std::fs::remove_file(tmp);
+        anyhow!("rename temp secret file into {}: {e}", path.display())
+    })?;
+    sync_parent_dir(path)?;
+    Ok(())
+}
+
+fn sync_parent_dir(path: &Path) -> Result<()> {
+    #[cfg(unix)]
+    {
+        let dir = path
+            .parent()
+            .filter(|p| !p.as_os_str().is_empty())
+            .unwrap_or_else(|| Path::new("."));
+        std::fs::File::open(dir)
+            .and_then(|f| f.sync_all())
+            .map_err(|e| anyhow!("fsync parent directory {}: {e}", dir.display()))?;
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = path;
+    }
+    Ok(())
+}
+
+fn normalize_secret_hex(secret_hex: &str) -> Result<String> {
+    let secret = secret_hex
+        .trim()
+        .trim_start_matches("0x")
+        .trim_start_matches("0X");
+    let bytes = hex::decode(secret)
+        .map_err(|e| anyhow!("owner_secret_key_hex must be 32-byte hex: {e}"))?;
+    if bytes.len() != 32 {
+        bail!("owner_secret_key_hex must be exactly 32 bytes");
+    }
+    Ok(secret.to_ascii_lowercase())
+}
+
+fn normalize_secret_like_hex(raw: &str, label: &str) -> Result<String> {
+    let value = raw.trim().trim_start_matches("0x").trim_start_matches("0X");
+    if value.len() != 64 || !value.bytes().all(|b| b.is_ascii_hexdigit()) {
+        bail!("{label} must be a 32-byte hex value");
+    }
+    Ok(value.to_ascii_lowercase())
+}
+
+fn validate_hex_u256(raw: &str, label: &str) -> Result<()> {
+    normalize_secret_like_hex(raw, label).map(|_| ())
+}
+
 /// CLI-compatible note deploy state. A subset of its fields -- exactly those the pool needs. **Carries the owner
 /// secret key** -- never log it.
 /// `allow(dead_code)` off `shellnet`: the only non-test consumer(`run_note_deploy`) is shellnet-gated, and the
 /// `cfg(test)` suite does not save these from clippy's non-test `-D warnings` pass on the default bin.
 #[cfg_attr(not(feature = "shellnet"), allow(dead_code))]
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub(crate) struct OnboardPnState {
     pub endpoint: String,
     pub nominal: String,
@@ -283,6 +1011,7 @@ pub(crate) fn pn_state_to_pool_note(s: &OnboardPnState) -> Result<Value> {
         .owner_secret_key_hex
         .as_deref()
         .ok_or_else(|| anyhow!("pn_state has no owner_secret_key_hex -- incomplete note deploy"))?;
+    ensure_pool_note_keypair_matches(address, pubkey, seckey)?;
     if !s.shell_funded || !s.sanity_checked {
         bail!(
             "note deploy state not fully deployed (shell_funded={}, sanity_checked={}) -- the PN has no gas / failed its \
@@ -383,11 +1112,109 @@ pub(crate) fn pool_with_note_added(
     Ok(pool)
 }
 
+pub(crate) fn pool_with_note_token_contract_recorded(
+    mut pool: Value,
+    note_addr: &str,
+    token_contract: &str,
+    role: &str,
+    updated_at_unix: u64,
+) -> Result<Value> {
+    if role != "buyer" && role != "seller" {
+        bail!("token_contract_role must be buyer or seller, got `{role}`");
+    }
+    let note_addr = dexdo_core::normalize_wallet_address(note_addr)
+        .map_err(|e| anyhow!("note address {note_addr}: {e}"))?;
+    let token_contract = dexdo_core::normalize_wallet_address(token_contract)
+        .map_err(|e| anyhow!("token_contract {token_contract}: {e}"))?;
+    let notes = pool["notes"]
+        .as_array_mut()
+        .ok_or_else(|| anyhow!("DEXDO_PN_POOL: malformed (\"notes\" is not an array)"))?;
+    let mut matched = 0usize;
+    for note in notes {
+        let Some(address) = note["address"].as_str() else {
+            continue;
+        };
+        let normalized = dexdo_core::normalize_wallet_address(address)
+            .unwrap_or_else(|_| address.trim().to_ascii_lowercase());
+        if normalized == note_addr {
+            matched += 1;
+            note["address"] = json!(note_addr);
+            note["token_contract"] = json!(token_contract);
+            note["token_contract_role"] = json!(role);
+            note["token_contract_updated_at_unix"] = json!(updated_at_unix);
+        }
+    }
+    match matched {
+        1 => Ok(pool),
+        0 => bail!(
+            "DEXDO_PN_POOL has no note entry for {note_addr}; refusing to claim TokenContract recovery metadata \
+             was persisted"
+        ),
+        _ => bail!(
+            "DEXDO_PN_POOL has {matched} entries for note {note_addr}; refusing ambiguous TokenContract metadata"
+        ),
+    }
+}
+
+pub(crate) fn pool_has_unique_note_entry(pool: &Value, note_addr: &str) -> Result<()> {
+    let note_addr = dexdo_core::normalize_wallet_address(note_addr)
+        .map_err(|e| anyhow!("note address {note_addr}: {e}"))?;
+    let notes = pool["notes"]
+        .as_array()
+        .ok_or_else(|| anyhow!("DEXDO_PN_POOL: malformed (\"notes\" is not an array)"))?;
+    let matched = notes
+        .iter()
+        .filter_map(|note| note["address"].as_str())
+        .filter(|address| {
+            dexdo_core::normalize_wallet_address(address)
+                .unwrap_or_else(|_| address.trim().to_ascii_lowercase())
+                == note_addr
+        })
+        .count();
+    match matched {
+        1 => Ok(()),
+        0 => bail!("DEXDO_PN_POOL has no note entry for {note_addr}"),
+        _ => bail!("DEXDO_PN_POOL has {matched} entries for note {note_addr}"),
+    }
+}
+
+pub(crate) fn pool_note_recovery_records(pool: &Value) -> Result<Vec<(String, String, String)>> {
+    let notes = pool["notes"]
+        .as_array()
+        .ok_or_else(|| anyhow!("DEXDO_PN_POOL: malformed (\"notes\" is not an array)"))?;
+    let mut out = Vec::new();
+    for note in notes {
+        let Some(note_addr) = note["address"].as_str() else {
+            continue;
+        };
+        let Some(owner_secret) = note["owner_secret_key_hex"].as_str() else {
+            continue;
+        };
+        let Some(token_contract) = note["token_contract"].as_str() else {
+            continue;
+        };
+        out.push((
+            dexdo_core::normalize_wallet_address(note_addr)
+                .map_err(|e| anyhow!("DEXDO_PN_POOL note address {note_addr}: {e}"))?,
+            owner_secret.to_string(),
+            dexdo_core::normalize_wallet_address(token_contract)
+                .map_err(|e| anyhow!("DEXDO_PN_POOL token_contract {token_contract}: {e}"))?,
+        ));
+    }
+    Ok(out)
+}
+
 #[cfg(test)]
 mod note_deploy_tests {
     use super::*;
 
+    fn fixture_secret_hex() -> String {
+        "2a".repeat(32)
+    }
+
     fn complete_state() -> OnboardPnState {
+        let secret = fixture_secret_hex();
+        let public = derive_owner_pubkey_from_secret_hex(&secret).expect("fixture key derives");
         OnboardPnState {
             endpoint: "shellnet.ackinacki.org".into(),
             nominal: "N100".into(),
@@ -396,8 +1223,8 @@ mod note_deploy_tests {
             ecc_shell_deposit: 100_000_000_000,
             pn_address: Some("0:abc".into()),
             deposit_identifier_hash: Some("123".into()),
-            owner_public_key_hex: Some("pub".into()),
-            owner_secret_key_hex: Some("sec".into()),
+            owner_public_key_hex: Some(public),
+            owner_secret_key_hex: Some(secret),
             deployed_at_unix: Some(1000),
             shell_funded: true,
             sanity_checked: true,
@@ -413,6 +1240,63 @@ mod note_deploy_tests {
             .map(|i| bip39::Language::English.wordlist().get_word((*i).into()))
             .collect::<Vec<_>>()
             .join(" ")
+    }
+
+    fn recovery_request<'a>(
+        endpoint: &'a str,
+        funding_multisig_address: &'a str,
+    ) -> NoteDeployRecoveryRequest<'a> {
+        NoteDeployRecoveryRequest {
+            endpoint,
+            nominal: "N100",
+            token_type: 1,
+            raw_value: 100_000_000_000,
+            ecc_shell_deposit: 100_000_000_000,
+            funding_multisig_address,
+        }
+    }
+
+    fn complete_recovery_state() -> NoteDeployRecoveryState {
+        let state = complete_state();
+        NoteDeployRecoveryState {
+            version: NOTE_DEPLOY_RECOVERY_VERSION,
+            endpoint: state.endpoint,
+            nominal: state.nominal,
+            token_type: state.token_type,
+            raw_value: state.raw_value,
+            ecc_shell_deposit: state.ecc_shell_deposit,
+            funding_multisig_address: format!("0:{}", "a".repeat(64)),
+            owner_public_key_hex: state.owner_public_key_hex.unwrap(),
+            owner_secret_key_hex: state.owner_secret_key_hex.unwrap(),
+            pn_address: state.pn_address,
+            deposit_identifier_hash: state.deposit_identifier_hash,
+            deployed_at_unix: state.deployed_at_unix,
+            deposit_voucher: None,
+            shell_voucher: None,
+            shell_funded: state.shell_funded,
+            sanity_checked: state.sanity_checked,
+        }
+    }
+
+    struct TempDirCleanup(std::path::PathBuf);
+
+    impl Drop for TempDirCleanup {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    fn temp_dir(prefix: &str) -> (std::path::PathBuf, TempDirCleanup) {
+        let dir = std::env::temp_dir().join(format!(
+            "{prefix}-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir(&dir).unwrap();
+        (dir.clone(), TempDirCleanup(dir))
     }
 
     /// account-reader data formats SHELL/ECC[2] and native gas in readable units plus raw units.
@@ -518,11 +1402,14 @@ mod note_deploy_tests {
     /// a fully deployed note state maps to the exact pool note schema the seller/buyer consume.
     #[test]
     fn pn_state_to_note_exact_schema() {
-        let n = pn_state_to_pool_note(&complete_state()).unwrap();
+        let state = complete_state();
+        let public = state.owner_public_key_hex.clone().unwrap();
+        let secret = state.owner_secret_key_hex.clone().unwrap();
+        let n = pn_state_to_pool_note(&state).unwrap();
         assert_eq!(n["address"], "0:abc");
         assert_eq!(n["deposit_identifier_hash"], "123");
-        assert_eq!(n["owner_public_key_hex"], "pub");
-        assert_eq!(n["owner_secret_key_hex"], "sec");
+        assert_eq!(n["owner_public_key_hex"].as_str(), Some(public.as_str()));
+        assert_eq!(n["owner_secret_key_hex"].as_str(), Some(secret.as_str()));
         assert_eq!(n["deployed_at_unix"], 1000);
         assert_eq!(n["shell_funded"], true);
         assert_eq!(n["native_funded"], true);
@@ -551,6 +1438,50 @@ mod note_deploy_tests {
             .contains("not fully deployed"));
     }
 
+    /// regression: a pool entry whose stored secret cannot derive the recorded owner pubkey is
+    /// rejected before the bad DEXDO_PN_POOL entry is serialized. Without this, later owner-signed writes fail
+    /// opaquely with ERR_INVALID_SENDER 101.
+    #[test]
+    fn pn_state_to_note_rejects_owner_secret_public_mismatch() {
+        let mut s = complete_state();
+        s.owner_public_key_hex = Some("11".repeat(32));
+
+        let err = pn_state_to_pool_note(&s).unwrap_err().to_string();
+
+        assert!(err.contains("DEXDO_PN_POOL"), "{err}");
+        assert!(err.contains("owner_secret_key_hex derives pubkey"), "{err}");
+        assert!(err.contains("ERR_INVALID_SENDER 101"), "{err}");
+        assert!(err.contains("--pool <new_file>"), "{err}");
+    }
+
+    /// regression: deploy must compare the freshly deployed PrivateNote's on-chain owner key
+    /// (`getDetails().ephemeralPubkey`) against the saved pool key before writing the pool file.
+    #[test]
+    fn onchain_owner_check_rejects_mismatched_pool_key() {
+        let derived = derive_owner_pubkey_from_secret_hex(&fixture_secret_hex()).unwrap();
+        assert!(ensure_onchain_owner_matches_pool_key(
+            "note deploy",
+            "0:abc",
+            Some(&format!("0x{}", derived.to_ascii_uppercase())),
+            &derived,
+        )
+        .is_ok());
+
+        let err = ensure_onchain_owner_matches_pool_key(
+            "note deploy",
+            "0:abc",
+            Some(&format!("0x{}", "11".repeat(32))),
+            &derived,
+        )
+        .unwrap_err()
+        .to_string();
+
+        assert!(err.contains("_ephemeralPubkey"), "{err}");
+        assert!(err.contains("provision/sell/withdraw"), "{err}");
+        assert!(err.contains("ERR_INVALID_SENDER 101"), "{err}");
+        assert!(err.contains("--pool <new_file>"), "{err}");
+    }
+
     /// a fresh pool is created from the pn_state pool-level fields; a second note appends.
     #[test]
     fn pool_create_then_append() {
@@ -569,6 +1500,70 @@ mod note_deploy_tests {
         let pool = pool_with_note_added(Some(pool), &s2, n2, 43, &wallet).unwrap();
         assert_eq!(pool["funding_multisig_address"], wallet);
         assert_eq!(pool["notes"].as_array().unwrap().len(), 2);
+    }
+
+    /// residual: the pool entry itself carries the current TokenContract so buyer recovery/reclaim does not
+    /// depend on a side manifest or scraped logs.
+    #[test]
+    fn pool_records_token_contract_next_to_note_entry() {
+        let mut s = complete_state();
+        s.pn_address = Some(format!("0:{}", "1".repeat(64)));
+        let wallet = format!("0:{}", "a".repeat(64));
+        let pool =
+            pool_with_note_added(None, &s, pn_state_to_pool_note(&s).unwrap(), 1, &wallet).unwrap();
+        let note_addr = s.pn_address.as_deref().unwrap();
+        let tc = format!("0:{}", "b".repeat(64));
+
+        let pool =
+            pool_with_note_token_contract_recorded(pool, note_addr, &tc, "buyer", 99).unwrap();
+
+        let note = &pool["notes"].as_array().unwrap()[0];
+        assert_eq!(note["token_contract"], tc);
+        assert_eq!(note["token_contract_role"], "buyer");
+        assert_eq!(note["token_contract_updated_at_unix"], 99);
+        assert_eq!(
+            pool_note_recovery_records(&pool).unwrap(),
+            vec![(
+                note_addr.to_string(),
+                s.owner_secret_key_hex.clone().unwrap(),
+                tc
+            )]
+        );
+    }
+
+    /// negative: do not silently claim recovery metadata was persisted if the active pool is not the note's
+    /// pool.
+    #[test]
+    fn pool_token_contract_record_requires_matching_note() {
+        let mut s = complete_state();
+        s.pn_address = Some(format!("0:{}", "1".repeat(64)));
+        let wallet = format!("0:{}", "a".repeat(64));
+        let pool =
+            pool_with_note_added(None, &s, pn_state_to_pool_note(&s).unwrap(), 1, &wallet).unwrap();
+        let err = pool_with_note_token_contract_recorded(
+            pool,
+            &format!("0:{}", "c".repeat(64)),
+            &format!("0:{}", "b".repeat(64)),
+            "buyer",
+            99,
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("no note entry"), "{err}");
+    }
+
+    #[test]
+    fn pool_note_entry_preflight_requires_unique_note() {
+        let mut s = complete_state();
+        s.pn_address = Some(format!("0:{}", "1".repeat(64)));
+        let wallet = format!("0:{}", "a".repeat(64));
+        let pool =
+            pool_with_note_added(None, &s, pn_state_to_pool_note(&s).unwrap(), 1, &wallet).unwrap();
+        pool_has_unique_note_entry(&pool, s.pn_address.as_deref().unwrap()).unwrap();
+        let err = pool_has_unique_note_entry(&pool, &format!("0:{}", "c".repeat(64)))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("no note entry"), "{err}");
     }
 
     /// (negatives): duplicate address + mixed nominal are refused.
@@ -669,5 +1664,209 @@ mod note_deploy_tests {
         for word in phrase.split_whitespace() {
             assert!(!json.contains(word), "pool output contains a seed word");
         }
+    }
+
+    /// the recovery file is the durable owner-key copy and must be private, atomic JSON.
+    #[test]
+    fn recovery_file_writes_owner_key_with_private_mode() {
+        let (dir, _cleanup) = temp_dir("dexdo-note-recovery-test");
+        let path = dir.join("pn_pool.json.recovery.json");
+        let state = NoteDeployRecoveryState::new(
+            recovery_request(
+                "https://shellnet.ackinacki.org",
+                &format!("0:{}", "a".repeat(64)),
+            ),
+            &derive_owner_pubkey_from_secret_hex(&fixture_secret_hex()).unwrap(),
+            &fixture_secret_hex(),
+        )
+        .unwrap();
+
+        write_note_deploy_recovery(&path, &state).unwrap();
+        let loaded = load_note_deploy_recovery(&path).unwrap().unwrap();
+
+        assert_eq!(loaded.owner_secret_key_hex, fixture_secret_hex());
+        assert_eq!(loaded.pn_address, None);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+            assert_eq!(mode, 0o600, "recovery file must be 0600");
+        }
+    }
+
+    /// recovery state contains note recovery material, but never the funding wallet secret.
+    #[test]
+    fn recovery_contents_exclude_funding_wallet_secret() {
+        let state = complete_recovery_state();
+        let wallet_secret = "f1".repeat(32);
+        let json = serde_json::to_string_pretty(&state).unwrap();
+
+        assert!(json.contains("owner_secret_key_hex"), "{json}");
+        assert!(json.contains(&state.owner_secret_key_hex), "{json}");
+        assert!(
+            !json.contains(&wallet_secret),
+            "wallet secret leaked into recovery JSON"
+        );
+        assert!(
+            !json.contains("multisig_key") && !json.contains("multisig_seed"),
+            "recovery JSON must not serialize funding wallet credential fields: {json}"
+        );
+    }
+
+    /// a complete recovery state can rebuild the exact pool entry without wallet credentials/spend.
+    #[test]
+    fn recovery_state_finalizes_pool_entry_without_wallet_secret() {
+        let state = complete_recovery_state();
+        state.ensure_ready_for_pool().unwrap();
+        let onboard = state.to_onboard_state().unwrap();
+        let note = pn_state_to_pool_note(&onboard).unwrap();
+        let pool =
+            pool_with_note_added(None, &onboard, note, 1234, &state.funding_multisig_address)
+                .unwrap();
+
+        assert_eq!(pool["notes"].as_array().unwrap().len(), 1);
+        assert_eq!(pool["notes"][0]["address"], state.pn_address.unwrap());
+        assert_eq!(
+            pool["notes"][0]["owner_secret_key_hex"],
+            state.owner_secret_key_hex
+        );
+    }
+
+    /// negative: owner-key-only recovery is useful for resume, but not enough to write a pool entry.
+    #[test]
+    fn incomplete_recovery_refuses_finalize_with_clear_message() {
+        let mut state = complete_recovery_state();
+        state.pn_address = None;
+        state.deposit_identifier_hash = None;
+        state.shell_funded = false;
+        state.sanity_checked = false;
+
+        let err = state.ensure_ready_for_pool().unwrap_err().to_string();
+
+        assert!(err.contains("owner key"), "{err}");
+        assert!(err.contains("no deployed PrivateNote address"), "{err}");
+        assert!(err.contains("note deploy --recovery"), "{err}");
+        assert!(
+            !err.contains(&state.owner_secret_key_hex),
+            "secret leaked in error: {err}"
+        );
+    }
+
+    /// regression: voucher-level recovery may contain a wallet-submitted deposit voucher, but without a
+    /// deployed PrivateNote it must resume through `note deploy`, not be folded into a pool.
+    #[test]
+    fn voucher_submitted_recovery_refuses_pool_finalize_without_note_deploy() {
+        let mut state = complete_recovery_state();
+        state.pn_address = None;
+        state.deposit_identifier_hash = None;
+        state.shell_funded = false;
+        state.sanity_checked = false;
+        let mut voucher = NoteDeployVoucherCheckpoint::new(
+            &state.owner_public_key_hex,
+            state.token_type,
+            state.raw_value,
+            false,
+            "11".repeat(32),
+            "22".repeat(32),
+        )
+        .unwrap();
+        voucher.submit_maybe_sent = true;
+        state
+            .set_voucher_checkpoint(NoteDeployVoucherKind::Deposit, voucher)
+            .unwrap();
+
+        let err = state.ensure_ready_for_pool().unwrap_err().to_string();
+        let json = serde_json::to_string_pretty(&state).unwrap();
+
+        assert!(err.contains("no deployed PrivateNote address"), "{err}");
+        assert!(json.contains("\"deposit_voucher\""), "{json}");
+        assert!(json.contains("\"submit_maybe_sent\": true"), "{json}");
+        assert!(
+            !err.contains(&state.deposit_voucher.unwrap().sk_u_hex),
+            "voucher secret leaked in error: {err}"
+        );
+    }
+
+    /// regression: voucher checkpoints serialize the recovery material required to avoid a second wallet
+    /// spend, but never serialize the funding-wallet credential names or values.
+    #[test]
+    fn recovery_contents_include_voucher_checkpoint_without_wallet_secret() {
+        let mut state = complete_recovery_state();
+        let wallet_secret = "f1".repeat(32);
+        let mut voucher = NoteDeployVoucherCheckpoint::new(
+            &state.owner_public_key_hex,
+            state.token_type,
+            state.raw_value,
+            false,
+            "33".repeat(32),
+            "44".repeat(32),
+        )
+        .unwrap();
+        voucher.submit_maybe_sent = true;
+        voucher.event = Some(NoteDeployVoucherEvent {
+            id: "event-id".to_string(),
+            boc: "boc".to_string(),
+            body: "body".to_string(),
+            dst: ":0000000000000000000000000000000000000000000000000000000000000087".to_string(),
+            created_at: 1234,
+            block_id: Some("block".to_string()),
+        });
+        state
+            .set_voucher_checkpoint(NoteDeployVoucherKind::Deposit, voucher)
+            .unwrap();
+
+        let json = serde_json::to_string_pretty(&state).unwrap();
+
+        assert!(json.contains("\"sk_u_hex\""), "{json}");
+        assert!(json.contains("\"sk_u_commit_hex\""), "{json}");
+        assert!(json.contains("\"event\""), "{json}");
+        assert!(
+            !json.contains(&wallet_secret),
+            "wallet secret leaked: {json}"
+        );
+        assert!(
+            !json.contains("multisig_key") && !json.contains("multisig_seed"),
+            "wallet credential field leaked: {json}"
+        );
+    }
+
+    /// negative: an existing recovery file is tied to the deploy request and cannot be silently reused.
+    #[test]
+    fn recovery_rejects_mismatched_request() {
+        let state = complete_recovery_state();
+
+        let err = state
+            .ensure_matches_request(recovery_request(
+                "https://other-shellnet.example",
+                &state.funding_multisig_address,
+            ))
+            .unwrap_err()
+            .to_string();
+
+        assert!(err.contains("does not match this deploy request"), "{err}");
+        assert!(err.contains("fresh --pool/--recovery"), "{err}");
+        assert!(
+            !err.contains(&state.owner_secret_key_hex),
+            "secret leaked in error: {err}"
+        );
+    }
+
+    /// user-facing recovery guidance names only paths and actions, not raw key material.
+    #[test]
+    fn recovery_user_message_does_not_log_secret() {
+        let path = std::path::Path::new("pn_pool.json.recovery.json");
+        let state = complete_recovery_state();
+        let msg = recovery_owner_key_written_message(path);
+
+        assert!(msg.contains("note recover"), "{msg}");
+        assert!(msg.contains("pn_pool.json.recovery.json"), "{msg}");
+        assert!(
+            !msg.contains(&state.owner_secret_key_hex),
+            "secret leaked in message: {msg}"
+        );
+        assert!(
+            !msg.contains(&state.owner_public_key_hex),
+            "owner key material should not be printed in recovery guidance: {msg}"
+        );
     }
 }

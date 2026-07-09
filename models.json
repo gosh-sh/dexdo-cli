@@ -7,6 +7,17 @@
       "api_key_env": "GROQ_API_KEY",
       "tokenizer_family": "qwen",
       "price_per_tick": 1000,
+      "identity_aliases": [
+        "Qwen/Qwen3-32B"
+      ],
+      "vocab_size": 152064,
+      "fingerprints": [
+        {
+          "probe_prompt": "What is 17*23? Think step by step.",
+          "expected_contains": "<think>",
+          "accepts_reasoning_side_channel": true
+        }
+      ],
       "capabilities": {
         "logprobs": true,
         "top_logprobs": 5

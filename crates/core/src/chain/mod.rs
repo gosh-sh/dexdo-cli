@@ -33,6 +33,13 @@ pub trait ChainBackend: Send + Sync {
     async fn assert_note_current(&self) -> Result<(), ChainError> {
         Ok(())
     }
+    /// before any seller write that can reach `PrivateNote.postSellOffer`, ensure the note was not
+    /// permanently withdrawn. A withdrawn note is final by contract semantics and `postSellOffer` would revert
+    /// with `ERR_INVALID_STATE` 151; real shellnet overrides this with a read-only `getDetails().hasWithdrawn`
+    /// preflight so the CLI can report a clear "use a fresh note" error before submitting.
+    async fn assert_note_can_post_sell_offer(&self) -> Result<(), ChainError> {
+        Ok(())
+    }
     /// ensure the per-deal `TokenContract` being advertised is FRESH(deployed but unused) before resting
     /// an ask on it. A deterministic `(sellerPubkey, nonce)` TC is a single-use per-deal resource -- if a prior
     /// deal already `opened`/`funded`/`disputed` it(or left residual deposit/prepaid/frozen/finalized), the
@@ -45,12 +52,11 @@ pub trait ChainBackend: Send + Sync {
     ) -> Result<(), ChainError> {
         Ok(())
     }
-    /// after `post_offer`, confirm the seller's ask actually RESTED in the `InferenceOrderBook` before
-    /// waiting for a match. A note-level `postSellOffer` can submit OK while the IOB rejects/does not rest the
-    /// ask (e.g. a non-canonical `(sellerPubkey, nonce)` TC) -- the gateway listens but never matches and the
-    /// buyer times out(300s). Default `Ok(())`(mock has no IOB); the real seller backend scans the book's
-    /// orders(`getStats` + `getOrder`) and requires one whose `tokenContract` is THIS deal's -- `getBestBidAsk.
-    /// hasAsk` alone is a false-green in a shared book -- failing closed with the IOB stats if our ask is absent.
+    /// after `post_offer`, confirm the accepted sell submit reached an IOB-acceptable outcome before
+    /// opening the gateway. A note-level `postSellOffer` can submit OK while no ask rests; that is valid only if
+    /// the same TC immediately matched/funded or the seller note has the matching fill event. Default `Ok(())`
+    /// for backends without a live IOB; the real seller backend accepts either this TC's resting ask or this TC's
+    /// immediate match evidence, otherwise it fails closed with IOB/TC/RootModel evidence.
     async fn assert_offer_rested(&self, _token_contract: &TokenContract) -> Result<(), ChainError> {
         Ok(())
     }
@@ -116,6 +122,18 @@ pub trait ChainBackend: Send + Sync {
         _max_price_per_tick: u128,
     ) -> Result<(), ChainError> {
         Ok(())
+    }
+    /// Return the submit-safe executable row for an explicit `--token-contract` buyer selection. Backends that
+    /// cannot expose the row return `Ok(None)` and the CLI falls back to legacy quote rendering after the
+    /// preflight above. Real shellnet returns `Some(row)` so the displayed quote is identical to the row that
+    /// the model-wide matcher can actually fund.
+    async fn submit_safe_explicit_buy_quote_order(
+        &self,
+        _token_contract: &TokenContract,
+        _ticks: u128,
+        _max_price_per_tick: u128,
+    ) -> Result<Option<OrderBookOrder>, ChainError> {
+        Ok(None)
     }
     /// The current real shellnet submit path requires raw price/time depth with per-fill TC state checks.
     /// Mock/backends without that order-book limitation keep the generic quote.

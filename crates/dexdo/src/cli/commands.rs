@@ -31,6 +31,7 @@ use dexdo_core::{
 #[cfg(feature = "shellnet")]
 use dexdo_core::{OrderBookSnapshot, OrderBookSubscription};
 use serde_json::{json, Map, Value};
+use std::future::Future;
 use std::io::Write as _;
 use std::sync::Arc;
 
@@ -44,6 +45,22 @@ pub(crate) const DEAL_WAIT_SECS: u64 = 300;
 pub(crate) const RESUME_LOOKBACK_SECS: i64 = 1800;
 #[cfg(feature = "shellnet")]
 const DEFAULT_CONTRACTS_PATH: &str = "contracts/deployed.shellnet.json";
+#[cfg(feature = "shellnet")]
+const NOTE_DEPLOY_LOCK_TIMEOUT_SECS: u64 = 3600;
+
+#[cfg_attr(not(feature = "shellnet"), allow(dead_code))]
+async fn direct_chain_read_with_timeout<T>(
+    timeout_secs: u64,
+    read: impl Future<Output = Result<T>>,
+) -> Result<T> {
+    let duration = std::time::Duration::from_secs(timeout_secs);
+    match tokio::time::timeout(duration, read).await {
+        Ok(result) => result,
+        Err(_) => bail!(
+            "chain read timed out after {timeout_secs}s; retry or use `dexdo market-data` where applicable"
+        ),
+    }
+}
 
 #[cfg(feature = "shellnet")]
 struct DealTarget {
@@ -63,6 +80,26 @@ struct RuntimeDealHandleInput<'a> {
     market_path: Option<&'a std::path::Path>,
     contracts: &'a std::path::Path,
     endpoint: Option<deals::DealEndpointInfo>,
+}
+
+#[cfg(feature = "shellnet")]
+#[derive(Debug, Clone)]
+struct PoolRecoveryInputs {
+    note_addr: String,
+    note_secret_hex: String,
+    token_contract: String,
+}
+
+#[cfg(feature = "shellnet")]
+struct NoteDeployWalletLock {
+    path: std::path::PathBuf,
+}
+
+#[cfg(feature = "shellnet")]
+impl Drop for NoteDeployWalletLock {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.path);
+    }
 }
 
 fn note_pubkey_id(pk: &dexdo_core::NotePubkey) -> String {
@@ -99,6 +136,317 @@ fn persist_runtime_deal_handle(
 
 fn save_mock_runtime_deal_handle(input: RuntimeDealHandleInput<'_>) -> Result<deals::DealHandle> {
     persist_runtime_deal_handle(input, "mock")
+}
+
+#[cfg(feature = "shellnet")]
+fn load_pool_json(path: &std::path::Path) -> Result<Value> {
+    let bytes = std::fs::read(path)
+        .map_err(|e| anyhow::anyhow!("read DEXDO_PN_POOL {}: {e}", path.display()))?;
+    serde_json::from_slice(&bytes)
+        .map_err(|e| anyhow::anyhow!("parse DEXDO_PN_POOL {}: {e}", path.display()))
+}
+
+#[cfg(feature = "shellnet")]
+fn note_pool_path(explicit: Option<&std::path::Path>) -> Option<std::path::PathBuf> {
+    if let Some(path) = explicit {
+        return Some(path.to_path_buf());
+    }
+    match std::env::var_os("DEXDO_PN_POOL") {
+        Some(raw) if !raw.is_empty() => Some(std::path::PathBuf::from(raw)),
+        _ => None,
+    }
+}
+
+#[cfg(feature = "shellnet")]
+fn persist_pool_token_contract_for_note(
+    pool_path: &std::path::Path,
+    note_addr: &str,
+    token_contract: &str,
+    role: &str,
+) -> Result<()> {
+    let pool = load_pool_json(pool_path)?;
+    let updated = crate::cli::note::pool_with_note_token_contract_recorded(
+        pool,
+        note_addr,
+        token_contract,
+        role,
+        unix_now_secs(),
+    )?;
+    let bytes = serde_json::to_vec_pretty(&updated)?;
+    write_pool_private(pool_path, &bytes)?;
+    Ok(())
+}
+
+#[cfg(feature = "shellnet")]
+fn preflight_buyer_pool_for_note(note_addr: Option<&str>) -> Result<()> {
+    let Some(pool_path) = note_pool_path(None) else {
+        return Ok(());
+    };
+    let note_addr = note_addr.ok_or_else(|| {
+        anyhow::anyhow!(
+            "real shellnet: --note-addr is required to preflight DEXDO_PN_POOL before buying"
+        )
+    })?;
+    let pool = load_pool_json(&pool_path)?;
+    crate::cli::note::pool_has_unique_note_entry(&pool, note_addr)?;
+    let bytes = serde_json::to_vec_pretty(&pool)?;
+    write_pool_private(&pool_path, &bytes).map_err(|e| {
+        anyhow::anyhow!(
+            "preflight DEXDO_PN_POOL {} before buying: pool is not safely updateable: {e}",
+            pool_path.display()
+        )
+    })
+}
+
+#[cfg(not(feature = "shellnet"))]
+fn preflight_buyer_pool_for_note(_note_addr: Option<&str>) -> Result<()> {
+    Ok(())
+}
+
+fn preflight_buyer_pool_for_money_move(args: &BuyerArgs) -> Result<()> {
+    if args.mock.mock_chain {
+        return Ok(());
+    }
+    preflight_buyer_pool_for_note(args.identity.note_addr.as_deref())
+}
+
+async fn place_buy_by_model_after_pool_preflight(
+    chain: &dyn ChainBackend,
+    buyer: &dexdo::buyer::Buyer,
+    preflight_pool: bool,
+    pool_note_addr: Option<&str>,
+    ticks: u128,
+    max_price: u128,
+    escrow: u128,
+) -> Result<()> {
+    if preflight_pool {
+        preflight_buyer_pool_for_note(pool_note_addr)?;
+    }
+    chain
+        .place_buy_by_model(buyer.note.as_ref(), ticks, max_price, escrow)
+        .await
+        .map_err(|e| anyhow::anyhow!("{e}"))
+}
+
+fn record_buyer_token_contract_after_money_move(args: &BuyerArgs, token_contract: &str) {
+    if let Err(e) = persist_buyer_token_contract_in_env_pool(args, token_contract) {
+        tracing::warn!(
+            token_contract = %token_contract,
+            error = %e,
+            "failed to persist buyer TokenContract recovery metadata after preflight; continuing handover/recovery"
+        );
+        eprintln!(
+            "warning: failed to persist TokenContract recovery metadata in DEXDO_PN_POOL after buy; \
+             continuing handover/recovery: {e}"
+        );
+    }
+}
+
+#[cfg(feature = "shellnet")]
+fn persist_buyer_token_contract_in_env_pool(args: &BuyerArgs, token_contract: &str) -> Result<()> {
+    if args.mock.mock_chain {
+        return Ok(());
+    }
+    let Some(pool_path) = note_pool_path(None) else {
+        return Ok(());
+    };
+    let note_addr = args.identity.note_addr.as_deref().ok_or_else(|| {
+        anyhow::anyhow!(
+            "real shellnet: --note-addr is required to persist TokenContract in DEXDO_PN_POOL"
+        )
+    })?;
+    persist_pool_token_contract_for_note(&pool_path, note_addr, token_contract, "buyer")
+}
+
+#[cfg(feature = "shellnet")]
+fn persist_buyer_token_contract_for_note(note_addr: Option<&str>, token_contract: &str) {
+    let Some(note_addr) = note_addr else {
+        return;
+    };
+    let Some(pool_path) = note_pool_path(None) else {
+        return;
+    };
+    if let Err(e) =
+        persist_pool_token_contract_for_note(&pool_path, note_addr, token_contract, "buyer")
+    {
+        tracing::warn!(
+            token_contract = %token_contract,
+            note_addr,
+            pool = %pool_path.display(),
+            error = %e,
+            "failed to persist buyer TokenContract recovery metadata in DEXDO_PN_POOL"
+        );
+    }
+}
+
+#[cfg(not(feature = "shellnet"))]
+fn persist_buyer_token_contract_in_env_pool(
+    _args: &BuyerArgs,
+    _token_contract: &str,
+) -> Result<()> {
+    Ok(())
+}
+
+#[cfg(not(feature = "shellnet"))]
+fn persist_buyer_token_contract_for_note(_note_addr: Option<&str>, _token_contract: &str) {}
+
+#[cfg(feature = "shellnet")]
+fn resolve_pool_recovery_inputs(
+    command: &str,
+    identity: &IdentityArgs,
+    market: Option<&std::path::Path>,
+    token_contract: Option<&str>,
+    pool: Option<&std::path::Path>,
+) -> Result<PoolRecoveryInputs> {
+    let explicit_tc = if market.is_some() || token_contract.is_some() {
+        let (tc, _frame, _nonce) = resolve_market_fields(market, token_contract, None)?;
+        Some(dexdo_core::normalize_wallet_address(&tc).map_err(|e| anyhow::anyhow!("{e}"))?)
+    } else {
+        None
+    };
+    let explicit_note_addr = identity
+        .note_addr
+        .as_deref()
+        .map(dexdo_core::normalize_wallet_address)
+        .transpose()
+        .map_err(|e| anyhow::anyhow!("--note-addr: {e}"))?;
+    if let (Some(note_addr), Some(note_key), Some(tc)) = (
+        &explicit_note_addr,
+        identity.note_key.as_deref(),
+        &explicit_tc,
+    ) {
+        return Ok(PoolRecoveryInputs {
+            note_addr: note_addr.clone(),
+            note_secret_hex: read_secret_hex(note_key, "--note-key")?,
+            token_contract: tc.clone(),
+        });
+    }
+
+    let Some(pool_path) = note_pool_path(pool) else {
+        bail!(
+            "{command}: pass --note-addr, --note-key, and --token-contract/--market, or pass --pool / set \
+             DEXDO_PN_POOL containing this note entry with token_contract recovery metadata"
+        );
+    };
+    let pool = load_pool_json(&pool_path)?;
+    let mut records = crate::cli::note::pool_note_recovery_records(&pool)?
+        .into_iter()
+        .filter(|(note_addr, _, tc)| {
+            explicit_note_addr
+                .as_ref()
+                .map_or(true, |want| want == note_addr)
+                && explicit_tc.as_ref().map_or(true, |want| want == tc)
+        })
+        .collect::<Vec<_>>();
+    if records.is_empty() {
+        bail!(
+            "{command}: DEXDO_PN_POOL {} has no matching note entry with token_contract recovery metadata; \
+             run the buyer once with this pool active, or pass explicit --note-addr/--note-key/--token-contract",
+            pool_path.display()
+        );
+    }
+    if records.len() > 1 {
+        bail!(
+            "{command}: DEXDO_PN_POOL {} has {} matching recovery entries; pass --note-addr or --token-contract \
+             to disambiguate",
+            pool_path.display(),
+            records.len()
+        );
+    }
+    let (pool_note_addr, pool_secret, pool_tc) = records.remove(0);
+    let note_secret_hex = match identity.note_key.as_deref() {
+        Some(path) => read_secret_hex(path, "--note-key")?,
+        None => pool_secret,
+    };
+    Ok(PoolRecoveryInputs {
+        note_addr: explicit_note_addr.unwrap_or(pool_note_addr),
+        note_secret_hex,
+        token_contract: explicit_tc.unwrap_or(pool_tc),
+    })
+}
+
+#[cfg(feature = "shellnet")]
+fn note_deploy_lock_path(funding_multisig_address: &str) -> std::path::PathBuf {
+    use sha2::{Digest, Sha256};
+    let digest = Sha256::digest(funding_multisig_address.as_bytes());
+    std::env::temp_dir().join(format!(
+        "dexdo-note-deploy-wallet-{}.lock",
+        &hex::encode(digest)[..16]
+    ))
+}
+
+#[cfg(feature = "shellnet")]
+fn acquire_note_deploy_wallet_lock(funding_multisig_address: &str) -> Result<NoteDeployWalletLock> {
+    let path = note_deploy_lock_path(funding_multisig_address);
+    let timeout = std::env::var("DEXDO_NOTE_DEPLOY_LOCK_TIMEOUT_SECS")
+        .ok()
+        .and_then(|s| s.parse::<u64>().ok())
+        .unwrap_or(NOTE_DEPLOY_LOCK_TIMEOUT_SECS);
+    let started = std::time::Instant::now();
+    let mut announced = false;
+    loop {
+        match std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&path)
+        {
+            Ok(mut file) => {
+                writeln!(
+                    file,
+                    "pid={} wallet={} created_at_unix={}",
+                    std::process::id(),
+                    funding_multisig_address,
+                    unix_now_secs()
+                )
+                .ok();
+                return Ok(NoteDeployWalletLock { path });
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+                if started.elapsed().as_secs() >= timeout {
+                    bail!(
+                        "note deploy wallet busy: another `dexdo note deploy` appears to be using funding wallet \
+                         {funding_multisig_address}; lock {} remained for {timeout}s. Retry after the previous \
+                         deploy reaches a terminal state, or remove the lock only after confirming no deploy is \
+                         running.",
+                        path.display()
+                    );
+                }
+                if !announced {
+                    eprintln!(
+                        "note deploy: funding wallet {funding_multisig_address} is already in use locally; \
+                         waiting for {} (timeout {timeout}s)",
+                        path.display()
+                    );
+                    announced = true;
+                }
+                std::thread::sleep(std::time::Duration::from_secs(2));
+            }
+            Err(e) => bail!("create note deploy wallet lock {}: {e}", path.display()),
+        }
+    }
+}
+
+#[cfg(feature = "shellnet")]
+fn is_note_deploy_wallet_busy_error(error: &anyhow::Error) -> bool {
+    let msg = error.to_string().to_ascii_lowercase();
+    msg.contains("tvm_error")
+        || msg.contains("replay protection")
+        || msg.contains("exit code 52")
+        || msg.contains("nonce")
+        || msg.contains("seqno")
+}
+
+#[cfg(feature = "shellnet")]
+fn note_deploy_error(funding_multisig_address: &str, error: anyhow::Error) -> anyhow::Error {
+    if is_note_deploy_wallet_busy_error(&error) {
+        anyhow::anyhow!(
+            "note deploy wallet busy/out-of-sync for funding wallet {funding_multisig_address}: a previous \
+             wallet transaction is likely still pending or the wallet nonce cache is stale. Retry after the prior \
+             `dexdo note deploy` reaches a terminal state; local deploys are serialized by a wallet lock."
+        )
+    } else {
+        anyhow::anyhow!("deploy PrivateNote from wallet {funding_multisig_address}: {error}")
+    }
 }
 
 fn load_enabled_model_registry_policy(
@@ -764,6 +1112,7 @@ async fn buyer_quote_selection(
     max_price_per_tick: u128,
     escrow: Option<u128>,
 ) -> Result<BuyerQuoteSelection> {
+    let mut explicit_submit_safe_order = None;
     if explicit_tc.is_none() {
         chain
             .assert_model_buy_matches_executable_quote(ticks, max_price_per_tick)
@@ -771,29 +1120,43 @@ async fn buyer_quote_selection(
             .map_err(|e| anyhow::anyhow!("buyer model-only quote preflight: {e}"))?;
     } else if let Some(tc) = explicit_tc {
         let tc_owned = tc.to_string();
-        chain
-            .assert_explicit_buy_matches_executable_quote(&tc_owned, ticks, max_price_per_tick)
+        explicit_submit_safe_order = chain
+            .submit_safe_explicit_buy_quote_order(&tc_owned, ticks, max_price_per_tick)
             .await
             .map_err(|e| anyhow::anyhow!("buyer explicit-token quote preflight: {e}"))?;
+        if explicit_submit_safe_order.is_none() {
+            chain
+                .assert_explicit_buy_matches_executable_quote(&tc_owned, ticks, max_price_per_tick)
+                .await
+                .map_err(|e| anyhow::anyhow!("buyer explicit-token quote preflight: {e}"))?;
+        }
     }
-    let mut orders = mock_orders_from_offers(chain.discover_offers().await?);
+    let explicit_submit_safe_selected = explicit_submit_safe_order.is_some();
+    let mut orders = if let Some(order) = explicit_submit_safe_order {
+        vec![order]
+    } else {
+        mock_orders_from_offers(chain.discover_offers().await?)
+    };
     let order_book = if let Some(tc) = explicit_tc {
-        orders.retain(|o| o.token_contract.as_deref() == Some(tc));
-        if orders.is_empty() {
-            let tc_owned = tc.to_string();
-            if let Some((price_per_tick, max_ticks)) = chain.sell_offer_terms(&tc_owned).await? {
-                orders.push(OrderBookOrder {
-                    order_id: 1,
-                    owner_note: String::new(),
-                    token_contract: Some(tc_owned),
-                    is_buy: false,
-                    price_per_tick: u128::from(price_per_tick),
-                    ticks: u128::from(max_ticks),
-                    escrow: 0,
-                    deadline: 0,
-                    flags: 0,
-                    timestamp: 0,
-                });
+        if !explicit_submit_safe_selected {
+            orders.retain(|o| o.token_contract.as_deref() == Some(tc));
+            if orders.is_empty() {
+                let tc_owned = tc.to_string();
+                if let Some((price_per_tick, max_ticks)) = chain.sell_offer_terms(&tc_owned).await?
+                {
+                    orders.push(OrderBookOrder {
+                        order_id: 1,
+                        owner_note: String::new(),
+                        token_contract: Some(tc_owned),
+                        is_buy: false,
+                        price_per_tick: u128::from(price_per_tick),
+                        ticks: u128::from(max_ticks),
+                        escrow: 0,
+                        deadline: 0,
+                        flags: 0,
+                        timestamp: 0,
+                    });
+                }
             }
         }
         "explicit_token_contract"
@@ -868,18 +1231,28 @@ fn fail_buyer_quote_selection(
     };
     let mut fields = quote_selected_fields(frame_model, selection, ticks, max_price_per_tick);
     merge_json_fields(&mut fields, context_fields);
+    let failure_class = buyer_quote_failure_class(selection, code);
     if let serde_json::Value::Object(obj) = &mut fields {
-        obj.insert(
-            "failure_class".to_string(),
-            json!(if code == machine::ErrorCode::NoLiquidity {
-                "no_liquidity"
-            } else {
-                "incomplete_quote"
-            }),
-        );
+        obj.insert("failure_class".to_string(), json!(failure_class));
+        if failure_class == "no_executable_ask" {
+            obj.insert("no_executable_ask".to_string(), json!(true));
+        }
     }
     events.error(machine::OP_BUYER_START, code, fields)?;
     Ok(Some(()))
+}
+
+fn buyer_quote_failure_class(
+    selection: &BuyerQuoteSelection,
+    code: machine::ErrorCode,
+) -> &'static str {
+    if code == machine::ErrorCode::NoLiquidity && selection.order_book == "model_order_book" {
+        "no_executable_ask"
+    } else if code == machine::ErrorCode::NoLiquidity {
+        "no_liquidity"
+    } else {
+        "incomplete_quote"
+    }
 }
 
 fn merge_json_fields(base: &mut Value, extra: Value) {
@@ -1036,59 +1409,62 @@ pub(crate) async fn run_markets(args: MarketsArgs) -> Result<()> {
             .map(|p| target_from_market(p))
             .collect::<Result<Vec<_>>>()?
     };
-    if args.json {
-        let mut markets = Vec::new();
-        for target in targets {
-            let source = if target.order_book.is_some() {
-                "market_manifest"
-            } else {
-                "models_config"
-            };
-            let root_model = target.root_model.clone();
-            let snapshot = read_executable_book_target(&chain, &target).await?;
-            markets.push(market_entry_from_snapshot(&snapshot, root_model, source));
-        }
-        return machine::print_json(&machine::MarketsResponse {
-            schema: machine::MARKETS_SCHEMA,
-            network: "shellnet".to_string(),
-            generated_at_unix: machine::now_unix()?,
-            markets,
-        });
-    }
-    for target in targets {
-        let snapshot = read_executable_book_target(&chain, &target).await?;
-        if let Some(policy) = registry_policy.as_ref() {
-            let action = enforce_model_registry_policy(
-                RegistryRole::Buyer,
-                policy,
-                &args.contracts,
-                &target.frame_model,
-                &snapshot.order_book,
-                snapshot.active(),
-                BuyerMissingBookPolicy::HideFromAvailableList,
-            )
-            .await?;
-            if action == RegistryBookAction::BuyerHideMissing {
-                continue;
+    direct_chain_read_with_timeout(args.read_timeout.read_timeout_secs, async {
+        if args.json {
+            let mut markets = Vec::new();
+            for target in targets {
+                let source = if target.order_book.is_some() {
+                    "market_manifest"
+                } else {
+                    "models_config"
+                };
+                let root_model = target.root_model.clone();
+                let snapshot = read_executable_book_target(&chain, &target).await?;
+                markets.push(market_entry_from_snapshot(&snapshot, root_model, source));
             }
+            return machine::print_json(&machine::MarketsResponse {
+                schema: machine::MARKETS_SCHEMA,
+                network: "shellnet".to_string(),
+                generated_at_unix: machine::now_unix()?,
+                markets,
+            });
         }
-        let depth_ticks: u128 = snapshot.resting_asks().map(|o| o.ticks).sum();
-        let best_ask = snapshot.resting_asks().map(|o| o.price_per_tick).min();
-        let order_count = snapshot.stats.as_ref().map(|s| s.order_count).unwrap_or(0);
-        println!(
-            "model={} order_book={} active={} order_count={} ask_count={} depth_ticks={} best_ask={}",
-            snapshot.frame_model,
-            snapshot.order_book,
-            snapshot.active(),
-            order_count,
-            snapshot.resting_asks().count(),
-            depth_ticks,
-            best_ask
-                .map(|v| v.to_string())
-                .unwrap_or_else(|| "-".to_string())
-        );
-    }
-    Ok(())
+        for target in targets {
+            let snapshot = read_executable_book_target(&chain, &target).await?;
+            if let Some(policy) = registry_policy.as_ref() {
+                let action = enforce_model_registry_policy(
+                    RegistryRole::Buyer,
+                    policy,
+                    &args.contracts,
+                    &target.frame_model,
+                    &snapshot.order_book,
+                    snapshot.active(),
+                    BuyerMissingBookPolicy::HideFromAvailableList,
+                )
+                .await?;
+                if action == RegistryBookAction::BuyerHideMissing {
+                    continue;
+                }
+            }
+            let depth_ticks: u128 = snapshot.resting_asks().map(|o| o.ticks).sum();
+            let best_ask = snapshot.resting_asks().map(|o| o.price_per_tick).min();
+            let order_count = snapshot.stats.as_ref().map(|s| s.order_count).unwrap_or(0);
+            println!(
+                "model={} order_book={} active={} order_count={} ask_count={} depth_ticks={} best_ask={}",
+                snapshot.frame_model,
+                snapshot.order_book,
+                snapshot.active(),
+                order_count,
+                snapshot.resting_asks().count(),
+                depth_ticks,
+                best_ask
+                    .map(|v| v.to_string())
+                    .unwrap_or_else(|| "-".to_string())
+            );
+        }
+        Ok(())
+    })
+    .await
 }
 
 #[cfg(not(feature = "shellnet"))]
@@ -1123,19 +1499,23 @@ pub(crate) async fn run_market(args: MarketArgs) -> Result<()> {
             anyhow::anyhow!("{e}\n(pass --note-addr 0:<your PrivateNote> so the per-model book can be derived)")
         })?
     };
-    let snapshot = read_executable_book_target(&chain, &target).await?;
-    if let Some(policy) = registry_policy.as_ref() {
-        enforce_model_registry_policy(
-            RegistryRole::Buyer,
-            policy,
-            &args.contracts,
-            &target.frame_model,
-            &snapshot.order_book,
-            snapshot.active(),
-            BuyerMissingBookPolicy::Reject,
-        )
-        .await?;
-    }
+    let snapshot = direct_chain_read_with_timeout(args.read_timeout.read_timeout_secs, async {
+        let snapshot = read_executable_book_target(&chain, &target).await?;
+        if let Some(policy) = registry_policy.as_ref() {
+            enforce_model_registry_policy(
+                RegistryRole::Buyer,
+                policy,
+                &args.contracts,
+                &target.frame_model,
+                &snapshot.order_book,
+                snapshot.active(),
+                BuyerMissingBookPolicy::Reject,
+            )
+            .await?;
+        }
+        Ok(snapshot)
+    })
+    .await?;
     let rows: Vec<BookRow> = snapshot
         .resting_asks()
         .map(|o| BookRow {
@@ -1173,6 +1553,145 @@ pub(crate) async fn run_market(_args: MarketArgs) -> Result<()> {
 }
 
 #[cfg(feature = "shellnet")]
+fn selection_error_is_empty_book_state(reason: &str) -> bool {
+    let reason = reason.to_ascii_lowercase();
+    reason.contains("no executable matching ask")
+        || reason.contains("no submit-safe ask")
+        || reason.contains("best ask price")
+        || reason.contains("no resting asks")
+        || reason.contains("no matchable ask")
+        || reason.contains("raw order-book matcher")
+        || reason.contains("refusing multi-ask fill")
+}
+
+#[cfg(feature = "shellnet")]
+fn render_executable_book_line(
+    snapshot: &OrderBookSnapshot,
+    order: &OrderBookOrder,
+    ticks: u128,
+    max_price_per_tick: u128,
+) -> String {
+    format!(
+        "executable_ask model={} order_book={} order_id={} token_contract={} price_per_tick={} ticks={} requested_ticks={} max_price_per_tick={}",
+        snapshot.frame_model,
+        snapshot.order_book,
+        order.order_id,
+        order.token_contract.as_deref().unwrap_or("-"),
+        order.price_per_tick,
+        order.ticks,
+        ticks,
+        max_price_per_tick
+    )
+}
+
+#[cfg(feature = "shellnet")]
+fn render_no_executable_book_line(
+    snapshot: &OrderBookSnapshot,
+    ticks: u128,
+    max_price_per_tick: u128,
+    reason: &str,
+) -> String {
+    format!(
+        "executable_ask model={} order_book={} none=true no_executable_ask=true requested_ticks={} max_price_per_tick={} reason={}",
+        snapshot.frame_model,
+        snapshot.order_book,
+        ticks,
+        max_price_per_tick,
+        reason.replace('\n', " ")
+    )
+}
+
+#[cfg(feature = "shellnet")]
+fn render_executable_book_output(
+    snapshot: &OrderBookSnapshot,
+    orders: &[OrderBookOrder],
+    ticks: u128,
+    max_price_per_tick: u128,
+    empty_reason: Option<&str>,
+) -> String {
+    if orders.is_empty() {
+        return render_no_executable_book_line(
+            snapshot,
+            ticks,
+            max_price_per_tick,
+            empty_reason.unwrap_or("no executable matching ask"),
+        );
+    }
+    orders
+        .iter()
+        .map(|order| render_executable_book_line(snapshot, order, ticks, max_price_per_tick))
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+/// `dexdo executable-book <model>`: show all currently executable asks for this tick count and ceiling.
+/// Rows hidden behind a stale cheaper raw row are intentionally not listed, because the model-wide matcher
+/// would hit that unsafe row first.
+#[cfg(feature = "shellnet")]
+pub(crate) async fn run_executable_book(args: ExecutableBookArgs) -> Result<()> {
+    let registry_policy =
+        load_enabled_model_registry_policy(RegistryRole::Buyer, &args.registry, &args.contracts)?;
+    let chain = dexdo_core::RealChainBackend::connect(
+        args.contracts
+            .to_str()
+            .ok_or_else(|| anyhow::anyhow!("--contracts: non-printable path"))?,
+    )?;
+    let target = if let Some(market) = args.market.as_deref() {
+        if args.note_addr.is_some() {
+            bail!("--market is mutually exclusive with --note-addr");
+        }
+        target_from_market_for_model(market, &args.models, &args.model)?
+    } else {
+        model_target_from_config(&args.models, &args.model, args.note_addr.clone()).map_err(|e| {
+            anyhow::anyhow!("{e}\n(pass --note-addr 0:<your PrivateNote> so the per-model book can be derived)")
+        })?
+    };
+    let (snapshot, orders, empty_reason) =
+        direct_chain_read_with_timeout(args.read_timeout.read_timeout_secs, async {
+            let snapshot = read_book_target(&chain, &target).await?;
+            if let Some(policy) = registry_policy.as_ref() {
+                enforce_model_registry_policy(
+                    RegistryRole::Buyer,
+                    policy,
+                    &args.contracts,
+                    &target.frame_model,
+                    &snapshot.order_book,
+                    snapshot.active(),
+                    BuyerMissingBookPolicy::Reject,
+                )
+                .await?;
+            }
+            match chain
+                .submit_safe_executable_book_asks(&snapshot, args.ticks, args.max_price_per_tick)
+                .await
+            {
+                Ok((orders, reason)) => Ok((snapshot, orders, reason)),
+                Err(err) if selection_error_is_empty_book_state(&err.to_string()) => {
+                    Ok((snapshot, Vec::new(), Some(err.to_string())))
+                }
+                Err(err) => Err(err),
+            }
+        })
+        .await?;
+    println!(
+        "{}",
+        render_executable_book_output(
+            &snapshot,
+            &orders,
+            args.ticks,
+            args.max_price_per_tick,
+            empty_reason.as_deref()
+        )
+    );
+    Ok(())
+}
+
+#[cfg(not(feature = "shellnet"))]
+pub(crate) async fn run_executable_book(_args: ExecutableBookArgs) -> Result<()> {
+    bail!("executable-book unavailable: build with `--features shellnet`")
+}
+
+#[cfg(feature = "shellnet")]
 pub(crate) async fn run_quote(args: QuoteArgs) -> Result<()> {
     if args.mock_chain {
         return run_quote_mock(args).await;
@@ -1201,23 +1720,28 @@ pub(crate) async fn run_quote(args: QuoteArgs) -> Result<()> {
             args.note_addr.clone(),
         )?
     };
-    let snapshot = read_book_target(&chain, &target).await?;
-    if let Some(policy) = registry_policy.as_ref() {
-        enforce_model_registry_policy(
-            RegistryRole::Buyer,
-            policy,
-            &args.contracts,
-            &target.frame_model,
-            &snapshot.order_book,
-            snapshot.active(),
-            BuyerMissingBookPolicy::Reject,
-        )
+    let (snapshot, q) =
+        direct_chain_read_with_timeout(args.read_timeout.read_timeout_secs, async {
+            let snapshot = read_book_target(&chain, &target).await?;
+            if let Some(policy) = registry_policy.as_ref() {
+                enforce_model_registry_policy(
+                    RegistryRole::Buyer,
+                    policy,
+                    &args.contracts,
+                    &target.frame_model,
+                    &snapshot.order_book,
+                    snapshot.active(),
+                    BuyerMissingBookPolicy::Reject,
+                )
+                .await?;
+            }
+            let q = chain
+                .submit_safe_single_ask_quote(&snapshot, args.ticks, args.budget)
+                .await
+                .map_err(|e| anyhow::anyhow!("quote: {e}"))?;
+            Ok((snapshot, q))
+        })
         .await?;
-    }
-    let q = chain
-        .submit_safe_single_ask_quote(&snapshot, args.ticks, args.budget)
-        .await
-        .map_err(|e| anyhow::anyhow!("quote: {e}"))?;
     if args.json {
         return machine::print_json(&quote_response_from_quote(
             "shellnet",
@@ -1372,7 +1896,11 @@ pub(crate) async fn run_orders(args: OrdersArgs) -> Result<()> {
             Some(note_addr.to_string()),
         )?
     };
-    let snapshot = read_book_target(&chain, &target).await?;
+    let snapshot = direct_chain_read_with_timeout(
+        args.read_timeout.read_timeout_secs,
+        read_book_target(&chain, &target),
+    )
+    .await?;
     let own = own_orders(&snapshot, note_addr);
     match args.command {
         OrdersCommand::List => {
@@ -1420,9 +1948,11 @@ pub(crate) async fn run_orders(args: OrdersArgs) -> Result<()> {
                 read_secret_hex(note_key, "--note-key")?.trim(),
             )
             .map_err(|e| anyhow::anyhow!("--note-key (SDK secret hex): {e:?}"))?;
-            chain
-                .assert_note_owner_matches("orders cancel", &note, &keys)
-                .await?;
+            direct_chain_read_with_timeout(
+                args.read_timeout.read_timeout_secs,
+                chain.assert_note_owner_matches("orders cancel", &note, &keys),
+            )
+            .await?;
             chain
                 .cancel_inference_order(&note, &keys, &target.model_hash, order.order_id)
                 .await?;
@@ -1449,9 +1979,11 @@ pub(crate) async fn run_orders(args: OrdersArgs) -> Result<()> {
                 read_secret_hex(note_key, "--note-key")?.trim(),
             )
             .map_err(|e| anyhow::anyhow!("--note-key (SDK secret hex): {e:?}"))?;
-            chain
-                .assert_note_owner_matches("orders cancel-all", &note, &keys)
-                .await?;
+            direct_chain_read_with_timeout(
+                args.read_timeout.read_timeout_secs,
+                chain.assert_note_owner_matches("orders cancel-all", &note, &keys),
+            )
+            .await?;
             chain
                 .cancel_all_inference_orders(&note, &keys, &target.model_hash)
                 .await?;
@@ -1564,12 +2096,21 @@ fn require_subscription_note(args: &SubscriptionArgs, action: &str) -> Result<de
 }
 
 #[cfg(feature = "shellnet")]
-fn require_subscription_keys(args: &SubscriptionArgs, action: &str) -> Result<dexdo_core::KeyPair> {
-    let note_key = args
-        .identity
-        .note_key
-        .as_deref()
-        .ok_or_else(|| anyhow::anyhow!("subscription {action} requires --note-key"))?;
+fn require_subscription_keys(
+    args: &SubscriptionArgs,
+    action: &str,
+    subcommand_note_key: Option<&std::path::Path>,
+) -> Result<dexdo_core::KeyPair> {
+    let note_key = match (args.identity.note_key.as_deref(), subcommand_note_key) {
+        (Some(parent), Some(child)) if parent != child => {
+            bail!(
+                "subscription {action}: pass --note-key only once; parent and place values differ"
+            )
+        }
+        (Some(parent), _) => parent,
+        (_, Some(child)) => child,
+        (None, None) => bail!("subscription {action} requires --note-key"),
+    };
     dexdo_core::KeyPair::from_secret_hex(read_secret_hex(note_key, "--note-key")?.trim())
         .map_err(|e| anyhow::anyhow!("--note-key (SDK secret hex): {e:?}"))
 }
@@ -1647,21 +2188,25 @@ pub(crate) async fn run_subscription(args: SubscriptionArgs) -> Result<()> {
             .ok_or_else(|| anyhow::anyhow!("--contracts: non-printable path"))?,
     )?;
     let target = subscription_target(&args)?;
-    let snapshot = read_book_target(&chain, &target).await?;
-    if matches!(args.command, SubscriptionCommand::Place(_)) {
-        if let Some(policy) = registry_policy.as_ref() {
-            enforce_model_registry_policy(
-                RegistryRole::Buyer,
-                policy,
-                &args.contracts,
-                &target.frame_model,
-                &snapshot.order_book,
-                snapshot.active(),
-                BuyerMissingBookPolicy::Reject,
-            )
-            .await?;
+    let snapshot = direct_chain_read_with_timeout(args.read_timeout.read_timeout_secs, async {
+        let snapshot = read_book_target(&chain, &target).await?;
+        if matches!(&args.command, SubscriptionCommand::Place(_)) {
+            if let Some(policy) = registry_policy.as_ref() {
+                enforce_model_registry_policy(
+                    RegistryRole::Buyer,
+                    policy,
+                    &args.contracts,
+                    &target.frame_model,
+                    &snapshot.order_book,
+                    snapshot.active(),
+                    BuyerMissingBookPolicy::Reject,
+                )
+                .await?;
+            }
         }
-    }
+        Ok(snapshot)
+    })
+    .await?;
     if !snapshot.active() {
         bail!(
             "subscription: InferenceOrderBook {} for model {} is not active; run `dexdo deploy-market` or `dexdo provision` first",
@@ -1680,10 +2225,12 @@ pub(crate) async fn run_subscription(args: SubscriptionArgs) -> Result<()> {
                 .as_deref()
                 .ok_or_else(|| anyhow::anyhow!("subscription place requires --note-addr"))?;
             let note = require_subscription_note(&args, "place")?;
-            let keys = require_subscription_keys(&args, "place")?;
-            chain
-                .assert_note_owner_matches("subscription place", &note, &keys)
-                .await?;
+            let keys = require_subscription_keys(&args, "place", place.note_key.as_deref())?;
+            direct_chain_read_with_timeout(
+                args.read_timeout.read_timeout_secs,
+                chain.assert_note_owner_matches("subscription place", &note, &keys),
+            )
+            .await?;
             let plan = subscription_place_plan(place)?;
             let expected_order_id = snapshot
                 .stats
@@ -1727,9 +2274,11 @@ pub(crate) async fn run_subscription(args: SubscriptionArgs) -> Result<()> {
                     }
                 }
             }
-            let sub = chain
-                .inference_orderbook_subscription(&ob, order_id)
-                .await?;
+            let sub = direct_chain_read_with_timeout(
+                args.read_timeout.read_timeout_secs,
+                chain.inference_orderbook_subscription(&ob, order_id),
+            )
+            .await?;
             println!(
                 "{}",
                 render_subscription_line(&snapshot, order_id, order, sub.as_ref())
@@ -1758,24 +2307,28 @@ pub(crate) async fn run_subscription(args: SubscriptionArgs) -> Result<()> {
                     order.owner_note
                 );
             }
-            let sub = chain
-                .inference_orderbook_subscription(&ob, order_id)
-                .await?
-                .ok_or_else(|| {
-                    anyhow::anyhow!(
-                        "refusing to cancel subscription: could not read getSubscription({order_id})"
-                    )
-                })?;
+            let sub = direct_chain_read_with_timeout(
+                args.read_timeout.read_timeout_secs,
+                chain.inference_orderbook_subscription(&ob, order_id),
+            )
+            .await?
+            .ok_or_else(|| {
+                anyhow::anyhow!(
+                    "refusing to cancel subscription: could not read getSubscription({order_id})"
+                )
+            })?;
             if !sub.exists {
                 bail!(
                     "refusing to cancel subscription: order {order_id} is not a live subscription"
                 );
             }
             let note = require_subscription_note(&args, "cancel")?;
-            let keys = require_subscription_keys(&args, "cancel")?;
-            chain
-                .assert_note_owner_matches("subscription cancel", &note, &keys)
-                .await?;
+            let keys = require_subscription_keys(&args, "cancel", None)?;
+            direct_chain_read_with_timeout(
+                args.read_timeout.read_timeout_secs,
+                chain.assert_note_owner_matches("subscription cancel", &note, &keys),
+            )
+            .await?;
             chain
                 .cancel_inference_order(&note, &keys, &target.model_hash, order_id)
                 .await?;
@@ -3106,6 +3659,13 @@ pub(crate) async fn run_seller(args: SellerArgs) -> Result<()> {
     } else {
         seller_real_backend(&args, market_frame_model.as_deref(), deal_nonce)?
     };
+    // the seller daemon publishes offers WITHOUT going through `provision_market`'s note-current gate, so
+    // a note orphaned by a contract redeploy(stale code_hash) would hit a raw `TVM_ERROR` from `postSellOffer`.
+    // Gate here: fail closed with an actionable "re-mint" message before any seller-chain read/write path.
+    chain.assert_note_current().await?;
+    // a withdrawn PrivateNote is final for seller writes. Fail before even reading per-deal TC terms, so a
+    // withdrawn note surfaces the fresh-note action instead of any later TC/postSellOffer error.
+    chain.assert_note_can_post_sell_offer().await?;
     // Real-shellnet offer terms are bound to the deployed per-deal TokenContract, not prompt/default values.
     // `deploy-market` creates only the shared model book; `dexdo provision` creates the per-deal TC carrying
     // price/maxTicks. The mock path keeps the prior fixed defaults.
@@ -3136,10 +3696,6 @@ pub(crate) async fn run_seller(args: SellerArgs) -> Result<()> {
         gateway_advertise: gateway_advertise.clone(),
         mock_token_count: args.mock_token_count,
     };
-    // the seller daemon publishes offers WITHOUT going through `provision_market`'s note-current gate, so
-    // a note orphaned by a contract redeploy(stale code_hash) would hit a raw `TVM_ERROR` from `postSellOffer`.
-    // Gate here: fail closed with an actionable "re-mint" message before posting(the mock backend no-ops).
-    chain.assert_note_current().await?;
     // Resume path: a matched buyer can fund this per-deal TC while no seller process was live (the deal ends up
     // `funded-but-never-opened`). Because a `(sellerPubkey, nonce)` TC is single-use, re-posting the offer would
     // fail -- but the stream can still be opened. This pre-offer probe MUST be non-blocking: fresh normal
@@ -3167,11 +3723,11 @@ pub(crate) async fn run_seller(args: SellerArgs) -> Result<()> {
         chain.assert_no_active_sell_order(&token_contract).await?;
         tracing::info!(token_contract = %token_contract, "seller posting offer, awaiting buy + match");
         dexdo::seller::post_offer_with_note(note.as_ref(), chain.as_ref(), &cfg).await?;
-        // confirm the ask actually RESTED in the InferenceOrderBook before waiting for a match -- a note-level
-        // postSellOffer can submit OK while the IOB rejects the ask(non-canonical TC / note-pairing mismatch). Fail
-        // closed actionable with the IOB stats instead of silently waiting out the 300s read_match(the mock no-ops).
-        // Start the TCP gateway only after this guard passes; external supervisors must not interpret an open port
-        // as sell-ready while this deal's ask is still absent from the book.
+        // confirm the accepted postSellOffer reached an IOB-acceptable outcome before waiting for a
+        // match. In a shared book the ask may match immediately, so the guard accepts either THIS TC's resting ask
+        // or THIS TC's funded/openable/fill-event evidence. Start the TCP gateway only after this guard passes;
+        // external supervisors must not interpret an open port as sell-ready while this deal is absent from the
+        // book and also not matched.
         chain.assert_offer_rested(&token_contract).await?;
     }
     let seller =
@@ -3184,7 +3740,7 @@ pub(crate) async fn run_seller(args: SellerArgs) -> Result<()> {
         if already_matched {
             "resumed_funded_tc"
         } else {
-            "exact_tc_offer_rested"
+            "exact_tc_offer_accepted"
         }
     );
     let _ = std::io::stdout().flush();
@@ -3874,6 +4430,7 @@ async fn apply_no_handover_after_match_policy(
     next_buy: Option<(u128, u128, u128)>,
     attempt: u64,
     diagnostic: &str,
+    pool_note_addr: Option<&str>,
 ) -> Result<NoHandoverPolicyOutcome> {
     match buyer_policy.no_handover_after_match {
         policy::NoHandoverAfterMatchAction::FailClosed => {
@@ -3936,6 +4493,7 @@ async fn apply_no_handover_after_match_policy(
                  token_contract={token_contract} state=funded/opened result=placing_next_seller \
                  attempt={next_attempt}"
             );
+            preflight_buyer_pool_for_note(pool_note_addr)?;
             let next =
                 submit_buyer_monitor_next_deal(chain, buyer, ticks, max_price, escrow).await?;
             println!(
@@ -4042,6 +4600,7 @@ fn spawn_buyer_service_renewal(
     chain: Arc<dyn ChainBackend>,
     buyer: Arc<dexdo::buyer::Buyer>,
     deals: Arc<dexdo::buyer::api::RouteManager>,
+    pool_note_addr: Option<String>,
     ticks: u128,
     max_price: u128,
     escrow: u128,
@@ -4244,6 +4803,22 @@ fn spawn_buyer_service_renewal(
                         );
                         continue;
                     }
+                    if let Err(e) = preflight_buyer_pool_for_note(pool_note_addr.as_deref()) {
+                        planner.clear_pending_next(&current);
+                        pending = None;
+                        prepare_retry = Some(PrepareRetry {
+                            current: current.clone(),
+                            retry_at: std::time::Instant::now()
+                                + std::time::Duration::from_secs(RENEWAL_FAILURE_BACKOFF_SECS),
+                        });
+                        tracing::warn!(
+                            current = %current,
+                            retry_after_secs = RENEWAL_FAILURE_BACKOFF_SECS,
+                            error = %e,
+                            "buyer continuity: pool preflight failed before fresh buy submit"
+                        );
+                        continue;
+                    }
                     match submit_buyer_monitor_next_deal(
                         chain.as_ref(),
                         buyer.as_ref(),
@@ -4254,6 +4829,7 @@ fn spawn_buyer_service_renewal(
                     .await
                     {
                         Ok(next) => {
+                            persist_buyer_token_contract_for_note(pool_note_addr.as_deref(), &next);
                             prepare_retry = None;
                             planner.note_pending_next(current.clone(), next.clone());
                             pending = Some(PendingRenewal {
@@ -4298,6 +4874,22 @@ fn spawn_buyer_service_renewal(
                         );
                         continue;
                     }
+                    if let Err(e) = preflight_buyer_pool_for_note(pool_note_addr.as_deref()) {
+                        planner.clear_pending_next(&current);
+                        pending = None;
+                        prepare_retry = Some(PrepareRetry {
+                            current: current.clone(),
+                            retry_at: std::time::Instant::now()
+                                + std::time::Duration::from_secs(RENEWAL_FAILURE_BACKOFF_SECS),
+                        });
+                        tracing::warn!(
+                            current = %current,
+                            retry_after_secs = RENEWAL_FAILURE_BACKOFF_SECS,
+                            error = %e,
+                            "buyer continuity: pool preflight failed before renewal buy submit"
+                        );
+                        continue;
+                    }
                     match submit_buyer_monitor_next_deal(
                         chain.as_ref(),
                         buyer.as_ref(),
@@ -4308,6 +4900,7 @@ fn spawn_buyer_service_renewal(
                     .await
                     {
                         Ok(next) => {
+                            persist_buyer_token_contract_for_note(pool_note_addr.as_deref(), &next);
                             prepare_retry = None;
                             planner.note_pending_next(current.clone(), next.clone());
                             pending = Some(PendingRenewal {
@@ -4394,6 +4987,14 @@ pub(crate) async fn run_buyer(args: BuyerArgs) -> Result<()> {
         }
         if let Some(events) = machine_events.as_mut() {
             let code = machine::classify_error(machine::OP_BUYER_START, &err);
+            if code == machine::ErrorCode::NoLiquidity
+                && err
+                    .to_string()
+                    .to_ascii_lowercase()
+                    .contains("no_executable_ask")
+            {
+                machine_context.failure_class = Some("no_executable_ask".to_string());
+            }
             events.error(machine::OP_BUYER_START, code, machine_context.fields())?;
             return Err(machine::printed_error());
         }
@@ -4517,6 +5118,18 @@ fn require_complete_buyer_quote(selection: &BuyerQuoteSelection) -> Result<()> {
     Ok(())
 }
 
+fn require_stream_buy_ticks(ticks: u128) -> Result<()> {
+    const MIN_STREAM_BUY_TICKS: u128 = 2;
+    if ticks >= MIN_STREAM_BUY_TICKS {
+        return Ok(());
+    }
+    bail!(
+        "invalid buy ticks: --ticks {ticks} is below the {MIN_STREAM_BUY_TICKS}-tick stream minimum; \
+         TokenContract funding needs the probe tick plus at least one streaming tick. \
+         Buy at least {MIN_STREAM_BUY_TICKS} ticks or wait for an ask with >= {MIN_STREAM_BUY_TICKS} ticks"
+    );
+}
+
 fn is_replay_protection_error(err: &anyhow::Error) -> bool {
     let msg = err.to_string().to_ascii_lowercase();
     msg.contains("exit code 52") || msg.contains("replay protection")
@@ -4607,6 +5220,7 @@ async fn prepare_lazy_buyer_api_deal_once(
         }),
     )
     .await?;
+    require_stream_buy_ticks(args.ticks)?;
     if !args.mock.mock_chain {
         emit_shared_buyer_event(
             &events,
@@ -4694,6 +5308,8 @@ async fn prepare_lazy_buyer_api_deal_once(
                     ),
                 )
                 .await?;
+                require_stream_buy_ticks(args.ticks)?;
+                preflight_buyer_pool_for_money_move(args.as_ref())?;
                 buyer.place_buy(chain.as_ref(), &tc).await?;
                 emit_shared_buyer_event(
                     &events,
@@ -4767,13 +5383,21 @@ async fn prepare_lazy_buyer_api_deal_once(
                 quote_selected_fields(&frame_model, &selection, ticks, max_price),
             )
             .await?;
+            require_stream_buy_ticks(ticks)?;
             let since_unix = std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .map(|d| d.as_secs() as i64)
                 .unwrap_or(0);
-            chain
-                .place_buy_by_model(buyer.note.as_ref(), ticks, max_price, escrow)
-                .await?;
+            place_buy_by_model_after_pool_preflight(
+                chain.as_ref(),
+                buyer.as_ref(),
+                !args.mock.mock_chain,
+                args.identity.note_addr.as_deref(),
+                ticks,
+                max_price,
+                escrow,
+            )
+            .await?;
             emit_shared_buyer_event(
                 &events,
                 "buy_submitted",
@@ -4808,6 +5432,8 @@ async fn prepare_lazy_buyer_api_deal_once(
             (tc, ticks)
         }
     };
+
+    record_buyer_token_contract_after_money_move(args.as_ref(), &token_contract);
 
     let mut handover_attempt = 1u64;
     let handover = 'handover: loop {
@@ -4862,12 +5488,17 @@ async fn prepare_lazy_buyer_api_deal_once(
                                 service_renewal,
                                 handover_attempt,
                                 &diagnostic,
+                                args.identity.note_addr.as_deref(),
                             )
                             .await?
                             {
                                 NoHandoverPolicyOutcome::RetryCurrent => continue 'handover,
                                 NoHandoverPolicyOutcome::RetryNext(next) => {
                                     token_contract = next;
+                                    record_buyer_token_contract_after_money_move(
+                                        args.as_ref(),
+                                        &token_contract,
+                                    );
                                     handover_attempt = handover_attempt.saturating_add(1);
                                     continue 'handover;
                                 }
@@ -5399,6 +6030,7 @@ async fn run_buyer_inner(
                     println!("resuming existing deal {tc} -- connecting without a new buy");
                 }
             } else {
+                require_stream_buy_ticks(args.ticks)?;
                 let mut selected = None;
                 if let Some(events) = machine_events.as_mut() {
                     let selection = buyer_quote_selection(
@@ -5433,11 +6065,13 @@ async fn run_buyer_inner(
                     )?;
                     selected = Some(selection);
                 }
+                require_stream_buy_ticks(args.ticks)?;
                 let submitted_escrow = selected.as_ref().map(|s| s.escrow).unwrap_or_else(|| {
                     args.escrow.unwrap_or_else(|| {
                         required_escrow_for_buy(args.ticks, args.max_price_per_tick)
                     })
                 });
+                preflight_buyer_pool_for_money_move(&args)?;
                 buyer.place_buy(chain.as_ref(), &tc).await?;
                 if let Some(events) = machine_events.as_mut() {
                     events.event(
@@ -5532,6 +6166,7 @@ async fn run_buyer_inner(
                 .escrow
                 .unwrap_or_else(|| dexdo_core::required_escrow_for_buy(ticks, max_price));
             service_renewal = Some((ticks, max_price, escrow));
+            require_stream_buy_ticks(ticks)?;
             if machine_events.is_none() {
                 println!("placing buy: {ticks} ticks at <= {max_price}/tick (escrow {escrow})");
             }
@@ -5559,13 +6194,21 @@ async fn run_buyer_inner(
                 )?;
                 selected = Some(selection);
             }
+            require_stream_buy_ticks(ticks)?;
             let since_unix = std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .map(|d| d.as_secs() as i64)
                 .unwrap_or(0);
-            chain
-                .place_buy_by_model(buyer.note.as_ref(), ticks, max_price, escrow)
-                .await?;
+            place_buy_by_model_after_pool_preflight(
+                chain.as_ref(),
+                &buyer,
+                !args.mock.mock_chain,
+                args.identity.note_addr.as_deref(),
+                ticks,
+                max_price,
+                escrow,
+            )
+            .await?;
             if let Some(events) = machine_events.as_mut() {
                 events.event(
                     "buy_submitted",
@@ -5610,6 +6253,7 @@ async fn run_buyer_inner(
             (tc, ticks)
         }
     };
+    record_buyer_token_contract_after_money_move(&args, &token_contract);
     tracing::info!("buy placed; awaiting handover");
     // Wait for the seller to open the stream and write the handover. Issue: fail-closed on the deadline instead of
     // waiting forever; do not swallow the `resolve_endpoint` error(diagnostics for the operator).
@@ -5666,12 +6310,17 @@ async fn run_buyer_inner(
                                 service_renewal,
                                 handover_attempt,
                                 &diagnostic,
+                                args.identity.note_addr.as_deref(),
                             )
                             .await?
                             {
                                 NoHandoverPolicyOutcome::RetryCurrent => continue 'handover,
                                 NoHandoverPolicyOutcome::RetryNext(next) => {
                                     token_contract = next;
+                                    record_buyer_token_contract_after_money_move(
+                                        &args,
+                                        &token_contract,
+                                    );
                                     handover_attempt = handover_attempt.saturating_add(1);
                                     continue 'handover;
                                 }
@@ -5776,6 +6425,11 @@ async fn run_buyer_inner(
                 chain.clone(),
                 state.buyer.clone(),
                 state.deals.clone(),
+                if args.mock.mock_chain {
+                    None
+                } else {
+                    args.identity.note_addr.clone()
+                },
                 ticks,
                 max_price,
                 escrow,
@@ -6280,24 +6934,20 @@ pub(crate) async fn run_destroy(_args: DestroyArgs) -> Result<()> {
 #[cfg(feature = "shellnet")]
 pub(crate) async fn run_recover(args: RecoverArgs) -> Result<()> {
     use dexdo_core::{check_recoverable, keypair_ed_pubkey, Address, KeyPair, RealChainBackend};
-    let note_addr = args
-        .identity
-        .note_addr
-        .clone()
-        .ok_or_else(|| anyhow::anyhow!("recover: --note-addr (buyer note) is required"))?;
-    let note_key = args
-        .identity
-        .note_key
-        .as_deref()
-        .ok_or_else(|| anyhow::anyhow!("recover: --note-key (buyer owner key) is required"))?;
     let manifest = args
         .contracts
         .to_str()
         .ok_or_else(|| anyhow::anyhow!("--contracts: non-printable path"))?;
-    // The TC comes from --token-contract OR --market(single source of truth, fail-loud).
-    let (tc_str, _frame, _nonce) =
-        resolve_market_fields(args.market.as_deref(), args.token_contract.as_deref(), None)?;
-    let seed = read_secret_hex(note_key, "--note-key")?;
+    let resolved = resolve_pool_recovery_inputs(
+        "recover",
+        &args.identity,
+        args.market.as_deref(),
+        args.token_contract.as_deref(),
+        args.pool.as_deref(),
+    )?;
+    let note_addr = resolved.note_addr;
+    let tc_str = resolved.token_contract;
+    let seed = resolved.note_secret_hex;
     let chain = RealChainBackend::connect(manifest)?;
     let keys = KeyPair::from_secret_hex(seed.trim())
         .map_err(|e| anyhow::anyhow!("--note-key (SDK secret hex): {e:?}"))?;
@@ -6347,24 +6997,20 @@ pub(crate) async fn run_recover(_args: RecoverArgs) -> Result<()> {
 #[cfg(feature = "shellnet")]
 pub(crate) async fn run_dispute(args: DisputeArgs) -> Result<()> {
     use dexdo_core::{check_disputable, keypair_ed_pubkey, Address, KeyPair, RealChainBackend};
-    let note_addr = args
-        .identity
-        .note_addr
-        .clone()
-        .ok_or_else(|| anyhow::anyhow!("dispute: --note-addr (buyer note) is required"))?;
-    let note_key = args
-        .identity
-        .note_key
-        .as_deref()
-        .ok_or_else(|| anyhow::anyhow!("dispute: --note-key (buyer owner key) is required"))?;
     let manifest = args
         .contracts
         .to_str()
         .ok_or_else(|| anyhow::anyhow!("--contracts: non-printable path"))?;
-    // The TC comes from --token-contract OR --market(single source of truth, fail-loud).
-    let (tc_str, _frame, _nonce) =
-        resolve_market_fields(args.market.as_deref(), args.token_contract.as_deref(), None)?;
-    let seed = read_secret_hex(note_key, "--note-key")?;
+    let resolved = resolve_pool_recovery_inputs(
+        "dispute",
+        &args.identity,
+        args.market.as_deref(),
+        args.token_contract.as_deref(),
+        args.pool.as_deref(),
+    )?;
+    let note_addr = resolved.note_addr;
+    let tc_str = resolved.token_contract;
+    let seed = resolved.note_secret_hex;
     let chain = RealChainBackend::connect(manifest)?;
     let keys = KeyPair::from_secret_hex(seed.trim())
         .map_err(|e| anyhow::anyhow!("--note-key (SDK secret hex): {e:?}"))?;
@@ -6418,23 +7064,20 @@ pub(crate) async fn run_reclaim(args: ReclaimArgs) -> Result<()> {
         check_reclaimable, keypair_ed_pubkey, Address, KeyPair, RealChainBackend,
         MATCH_OPEN_TIMEOUT_SECS,
     };
-    let note_addr = args
-        .identity
-        .note_addr
-        .clone()
-        .ok_or_else(|| anyhow::anyhow!("reclaim: --note-addr (buyer note) is required"))?;
-    let note_key = args
-        .identity
-        .note_key
-        .as_deref()
-        .ok_or_else(|| anyhow::anyhow!("reclaim: --note-key (buyer owner key) is required"))?;
     let manifest = args
         .contracts
         .to_str()
         .ok_or_else(|| anyhow::anyhow!("--contracts: non-printable path"))?;
-    let (tc_str, _frame, _nonce) =
-        resolve_market_fields(args.market.as_deref(), args.token_contract.as_deref(), None)?;
-    let seed = read_secret_hex(note_key, "--note-key")?;
+    let resolved = resolve_pool_recovery_inputs(
+        "reclaim",
+        &args.identity,
+        args.market.as_deref(),
+        args.token_contract.as_deref(),
+        args.pool.as_deref(),
+    )?;
+    let note_addr = resolved.note_addr;
+    let tc_str = resolved.token_contract;
+    let seed = resolved.note_secret_hex;
     let chain = RealChainBackend::connect(manifest)?;
     let keys = KeyPair::from_secret_hex(seed.trim())
         .map_err(|e| anyhow::anyhow!("--note-key (SDK secret hex): {e:?}"))?;
@@ -6647,48 +7290,80 @@ pub(crate) async fn run_withdraw_shell(_args: WithdrawShellArgs) -> Result<()> {
 /// inherits the umask, and a predictable non-exclusive temp path can clobber a pre-created file/symlink.
 #[cfg(feature = "shellnet")]
 fn write_pool_private(path: &std::path::Path, bytes: &[u8]) -> Result<()> {
-    let dir = path
-        .parent()
-        .filter(|p| !p.as_os_str().is_empty())
-        .unwrap_or_else(|| std::path::Path::new("."));
-    let name = path
-        .file_name()
-        .and_then(|s| s.to_str())
-        .unwrap_or("pn_pool.json");
-    let nanos = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map_err(|e| anyhow::anyhow!("system clock before epoch: {e}"))?
-        .as_nanos();
-    let tmp = dir.join(format!(".{name}.tmp.{}.{nanos}", std::process::id()));
-    write_pool_private_via_temp(path, &tmp, bytes)
+    crate::cli::note::write_private_atomic(path, bytes)
 }
 
 #[cfg(feature = "shellnet")]
+#[cfg_attr(not(test), allow(dead_code))]
 fn write_pool_private_via_temp(
     path: &std::path::Path,
     tmp: &std::path::Path,
     bytes: &[u8],
 ) -> Result<()> {
-    use std::io::Write;
-    let mut opts = std::fs::OpenOptions::new();
-    opts.write(true).create_new(true);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt;
-        opts.mode(0o600);
+    crate::cli::note::write_private_atomic_via_temp(path, tmp, bytes)
+}
+
+#[cfg(feature = "shellnet")]
+fn note_deploy_same_file_pool_guard(
+    env_pool: Option<&std::ffi::OsStr>,
+    pool: &std::path::Path,
+) -> Result<()> {
+    let Some(env_pool) = env_pool else {
+        return Ok(());
+    };
+    if env_pool.is_empty() {
+        return Ok(());
     }
-    let mut f = opts
-        .open(tmp)
-        .map_err(|e| anyhow::anyhow!("create temp pool {}: {e}", tmp.display()))?;
-    if let Err(e) = f.write_all(bytes).and_then(|()| f.sync_all()) {
-        let _ = std::fs::remove_file(tmp);
-        return Err(anyhow::anyhow!("write temp pool {}: {e}", tmp.display()));
+    let env_pool = std::path::Path::new(env_pool);
+    let (Ok(env_pool), Ok(pool)) = (std::fs::canonicalize(env_pool), std::fs::canonicalize(pool))
+    else {
+        return Ok(());
+    };
+    if env_pool == pool {
+        bail!(
+            "note deploy refused: DEXDO_PN_POOL and --pool both point to the same existing file {}. \
+             This append mode can hide note-key confusion and leave a pool entry whose --note-key later fails \
+             owner-signed writes with ERR_INVALID_SENDER 101. Unset DEXDO_PN_POOL while deploying, or deploy \
+             into a fresh --pool <new_file> and switch DEXDO_PN_POOL to that file after the command succeeds.",
+            pool.display()
+        );
     }
-    std::fs::rename(tmp, path).map_err(|e| {
-        let _ = std::fs::remove_file(tmp);
-        anyhow::anyhow!("rename temp pool into {}: {e}", path.display())
-    })?;
     Ok(())
+}
+
+#[cfg(feature = "shellnet")]
+fn note_deploy_recovery_pool_guard(
+    pool: &std::path::Path,
+    recovery: &std::path::Path,
+) -> Result<()> {
+    if comparable_path(pool)? == comparable_path(recovery)? {
+        bail!(
+            "note deploy refused: --recovery and --pool both point to {}. The recovery file is an \
+             intermediate secret-bearing state file; keep it separate from the final DEXDO_PN_POOL.",
+            pool.display()
+        );
+    }
+    Ok(())
+}
+
+#[cfg(feature = "shellnet")]
+fn comparable_path(path: &std::path::Path) -> Result<std::path::PathBuf> {
+    if let Ok(canonical) = std::fs::canonicalize(path) {
+        return Ok(canonical);
+    }
+    let cwd = std::env::current_dir().unwrap_or_else(|_| ".".into());
+    let parent = path.parent().filter(|p| !p.as_os_str().is_empty());
+    let base = match parent {
+        Some(parent) => std::fs::canonicalize(parent).unwrap_or_else(|_| cwd.join(parent)),
+        None => cwd,
+    };
+    let file = path.file_name().ok_or_else(|| {
+        anyhow::anyhow!(
+            "path {} has no file name for same-file check",
+            path.display()
+        )
+    })?;
+    Ok(base.join(file))
 }
 
 #[cfg(feature = "shellnet")]
@@ -6731,6 +7406,870 @@ fn note_deploy_multisig_keys(args: &NoteDeployArgs) -> Result<dexdo_core::KeyPai
         .map_err(|e| anyhow::anyhow!("{source} (SDK secret hex): {e:?}"))
 }
 
+#[cfg(feature = "shellnet")]
+#[derive(Debug, Clone, Copy, Default)]
+struct NoteDeployVoucherFailpoints {
+    after_deposit_submit: bool,
+    after_deposit_event: bool,
+    after_shell_submit: bool,
+    after_deploy_before_note_record: bool,
+}
+
+#[cfg(feature = "shellnet")]
+impl NoteDeployVoucherFailpoints {
+    fn after_submit(self, kind: crate::cli::note::NoteDeployVoucherKind) -> bool {
+        match kind {
+            crate::cli::note::NoteDeployVoucherKind::Deposit => self.after_deposit_submit,
+            crate::cli::note::NoteDeployVoucherKind::ShellGas => self.after_shell_submit,
+        }
+    }
+
+    fn after_event(self, kind: crate::cli::note::NoteDeployVoucherKind) -> bool {
+        match kind {
+            crate::cli::note::NoteDeployVoucherKind::Deposit => self.after_deposit_event,
+            crate::cli::note::NoteDeployVoucherKind::ShellGas => false,
+        }
+    }
+}
+
+#[cfg(feature = "shellnet")]
+const NOTE_DEPLOY_SUBMIT_NATIVE_VALUE: u128 = 2_000_000_000;
+#[cfg(feature = "shellnet")]
+const NOTE_DEPLOY_VOUCHER_EVENT_TIMEOUT_SECS: u64 = 480;
+#[cfg(feature = "shellnet")]
+const NOTE_DEPLOY_ROOT_PN_DAPP_ID: &str = "0";
+#[cfg(feature = "shellnet")]
+const NOTE_DEPLOY_GENERIC_MULTISIG_CODE_HASH: &str =
+    "3a7a53248ff39fde936a4274eab143b5fac94feac0d8e2e2748aac5e74538d5f";
+#[cfg(feature = "shellnet")]
+const NOTE_DEPLOY_UPDATE_CUSTODIAN_MULTISIG_CODE_HASH: &str =
+    "8470e1da28a2b4c742b5f7edefdd97db81c79e726f8a8b0be78d921adaf32414";
+
+#[cfg(feature = "shellnet")]
+const NOTE_DEPLOY_GENERIC_MULTISIG_ABI_JSON: &str = r#"{
+  "ABI version": 2,
+  "version": "2.4",
+  "header": ["pubkey", "time", "expire"],
+  "functions": [
+    {
+      "name": "sendTransaction",
+      "inputs": [
+        { "name": "dest", "type": "address" },
+        { "name": "value", "type": "uint128" },
+        { "name": "cc", "type": "map(uint32,varuint32)" },
+        { "name": "bounce", "type": "bool" },
+        { "name": "flags", "type": "uint8" },
+        { "name": "payload", "type": "cell" },
+        { "name": "dapp_id", "type": "uint256" }
+      ],
+      "outputs": [{ "name": "value0", "type": "address" }]
+    }
+  ],
+  "events": [],
+  "data": []
+}"#;
+
+#[cfg(feature = "shellnet")]
+const NOTE_DEPLOY_UPDATE_CUSTODIAN_MULTISIG_ABI_JSON: &str = r#"{
+  "ABI version": 2,
+  "version": "2.4",
+  "header": ["pubkey", "time", "expire"],
+  "functions": [
+    {
+      "name": "sendTransaction",
+      "inputs": [
+        { "name": "dest", "type": "address" },
+        { "name": "value", "type": "uint128" },
+        { "name": "cc", "type": "map(uint32,varuint32)" },
+        { "name": "bounce", "type": "bool" },
+        { "name": "flags", "type": "uint8" },
+        { "name": "payload", "type": "cell" }
+      ],
+      "outputs": [{ "name": "value0", "type": "address" }]
+    }
+  ],
+  "events": [],
+  "data": []
+}"#;
+
+#[cfg(feature = "shellnet")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum NoteDeployMultisigForwardKind {
+    Generic,
+    UpdateCustodian,
+}
+
+#[cfg(feature = "shellnet")]
+impl NoteDeployMultisigForwardKind {
+    fn from_code_hash(code_hash: &str) -> Result<Self> {
+        let code_hash = code_hash
+            .trim()
+            .trim_start_matches("0x")
+            .to_ascii_lowercase();
+        match code_hash.as_str() {
+            NOTE_DEPLOY_GENERIC_MULTISIG_CODE_HASH => Ok(Self::Generic),
+            NOTE_DEPLOY_UPDATE_CUSTODIAN_MULTISIG_CODE_HASH => Ok(Self::UpdateCustodian),
+            other => Err(anyhow::anyhow!(
+                "unsupported funding wallet code_hash {other}; supported generic Multisig \
+                 {NOTE_DEPLOY_GENERIC_MULTISIG_CODE_HASH} and UpdateCustodianMultisigWallet \
+                 {NOTE_DEPLOY_UPDATE_CUSTODIAN_MULTISIG_CODE_HASH}"
+            )),
+        }
+    }
+
+    fn abi_json(self) -> &'static str {
+        match self {
+            Self::Generic => NOTE_DEPLOY_GENERIC_MULTISIG_ABI_JSON,
+            Self::UpdateCustodian => NOTE_DEPLOY_UPDATE_CUSTODIAN_MULTISIG_ABI_JSON,
+        }
+    }
+
+    fn send_transaction_params(
+        self,
+        root_pn: &dexdo_core::Address,
+        cc: serde_json::Map<String, serde_json::Value>,
+        voucher_body: String,
+    ) -> serde_json::Value {
+        let mut params = serde_json::json!({
+            "dest": root_pn.with_workchain(),
+            "value": NOTE_DEPLOY_SUBMIT_NATIVE_VALUE.to_string(),
+            "cc": serde_json::Value::Object(cc),
+            "bounce": true,
+            "flags": 1,
+            "payload": voucher_body,
+        });
+        if self == Self::Generic {
+            params["dapp_id"] = serde_json::Value::String(NOTE_DEPLOY_ROOT_PN_DAPP_ID.to_string());
+        }
+        params
+    }
+}
+
+#[cfg(feature = "shellnet")]
+async fn note_deploy_fetch_wallet_code_hash(
+    http: &reqwest::Client,
+    endpoint: &str,
+    wallet: &dexdo_core::Address,
+) -> Result<String> {
+    let bare = wallet.bare();
+    let query = format!(
+        "{{ blockchain {{ account(account_id: \"{bare}\", dapp_id: \"{bare}\") {{ info {{ acc_type_name code_hash }} }} }} }}"
+    );
+    let resp: serde_json::Value = http
+        .post(format!("{}/graphql", endpoint.trim_end_matches('/')))
+        .json(&serde_json::json!({ "query": query }))
+        .send()
+        .await
+        .map_err(|e| anyhow::anyhow!("read funding wallet code_hash: {e}"))?
+        .error_for_status()
+        .map_err(|e| anyhow::anyhow!("read funding wallet code_hash: {e}"))?
+        .json()
+        .await
+        .map_err(|e| anyhow::anyhow!("decode funding wallet code_hash response: {e}"))?;
+    if let Some(errors) = resp.get("errors") {
+        bail!("read funding wallet code_hash GraphQL errors: {errors}");
+    }
+    let info = resp
+        .pointer("/data/blockchain/account/info")
+        .ok_or_else(|| anyhow::anyhow!("funding wallet {} not found", wallet.with_workchain()))?;
+    let acc_type = info
+        .get("acc_type_name")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("unknown");
+    if acc_type != "Active" {
+        bail!(
+            "funding wallet {} is not Active (acc_type={acc_type})",
+            wallet.with_workchain()
+        );
+    }
+    info.get("code_hash")
+        .and_then(serde_json::Value::as_str)
+        .map(ToOwned::to_owned)
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "funding wallet {} has no code_hash",
+                wallet.with_workchain()
+            )
+        })
+}
+
+#[cfg(feature = "shellnet")]
+fn note_deploy_persist_voucher_checkpoint(
+    recovery_path: &std::path::Path,
+    recovery: &mut crate::cli::note::NoteDeployRecoveryState,
+    kind: crate::cli::note::NoteDeployVoucherKind,
+    checkpoint: crate::cli::note::NoteDeployVoucherCheckpoint,
+) -> Result<()> {
+    recovery.set_voucher_checkpoint(kind, checkpoint)?;
+    crate::cli::note::write_note_deploy_recovery(recovery_path, recovery)
+}
+
+#[cfg(feature = "shellnet")]
+#[allow(clippy::too_many_arguments)]
+async fn note_deploy_build_voucher_submit_boc(
+    endpoint: &str,
+    multisig_address: &dexdo_core::Address,
+    multisig_keys: &dexdo_core::KeyPair,
+    root_pn: &dexdo_core::Address,
+    checkpoint: &crate::cli::note::NoteDeployVoucherCheckpoint,
+    http: &reqwest::Client,
+) -> Result<String> {
+    use dexdo_core::{
+        airegistry::{
+            calls::{encode_external_call, encode_internal_payload},
+            deploy::local_context,
+        },
+        private_note::artifacts::ROOT_PN_ABI_JSON,
+    };
+
+    let ctx = local_context()?;
+    let voucher_body = encode_internal_payload(
+        &ctx,
+        ROOT_PN_ABI_JSON,
+        "generateVoucher",
+        serde_json::json!({
+            "skUCommit": format!("0x{}", checkpoint.sk_u_commit_hex),
+            "isFee": checkpoint.is_fee,
+        }),
+    )
+    .await
+    .map_err(|e| anyhow::anyhow!("encode RootPN.generateVoucher body: {e}"))?;
+
+    let mut cc = serde_json::Map::new();
+    cc.insert(
+        checkpoint.token_type.to_string(),
+        serde_json::Value::String(checkpoint.raw_value.to_string()),
+    );
+    let wallet_code_hash =
+        note_deploy_fetch_wallet_code_hash(http, endpoint, multisig_address).await?;
+    let forward_kind = NoteDeployMultisigForwardKind::from_code_hash(&wallet_code_hash)?;
+    let boc = encode_external_call(
+        &ctx,
+        forward_kind.abi_json(),
+        &multisig_address.with_workchain(),
+        "sendTransaction",
+        forward_kind.send_transaction_params(root_pn, cc, voucher_body),
+        multisig_keys.public_hex(),
+        multisig_keys.secret_hex(),
+    )
+    .await
+    .map_err(|e| {
+        anyhow::anyhow!("encode Multisig.sendTransaction -> RootPN.generateVoucher: {e}")
+    })?;
+    Ok(boc)
+}
+
+#[cfg(feature = "shellnet")]
+async fn note_deploy_submit_voucher_boc(
+    endpoint: &str,
+    multisig_address: &dexdo_core::Address,
+    boc: &str,
+    http: &reqwest::Client,
+) -> Result<()> {
+    use dexdo_core::ackinacki_wallet::query::send_message_routed;
+    send_message_routed(
+        http,
+        endpoint,
+        boc,
+        multisig_address.bare(),
+        multisig_address.bare(),
+        None,
+    )
+    .await
+    .map_err(|e| {
+        anyhow::anyhow!("submit Multisig.sendTransaction -> RootPN.generateVoucher: {e}")
+    })?;
+    Ok(())
+}
+
+#[cfg(feature = "shellnet")]
+#[allow(clippy::too_many_arguments)]
+async fn note_deploy_mint_voucher_recoverable(
+    client: &dexdo_core::ChainClient,
+    recovery_path: &std::path::Path,
+    recovery: &mut crate::cli::note::NoteDeployRecoveryState,
+    kind: crate::cli::note::NoteDeployVoucherKind,
+    multisig_address: &dexdo_core::Address,
+    multisig_keys: &dexdo_core::KeyPair,
+    recipient_ephemeral_pubkey_hex: &str,
+    voucher_token_type: u32,
+    voucher_value: u64,
+    is_fee: bool,
+    halo2_paths: &dexdo_core::private_note::Halo2Paths,
+    failpoints: NoteDeployVoucherFailpoints,
+) -> Result<dexdo_core::private_note::halo2::live::Halo2Proof> {
+    use dexdo_core::private_note::{
+        artifacts::ROOT_PN_ADDRESS,
+        halo2::{
+            live::{prove_voucher_for_event, ProveVoucherForEventParams},
+            sk_commit::compute_sk_u_commit_hex,
+        },
+        proof, voucher_event,
+    };
+    use std::time::Duration;
+
+    let endpoint = client.endpoint();
+    let root_pn = dexdo_core::Address::parse(ROOT_PN_ADDRESS)?;
+    let recipient_ephemeral_pubkey_hex = proof::strip_0x(recipient_ephemeral_pubkey_hex);
+    let mut checkpoint = match recovery.voucher_checkpoint(kind).cloned() {
+        Some(checkpoint) => {
+            checkpoint.ensure_matches(
+                kind,
+                recipient_ephemeral_pubkey_hex,
+                voucher_token_type,
+                voucher_value,
+                is_fee,
+            )?;
+            checkpoint
+        }
+        None => {
+            let sk_u_hex = proof::random_secret_key();
+            let sk_u_commit_hex = compute_sk_u_commit_hex(&sk_u_hex)
+                .map_err(|e| anyhow::anyhow!("compute {} voucher skUCommit: {e}", kind.label()))?;
+            let checkpoint = crate::cli::note::NoteDeployVoucherCheckpoint::new(
+                recipient_ephemeral_pubkey_hex,
+                voucher_token_type,
+                voucher_value,
+                is_fee,
+                sk_u_hex,
+                sk_u_commit_hex,
+            )?;
+            note_deploy_persist_voucher_checkpoint(
+                recovery_path,
+                recovery,
+                kind,
+                checkpoint.clone(),
+            )?;
+            eprintln!(
+                "note deploy recovery: recorded {} voucher checkpoint in {} before wallet spend.",
+                kind.label(),
+                recovery_path.display()
+            );
+            checkpoint
+        }
+    };
+
+    if let Some(proof) = checkpoint.proof.as_ref() {
+        eprintln!(
+            "note deploy recovery: reusing persisted {} voucher proof from {}; no wallet spend will be submitted.",
+            kind.label(),
+            recovery_path.display()
+        );
+        return Ok(proof.to_halo2());
+    }
+
+    let http = reqwest::Client::new();
+    if checkpoint.event.is_none() {
+        if !checkpoint.submit_maybe_sent {
+            let boc = note_deploy_build_voucher_submit_boc(
+                endpoint,
+                multisig_address,
+                multisig_keys,
+                &root_pn,
+                &checkpoint,
+                &http,
+            )
+            .await?;
+            checkpoint.submit_maybe_sent = true;
+            note_deploy_persist_voucher_checkpoint(
+                recovery_path,
+                recovery,
+                kind,
+                checkpoint.clone(),
+            )?;
+            eprintln!(
+                "note deploy recovery: marked {} voucher wallet submit as uncertain in {}; reruns will not submit a second wallet spend.",
+                kind.label(),
+                recovery_path.display()
+            );
+            note_deploy_submit_voucher_boc(endpoint, multisig_address, &boc, &http).await?;
+            if failpoints.after_submit(kind) {
+                bail!(
+                    "simulated interruption after {} voucher wallet submit. Recovery state is at {}; rerun `dexdo note deploy --recovery <this-file> --pool <pool>` to resume without a second wallet spend.",
+                    kind.label(),
+                    recovery_path.display()
+                );
+            }
+        } else {
+            eprintln!(
+                "note deploy recovery: resuming {} voucher from {}; waiting/proving the existing skUCommit without submitting another wallet spend.",
+                kind.label(),
+                recovery_path.display()
+            );
+        }
+
+        let event = voucher_event::wait_for_voucher_event_by_sk_u_commit(
+            &http,
+            endpoint,
+            &root_pn,
+            &format!("0x{}", checkpoint.sk_u_commit_hex),
+            Duration::from_secs(NOTE_DEPLOY_VOUCHER_EVENT_TIMEOUT_SECS),
+        )
+        .await
+        .map_err(|e| {
+            anyhow::anyhow!(
+                "wait for {} VoucherGenerated from persisted wallet submit: {e}; refusing to submit a second wallet spend for recovery {}",
+                kind.label(),
+                recovery_path.display()
+            )
+        })?;
+        checkpoint.event = Some(crate::cli::note::NoteDeployVoucherEvent::from_sdk(event));
+        note_deploy_persist_voucher_checkpoint(recovery_path, recovery, kind, checkpoint.clone())?;
+        eprintln!(
+            "note deploy recovery: recorded {} VoucherGenerated event in {}; reruns will prove this voucher without a second wallet spend.",
+            kind.label(),
+            recovery_path.display()
+        );
+        if failpoints.after_event(kind) {
+            bail!(
+                "simulated interruption after {} VoucherGenerated event before proof/deploy. Recovery state is at {}; rerun `dexdo note deploy --recovery <this-file> --pool <pool>` to resume without a second wallet spend.",
+                kind.label(),
+                recovery_path.display()
+            );
+        }
+    }
+
+    let event = checkpoint
+        .event
+        .as_ref()
+        .ok_or_else(|| {
+            anyhow::anyhow!("{} voucher event missing after recovery wait", kind.label())
+        })?
+        .to_sdk();
+    let proof = prove_voucher_for_event(ProveVoucherForEventParams {
+        endpoint: endpoint.to_string(),
+        event,
+        sk_u_hex: checkpoint.sk_u_hex.clone(),
+        sk_u_commit_hex: checkpoint.sk_u_commit_hex.clone(),
+        voucher_value,
+        voucher_token_type,
+        ephemeral_pubkey_hex: recipient_ephemeral_pubkey_hex.to_string(),
+        history_proof_window_size: None,
+        paths: halo2_paths,
+    })
+    .await
+    .map_err(|e| anyhow::anyhow!("prove {} voucher: {e}", kind.label()))?;
+    checkpoint.proof = Some(crate::cli::note::NoteDeployVoucherProof::from_halo2(&proof));
+    note_deploy_persist_voucher_checkpoint(recovery_path, recovery, kind, checkpoint)?;
+    eprintln!(
+        "note deploy recovery: recorded {} voucher proof in {}; reruns will not re-spend this voucher.",
+        kind.label(),
+        recovery_path.display()
+    );
+    Ok(proof)
+}
+
+#[cfg(feature = "shellnet")]
+async fn note_deploy_submit_private_note(
+    client: &dexdo_core::ChainClient,
+    root_pn: &dexdo_core::Address,
+    pn_keys: &dexdo_core::KeyPair,
+    deposit_zk: &dexdo_core::private_note::halo2::live::Halo2Proof,
+    deposit_identifier_hash: &str,
+) -> Result<()> {
+    use dexdo_core::private_note::{
+        artifacts::ROOT_PN_ABI_JSON,
+        proof::{hex_u256_to_dec, pubkey_to_dec},
+    };
+
+    client
+        .call(
+            root_pn,
+            ROOT_PN_ABI_JSON,
+            "deployPrivateNote",
+            serde_json::json!({
+                "zkproof": deposit_zk.proof,
+                "depositIdentifierHash": deposit_identifier_hash,
+                "finalLayerHistoricalHashRoot": hex_u256_to_dec(&deposit_zk.final_layer_historical_hash_root_hex)?,
+                "voucherNominalFr": hex_u256_to_dec(&deposit_zk.voucher_nominal_fr_hex)?,
+                "tokenTypeFr": hex_u256_to_dec(&deposit_zk.token_type_fr_hex)?,
+                "ephemeralPubkey": pubkey_to_dec(pn_keys.public_hex())?,
+                "value": deposit_zk.voucher_value,
+                "tokenType": deposit_zk.voucher_token_type,
+                "layerNumber": deposit_zk.layer_number,
+            }),
+            pn_keys,
+        )
+        .await
+        .map_err(|e| anyhow::anyhow!("RootPN.deployPrivateNote: {e}"))
+        .map(|_| ())
+}
+
+#[cfg(feature = "shellnet")]
+async fn deploy_private_note_from_multisig_recoverable(
+    client: &dexdo_core::ChainClient,
+    recovery_path: &std::path::Path,
+    recovery: &mut crate::cli::note::NoteDeployRecoveryState,
+    multisig_address: &dexdo_core::Address,
+    multisig_keys: &dexdo_core::KeyPair,
+    pn_keys: &dexdo_core::KeyPair,
+    halo2_paths: &dexdo_core::private_note::Halo2Paths,
+    failpoints: NoteDeployVoucherFailpoints,
+) -> Result<crate::cli::note::OnboardPnState> {
+    use dexdo_core::private_note::{
+        artifacts::{PRIVATE_NOTE_ABI_JSON, ROOT_PN_ABI_JSON, ROOT_PN_ADDRESS},
+        proof::{hex_u256_to_dec, pubkey_to_dec, CURRENCY_ID_SHELL, ECC_SHELL_DEPOSIT_RAW},
+    };
+    use dexdo_core::Address;
+    use serde_json::json;
+    use std::time::Duration;
+
+    if recovery.shell_funded && recovery.sanity_checked {
+        recovery.ensure_ready_for_pool()?;
+        return recovery.to_onboard_state();
+    }
+
+    let root_pn = Address::parse(ROOT_PN_ADDRESS)?;
+    let mut resumed_existing_note = false;
+    let (pn_address, deposit_identifier_hash) = match (
+        recovery.pn_address.clone(),
+        recovery.deposit_identifier_hash.clone(),
+    ) {
+        (Some(pn_address), Some(deposit_identifier_hash)) => {
+            resumed_existing_note = true;
+            eprintln!(
+                "note deploy recovery: PrivateNote {pn_address} is already recorded in {}; skipping \
+                 deployPrivateNote spend and resuming later steps.",
+                recovery_path.display()
+            );
+            (pn_address, deposit_identifier_hash)
+        }
+        (None, None) => {
+            eprintln!(
+                "note deploy recovery: no on-chain PrivateNote recorded yet; continuing deploy with the \
+                 persisted owner key in {}.",
+                recovery_path.display()
+            );
+            let deposit_token_type = recovery.token_type;
+            let deposit_raw_value = recovery.raw_value;
+            let had_persisted_deposit_proof = recovery
+                .voucher_checkpoint(crate::cli::note::NoteDeployVoucherKind::Deposit)
+                .and_then(|checkpoint| checkpoint.proof.as_ref())
+                .is_some();
+            let deposit_zk = note_deploy_mint_voucher_recoverable(
+                client,
+                recovery_path,
+                recovery,
+                crate::cli::note::NoteDeployVoucherKind::Deposit,
+                multisig_address,
+                multisig_keys,
+                pn_keys.public_hex(),
+                deposit_token_type,
+                deposit_raw_value,
+                false,
+                halo2_paths,
+                failpoints,
+            )
+            .await
+            .map_err(|e| anyhow::anyhow!("halo2 deposit voucher: {e}"))?;
+
+            let dih_dec = hex_u256_to_dec(&deposit_zk.deposit_identifier_hash_hex)?;
+            if had_persisted_deposit_proof {
+                let pn_address = note_deploy_private_note_address(client, &root_pn, &dih_dec)
+                    .await
+                    .map_err(|e| {
+                        anyhow::anyhow!(
+                            "RootPN.getPrivateNoteAddress before repeat deployPrivateNote: {e}"
+                        )
+                    })?;
+                let pn = Address::parse(&pn_address)?;
+                if note_deploy_wait_existing_active(client, &pn, Duration::from_secs(120)).await? {
+                    let deployed_at_unix = note_deploy_now_unix()?;
+                    recovery.mark_private_note_deployed(
+                        pn_address.clone(),
+                        dih_dec.clone(),
+                        deployed_at_unix,
+                    )?;
+                    crate::cli::note::write_note_deploy_recovery(recovery_path, recovery)?;
+                    eprintln!(
+                        "note deploy recovery: recovered active PrivateNote {pn_address} from persisted \
+                         deposit proof in {}; skipping repeat deployPrivateNote submit.",
+                        recovery_path.display()
+                    );
+                    resumed_existing_note = true;
+                    (pn_address, dih_dec)
+                } else {
+                    eprintln!(
+                        "note deploy recovery: persisted deposit proof in {} has no active PrivateNote yet; \
+                         submitting deployPrivateNote once.",
+                        recovery_path.display()
+                    );
+                    note_deploy_submit_private_note(
+                        client,
+                        &root_pn,
+                        pn_keys,
+                        &deposit_zk,
+                        &dih_dec,
+                    )
+                    .await?;
+
+                    let pn_address =
+                        note_deploy_private_note_address(client, &root_pn, &dih_dec).await?;
+                    let pn = Address::parse(&pn_address)?;
+                    note_deploy_wait_active(client, &pn, Duration::from_secs(120)).await?;
+                    if failpoints.after_deploy_before_note_record {
+                        bail!(
+                            "simulated interruption after deployPrivateNote active before recovery note record. \
+                             Recovery state is at {}; rerun `dexdo note deploy --recovery <this-file> \
+                             --pool <pool>` to discover the active PrivateNote without repeating deployPrivateNote.",
+                            recovery_path.display()
+                        );
+                    }
+                    let deployed_at_unix = note_deploy_now_unix()?;
+                    recovery.mark_private_note_deployed(
+                        pn_address.clone(),
+                        dih_dec.clone(),
+                        deployed_at_unix,
+                    )?;
+                    crate::cli::note::write_note_deploy_recovery(recovery_path, recovery)?;
+                    eprintln!(
+                        "note deploy recovery: recorded deployed PrivateNote {pn_address} in {}; a later recovery \
+                         will not repeat deployPrivateNote.",
+                        recovery_path.display()
+                    );
+                    (pn_address, dih_dec)
+                }
+            } else {
+                note_deploy_submit_private_note(client, &root_pn, pn_keys, &deposit_zk, &dih_dec)
+                    .await?;
+
+                let pn_address =
+                    note_deploy_private_note_address(client, &root_pn, &dih_dec).await?;
+                let pn = Address::parse(&pn_address)?;
+                note_deploy_wait_active(client, &pn, Duration::from_secs(120)).await?;
+                if failpoints.after_deploy_before_note_record {
+                    bail!(
+                        "simulated interruption after deployPrivateNote active before recovery note record. \
+                         Recovery state is at {}; rerun `dexdo note deploy --recovery <this-file> --pool <pool>` \
+                         to discover the active PrivateNote without repeating deployPrivateNote.",
+                        recovery_path.display()
+                    );
+                }
+                let deployed_at_unix = note_deploy_now_unix()?;
+                recovery.mark_private_note_deployed(
+                    pn_address.clone(),
+                    dih_dec.clone(),
+                    deployed_at_unix,
+                )?;
+                crate::cli::note::write_note_deploy_recovery(recovery_path, recovery)?;
+                eprintln!(
+                    "note deploy recovery: recorded deployed PrivateNote {pn_address} in {}; a later recovery \
+                     will not repeat deployPrivateNote.",
+                    recovery_path.display()
+                );
+                (pn_address, dih_dec)
+            }
+        }
+        _ => {
+            bail!(
+                "note deploy recovery {} is inconsistent: pn_address and deposit_identifier_hash must both be \
+                 present or both absent",
+                recovery_path.display()
+            );
+        }
+    };
+
+    if !recovery.shell_funded {
+        let pn = Address::parse(&pn_address)?;
+        let expected_shell = recovery.ecc_shell_deposit as u128;
+        let already_funded = resumed_existing_note
+            && note_deploy_wait_existing_shell_funding(
+                client,
+                &pn,
+                expected_shell,
+                Duration::from_secs(60),
+            )
+            .await?;
+        if already_funded {
+            eprintln!(
+                "note deploy recovery: PrivateNote {pn_address} already has expected ECC[2] funding; \
+                 skipping sendEccShellToPrivateNote spend."
+            );
+        } else {
+            let gas_zk = note_deploy_mint_voucher_recoverable(
+                client,
+                recovery_path,
+                recovery,
+                crate::cli::note::NoteDeployVoucherKind::ShellGas,
+                multisig_address,
+                multisig_keys,
+                pn_keys.public_hex(),
+                CURRENCY_ID_SHELL,
+                ECC_SHELL_DEPOSIT_RAW,
+                true,
+                halo2_paths,
+                failpoints,
+            )
+            .await
+            .map_err(|e| anyhow::anyhow!("halo2 SHELL gas voucher: {e}"))?;
+
+            client
+                .call(
+                    &root_pn,
+                    ROOT_PN_ABI_JSON,
+                    "sendEccShellToPrivateNote",
+                    json!({
+                        "proof": gas_zk.proof,
+                        "nullifierHash": hex_u256_to_dec(&gas_zk.deposit_identifier_hash_hex)?,
+                        "depositIdentifierHash": deposit_identifier_hash,
+                        "finalLayerHistoricalHashRoot": hex_u256_to_dec(&gas_zk.final_layer_historical_hash_root_hex)?,
+                        "voucherNominalFr": hex_u256_to_dec(&gas_zk.voucher_nominal_fr_hex)?,
+                        "tokenTypeFr": hex_u256_to_dec(&gas_zk.token_type_fr_hex)?,
+                        "value": gas_zk.voucher_value,
+                        "layerNumber": gas_zk.layer_number,
+                        "recipientEphemeralPubkey": pubkey_to_dec(pn_keys.public_hex())?,
+                    }),
+                    pn_keys,
+                )
+                .await
+                .map_err(|e| anyhow::anyhow!("RootPN.sendEccShellToPrivateNote: {e}"))?;
+            if !note_deploy_wait_existing_shell_funding(
+                client,
+                &pn,
+                expected_shell,
+                Duration::from_secs(180),
+            )
+            .await?
+            {
+                bail!(
+                    "PrivateNote {pn_address} did not show expected ECC[2] funding {expected_shell} within \
+                     180s after sendEccShellToPrivateNote; recovery state was left unfinalized so rerun \
+                     `dexdo note deploy --recovery {}` before pooling.",
+                    recovery_path.display()
+                );
+            }
+        }
+    }
+
+    let pn = Address::parse(&pn_address)?;
+    client
+        .run_getter(&pn, PRIVATE_NOTE_ABI_JSON, "getDetails", json!({}))
+        .await?
+        .ok_or_else(|| anyhow::anyhow!("PrivateNote.getDetails returned no output"))?;
+    recovery.mark_shell_funded_and_checked()?;
+    crate::cli::note::write_note_deploy_recovery(recovery_path, recovery)?;
+    recovery.to_onboard_state()
+}
+
+#[cfg(feature = "shellnet")]
+async fn note_deploy_wait_existing_shell_funding(
+    client: &dexdo_core::ChainClient,
+    note: &dexdo_core::Address,
+    expected_shell_ecc: u128,
+    timeout: std::time::Duration,
+) -> Result<bool> {
+    let deadline = std::time::Instant::now() + timeout;
+    loop {
+        if let Some(acc) = client.get_account(note).await? {
+            if acc.ecc_balance(2) >= expected_shell_ecc {
+                return Ok(true);
+            }
+        }
+        if std::time::Instant::now() >= deadline {
+            return Ok(false);
+        }
+        tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+    }
+}
+
+#[cfg(feature = "shellnet")]
+async fn note_deploy_wait_existing_active(
+    client: &dexdo_core::ChainClient,
+    note: &dexdo_core::Address,
+    timeout: std::time::Duration,
+) -> Result<bool> {
+    let deadline = std::time::Instant::now() + timeout;
+    loop {
+        if let Some(acc) = client.get_account(note).await? {
+            if acc.is_active() {
+                return Ok(true);
+            }
+        }
+        if std::time::Instant::now() >= deadline {
+            return Ok(false);
+        }
+        tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+    }
+}
+
+#[cfg(feature = "shellnet")]
+async fn note_deploy_private_note_address(
+    client: &dexdo_core::ChainClient,
+    root_pn: &dexdo_core::Address,
+    deposit_identifier_hash: &str,
+) -> Result<String> {
+    use dexdo_core::private_note::artifacts::ROOT_PN_ABI_JSON;
+    let out = client
+        .run_getter(
+            root_pn,
+            ROOT_PN_ABI_JSON,
+            "getPrivateNoteAddress",
+            serde_json::json!({ "depositIdentifierHash": deposit_identifier_hash }),
+        )
+        .await?
+        .ok_or_else(|| anyhow::anyhow!("RootPN.getPrivateNoteAddress returned no output"))?;
+    out.get("privateNoteAddress")
+        .and_then(|v| v.as_str())
+        .map(ToOwned::to_owned)
+        .ok_or_else(|| {
+            anyhow::anyhow!("RootPN.getPrivateNoteAddress missing privateNoteAddress: {out}")
+        })
+}
+
+#[cfg(feature = "shellnet")]
+async fn note_deploy_wait_active(
+    client: &dexdo_core::ChainClient,
+    address: &dexdo_core::Address,
+    timeout: std::time::Duration,
+) -> Result<()> {
+    let deadline = std::time::Instant::now() + timeout;
+    loop {
+        if let Some(acc) = client.get_account(address).await? {
+            if acc.is_active() {
+                return Ok(());
+            }
+        }
+        if std::time::Instant::now() >= deadline {
+            return Err(anyhow::anyhow!(
+                "{address} did not become Active within {}s",
+                timeout.as_secs()
+            ));
+        }
+        tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+    }
+}
+
+#[cfg(feature = "shellnet")]
+fn note_deploy_now_unix() -> Result<u64> {
+    Ok(std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_err(|e| anyhow::anyhow!("system clock before epoch: {e}"))?
+        .as_secs())
+}
+
+#[cfg(feature = "shellnet")]
+fn note_deploy_fold_state_into_pool(
+    pool_path: &std::path::Path,
+    state: &crate::cli::note::OnboardPnState,
+    funding_multisig_address: &str,
+) -> Result<usize> {
+    use crate::cli::note::{pn_state_to_pool_note, pool_with_note_added};
+
+    let note = pn_state_to_pool_note(state)?;
+    let existing = match std::fs::read(pool_path) {
+        Ok(b) => Some(serde_json::from_slice(&b).map_err(|e| {
+            anyhow::anyhow!("--pool {} is not valid JSON: {e}", pool_path.display())
+        })?),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
+        Err(e) => bail!("read --pool {}: {e}", pool_path.display()),
+    };
+    let now = note_deploy_now_unix()?;
+    let pool = pool_with_note_added(existing, state, note, now, funding_multisig_address)?;
+    let pool_json = serde_json::to_string_pretty(&pool)?;
+    write_pool_private(pool_path, pool_json.as_bytes())?;
+    Ok(pool["notes"].as_array().map(|a| a.len()).unwrap_or(0))
+}
+
 /// `dexdo note deploy` -- deploy a wallet-funded `PrivateNote` on shellnet in-process through
 /// `gosh.ackinacki`, then fold its result into a `DEXDO_PN_POOL` the `seller`/`buyer` consume. The wallet funding
 /// secret is read from `--multisig-key` or derived from `--multisig-seed-file`, then passed directly to the SDK.
@@ -6738,76 +8277,165 @@ fn note_deploy_multisig_keys(args: &NoteDeployArgs) -> Result<dexdo_core::KeyPai
 /// but is NEVER printed/logged.
 #[cfg(feature = "shellnet")]
 pub(crate) async fn run_note_deploy(args: NoteDeployArgs) -> Result<()> {
-    use crate::cli::note::{pn_state_to_pool_note, pool_with_note_added, OnboardPnState};
+    use crate::cli::note::{
+        default_note_deploy_recovery_path, derive_owner_pubkey_from_secret_hex,
+        ensure_onchain_owner_matches_pool_key, load_note_deploy_recovery,
+        recovery_owner_key_written_message, write_note_deploy_recovery, NoteDeployRecoveryRequest,
+        NoteDeployRecoveryState, OnboardPnState,
+    };
     use dexdo_core::{
         private_note::{
-            deploy_private_note_from_multisig, DeployPrivateNoteParams, Halo2Paths, Nominal,
+            artifacts::PRIVATE_NOTE_ABI_JSON, proof::ECC_SHELL_DEPOSIT_RAW, Halo2Paths, Nominal,
             TokenType,
         },
-        Address, ChainClient,
+        Address, ChainClient, KeyPair,
     };
 
-    let multisig_keys = note_deploy_multisig_keys(&args)?;
+    note_deploy_same_file_pool_guard(std::env::var_os("DEXDO_PN_POOL").as_deref(), &args.pool)?;
     let funding_multisig_address = dexdo_core::normalize_wallet_address(&args.multisig_address)
         .map_err(|e| anyhow::anyhow!("--multisig-address: {e}"))?;
-    let multisig_address = Address::parse(&funding_multisig_address)
+    Address::parse(&funding_multisig_address)
         .map_err(|e| anyhow::anyhow!("--multisig-address: {e}"))?;
     let nominal = Nominal::parse(&args.nominal)?;
     let token_type = TokenType::parse(&args.token_type)?;
+    let nominal_label = nominal.label().to_string();
+    let token_type_label = token_type.label().to_string();
     let endpoint = note_endpoint_url(&args.endpoint)?;
     let client = ChainClient::connect(&endpoint)?;
+    let _wallet_lock = acquire_note_deploy_wallet_lock(&funding_multisig_address)?;
     let halo2_paths = Halo2Paths::from_env();
     halo2_paths.ensure_srs();
+    let recovery_path = args
+        .recovery
+        .clone()
+        .unwrap_or_else(|| default_note_deploy_recovery_path(&args.pool));
+    note_deploy_recovery_pool_guard(&args.pool, &recovery_path)?;
+    let recovery_request = NoteDeployRecoveryRequest {
+        endpoint: &endpoint,
+        nominal: &nominal_label,
+        token_type: token_type.id(),
+        raw_value: nominal.raw_value(token_type),
+        ecc_shell_deposit: ECC_SHELL_DEPOSIT_RAW,
+        funding_multisig_address: &funding_multisig_address,
+    };
+    let mut recovery = match load_note_deploy_recovery(&recovery_path)? {
+        Some(state) => {
+            state.ensure_matches_request(recovery_request)?;
+            eprintln!(
+                "note deploy recovery: using existing state file {}.",
+                recovery_path.display()
+            );
+            state
+        }
+        None => {
+            let pn_keys = KeyPair::generate();
+            let state = NoteDeployRecoveryState::new(
+                recovery_request,
+                pn_keys.public_hex(),
+                pn_keys.secret_hex(),
+            )?;
+            write_note_deploy_recovery(&recovery_path, &state)?;
+            state
+        }
+    };
+    eprintln!("{}", recovery_owner_key_written_message(&recovery_path));
+    let pn_keys = KeyPair::from_secret_hex(&recovery.owner_secret_key_hex)
+        .map_err(|e| anyhow::anyhow!("note deploy recovery owner key: {e:?}"))?;
 
     eprintln!(
         "note deploy: in-process gosh.ackinacki -- wallet {} funds a {} {} PrivateNote on {} ...",
-        funding_multisig_address,
-        nominal.label(),
-        token_type.label(),
-        endpoint
+        funding_multisig_address, nominal_label, token_type_label, endpoint
     );
-
-    let state: OnboardPnState = deploy_private_note_from_multisig(
-        &client,
-        DeployPrivateNoteParams {
-            multisig_address,
-            multisig_keys,
-            nominal,
-            token_type,
-            halo2_paths,
-        },
-    )
-    .await
-    .map_err(|e| anyhow::anyhow!("deploy PrivateNote from wallet {funding_multisig_address}: {e}"))?
-    .into();
-    let note = pn_state_to_pool_note(&state)?;
-    let note_addr = note["address"].as_str().unwrap_or_default().to_string();
-
-    // Fold into the pool(create or append). The homogeneity + duplicate guards live in the pure adapter.
-    let existing = match std::fs::read(&args.pool) {
-        Ok(b) => Some(serde_json::from_slice(&b).map_err(|e| {
-            anyhow::anyhow!("--pool {} is not valid JSON: {e}", args.pool.display())
-        })?),
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
-        Err(e) => bail!("read --pool {}: {e}", args.pool.display()),
+    let voucher_failpoints = NoteDeployVoucherFailpoints {
+        after_deposit_submit: args.simulate_interrupt_after_deposit_voucher_submit,
+        after_deposit_event: args.simulate_interrupt_after_deposit_voucher_event,
+        after_shell_submit: args.simulate_interrupt_after_shell_voucher_submit,
+        after_deploy_before_note_record: args.simulate_interrupt_after_deploy_before_note_record,
     };
-    let now = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map_err(|e| anyhow::anyhow!("system clock before epoch: {e}"))?
-        .as_secs();
-    let pool = pool_with_note_added(existing, &state, note, now, &funding_multisig_address)?;
-    let pool_json = serde_json::to_string_pretty(&pool)?;
-    // the pool carries the note owner secret -- write it 0600 + atomically, not under umask.
-    write_pool_private(&args.pool, pool_json.as_bytes())?;
 
-    let n = pool["notes"].as_array().map(|a| a.len()).unwrap_or(0);
+    let state: OnboardPnState = {
+        let mut attempt = 1u64;
+        loop {
+            let multisig_address = Address::parse(&funding_multisig_address)
+                .map_err(|e| anyhow::anyhow!("--multisig-address: {e}"))?;
+            let multisig_keys = note_deploy_multisig_keys(&args)?;
+            match deploy_private_note_from_multisig_recoverable(
+                &client,
+                &recovery_path,
+                &mut recovery,
+                &multisig_address,
+                &multisig_keys,
+                &pn_keys,
+                &halo2_paths,
+                voucher_failpoints,
+            )
+            .await
+            {
+                Ok(state) => break state,
+                Err(error) => {
+                    if is_note_deploy_wallet_busy_error(&error) && attempt < 3 {
+                        let backoff_secs = attempt.saturating_mul(10);
+                        eprintln!(
+                            "note deploy: funding wallet {funding_multisig_address} looks busy/out-of-sync; \
+                             retrying attempt {} after {backoff_secs}s",
+                            attempt + 1
+                        );
+                        tokio::time::sleep(std::time::Duration::from_secs(backoff_secs)).await;
+                        attempt = attempt.saturating_add(1);
+                        continue;
+                    }
+                    return Err(note_deploy_error(&funding_multisig_address, error));
+                }
+            }
+        }
+    };
+    let note_addr = state
+        .pn_address
+        .as_deref()
+        .ok_or_else(|| {
+            anyhow::anyhow!("pn_state has no pn_address -- note deploy did not complete")
+        })?
+        .to_string();
+    let owner_secret = state.owner_secret_key_hex.as_deref().ok_or_else(|| {
+        anyhow::anyhow!("pn_state has no owner_secret_key_hex -- incomplete note deploy")
+    })?;
+    let derived_owner = derive_owner_pubkey_from_secret_hex(owner_secret)?;
+    let note_address = Address::parse(&note_addr)
+        .map_err(|e| anyhow::anyhow!("deployed note {note_addr}: {e}"))?;
+    let details = client
+        .run_getter(
+            &note_address,
+            PRIVATE_NOTE_ABI_JSON,
+            "getDetails",
+            serde_json::json!({}),
+        )
+        .await
+        .map_err(|e| anyhow::anyhow!("verify deployed PrivateNote {note_addr} owner key: {e}"))?;
+    ensure_onchain_owner_matches_pool_key(
+        "note deploy",
+        &note_addr,
+        details.as_ref().and_then(|d| d["ephemeralPubkey"].as_str()),
+        &derived_owner,
+    )?;
+    if args.simulate_interrupt_after_spend_before_pool {
+        bail!(
+            "simulated interruption after on-chain spend before final pool write. Recovery state is complete at {}; \
+             run `dexdo note recover --recovery {} --pool {}` to finalize without re-spending.",
+            recovery_path.display(),
+            recovery_path.display(),
+            args.pool.display()
+        );
+    }
+
+    let n = note_deploy_fold_state_into_pool(&args.pool, &state, &funding_multisig_address)?;
     println!(
-        "note deployed -> PrivateNote {note_addr} ({} {}); folded into --pool {} ({} note(s)). The owner secret is \
-         stored in the pool for the seller/buyer -- keep the file private.",
+        "note deployed -> PrivateNote {note_addr} ({} {}); folded into --pool {} ({} note(s)). Recovery state is \
+         at {}. The owner secret is stored in the pool for the seller/buyer -- keep both files private.",
         state.nominal,
         state.token_type,
         args.pool.display(),
-        n
+        n,
+        recovery_path.display()
     );
     Ok(())
 }
@@ -6815,6 +8443,67 @@ pub(crate) async fn run_note_deploy(args: NoteDeployArgs) -> Result<()> {
 #[cfg(not(feature = "shellnet"))]
 pub(crate) async fn run_note_deploy(_args: NoteDeployArgs) -> Result<()> {
     bail!("note deploy unavailable: build with `--features shellnet`")
+}
+
+#[cfg(feature = "shellnet")]
+pub(crate) async fn run_note_recover(args: NoteRecoverArgs) -> Result<()> {
+    use crate::cli::note::{
+        derive_owner_pubkey_from_secret_hex, ensure_onchain_owner_matches_pool_key,
+        load_note_deploy_recovery,
+    };
+    use dexdo_core::{private_note::artifacts::PRIVATE_NOTE_ABI_JSON, Address, ChainClient};
+
+    note_deploy_recovery_pool_guard(&args.pool, &args.recovery)?;
+    let recovery = load_note_deploy_recovery(&args.recovery)?.ok_or_else(|| {
+        anyhow::anyhow!(
+            "note recover: recovery file {} not found",
+            args.recovery.display()
+        )
+    })?;
+    recovery.ensure_ready_for_pool()?;
+    let state = recovery.to_onboard_state()?;
+    let note_addr = state
+        .pn_address
+        .as_deref()
+        .ok_or_else(|| anyhow::anyhow!("note recover: recovery state has no pn_address"))?
+        .to_string();
+    let owner_secret = state.owner_secret_key_hex.as_deref().ok_or_else(|| {
+        anyhow::anyhow!("note recover: recovery state has no owner_secret_key_hex")
+    })?;
+    let derived_owner = derive_owner_pubkey_from_secret_hex(owner_secret)?;
+    let client = ChainClient::connect(&recovery.endpoint)?;
+    let note_address = Address::parse(&note_addr)
+        .map_err(|e| anyhow::anyhow!("recovered note {note_addr}: {e}"))?;
+    let details = client
+        .run_getter(
+            &note_address,
+            PRIVATE_NOTE_ABI_JSON,
+            "getDetails",
+            serde_json::json!({}),
+        )
+        .await
+        .map_err(|e| anyhow::anyhow!("verify recovered PrivateNote {note_addr} owner key: {e}"))?;
+    ensure_onchain_owner_matches_pool_key(
+        "note recover",
+        &note_addr,
+        details.as_ref().and_then(|d| d["ephemeralPubkey"].as_str()),
+        &derived_owner,
+    )?;
+    let n =
+        note_deploy_fold_state_into_pool(&args.pool, &state, &recovery.funding_multisig_address)?;
+    println!(
+        "note recovered -> PrivateNote {note_addr}; folded into --pool {} ({} note(s)) from recovery {}. \
+         No wallet spend was submitted.",
+        args.pool.display(),
+        n,
+        args.recovery.display()
+    );
+    Ok(())
+}
+
+#[cfg(not(feature = "shellnet"))]
+pub(crate) async fn run_note_recover(_args: NoteRecoverArgs) -> Result<()> {
+    bail!("note recover unavailable: build with `--features shellnet`")
 }
 
 /// `dexdo note balance`: address-only, read-only PrivateNote balance diagnostics.
@@ -6894,6 +8583,9 @@ pub(crate) async fn run_note_withdraw(args: NoteWithdrawArgs) -> Result<()> {
     let note =
         Address::parse(&note_addr).map_err(|e| anyhow::anyhow!("--note-addr {note_addr}: {e}"))?;
     let dest_addr = Address::parse(&dest).map_err(|e| anyhow::anyhow!("--to {dest}: {e}"))?;
+    chain
+        .assert_note_owner_matches("note withdraw", &note, &keys)
+        .await?;
     println!("withdrawing note {note_addr} token balances -> {dest}");
     chain.withdraw_note_tokens(&note, &keys, &dest_addr).await?;
     println!("withdrawTokens submitted for note {note_addr} -> {dest}");
@@ -7161,9 +8853,161 @@ async fn run_oracle_resolve(args: OracleResolveArgs) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
-    #[cfg(feature = "shellnet")]
-    use crate::cli::args::NoteDeployArgs;
     use crate::cli::args::SubscriptionPlaceArgs;
+    #[cfg(feature = "shellnet")]
+    use crate::cli::args::{IdentityArgs, NoteDeployArgs};
+
+    #[tokio::test]
+    async fn direct_chain_read_timeout_returns_terminal_retryable_error() {
+        let started = std::time::Instant::now();
+        let err = super::direct_chain_read_with_timeout(1, async {
+            tokio::time::sleep(std::time::Duration::from_secs(60)).await;
+            Ok::<(), anyhow::Error>(())
+        })
+        .await
+        .expect_err("slow read must fail at the bounded timeout")
+        .to_string();
+
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(2),
+            "timeout should be terminal within the configured bound"
+        );
+        assert!(err.contains("chain read timed out after 1s"), "{err}");
+        assert!(err.contains("retry"), "{err}");
+        assert!(err.contains("dexdo market-data"), "{err}");
+    }
+
+    #[cfg(feature = "shellnet")]
+    #[test]
+    fn executable_book_line_includes_selection_fields() {
+        let snapshot = dexdo_core::OrderBookSnapshot {
+            frame_model: "qwen--qwen3--32b".to_string(),
+            model_hash: "hash".to_string(),
+            order_book: "0:book".to_string(),
+            stats: None,
+            orders: Vec::new(),
+        };
+        let order = dexdo_core::OrderBookOrder {
+            order_id: 7,
+            owner_note: "0:seller".to_string(),
+            token_contract: Some("0:tc".to_string()),
+            is_buy: false,
+            price_per_tick: 42,
+            ticks: 1024,
+            escrow: 0,
+            deadline: 0,
+            flags: 0,
+            timestamp: 0,
+        };
+
+        let line = super::render_executable_book_line(&snapshot, &order, 8, 50);
+
+        assert!(line.contains("executable_ask"), "{line}");
+        assert!(line.contains("order_id=7"), "{line}");
+        assert!(line.contains("token_contract=0:tc"), "{line}");
+        assert!(line.contains("price_per_tick=42"), "{line}");
+        assert!(line.contains("ticks=1024"), "{line}");
+        assert!(line.contains("requested_ticks=8"), "{line}");
+        assert!(line.contains("max_price_per_tick=50"), "{line}");
+    }
+
+    #[cfg(feature = "shellnet")]
+    #[test]
+    fn executable_book_output_includes_multiple_rows() {
+        let snapshot = dexdo_core::OrderBookSnapshot {
+            frame_model: "qwen--qwen3--32b".to_string(),
+            model_hash: "hash".to_string(),
+            order_book: "0:book".to_string(),
+            stats: None,
+            orders: Vec::new(),
+        };
+        let orders = vec![
+            dexdo_core::OrderBookOrder {
+                order_id: 7,
+                owner_note: "0:seller-a".to_string(),
+                token_contract: Some("0:tc-a".to_string()),
+                is_buy: false,
+                price_per_tick: 42,
+                ticks: 1024,
+                escrow: 0,
+                deadline: 0,
+                flags: 0,
+                timestamp: 0,
+            },
+            dexdo_core::OrderBookOrder {
+                order_id: 8,
+                owner_note: "0:seller-b".to_string(),
+                token_contract: Some("0:tc-b".to_string()),
+                is_buy: false,
+                price_per_tick: 43,
+                ticks: 2048,
+                escrow: 0,
+                deadline: 0,
+                flags: 0,
+                timestamp: 0,
+            },
+        ];
+
+        let output = super::render_executable_book_output(&snapshot, &orders, 8, 50, None);
+        let rows = output
+            .lines()
+            .filter(|line| line.starts_with("executable_ask "))
+            .collect::<Vec<_>>();
+
+        assert_eq!(rows.len(), 2, "{output}");
+        assert!(rows[0].contains("token_contract=0:tc-a"), "{output}");
+        assert!(rows[1].contains("token_contract=0:tc-b"), "{output}");
+    }
+
+    #[cfg(feature = "shellnet")]
+    #[test]
+    fn executable_book_output_empty_is_terminal_and_clear() {
+        let snapshot = dexdo_core::OrderBookSnapshot {
+            frame_model: "qwen--qwen3--32b".to_string(),
+            model_hash: "hash".to_string(),
+            order_book: "0:book".to_string(),
+            stats: None,
+            orders: Vec::new(),
+        };
+
+        let output = super::render_executable_book_output(
+            &snapshot,
+            &[],
+            8,
+            10,
+            Some("raw order-book matcher would hit non-executable order "),
+        );
+
+        assert!(output.contains("none=true"), "{output}");
+        assert!(output.contains("no_executable_ask=true"), "{output}");
+        assert!(output.contains("non-executable order "), "{output}");
+    }
+
+    #[cfg(feature = "shellnet")]
+    #[test]
+    fn no_executable_book_line_is_terminal_and_clear() {
+        let snapshot = dexdo_core::OrderBookSnapshot {
+            frame_model: "qwen--qwen3--32b".to_string(),
+            model_hash: "hash".to_string(),
+            order_book: "0:book".to_string(),
+            stats: None,
+            orders: Vec::new(),
+        };
+
+        let line = super::render_no_executable_book_line(
+            &snapshot,
+            8,
+            10,
+            "no executable matching ask\nbest ask price 11 is above buyer max_price_per_tick 10",
+        );
+
+        assert!(line.contains("none=true"), "{line}");
+        assert!(line.contains("no_executable_ask=true"), "{line}");
+        assert!(line.contains("requested_ticks=8"), "{line}");
+        assert!(line.contains("max_price_per_tick=10"), "{line}");
+        assert!(!line.contains('\n'), "{line}");
+        assert!(line.contains("best ask price 11"), "{line}");
+    }
 
     #[test]
     fn seller_open_probe_status_points_to_advance_not_buyer_stop() {
@@ -7221,6 +9065,7 @@ mod tests {
     #[test]
     fn subscription_place_plan_uses_exact_fee_inclusive_escrow() {
         let plan = super::subscription_place_plan(&SubscriptionPlaceArgs {
+            note_key: None,
             max_price_per_tick: 1000,
             ticks: Some(4),
             budget: None,
@@ -7232,6 +9077,7 @@ mod tests {
         assert_eq!(plan.unused_budget, 0);
 
         let plan = super::subscription_place_plan(&SubscriptionPlaceArgs {
+            note_key: None,
             max_price_per_tick: 1000,
             ticks: None,
             budget: Some(4200),
@@ -7246,6 +9092,7 @@ mod tests {
     #[test]
     fn subscription_place_plan_rejects_zero_sized_money_moves() {
         assert!(super::subscription_place_plan(&SubscriptionPlaceArgs {
+            note_key: None,
             max_price_per_tick: 1000,
             ticks: Some(0),
             budget: None,
@@ -7253,6 +9100,7 @@ mod tests {
         })
         .is_err());
         assert!(super::subscription_place_plan(&SubscriptionPlaceArgs {
+            note_key: None,
             max_price_per_tick: 1000,
             ticks: None,
             budget: Some(1),
@@ -7260,6 +9108,7 @@ mod tests {
         })
         .is_err());
         assert!(super::subscription_place_plan(&SubscriptionPlaceArgs {
+            note_key: None,
             max_price_per_tick: 0,
             ticks: Some(1),
             budget: None,
@@ -7273,6 +9122,7 @@ mod tests {
         offers: Vec<dexdo_core::OfferListing>,
         model_preflight_error: Option<String>,
         explicit_preflight_error: Option<String>,
+        explicit_submit_safe_order: Option<dexdo_core::OrderBookOrder>,
         sell_offer_terms: Option<(u64, u64)>,
         sell_offer_terms_calls: std::sync::atomic::AtomicUsize,
         submit_safe_single_ask_quote: bool,
@@ -7289,6 +9139,26 @@ mod tests {
                 token_contract: token_contract.to_string(),
                 price_per_tick,
                 max_ticks,
+            }
+        }
+
+        fn order(
+            order_id: u128,
+            token_contract: &str,
+            price_per_tick: u128,
+            ticks: u128,
+        ) -> dexdo_core::OrderBookOrder {
+            dexdo_core::OrderBookOrder {
+                order_id,
+                owner_note: "seller".to_string(),
+                token_contract: Some(token_contract.to_string()),
+                is_buy: false,
+                price_per_tick,
+                ticks,
+                escrow: 0,
+                deadline: 0,
+                flags: 0,
+                timestamp: 0,
             }
         }
     }
@@ -7339,6 +9209,15 @@ mod tests {
                 Some(err) => Err(dexdo_core::ChainError::Chain(err.clone())),
                 None => Ok(()),
             }
+        }
+
+        async fn submit_safe_explicit_buy_quote_order(
+            &self,
+            _token_contract: &dexdo_core::TokenContract,
+            _ticks: u128,
+            _max_price_per_tick: u128,
+        ) -> Result<Option<dexdo_core::OrderBookOrder>, dexdo_core::ChainError> {
+            Ok(self.explicit_submit_safe_order.clone())
         }
 
         fn requires_submit_safe_single_ask_quote(&self) -> bool {
@@ -7443,6 +9322,25 @@ mod tests {
         assert!(err.contains("above buyer max_price_per_tick 10"), "{err}");
     }
 
+    #[test]
+    fn model_only_no_liquidity_failure_class_is_no_executable_ask() {
+        let selection = super::BuyerQuoteSelection {
+            order_book: "model_order_book",
+            escrow: 0,
+            quote: dexdo_core::ExecutableQuote {
+                filled_ticks: 0,
+                total_with_fee: 0,
+                complete: false,
+                fills: Vec::new(),
+            },
+        };
+
+        assert_eq!(
+            super::buyer_quote_failure_class(&selection, super::machine::ErrorCode::NoLiquidity),
+            "no_executable_ask"
+        );
+    }
+
     #[tokio::test]
     async fn buyer_explicit_quote_selection_runs_target_preflight_before_synthetic_terms() {
         let chain = QuotePreflightChain {
@@ -7519,6 +9417,33 @@ mod tests {
         assert_eq!(selection.quote.fills.len(), 1);
         assert_eq!(selection.quote.fills[0].ticks, 1);
         assert_eq!(selection.quote.fills[0].token_contract, "0:big");
+    }
+
+    #[tokio::test]
+    async fn buyer_explicit_quote_selection_uses_submit_safe_row_before_synthetic_terms() {
+        let chain = QuotePreflightChain {
+            explicit_submit_safe_order: Some(QuotePreflightChain::order(7, "0:big", 1000, 1024)),
+            submit_safe_single_ask_quote: true,
+            ..Default::default()
+        };
+
+        let selection = super::buyer_quote_selection(&chain, Some("0:big"), 1, 1000, None)
+            .await
+            .expect("selection returns an explicit submit-safe quote");
+
+        assert_eq!(selection.order_book, "explicit_token_contract");
+        assert!(selection.quote.complete);
+        assert_eq!(selection.quote.filled_ticks, 1);
+        assert_eq!(selection.quote.fills.len(), 1);
+        assert_eq!(selection.quote.fills[0].order_id, 7);
+        assert_eq!(selection.quote.fills[0].token_contract, "0:big");
+        assert_eq!(
+            chain
+                .sell_offer_terms_calls
+                .load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "explicit submit-safe row should not be replaced by synthetic terms"
+        );
     }
 
     #[cfg(feature = "shellnet")]
@@ -7669,10 +9594,11 @@ mod tests {
         assert!(err.contains("qwen--qwen3--32b"), "{err}");
     }
 
-    /// (PR155): static guard -- the seller publishes its offer and confirms THIS TC's ask rested in the IOB
-    /// BEFORE binding the gateway, so "gateway listening" cannot false-green as market readiness on an empty book.
+    /// static guard -- the seller publishes its offer and confirms THIS TC either rested in the IOB or
+    /// immediately matched/funded BEFORE binding the gateway, so "gateway listening" cannot false-green as market
+    /// readiness on an empty and unmatched book.
     #[test]
-    fn seller_gateway_listens_only_after_offer_rested_guard() {
+    fn seller_gateway_listens_only_after_offer_acceptance_guard() {
         let source = include_str!("commands.rs");
         let terms = source
             .find(&["sell_", "offer_terms(&token_contract)"].concat())
@@ -7686,12 +9612,20 @@ mod tests {
         let duplicate = source
             .find(&["assert_", "no_active_sell_order(&token_contract)"].concat())
             .expect("seller rejects duplicate active asks before posting");
-        let rested = source
+        let withdrawn = source
+            .find(&["assert_note_can_", "post_sell_offer()"].concat())
+            .expect("seller checks withdrawn note state before posting");
+        let accepted = source
             .find(&["assert_", "offer_rested(&token_contract)"].concat())
-            .expect("seller waits for this TC's ask to rest");
+            .expect("seller waits for this TC's postSellOffer to be accepted by rest or match");
         let gateway = source
             .find(&["start_gateway", "_with_note(args.gateway_listen"].concat())
             .expect("seller starts the gateway");
+        let real_backend = include_str!("../../../core/src/shellnet/backends.rs");
+        let guard = real_backend
+            .find("async fn assert_offer_rested(&self, tc: &TokenContract)")
+            .expect("real seller acceptance guard present");
+        let guard_body = &real_backend[guard..];
 
         assert!(
             terms < post,
@@ -7710,12 +9644,24 @@ mod tests {
             "seller must reject duplicate active asks before postSellOffer"
         );
         assert!(
-            post < rested,
-            "seller must publish the offer before checking IOB rest"
+            withdrawn < post,
+            "seller must reject withdrawn notes before postSellOffer"
         );
         assert!(
-            rested < gateway,
-            "seller gateway must not listen before this TC's ask rests in the IOB"
+            post < accepted,
+            "seller must publish the offer before checking IOB acceptance"
+        );
+        assert!(
+            accepted < gateway,
+            "seller gateway must not listen before this TC's offer rested or immediately matched"
+        );
+        assert!(
+            guard_body.contains("read_openable_match_once(tc)"),
+            "post-offer acceptance must allow an immediate funded/openable match"
+        );
+        assert!(
+            guard_body.contains("poll_inference_filled_tcs"),
+            "post-offer acceptance must inspect this seller note's exact fill events"
         );
     }
 
@@ -7787,7 +9733,7 @@ mod tests {
             .find("buyer.place_buy(chain.as_ref(), &tc)")
             .expect("direct buy present");
         let model_buy = body
-            .find(".place_buy_by_model(")
+            .find("place_buy_by_model_after_pool_preflight(")
             .expect("model-only buy present");
 
         assert!(
@@ -7801,6 +9747,79 @@ mod tests {
             registry < role && role < enforce && enforce < model_buy,
             "registry check must precede model buy"
         );
+    }
+
+    /// PR347 review blocker regression: active-pool validation must stay before both direct and model-only
+    /// money-moving buy submissions in lazy and one-shot buyer flows.
+    #[test]
+    fn buyer_pool_preflight_precedes_money_moving_buy_paths() {
+        let source = include_str!("commands.rs");
+        let wrapper_start = source
+            .find("async fn place_buy_by_model_after_pool_preflight")
+            .expect("model buy wrapper present");
+        let wrapper_end = source[wrapper_start..]
+            .find("fn record_buyer_token_contract_after_money_move")
+            .map(|offset| wrapper_start + offset)
+            .expect("model buy wrapper end marker present");
+        let wrapper = &source[wrapper_start..wrapper_end];
+        let wrapper_preflight = wrapper
+            .find("preflight_buyer_pool_for_note(pool_note_addr)?")
+            .expect("wrapper pool preflight present");
+        let wrapper_submit = wrapper
+            .find(".place_buy_by_model(")
+            .expect("wrapper model buy submit present");
+        assert!(
+            wrapper_preflight < wrapper_submit,
+            "model buy wrapper must preflight DEXDO_PN_POOL before place_buy_by_model"
+        );
+
+        let lazy_start = source
+            .find("async fn prepare_lazy_buyer_api_deal_once")
+            .expect("lazy buyer helper present");
+        let lazy_end = source[lazy_start..]
+            .find("async fn run_buyer_on_demand_local_api")
+            .map(|offset| lazy_start + offset)
+            .expect("lazy buyer helper end marker present");
+        let lazy = &source[lazy_start..lazy_end];
+        let lazy_preflight = lazy
+            .find("preflight_buyer_pool_for_money_move(args.as_ref())?")
+            .expect("lazy direct-buy pool preflight present");
+        let lazy_direct = lazy
+            .find("buyer.place_buy(chain.as_ref(), &tc)")
+            .expect("lazy direct-buy submit present");
+        let lazy_model = lazy
+            .find("place_buy_by_model_after_pool_preflight(")
+            .expect("lazy model-buy wrapper present");
+        let lazy_match = lazy[lazy_model..]
+            .find("wait_matched_token_contract")
+            .map(|offset| lazy_model + offset)
+            .expect("lazy match wait present");
+        assert!(lazy_preflight < lazy_direct);
+        assert!(lazy_model < lazy_match);
+
+        let oneshot_start = source
+            .find("async fn run_buyer_inner")
+            .expect("one-shot buyer helper present");
+        let oneshot_end = source[oneshot_start..]
+            .find("pub(crate) async fn run_monitor")
+            .map(|offset| oneshot_start + offset)
+            .expect("one-shot buyer helper end marker present");
+        let oneshot = &source[oneshot_start..oneshot_end];
+        let oneshot_preflight = oneshot
+            .find("preflight_buyer_pool_for_money_move(&args)?")
+            .expect("one-shot direct-buy pool preflight present");
+        let oneshot_direct = oneshot
+            .find("buyer.place_buy(chain.as_ref(), &tc)")
+            .expect("one-shot direct-buy submit present");
+        let oneshot_model = oneshot
+            .find("place_buy_by_model_after_pool_preflight(")
+            .expect("one-shot model-buy wrapper present");
+        let oneshot_match = oneshot[oneshot_model..]
+            .find("wait_matched_token_contract")
+            .map(|offset| oneshot_model + offset)
+            .expect("one-shot match wait present");
+        assert!(oneshot_preflight < oneshot_direct);
+        assert!(oneshot_model < oneshot_match);
     }
 
     /// regression: under buyer registry validation a raw `--token-contract` does not carry canonical
@@ -8379,11 +10398,262 @@ mod tests {
             .unwrap_err()
             .to_string();
 
-        assert!(err.contains("create temp pool"), "unexpected error: {err}");
+        assert!(
+            err.contains("create temp secret file"),
+            "unexpected error: {err}"
+        );
         assert_eq!(std::fs::read(&tmp).unwrap(), b"do-not-clobber");
         assert!(
             !target.exists(),
             "target must not be written after temp creation failed"
+        );
+    }
+
+    /// regression: `DEXDO_PN_POOL=<same existing file> dexdo note deploy --pool <same file>` is the
+    /// reported footgun. Refuse before chain work, so a bad append cannot silently poison the active pool.
+    #[cfg(feature = "shellnet")]
+    #[test]
+    fn note_deploy_rejects_same_file_env_pool_append() {
+        let dir = std::env::temp_dir().join(format!(
+            "dexdo-same-pool-test-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir(&dir).unwrap();
+        let _cleanup = TempDirCleanup(dir.clone());
+        let pool = dir.join("pn_pool.json");
+        let other = dir.join("other_pool.json");
+        std::fs::write(&pool, br#"{"notes":[]}"#).unwrap();
+        std::fs::write(&other, br#"{"notes":[]}"#).unwrap();
+
+        let err = super::note_deploy_same_file_pool_guard(Some(pool.as_os_str()), &pool)
+            .unwrap_err()
+            .to_string();
+
+        assert!(err.contains("DEXDO_PN_POOL"), "{err}");
+        assert!(err.contains("--pool"), "{err}");
+        assert!(err.contains("ERR_INVALID_SENDER 101"), "{err}");
+        assert!(err.contains("--pool <new_file>"), "{err}");
+        super::note_deploy_same_file_pool_guard(Some(other.as_os_str()), &pool)
+            .expect("different existing pool file is allowed");
+        super::note_deploy_same_file_pool_guard(None, &pool).expect("unset env pool is allowed");
+    }
+
+    /// PR347 review blocker regression: a stale active pool must fail before the money-moving model buy call.
+    #[cfg(feature = "shellnet")]
+    #[tokio::test]
+    async fn stale_pool_preflight_blocks_model_buy_before_chain_call() {
+        use std::sync::atomic::Ordering;
+
+        let _env_lock = dexdo_pn_pool_env_lock().lock().unwrap();
+        let dir = std::env::temp_dir().join(format!(
+            "dexdo-stale-pool-preflight-test-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir(&dir).unwrap();
+        let _cleanup = TempDirCleanup(dir.clone());
+        let pool = dir.join("pn_pool.json");
+        let stale_note = format!("0:{}", "1".repeat(64));
+        let buyer_note = format!("0:{}", "2".repeat(64));
+        std::fs::write(
+            &pool,
+            serde_json::to_vec_pretty(&serde_json::json!({
+                "notes": [{
+                    "address": stale_note,
+                    "owner_secret_key_hex": "00"
+                }]
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        let _env = EnvVarGuard::set("DEXDO_PN_POOL", pool.as_os_str());
+        let chain = RecordingRecoveryChain::default();
+        let buyer =
+            dexdo::buyer::Buyer::from_note(std::sync::Arc::new(dexdo_core::LocalNote::generate()));
+
+        let err = super::place_buy_by_model_after_pool_preflight(
+            &chain,
+            &buyer,
+            true,
+            Some(&buyer_note),
+            1,
+            1,
+            1,
+        )
+        .await
+        .unwrap_err()
+        .to_string();
+
+        assert!(err.contains("no note entry"), "{err}");
+        assert_eq!(
+            chain.place_next_calls.load(Ordering::SeqCst),
+            0,
+            "stale pool must fail before place_buy_by_model moves escrow"
+        );
+    }
+
+    /// residual: recovery/reclaim can be driven from the pool file alone once the buyer has recorded the
+    /// matched TokenContract next to the note entry.
+    #[cfg(feature = "shellnet")]
+    #[test]
+    fn recovery_inputs_can_use_pool_only() {
+        let dir = std::env::temp_dir().join(format!(
+            "dexdo-recovery-pool-test-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir(&dir).unwrap();
+        let _cleanup = TempDirCleanup(dir.clone());
+        let pool_path = dir.join("pn_pool.json");
+        let note_addr = format!("0:{}", "1".repeat(64));
+        let token_contract = format!("0:{}", "2".repeat(64));
+        let secret = "2a".repeat(32);
+        std::fs::write(
+            &pool_path,
+            serde_json::to_vec_pretty(&serde_json::json!({
+                "notes": [{
+                    "address": note_addr,
+                    "owner_secret_key_hex": secret,
+                    "token_contract": token_contract,
+                    "token_contract_role": "buyer",
+                    "token_contract_updated_at_unix": 99
+                }]
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+
+        let resolved = super::resolve_pool_recovery_inputs(
+            "reclaim",
+            &IdentityArgs {
+                note_key: None,
+                note_index: 0,
+                note_addr: None,
+            },
+            None,
+            None,
+            Some(pool_path.as_path()),
+        )
+        .unwrap();
+
+        assert_eq!(resolved.note_addr, format!("0:{}", "1".repeat(64)));
+        assert_eq!(resolved.note_secret_hex, "2a".repeat(32));
+        assert_eq!(resolved.token_contract, format!("0:{}", "2".repeat(64)));
+    }
+
+    /// negative: pool-only recovery must not guess when several note entries carry TokenContracts.
+    #[cfg(feature = "shellnet")]
+    #[test]
+    fn recovery_inputs_reject_ambiguous_pool() {
+        let dir = std::env::temp_dir().join(format!(
+            "dexdo-recovery-pool-ambiguous-test-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir(&dir).unwrap();
+        let _cleanup = TempDirCleanup(dir.clone());
+        let pool_path = dir.join("pn_pool.json");
+        std::fs::write(
+            &pool_path,
+            serde_json::to_vec_pretty(&serde_json::json!({
+                "notes": [
+                    {
+                        "address": format!("0:{}", "1".repeat(64)),
+                        "owner_secret_key_hex": "2a".repeat(32),
+                        "token_contract": format!("0:{}", "2".repeat(64))
+                    },
+                    {
+                        "address": format!("0:{}", "3".repeat(64)),
+                        "owner_secret_key_hex": "3a".repeat(32),
+                        "token_contract": format!("0:{}", "4".repeat(64))
+                    }
+                ]
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+
+        let err = super::resolve_pool_recovery_inputs(
+            "recover",
+            &IdentityArgs {
+                note_key: None,
+                note_index: 0,
+                note_addr: None,
+            },
+            None,
+            None,
+            Some(pool_path.as_path()),
+        )
+        .unwrap_err()
+        .to_string();
+
+        assert!(err.contains("disambiguate"), "{err}");
+    }
+
+    /// regression: the recovery state and final pool are different JSON formats; first-run absent paths
+    /// must still reject an accidental same path before any wallet spend.
+    #[cfg(feature = "shellnet")]
+    #[test]
+    fn note_deploy_rejects_same_recovery_and_pool_path() {
+        let dir = std::env::temp_dir().join(format!(
+            "dexdo-recovery-pool-test-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir(&dir).unwrap();
+        let _cleanup = TempDirCleanup(dir.clone());
+        let pool = dir.join("pn_pool.json");
+        let recovery = dir.join("pn_pool.json.recovery.json");
+
+        let err = super::note_deploy_recovery_pool_guard(&pool, &pool)
+            .unwrap_err()
+            .to_string();
+
+        assert!(err.contains("--recovery"), "{err}");
+        assert!(err.contains("--pool"), "{err}");
+        assert!(err.contains("DEXDO_PN_POOL"), "{err}");
+        super::note_deploy_recovery_pool_guard(&pool, &recovery)
+            .expect("separate recovery and pool paths are allowed");
+    }
+
+    /// regression: note withdraw is an owner-signed PrivateNote write. A mismatched --note-key must
+    /// hit the existing owner-key guidance before `withdrawTokens` can surface a bare ERR_INVALID_SENDER 101.
+    #[test]
+    fn note_withdraw_checks_owner_before_submit() {
+        let source = include_str!("commands.rs");
+        let start = source
+            .find("pub(crate) async fn run_note_withdraw")
+            .expect("run_note_withdraw present");
+        let end = source[start..]
+            .find("#[cfg(not(feature = \"shellnet\"))]")
+            .map(|offset| start + offset)
+            .expect("run_note_withdraw cfg end present");
+        let body = &source[start..end];
+        let guard = body
+            .find("assert_note_owner_matches(\"note withdraw\"")
+            .expect("note withdraw owner-key guard present");
+        let submit = body
+            .find("withdraw_note_tokens")
+            .expect("note withdraw submit present");
+        assert!(
+            guard < submit,
+            "note withdraw must check note owner key before submitting withdrawTokens"
         );
     }
 
@@ -8414,6 +10684,12 @@ mod tests {
             token_type: "nackl".into(),
             endpoint: "shellnet.ackinacki.org".into(),
             pool: std::path::PathBuf::from("pn_pool.json"),
+            recovery: None,
+            simulate_interrupt_after_spend_before_pool: false,
+            simulate_interrupt_after_deposit_voucher_submit: false,
+            simulate_interrupt_after_deposit_voucher_event: false,
+            simulate_interrupt_after_shell_voucher_submit: false,
+            simulate_interrupt_after_deploy_before_note_record: false,
         }
     }
 
@@ -9238,6 +11514,7 @@ mod tests {
             None,
             1,
             "diagnostic",
+            None,
         )
         .await
         .unwrap_err()
@@ -9272,6 +11549,7 @@ mod tests {
             Some((1, 1, 1)),
             1,
             "diagnostic",
+            None,
         )
         .await
         .expect("next_seller dispatch succeeds");
@@ -9304,6 +11582,7 @@ mod tests {
             None,
             1,
             "diagnostic",
+            None,
         )
         .await
         .unwrap_err()
@@ -9640,6 +11919,19 @@ mod tests {
 
     #[cfg(feature = "shellnet")]
     #[test]
+    fn note_deploy_wallet_busy_error_is_actionable() {
+        let raw = anyhow::anyhow!(
+            "block manager rejected message code=TVM_ERROR; exit_code=52 nonce desynchronized"
+        );
+        assert!(super::is_note_deploy_wallet_busy_error(&raw));
+        let err = super::note_deploy_error("0:wallet", raw).to_string();
+        assert!(err.contains("wallet busy/out-of-sync"), "{err}");
+        assert!(err.contains("Retry after"), "{err}");
+        assert!(!err.contains("TVM_ERROR"), "{err}");
+    }
+
+    #[cfg(feature = "shellnet")]
+    #[test]
     fn oracle_deadline_enforces_contract_result_gap() {
         let now = 1_900_000_000;
         assert!(super::validate_oracle_deadline(now + 119, now).is_err());
@@ -9653,6 +11945,37 @@ mod tests {
     impl Drop for TempDirCleanup {
         fn drop(&mut self) {
             let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    #[cfg(feature = "shellnet")]
+    fn dexdo_pn_pool_env_lock() -> &'static std::sync::Mutex<()> {
+        static LOCK: std::sync::OnceLock<std::sync::Mutex<()>> = std::sync::OnceLock::new();
+        LOCK.get_or_init(|| std::sync::Mutex::new(()))
+    }
+
+    #[cfg(feature = "shellnet")]
+    struct EnvVarGuard {
+        key: &'static str,
+        old: Option<std::ffi::OsString>,
+    }
+
+    #[cfg(feature = "shellnet")]
+    impl EnvVarGuard {
+        fn set(key: &'static str, value: &std::ffi::OsStr) -> Self {
+            let old = std::env::var_os(key);
+            std::env::set_var(key, value);
+            Self { key, old }
+        }
+    }
+
+    #[cfg(feature = "shellnet")]
+    impl Drop for EnvVarGuard {
+        fn drop(&mut self) {
+            match self.old.take() {
+                Some(value) => std::env::set_var(self.key, value),
+                None => std::env::remove_var(self.key),
+            }
         }
     }
 }

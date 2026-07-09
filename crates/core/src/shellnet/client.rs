@@ -94,6 +94,60 @@ fn getter_u128(v: &Value, key: &str) -> Option<u128> {
     }
 }
 
+fn getter_bool(v: &Value, key: &str) -> Option<bool> {
+    let raw = &v[key];
+    if let Some(b) = raw.as_bool() {
+        return Some(b);
+    }
+    let s = raw.as_str()?.trim();
+    match s.to_ascii_lowercase().as_str() {
+        "true" | "1" => Some(true),
+        "false" | "0" => Some(false),
+        _ => None,
+    }
+}
+
+fn details_has_withdrawn(details: &Value) -> Option<bool> {
+    getter_bool(details, "hasWithdrawn")
+}
+
+fn note_withdrawn_sell_offer_message(note: &Address) -> String {
+    format!(
+        "seller post_offer aborted: this note has withdrawn and can no longer post sell offers -- deploy/use a \
+         fresh note, re-provision the market, and retry. note={note}; postSellOffer would revert \
+         ERR_INVALID_STATE 151 because PrivateNote._hasWithdrawn=true."
+    )
+}
+
+fn seller_note_withdrawn_check(note: &Address, actual: Option<bool>) -> ShellnetDoctorCheck {
+    let (status, actual, message) = match actual {
+        Some(false) => (
+            ShellnetDoctorStatus::Pass,
+            Some("hasWithdrawn=false".to_string()),
+            "seller note has not withdrawn; postSellOffer is not blocked by _hasWithdrawn".to_string(),
+        ),
+        Some(true) => (
+            ShellnetDoctorStatus::Fail,
+            Some("hasWithdrawn=true".to_string()),
+            note_withdrawn_sell_offer_message(note),
+        ),
+        None => (
+            ShellnetDoctorStatus::Fail,
+            Some("hasWithdrawn=<missing>".to_string()),
+            "PrivateNote.getDetails did not expose hasWithdrawn; refusing to prove postSellOffer safety"
+                .to_string(),
+        ),
+    };
+    ShellnetDoctorCheck {
+        name: "seller PrivateNote withdrawn state".to_string(),
+        status,
+        address: Some(note.with_workchain()),
+        expected: Some("hasWithdrawn=false".to_string()),
+        actual,
+        message,
+    }
+}
+
 pub(super) fn code_hash_check(
     name: &str,
     address: Option<&Address>,
@@ -689,6 +743,34 @@ impl RealChainBackend {
         Ok(code_hash_check(name, Some(addr), expected, hash.as_deref()))
     }
 
+    async fn seller_note_withdrawn_check(&self, note: &Address) -> Result<ShellnetDoctorCheck> {
+        match self.private_note_details(note).await {
+            Ok(Some(details)) => Ok(seller_note_withdrawn_check(
+                note,
+                details_has_withdrawn(&details),
+            )),
+            Ok(None) => Ok(ShellnetDoctorCheck {
+                name: "seller PrivateNote withdrawn state".to_string(),
+                status: ShellnetDoctorStatus::Fail,
+                address: Some(note.with_workchain()),
+                expected: Some("hasWithdrawn=false".to_string()),
+                actual: Some("getDetails=<none>".to_string()),
+                message: "seller note returned no PrivateNote.getDetails; it is not active/current enough to prove postSellOffer safety"
+                    .to_string(),
+            }),
+            Err(e) => Ok(ShellnetDoctorCheck {
+                name: "seller PrivateNote withdrawn state".to_string(),
+                status: ShellnetDoctorStatus::Fail,
+                address: Some(note.with_workchain()),
+                expected: Some("hasWithdrawn=false".to_string()),
+                actual: Some("getDetails=<error>".to_string()),
+                message: format!(
+                    "cannot read PrivateNote.getDetails.hasWithdrawn before seller postSellOffer: {e}"
+                ),
+            }),
+        }
+    }
+
     async fn version_of(&self, addr: &Address, abi: &str) -> Result<Option<String>> {
         let Some(v) = self
             .client
@@ -806,6 +888,8 @@ impl RealChainBackend {
                 &tc,
                 self.token_contract_state(&tc).await?.is_some(),
             ));
+            let seller_note = Address::parse(&market.seller_note)?;
+            checks.push(self.seller_note_withdrawn_check(&seller_note).await?);
         } else {
             checks.push(skipped_check(
                 "RootModel code hash",
@@ -822,6 +906,10 @@ impl RealChainBackend {
             checks.push(skipped_check(
                 "market TokenContract state",
                 "pass --market <manifest> to check manifest freshness",
+            ));
+            checks.push(skipped_check(
+                "seller PrivateNote withdrawn state",
+                "pass --market <manifest> to check the seller note's hasWithdrawn flag",
             ));
         }
 
@@ -1750,6 +1838,28 @@ impl RealChainBackend {
             .await
     }
 
+    /// read-only seller preflight for the contract's final-withdrawal latch. `withdrawTokens` sets
+    /// `_hasWithdrawn=true`; after that `PrivateNote.postSellOffer` is permanently blocked by
+    /// `ERR_INVALID_STATE` 151. Keep that semantics and fail before any seller write.
+    pub async fn assert_note_can_post_sell_offer(&self, note: &Address) -> Result<()> {
+        let details = self.private_note_details(note).await?.ok_or_else(|| {
+            anyhow!(
+                "seller post_offer aborted: note {note} returned no PrivateNote.getDetails; cannot read \
+                 hasWithdrawn before postSellOffer. Re-mint/deploy a fresh note against the current contracts."
+            )
+        })?;
+        let withdrawn = details_has_withdrawn(&details).ok_or_else(|| {
+            anyhow!(
+                "seller post_offer aborted: PrivateNote.getDetails for note {note} has no hasWithdrawn field; \
+                 refusing to submit postSellOffer without proving the note is not withdrawn"
+            )
+        })?;
+        if withdrawn {
+            return Err(anyhow!(note_withdrawn_sell_offer_message(note)));
+        }
+        Ok(())
+    }
+
     /// Directive -- the note pre-funds its own RootModel + TC **uninit deploy addresses** from its ECC[2],
     /// via the `PrivateNote` owner-method `fundDeployShell(nonce, rootModelShell, tcShell)`(4.0.7). The note
     /// derives both targets internally from `(ephemeralPubkey, nonce)`, so no caller-supplied address -- this
@@ -2017,10 +2127,7 @@ impl RealChainBackend {
             .run_getter(note, PRIVATENOTE_ABI, "getDetails", json!({}))
             .await?
         {
-            let already = d["hasWithdrawn"]
-                .as_bool()
-                .or_else(|| d["hasWithdrawn"].as_str().map(|s| s == "true" || s == "1"))
-                .unwrap_or(false);
+            let already = details_has_withdrawn(&d).unwrap_or(false);
             if already {
                 return Err(anyhow!(
                     "note {note} was already withdrawn -- `withdrawTokens` is one-shot per note. Re-check the \
@@ -2924,6 +3031,54 @@ fn withdraw_note_tokens_payload(dest_wallet: &Address, dapp_id: &str) -> Value {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn details_has_withdrawn_accepts_bool_and_string_forms() {
+        assert_eq!(
+            details_has_withdrawn(&json!({"hasWithdrawn": false})),
+            Some(false)
+        );
+        assert_eq!(
+            details_has_withdrawn(&json!({"hasWithdrawn": true})),
+            Some(true)
+        );
+        assert_eq!(
+            details_has_withdrawn(&json!({"hasWithdrawn": "0"})),
+            Some(false)
+        );
+        assert_eq!(
+            details_has_withdrawn(&json!({"hasWithdrawn": "true"})),
+            Some(true)
+        );
+        assert_eq!(details_has_withdrawn(&json!({"hasWithdrawn": "wat"})), None);
+    }
+
+    #[test]
+    fn seller_note_withdrawn_check_fails_with_actionable_message() {
+        let note =
+            Address::parse("0:1111111111111111111111111111111111111111111111111111111111111111")
+                .expect("address");
+        let check = seller_note_withdrawn_check(&note, Some(true));
+        assert_eq!(check.status, ShellnetDoctorStatus::Fail);
+        assert_eq!(check.expected.as_deref(), Some("hasWithdrawn=false"));
+        assert_eq!(check.actual.as_deref(), Some("hasWithdrawn=true"));
+        assert!(
+            check.message.contains("this note has withdrawn"),
+            "{}",
+            check.message
+        );
+        assert!(
+            check.message.contains("can no longer post sell offers"),
+            "{}",
+            check.message
+        );
+        assert!(
+            check.message.contains("ERR_INVALID_STATE 151"),
+            "{}",
+            check.message
+        );
+        assert!(!check.message.contains("TVM_ERROR"), "{}", check.message);
+    }
 
     #[test]
     fn withdraw_note_tokens_payload_shape_is_pinned() {

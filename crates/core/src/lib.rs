@@ -26,8 +26,9 @@ pub mod shellnet;
 /// owns key generation.
 #[cfg(feature = "shellnet")]
 pub use gosh_ackinacki::{
-    private_note,
+    airegistry, private_note,
     sdk::{Address, ChainClient, KeyPair},
+    wallet as ackinacki_wallet,
 };
 #[cfg(feature = "shellnet")]
 pub use shellnet::{

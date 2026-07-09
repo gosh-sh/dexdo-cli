@@ -42,7 +42,7 @@ pub async fn chat_completions(
     }
     let deal = match state.current_deal().await {
         Ok(deal) => deal,
-        Err(reason) => return reject(StatusCode::SERVICE_UNAVAILABLE, &reason),
+        Err(reason) => return reject(deal_init_error_status(&reason), &reason),
     };
     let request_guard = deal.begin_request(now_secs());
     // Session-scoped lifecycle: once the local deal is closed (terminal settlement landed or policy
@@ -277,6 +277,14 @@ fn reject(status: StatusCode, message: &str) -> Response {
     (status, Json(body)).into_response()
 }
 
+fn deal_init_error_status(reason: &str) -> StatusCode {
+    if reason.to_ascii_lowercase().contains("invalid buy ticks") {
+        StatusCode::BAD_REQUEST
+    } else {
+        StatusCode::SERVICE_UNAVAILABLE
+    }
+}
+
 fn now_secs() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -286,4 +294,23 @@ fn now_secs() -> u64 {
 
 fn completion_id() -> String {
     format!("chatcmpl-dexdo-{}", now_secs())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn invalid_on_demand_buy_ticks_are_bad_request() {
+        assert_eq!(
+            deal_init_error_status(
+                "invalid buy ticks: --ticks 1 is below the 2-tick stream minimum"
+            ),
+            StatusCode::BAD_REQUEST
+        );
+        assert_eq!(
+            deal_init_error_status("on-demand purchase timed out before a deal became ready"),
+            StatusCode::SERVICE_UNAVAILABLE
+        );
+    }
 }

@@ -18,9 +18,7 @@ use async_trait::async_trait;
 #[cfg(test)]
 use gosh_ackinacki::airegistry::deploy::{build_deploy, local_context};
 use gosh_ackinacki::sdk::{Address, KeyPair};
-#[cfg(test)]
-use serde_json::json;
-use serde_json::Value;
+use serde_json::{json, Value};
 
 fn now_secs() -> u64 {
     std::time::SystemTime::now()
@@ -28,6 +26,12 @@ fn now_secs() -> u64 {
         .map(|d| d.as_secs())
         .unwrap_or(0)
 }
+
+const POST_SELL_OFFER_SUBMIT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(120);
+const ORDERBOOK_EXACT_TC_SCAN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(20);
+const ORDERBOOK_EXACT_TC_SCAN_SLICE: std::time::Duration = std::time::Duration::from_secs(8);
+const OFFER_ACCEPTANCE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(45);
+const ORDERBOOK_GET_ORDER_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(3);
 
 fn normalized_hash_eq(left: &str, right: &str) -> bool {
     let norm = |s: &str| {
@@ -990,6 +994,92 @@ fn selected_model_buy_ask_matching_executable_depth(
     Ok(executable_selected)
 }
 
+fn same_token_contract(left: &OrderBookOrder, right: &OrderBookOrder) -> bool {
+    left.token_contract
+        .as_deref()
+        .zip(right.token_contract.as_deref())
+        .is_some_and(|(left, right)| left.eq_ignore_ascii_case(right))
+}
+
+fn submit_safe_executable_book_asks(
+    raw_asks: &[OrderBookOrder],
+    executable_asks: &[OrderBookOrder],
+    max_price_per_tick: u128,
+    ticks: u128,
+) -> Result<(Vec<OrderBookOrder>, Option<String>), String> {
+    enum ListingBlocker {
+        NonExecutable(OrderBookOrder),
+        InsufficientHead(OrderBookOrder),
+    }
+
+    let raw_asks = coalesce_equivalent_resting_asks(raw_asks)?;
+    let executable_asks = coalesce_equivalent_resting_asks(executable_asks)?;
+    let mut rows = Vec::new();
+    let mut blocker = None;
+
+    for raw in raw_asks
+        .iter()
+        .filter(|ask| ask.price_per_tick <= max_price_per_tick)
+    {
+        let Some(executable) = executable_asks
+            .iter()
+            .find(|executable| same_token_contract(raw, executable))
+        else {
+            blocker = Some(ListingBlocker::NonExecutable(raw.clone()));
+            break;
+        };
+        if executable.ticks >= ticks {
+            rows.push(executable.clone());
+        } else {
+            blocker = Some(ListingBlocker::InsufficientHead(executable.clone()));
+            break;
+        }
+    }
+
+    if !rows.is_empty() {
+        return Ok((rows, None));
+    }
+
+    let reason = if let Some(blocker) = blocker {
+        match blocker {
+            ListingBlocker::NonExecutable(blocker) => format!(
+                "raw order-book matcher would hit non-executable {} before any later executable ask. \
+                 Refusing to list stale/unreadable-blocked rows",
+                describe_buy_ask(&blocker)
+            ),
+            ListingBlocker::InsufficientHead(blocker) => {
+                let capacity = check_single_head_capacity(&blocker, ticks)
+                    .expect_err("insufficient head blocker was checked before listing");
+                format!(
+                    "raw order-book matcher would hit executable but insufficient head {} before any later \
+                     executable ask: {capacity}. Refusing to list rows the model-wide matcher cannot reach",
+                    describe_buy_ask(&blocker)
+                )
+            }
+        }
+    } else if raw_asks
+        .iter()
+        .all(|ask| ask.price_per_tick > max_price_per_tick)
+    {
+        no_matching_ask_reason(&raw_asks, max_price_per_tick, ticks)
+    } else if let Some(best) = executable_asks
+        .iter()
+        .filter(|ask| ask.price_per_tick <= max_price_per_tick)
+        .min_by_key(|ask| (ask.price_per_tick, ask.order_id))
+    {
+        format!(
+            "no executable ask has at least requested ticks {ticks}. Best executable ask is {}",
+            describe_buy_ask(best)
+        )
+    } else {
+        format!(
+            "no executable matching ask for max_price_per_tick {max_price_per_tick}, requested ticks {ticks}. \
+             The raw book has crossing rows, but none are live, funded, fresh, and unblocked"
+        )
+    };
+    Ok((Vec::new(), Some(reason)))
+}
+
 fn orderbook_stats_for_error(snapshot: &OrderBookSnapshot) -> String {
     snapshot
         .stats
@@ -1054,18 +1144,79 @@ fn check_expected_buy_target(
     })
 }
 
-fn active_sell_order_ids_for_tc(orders: &[OrderBookOrder], want_tc_lower: &str) -> Vec<u128> {
-    orders
-        .iter()
-        .filter(|order| {
-            order.is_resting_ask()
-                && order
-                    .token_contract
-                    .as_deref()
-                    .is_some_and(|tc| tc.eq_ignore_ascii_case(want_tc_lower))
-        })
-        .map(|order| order.order_id)
-        .collect()
+#[allow(clippy::too_many_arguments)]
+fn seller_offer_acceptance_failure_message(
+    ob: &Address,
+    token_contract: &str,
+    model_hash: &str,
+    nonce: u64,
+    seller_note: &Address,
+    initial_stats: &str,
+    final_stats: &str,
+    canonical_evidence: &str,
+    tc_state_evidence: &str,
+    saw_fill_event: bool,
+) -> String {
+    format!(
+        "seller postSellOffer was accepted but no IOB-acceptable outcome appeared for TokenContract \
+         {token_contract}: no resting ask in InferenceOrderBook {ob}, no funded/openable TC match, and \
+         matching InferenceFilledConfirmed seen={saw_fill_event}. model_hash={model_hash} nonce={nonce} \
+         seller_note={seller_note} initial_iob_stats={initial_stats} final_iob_stats={final_stats}. \
+         {canonical_evidence}. {tc_state_evidence}. This is  accepted-submit/no-rest evidence; \
+         the failure is not assumed to be a canonical TC mismatch."
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn seller_post_sell_offer_timeout_message(
+    ob: &Address,
+    token_contract: &str,
+    model_hash: &str,
+    nonce: u64,
+    seller_note: &Address,
+    timeout: std::time::Duration,
+    canonical_evidence: &str,
+    tc_state_evidence: &str,
+) -> String {
+    format!(
+        "seller postSellOffer submit timed out after {}s before shellnet returned an accepted/rejected \
+         /v2/messages response; no message_hash/tx_hash is available. InferenceOrderBook {ob} model_hash={model_hash} \
+         nonce={nonce} seller_note={seller_note} token_contract={token_contract}. {canonical_evidence}. \
+         {tc_state_evidence}. This is  submit-timeout evidence; retry may be safe only after checking \
+         whether the chain later shows a matching message/order for this exact TC.",
+        timeout.as_secs()
+    )
+}
+
+fn duplicate_sell_order_preflight_result(
+    ob: &Address,
+    want: &str,
+    stats: Option<&str>,
+    order_ids: &[u128],
+    complete: bool,
+    timeout: std::time::Duration,
+) -> Result<(), ChainError> {
+    if !order_ids.is_empty() {
+        return Err(ChainError::Chain(format!(
+            "duplicate active sell order rejected for TokenContract {want}: InferenceOrderBook {ob} already has \
+             active sell order id(s) {}. Cancel/fill/cleanup the old order before reposting this TC.",
+            order_ids
+                .iter()
+                .map(u128::to_string)
+                .collect::<Vec<_>>()
+                .join(",")
+        )));
+    }
+    if !complete {
+        return Err(ChainError::Chain(format!(
+            "duplicate active sell order preflight incomplete for TokenContract {want}: InferenceOrderBook {ob} \
+             was not fully scanned within {}s before postSellOffer; stats={}. Refusing to post because an \
+             older active duplicate for this exact TC may exist in the shared book.",
+            timeout.as_secs(),
+            stats.unwrap_or("<unreadable>")
+        )));
+    }
+    Ok(())
 }
 
 fn orderbook_stats_from_getter(stats: &Value) -> OrderBookStats {
@@ -1083,7 +1234,7 @@ mod offer_rested_match_tests {
         ask_matches_deal, check_expected_buy_target, check_model_buy_full_fill,
         executable_resting_asks_by_state, next_matching_ask, orderbook_order_from_getter,
         resting_ask_from_order, selected_model_buy_ask,
-        selected_model_buy_ask_matching_executable_depth,
+        selected_model_buy_ask_matching_executable_depth, submit_safe_executable_book_asks,
     };
     use serde_json::{json, Value};
     use std::collections::BTreeMap;
@@ -1456,6 +1607,88 @@ mod offer_rested_match_tests {
                 .expect("raw matcher and executable quote select the same ask");
         assert_eq!(selected.order_id, 35);
         assert_eq!(selected.token_contract.as_deref(), Some(live));
+    }
+
+    #[test]
+    fn executable_book_listing_returns_multiple_fresh_rows() {
+        let first = "0:1111000000000000000000000000000000000000000000000000000000000000";
+        let second = "0:2222000000000000000000000000000000000000000000000000000000000000";
+        let asks = vec![
+            parsed_ask(11, first, 100, 10),
+            parsed_ask(12, second, 101, 12),
+        ];
+
+        let (rows, reason) =
+            submit_safe_executable_book_asks(&asks, &asks, 101, 8).expect("listing is safe");
+
+        assert!(reason.is_none(), "{reason:?}");
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0].token_contract.as_deref(), Some(first));
+        assert_eq!(rows[1].token_contract.as_deref(), Some(second));
+    }
+
+    #[test]
+    fn executable_book_listing_hides_rows_after_stale_cheaper_blocker() {
+        let stale = "0:1111000000000000000000000000000000000000000000000000000000000000";
+        let live = "0:2222000000000000000000000000000000000000000000000000000000000000";
+        let raw_asks = vec![
+            parsed_ask(11, stale, 100, 10),
+            parsed_ask(12, live, 101, 12),
+        ];
+        let executable_asks = vec![parsed_ask(12, live, 101, 12)];
+
+        let (rows, reason) = submit_safe_executable_book_asks(&raw_asks, &executable_asks, 101, 8)
+            .expect("stale blocker is an empty executable book, not a duplicate-book error");
+
+        assert!(rows.is_empty(), "{rows:?}");
+        let reason = reason.expect("empty stale-blocked list carries reason");
+        assert!(reason.contains("non-executable order "), "{reason}");
+        assert!(reason.contains("Refusing to list"), "{reason}");
+    }
+
+    #[test]
+    fn executable_book_listing_keeps_safe_prefix_before_stale_tail() {
+        let first = "0:1111000000000000000000000000000000000000000000000000000000000000";
+        let stale = "0:2222000000000000000000000000000000000000000000000000000000000000";
+        let hidden = "0:3333000000000000000000000000000000000000000000000000000000000000";
+        let raw_asks = vec![
+            parsed_ask(11, first, 100, 10),
+            parsed_ask(12, stale, 101, 12),
+            parsed_ask(13, hidden, 102, 12),
+        ];
+        let executable_asks = vec![
+            parsed_ask(11, first, 100, 10),
+            parsed_ask(13, hidden, 102, 12),
+        ];
+
+        let (rows, reason) = submit_safe_executable_book_asks(&raw_asks, &executable_asks, 102, 8)
+            .expect("safe prefix can still be listed");
+
+        assert!(reason.is_none(), "{reason:?}");
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].token_contract.as_deref(), Some(first));
+    }
+
+    #[test]
+    fn executable_book_listing_blocks_later_rows_after_insufficient_head() {
+        let short_head = "0:1111000000000000000000000000000000000000000000000000000000000000";
+        let hidden = "0:2222000000000000000000000000000000000000000000000000000000000000";
+        let asks = vec![
+            parsed_ask(11, short_head, 100, 1),
+            parsed_ask(12, hidden, 101, 8),
+        ];
+
+        let (rows, reason) =
+            submit_safe_executable_book_asks(&asks, &asks, 101, 8).expect("listing is safe");
+
+        assert!(
+            rows.is_empty(),
+            "later row must not be listed because model-wide matcher fails on the insufficient head: {rows:?}"
+        );
+        let reason = reason.expect("empty insufficient-head-blocked list carries reason");
+        assert!(reason.contains("insufficient head"), "{reason}");
+        assert!(reason.contains("refusing multi-ask fill"), "{reason}");
+        assert!(reason.contains("order "), "{reason}");
     }
 
     #[test]
@@ -1945,7 +2178,10 @@ impl RealChainBackend {
             };
             let state = self.token_contract_state(&tc).await?;
             if token_contract_non_executable_reason(state.as_ref()).is_none() {
-                executable.push(ask);
+                let balance = self.active_native_balance(&tc).await?;
+                if balance > GAS_HEALTH_MIN {
+                    executable.push(ask);
+                }
             }
         }
         Ok(executable)
@@ -1986,8 +2222,59 @@ impl RealChainBackend {
                     fills: Vec::new(),
                 });
             }
+            if self.active_native_balance(&tc).await? <= GAS_HEALTH_MIN {
+                return Ok(ExecutableQuote {
+                    filled_ticks: 0,
+                    total_with_fee: 0,
+                    complete: false,
+                    fills: Vec::new(),
+                });
+            }
         }
         Ok(quote)
+    }
+
+    pub async fn submit_safe_model_buy_ask(
+        &self,
+        snapshot: &OrderBookSnapshot,
+        ticks: u128,
+        max_price_per_tick: u128,
+    ) -> Result<OrderBookOrder> {
+        let raw_asks: Vec<OrderBookOrder> = snapshot.resting_asks().cloned().collect();
+        let executable_asks = self.executable_resting_asks(snapshot).await?;
+        selected_model_buy_ask_matching_executable_depth(
+            &raw_asks,
+            &executable_asks,
+            max_price_per_tick,
+            ticks,
+        )
+        .map_err(|e| {
+            anyhow!(
+                "no_executable_ask: no executable matching ask for InferenceOrderBook {} at max_price_per_tick {}, \
+                 requested ticks {}: {e}. IOB stats {}",
+                snapshot.order_book,
+                max_price_per_tick,
+                ticks,
+                orderbook_stats_for_error(snapshot)
+            )
+        })
+    }
+
+    pub async fn submit_safe_executable_book_asks(
+        &self,
+        snapshot: &OrderBookSnapshot,
+        ticks: u128,
+        max_price_per_tick: u128,
+    ) -> Result<(Vec<OrderBookOrder>, Option<String>)> {
+        let raw_asks: Vec<OrderBookOrder> = snapshot.resting_asks().cloned().collect();
+        let executable_asks = self.executable_resting_asks(snapshot).await?;
+        submit_safe_executable_book_asks(&raw_asks, &executable_asks, max_price_per_tick, ticks)
+            .map_err(|e| {
+                anyhow!(
+                    "InferenceOrderBook {} exposes unsafe executable-book depth: {e}",
+                    snapshot.order_book
+                )
+            })
     }
 }
 
@@ -2502,6 +2789,92 @@ impl RealSellerBackend {
             price_per_tick,
         }))
     }
+
+    async fn post_offer_failure_evidence(&self, tc: &Address) -> (String, String) {
+        let tc_state_evidence = match self.chain.token_contract_state(tc).await {
+            Ok(Some(_)) => format!(
+                "TokenContract {} state evidence: Active/getState readable",
+                tc.with_workchain()
+            ),
+            Ok(None) => format!(
+                "TokenContract {} state evidence: not Active or getState unreadable",
+                tc.with_workchain()
+            ),
+            Err(e) => format!(
+                "TokenContract {} state evidence: getState error: {e:#}",
+                tc.with_workchain()
+            ),
+        };
+        let seller_pubkey = json!(format!("0x{}", self.keys.public_hex()));
+        let canonical_evidence = match self.chain.root_model_address_for(&seller_pubkey).await {
+            Ok(root_model) => match self
+                .chain
+                .resolve_token_contract(&root_model, &seller_pubkey, self.nonce)
+                .await
+            {
+                Ok(expected) => format!(
+                    "RootModel expected TokenContract for (sellerPubkey, nonce) is {} and offered token_contract is {}; match={}",
+                    expected.with_workchain(),
+                    tc.with_workchain(),
+                    expected.with_workchain().eq_ignore_ascii_case(&tc.with_workchain())
+                ),
+                Err(e) => format!(
+                    "RootModel expected TokenContract for (sellerPubkey, nonce) could not be read from {root_model}: {e:#}"
+                ),
+            },
+            Err(e) => format!(
+                "RootModel address for sellerPubkey could not be read from SuperRoot: {e:#}"
+            ),
+        };
+        (canonical_evidence, tc_state_evidence)
+    }
+
+    async fn active_sell_order_ids_for_exact_tc_bounded(
+        &self,
+        ob: &Address,
+        want_tc_lower: &str,
+        max_duration: std::time::Duration,
+    ) -> Result<(Option<String>, Vec<u128>, bool), ChainError> {
+        let Some(stats) = self
+            .chain
+            .inference_orderbook_stats(ob)
+            .await
+            .map_err(map_err)?
+        else {
+            return Ok((None, Vec::new(), true));
+        };
+        let stats_string = stats.to_string();
+        let next_id = stats["nextOrderId"]
+            .as_str()
+            .and_then(|x| x.parse::<u128>().ok())
+            .unwrap_or(0);
+        let deadline = std::time::Instant::now() + max_duration;
+        let mut order_ids = Vec::new();
+        for id in (1..next_id).rev() {
+            let now = std::time::Instant::now();
+            if now >= deadline {
+                order_ids.sort_unstable();
+                return Ok((Some(stats_string), order_ids, false));
+            }
+            let remaining = deadline.saturating_duration_since(now);
+            let per_order = remaining.min(ORDERBOOK_GET_ORDER_TIMEOUT);
+            match tokio::time::timeout(per_order, self.chain.inference_orderbook_order(ob, id))
+                .await
+            {
+                Ok(Ok(Some(order))) if ask_matches_deal(&order, want_tc_lower) => {
+                    order_ids.push(id);
+                }
+                Ok(Ok(_)) => {}
+                Ok(Err(e)) => return Err(map_err(e)),
+                Err(_) => {
+                    order_ids.sort_unstable();
+                    return Ok((Some(stats_string), order_ids, false));
+                }
+            }
+        }
+        order_ids.sort_unstable();
+        Ok((Some(stats_string), order_ids, true))
+    }
 }
 
 #[async_trait]
@@ -2512,6 +2885,14 @@ impl ChainBackend for RealSellerBackend {
     async fn assert_note_current(&self) -> Result<(), ChainError> {
         self.chain
             .assert_seller_note_current(&self.note)
+            .await
+            .map_err(map_err)
+    }
+    /// `PrivateNote._hasWithdrawn=true` permanently blocks `postSellOffer`. Read it before seller writes
+    /// so users get the fresh-note action instead of raw `ERR_INVALID_STATE` 151.
+    async fn assert_note_can_post_sell_offer(&self) -> Result<(), ChainError> {
+        self.chain
+            .assert_note_can_post_sell_offer(&self.note)
             .await
             .map_err(map_err)
     }
@@ -2570,6 +2951,7 @@ impl ChainBackend for RealSellerBackend {
 
     async fn post_offer(&self, offer: SellOffer, _note: &dyn Note) -> Result<(), ChainError> {
         let tc = parse_tc(&offer.token_contract)?;
+        self.assert_note_can_post_sell_offer().await?;
         // (symmetric branch-3 guard): fail closed if this note's on-chain owner key
         // (`getDetails().ephemeralPubkey`) is not the key we sign `postSellOffer` with -- otherwise
         // `onlyOwnerPubkey` reverts pre-accept(ERR_INVALID_SENDER 101) and the ask never rests (only an
@@ -2627,8 +3009,9 @@ impl ChainBackend for RealSellerBackend {
                 max_ticks
             );
         }
-        self.chain
-            .post_sell_offer(
+        match tokio::time::timeout(
+            POST_SELL_OFFER_SUBMIT_TIMEOUT,
+            self.chain.post_sell_offer(
                 &self.note,
                 &self.keys,
                 &self.model_hash,
@@ -2637,9 +3020,27 @@ impl ChainBackend for RealSellerBackend {
                 &tc,
                 0,
                 self.nonce,
-            )
-            .await
-            .map_err(map_err)?;
+            ),
+        )
+        .await
+        {
+            Ok(Ok(_)) => {}
+            Ok(Err(e)) => return Err(map_err(e)),
+            Err(_) => {
+                let (canonical_evidence, tc_state_evidence) =
+                    self.post_offer_failure_evidence(&tc).await;
+                return Err(ChainError::Chain(seller_post_sell_offer_timeout_message(
+                    &ob,
+                    &offer.token_contract,
+                    &self.model_hash,
+                    self.nonce,
+                    &self.note,
+                    POST_SELL_OFFER_SUBMIT_TIMEOUT,
+                    &canonical_evidence,
+                    &tc_state_evidence,
+                )));
+            }
+        }
         Ok(())
     }
 
@@ -2649,85 +3050,115 @@ impl ChainBackend for RealSellerBackend {
             .inference_orderbook_address(&self.note, &self.model_hash, self.tick_size)
             .await
             .map_err(map_err)?;
-        let snapshot = self
-            .chain
-            .inference_orderbook_snapshot(&ob, &self.model_name, &self.model_hash)
-            .await
-            .map_err(map_err)?;
         let want = parse_tc(tc)?.with_workchain().to_ascii_lowercase();
-        let order_ids = active_sell_order_ids_for_tc(&snapshot.orders, &want);
-        if order_ids.is_empty() {
-            return Ok(());
-        }
-        Err(ChainError::Chain(format!(
-            "duplicate active sell order rejected for TokenContract {want}: InferenceOrderBook {} already has \
-             active sell order id(s) {}. Cancel/fill/cleanup the old order before reposting this TC.",
-            snapshot.order_book,
-            order_ids
-                .iter()
-                .map(u128::to_string)
-                .collect::<Vec<_>>()
-                .join(",")
-        )))
+        let (stats, order_ids, complete) = self
+            .active_sell_order_ids_for_exact_tc_bounded(&ob, &want, ORDERBOOK_EXACT_TC_SCAN_TIMEOUT)
+            .await?;
+        duplicate_sell_order_preflight_result(
+            &ob,
+            &want,
+            stats.as_deref(),
+            &order_ids,
+            complete,
+            ORDERBOOK_EXACT_TC_SCAN_TIMEOUT,
+        )
     }
 
-    /// confirm THIS deal's ask actually rested in the per-model `InferenceOrderBook` after `post_offer`.
-    /// `getBestBidAsk.hasAsk` alone is a false-green -- a shared/non-empty model book carries unrelated asks -- so
-    /// this scans the book's orders (`getStats.nextOrderId` + `getOrder(id)`, like the buyer's `discover_offers`)
-    /// for ~16s and requires an order whose `tokenContract` == ours. If our ask never rests, fails closed with the
-    /// IOB stats so the operator can route(canonical-TC / note-pairing mismatch) instead of a silent 300s
-    /// `read_match` timeout.
+    /// confirm the accepted `postSellOffer` reached an IOB-acceptable outcome for THIS deal before
+    /// opening the gateway. A shared qwen book can match immediately; in that case there may be no resting ask,
+    /// but the exact TC is funded/openable(or the seller note has the matching fill event). Accept any of:
+    /// resting ask for this TC, funded/openable match for this TC, or matching `InferenceFilledConfirmed`.
+    /// Otherwise fail closed with current by-fact address/state evidence instead of blaming canonical mismatch
+    /// blindly or waiting in the gateway watcher forever.
     async fn assert_offer_rested(&self, tc: &TokenContract) -> Result<(), ChainError> {
         let ob = self
             .chain
             .inference_orderbook_address(&self.note, &self.model_hash, self.tick_size)
             .await
             .map_err(map_err)?;
-        let want = parse_tc(tc)?.with_workchain().to_ascii_lowercase();
-        for _ in 0..8 {
-            if let Some(stats) = self
+        let tc_addr = parse_tc(tc)?;
+        let want = tc_addr.with_workchain();
+        let want_lower = want.to_ascii_lowercase();
+        let mut cursor = MatchWatchCursor::new(now_secs().saturating_sub(30) as i64);
+        let mut initial_stats: Option<String> = None;
+        let mut final_stats: Option<String> = None;
+        let started = std::time::Instant::now();
+        while started.elapsed() < OFFER_ACCEPTANCE_TIMEOUT {
+            if let Some(matched) = self.read_openable_match_once(tc).await? {
+                eprintln!(
+                    "offer_accepted evidence: TokenContract {want} is funded/openable for seller; \
+                     price_per_tick={}",
+                    matched.price_per_tick
+                );
+                return Ok(());
+            }
+            let fills = self
+                .chain
+                .poll_inference_filled_tcs(&self.note, &ob, false, &mut cursor)
+                .await
+                .map_err(map_err)?;
+            if fills
+                .iter()
+                .any(|fill| fill.with_workchain().eq_ignore_ascii_case(&want))
+            {
+                eprintln!(
+                    "offer_accepted evidence: seller note observed InferenceFilledConfirmed for TokenContract {want}"
+                );
+                return Ok(());
+            }
+            let remaining = OFFER_ACCEPTANCE_TIMEOUT.saturating_sub(started.elapsed());
+            if remaining.is_zero() {
+                break;
+            }
+            let scan_for = remaining.min(ORDERBOOK_EXACT_TC_SCAN_SLICE);
+            let (stats, order_ids, complete) = self
+                .active_sell_order_ids_for_exact_tc_bounded(&ob, &want_lower, scan_for)
+                .await?;
+            if let Some(stats) = stats {
+                if initial_stats.is_none() {
+                    initial_stats = Some(stats.clone());
+                }
+                final_stats = Some(stats);
+            }
+            if let Some(order_id) = order_ids.first() {
+                eprintln!(
+                    "offer_accepted evidence: InferenceOrderBook {ob} order_id={order_id} resting token_contract={want}"
+                );
+                return Ok(());
+            }
+            if !complete {
+                tracing::debug!(
+                    order_book = %ob,
+                    token_contract = %want,
+                    scan_secs = scan_for.as_secs_f32(),
+                    "post-offer exact-TC rest scan slice ended before the shared book was exhausted"
+                );
+            }
+            tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+        }
+        let final_stats = match final_stats {
+            Some(stats) => stats,
+            None => self
                 .chain
                 .inference_orderbook_stats(&ob)
                 .await
                 .map_err(map_err)?
-            {
-                let next_id = stats["nextOrderId"]
-                    .as_str()
-                    .and_then(|x| x.parse::<u128>().ok())
-                    .unwrap_or(0);
-                for id in 1..next_id {
-                    if let Some(o) = self
-                        .chain
-                        .inference_orderbook_order(&ob, id)
-                        .await
-                        .map_err(map_err)?
-                    {
-                        if ask_matches_deal(&o, &want) {
-                            eprintln!(
-                                "offer_rested evidence: InferenceOrderBook {ob} order_id={id} token_contract={want}"
-                            );
-                            return Ok(());
-                        }
-                    }
-                }
-            }
-            tokio::time::sleep(std::time::Duration::from_secs(2)).await;
-        }
-        let stats = self
-            .chain
-            .inference_orderbook_stats(&ob)
-            .await
-            .map_err(map_err)?
-            .map(|s| s.to_string())
-            .unwrap_or_else(|| "<unreadable>".to_string());
-        Err(ChainError::Chain(format!(
-            "seller offer did not rest in the InferenceOrderBook {ob} after posting (no resting order with our \
-             tokenContract {want} after ~16s) -- model_hash {}, nonce {}, seller_note {}, IOB stats {stats}. \
-             `postSellOffer` submitted but the book did not accept THIS deal's ask: most likely the offer's \
-             tokenContract is not the canonical `(sellerPubkey, nonce)` TC for this note (the IOB rejects a \
-             mismatched TC), or the market/note pairing differs from what was provisioned. Re-provision a market \
-             for THIS note + nonce and offer that, instead of waiting out the match ().",
-            self.model_hash, self.nonce, self.note,
+                .map(|s| s.to_string())
+                .unwrap_or_else(|| "<unreadable>".to_string()),
+        };
+        let (canonical_evidence, tc_state_evidence) =
+            self.post_offer_failure_evidence(&tc_addr).await;
+        Err(ChainError::Chain(seller_offer_acceptance_failure_message(
+            &ob,
+            &want,
+            &self.model_hash,
+            self.nonce,
+            &self.note,
+            initial_stats.as_deref().unwrap_or("<unreadable>"),
+            &final_stats,
+            &canonical_evidence,
+            &tc_state_evidence,
+            false,
         )))
     }
 
@@ -3061,31 +3492,11 @@ impl RealBuyerBackend {
         max_price_per_tick: u128,
     ) -> Result<(String, OrderBookOrder), ChainError> {
         let snapshot = self.orderbook_snapshot().await?;
-        let raw_asks: Vec<OrderBookOrder> = snapshot.resting_asks().cloned().collect();
-        let executable_asks = self
+        let selected = self
             .chain
-            .executable_resting_asks(&snapshot)
+            .submit_safe_model_buy_ask(&snapshot, ticks, max_price_per_tick)
             .await
-            .map_err(|e| {
-                ChainError::Chain(format!(
-                    "buyer model-only executable-depth preflight failed for InferenceOrderBook {}: {e}. IOB stats {}",
-                    snapshot.order_book,
-                    orderbook_stats_for_error(&snapshot)
-                ))
-            })?;
-        let selected = selected_model_buy_ask_matching_executable_depth(
-            &raw_asks,
-            &executable_asks,
-            max_price_per_tick,
-            ticks,
-        )
-        .map_err(|e| {
-            ChainError::Chain(format!(
-                "buyer model-only preflight failed for InferenceOrderBook {}: {e}. IOB stats {}",
-                snapshot.order_book,
-                orderbook_stats_for_error(&snapshot)
-            ))
-        })?;
+            .map_err(map_err)?;
         Ok((snapshot.order_book, selected))
     }
 
@@ -3229,6 +3640,57 @@ impl ChainBackend for RealBuyerBackend {
         let expected_tc = expected.with_workchain();
         self.assert_selected_tc_unused(&expected_tc, &order_book)
             .await
+    }
+
+    async fn submit_safe_explicit_buy_quote_order(
+        &self,
+        token_contract: &TokenContract,
+        ticks: u128,
+        max_price_per_tick: u128,
+    ) -> Result<Option<OrderBookOrder>, ChainError> {
+        let expected = parse_tc(token_contract)?;
+        self.require_tc_gas(&expected).await?;
+        self.chain
+            .assert_note_owner_matches(
+                "buyer explicit-token quote preflight",
+                &self.note,
+                &self.keys,
+            )
+            .await
+            .map_err(map_err)?;
+        let snapshot = self.orderbook_snapshot().await?;
+        let asks: Vec<OrderBookOrder> = snapshot.resting_asks().cloned().collect();
+        let expected_tc = expected.with_workchain();
+        let want = expected_tc.to_ascii_lowercase();
+        check_expected_buy_target(&asks, &want, max_price_per_tick, ticks).map_err(|e| {
+            ChainError::Chain(format!(
+                "buyer target preflight failed for InferenceOrderBook {}: {e}. IOB stats {}",
+                snapshot.order_book,
+                orderbook_stats_for_error(&snapshot)
+            ))
+        })?;
+        let selected = self
+            .chain
+            .submit_safe_model_buy_ask(&snapshot, ticks, max_price_per_tick)
+            .await
+            .map_err(map_err)?;
+        if !selected
+            .token_contract
+            .as_deref()
+            .is_some_and(|tc| tc.eq_ignore_ascii_case(&expected_tc))
+        {
+            return Err(ChainError::Chain(format!(
+                "buyer target preflight failed for InferenceOrderBook {}: submit-safe executable quote selected {}, \
+                 not expected tokenContract {}. IOB stats {}",
+                snapshot.order_book,
+                describe_buy_ask(&selected),
+                expected_tc,
+                orderbook_stats_for_error(&snapshot)
+            )));
+        }
+        self.assert_selected_tc_unused(&expected_tc, &snapshot.order_book)
+            .await?;
+        Ok(Some(selected))
     }
 
     fn requires_submit_safe_single_ask_quote(&self) -> bool {
@@ -3840,6 +4302,107 @@ mod codecell_tests {
         assert!(r.contains("disputed"), "{r}");
     }
 
+    /// review regression: the duplicate-offer preflight is fail-closed. If the shared book scan is
+    /// incomplete, "no duplicate found so far" is not proof that this exact TC is absent.
+    #[test]
+    fn seller_duplicate_offer_preflight_fails_closed_on_incomplete_scan() {
+        let ob =
+            Address::parse("0:6330b82c9d866f68e989d4f71c79e6f4757602c065933b7e63179b00acd9aa0e")
+                .expect("ob");
+        let tc = "0:2844086a9e2ee2e24ab8329067dcd47a271a4c5f24e700fb713fbc32d7f79314";
+        let err = duplicate_sell_order_preflight_result(
+            &ob,
+            tc,
+            Some(r#"{"nextOrderId":"1000","orderCount":"900"}"#),
+            &[],
+            false,
+            std::time::Duration::from_secs(20),
+        )
+        .expect_err("incomplete duplicate scan must fail closed");
+        let ChainError::Chain(msg) = err else {
+            panic!("expected ChainError::Chain");
+        };
+        assert!(
+            msg.contains("duplicate active sell order preflight incomplete"),
+            "{msg}"
+        );
+        assert!(msg.contains(tc), "{msg}");
+        assert!(msg.contains("InferenceOrderBook 0:6330b82c"), "{msg}");
+        assert!(msg.contains("within 20s"), "{msg}");
+        assert!(msg.contains("stats="), "{msg}");
+        assert!(msg.contains("may exist"), "{msg}");
+    }
+
+    /// regression: accepted `postSellOffer` with no resting ask/funded TC must fail with the exact
+    /// by-fact context instead of the stale canonical-mismatch guess. The live reproduce proved the RootModel
+    /// expected TC can match the manifest while the ask still does not rest.
+    #[test]
+    fn seller_offer_acceptance_failure_names_tc_without_blind_canonical_blame() {
+        let ob =
+            Address::parse("0:6330b82c9d866f68e989d4f71c79e6f4757602c065933b7e63179b00acd9aa0e")
+                .expect("ob");
+        let note =
+            Address::parse("0:c60ff3783e78ce3feba2236b35403639a2a434ba9f3c6c351813a87ab98c9331")
+                .expect("note");
+        let tc = "0:c0b3903a7cc9ac05986419dff8c2eab034d61c19b9787fde6782d2b7650711f3";
+        let msg = seller_offer_acceptance_failure_message(
+            &ob,
+            tc,
+            "0xe3cc0b0b5cdadfaee3d9b9adf50b489a09f2d7540cb9436ef15423fe27b91a09",
+            1783555646,
+            &note,
+            r#"{"nextOrderId":"787","orderCount":"67"}"#,
+            r#"{"nextOrderId":"788","orderCount":"67"}"#,
+            "RootModel expected TokenContract for (sellerPubkey, nonce) is 0:c0b3903a7cc9ac05986419dff8c2eab034d61c19b9787fde6782d2b7650711f3 and offered token_contract is 0:c0b3903a7cc9ac05986419dff8c2eab034d61c19b9787fde6782d2b7650711f3; match=true",
+            "TokenContract 0:c0b3903a7cc9ac05986419dff8c2eab034d61c19b9787fde6782d2b7650711f3 state evidence: Active/getState readable",
+            false,
+        );
+        assert!(msg.contains("seller postSellOffer was accepted"), "{msg}");
+        assert!(msg.contains(tc), "{msg}");
+        assert!(msg.contains("InferenceOrderBook 0:6330b82c"), "{msg}");
+        assert!(msg.contains("nonce=1783555646"), "{msg}");
+        assert!(msg.contains("seller_note=0:c60ff378"), "{msg}");
+        assert!(msg.contains("match=true"), "{msg}");
+        assert!(msg.contains("Active/getState readable"), "{msg}");
+        assert!(msg.contains("initial_iob_stats="), "{msg}");
+        assert!(msg.contains("final_iob_stats="), "{msg}");
+        assert!(!msg.contains("most likely"), "{msg}");
+        assert!(!msg.contains("not the canonical"), "{msg}");
+    }
+
+    /// negative regression: a shellnet submit stall must not leave `dexdo seller` hanging forever or
+    /// pretend a message hash exists. The operator gets exact TC/book context and the by-fact derivation state.
+    #[test]
+    fn seller_post_sell_offer_timeout_message_is_precise_and_hash_free() {
+        let ob =
+            Address::parse("0:6330b82c9d866f68e989d4f71c79e6f4757602c065933b7e63179b00acd9aa0e")
+                .expect("ob");
+        let note =
+            Address::parse("0:c60ff3783e78ce3feba2236b35403639a2a434ba9f3c6c351813a87ab98c9331")
+                .expect("note");
+        let tc = "0:9aff5b8520caf32dbb91390134a946fc9c2896830d96b86cb0f1fbd2262dbe36";
+        let msg = seller_post_sell_offer_timeout_message(
+            &ob,
+            tc,
+            "0xe3cc0b0b5cdadfaee3d9b9adf50b489a09f2d7540cb9436ef15423fe27b91a09",
+            1783558097,
+            &note,
+            std::time::Duration::from_secs(120),
+            "RootModel expected TokenContract for (sellerPubkey, nonce) is 0:9aff5b8520caf32dbb91390134a946fc9c2896830d96b86cb0f1fbd2262dbe36 and offered token_contract is 0:9aff5b8520caf32dbb91390134a946fc9c2896830d96b86cb0f1fbd2262dbe36; match=true",
+            "TokenContract 0:9aff5b8520caf32dbb91390134a946fc9c2896830d96b86cb0f1fbd2262dbe36 state evidence: Active/getState readable",
+        );
+        assert!(msg.contains("timed out after 120s"), "{msg}");
+        assert!(
+            msg.contains("no message_hash/tx_hash is available"),
+            "{msg}"
+        );
+        assert!(msg.contains(tc), "{msg}");
+        assert!(msg.contains("nonce=1783558097"), "{msg}");
+        assert!(msg.contains("match=true"), "{msg}");
+        assert!(msg.contains("Active/getState readable"), "{msg}");
+        assert!(!msg.contains("seller offer did not rest"), "{msg}");
+    }
+
     /// the buyer/seller pre-write owner-key gate behind `assert_note_owner_matches`. A note
     /// whose on-chain `_ephemeralPubkey` equals the client's signing pubkey (case- and `0x`-insensitive -- the
     /// getter returns `0x...`, `public_hex()` has no prefix) passes; a rotated/orphaned note (different or absent
@@ -4166,12 +4729,19 @@ mod codecell_tests {
             .find("async fn post_offer(&self, offer: SellOffer")
             .expect("real seller post_offer present");
         let body = &seller[post_offer..];
+        let withdrawn = body
+            .find("assert_note_can_post_sell_offer")
+            .expect("post_offer checks PrivateNote hasWithdrawn");
         let terms = body
             .find("sell_offer_terms(&offer.token_contract)")
             .expect("post_offer reads on-chain deal terms");
         let submit = body
             .find(".post_sell_offer(")
             .expect("post_offer submits to shellnet");
+        assert!(
+            withdrawn < submit,
+            "PrivateNote.hasWithdrawn must be checked before postSellOffer"
+        );
         assert!(
             terms < submit,
             "TokenContract.getDeal terms must be read before postSellOffer"

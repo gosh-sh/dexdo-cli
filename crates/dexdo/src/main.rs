@@ -75,6 +75,9 @@ enum Command {
     Markets(MarketsArgs),
     /// Market: render ONE model's order book as the human-readable box table(`dexdo market <model>`).
     Market(MarketArgs),
+    /// Executable-book: list current buyer-executable asks for one model book.
+    #[command(name = "executable-book")]
+    ExecutableBook(ExecutableBookArgs),
     /// Quote: compute an executable quote over current order-book depth.
     Quote(QuoteArgs),
     /// Market-data: read-only Dodex indexer discovery/cache for inference model books.
@@ -207,6 +210,7 @@ async fn main() -> Result<()> {
         Command::WithdrawShell(args) => run_withdraw_shell(args).await,
         Command::Markets(args) => run_markets(args).await,
         Command::Market(args) => run_market(args).await,
+        Command::ExecutableBook(args) => run_executable_book(args).await,
         Command::Quote(args) => run_quote(args).await,
         Command::MarketData(args) => run_market_data(args).await,
         Command::Orders(args) => run_orders(args).await,
@@ -220,6 +224,7 @@ async fn main() -> Result<()> {
         Command::Note(args) => match args.command {
             NoteCommand::Balance(b) => run_note_balance(b).await,
             NoteCommand::Deploy(d) => run_note_deploy(d).await,
+            NoteCommand::Recover(r) => run_note_recover(r).await,
             NoteCommand::Withdraw(w) => run_note_withdraw(w).await,
         },
         Command::Oracle(args) => run_oracle(args).await,
@@ -372,6 +377,8 @@ mod note_cli_tests {
         assert_eq!(d.endpoint, "shellnet.ackinacki.org");
         assert_eq!(d.multisig_key, Some(PathBuf::from("w.keys.json")));
         assert_eq!(d.multisig_seed_file, None);
+        assert_eq!(d.recovery, None);
+        assert!(!d.simulate_interrupt_after_spend_before_pool);
         let c = Cli::try_parse_from([
             "dexdo",
             "note",
@@ -382,6 +389,8 @@ mod note_cli_tests {
             r"C:\Users\operator\wallet.seed",
             "--pool",
             "pn_pool.json",
+            "--recovery",
+            "pn_pool.json.recovery.json",
         ])
         .expect("note deploy parses seed-file path");
         let Command::Note(n) = c.command else {
@@ -394,6 +403,10 @@ mod note_cli_tests {
         assert_eq!(
             d.multisig_seed_file,
             Some(PathBuf::from(r"C:\Users\operator\wallet.seed"))
+        );
+        assert_eq!(
+            d.recovery,
+            Some(PathBuf::from("pn_pool.json.recovery.json"))
         );
         // The wallet address, one key input, and pool are required -- omitting any fails parse.
         assert!(Cli::try_parse_from(["dexdo", "note", "deploy", "--pool", "p.json"]).is_err());
@@ -425,6 +438,33 @@ mod note_cli_tests {
             "/bin/onboard_user_shellnet",
         ])
         .is_err());
+    }
+
+    /// `dexdo note recover` finalizes from the crash-safe state without wallet credentials.
+    #[test]
+    fn note_recover_subcommand_parses() {
+        let c = Cli::try_parse_from([
+            "dexdo",
+            "note",
+            "recover",
+            "--recovery",
+            "pn_pool.json.recovery.json",
+            "--pool",
+            "pn_pool.json",
+        ])
+        .expect("note recover parses");
+        let Command::Note(n) = c.command else {
+            panic!("expected Command::Note");
+        };
+        let NoteCommand::Recover(r) = n.command else {
+            panic!("expected NoteCommand::Recover");
+        };
+        assert_eq!(r.recovery, PathBuf::from("pn_pool.json.recovery.json"));
+        assert_eq!(r.pool, PathBuf::from("pn_pool.json"));
+        assert!(Cli::try_parse_from(["dexdo", "note", "recover", "--pool", "p.json"]).is_err());
+        assert!(
+            Cli::try_parse_from(["dexdo", "note", "recover", "--recovery", "state.json"]).is_err()
+        );
     }
 
     /// `dexdo note withdraw` is owner-signed money movement, so the parser surface and destination
@@ -573,6 +613,7 @@ mod market_orders_cli_tests {
     use super::{Cli, Command};
     use crate::cli::args::{
         MarketDataCommand, MarketDataOutput, OrdersCommand, SubscriptionCommand,
+        DEFAULT_CHAIN_READ_TIMEOUT_SECS,
     };
     use clap::Parser;
     use std::path::PathBuf;
@@ -591,6 +632,10 @@ mod market_orders_cli_tests {
             m.market,
             vec![PathBuf::from("m1.json"), PathBuf::from("m2.json")]
         );
+        assert_eq!(
+            m.read_timeout.read_timeout_secs,
+            DEFAULT_CHAIN_READ_TIMEOUT_SECS
+        );
 
         let c = Cli::try_parse_from(["dexdo", "quote", "--market", "m.json", "--ticks", "3"])
             .expect("quote by ticks parses");
@@ -600,12 +645,18 @@ mod market_orders_cli_tests {
         assert_eq!(q.market, Some(PathBuf::from("m.json")));
         assert_eq!(q.ticks, Some(3));
         assert_eq!(q.budget, None);
+        assert_eq!(
+            q.read_timeout.read_timeout_secs,
+            DEFAULT_CHAIN_READ_TIMEOUT_SECS
+        );
 
         let c = Cli::try_parse_from([
             "dexdo",
             "quote",
             "--market",
             "m.json",
+            "--read-timeout-secs",
+            "7",
             "--ticks",
             "3",
             "--model-registry-validation",
@@ -625,6 +676,7 @@ mod market_orders_cli_tests {
             q.registry.model_registry_address.as_deref(),
             Some("0:9999999999999999999999999999999999999999999999999999999999999999")
         );
+        assert_eq!(q.read_timeout.read_timeout_secs, 7);
 
         let c = Cli::try_parse_from([
             "dexdo",
@@ -638,6 +690,53 @@ mod market_orders_cli_tests {
         ])
         .expect("quote by budget parses");
         assert!(matches!(c.command, Command::Quote(_)));
+
+        let c = Cli::try_parse_from([
+            "dexdo",
+            "market",
+            "--read-timeout-secs",
+            "9",
+            "--note-addr",
+            "0:note",
+            "qwen",
+        ])
+        .expect("market read timeout parses");
+        let Command::Market(m) = c.command else {
+            panic!("expected Command::Market");
+        };
+        assert_eq!(m.read_timeout.read_timeout_secs, 9);
+        assert!(Cli::try_parse_from([
+            "dexdo",
+            "market",
+            "--read-timeout-secs",
+            "0",
+            "--note-addr",
+            "0:note",
+            "qwen",
+        ])
+        .is_err());
+
+        let c = Cli::try_parse_from([
+            "dexdo",
+            "executable-book",
+            "--market",
+            "m.json",
+            "--ticks",
+            "8",
+            "--max-price-per-tick",
+            "1000",
+            "--read-timeout-secs",
+            "11",
+            "qwen",
+        ])
+        .expect("executable-book parses");
+        let Command::ExecutableBook(b) = c.command else {
+            panic!("expected Command::ExecutableBook");
+        };
+        assert_eq!(b.market, Some(PathBuf::from("m.json")));
+        assert_eq!(b.ticks, 8);
+        assert_eq!(b.max_price_per_tick, 1000);
+        assert_eq!(b.read_timeout.read_timeout_secs, 11);
     }
 
     /// read-only Dodex indexer discovery parses independently of shellnet signing flags.
@@ -773,12 +872,18 @@ mod market_orders_cli_tests {
             panic!("expected Command::Orders");
         };
         assert!(matches!(o.command, OrdersCommand::List));
+        assert_eq!(
+            o.read_timeout.read_timeout_secs,
+            DEFAULT_CHAIN_READ_TIMEOUT_SECS
+        );
 
         let c = Cli::try_parse_from([
             "dexdo",
             "orders",
             "--note-addr",
             "0:note",
+            "--read-timeout-secs",
+            "11",
             "--model",
             "qwen",
             "show",
@@ -789,6 +894,7 @@ mod market_orders_cli_tests {
             panic!("expected Command::Orders");
         };
         assert!(matches!(o.command, OrdersCommand::Show { order_id: 7 }));
+        assert_eq!(o.read_timeout.read_timeout_secs, 11);
 
         let c = Cli::try_parse_from([
             "dexdo",
@@ -859,6 +965,10 @@ mod market_orders_cli_tests {
             panic!("expected subscription place");
         };
         assert_eq!(s.market, Some(PathBuf::from("m.json")));
+        assert_eq!(
+            s.read_timeout.read_timeout_secs,
+            DEFAULT_CHAIN_READ_TIMEOUT_SECS
+        );
         assert_eq!(p.max_price_per_tick, 1000);
         assert_eq!(p.ticks, Some(4));
         assert_eq!(p.budget, None);
@@ -869,6 +979,33 @@ mod market_orders_cli_tests {
             "subscription",
             "--note-addr",
             "0:note",
+            "--market",
+            "m.json",
+            "place",
+            "--note-key",
+            "note.secret",
+            "--max-price-per-tick",
+            "1000",
+            "--ticks",
+            "4",
+        ])
+        .expect("subscription place accepts --note-key after place");
+        let Command::Subscription(s) = c.command else {
+            panic!("expected Command::Subscription");
+        };
+        let SubscriptionCommand::Place(p) = s.command else {
+            panic!("expected subscription place");
+        };
+        assert_eq!(s.identity.note_key, None);
+        assert_eq!(p.note_key, Some(PathBuf::from("note.secret")));
+
+        let c = Cli::try_parse_from([
+            "dexdo",
+            "subscription",
+            "--note-addr",
+            "0:note",
+            "--read-timeout-secs",
+            "12",
             "--model",
             "qwen",
             "status",
@@ -879,6 +1016,9 @@ mod market_orders_cli_tests {
             c.command,
             Command::Subscription(crate::cli::args::SubscriptionArgs {
                 command: SubscriptionCommand::Status { order_id: 7 },
+                read_timeout: crate::cli::args::ChainReadTimeoutArgs {
+                    read_timeout_secs: 12
+                },
                 ..
             })
         ));
@@ -1057,6 +1197,28 @@ mod deal_handle_cli_tests {
         assert!(buyer.resume);
         assert_eq!(buyer.token_contract.as_deref(), Some("0:tc"));
         assert_eq!(buyer.frame_model.as_deref(), Some("qwen--qwen3--32b"));
+    }
+
+    #[test]
+    fn buyer_model_alias_and_models_config_parse() {
+        let c = Cli::try_parse_from([
+            "dexdo",
+            "buyer",
+            "--mock-model",
+            "--mock-chain",
+            "--token-contract",
+            "0:tc",
+            "--model",
+            "qwen--qwen3--32b",
+            "--models",
+            "custom-models.json",
+        ])
+        .expect("buyer accepts --model alias plus --models config path");
+        let Command::Buyer(buyer) = c.command else {
+            panic!("expected Command::Buyer");
+        };
+        assert_eq!(buyer.frame_model.as_deref(), Some("qwen--qwen3--32b"));
+        assert_eq!(buyer.models, PathBuf::from("custom-models.json"));
     }
 
     #[test]
@@ -1380,6 +1542,17 @@ mod tests {
             .to_string()
     }
 
+    fn nested_subcommand_long_help(path: &[&str]) -> String {
+        let mut command = Cli::command();
+        let mut current = &mut command;
+        for name in path {
+            current = current
+                .find_subcommand_mut(name)
+                .expect("nested subcommand exists");
+        }
+        current.render_long_help().to_string()
+    }
+
     #[test]
     fn root_version_flag_is_available_for_release_smoke() {
         let err = Cli::command()
@@ -1459,6 +1632,38 @@ mod tests {
         let help = subcommand_long_help("seller");
         assert!(help.contains("--gateway-advertise <HOST:PORT>"), "{help}");
         assert!(help.contains("Defaults to --gateway-listen"), "{help}");
+    }
+
+    #[test]
+    fn listen_help_documents_seller_buyer_equivalence() {
+        let seller = subcommand_long_help("seller");
+        assert!(
+            seller.contains("equivalent of buyer --local-listen"),
+            "{seller}"
+        );
+        let buyer = subcommand_long_help("buyer");
+        assert!(
+            buyer.contains("equivalent of seller --gateway-listen"),
+            "{buyer}"
+        );
+    }
+
+    #[test]
+    fn buyer_model_alias_is_visible_in_help() {
+        let help = subcommand_long_help("buyer");
+        assert!(help.contains("--frame-model <FRAME_MODEL>"), "{help}");
+        assert!(help.contains("Alias: --model"), "{help}");
+        assert!(help.contains("[aliases: --model]"), "{help}");
+    }
+
+    #[test]
+    fn note_deploy_token_type_help_lists_values() {
+        let help = nested_subcommand_long_help(&["note", "deploy"]);
+        assert!(help.contains("--token-type <TOKEN_TYPE>"), "{help}");
+        assert!(
+            help.contains("[possible values: nackl, shell, usdc]"),
+            "{help}"
+        );
     }
 
     #[test]

@@ -603,6 +603,12 @@ mod tests {
                 ),
                 ErrorCode::ChainRevert,
             ),
+            (
+                anyhow::anyhow!(
+                    "invalid buy ticks: --ticks 1 is below the 2-tick stream minimum"
+                ),
+                ErrorCode::InvalidArgument,
+            ),
         ];
         for (err, code) in cases {
             assert_eq!(classify_error(OP_BUYER_START, &err), code);
