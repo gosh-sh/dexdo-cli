@@ -1797,7 +1797,7 @@ dependencies = [
 
 [[package]]
 name = "dexdo"
-version = "0.0.8"
+version = "0.0.9"
 dependencies = [
  "anyhow",
  "async-stream",
@@ -1836,7 +1836,7 @@ dependencies = [
 
 [[package]]
 name = "dexdo-core"
-version = "0.0.8"
+version = "0.0.9"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -1862,7 +1862,7 @@ dependencies = [
 
 [[package]]
 name = "dexdo-e2e"
-version = "0.0.8"
+version = "0.0.9"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -1882,7 +1882,7 @@ dependencies = [
 
 [[package]]
 name = "dexdo-proto"
-version = "0.0.8"
+version = "0.0.9"
 dependencies = [
  "prost",
  "protoc-bin-vendored",

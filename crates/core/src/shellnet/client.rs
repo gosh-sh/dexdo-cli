@@ -2970,6 +2970,26 @@ impl RealChainBackend {
         note_code_hash_current(note, acc.code_hash.as_deref())
     }
 
+    /// Fund-safety guard for `note withdraw`. A PrivateNote deployed by a
+    /// PREVIOUS contract generation -- its on-chain `code_hash` != the current
+    /// `PRIVATENOTE_PINNED_CODE_HASH` -- still accepts the current-generation `withdrawTokens`
+    /// message: it ZEROES the note's balance but does NOT credit the destination wallet, so the
+    /// SHELL is lost. Refuse the withdraw BEFORE any on-chain write when the note is not the current
+    /// generation. This does not recover funds already lost; it prevents zeroing a still-funded
+    /// previous-generation note.
+    pub async fn assert_note_withdraw_generation(&self, note: &Address) -> Result<()> {
+        let acc = self.client.get_account(note).await?.ok_or_else(|| {
+            anyhow!("note {note} is not on-chain; cannot withdraw")
+        })?;
+        if !acc.is_active() {
+            return Err(anyhow!(
+                "note {note} is {}, not Active; cannot withdraw",
+                acc.status
+            ));
+        }
+        note_withdraw_generation_ok(note, acc.code_hash.as_deref())
+    }
+
     /// read the note's on-chain owner key (`getDetails().ephemeralPubkey`) and fail closed if it does not
     /// match the key the client will sign the owner-authenticated write with -- turning the opaque pre-accept
     /// `onlyOwnerPubkey` revert(branch 3: a non-conforming/orphaned note) into an actionable error. The buyer's

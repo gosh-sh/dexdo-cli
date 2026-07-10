@@ -1,3 +1,31 @@
+## v0.0.9
+
+- directive(v0.0.9): item 12 -- withdraw fail-closed on prev-gen note (public fund loss)
+- directive(v0.0.9): narrow scope to client-only, contract-independent fixes
+- directive(v0.0.9): item 11 -- phantom order root = destroy orphans order (/)
+- directive(v0.0.9): item 9 contract fixed in 4.0.21, client work remains
+- directive(v0.0.9): item 10 -- withdraw stuck stream-lock (public )
+- directive(v0.0.9): item 9 root -- undeployed TC, possible money hole
+- directive(v0.0.9): amend item 9 -- qwen book deadlocked by best-priced unusable ask
+- directive(v0.0.9): item 9 -- buyer selector vs contract FIFO (public )
+- directive(v0.0.9): item 8 -- stale recovery file (public )
+- directive(v0.0.9): amend item 3 after new by-fact from
+- directive: v0.0.9 post-release fixes
+- directive: agent wallets (verify hash at pinned tag + wallet onboard/topup)
+- chore: bump version to 0.0.8
+- fix: accept matched seller offer outcomes
+- directive: seller TC Uninit / offer never rests
+- fix: recover note deploy after interrupted pool write
+- fix: TC pool recovery and CLI nitpicks
+- Buyer executable book and auto-match
+- directive: note deploy money-safety (persist key before spend)
+- directives: remaining + buyer view-book/auto-match
+- Guard note deploy key mismatches
+- precheck withdrawn seller notes
+- Bound direct shellnet read commands
+- directive: keypair check + pool-key mismatch + 101 guidance
+- directives: seller postSellOffer root + read timeout
+
 ## v0.0.8
 
 - chore: bump version to 0.0.8

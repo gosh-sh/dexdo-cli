@@ -92,6 +92,57 @@ pub(super) fn note_code_hash_current(note: &Address, code_hash: Option<&str>) ->
         )),
     }
 }
+
+/// Fund-safety guard for `note withdraw`: pure code-hash generation check.
+/// A note whose on-chain `code_hash` is not the current `PRIVATENOTE_PINNED_CODE_HASH` was deployed
+/// by a previous contract generation; the current-generation `withdrawTokens` zeroes it without
+/// crediting the destination, so the SHELL is lost. Refuse before any on-chain write.
+pub(super) fn note_withdraw_generation_ok(note: &Address, code_hash: Option<&str>) -> Result<()> {
+    match code_hash {
+        Some(h) if h == PRIVATENOTE_PINNED_CODE_HASH => Ok(()),
+        other => Err(anyhow!(
+            "REFUSING to withdraw from note {note}: it was deployed by a PREVIOUS contract generation \
+             (code_hash {}, current is {PRIVATENOTE_PINNED_CODE_HASH}). Withdrawing from a \
+             previous-generation note with this CLI zeroes the note WITHOUT crediting the destination \
+             -- the SHELL is lost (dexdo-cli). This CLI will not submit the withdraw.",
+            other.unwrap_or("<none>")
+        )),
+    }
+}
+
+#[cfg(test)]
+mod withdraw_generation_tests {
+    use super::*;
+
+    fn any_note() -> Address {
+        Address::parse(&format!("0:{}", "1".repeat(64))).unwrap()
+    }
+
+    #[test]
+    fn withdraw_allows_current_generation_note() {
+        assert!(note_withdraw_generation_ok(&any_note(), Some(PRIVATENOTE_PINNED_CODE_HASH)).is_ok());
+    }
+
+    #[test]
+    fn withdraw_refuses_previous_generation_note() {
+        // The two previous-generation hashes from dexdo-cli that zeroed notes without crediting.
+        for stale in [
+            "210add370000000000000000000000000000000000000000000000000000000a",
+            "76acd39200000000000000000000000000000000000000000000000000000007",
+        ] {
+            let err = note_withdraw_generation_ok(&any_note(), Some(stale)).unwrap_err().to_string();
+            assert!(err.contains("REFUSING to withdraw"), "message: {err}");
+            assert!(err.contains(stale), "must name the stale hash: {err}");
+            assert!(err.contains(PRIVATENOTE_PINNED_CODE_HASH), "must name the current hash: {err}");
+        }
+    }
+
+    #[test]
+    fn withdraw_refuses_note_with_no_code_hash() {
+        assert!(note_withdraw_generation_ok(&any_note(), None).is_err());
+    }
+}
+
 /// `InferenceOrderBook` -- ABI of the on-chain offer/order book.
 pub(super) const INFERENCE_ORDERBOOK_ABI: &str =
     include_str!("../../../../contracts/compiled_0.79.3/airegistry/InferenceOrderBook.abi.json");

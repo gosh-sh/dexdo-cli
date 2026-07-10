@@ -8586,6 +8586,10 @@ pub(crate) async fn run_note_withdraw(args: NoteWithdrawArgs) -> Result<()> {
     chain
         .assert_note_owner_matches("note withdraw", &note, &keys)
         .await?;
+    // Fund-safety: a note from a previous contract generation accepts withdrawTokens,
+    // zeroes its balance, but never credits the destination -- the SHELL is lost. Fail closed before
+    // any on-chain write when the note's code_hash is not the current generation.
+    chain.assert_note_withdraw_generation(&note).await?;
     println!("withdrawing note {note_addr} token balances -> {dest}");
     chain.withdraw_note_tokens(&note, &keys, &dest_addr).await?;
     println!("withdrawTokens submitted for note {note_addr} -> {dest}");
