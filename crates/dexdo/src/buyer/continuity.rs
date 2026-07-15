@@ -1,4 +1,5 @@
-//! Buyer continuity planner for the long-running local API mode.
+//! Buyer continuity planner for the long-running local API mode (#202).
+//!
 //! The planner is deliberately side-effect free: callers read chain facts, pass them in, and execute the
 //! returned action through existing primitives (`place_buy`, handover resolution, `streamCleanup`,
 //! `streamReclaim`, `SessionSettle`). This keeps duplicate monitor ticks and process restarts idempotent.
@@ -146,16 +147,11 @@ impl ConsumerDemand {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub enum ContinuityMode {
+    #[default]
     Proactive,
     OnDemand,
-}
-
-impl Default for ContinuityMode {
-    fn default() -> Self {
-        Self::Proactive
-    }
 }
 
 impl ContinuityMode {

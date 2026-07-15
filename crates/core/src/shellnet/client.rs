@@ -1,12 +1,20 @@
 use super::backends::{note_owner_mismatch_reason, MODEL_TICK_SIZE};
+use super::book_events::{read_book_event_fold, BookEventFold};
 use super::contracts_provision::*;
-use crate::chain::{MatchWatchCursor, OrderBookSubscription};
+use super::stream_locks::{
+    decode_note_stream_lock_call, NoteStreamLockEntry, NoteStreamLockFold, NoteStreamLockKind,
+    NoteStreamLockSnapshot,
+};
+use crate::chain::{
+    InferenceSubscriptionPlacement, MatchWatchCursor, MatchedFill, OrderBookSubscription,
+};
 use crate::manifest::{model_hash_for, MarketManifest};
 use crate::onchain_diagnostics::validate_onchain_submit_response;
 use crate::oracle_manifest::OracleMarketManifest;
-use anyhow::{anyhow, Result};
+use anyhow::{anyhow, Context, Result};
 use gosh_ackinacki::airegistry::calls::encode_external_call;
 use gosh_ackinacki::airegistry::deploy::{build_deploy, local_context};
+use gosh_ackinacki::config::AiRegistryConfig;
 use gosh_ackinacki::sdk::{Address, ChainClient, ChainLiveness, KeyPair};
 use gosh_ackinacki::wallet::query::{dest_account_id_hex, fetch_dapp_id};
 use serde::Deserialize;
@@ -17,6 +25,151 @@ use std::path::Path;
 const FIXED_SUPERROOT_ACCOUNT_ID: &str =
     "0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c";
 const MIN_PMP_INITIAL_STAKE: u128 = 10_000_000;
+/// `PrivateNote.sol::STREAM_LOCK_MAX`; the owner escape hatch is accepted strictly after this delay.
+pub const PRIVATE_NOTE_STREAM_LOCK_MAX_SECS: u64 = 7 * 24 * 60 * 60;
+
+fn money_submit_identity(signed_boc: &str) -> String {
+    use sha2::{Digest, Sha256};
+
+    let digest = Sha256::digest(signed_boc.as_bytes());
+    format!(
+        "boc-sha256:{}",
+        digest
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect::<String>()
+    )
+}
+
+/// Stage-aware failure from a non-idempotent money write.
+#[derive(Debug, thiserror::Error)]
+pub enum MoneySubmitError {
+    #[error("money write failed before any message POST: {source}")]
+    Preparation {
+        #[source]
+        source: anyhow::Error,
+    },
+    #[error("money message POST outcome is ambiguous: {source}")]
+    Ambiguous {
+        #[source]
+        source: anyhow::Error,
+    },
+    #[error("money message POST was rejected: {source}")]
+    Rejected {
+        #[source]
+        source: anyhow::Error,
+    },
+}
+
+impl MoneySubmitError {
+    pub fn is_ambiguous(&self) -> bool {
+        matches!(self, Self::Ambiguous { .. })
+    }
+
+    /// Clearing an exactly-once journal is safe only when no POST was attempted or when the
+    /// protocol returned a decoded rejection. Every other outcome may have landed.
+    pub fn clears_journal(&self) -> bool {
+        matches!(self, Self::Preparation { .. } | Self::Rejected { .. })
+    }
+}
+
+#[allow(dead_code)]
+fn consume_new_fill_batch(
+    cursor: &mut MatchWatchCursor,
+    mut fills: Vec<(i64, MatchedFill)>,
+) -> Vec<MatchedFill> {
+    fills.sort_by(|a, b| {
+        a.0.cmp(&b.0)
+            .then_with(|| a.1.token_contract.cmp(&b.1.token_contract))
+            .then_with(|| a.1.ticks.cmp(&b.1.ticks))
+            .then_with(|| a.1.price_per_tick.cmp(&b.1.price_per_tick))
+    });
+    let mut out = Vec::new();
+    let mut consumed = Vec::new();
+    let mut unique_new = BTreeSet::new();
+    for (created_at, fill) in fills {
+        if cursor.has_seen(created_at, &fill.token_contract) {
+            continue;
+        }
+        if unique_new.insert((
+            created_at,
+            fill.token_contract.clone(),
+            fill.ticks,
+            fill.price_per_tick,
+        )) {
+            consumed.push((created_at, fill.token_contract.clone()));
+            out.push(fill);
+        }
+    }
+    cursor.record_seen_batch(consumed);
+    out
+}
+
+fn correlate_fill_batch(
+    expected: Option<&MatchedFill>,
+    fills: &[MatchedFill],
+) -> Result<Option<MatchedFill>> {
+    let Some(expected) = expected else {
+        return Ok(fills.last().cloned());
+    };
+    if let Some(fill) = fills.iter().find(|fill| *fill == expected) {
+        return Ok(Some(fill.clone()));
+    }
+    let Some(fill) = fills.first() else {
+        return Ok(None);
+    };
+    Err(anyhow!(
+        "buyer fill correlation failed: expected tokenContract {} ticks {} price_per_tick {}, \
+         got tokenContract {} ticks {} price_per_tick {}; refusing wrong-fill attribution",
+        expected.token_contract,
+        expected.ticks,
+        expected.price_per_tick,
+        fill.token_contract,
+        fill.ticks,
+        fill.price_per_tick
+    ))
+}
+
+#[async_trait::async_trait]
+pub(super) trait InferenceFillPoller: Send + Sync {
+    async fn poll(&self, cursor: &mut MatchWatchCursor) -> Result<Vec<MatchedFill>>;
+}
+
+struct RealInferenceFillPoller<'a> {
+    chain: &'a RealChainBackend,
+    note: &'a Address,
+    order_book: &'a Address,
+}
+
+#[async_trait::async_trait]
+impl InferenceFillPoller for RealInferenceFillPoller<'_> {
+    async fn poll(&self, cursor: &mut MatchWatchCursor) -> Result<Vec<MatchedFill>> {
+        self.chain
+            .poll_inference_filled_tcs(self.note, self.order_book, true, cursor)
+            .await
+    }
+}
+
+pub(super) async fn wait_correlated_inference_fill(
+    poller: &dyn InferenceFillPoller,
+    cursor: &mut MatchWatchCursor,
+    expected: Option<&MatchedFill>,
+    timeout: std::time::Duration,
+    poll_interval: std::time::Duration,
+    timeout_context: &str,
+) -> Result<MatchedFill> {
+    let start = std::time::Instant::now();
+    loop {
+        let fills = poller.poll(cursor).await?;
+        if let Some(fill) = correlate_fill_batch(expected, &fills)? {
+            return Ok(fill);
+        }
+        if start.elapsed() >= timeout {
+            return Err(anyhow!(timeout_context.to_string()));
+        }
+        tokio::time::sleep(poll_interval).await;
+    }
+}
 
 #[cfg(feature = "test-giver")]
 #[path = "test_giver.rs"]
@@ -54,6 +207,60 @@ pub struct ShellnetDoctorReport {
     pub network: String,
     pub versions: Vec<(String, String)>,
     pub checks: Vec<ShellnetDoctorCheck>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NoteStreamLockStatus {
+    pub stream_count: u32,
+    pub dispute_count: u32,
+    pub last_change_unix: u64,
+    pub entries: Vec<NoteStreamLockEntry>,
+    pub history_complete: bool,
+}
+
+impl NoteStreamLockStatus {
+    /// Reconstruct a status from successful inbound calls ordered from oldest to newest.
+    /// `internal_source` is the authoritative TokenContract deal address for 4.0.27
+    /// `stream*Lock(sellerPubkey, nonce)` calls; `None` identifies an external owner clear call.
+    pub fn from_successful_inbound_calls<'a>(
+        stream_count: u32,
+        dispute_count: u32,
+        last_change_unix: u64,
+        calls: impl IntoIterator<Item = (u64, &'a str, bool, Option<&'a str>)>,
+    ) -> Result<Self> {
+        let entries = reconstruct_note_stream_lock_entries(calls)?;
+        Ok(Self::from_entries(
+            stream_count,
+            dispute_count,
+            last_change_unix,
+            entries,
+        ))
+    }
+
+    fn from_entries(
+        stream_count: u32,
+        dispute_count: u32,
+        last_change_unix: u64,
+        entries: Vec<NoteStreamLockEntry>,
+    ) -> Self {
+        let folded_stream = entries
+            .iter()
+            .filter(|entry| entry.kind == NoteStreamLockKind::Stream)
+            .count();
+        let folded_dispute = entries
+            .iter()
+            .filter(|entry| entry.kind == NoteStreamLockKind::Dispute)
+            .count();
+        let history_complete =
+            folded_stream == stream_count as usize && folded_dispute == dispute_count as usize;
+        Self {
+            stream_count,
+            dispute_count,
+            last_change_unix,
+            entries,
+            history_complete,
+        }
+    }
 }
 
 impl ShellnetDoctorReport {
@@ -107,6 +314,63 @@ fn getter_bool(v: &Value, key: &str) -> Option<bool> {
     }
 }
 
+fn successful_inbound_call(node: &Value) -> bool {
+    let transaction = &node["dst_transaction"];
+    if transaction.is_null() || transaction["aborted"].as_bool() != Some(false) {
+        return false;
+    }
+    let stage_succeeded = |stage: &Value, code: &str| {
+        if stage.is_null() {
+            return false;
+        }
+        let success = stage["success"].as_bool();
+        let exit_code = getter_u128(stage, code);
+        success != Some(false)
+            && exit_code.is_none_or(|value| value == 0)
+            && (success == Some(true) || exit_code == Some(0))
+    };
+    stage_succeeded(&transaction["compute"], "exit_code")
+        && stage_succeeded(&transaction["action"], "result_code")
+}
+
+type SuccessfulInboundLockCall<'a> = (u64, &'a str, bool, Option<&'a str>);
+
+fn successful_inbound_lock_call(node: &Value) -> Result<Option<SuccessfulInboundLockCall<'_>>> {
+    if !successful_inbound_call(node) {
+        return Ok(None);
+    }
+    let Some(body) = node["body"].as_str() else {
+        return Ok(None);
+    };
+    let created_at = node["created_at"]
+        .as_u64()
+        .or_else(|| {
+            node["created_at"]
+                .as_str()
+                .and_then(|value| value.parse().ok())
+        })
+        .ok_or_else(|| anyhow!("successful PrivateNote inbound call has no created_at"))?;
+    let internal_source = node["src"].as_str().filter(|source| !source.is_empty());
+    Ok(Some((
+        created_at,
+        body,
+        internal_source.is_some(),
+        internal_source,
+    )))
+}
+
+fn reconstruct_note_stream_lock_entries<'a>(
+    calls: impl IntoIterator<Item = (u64, &'a str, bool, Option<&'a str>)>,
+) -> Result<Vec<NoteStreamLockEntry>> {
+    let mut fold = NoteStreamLockFold::default();
+    for (created_at, body, internal, internal_source) in calls {
+        if let Some(call) = decode_note_stream_lock_call(body, internal, internal_source)? {
+            fold.apply(call, created_at);
+        }
+    }
+    Ok(fold.into_entries())
+}
+
 fn details_has_withdrawn(details: &Value) -> Option<bool> {
     getter_bool(details, "hasWithdrawn")
 }
@@ -117,6 +381,27 @@ fn note_withdrawn_sell_offer_message(note: &Address) -> String {
          fresh note, re-provision the market, and retry. note={note}; postSellOffer would revert \
          ERR_INVALID_STATE 151 because PrivateNote._hasWithdrawn=true."
     )
+}
+
+fn note_withdrawn_buy_message(note: &Address) -> String {
+    format!(
+        "buyer place aborted: this note has withdrawn and can no longer place buys (deploy/use a fresh note); \
+         the chain rejects it with ERR_INVALID_STATE 151 because PrivateNote._hasWithdrawn=true. note={note}"
+    )
+}
+
+fn buyer_note_withdrawn_guard(note: &Address, details: Option<&Value>) -> Result<()> {
+    match details.and_then(details_has_withdrawn) {
+        Some(true) => Err(anyhow!(note_withdrawn_buy_message(note))),
+        Some(false) => Ok(()),
+        None => {
+            eprintln!(
+                "buyer place preflight note: PrivateNote.getDetails for note {note} did not expose \
+                 hasWithdrawn; continuing without the withdrawn-state guard"
+            );
+            Ok(())
+        }
+    }
 }
 
 fn seller_note_withdrawn_check(note: &Address, actual: Option<bool>) -> ShellnetDoctorCheck {
@@ -577,45 +862,82 @@ mod oracle_getter_tests {
     }
 }
 
-/// Manifest of the deployed shellnet contracts(`contracts/deployed.shellnet.json`).
-/// The address source for the adapter and e2e. `InferenceOrderBook`(per-model) and
-/// `TokenContract`(per-deal) are derived/discovered on the fly, so they are not pinned here.
+/// Manifest of the deployed shellnet contracts (`contracts/deployed.shellnet.json`).
+/// The address source for the adapter and e2e (directive 2). `InferenceOrderBook` (per-model) and
+/// `TokenContract` (per-deal) are derived/discovered on the fly, so they are not pinned here.
 #[derive(Debug, Clone, Deserialize)]
 pub struct Deployed {
-    /// Network(for shellnet -- `"shellnet"`; the connection goes through [`ChainClient::shellnet`]).
+    /// Network label (for shellnet, `"shellnet"`).
     pub network: String,
-    /// `SuperRoot` airegistry -- the derivation point for `RootModel`/`InferenceOrderBook`.
+    /// `SuperRoot` airegistry — the derivation point for `RootModel`/`InferenceOrderBook`.
     pub superroot: String,
-    /// `DappConfig`(a DApp with unlimited credit for deploys).
+    /// `DappConfig` (a DApp with unlimited credit for deploys).
     pub dapp_config: String,
-    /// `dapp_id`(= account_id of `SuperRoot`).
+    /// `dapp_id` (= account_id of `SuperRoot`).
     pub dapp_id: String,
-    /// The seller's probe-tick commission in bps.
+    /// The seller's probe-tick commission in bps (an order-book deploy parameter, §3.1.2).
     pub seller_probe_commission_bps: u16,
+    /// Optional Block Manager endpoint. `graphql` is accepted for deployed-manifest compatibility.
+    #[serde(default, alias = "graphql")]
+    pub endpoint: Option<String>,
 }
 
 impl Deployed {
-    /// Read the manifest from a file(`contracts/deployed.shellnet.json`).
+    /// Read the manifest from a file (`contracts/deployed.shellnet.json`).
     pub fn load(path: impl AsRef<Path>) -> anyhow::Result<Self> {
         let bytes = std::fs::read(path.as_ref())?;
         Ok(serde_json::from_slice(&bytes)?)
     }
 }
 
-/// Real on-chain backend on top of `gosh.ackinacki` `ChainClient`.
+pub const DEFAULT_SHELLNET_ENDPOINT: &str = "https://shellnet.ackinacki.org";
+
+/// Normalize a Block Manager host or URL to the base used by GraphQL and REST reads.
+pub fn normalize_endpoint(endpoint: &str) -> anyhow::Result<String> {
+    let endpoint = endpoint.trim().trim_end_matches('/');
+    if endpoint.is_empty() {
+        anyhow::bail!("endpoint must not be empty");
+    }
+    let endpoint = endpoint.strip_suffix("/graphql").unwrap_or(endpoint);
+    if endpoint.starts_with("http://") || endpoint.starts_with("https://") {
+        Ok(endpoint.to_string())
+    } else {
+        Ok(format!("https://{endpoint}"))
+    }
+}
+
+pub fn endpoint_urls(endpoint: &str) -> anyhow::Result<(String, String)> {
+    let endpoint = normalize_endpoint(endpoint)?;
+    Ok((
+        format!("{endpoint}/graphql"),
+        format!("{endpoint}/v2/account"),
+    ))
+}
+
+pub fn resolve_endpoint(explicit: Option<&str>, manifest: &Deployed) -> anyhow::Result<String> {
+    normalize_endpoint(
+        explicit
+            .or(manifest.endpoint.as_deref())
+            .unwrap_or(DEFAULT_SHELLNET_ENDPOINT),
+    )
+}
+
+/// Real on-chain backend on top of `gosh.ackinacki` `ChainClient` (directive 2).
 /// Carries a live connection to shellnet and the root addresses from the manifest.
 pub struct RealChainBackend {
     client: ChainClient,
-    /// Browser-UA http client for writes(submitting messages to `/v2/messages`).
+    /// Browser-UA http client for reads, with reqwest's default redirect behavior.
     pub(super) http: reqwest::Client,
+    /// Browser-UA client used only for one-shot money POSTs to `/v2/messages`.
+    money_post_http: reqwest::Client,
     superroot: Address,
     deployed: Deployed,
 }
 
-/// True iff `e` is the BK REST `/v2/account` lookup 404 -- the destination account is not yet in the
-/// block-manager index(a **funded-uninit deploy target**). Matched on the specific endpoint **and**
+/// True iff `e` is the BK REST `/v2/account` lookup 404 — the destination account is not yet in the
+/// block-manager index (a **funded-uninit deploy target**). Matched on the specific endpoint **and**
 /// status, NOT a blanket "contains 404": a 404 from any other URL/cause still propagates as a real
-/// error, and this only ever flips routing for a deploy-message send (`submit_once(.., deploy=true)`)..
+/// error, and this only ever flips routing for a deploy-message send (`submit_once(.., deploy=true)`). #68.
 pub(super) fn is_uninit_account_404(e: &str) -> bool {
     e.contains("/v2/account") && e.contains("404")
 }
@@ -645,14 +967,30 @@ fn checked_submit_response(resp: Value) -> Result<Value> {
     })
 }
 
+fn build_money_post_http_client() -> reqwest::Result<reqwest::Client> {
+    reqwest::Client::builder()
+        .user_agent(BROWSER_UA)
+        .redirect(reqwest::redirect::Policy::none())
+        .build()
+}
+
 async fn send_message_checked(
     http: &reqwest::Client,
+    money_post_http: &reqwest::Client,
     endpoint: &str,
     boc_base64: &str,
 ) -> Result<Value> {
     let account_id = dest_account_id_hex(boc_base64)?;
     let dapp_id = fetch_dapp_id(http, endpoint, &account_id).await?;
-    send_message_routed_checked(http, endpoint, boc_base64, &account_id, &dapp_id, None).await
+    send_message_routed_checked(
+        money_post_http,
+        endpoint,
+        boc_base64,
+        &account_id,
+        &dapp_id,
+        None,
+    )
+    .await
 }
 
 async fn send_message_routed_checked(
@@ -663,6 +1001,12 @@ async fn send_message_routed_checked(
     dapp_id: &str,
     thread_id: Option<&str>,
 ) -> Result<Value> {
+    eprintln!(
+        "DEXDO-SUBMIT-DBG account_id={} dapp_id={} thread_id={:?}",
+        bare_hex(account_id),
+        bare_hex(dapp_id),
+        thread_id
+    );
     let mut item = json!({
         "id": submit_message_id(),
         "body": boc_base64,
@@ -672,40 +1016,271 @@ async fn send_message_routed_checked(
     if let Some(thread_id) = thread_id {
         item["thread_id"] = json!(bare_hex(thread_id));
     }
-    let resp = http
+    let response = http
         .post(format!("{}/v2/messages", endpoint.trim_end_matches('/')))
         .header("Content-Type", "application/json")
         .json(&json!([item]))
         .send()
-        .await?
-        .error_for_status()?
-        .json::<Value>()
         .await?;
+    if response.status().is_redirection() {
+        return Err(anyhow!(
+            "shellnet submit refused HTTP redirect {}",
+            response.status()
+        ));
+    }
+    let resp = response.error_for_status()?.json::<Value>().await?;
     checked_submit_response(resp)
 }
 
+async fn send_message_routed_money_once(
+    http: &reqwest::Client,
+    endpoint: &str,
+    boc_base64: &str,
+    account_id: &str,
+    dapp_id: &str,
+) -> Result<Value> {
+    let item = json!({
+        "id": submit_message_id(),
+        "body": boc_base64,
+        "account_id": bare_hex(account_id),
+        "dapp_id": bare_hex(dapp_id),
+    });
+    let response = http
+        .post(format!("{}/v2/messages", endpoint.trim_end_matches('/')))
+        .header("Content-Type", "application/json")
+        .json(&json!([item]))
+        .send()
+        .await
+        .map_err(|source| {
+            let source = anyhow::Error::new(source);
+            let before_post = source
+                .downcast_ref::<reqwest::Error>()
+                .is_some_and(|error| error.is_builder() || error.is_connect());
+            anyhow::Error::new(if before_post {
+                MoneySubmitError::Preparation { source }
+            } else {
+                MoneySubmitError::Ambiguous { source }
+            })
+        })?;
+    let status = response.status();
+    if !status.is_success() {
+        return Err(anyhow::Error::new(MoneySubmitError::Ambiguous {
+            source: anyhow!(
+                "money POST returned unvalidated HTTP status {status}; redirects are disabled and no fresh BOC is safe"
+            ),
+        }));
+    }
+    let response = response.json::<Value>().await.map_err(|source| {
+        anyhow::Error::new(MoneySubmitError::Ambiguous {
+            source: anyhow::Error::new(source),
+        })
+    })?;
+    checked_submit_response(response)
+        .map_err(|source| anyhow::Error::new(MoneySubmitError::Rejected { source }))
+}
+
+pub(super) fn previous_page_cursor(
+    context: &str,
+    page: &Value,
+    before: Option<&str>,
+) -> Result<Option<String>> {
+    let page_info = page
+        .get("pageInfo")
+        .ok_or_else(|| anyhow!("{context} pageInfo missing"))?;
+    let has_previous = page_info["hasPreviousPage"]
+        .as_bool()
+        .ok_or_else(|| anyhow!("{context} hasPreviousPage missing/invalid"))?;
+    if !has_previous {
+        return Ok(None);
+    }
+    let next = page_info["startCursor"]
+        .as_str()
+        .filter(|cursor| Some(*cursor) != before)
+        .ok_or_else(|| anyhow!("{context} pagination made no progress"))?;
+    Ok(Some(next.to_string()))
+}
+
+#[derive(Debug)]
+pub(super) struct ExtOutMessage {
+    pub id: String,
+    pub created_at: u64,
+    pub cursor: String,
+    pub body: String,
+}
+
+pub(super) struct ExtOutPage {
+    pub messages: Vec<ExtOutMessage>,
+    pub previous_cursor: Option<String>,
+}
+
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub(super) struct SellerOfferEvents {
+    pub placed_order_id: Option<u128>,
+    pub matched: bool,
+    pub placement_value_returned: bool,
+}
+
+pub(super) async fn fetch_ext_out_page(
+    http: &reqwest::Client,
+    endpoint: &str,
+    account_id: &str,
+    dapp_id: &str,
+    page_size: u32,
+    before: Option<&str>,
+) -> Result<ExtOutPage> {
+    let gql = format!("{}/graphql", endpoint.trim_end_matches('/'));
+    let query = r#"
+        query($accountId: String!, $dappId: String!, $last: Int!, $before: String) {
+          blockchain {
+            account(account_id: $accountId, dapp_id: $dappId) {
+              messages(msg_type: [ExtOut], last: $last, before: $before) {
+                pageInfo { startCursor hasPreviousPage }
+                edges { cursor node { id body created_at } }
+              }
+            }
+          }
+        }
+    "#;
+    let response: Value = http
+        .post(&gql)
+        .json(&json!({
+            "query": query,
+            "variables": {
+                "accountId": account_id,
+                "dappId": dapp_id,
+                "last": page_size,
+                "before": before,
+            },
+        }))
+        .send()
+        .await?
+        .error_for_status()?
+        .json()
+        .await?;
+    if let Some(errors) = response.get("errors") {
+        return Err(anyhow!(
+            "account {account_id} ext-out GraphQL errors: {errors}"
+        ));
+    }
+    let page = response
+        .pointer("/data/blockchain/account/messages")
+        .ok_or_else(|| anyhow!("account {account_id} ext-out GraphQL shape changed: {response}"))?;
+    let edges = page["edges"]
+        .as_array()
+        .ok_or_else(|| anyhow!("account {account_id} ext-out GraphQL edges missing: {response}"))?;
+    let mut messages = Vec::with_capacity(edges.len());
+    for edge in edges {
+        let cursor = edge["cursor"]
+            .as_str()
+            .ok_or_else(|| anyhow!("account {account_id} ext-out event has no cursor"))?;
+        let node = &edge["node"];
+        let id = node["id"].as_str().unwrap_or(cursor);
+        let body = node["body"]
+            .as_str()
+            .ok_or_else(|| anyhow!("account {account_id} ext-out event {id} has no body"))?;
+        let created_at = node["created_at"]
+            .as_u64()
+            .or_else(|| {
+                node["created_at"]
+                    .as_str()
+                    .and_then(|value| value.parse().ok())
+            })
+            .ok_or_else(|| anyhow!("account {account_id} ext-out event has no created_at"))?;
+        messages.push(ExtOutMessage {
+            id: id.to_string(),
+            created_at,
+            cursor: cursor.to_string(),
+            body: body.to_string(),
+        });
+    }
+    Ok(ExtOutPage {
+        messages,
+        previous_cursor: previous_page_cursor(
+            &format!("account {account_id} ext-out"),
+            page,
+            before,
+        )?,
+    })
+}
+
+async fn fetch_all_ext_out_messages(
+    http: &reqwest::Client,
+    endpoint: &str,
+    account_id: &str,
+) -> Result<Vec<ExtOutMessage>> {
+    const PAGE_SIZE: u32 = 1_000;
+    let dapp_id = fetch_dapp_id(http, endpoint, account_id).await?;
+    let mut before: Option<String> = None;
+    let mut seen = BTreeSet::new();
+    let mut messages = Vec::new();
+    loop {
+        let page = fetch_ext_out_page(
+            http,
+            endpoint,
+            account_id,
+            &dapp_id,
+            PAGE_SIZE,
+            before.as_deref(),
+        )
+        .await?;
+        for message in page.messages {
+            if !seen.insert(message.id.clone()) {
+                continue;
+            }
+            messages.push(message);
+        }
+        let Some(next) = page.previous_cursor else {
+            break;
+        };
+        before = Some(next);
+    }
+    messages.sort_by(|left, right| {
+        (left.created_at, &left.cursor).cmp(&(right.created_at, &right.cursor))
+    });
+    Ok(messages)
+}
+
 impl RealChainBackend {
-    /// Connect to shellnet (`ChainClient::shellnet()`) and read the manifest
-    /// of deployed contracts. The endpoint is taken from the SDK -- no URL is needed in the manifest.
+    /// Connect using an optional manifest endpoint, falling back to the canonical shellnet endpoint.
     pub fn connect(manifest_path: impl AsRef<Path>) -> anyhow::Result<Self> {
+        Self::connect_with_endpoint(manifest_path, None)
+    }
+
+    /// Connect with an explicit endpoint override, then manifest endpoint, then the shellnet default.
+    pub fn connect_with_endpoint(
+        manifest_path: impl AsRef<Path>,
+        endpoint: Option<&str>,
+    ) -> anyhow::Result<Self> {
         let deployed = Deployed::load(manifest_path)?;
-        let client = ChainClient::shellnet()?;
+        let endpoint = resolve_endpoint(endpoint, &deployed)?;
+        let client = ChainClient::connect_with_config(&endpoint, AiRegistryConfig::shellnet())?;
         let http = reqwest::Client::builder().user_agent(BROWSER_UA).build()?;
+        let money_post_http = build_money_post_http_client()?;
         let superroot = Address::parse(&deployed.superroot)?;
         Ok(Self {
             client,
             http,
+            money_post_http,
             superroot,
             deployed,
         })
     }
 
-    /// Low-level chain client(for the trait adapter in the next step).
+    /// Fold authoritative live orders from one `InferenceOrderBook` ext-out stream.
+    pub async fn fold_order_book_events(
+        &self,
+        order_book: &str,
+        previous: BookEventFold,
+    ) -> Result<BookEventFold> {
+        read_book_event_fold(&self.http, self.client.endpoint(), order_book, previous).await
+    }
+
+    /// Low-level chain client (for the trait adapter in the next step).
     pub fn client(&self) -> &ChainClient {
         &self.client
     }
 
-    /// The `SuperRoot` address -- the derivation point for `RootModel`/`InferenceOrderBook`.
+    /// The `SuperRoot` address — the derivation point for `RootModel`/`InferenceOrderBook`.
     pub fn superroot(&self) -> &Address {
         &self.superroot
     }
@@ -715,7 +1290,7 @@ impl RealChainBackend {
         &self.deployed
     }
 
-    /// Chain liveness check -- confirms a working connection to shellnet.
+    /// Chain liveness check — confirms a working connection to shellnet.
     pub async fn liveness(&self) -> Result<ChainLiveness> {
         self.client.chain_liveness().await
     }
@@ -789,7 +1364,7 @@ impl RealChainBackend {
         })
     }
 
-    /// Read-only shellnet readiness report: compare this binary's embedded/pinned contract images against
+    /// Read-only shellnet readiness report (#161): compare this binary's embedded/pinned contract images against
     /// live shellnet and, when supplied, verify that a market manifest still points at active IOB/TC accounts.
     pub async fn doctor(&self, market: Option<&MarketManifest>) -> Result<ShellnetDoctorReport> {
         let mut checks = Vec::new();
@@ -830,7 +1405,7 @@ impl RealChainBackend {
 
         let rootpn = Address::parse(ROOTPN_ADDR)?;
         checks.push(
-            self.code_hash_account_check("RootPN code hash", &rootpn, &code_hash(ROOTPN_TVC)?)
+            self.code_hash_account_check("RootPN code hash", &rootpn, SHELLNET_ROOTPN_V1_CODE_HASH)
                 .await?,
         );
         let rootoracle = Address::parse(ROOTORACLE_ADDR)?;
@@ -930,7 +1505,7 @@ impl RealChainBackend {
         })
     }
 
-    /// The `SuperRoot` owner pubkey(on-chain getter `getOwnerPubkey`).
+    /// The `SuperRoot` owner pubkey (on-chain getter `getOwnerPubkey`).
     pub async fn superroot_owner_pubkey(&self) -> Result<Value> {
         let v = self
             .client
@@ -940,9 +1515,9 @@ impl RealChainBackend {
         Ok(v["value0"].clone())
     }
 
-    /// The `RootModel` address for a given owner pubkey -- the deterministic SuperRoot on-chain getter
-    /// `getRootModelAddress(ownerPubkey)`. RootModel is per-owner: for the seller(model owner)
-    /// it is derived from their pubkey(see [`Self::deploy_root_model`]).
+    /// The `RootModel` address for a given owner pubkey — the deterministic SuperRoot on-chain getter
+    /// `getRootModelAddress(ownerPubkey)`. RootModel is per-owner: for the seller (model owner)
+    /// it is derived from their pubkey (see [`Self::deploy_root_model`]).
     pub async fn root_model_address_for(&self, owner_pubkey: &Value) -> Result<Address> {
         let v = self
             .client
@@ -957,7 +1532,7 @@ impl RealChainBackend {
         Address::parse(v["value0"].as_str().ok_or_else(|| anyhow!("no address"))?)
     }
 
-    /// Derive the `RootModel` address of the `SuperRoot` owner(part of address resolution for `ChainBackend`).
+    /// Derive the `RootModel` address of the `SuperRoot` owner (part of address resolution for `ChainBackend`).
     pub async fn resolve_root_model(&self) -> Result<Address> {
         let owner = self.superroot_owner_pubkey().await?;
         self.root_model_address_for(&owner).await
@@ -984,8 +1559,8 @@ impl RealChainBackend {
         Ok((Address::parse(&msg.address)?, msg.message_boc_b64))
     }
 
-    /// Derive the per-deal `TokenContract` address from `RootModel`(`getTokenContractAddress`)
-    /// by the seller's pubkey and the deal nonce -- a deterministic on-chain getter.
+    /// Derive the per-deal `TokenContract` address from `RootModel` (`getTokenContractAddress`)
+    /// by the seller's pubkey and the deal nonce — a deterministic on-chain getter.
     pub async fn resolve_token_contract(
         &self,
         root_model: &Address,
@@ -1005,14 +1580,15 @@ impl RealChainBackend {
         Address::parse(v["value0"].as_str().ok_or_else(|| anyhow!("no address"))?)
     }
 
-    /// Derive the per-deal `TokenContract` address from the deploy **INIT-DATA(stateInit)** -- the
-    /// getter-free, offline counterpart to [`resolve_token_contract`](Self::resolve_token_contract).
+    /// Derive the per-deal `TokenContract` address from the deploy **INIT-DATA (stateInit)** — the
+    /// getter-free, offline counterpart to [`resolve_token_contract`](Self::resolve_token_contract) (#68).
+    ///
     /// `provision_market`'s idempotency check must NOT depend on the RootModel `getTokenContractAddress`
     /// network getter: on a fresh provision the RootModel deploy was just sent but is not yet `Active`, so the
     /// getter 404s and `resolve_token_contract`'s `"RootModel is not active"` error would abort the **entire**
-    /// idempotent provision -- exactly the case the check exists to handle. The TC address is `hash(stateInit)`
+    /// idempotent provision — exactly the case the check exists to handle. The TC address is `hash(stateInit)`
     /// over `{code, varInit {_sellerPubkey,_rootModelAddress,_nonce,_pubkey}}`; it needs no RootModel account,
-    /// no network, and cannot 404. (Bit-for-bit the address the deploy creates -- cross-checked against the
+    /// no network, and cannot 404. (Bit-for-bit the address the deploy creates — cross-checked against the
     /// getter only on the idempotent-skip branch, where the RootModel is guaranteed `Active`.)
     #[allow(clippy::too_many_arguments)]
     pub async fn token_contract_deploy_address(
@@ -1040,8 +1616,8 @@ impl RealChainBackend {
             .0)
     }
 
-    /// Read the endpoint ciphertext from `TokenContract` -- getter
-    /// `getEndpointCipher`. The same `Handover` format as in (the buyer
+    /// Read the endpoint ciphertext from `TokenContract` (handover §3.1) — getter
+    /// `getEndpointCipher`. The same `Handover` format as in directive 1 (the buyer
     /// decrypts with the note key). `None` if the contract is not active or the endpoint is not yet written.
     pub async fn read_handover(&self, token_contract: &Address) -> Result<Option<Vec<u8>>> {
         let Some(v) = self
@@ -1066,7 +1642,7 @@ impl RealChainBackend {
 
     /// The deployed TC's stored `_modelHash` (4.0.6 `getModelHash() = sha256(modelName)`), normalized to
     /// `0x` + 64 lowercase hex. Used to assert the deal TC is for the SAME model as the order book
-    /// (`model_hash`) before posting -- the 4.0.6 end-to-end model-name invariant.
+    /// (`model_hash`) before posting — the 4.0.6 end-to-end model-name invariant.
     pub async fn token_contract_model_hash(&self, tc: &Address) -> Result<Option<String>> {
         let Some(v) = self
             .client
@@ -1083,8 +1659,8 @@ impl RealChainBackend {
         Ok(Some(format!("0x{}", format!("{hex:0>64}").to_lowercase())))
     }
 
-    /// The TC's on-chain **model display name** (`getModelName() -> string`, 4.0.6) -- the authoritative name
-    /// for the accounting view: the manifest's `frame_model` is operator-supplied and must NOT be
+    /// The TC's on-chain **model display name** (`getModelName() -> string`, 4.0.6) — the authoritative name
+    /// for the accounting view (issue #23): the manifest's `frame_model` is operator-supplied and must NOT be
     /// trusted as chain truth. `None` if the TC is not active or the name is empty.
     pub async fn token_contract_model_name(&self, tc: &Address) -> Result<Option<String>> {
         let Some(v) = self
@@ -1101,8 +1677,8 @@ impl RealChainBackend {
         Ok(Some(name.to_string()))
     }
 
-    /// The TC's on-chain **price per tick** (`getDeal() ->(tickSize, pricePerTick, maxTicks)`, 4.0.6) -- the
-    /// authoritative deal price for the accounting view, NOT the operator-supplied manifest value.
+    /// The TC's on-chain **price per tick** (`getDeal() -> (tickSize, pricePerTick, maxTicks)`, 4.0.6) — the
+    /// authoritative deal price for the accounting view (issue #23), NOT the operator-supplied manifest value.
     /// `uint128` decimal string. `None` if the TC is not active.
     pub async fn token_contract_price_per_tick(&self, tc: &Address) -> Result<Option<u128>> {
         let Some(v) = self
@@ -1141,11 +1717,11 @@ impl RealChainBackend {
         Ok(Some((tick_size, price_per_tick, max_ticks)))
     }
 
-    /// Read the **buyer's ed25519 pubkey** from `TokenContract`(`getBuyerPubkey`, uint256) -- the book
-    /// records it on a match(`placeInferenceBuy`). From it the seller **reconstructs the x25519 handover**
-    /// and encrypts the endpoint to
-    /// the recovered pubkey -- no separate x25519 channel is needed. `None` if the TC is not active or the buyer
-    /// is not yet recorded(zero pubkey). The pubkey round-trips as `0x`-hex(like `getOwnerPubkey`).
+    /// Read the **buyer's ed25519 pubkey** from `TokenContract` (`getBuyerPubkey`, uint256) — the book
+    /// records it on a match (`placeInferenceBuy`). From it the seller **reconstructs the x25519 handover**
+    /// ([`crate::note::x25519_pub_from_ed25519_pub`], Montgomery form, D10) and encrypts the endpoint to
+    /// the recovered pubkey — no separate x25519 channel is needed. `None` if the TC is not active or the buyer
+    /// is not yet recorded (zero pubkey). The pubkey round-trips as `0x`-hex (like `getOwnerPubkey`).
     pub async fn token_contract_buyer_pubkey(&self, tc: &Address) -> Result<Option<[u8; 32]>> {
         let Some(v) = self
             .client
@@ -1159,7 +1735,7 @@ impl RealChainBackend {
         if hex.is_empty() {
             return Ok(None);
         }
-        // uint256 -> 32 bytes BE(the pubkey may have arrived without leading zeros -- left-pad to 64 hex).
+        // uint256 → 32 bytes BE (the pubkey may have arrived without leading zeros — left-pad to 64 hex).
         let bytes = decode_hex(&format!("{hex:0>64}"))?;
         if bytes.len() != 32 {
             return Err(anyhow!(
@@ -1226,16 +1802,20 @@ impl RealChainBackend {
         Ok(Some(hex))
     }
 
-    /// The `InferenceOrderBook` code-cell as base64-BOC -- the `code` argument for
+    /// The `InferenceOrderBook` code-cell as base64-BOC — the `code` argument for
     /// `deployInferenceOrderBook`/`getInferenceOrderBookAddress`. Extracted from the embedded
-    /// `.tvc`(StateInit -> `.code`), like `airegistry::abi::Contract::code_boc_b64` in the SDK.
+    /// `.tvc` (StateInit → `.code`), like `airegistry::abi::Contract::code_boc_b64` in the SDK.
     pub fn inference_orderbook_code_b64() -> Result<String> {
         code_boc_b64(INFERENCE_ORDERBOOK_TVC)
     }
 
-    /// Deterministic `InferenceOrderBook` address for(model, tick size) -- the note's on-chain getter
+    pub fn canonical_inference_orderbook_address(model_hash: &str) -> Result<Address> {
+        inference_orderbook_address_from_model_hash(model_hash)
+    }
+
+    /// Deterministic `InferenceOrderBook` address for (model, tick size) — the note's on-chain getter
     /// `getInferenceOrderBookAddress(code, modelHash, tickSize)`. Success = the note has this
-    /// method(meaning it is an inference note). `model_hash` is `0x...` uint256, `tick_size` is uint128.
+    /// method (meaning it is an inference note). `model_hash` is `0x…` uint256, `tick_size` is uint128.
     pub async fn inference_orderbook_address(
         &self,
         note: &Address,
@@ -1260,7 +1840,7 @@ impl RealChainBackend {
         Address::parse(v["value0"].as_str().ok_or_else(|| anyhow!("no address"))?)
     }
 
-    /// Parameters of the deployed `InferenceOrderBook` -- getter `getParams` (`modelHash`, `tickSize`,
+    /// Parameters of the deployed `InferenceOrderBook` — getter `getParams` (`modelHash`, `tickSize`,
     /// `platformFeeBps`). Confirms that the book came up with the expected parameters. `None` if
     /// the book is not yet active.
     pub async fn inference_orderbook_params(&self, ob: &Address) -> Result<Option<Value>> {
@@ -1269,20 +1849,19 @@ impl RealChainBackend {
             .await
     }
 
-    /// A signed external contract call(write) through the backend's **browser-UA** http
-    /// client: `encode_external_call`(the same codec as `ChainClient::call`) -> submit to
-    /// `/v2/messages`. The ChainClient is not used for writes -- its default UA is blocked by
-    /// Cloudflare(getters through it work fine). Returns the submit response.
-    async fn submit(
-        &self,
+    /// A signed external contract call (write) through the backend's **browser-UA** http
+    /// client: `encode_external_call` (the same codec as `ChainClient::call`) → submit to
+    /// `/v2/messages`. The ChainClient is not used for writes — its default UA is blocked by
+    /// Cloudflare (getters through it work fine). Returns the submit response.
+    async fn encode_signed_call_boc(
         addr: &Address,
         abi_json: &str,
         method: &str,
         args: Value,
         keys: &KeyPair,
-    ) -> Result<Value> {
+    ) -> Result<String> {
         let ctx = local_context()?;
-        let boc = encode_external_call(
+        encode_external_call(
             &ctx,
             abi_json,
             &addr.with_workchain(),
@@ -1291,24 +1870,55 @@ impl RealChainBackend {
             keys.public_hex(),
             keys.secret_hex(),
         )
-        .await?;
+        .await
+    }
+
+    async fn submit(
+        &self,
+        addr: &Address,
+        abi_json: &str,
+        method: &str,
+        args: Value,
+        keys: &KeyPair,
+    ) -> Result<Value> {
+        let boc = Self::encode_signed_call_boc(addr, abi_json, method, args, keys).await?;
         self.send_with_retry(&boc).await
     }
 
-    /// Submit `boc` to `/v2/messages`. `deploy` selects the routing:
-    /// - `false` -- a regular write to an **existing** contract(call/fund): `send_message`, which
-    /// reads the real `dapp_id` via the BK REST `/v2/account`. A 404 there is a real error -> propagates.
-    /// - `true` -- a **deploy-message send** whose destination is a not-yet-deployed self-dapp address:
-    /// read the real `dapp_id`, but on the **specific `/v2/account` uninit-404**([`is_uninit_account_404`])
-    /// fall back to `dapp_id = account_id`(self-dapp) and submit via `send_message_routed` (which skips
-    /// the `/v2/account` read). This lets one `dexdo provision` land a fresh deploy in a SINGLE shot
-    /// instead of dying on the first attempt and forcing a cumulative re-funded retry.
-    /// **Scoped:** only the deploy/fund submit sites pass `deploy = true`; every regular write keeps the
-    /// unchanged `send_message` path. Any non-`/v2/account` 404(or other error) still propagates.
+    async fn prepare_money_post(
+        &self,
+        addr: &Address,
+        abi_json: &str,
+        method: &str,
+        args: Value,
+        keys: &KeyPair,
+    ) -> Result<(String, String, String, String)> {
+        let boc = Self::encode_signed_call_boc(addr, abi_json, method, args, keys)
+            .await
+            .map_err(|source| anyhow::Error::new(MoneySubmitError::Preparation { source }))?;
+        let endpoint = self.client.endpoint().to_string();
+        let account_id = dest_account_id_hex(&boc)
+            .map_err(|source| anyhow::Error::new(MoneySubmitError::Preparation { source }))?;
+        let dapp_id = fetch_dapp_id(&self.http, &endpoint, &account_id)
+            .await
+            .map_err(|source| anyhow::Error::new(MoneySubmitError::Preparation { source }))?;
+        Ok((endpoint, boc, account_id, dapp_id))
+    }
+
+    /// Submit `boc` to `/v2/messages`. `deploy` selects the routing (#65/#68):
+    /// - `false` — a regular write to an **existing** contract (call/fund): `send_message`, which
+    ///   reads the real `dapp_id` via the BK REST `/v2/account`. A 404 there is a real error → propagates.
+    /// - `true` — a **deploy-message send** whose destination is a not-yet-deployed self-dapp address:
+    ///   read the real `dapp_id`, but on the **specific `/v2/account` uninit-404** ([`is_uninit_account_404`])
+    ///   fall back to `dapp_id = account_id` (self-dapp) and submit via `send_message_routed` (which skips
+    ///   the `/v2/account` read). This lets one `dexdo provision` land a fresh deploy in a SINGLE shot
+    ///   instead of dying on the first attempt and forcing a cumulative re-funded retry.
+    ///   **Scoped:** only the deploy/fund submit sites pass `deploy = true`; every regular write keeps the
+    ///   unchanged `send_message` path. Any non-`/v2/account` 404 (or other error) still propagates.
     async fn submit_once(&self, boc: &str, deploy: bool) -> Result<Value> {
         let endpoint = self.client.endpoint();
         if !deploy {
-            return send_message_checked(&self.http, endpoint, boc).await;
+            return send_message_checked(&self.http, &self.money_post_http, endpoint, boc).await;
         }
         let account_id = dest_account_id_hex(boc)?;
         let dapp_id = match fetch_dapp_id(&self.http, endpoint, &account_id).await {
@@ -1316,18 +1926,26 @@ impl RealChainBackend {
             Err(e) if is_uninit_account_404(&e.to_string()) => account_id.clone(),
             Err(e) => return Err(e),
         };
-        send_message_routed_checked(&self.http, endpoint, boc, &account_id, &dapp_id, None).await
+        send_message_routed_checked(
+            &self.money_post_http,
+            endpoint,
+            boc,
+            &account_id,
+            &dapp_id,
+            None,
+        )
+        .await
     }
 
     /// Submit a message to shellnet with retry on **transient** infrastructure failures:
-    /// (1) overflow of the block manager's write queue(`QUEUE_OVERFLOW` -- "message queue is full");
+    /// (1) overflow of the block manager's write queue (`QUEUE_OVERFLOW` — "message queue is full");
     /// (2) **transient gateway 5xx** (`502 Bad Gateway` / `503` / `504` from the reverse proxy, when
-    /// the backend is briefly unavailable -- observed to flicker on shellnet under load). The node is alive and moving
-    /// blocks; we wait(exponential backoff, cap 8s) and retry -- this is resilience to a real network,
-    /// not a test crutch. Other(logical) errors propagate immediately. `deploy` is threaded to
+    /// the backend is briefly unavailable — observed to flicker on shellnet under load). The node is alive and moving
+    /// blocks; we wait (exponential backoff, cap 8s) and retry — this is resilience to a real network,
+    /// not a test crutch. Other (logical) errors propagate immediately. `deploy` is threaded to
     /// [`submit_once`] so only deploy-message sends get the funded-uninit `/v2/account` 404 tolerance.
     async fn retry_submit(&self, boc: &str, deploy: bool) -> Result<Value> {
-        // Transient marker: the queue is full OR a temporary gateway failure(5xx) that clears on its own.
+        // Transient marker: the queue is full OR a temporary gateway failure (5xx) that clears on its own.
         fn is_transient(msg: &str) -> bool {
             msg.contains("QUEUE_OVERFLOW")
                 || msg.contains("502")
@@ -1351,17 +1969,17 @@ impl RealChainBackend {
                 Err(e) => return Err(e),
             }
         }
-        // Final attempt -- pass the result through as-is(Ok or the final error).
+        // Final attempt — pass the result through as-is (Ok or the final error).
         self.submit_once(boc, deploy).await
     }
 
-    /// Regular write to an **existing** contract(call/fund) -- unchanged `send_message` routing.
+    /// Regular write to an **existing** contract (call/fund) — unchanged `send_message` routing.
     pub(super) async fn send_with_retry(&self, boc: &str) -> Result<Value> {
         self.retry_submit(boc, false).await
     }
 
-    /// A **deploy-message** send(its destination is a not-yet-deployed self-dapp address): tolerates
-    /// the funded-uninit `/v2/account` 404 via self-dapp routing. Use ONLY for deploy submits.
+    /// A **deploy-message** send (its destination is a not-yet-deployed self-dapp address): tolerates
+    /// the funded-uninit `/v2/account` 404 via self-dapp routing (#65/#68). Use ONLY for deploy submits.
     async fn send_deploy_with_retry(&self, boc: &str) -> Result<Value> {
         self.retry_submit(boc, true).await
     }
@@ -1380,8 +1998,8 @@ impl RealChainBackend {
     ) -> Result<Value> {
         let code = Self::inference_orderbook_code_b64()?;
         // 4.0.6: the book's ctor verifies `sha256(modelName) == modelHash`, so `model_hash` MUST be
-        // `sha256(model_name)`(the canonical preimage). `inferenceOrderBookCode`/`tickSize` are not in
-        // the 2-arg ABI(the OB code is stored on the note) -- harmless extra keys, the encoder ignores them.
+        // `sha256(model_name)` (the canonical preimage). `inferenceOrderBookCode`/`tickSize` are not in
+        // the 2-arg ABI (the OB code is stored on the note) — harmless extra keys, the encoder ignores them.
         self.submit(
             note,
             PRIVATENOTE_ABI,
@@ -1397,7 +2015,7 @@ impl RealChainBackend {
         .await
     }
 
-    /// The book's `getBestBidAsk` getter(`hasBid`, `bid`, `hasAsk`, `ask`) -- a check that the offer landed
+    /// The book's `getBestBidAsk` getter (`hasBid`, `bid`, `hasAsk`, `ask`) — a check that the offer landed
     /// in the order book as an ask. `None` if the book is not active.
     pub async fn inference_orderbook_best_bid_ask(&self, ob: &Address) -> Result<Option<Value>> {
         self.client
@@ -1405,7 +2023,7 @@ impl RealChainBackend {
             .await
     }
 
-    /// Poll THIS note's owner-facing `InferenceFilledConfirmed` ext-out
+    /// Poll THIS note's owner-facing `InferenceFilledConfirmed` ext-out (§3.1, vendored 4.0.15 mirror)
     /// and advance a durable cursor. The side is owner-relative: `want_is_buy=true` for the buyer's note,
     /// `false` for the seller's note. The caller decides whether/how long to sleep between polls.
     pub async fn poll_inference_filled_tcs(
@@ -1414,7 +2032,7 @@ impl RealChainBackend {
         order_book: &Address,
         want_is_buy: bool,
         cursor: &mut MatchWatchCursor,
-    ) -> Result<Vec<Address>> {
+    ) -> Result<Vec<MatchedFill>> {
         let acct = note.with_workchain();
         let account_id = acct.strip_prefix("0:").unwrap_or(&acct).to_string();
         let want_ob = Address::parse(&order_book.with_workchain())
@@ -1449,7 +2067,7 @@ impl RealChainBackend {
         let edges = resp["data"]["blockchain"]["account"]["messages"]["edges"]
             .as_array()
             .ok_or_else(|| anyhow!("note ext-out GraphQL shape changed: {resp}"))?;
-        let mut matches = Vec::<(i64, String)>::new();
+        let mut matches = Vec::<(i64, MatchedFill)>::new();
         for edge in edges {
             let node = &edge["node"];
             let created = node["created_at"]
@@ -1482,7 +2100,14 @@ impl RealChainBackend {
                             )
                         })?
                         .with_workchain();
-                    matches.push((created_at, tc));
+                    matches.push((
+                        created_at,
+                        MatchedFill {
+                            token_contract: tc,
+                            ticks: fill.ticks,
+                            price_per_tick: fill.price_per_tick,
+                        },
+                    ));
                 }
                 Ok(None) => {}
                 Err(e) => {
@@ -1492,68 +2117,270 @@ impl RealChainBackend {
                 }
             }
         }
-        matches.sort_by(|a, b| a.0.cmp(&b.0).then_with(|| a.1.cmp(&b.1)));
+        Ok(consume_new_fill_batch(cursor, matches))
+    }
+
+    pub(super) async fn seller_offer_events_since(
+        &self,
+        note: &Address,
+        order_book: &Address,
+        token_contract: &Address,
+        since: u64,
+    ) -> Result<SellerOfferEvents> {
+        let acct = note.with_workchain();
+        let account_id = acct.strip_prefix("0:").unwrap_or(&acct).to_string();
+        let want_ob = order_book.with_workchain();
+        let want_tc = token_contract.with_workchain();
+        let endpoint = self.client.endpoint();
+        let gql = format!("{}/graphql", endpoint.trim_end_matches('/'));
+        let dapp_id = fetch_dapp_id(&self.http, endpoint, &account_id).await?;
+        let query = r#"
+            query($accountId: String!, $dappId: String!, $last: Int!) {
+              blockchain {
+                account(account_id: $accountId, dapp_id: $dappId) {
+                  messages(msg_type: [ExtOut, IntIn], last: $last) {
+                    edges { node { body src value created_at } }
+                  }
+                }
+              }
+            }
+        "#;
+        let response: Value = self
+            .http
+            .post(&gql)
+            .json(&json!({
+                "query": query,
+                "variables": { "accountId": account_id, "dappId": dapp_id, "last": 200 },
+            }))
+            .send()
+            .await?
+            .error_for_status()?
+            .json()
+            .await?;
+        let edges = response["data"]["blockchain"]["account"]["messages"]["edges"]
+            .as_array()
+            .ok_or_else(|| anyhow!("seller offer outcome GraphQL shape changed: {response}"))?;
+        let mut outcome = SellerOfferEvents::default();
+        for edge in edges {
+            let node = &edge["node"];
+            let created_at = node["created_at"].as_u64().or_else(|| {
+                node["created_at"]
+                    .as_str()
+                    .and_then(|value| value.parse().ok())
+            });
+            if created_at.is_none_or(|created_at| created_at < since) {
+                continue;
+            }
+            if let Some(body) = node["body"].as_str().filter(|body| !body.is_empty()) {
+                if let Some(placed) = super::note_events::decode_inference_placed(body)? {
+                    if !placed.is_buy
+                        && placed.order_book.eq_ignore_ascii_case(&want_ob)
+                        && placed.token_contract.eq_ignore_ascii_case(&want_tc)
+                    {
+                        outcome.placed_order_id = Some(placed.order_id);
+                    }
+                }
+                if let Some(fill) = super::note_events::decode_inference_filled(body)? {
+                    if !fill.is_buy
+                        && fill.order_book.eq_ignore_ascii_case(&want_ob)
+                        && fill.token_contract.eq_ignore_ascii_case(&want_tc)
+                    {
+                        outcome.matched = true;
+                    }
+                }
+            }
+            let source_matches = node["src"]
+                .as_str()
+                .is_some_and(|source| source.eq_ignore_ascii_case(&want_ob));
+            let empty_body = node["body"].as_str().is_none_or(str::is_empty);
+            if source_matches && empty_body && value_u128(&node["value"]) == Some(1_000_000_000) {
+                outcome.placement_value_returned = true;
+            }
+        }
+        Ok(outcome)
+    }
+
+    /// Scan paginated fill history with order-id attribution for the inert subscription journal.
+    pub async fn poll_inference_attributed_fills(
+        &self,
+        note: &Address,
+        order_book: &Address,
+        cursor: &mut MatchWatchCursor,
+    ) -> Result<Vec<(u128, MatchedFill)>> {
+        let acct = note.with_workchain();
+        let account_id = acct.strip_prefix("0:").unwrap_or(&acct).to_string();
+        let want_ob = Address::parse(&order_book.with_workchain())
+            .map(|a| a.with_workchain())
+            .unwrap_or_else(|_| order_book.with_workchain());
+        let messages =
+            fetch_all_ext_out_messages(&self.http, self.client.endpoint(), &account_id).await?;
+        let mut matches = Vec::<(i64, u128, MatchedFill)>::new();
+        for message in messages {
+            match super::note_events::decode_attributed_inference_filled(&message.body) {
+                Ok(Some(fill)) => {
+                    if !fill.is_buy {
+                        continue;
+                    }
+                    let got_ob = Address::parse(&fill.order_book)
+                        .map(|a| a.with_workchain())
+                        .unwrap_or(fill.order_book.clone());
+                    if got_ob != want_ob {
+                        continue;
+                    }
+                    let created_at = message.created_at.try_into().map_err(|_| {
+                        anyhow!("InferenceFilledConfirmed ext-out on note {account_id} has created_at above i64")
+                    })?;
+                    let tc = Address::parse(&fill.token_contract)
+                        .map_err(|e| {
+                            anyhow!(
+                                "InferenceFilledConfirmed tokenContract {}: {e}",
+                                fill.token_contract
+                            )
+                        })?
+                        .with_workchain();
+                    matches.push((
+                        created_at,
+                        fill.order_id,
+                        MatchedFill {
+                            token_contract: tc,
+                            ticks: fill.ticks,
+                            price_per_tick: fill.price_per_tick,
+                        },
+                    ));
+                }
+                Ok(None) => {}
+                Err(e) => {
+                    return Err(anyhow!(
+                        "decode InferenceFilledConfirmed ext-out on note {account_id}: {e}"
+                    ));
+                }
+            }
+        }
+        matches.sort_by(|left, right| {
+            left.0
+                .cmp(&right.0)
+                .then_with(|| left.2.token_contract.cmp(&right.2.token_contract))
+                .then_with(|| left.1.cmp(&right.1))
+        });
         let mut out = Vec::new();
         let mut consumed = Vec::new();
         let mut unique_new = BTreeSet::new();
-        for (created_at, tc) in matches {
-            if cursor.has_seen(created_at, &tc) {
+        for (created_at, order_id, fill) in matches {
+            if cursor.has_seen(created_at, &fill.token_contract) {
                 continue;
             }
-            if unique_new.insert((created_at, tc.clone())) {
-                out.push(
-                    Address::parse(&tc)
-                        .map_err(|e| anyhow!("InferenceFilledConfirmed tokenContract {tc}: {e}"))?,
-                );
-                consumed.push((created_at, tc));
+            if unique_new.insert((created_at, fill.token_contract.clone(), order_id)) {
+                consumed.push((created_at, fill.token_contract.clone()));
+                out.push((order_id, fill));
             }
         }
         cursor.record_seen_batch(consumed);
         Ok(out)
     }
 
-    /// Wait for THIS note's owner-facing `InferenceFilledConfirmed` ext-out
-    /// and return the matched per-deal `TokenContract`. The buyer learns its deal from JUST its own note --
+    /// Wait for THIS note's owner-facing `InferenceFilledConfirmed` ext-out (§3.1, vendored 4.0.15 mirror)
+    /// and return the matched per-deal `TokenContract`. The buyer learns its deal from JUST its own note —
     /// no shared-book index. Polls the note's ext-out via the chain GraphQL (the same `messages(ExtOut)`
     /// surface the live giver diag uses), decodes each body, and returns the first fill that is this note's
     /// BUY side on the derived `order_book`, ignoring events older than `since_unix` (a note may carry a
-    /// prior deal's fill). Fails closed on timeout -- never a silent empty.
+    /// prior deal's fill). Fails closed on timeout — never a silent empty.
     pub async fn wait_inference_filled_tc(
         &self,
         note: &Address,
         order_book: &Address,
-        since_unix: i64,
+        _since_unix: i64,
         timeout: std::time::Duration,
-    ) -> Result<Address> {
+        cursor: &mut MatchWatchCursor,
+        expected: Option<&MatchedFill>,
+    ) -> Result<MatchedFill> {
         let acct = note.with_workchain();
         let account_id = acct.strip_prefix("0:").unwrap_or(&acct).to_string();
         let want_ob = Address::parse(&order_book.with_workchain())
             .map(|a| a.with_workchain())
             .unwrap_or_else(|_| order_book.with_workchain());
-        let start = std::time::Instant::now();
-        let mut cursor = MatchWatchCursor::new(since_unix);
-        loop {
-            let mut tcs = self
-                .poll_inference_filled_tcs(note, order_book, true, &mut cursor)
-                .await?;
-            if let Some(tc) = tcs.pop() {
-                return Ok(tc);
-            }
-            if start.elapsed() >= timeout {
-                return Err(anyhow!(
-                    "timed out waiting for InferenceFilledConfirmed on note {account_id} (no buy match \
-                     on book {want_ob} yet) -- the seller's offer may not be resting, or the match didn't go through"
-                ));
-            }
-            tokio::time::sleep(std::time::Duration::from_secs(2)).await;
-        }
+        let timeout_context = format!(
+            "timed out waiting for InferenceFilledConfirmed on note {account_id} (no buy match \
+             on book {want_ob} yet for tokenContract {} ticks {} price_per_tick {}) -- the seller's offer \
+             may not be resting, or the match didn't go through",
+            expected
+                .map(|fill| fill.token_contract.as_str())
+                .unwrap_or("<resume-any>"),
+            expected.map(|fill| fill.ticks).unwrap_or(0),
+            expected.map(|fill| fill.price_per_tick).unwrap_or(0)
+        );
+        wait_correlated_inference_fill(
+            &RealInferenceFillPoller {
+                chain: self,
+                note,
+                order_book,
+            },
+            cursor,
+            expected,
+            timeout,
+            std::time::Duration::from_secs(2),
+            &timeout_context,
+        )
+        .await
     }
 
-    /// The book's `getStats` getter(`nextOrderId`, `orderCount`, `executedNotional`, `executedTicks`).
+    /// The book's `getStats` getter (`nextOrderId`, `orderCount`, `executedNotional`, `executedTicks`).
     pub async fn inference_orderbook_stats(&self, ob: &Address) -> Result<Option<Value>> {
         self.client
             .run_getter(ob, INFERENCE_ORDERBOOK_ABI, "getStats", json!({}))
             .await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub async fn inference_subscription_placements_since(
+        &self,
+        ob: &Address,
+        buyer_note: &Address,
+        order_id_floor: u128,
+        max_price_per_tick: u128,
+        ticks: u128,
+        cycle_budget: u128,
+        auto_renew: bool,
+    ) -> Result<Vec<InferenceSubscriptionPlacement>> {
+        let account_id = ob.bare().to_string();
+        let messages =
+            fetch_all_ext_out_messages(&self.http, self.client.endpoint(), &account_id).await?;
+        let buyer_note = buyer_note.with_workchain();
+        let mut placements = Vec::new();
+        for message in messages {
+            let Some(mut placement) =
+                super::order_events::decode_subscription_placement(&message.body)?
+            else {
+                continue;
+            };
+            let owner = Address::parse(&placement.buyer_note)
+                .map_err(|error| {
+                    anyhow!(
+                        "InferenceSubscriptionPlaced buyerNote {}: {error}",
+                        placement.buyer_note
+                    )
+                })?
+                .with_workchain();
+            if placement.order_id < order_id_floor
+                || !owner.eq_ignore_ascii_case(&buyer_note)
+                || placement.max_price_per_tick != max_price_per_tick
+                || placement.ticks != ticks
+                || placement.cycle_budget != cycle_budget
+                || placement.auto_renew != auto_renew
+            {
+                continue;
+            }
+            placement.buyer_note = owner;
+            placement.created_at = message.created_at.try_into().map_err(|_| {
+                anyhow!(
+                    "InferenceSubscriptionPlaced order #{} created_at exceeds i64",
+                    placement.order_id
+                )
+            })?;
+            placements.push(placement);
+        }
+        placements.sort_by_key(|placement| (placement.order_id, placement.created_at));
+        placements.dedup_by_key(|placement| placement.order_id);
+        Ok(placements)
     }
 
     /// The book's `getWeeklyMedianPrice` getter. `None` means the book is inactive; a live active
@@ -1583,7 +2410,7 @@ impl RealChainBackend {
             .map(Some)
     }
 
-    /// The book's `getOrder(id)` getter -- resolves a specific order/offer(note, `tokenContract`, price...).
+    /// The book's `getOrder(id)` getter — resolves a specific order/offer (note, `tokenContract`, price…).
     pub async fn inference_orderbook_order(&self, ob: &Address, id: u128) -> Result<Option<Value>> {
         self.client
             .run_getter(
@@ -1595,8 +2422,35 @@ impl RealChainBackend {
             .await
     }
 
+    pub async fn inference_buyer_order_is_active_for_owner(
+        &self,
+        ob: &Address,
+        order_id: u128,
+        owner_note: &str,
+    ) -> Result<bool> {
+        let Some(order) = self.inference_orderbook_order(ob, order_id).await? else {
+            return Ok(false);
+        };
+        let Some(note) = order.get("note").and_then(Value::as_str) else {
+            return Err(anyhow!("getOrder({order_id}) has no owner note: {order}"));
+        };
+        let note = Address::parse(note)
+            .map_err(|error| anyhow!("getOrder({order_id}) owner note {note}: {error}"))?
+            .with_workchain();
+        let owner_note = Address::parse(owner_note)
+            .map_err(|error| anyhow!("expected owner note {owner_note}: {error}"))?
+            .with_workchain();
+        let is_buy = order
+            .get("isBuy")
+            .and_then(Value::as_bool)
+            .ok_or_else(|| anyhow!("getOrder({order_id}) has no isBuy: {order}"))?;
+        let amount = getter_u128(&order, "amount")
+            .ok_or_else(|| anyhow!("getOrder({order_id}) has no amount: {order}"))?;
+        Ok(is_buy && amount > 0 && note.eq_ignore_ascii_case(&owner_note))
+    }
+
     /// The book's `getSubscription(orderId)` getter. `exists=false` means the order is not a live
-    /// subscription(it may be a plain order, cancelled, filled, or expired).
+    /// subscription (it may be a plain order, cancelled, filled, or expired).
     pub async fn inference_orderbook_subscription(
         &self,
         ob: &Address,
@@ -1656,23 +2510,14 @@ impl RealChainBackend {
         )))
     }
 
-    /// The seller(note) posts an offer into the on-chain book -- `postSellOffer(modelHash, pricePerTick,
-    /// maxTicks, tokenContract, flags, nonce)` (the note derives the book address from `modelHash`; owner =
-    /// `msg.sender` = note). `flags=0` -- a plain limit: the offer rests in the order book as an ask.
-    /// The deployed 4.0.6 `PrivateNote`(`c8a81f54`, live-verified -- RootPN `fc1d445d` updateCode'd to it)
-    /// `postSellOffer` **takes `nonce`**: the IOB re-derives the per-deal `TokenContract` address as
-    /// `_tokenContractAddr(sellerPubkey, nonce)` and rejects the offer(no ask rests) unless the supplied
-    /// `tokenContract` matches. The same `nonce` is the `_nonce` static the
-    /// TC is deployed with.
-    #[allow(clippy::too_many_arguments)]
+    /// The seller submits exactly one owner-signed external call to the note:
+    /// `postSellOffer(flags, nonce)`. In 4.0.26 the note derives the canonical per-deal
+    /// `TokenContract`, and the TC supplies its constructor-bound model, price, maximum ticks,
+    /// and seller note when it posts the ask internally. `flags=0` is a plain resting limit.
     pub async fn post_sell_offer(
         &self,
         note: &Address,
         owner_keys: &KeyPair,
-        model_hash: &str,
-        price_per_tick: u128,
-        max_ticks: u128,
-        token_contract: &Address,
         flags: u8,
         nonce: u64,
     ) -> Result<Value> {
@@ -1681,10 +2526,6 @@ impl RealChainBackend {
             PRIVATENOTE_ABI,
             "postSellOffer",
             json!({
-                "modelHash": model_hash,
-                "pricePerTick": price_per_tick.to_string(),
-                "maxTicks": max_ticks.to_string(),
-                "tokenContract": token_contract.with_workchain(),
                 "flags": flags,
                 "nonce": nonce.to_string(),
             }),
@@ -1693,10 +2534,10 @@ impl RealChainBackend {
         .await
     }
 
-    /// The buyer(note) places a limit buy for inference -- `placeInferenceBuy(modelHash,
-    /// maxPricePerTick, ticks, escrow, flags, deadline)`(signed with the note's owner key). The escrow is ECC
-    /// SHELL(currency 2): the note moves `escrow` from its ECC balance into the book. `deadline=0` = GTC.
-    /// If `maxPricePerTick` >= the resting ask -- a match happens immediately(the book calls `fundFromOrderBook` on the TC).
+    /// The buyer (note) places a limit buy for inference — `placeInferenceBuy(modelHash,
+    /// maxPricePerTick, ticks, escrow, flags, deadline)` (signed with the note's owner key). The escrow is ECC
+    /// SHELL (currency 2): the note moves `escrow` from its ECC balance into the book. `deadline=0` = GTC.
+    /// If `maxPricePerTick` ≥ the resting ask — a match happens immediately (the book calls `fundFromOrderBook` on the TC).
     #[allow(clippy::too_many_arguments)]
     pub async fn place_inference_buy(
         &self,
@@ -1726,7 +2567,57 @@ impl RealChainBackend {
         .await
     }
 
-    /// The buyer(note) places a recurring inference subscription through
+    /// Prepare the exact signed buy BOC and route, prime the owner-fill cursor, persist its
+    /// identity through `before_post`, then use the existing no-redirect money client once.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn place_inference_buy_with_submit_identity(
+        &self,
+        note: &Address,
+        owner_keys: &KeyPair,
+        order_book: &Address,
+        model_hash: &str,
+        max_price_per_tick: u128,
+        ticks: u128,
+        escrow: u128,
+        flags: u8,
+        deadline: u64,
+        cursor: &mut MatchWatchCursor,
+        before_post: &mut (dyn FnMut(String, MatchWatchCursor) -> Result<()> + Send),
+    ) -> Result<Value> {
+        let (endpoint, boc, account_id, dapp_id) = self
+            .prepare_money_post(
+                note,
+                PRIVATENOTE_ABI,
+                "placeInferenceBuy",
+                json!({
+                    "modelHash": model_hash,
+                    "maxPricePerTick": max_price_per_tick.to_string(),
+                    "ticks": ticks.to_string(),
+                    "escrow": escrow.to_string(),
+                    "flags": flags,
+                    "deadline": deadline.to_string(),
+                }),
+                owner_keys,
+            )
+            .await?;
+        let mut final_cursor = MatchWatchCursor::new(0);
+        self.poll_inference_filled_tcs(note, order_book, true, &mut final_cursor)
+            .await
+            .map_err(|source| anyhow::Error::new(MoneySubmitError::Preparation { source }))?;
+        *cursor = final_cursor;
+        before_post(money_submit_identity(&boc), cursor.clone())
+            .map_err(|source| anyhow::Error::new(MoneySubmitError::Preparation { source }))?;
+        send_message_routed_money_once(
+            &self.money_post_http,
+            &endpoint,
+            &boc,
+            &account_id,
+            &dapp_id,
+        )
+        .await
+    }
+
+    /// The buyer (note) places a recurring inference subscription through
     /// `PrivateNote.placeInferenceSubscription`. The escrow is exact fee-inclusive SHELL selected by
     /// the CLI; surplus is intentionally not sent.
     #[allow(clippy::too_many_arguments)]
@@ -1740,18 +2631,96 @@ impl RealChainBackend {
         escrow: u128,
         auto_renew: bool,
     ) -> Result<Value> {
-        self.submit(
+        let order_book = self
+            .inference_orderbook_address(note, model_hash, MODEL_TICK_SIZE)
+            .await?;
+        let mut fill_cursor = MatchWatchCursor::new(0);
+        let mut ignore_identity =
+            |_: String, _: u128, _: MatchWatchCursor, _: Vec<(u128, MatchedFill)>| Ok(());
+        self.place_inference_subscription_with_identity_and_cursors(
             note,
-            PRIVATENOTE_ABI,
-            "placeInferenceSubscription",
-            json!({
-                "modelHash": model_hash,
-                "maxPricePerTick": max_price_per_tick.to_string(),
-                "ticks": ticks.to_string(),
-                "escrow": escrow.to_string(),
-                "autoRenew": auto_renew,
-            }),
             owner_keys,
+            &order_book,
+            model_hash,
+            max_price_per_tick,
+            ticks,
+            escrow,
+            auto_renew,
+            &mut fill_cursor,
+            &mut ignore_identity,
+        )
+        .await
+    }
+
+    /// Prepare one subscription money message, anchor its placement/fill cursors,
+    /// persist its identity through `before_post`, then POST exactly once.
+    #[allow(clippy::too_many_arguments, clippy::type_complexity)]
+    pub async fn place_inference_subscription_with_identity_and_cursors(
+        &self,
+        note: &Address,
+        owner_keys: &KeyPair,
+        order_book: &Address,
+        model_hash: &str,
+        max_price_per_tick: u128,
+        ticks: u128,
+        escrow: u128,
+        auto_renew: bool,
+        fill_cursor: &mut MatchWatchCursor,
+        before_post: &mut (dyn FnMut(String, u128, MatchWatchCursor, Vec<(u128, MatchedFill)>) -> Result<()>
+                  + Send),
+    ) -> Result<Value> {
+        let (endpoint, boc, account_id, dapp_id) = self
+            .prepare_money_post(
+                note,
+                PRIVATENOTE_ABI,
+                "placeInferenceSubscription",
+                json!({
+                    "modelHash": model_hash,
+                    "maxPricePerTick": max_price_per_tick.to_string(),
+                    "ticks": ticks.to_string(),
+                    "escrow": escrow.to_string(),
+                    "autoRenew": auto_renew,
+                }),
+                owner_keys,
+            )
+            .await?;
+        let stats = self
+            .inference_orderbook_stats(order_book)
+            .await
+            .map_err(|source| anyhow::Error::new(MoneySubmitError::Preparation { source }))?
+            .ok_or_else(|| {
+                anyhow::Error::new(MoneySubmitError::Preparation {
+                    source: anyhow!(
+                        "InferenceOrderBook {} is not active before subscription POST",
+                        order_book.with_workchain()
+                    ),
+                })
+            })?;
+        let order_id_floor = stats
+            .get("nextOrderId")
+            .and_then(value_u128)
+            .ok_or_else(|| {
+                anyhow::Error::new(MoneySubmitError::Preparation {
+                    source: anyhow!("getStats returned no valid nextOrderId: {stats}"),
+                })
+            })?;
+        let pre_post_fills = self
+            .poll_inference_attributed_fills(note, order_book, fill_cursor)
+            .await
+            .map_err(|source| anyhow::Error::new(MoneySubmitError::Preparation { source }))?;
+        before_post(
+            money_submit_identity(&boc),
+            order_id_floor,
+            fill_cursor.clone(),
+            pre_post_fills,
+        )
+        .map_err(|source| anyhow::Error::new(MoneySubmitError::Preparation { source }))?;
+        send_message_routed_money_once(
+            &self.money_post_http,
+            &endpoint,
+            &boc,
+            &account_id,
+            &dapp_id,
         )
         .await
     }
@@ -1795,7 +2764,7 @@ impl RealChainBackend {
     }
 
     /// The `getState` getter of the `TokenContract` deal (`funded`, `opened`, `probeAccepted`, `disputed`,
-    /// `deposit`, `prepaid`, `frozen`, `finalizedOwed`,...). After a match `funded` becomes `true`
+    /// `deposit`, `prepaid`, `frozen`, `finalizedOwed`, …). After a match `funded` becomes `true`
     /// (the book funded the TC via `fundFromOrderBook`). `None` if the TC is not active.
     pub async fn token_contract_state(&self, tc: &Address) -> Result<Option<Value>> {
         self.client
@@ -1803,32 +2772,189 @@ impl RealChainBackend {
             .await
     }
 
-    /// The `getProbe` getter of the deal(`probeFunded`, `probeLocked`, `probeCommission`).
+    /// The `getProbe` getter of the deal (`probeFunded`, `probeLocked`, `probeCommission`).
     pub async fn token_contract_probe(&self, tc: &Address) -> Result<Option<Value>> {
         self.client
             .run_getter(tc, TOKENCONTRACT_ABI, "getProbe", json!({}))
             .await
     }
 
-    /// The `getConfig` getter of the deal(`TokenContract`, 4.0.5 `view`): the per-deal
-    /// `settleWindow`/`streamTimeout`(dynamic, scaled by `pricePerTick`) plus `platformFeeBps` and
+    /// The `getConfig` getter of the deal (`TokenContract`, 4.0.5 `view`): the per-deal
+    /// `settleWindow`/`streamTimeout` (dynamic, scaled by `pricePerTick`) plus `platformFeeBps` and
     /// `disputeWindow`. The seller advance driver reads this per deal to time the stream cadence
-    /// (`settleWindow`) and reclaim/timeout(`streamTimeout`); the fixed probe window is NOT in here
-    /// . `None` if the TC is not active.
+    /// (`settleWindow`) and reclaim/timeout (`streamTimeout`); the fixed probe window is NOT in here
+    /// (§9.1, issue #37). `None` if the TC is not active.
     pub async fn token_contract_config(&self, tc: &Address) -> Result<Option<Value>> {
         self.client
             .run_getter(tc, TOKENCONTRACT_ABI, "getConfig", json!({}))
             .await
     }
 
-    /// The `getStreamLocks` getter of the `PrivateNote` note(`streamCount`, `disputeCount`, `lastChange`):
-    /// direct proof that "the note is locked". After `TC.dispute()` both notes have
-    /// `disputeCount > 0` -- until the dispute is resolved, a new offer/withdrawal from the note is rejected
+    /// The `getStreamLocks` getter of the `PrivateNote` note (`streamCount`, `disputeCount`, `lastChange`):
+    /// direct proof that "the note is locked" (directive 5, §4.2). After `TC.dispute()` both notes have
+    /// `disputeCount > 0` — until the dispute is resolved, a new offer/withdrawal from the note is rejected
     /// (`ERR_STREAM_LOCKED`). `None` if the note is not active.
     pub async fn note_stream_locks(&self, note: &Address) -> Result<Option<Value>> {
         self.client
             .run_getter(note, PRIVATENOTE_ABI, "getStreamLocks", json!({}))
             .await
+    }
+
+    /// Read only the authoritative `getStreamLocks` counters and `lastChange`, without the
+    /// transaction-history reconstruction performed by [`Self::note_stream_lock_status`].
+    pub async fn note_stream_lock_snapshot(
+        &self,
+        note: &Address,
+    ) -> Result<Option<NoteStreamLockSnapshot>> {
+        let Some(raw) = self.note_stream_locks(note).await? else {
+            return Ok(None);
+        };
+        let stream_count: u32 = getter_u128(&raw, "streamCount")
+            .ok_or_else(|| anyhow!("PrivateNote {note} getStreamLocks has no streamCount"))?
+            .try_into()
+            .map_err(|_| anyhow!("PrivateNote {note} streamCount exceeds u32"))?;
+        let dispute_count: u32 = getter_u128(&raw, "disputeCount")
+            .ok_or_else(|| anyhow!("PrivateNote {note} getStreamLocks has no disputeCount"))?
+            .try_into()
+            .map_err(|_| anyhow!("PrivateNote {note} disputeCount exceeds u32"))?;
+        let last_change_unix: u64 = getter_u128(&raw, "lastChange")
+            .ok_or_else(|| anyhow!("PrivateNote {note} getStreamLocks has no lastChange"))?
+            .try_into()
+            .map_err(|_| anyhow!("PrivateNote {note} lastChange exceeds u64"))?;
+        Ok(Some(NoteStreamLockSnapshot {
+            stream_count,
+            dispute_count,
+            last_change_unix,
+        }))
+    }
+
+    /// Read the authoritative lock counters and reconstruct the active deal addresses from successful
+    /// inbound `stream*Lock`/`stream*Unlock` calls. `forceClearStreamLocks` is folded as a reset.
+    pub async fn note_stream_lock_status(
+        &self,
+        note: &Address,
+    ) -> Result<Option<NoteStreamLockStatus>> {
+        let Some(snapshot) = self.note_stream_lock_snapshot(note).await? else {
+            return Ok(None);
+        };
+        let entries = if snapshot.stream_count == 0 && snapshot.dispute_count == 0 {
+            Vec::new()
+        } else {
+            self.note_stream_lock_entries(note).await?
+        };
+        Ok(Some(NoteStreamLockStatus::from_entries(
+            snapshot.stream_count,
+            snapshot.dispute_count,
+            snapshot.last_change_unix,
+            entries,
+        )))
+    }
+
+    async fn note_stream_lock_entries(&self, note: &Address) -> Result<Vec<NoteStreamLockEntry>> {
+        const PAGE_SIZE: u32 = 1_000;
+        let account_id = note.bare().to_string();
+        let endpoint = self.client.endpoint().trim_end_matches('/');
+        let dapp_id = fetch_dapp_id(&self.http, endpoint, &account_id).await?;
+        let gql = format!("{endpoint}/graphql");
+        let query = r#"
+            query($accountId: String!, $dappId: String!, $last: Int!, $before: String) {
+              blockchain {
+                account(account_id: $accountId, dapp_id: $dappId) {
+                  messages(msg_type: [ExtIn, IntIn], last: $last, before: $before) {
+                    pageInfo { startCursor hasPreviousPage }
+                    edges {
+                      cursor
+                      node {
+                        id body src created_at
+                        dst_transaction {
+                          aborted
+                          compute { exit_code success }
+                          action { result_code success }
+                        }
+                      }
+                    }
+                  }
+                }
+              }
+            }
+        "#;
+        let mut before: Option<String> = None;
+        let mut seen = BTreeSet::new();
+        let mut decoded = Vec::new();
+        loop {
+            let response: Value = self
+                .http
+                .post(&gql)
+                .json(&json!({
+                    "query": query,
+                    "variables": {
+                        "accountId": account_id.as_str(),
+                        "dappId": dapp_id.as_str(),
+                        "last": PAGE_SIZE,
+                        "before": before.as_deref(),
+                    },
+                }))
+                .send()
+                .await?
+                .error_for_status()?
+                .json()
+                .await?;
+            if let Some(errors) = response.get("errors") {
+                return Err(anyhow!(
+                    "PrivateNote {note} inbound-message GraphQL errors: {errors}"
+                ));
+            }
+            let messages = response
+                .pointer("/data/blockchain/account/messages")
+                .ok_or_else(|| {
+                    anyhow!("PrivateNote {note} inbound-message GraphQL shape changed: {response}")
+                })?;
+            let edges = messages["edges"].as_array().ok_or_else(|| {
+                anyhow!("PrivateNote {note} inbound-message GraphQL edges missing: {response}")
+            })?;
+            for edge in edges {
+                let cursor = edge["cursor"]
+                    .as_str()
+                    .ok_or_else(|| anyhow!("PrivateNote {note} inbound message has no cursor"))?;
+                let node = &edge["node"];
+                let id = node["id"].as_str().unwrap_or(cursor);
+                if !seen.insert(id.to_string()) {
+                    continue;
+                }
+                let Some((created_at, body, internal, internal_source)) =
+                    successful_inbound_lock_call(node)?
+                else {
+                    continue;
+                };
+                decoded.push((
+                    created_at,
+                    cursor.to_string(),
+                    body.to_string(),
+                    internal,
+                    internal_source.map(str::to_string),
+                ));
+            }
+            let Some(next) = previous_page_cursor(
+                &format!("PrivateNote {note} inbound-message"),
+                messages,
+                before.as_deref(),
+            )?
+            else {
+                break;
+            };
+            before = Some(next);
+        }
+        decoded.sort_by(|left, right| (left.0, &left.1).cmp(&(right.0, &right.1)));
+        reconstruct_note_stream_lock_entries(decoded.iter().map(
+            |(created_at, _, body, internal, internal_source)| {
+                (
+                    *created_at,
+                    body.as_str(),
+                    *internal,
+                    internal_source.as_deref(),
+                )
+            },
+        ))
     }
 
     /// Read-only `PrivateNote.getDetails()`: public balance/lock maps and metadata, no key and no signed call.
@@ -1838,7 +2964,45 @@ impl RealChainBackend {
             .await
     }
 
-    /// read-only seller preflight for the contract's final-withdrawal latch. `withdrawTokens` sets
+    /// Read-only buyer preflight for the final-withdrawal latch. A withdrawn PrivateNote cannot call
+    /// `placeInferenceBuy`; detect that state before any money write and return the actionable chain
+    /// refusal instead of the raw exit code. Read errors are retried because a transient getter failure
+    /// is not evidence that the note withdrew. Older contract generations without `hasWithdrawn` remain
+    /// usable: the guard records that it could not inspect the latch and fails open.
+    pub async fn assert_note_can_place_inference_buy(&self, note: &Address) -> Result<()> {
+        const ATTEMPTS: u32 = 3;
+        let mut delay = std::time::Duration::from_millis(250);
+        let mut details = None;
+        for attempt in 1..=ATTEMPTS {
+            match self.private_note_details(note).await {
+                Ok(value) => {
+                    details = Some(value);
+                    break;
+                }
+                Err(error) if attempt < ATTEMPTS => {
+                    eprintln!(
+                        "buyer place preflight getDetails read failed (attempt {attempt}/{ATTEMPTS}): \
+                         {error}; retrying after {delay:?}"
+                    );
+                    tokio::time::sleep(delay).await;
+                    delay *= 2;
+                }
+                Err(error) => {
+                    return Err(error).with_context(|| {
+                        format!(
+                            "buyer place preflight could not read PrivateNote.getDetails for note {note} \
+                             after {ATTEMPTS} attempts"
+                        )
+                    });
+                }
+            }
+        }
+        let details =
+            details.expect("buyer note details retry loop must return or record a result");
+        buyer_note_withdrawn_guard(note, details.as_ref())
+    }
+
+    /// #335: read-only seller preflight for the contract's final-withdrawal latch. `withdrawTokens` sets
     /// `_hasWithdrawn=true`; after that `PrivateNote.postSellOffer` is permanently blocked by
     /// `ERR_INVALID_STATE` 151. Keep that semantics and fail before any seller write.
     pub async fn assert_note_can_post_sell_offer(&self, note: &Address) -> Result<()> {
@@ -1860,9 +3024,9 @@ impl RealChainBackend {
         Ok(())
     }
 
-    /// Directive -- the note pre-funds its own RootModel + TC **uninit deploy addresses** from its ECC[2],
-    /// via the `PrivateNote` owner-method `fundDeployShell(nonce, rootModelShell, tcShell)`(4.0.7). The note
-    /// derives both targets internally from `(ephemeralPubkey, nonce)`, so no caller-supplied address -- this
+    /// Directive #58 — the note pre-funds its own RootModel + TC **uninit deploy addresses** from its ECC[2],
+    /// via the `PrivateNote` owner-method `fundDeployShell(nonce, rootModelShell, tcShell)` (4.0.7). The note
+    /// derives both targets internally from `(ephemeralPubkey, nonce)`, so no caller-supplied address — this
     /// replaces the operator multisig's [`fund_deploy_from_wallet_ecc`](Self::fund_deploy_from_wallet_ecc) on the
     /// operate path. The RootModel/TC *deploys* stay external seller-signed; this call only pre-funds. The call is
     /// an external owner-signed message to the note, exactly like [`deploy_inference_orderbook`](Self::deploy_inference_orderbook).
@@ -1945,7 +3109,7 @@ impl RealChainBackend {
         );
     }
 
-    /// before an active RootModel / per-deal TC write, ensure the contract still has native
+    /// #70: before an active RootModel / per-deal TC write, ensure the contract still has native
     /// vmshell gas. `fundDeployShell` is seller-note-owned and derives both targets from
     /// `(seller pubkey, nonce)`, so only call this from paths that hold the seller note/key/nonce.
     pub async fn ensure_deal_contract_gas(
@@ -1995,8 +3159,8 @@ impl RealChainBackend {
         Ok(())
     }
 
-    /// Directive -- the note posts the probe-commission to the nonce-derived `TokenContract` from its own
-    /// ECC[2], via the `PrivateNote` owner-method `postProbeCommission(nonce, amount)`(4.0.7) -- replaces the
+    /// Directive #58 — the note posts the probe-commission to the nonce-derived `TokenContract` from its own
+    /// ECC[2], via the `PrivateNote` owner-method `postProbeCommission(nonce, amount)` (4.0.7) — replaces the
     /// operator multisig's [`fund_probe_commission`](Self::fund_probe_commission). External owner-signed message.
     pub async fn note_post_probe_commission(
         &self,
@@ -2018,9 +3182,9 @@ impl RealChainBackend {
         .await
     }
 
-    /// The seller opens a stream session: `open(endpointCipher)`(external signature `_sellerPubkey`).
-    /// Freezes a probe-tick from the deposit
-    /// and writes the endpoint cipher -- handover(`RealNote::encrypt_to` to the buyer's x25519 pubkey).
+    /// The seller opens a stream session: `open(endpointCipher)` (external signature `_sellerPubkey`).
+    /// Freezes a probe-tick from the deposit (`_frozen=P`, `_opened=true`, `_probeAccepted=false`, §3.1.2)
+    /// and writes the endpoint cipher — handover §3.1 (`RealNote::encrypt_to` to the buyer's x25519 pubkey).
     pub async fn open_stream(
         &self,
         tc: &Address,
@@ -2037,23 +3201,23 @@ impl RealChainBackend {
         .await
     }
 
-    /// The seller advances the stream: `advance()`(external signature `_sellerPubkey`). The first call after
-    /// `SETTLE_WINDOW`(180s) accepts the probe (probe-tick -> seller, commission is returned, sets the
+    /// The seller advances the stream: `advance()` (external signature `_sellerPubkey`). The first call after
+    /// `SETTLE_WINDOW` (180s) accepts the probe (probe-tick → seller, commission is returned, sets the
     /// two-tick invariant); afterwards it finalizes the delivered tick.
     pub async fn advance_stream(&self, tc: &Address, seller_keys: &KeyPair) -> Result<Value> {
         self.submit(tc, TOKENCONTRACT_ABI, "advance", json!({}), seller_keys)
             .await
     }
 
-    /// the seller CLOSES a STOPped deal's `TokenContract`. `destroy(payoutAddress)` is
+    /// #65: the seller CLOSES a STOPped deal's `TokenContract`. `destroy(payoutAddress)` is
     /// `onlyOwnerPubkey(_sellerPubkey)`, gated `!_opened && !_disputed` (the buyer's `stop()` clears
-    /// `_opened` on close), and calls `selfdestruct(payoutAddress)`(`contracts/airegistry/TokenContract.sol:651`).
-    /// External call, signed by the seller owner key(matches `_sellerPubkey`).
-    /// **DESTRUCTIVE / BURNS(by-fact, 4.0.7):** the held ~`MIN_BALANCE` reserve does NOT recover to `payout`
-    /// when `payout` is the cross-dapp note -- the note balance does not increase(reproduced x2). The deploy
-    /// *funding* crossed dapps via `fundDeployShell` flag:16(credited); the raw `selfdestruct` *return* crossing
-    /// the boundary is not credited -> the reserve is **burned at destroy**. So this closes the TC; reclaiming the
-    /// reserve to the note would need a `TokenContract` flag:16/dapp-credit return fix(contract-side).
+    /// `_opened` on close), and calls `selfdestruct(payoutAddress)` (`contracts/airegistry/TokenContract.sol:651`).
+    /// External call, signed by the seller owner key (matches `_sellerPubkey`).
+    /// **DESTRUCTIVE / BURNS (by-fact, 4.0.7):** the held ~`MIN_BALANCE` reserve does NOT recover to `payout`
+    /// when `payout` is the cross-dapp note — the note balance does not increase (reproduced ×2). The deploy
+    /// *funding* crossed dapps via `fundDeployShell` flag:16 (credited); the raw `selfdestruct` *return* crossing
+    /// the boundary is not credited → the reserve is **burned at destroy**. So this closes the TC; reclaiming the
+    /// reserve to the note would need a `TokenContract` flag:16/dapp-credit return fix (contract-side).
     /// NOT the dex/PMP oracle lifecycle.
     pub async fn destroy_token_contract(
         &self,
@@ -2071,10 +3235,10 @@ impl RealChainBackend {
         .await
     }
 
-    /// The seller **concedes the dispute**: `releaseDispute()` on the TC (`onlyOwnerPubkey(_sellerPubkey)`) ->
+    /// The seller **concedes the dispute**: `releaseDispute()` on the TC (`onlyOwnerPubkey(_sellerPubkey)`) →
     /// unlocks BOTH notes and **returns the tick to the buyer** (on the probe: probe+deposit to the buyer,
-    /// commission to the seller, NO burn -- a concession is not a stop,/). Symmetric to `stream_dispute`,
-    /// closing the anti-scam cycle of(lock -> resolution -> tick return).
+    /// commission to the seller, NO burn — a concession is not a stop, §4.2/§3.1.2). Symmetric to `stream_dispute`,
+    /// closing the anti-scam cycle of directive 5 (lock → resolution → tick return).
     pub async fn release_dispute(&self, tc: &Address, seller_keys: &KeyPair) -> Result<Value> {
         self.submit(
             tc,
@@ -2109,8 +3273,8 @@ impl RealChainBackend {
     }
 
     /// Submit owner-signed `PrivateNote.withdrawTokens(destWalletAddr, dapp_id)` for a note's available token
-    /// balances. `dapp_id` is event metadata only(surfaced in `TokensWithdrawn`, drives no logic) -- taken from
-    /// the deployed manifest. Fails on-chain if the note is stream-locked. Returns
+    /// balances. `dapp_id` is event metadata only (surfaced in `TokensWithdrawn`, drives no logic) — taken from
+    /// the deployed manifest. Fails on-chain if the note is stream-locked (`ERR_STREAM_LOCKED`, §4.2). Returns
     /// the submit result. Do not treat this helper as proof that every native/ECC balance is fully retired
     /// without by-fact evidence on the current deployed contract.
     pub async fn withdraw_note_tokens(
@@ -2121,7 +3285,7 @@ impl RealChainBackend {
     ) -> Result<Value> {
         // One-shot guard: `withdrawTokens` sets `_hasWithdrawn=true` and reverts `ERR_INVALID_STATE` on a
         // re-call. Read `getDetails().hasWithdrawn` and fail
-        // LOUD with a clear reason instead of the opaque `TVM_ERROR(compute phase)` the revert would produce.
+        // LOUD with a clear reason instead of the opaque `TVM_ERROR (compute phase)` the revert would produce.
         if let Some(d) = self
             .client
             .run_getter(note, PRIVATENOTE_ABI, "getDetails", json!({}))
@@ -2130,7 +3294,7 @@ impl RealChainBackend {
             let already = details_has_withdrawn(&d).unwrap_or(false);
             if already {
                 return Err(anyhow!(
-                    "note {note} was already withdrawn -- `withdrawTokens` is one-shot per note. Re-check the \
+                    "note {note} was already withdrawn — `withdrawTokens` is one-shot per note. Re-check the \
                      note/wallet on-chain before assuming any remaining balance is withdrawable."
                 ));
             }
@@ -2146,9 +3310,9 @@ impl RealChainBackend {
         .await
     }
 
-    /// The buyer stops the stream via their note: `streamStop(tokenContract)` -> `TC.stop()`
-    /// (the TC checks `msg.sender == _buyer`). On the probe(before accept) -- burns the probe-tick and commission
-    /// + returns the remaining deposit; in Streaming -- a standard split.
+    /// The buyer stops the stream via their note: `streamStop(tokenContract)` → `TC.stop()`
+    /// (the TC checks `msg.sender == _buyer`). On the probe (before accept) — burns the probe-tick and commission
+    /// (ProbeBurned, §3.1.2) + returns the remaining deposit; in Streaming — a standard split (§4.1).
     pub async fn stream_stop(
         &self,
         buyer_note: &Address,
@@ -2165,11 +3329,11 @@ impl RealChainBackend {
         .await
     }
 
-    /// The buyer **opens a dispute** via their note: `streamDispute(tokenContract)` -> `TC.dispute()`
+    /// The buyer **opens a dispute** via their note: `streamDispute(tokenContract)` → `TC.dispute()`
     /// (the TC checks `msg.sender == _buyer`). `TC.dispute()` locks **both** notes (`streamDisputeLock` on
-    /// `_buyer` and `_sellerNote`,): until the dispute is resolved, new offers/withdrawals from a locked note
-    /// are rejected(`ERR_STREAM_LOCKED`); `releaseDispute()` then returns the tick. The anti-scam `Dispute`
-    /// of -- a real on-chain lock of the scammer's note(strictly stronger than `streamStop`).
+    /// `_buyer` and `_sellerNote`, §4.2): until the dispute is resolved, new offers/withdrawals from a locked note
+    /// are rejected (`ERR_STREAM_LOCKED`); `releaseDispute()` then returns the tick. The anti-scam `Dispute`
+    /// of directive 5 — a real on-chain lock of the scammer's note (strictly stronger than `streamStop`).
     pub async fn stream_dispute(
         &self,
         buyer_note: &Address,
@@ -2186,10 +3350,10 @@ impl RealChainBackend {
         .await
     }
 
-    /// The buyer reclaims the deal on a **seller-inactivity timeout**: the note sends
-    /// `streamReclaim(tokenContract)` -> `TC.reclaimOnTimeout()`. Requires `block.timestamp >=
-    /// _lastAdvance + STREAM_TIMEOUT`(600s) and `_opened`. On the probe(seller no-show) -- **no burn**:
-    /// the probe and deposit are returned to the buyer, the commission to the seller.
+    /// The buyer reclaims the deal on a **seller-inactivity timeout** (§3.4): the note sends
+    /// `streamReclaim(tokenContract)` → `TC.reclaimOnTimeout()`. Requires `block.timestamp >=
+    /// _lastAdvance + STREAM_TIMEOUT` (600s) and `_opened`. On the probe (seller no-show) — **no burn**:
+    /// the probe and deposit are returned to the buyer, the commission to the seller (§9.1, a no-show is not slashed).
     pub async fn reclaim_on_timeout(
         &self,
         buyer_note: &Address,
@@ -2225,14 +3389,14 @@ impl RealChainBackend {
         .await
     }
 
-    /// Directive -- `RootModel` deploy on the **note-funded** path: builds the same deploy message as
+    /// Directive #58 — `RootModel` deploy on the **note-funded** path: builds the same deploy message as
     /// [`deploy_root_model_from_wallet`](Self::deploy_root_model_from_wallet) but assumes the note has already
     /// pre-funded the uninit address with ECC[2] (via [`note_fund_deploy_shell`](Self::note_fund_deploy_shell));
     /// it only sends the external seller-signed deploy and waits for `Active`. No operator wallet.
     pub async fn deploy_root_model_note_funded(&self, owner: &KeyPair) -> Result<Address> {
         let (addr, message_boc_b64) = self.root_model_deploy_msg(owner).await?;
-        // The note already pre-funded the uninit address(`fundDeployShell`); just send the deploy + wait.
-        // Deploy-message send -> `send_deploy_with_retry` tolerates the funded-uninit `/v2/account` 404.
+        // The note already pre-funded the uninit address (`fundDeployShell`); just send the deploy + wait.
+        // Deploy-message send → `send_deploy_with_retry` tolerates the funded-uninit `/v2/account` 404 (#65/#68).
         let submit_err = self.send_deploy_with_retry(&message_boc_b64).await.err();
         if self.wait_active(&addr, 40).await {
             if let Some(e) = submit_err {
@@ -2250,11 +3414,11 @@ impl RealChainBackend {
         }
     }
 
-    /// Build the per-deal `TokenContract` deploy message **and its INIT-DATA(stateInit) address** -- offline,
+    /// Build the per-deal `TokenContract` deploy message **and its INIT-DATA (stateInit) address** — offline,
     /// no send (`build_deploy` + `local_context()`). The single source of the per-deal TC derivation, shared by
     /// [`token_contract_deploy_address`](Self::token_contract_deploy_address) (the getter-free idempotency
-    /// address,) and [`deploy_token_contract_note_funded`](Self::deploy_token_contract_note_funded) (the
-    /// actual deploy) -- so the address checked for idempotency is bit-for-bit the one the deploy creates. The
+    /// address, #68) and [`deploy_token_contract_note_funded`](Self::deploy_token_contract_note_funded) (the
+    /// actual deploy) — so the address checked for idempotency is bit-for-bit the one the deploy creates. The
     /// address is `hash(stateInit)` over `{code, varInit {_sellerPubkey,_rootModelAddress,_nonce,_pubkey}}`;
     /// the ctor args do **not** enter the address but `build_deploy` needs them to encode the message body.
     #[allow(clippy::too_many_arguments)]
@@ -2294,9 +3458,9 @@ impl RealChainBackend {
         Ok((Address::parse(&msg.address)?, msg.message_boc_b64))
     }
 
-    /// Directive -- per-deal `TokenContract` deploy on the **note-funded** path: builds the deploy message
+    /// Directive #58 — per-deal `TokenContract` deploy on the **note-funded** path: builds the deploy message
     /// (the note pre-funded the uninit address via `fundDeployShell`) and sends it, waiting for `Active`. No
-    /// wallet. Shares [`token_contract_deploy_msg`](Self::token_contract_deploy_msg) with the idempotency
+    /// wallet. Shares [`token_contract_deploy_msg`](Self::token_contract_deploy_msg) with the #68 idempotency
     /// derivation, so the deployed address equals the pre-derived one by construction.
     #[allow(clippy::too_many_arguments)]
     pub async fn deploy_token_contract_note_funded(
@@ -2321,8 +3485,8 @@ impl RealChainBackend {
                 seller_note,
             )
             .await?;
-        // The note already pre-funded the uninit address(`fundDeployShell`); just send the deploy + wait.
-        // Deploy-message send -> `send_deploy_with_retry` tolerates the funded-uninit `/v2/account` 404.
+        // The note already pre-funded the uninit address (`fundDeployShell`); just send the deploy + wait.
+        // Deploy-message send → `send_deploy_with_retry` tolerates the funded-uninit `/v2/account` 404 (#65/#68).
         let submit_err = self.send_deploy_with_retry(&message_boc_b64).await.err();
         if self.wait_active(&addr, 40).await {
             if let Some(e) = submit_err {
@@ -2340,16 +3504,17 @@ impl RealChainBackend {
         }
     }
 
-    /// Provision a per-deal market for the seller (issue; **note-funded,** -- NO operator wallet, NO
+    /// Provision a per-deal market for the seller (issue #24; **note-funded, #58** — NO operator wallet, NO
     /// giver in the operate path): deploy-if-absent the per-model `InferenceOrderBook`, the per-owner
     /// `RootModel`, and the per-deal `TokenContract`, **all funded from the seller note's own ECC[2]**. Returns a
     /// [`MarketManifest`] whose `token_contract` is the **active** deployed address.
-    /// The per-deal `TokenContract`(and `RootModel`) is a self-dapp contract whose uninit cross-dapp deploy
-    /// address cannot be funded with privileged native gas(the 404). Instead the note pre-funds each uninit
+    ///
+    /// The per-deal `TokenContract` (and `RootModel`) is a self-dapp contract whose uninit cross-dapp deploy
+    /// address cannot be funded with privileged native gas (the 404). Instead the note pre-funds each uninit
     /// deploy address with **ECC[2] SHELL** via [`note_fund_deploy_shell`](Self::note_fund_deploy_shell)
     /// (`PrivateNote.fundDeployShell`, a single `flag:16` send so the ECC lands as spendable native balance), and
-    /// the external seller-signed deploy then activates it -- the permission-free mechanism, no privileged giver,
-    /// no separate operational wallet(the funding source is the anonymous note itself). `gas` is the ECC[2]
+    /// the external seller-signed deploy then activates it — the permission-free mechanism, no privileged giver,
+    /// no separate operational wallet (the funding source is the anonymous note itself). `gas` is the ECC[2]
     /// SHELL pre-funded per uninit deploy address.
     #[allow(clippy::too_many_arguments)]
     pub async fn provision_market(
@@ -2362,10 +3527,10 @@ impl RealChainBackend {
         max_ticks: u128,
         gas: u128,
     ) -> Result<crate::MarketManifest> {
-        // fail-closed up front if the seller note is orphaned by a contract redeploy -- a clear
-        // "re-mint" error instead of a downstream bare TVM_ERROR(stale note) or "note is not active".
+        // #83: fail-closed up front if the seller note is orphaned by a contract redeploy — a clear
+        // "re-mint" error instead of a downstream bare TVM_ERROR (stale note) or "note is not active".
         self.assert_seller_note_current(note).await?;
-        // 1) Per-model InferenceOrderBook -- note-funded(owner-method). Deploy-if-absent.
+        // 1) Per-model InferenceOrderBook — note-funded (owner-method). Deploy-if-absent.
         let model_hash = model_hash_for(frame_model);
         let ob = self
             .inference_orderbook_address(note, &model_hash, MODEL_TICK_SIZE)
@@ -2383,14 +3548,14 @@ impl RealChainBackend {
                 return Err(anyhow!("InferenceOrderBook {ob} did not activate"));
             }
         }
-        // 2) RootModel + per-deal TokenContract -- NOTE-FUNDED: no operator multisig. The note pre-funds
-        // each uninit deploy address from its own ECC[2] (`fundDeployShell`, the note derives the targets from
-        // `(ephemeralPubkey, nonce)`), then the external seller-signed deploy activates it. ORDER MATTERS: the
-        // RootModel is deployed first so the per-deal TC registers into it in its ctor; the TC address itself is
-        // derived **locally from the deploy INIT-DATA**, NOT by querying
-        // the RootModel `getTokenContractAddress` getter -- so neither a fixed-superroot shellnet restart nor
-        // a not-yet-`Active` RootModel can 404 the idempotency check. The getter is used only as a post-`Active`
-        // cross-check below.
+        // 2) RootModel + per-deal TokenContract — NOTE-FUNDED (#58): no operator multisig. The note pre-funds
+        //    each uninit deploy address from its own ECC[2] (`fundDeployShell`, the note derives the targets from
+        //    `(ephemeralPubkey, nonce)`), then the external seller-signed deploy activates it. ORDER MATTERS: the
+        //    RootModel is deployed first so the per-deal TC registers into it in its ctor; the TC address itself is
+        //    derived **locally from the deploy INIT-DATA** (#68, `token_contract_deploy_address`), NOT by querying
+        //    the RootModel `getTokenContractAddress` getter — so neither a fixed-superroot shellnet restart nor
+        //    a not-yet-`Active` RootModel can 404 the idempotency check. The getter is used only as a post-`Active`
+        //    cross-check below.
         let seller_pubkey = json!(format!("0x{}", seed_keys.public_hex()));
         let (rm, _) = self.root_model_deploy_msg(seed_keys).await?;
         let tc = self
@@ -2407,7 +3572,7 @@ impl RealChainBackend {
             .await?;
         let rm_absent = !self.wait_active(&rm, 1).await;
         if rm_absent {
-            // Pre-fund the RootModel's(and the TC's -- same nonce) uninit deploy addresses, then deploy the RM.
+            // Pre-fund the RootModel's (and the TC's — same nonce) uninit deploy addresses, then deploy the RM.
             self.log_deploy_prefund_snapshot("before fundDeployShell", note, &rm, &tc)
                 .await;
             let prefund = self
@@ -2426,12 +3591,12 @@ impl RealChainBackend {
         }
         self.ensure_deal_contract_gas(note, seed_keys, nonce, Some(&rm), None)
             .await?;
-        // The per-deal TC address is derived from the deploy INIT-DATA(stateInit), NOT the RootModel
-        // `getTokenContractAddress` network getter: on a fresh provision the RootModel deploy was just
-        // sent(step above) but is not yet `Active`, so the getter would 404 and abort this idempotent check.
+        // The per-deal TC address is derived from the deploy INIT-DATA (stateInit), NOT the RootModel
+        // `getTokenContractAddress` network getter (#68): on a fresh provision the RootModel deploy was just
+        // sent (step above) but is not yet `Active`, so the getter would 404 and abort this idempotent check.
         if self.wait_active(&tc, 1).await {
-            // Idempotent skip: the TC is already `Active` => the RootModel is guaranteed `Active`, so the getter
-            // is safe here -- cross-check it agrees with the INIT-DATA derivation (catch a code-hash/derivation
+            // Idempotent skip: the TC is already `Active` ⇒ the RootModel is guaranteed `Active`, so the getter
+            // is safe here — cross-check it agrees with the INIT-DATA derivation (catch a code-hash/derivation
             // divergence between the embedded TC image and the deployed RootModel).
             let getter_tc = self
                 .resolve_token_contract(&rm, &seller_pubkey, nonce)
@@ -2442,7 +3607,7 @@ impl RealChainBackend {
                 ));
             }
         } else {
-            // Deploy-if-absent. If the RootModel was already active(idempotent re-run), the TC was not
+            // Deploy-if-absent. If the RootModel was already active (idempotent re-run), the TC was not
             // pre-funded above.
             if !rm_absent {
                 self.log_deploy_prefund_snapshot("before fundDeployShell", note, &rm, &tc)
@@ -2946,23 +4111,23 @@ impl RealChainBackend {
         ))
     }
 
-    /// fail-closed pre-flight: the seller note must be Active on-chain AND carry the **current**
-    /// `PrivateNote` code(the embedded `PRIVATENOTE_TVC` hash). A `pn_pool` minted before a SuperRoot /
-    /// PrivateNote redeploy is orphaned -- the note is either gone (a later getter 404s as "note is not
+    /// #83 fail-closed pre-flight: the seller note must be Active on-chain AND carry the **current**
+    /// `PrivateNote` code (the embedded `PRIVATENOTE_TVC` hash). A `pn_pool` minted before a SuperRoot /
+    /// PrivateNote redeploy is orphaned — the note is either gone (a later getter 404s as "note is not
     /// active") or runs stale code whose deploy/registration into the rotated SuperRoot throws a bare
     /// `TVM_ERROR` in the compute phase. Catch both here with an actionable "re-mint your pool" message
     /// instead of letting provision fail opaquely downstream.
     pub async fn assert_seller_note_current(&self, note: &Address) -> Result<()> {
         let acc = self.client.get_account(note).await?.ok_or_else(|| {
             anyhow!(
-                "seller note {note} is not on-chain -- the pn_pool is likely orphaned by a contract redeploy \
+                "seller note {note} is not on-chain — the pn_pool is likely orphaned by a contract redeploy \
                  (SuperRoot/PrivateNote rotation). Re-mint against the current contracts (`mint_pn_pool`) and \
                  point DEXDO_PN_POOL at the fresh pool."
             )
         })?;
         if !acc.is_active() {
             return Err(anyhow!(
-                "seller note {note} is {}, not Active -- re-mint the pn_pool against the current contracts \
+                "seller note {note} is {}, not Active — re-mint the pn_pool against the current contracts \
                  (`mint_pn_pool`); a pool minted before a SuperRoot redeploy is orphaned.",
                 acc.status
             ));
@@ -2970,17 +4135,19 @@ impl RealChainBackend {
         note_code_hash_current(note, acc.code_hash.as_deref())
     }
 
-    /// Fund-safety guard for `note withdraw`. A PrivateNote deployed by a
-    /// PREVIOUS contract generation -- its on-chain `code_hash` != the current
-    /// `PRIVATENOTE_PINNED_CODE_HASH` -- still accepts the current-generation `withdrawTokens`
+    /// Fund-safety guard for `note withdraw` (public dexdo-cli#37). A PrivateNote deployed by a
+    /// PREVIOUS contract generation — its on-chain `code_hash` != the current
+    /// `PRIVATENOTE_PINNED_CODE_HASH` — still accepts the current-generation `withdrawTokens`
     /// message: it ZEROES the note's balance but does NOT credit the destination wallet, so the
     /// SHELL is lost. Refuse the withdraw BEFORE any on-chain write when the note is not the current
     /// generation. This does not recover funds already lost; it prevents zeroing a still-funded
     /// previous-generation note.
     pub async fn assert_note_withdraw_generation(&self, note: &Address) -> Result<()> {
-        let acc = self.client.get_account(note).await?.ok_or_else(|| {
-            anyhow!("note {note} is not on-chain; cannot withdraw")
-        })?;
+        let acc = self
+            .client
+            .get_account(note)
+            .await?
+            .ok_or_else(|| anyhow!("note {note} is not on-chain; cannot withdraw"))?;
         if !acc.is_active() {
             return Err(anyhow!(
                 "note {note} is {}, not Active; cannot withdraw",
@@ -2990,11 +4157,11 @@ impl RealChainBackend {
         note_withdraw_generation_ok(note, acc.code_hash.as_deref())
     }
 
-    /// read the note's on-chain owner key (`getDetails().ephemeralPubkey`) and fail closed if it does not
-    /// match the key the client will sign the owner-authenticated write with -- turning the opaque pre-accept
-    /// `onlyOwnerPubkey` revert(branch 3: a non-conforming/orphaned note) into an actionable error. The buyer's
+    /// #128: read the note's on-chain owner key (`getDetails().ephemeralPubkey`) and fail closed if it does not
+    /// match the key the client will sign the owner-authenticated write with — turning the opaque pre-accept
+    /// `onlyOwnerPubkey` revert (branch 3: a non-conforming/orphaned note) into an actionable error. The buyer's
     /// `place_buy` calls it before `placeInferenceBuy`; the seller's `post_offer` before `postSellOffer`. An
-    /// absent/empty `getDetails`(uninit/orphaned note) is itself a fail-closed re-mint case.
+    /// absent/empty `getDetails` (uninit/orphaned note) is itself a fail-closed re-mint case.
     pub async fn assert_note_owner_matches(
         &self,
         role: &str,
@@ -3007,7 +4174,7 @@ impl RealChainBackend {
             .await?
             .ok_or_else(|| {
                 anyhow!(
-                    "{role} aborted: note {note} returned no getDetails (not on-chain/active) -- the pn_pool is \
+                    "{role} aborted: note {note} returned no getDetails (not on-chain/active) — the pn_pool is \
                      likely orphaned by a contract redeploy. Re-mint against the current contracts \
                      (`mint_pn_pool`) and point DEXDO_PN_POOL at the fresh pool."
                 )
@@ -3023,9 +4190,9 @@ impl RealChainBackend {
         }
     }
 
-    /// Poll `get_account(addr).is_active()` up to `tries` times(3s apart; `tries=1` = a single check).
-    /// A query error or a not-yet-existent account(e.g. a self-dapp uninit address that 404s) counts
-    /// as "not active" -- the caller then deploys or fails with a clear message.
+    /// Poll `get_account(addr).is_active()` up to `tries` times (3s apart; `tries=1` = a single check).
+    /// A query error or a not-yet-existent account (e.g. a self-dapp uninit address that 404s) counts
+    /// as "not active" — the caller then deploys or fails with a clear message.
     async fn wait_active(&self, addr: &Address, tries: u32) -> bool {
         for i in 0..tries {
             if let Ok(Some(a)) = self.client.get_account(addr).await {
@@ -3051,6 +4218,377 @@ fn withdraw_note_tokens_payload(dest_wallet: &Address, dapp_id: &str) -> Value {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::VecDeque;
+    use std::sync::Mutex;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    fn deployed(endpoint_field: &str) -> Deployed {
+        serde_json::from_str(&format!(
+            r#"{{
+                "network": "shellnet",
+                "superroot": "0:{zeros}",
+                "dapp_config": "0:{zeros}",
+                "dapp_id": "{zeros}",
+                "seller_probe_commission_bps": 250
+                {endpoint_field}
+            }}"#,
+            zeros = "0".repeat(64),
+        ))
+        .unwrap()
+    }
+
+    #[test]
+    fn endpoint_default_is_shellnet_when_unset() {
+        let endpoint = resolve_endpoint(None, &deployed("")).unwrap();
+        assert_eq!(endpoint, DEFAULT_SHELLNET_ENDPOINT);
+        assert_eq!(
+            endpoint_urls(&endpoint).unwrap(),
+            (
+                "https://shellnet.ackinacki.org/graphql".into(),
+                "https://shellnet.ackinacki.org/v2/account".into(),
+            )
+        );
+    }
+
+    #[test]
+    fn explicit_endpoint_flag_overrides_default() {
+        let endpoint = resolve_endpoint(Some("some-host"), &deployed("")).unwrap();
+        assert_eq!(
+            endpoint_urls(&endpoint).unwrap(),
+            (
+                "https://some-host/graphql".into(),
+                "https://some-host/v2/account".into(),
+            )
+        );
+    }
+
+    #[test]
+    fn manifest_graphql_field_supplies_endpoint() {
+        let manifest = deployed(r#", "graphql": "https://manifest-host/graphql/""#);
+        assert_eq!(
+            resolve_endpoint(None, &manifest).unwrap(),
+            "https://manifest-host"
+        );
+        assert_eq!(
+            resolve_endpoint(Some("explicit-host"), &manifest).unwrap(),
+            "https://explicit-host"
+        );
+    }
+
+    #[test]
+    fn endpoint_url_normalization() {
+        let expected = (
+            "https://host/graphql".to_string(),
+            "https://host/v2/account".to_string(),
+        );
+        for endpoint in ["host", "https://host", "https://host/"] {
+            assert_eq!(endpoint_urls(endpoint).unwrap(), expected);
+        }
+    }
+
+    fn fill(token_contract: &str, ticks: u128, price_per_tick: u128) -> MatchedFill {
+        MatchedFill {
+            token_contract: token_contract.to_string(),
+            ticks,
+            price_per_tick,
+        }
+    }
+
+    struct CountingFillSource {
+        batches: Mutex<VecDeque<Vec<(i64, MatchedFill)>>>,
+    }
+
+    impl CountingFillSource {
+        fn new(batches: Vec<Vec<(i64, MatchedFill)>>) -> Self {
+            Self {
+                batches: Mutex::new(batches.into()),
+            }
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl InferenceFillPoller for CountingFillSource {
+        async fn poll(&self, cursor: &mut MatchWatchCursor) -> Result<Vec<MatchedFill>> {
+            let batch = self
+                .batches
+                .lock()
+                .expect("fill batches lock")
+                .pop_front()
+                .unwrap_or_default();
+            Ok(consume_new_fill_batch(cursor, batch))
+        }
+    }
+
+    async fn wait_for_test_fill(
+        source: &CountingFillSource,
+        cursor: &mut MatchWatchCursor,
+        expected: &MatchedFill,
+    ) -> Result<MatchedFill> {
+        wait_correlated_inference_fill(
+            source,
+            cursor,
+            Some(expected),
+            std::time::Duration::ZERO,
+            std::time::Duration::ZERO,
+            "test fill timeout",
+        )
+        .await
+    }
+
+    fn money_submit_stage(error: &anyhow::Error) -> &MoneySubmitError {
+        error
+            .chain()
+            .find_map(|cause| cause.downcast_ref::<MoneySubmitError>())
+            .expect("stage-aware money submit error")
+    }
+
+    async fn serve_money_post_response(
+        status: &str,
+        body: &str,
+    ) -> (String, tokio::task::JoinHandle<()>) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind money POST fixture");
+        let address = listener.local_addr().expect("money POST fixture address");
+        let response = format!(
+            "HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+            body.len()
+        );
+        let task = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.expect("accept money POST");
+            let mut request = [0_u8; 4096];
+            socket.read(&mut request).await.expect("read money POST");
+            socket
+                .write_all(response.as_bytes())
+                .await
+                .expect("write money POST response");
+        });
+        (format!("http://{address}"), task)
+    }
+
+    #[tokio::test]
+    async fn money_post_outcomes_only_clear_for_preparation_or_decoded_rejection() {
+        let account = "1".repeat(64);
+        let client = build_money_post_http_client().expect("money POST client");
+
+        for status in ["408 Request Timeout", "409 Conflict"] {
+            let (endpoint, task) =
+                serve_money_post_response(status, r#"{"error":"fixture"}"#).await;
+            let error = send_message_routed_money_once(
+                &client,
+                &endpoint,
+                "signed-boc",
+                &account,
+                &account,
+            )
+            .await
+            .expect_err("unvalidated HTTP status must be ambiguous");
+            assert!(matches!(
+                money_submit_stage(&error),
+                MoneySubmitError::Ambiguous { .. }
+            ));
+            assert!(!money_submit_stage(&error).clears_journal());
+            task.await.expect("money POST fixture task");
+        }
+
+        let (endpoint, task) = serve_money_post_response("200 OK", "not-json").await;
+        let error =
+            send_message_routed_money_once(&client, &endpoint, "signed-boc", &account, &account)
+                .await
+                .expect_err("undecodable response must be ambiguous");
+        assert!(matches!(
+            money_submit_stage(&error),
+            MoneySubmitError::Ambiguous { .. }
+        ));
+        assert!(!money_submit_stage(&error).clears_journal());
+        task.await.expect("invalid-body fixture task");
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind transport-after-send fixture");
+        let endpoint = format!("http://{}", listener.local_addr().unwrap());
+        let task = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.expect("accept money POST");
+            let mut request = [0_u8; 4096];
+            socket.read(&mut request).await.expect("read money POST");
+            drop(socket);
+        });
+        let error =
+            send_message_routed_money_once(&client, &endpoint, "signed-boc", &account, &account)
+                .await
+                .expect_err("transport failure after send must be ambiguous");
+        assert!(matches!(
+            money_submit_stage(&error),
+            MoneySubmitError::Ambiguous { .. }
+        ));
+        assert!(!money_submit_stage(&error).clears_journal());
+        task.await.expect("transport-after-send fixture task");
+
+        let (endpoint, task) =
+            serve_money_post_response("200 OK", r#"{"result":{"exit_code":151}}"#).await;
+        let error =
+            send_message_routed_money_once(&client, &endpoint, "signed-boc", &account, &account)
+                .await
+                .expect_err("decoded contract rejection must be terminal");
+        assert!(matches!(
+            money_submit_stage(&error),
+            MoneySubmitError::Rejected { .. }
+        ));
+        assert!(money_submit_stage(&error).clears_journal());
+        assert!(format!("{error:#}").contains("exit_code=151"));
+        task.await.expect("contract rejection fixture task");
+
+        let error = send_message_routed_money_once(
+            &client,
+            "not a valid URL",
+            "signed-boc",
+            &account,
+            &account,
+        )
+        .await
+        .expect_err("request builder failure must be pre-POST");
+        assert!(matches!(
+            money_submit_stage(&error),
+            MoneySubmitError::Preparation { .. }
+        ));
+        assert!(money_submit_stage(&error).clears_journal());
+    }
+
+    #[tokio::test]
+    async fn wait_reconciliation_logic_ignores_stale_rejects_wrong_and_selects_intended() {
+        let expected = fill("0:intended", 2, 700);
+        let stale = fill("0:stale", 9, 999);
+        let unrelated = fill("0:unrelated", 3, 701);
+
+        let wrong_source = CountingFillSource::new(vec![
+            vec![(100, stale.clone())],
+            vec![(100, stale.clone()), (101, unrelated.clone())],
+        ]);
+        let mut wrong_cursor = MatchWatchCursor::new(0);
+        wrong_source
+            .poll(&mut wrong_cursor)
+            .await
+            .expect("prime cursor past stale fill");
+        let error = wait_for_test_fill(&wrong_source, &mut wrong_cursor, &expected)
+            .await
+            .expect_err("post-submit unrelated fill must fail closed");
+        assert!(error
+            .to_string()
+            .contains("refusing wrong-fill attribution"));
+
+        let intended_source = CountingFillSource::new(vec![
+            vec![(100, stale.clone())],
+            vec![(100, stale), (101, unrelated), (101, expected.clone())],
+        ]);
+        let mut intended_cursor = MatchWatchCursor::new(0);
+        intended_source
+            .poll(&mut intended_cursor)
+            .await
+            .expect("prime cursor past stale fill");
+        let selected = wait_for_test_fill(&intended_source, &mut intended_cursor, &expected)
+            .await
+            .expect("intended fill must let the deal proceed");
+        assert_eq!(selected, expected);
+    }
+
+    #[tokio::test]
+    async fn money_post_refuses_307_without_replaying_signed_boc() {
+        let redirect_listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind redirect server");
+        let redirect_addr = redirect_listener.local_addr().expect("redirect address");
+        let redirect_task = tokio::spawn(async move {
+            let (mut socket, _) = redirect_listener.accept().await.expect("redirect request");
+            let mut request = [0u8; 4096];
+            socket.read(&mut request).await.expect("read money POST");
+            socket
+                .write_all(
+                    format!(
+                        "HTTP/1.1 307 Temporary Redirect\r\nLocation: http://{redirect_addr}/replayed\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                    )
+                    .as_bytes(),
+                )
+                .await
+                .expect("write redirect");
+            match tokio::time::timeout(
+                std::time::Duration::from_millis(100),
+                redirect_listener.accept(),
+            )
+            .await
+            {
+                Ok(Ok((mut replay, _))) => {
+                    replay.read(&mut request).await.expect("read replayed POST");
+                    replay
+                        .write_all(
+                            b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\n[]",
+                        )
+                        .await
+                        .expect("write replay response");
+                    true
+                }
+                _ => false,
+            }
+        });
+
+        let client = build_money_post_http_client().expect("money POST client");
+        let error = send_message_routed_checked(
+            &client,
+            &format!("http://{redirect_addr}"),
+            "signed-boc",
+            "0:11",
+            "0:22",
+            None,
+        )
+        .await
+        .expect_err("307 must fail instead of replaying the signed BOC");
+
+        let replayed = redirect_task.await.expect("redirect server task");
+        assert!(
+            error.to_string().contains("refused HTTP redirect 307"),
+            "{error:#}"
+        );
+        assert!(!replayed, "signed BOC was replayed at redirect target");
+
+        let redirect_listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind money redirect server");
+        let redirect_addr = redirect_listener.local_addr().expect("redirect address");
+        let redirect_task = tokio::spawn(async move {
+            let (mut socket, _) = redirect_listener.accept().await.expect("redirect request");
+            let mut request = [0u8; 4096];
+            socket.read(&mut request).await.expect("read money POST");
+            socket
+                .write_all(
+                    format!(
+                        "HTTP/1.1 307 Temporary Redirect\r\nLocation: http://{redirect_addr}/replayed\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                    )
+                    .as_bytes(),
+                )
+                .await
+                .expect("write redirect");
+            tokio::time::timeout(
+                std::time::Duration::from_millis(100),
+                redirect_listener.accept(),
+            )
+            .await
+            .is_ok()
+        });
+        let error = send_message_routed_money_once(
+            &client,
+            &format!("http://{redirect_addr}"),
+            "signed-boc",
+            "0:11",
+            "0:22",
+        )
+        .await
+        .expect_err("money redirect must remain ambiguous");
+        assert!(matches!(
+            money_submit_stage(&error),
+            MoneySubmitError::Ambiguous { .. }
+        ));
+        assert!(!money_submit_stage(&error).clears_journal());
+        assert!(!redirect_task.await.expect("money redirect task"));
+    }
 
     #[test]
     fn details_has_withdrawn_accepts_bool_and_string_forms() {
@@ -3098,6 +4636,156 @@ mod tests {
             check.message
         );
         assert!(!check.message.contains("TVM_ERROR"), "{}", check.message);
+    }
+
+    #[test]
+    fn buyer_note_withdrawn_guard_aborts_with_actionable_message() {
+        let note =
+            Address::parse("0:2222222222222222222222222222222222222222222222222222222222222222")
+                .expect("address");
+        let error = buyer_note_withdrawn_guard(&note, Some(&json!({"hasWithdrawn": true})))
+            .expect_err("a withdrawn buyer note must be rejected before submit");
+        let message = error.to_string();
+        assert!(message.contains("buyer place aborted"), "{message}");
+        assert!(message.contains("can no longer place buys"), "{message}");
+        assert!(message.contains("deploy/use a fresh note"), "{message}");
+        assert!(message.contains("ERR_INVALID_STATE 151"), "{message}");
+        assert!(
+            message.contains("PrivateNote._hasWithdrawn=true"),
+            "{message}"
+        );
+        assert!(!message.contains("CHAIN_TRANSPORT"), "{message}");
+    }
+
+    #[test]
+    fn buyer_note_withdrawn_guard_allows_not_withdrawn_note() {
+        let note =
+            Address::parse("0:2222222222222222222222222222222222222222222222222222222222222222")
+                .expect("address");
+        buyer_note_withdrawn_guard(&note, Some(&json!({"hasWithdrawn": false})))
+            .expect("a note that has not withdrawn must not be blocked");
+    }
+
+    #[test]
+    fn buyer_note_withdrawn_guard_fails_open_when_field_is_missing() {
+        let note =
+            Address::parse("0:2222222222222222222222222222222222222222222222222222222222222222")
+                .expect("address");
+        buyer_note_withdrawn_guard(&note, Some(&json!({"ephemeralPubkey": "0x1234"})))
+            .expect("a contract generation without hasWithdrawn must remain usable");
+        buyer_note_withdrawn_guard(&note, None)
+            .expect("an empty getter result must not be reported as withdrawn");
+    }
+
+    async fn encoded_internal_note_call(method: &str) -> String {
+        gosh_ackinacki::airegistry::calls::encode_internal_payload(
+            &local_context().expect("local TVM context"),
+            PRIVATENOTE_ABI,
+            method,
+            json!({
+                "sellerPubkey": format!("0x{}", "1".repeat(64)),
+                "nonce": "7",
+            }),
+        )
+        .await
+        .expect("encode PrivateNote internal call")
+    }
+
+    #[tokio::test]
+    async fn stream_lock_fold_ignores_failed_encoded_inbound_calls() {
+        const SUCCESSFUL_DEAL: &str =
+            "0:1111111111111111111111111111111111111111111111111111111111111111";
+        const FAILED_DEAL: &str =
+            "0:2222222222222222222222222222222222222222222222222222222222222222";
+        let successful_body = encoded_internal_note_call("streamLock").await;
+        let failed_body = encoded_internal_note_call("streamLock").await;
+        let successful = json!({
+            "body": successful_body,
+            "src": SUCCESSFUL_DEAL,
+            "created_at": 10,
+            "dst_transaction": {
+                "aborted": false,
+                "compute": {"exit_code": 0, "success": true},
+                "action": {"result_code": 0, "success": true}
+            }
+        });
+        let failed = json!({
+            "body": failed_body,
+            "src": FAILED_DEAL,
+            "created_at": 11,
+            "dst_transaction": {
+                "aborted": true,
+                "compute": {"exit_code": 151, "success": false},
+                "action": {"result_code": 0, "success": true}
+            }
+        });
+
+        let mut calls = Vec::new();
+        for node in [&successful, &failed] {
+            if let Some((created_at, body, internal, internal_source)) =
+                successful_inbound_lock_call(node).expect("inspect inbound call")
+            {
+                calls.push((
+                    created_at,
+                    body.to_string(),
+                    internal,
+                    internal_source.map(str::to_string),
+                ));
+            }
+        }
+        let status = NoteStreamLockStatus::from_successful_inbound_calls(
+            1,
+            0,
+            10,
+            calls
+                .iter()
+                .map(|(created_at, body, internal, internal_source)| {
+                    (
+                        *created_at,
+                        body.as_str(),
+                        *internal,
+                        internal_source.as_deref(),
+                    )
+                }),
+        )
+        .expect("decode and fold successful inbound calls");
+
+        assert_eq!(
+            calls.len(),
+            1,
+            "failed inbound call must not reach the fold"
+        );
+        assert_eq!(status.entries.len(), 1);
+        assert_eq!(status.entries[0].deal, SUCCESSFUL_DEAL);
+        assert_ne!(status.entries[0].deal, FAILED_DEAL);
+        assert!(status.history_complete);
+    }
+
+    #[test]
+    fn lock_history_requires_typed_complete_pagination_metadata() {
+        for page_info in [
+            None,
+            Some(json!({"startCursor": "c1"})),
+            Some(json!({"startCursor": "c1", "hasPreviousPage": "false"})),
+            Some(json!({"hasPreviousPage": true})),
+        ] {
+            let mut page = json!({"edges": []});
+            if let Some(page_info) = page_info {
+                page["pageInfo"] = page_info;
+            }
+            let error = previous_page_cursor("PrivateNote fixture inbound-message", &page, None)
+                .expect_err("truncated lock-history pagination must fail closed");
+            assert!(error.to_string().contains("inbound-message"), "{error:#}");
+        }
+
+        let complete = json!({
+            "pageInfo": {"startCursor": null, "hasPreviousPage": false},
+            "edges": []
+        });
+        assert_eq!(
+            previous_page_cursor("PrivateNote fixture inbound-message", &complete, None).unwrap(),
+            None
+        );
     }
 
     #[test]

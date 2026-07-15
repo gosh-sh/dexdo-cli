@@ -1,10 +1,11 @@
-//! Real OpenAI-compatible upstream.
-//! The gateway connects to an OpenAI-compatible API(by default **Groq**, `qwen/qwen3-32b`),
-//! sends the buyer's canonical request(R1), reads the **streaming SSE** and normalizes each
-//! delta into a `CanonChunk` incrementally(R6). Accounting is done after normalization from token-level
+//! Real OpenAI-compatible upstream (Directive 3, first step — §10.5 A, R1/R2/R5/R6).
+//! The gateway connects to an OpenAI-compatible API (by default **Groq**, `qwen/qwen3-32b`),
+//! sends the buyer's canonical request (R1), reads the **streaming SSE** and normalizes each
+//! delta into a `CanonChunk` incrementally (R6). Accounting is done after normalization from token-level
 //! signals, then converted to ticks with canonical `TICK_SIZE`; an SSE event is not a tick.
-//! The key is taken **from the environment at runtime**([`api_key`]) and is never stored/logged
-//! . Without a key the adapter does not start -- the stream
+//!
+//! The key is taken **from the environment at runtime** ([`api_key`]) and is never stored/logged
+//! (Directive 3: "don't expose the key and don't commit it"). Without a key the adapter does not start — the stream
 //! closes with `Status::failed_precondition`, which yields a clean skip in e2e.
 
 use crate::seller::models::{Capabilities, ModelConfig};
@@ -13,43 +14,43 @@ use serde::{Deserialize, Serialize};
 use tokio::sync::mpsc;
 use tonic::Status;
 
-/// Name of the env variable holding the upstream key(Groq OpenAI-compatible API). Creds come from "seahorse".
+/// Name of the env variable holding the upstream key (Groq OpenAI-compatible API). Creds come from "seahorse".
 pub const API_KEY_ENV: &str = "GROQ_API_KEY";
 
 /// Default base of the Groq OpenAI-compatible API.
 pub const DEFAULT_BASE_URL: &str = "https://api.groq.com/openai/v1";
 
-/// Default model id -- Qwen 32B on Groq(canonical id from the Groq model list).
+/// Default model id — Qwen 32B on Groq (canonical id from the Groq model list).
 pub const DEFAULT_MODEL: &str = "qwen/qwen3-32b";
 
 /// Real upstream configuration. Carries **only** non-confidential parameters (URL/model id/
-/// env-key name/tokenizer family/capabilities). The key itself is NOT stored here -- it is read from
+/// env-key name/tokenizer family/capabilities). The key itself is NOT stored here — it is read from
 /// the environment at request time via [`OpenAiConfig::api_key_env`]. Operationally built from a
-/// model config entry; `Default` is the built-in demo default
+/// model config entry ([`OpenAiConfig::from_model`], Directive 11); `Default` is the built-in demo default
 /// (Groq/qwen) for tests and `live_groq`.
 #[derive(Clone, Debug)]
 pub struct OpenAiConfig {
-    /// Base URL of the OpenAI-compatible API(without the trailing `/chat/completions`).
+    /// Base URL of the OpenAI-compatible API (without the trailing `/chat/completions`).
     pub base_url: String,
-    /// Upstream model id(`served_model`; forced by the market R1, the buyer's `model` is not trusted).
-    /// Sent to the upstream(Groq); an internal detail, NOT the on-wire declared model.
+    /// Upstream model id (`served_model`; forced by the market R1, the buyer's `model` is not trusted).
+    /// Sent to the upstream (Groq); an internal detail, NOT the on-wire declared model.
     pub model: String,
-    /// **Canonical market id**(`producer--model--version`, e.g. `qwen--qwen3--32b`) -- the protocol-facing model
-    /// identity the buyer paid for(B2) and verifies the declaration against. Declared as
-    /// `claimed_model`. It is DISTINCT from [`Self::model`](the upstream slug like `qwen/qwen3-32b`): the buyer's
+    /// **Canonical market id** (`producer--model--version`, e.g. `qwen--qwen3--32b`) — the protocol-facing model
+    /// identity the buyer paid for (B2) and verifies the declaration against (B7/§10.1.3). Declared as
+    /// `claimed_model`. It is DISTINCT from [`Self::model`] (the upstream slug like `qwen/qwen3-32b`): the buyer's
     /// frame is canonical, so declaring the served slug here would false-trip the substitution check.
     pub frame_model: String,
-    /// **Test-only seam:** declare a DIFFERENT `claimed_model` in the
+    /// **Test-only seam (§8 live substitution proof, #144):** declare a DIFFERENT `claimed_model` in the
     /// `SignalManifest` while the real upstream still serves [`Self::model`]. `None` (default / production path,
-    /// [`Self::from_model`]) -> `claimed_model == frame_model`(honest declaration of the canonical market id).
-    /// `Some(name)` -> emit `name` as the declared model while serving `model` -- reproduces a served!=declared
-    /// substitution so the buyer's content gate(B8 + B7-full) can be proven against a REAL divergent upstream.
+    /// [`Self::from_model`]) → `claimed_model == frame_model` (honest declaration of the canonical market id).
+    /// `Some(name)` → emit `name` as the declared model while serving `model` — reproduces a served≠declared
+    /// substitution so the buyer's content gate (B8 + B7-full) can be proven against a REAL divergent upstream.
     pub claimed_model_override: Option<String>,
-    /// Name of the env variable holding the key -- **per-model/provider**, not a single global one.
+    /// Name of the env variable holding the key — **per-model/provider** (Directive 11), not a single global one.
     pub api_key_env: String,
-    /// Tokenizer family for `SignalManifest` -- from config, not a substring hardcode.
+    /// Tokenizer family for `SignalManifest` (§6/§10.1.1) — from config, not a substring hardcode.
     pub tokenizer_family: String,
-    /// Upstream capabilities.
+    /// Upstream capabilities (Directive 12: capability-aware logprobs request).
     pub capabilities: Capabilities,
 }
 
@@ -71,15 +72,15 @@ impl Default for OpenAiConfig {
 }
 
 impl OpenAiConfig {
-    /// Build from a model config entry -- the operational CLI path(`--model`).
+    /// Build from a model config entry (Directive 11) — the operational CLI path (`--model`).
     pub fn from_model(m: &ModelConfig) -> Self {
         Self {
             base_url: m.base_url.clone(),
             model: m.served_model.clone(),
-            // The on-wire declared model is the CANONICAL frame(what the buyer paid for / verifies against),
-            // not the upstream served slug -- else the buyer's check false-trips a substitution.
+            // The on-wire declared model is the CANONICAL frame (what the buyer paid for / verifies against),
+            // not the upstream served slug — else the buyer's §10.1.3 check false-trips a substitution.
             frame_model: m.frame_model.clone(),
-            // Production path: honest declaration(`claimed_model == frame_model`). The override is test-only.
+            // Production path: honest declaration (`claimed_model == frame_model`). The override is test-only.
             claimed_model_override: None,
             api_key_env: m.api_key_env.clone(),
             tokenizer_family: m.tokenizer_family.clone(),
@@ -88,14 +89,14 @@ impl OpenAiConfig {
     }
 }
 
-/// Read the upstream key from the environment(runtime) by the **env-variable name from the model config**
-/// . `None` means no key(the live path is unavailable). The value is never
+/// Read the upstream key from the environment (runtime) by the **env-variable name from the model config**
+/// (`api_key_env`, Directive 11). `None` means no key (the live path is unavailable). The value is never
 /// logged and never persisted to disk.
 pub fn api_key(env_name: &str) -> Option<String> {
     std::env::var(env_name).ok().filter(|k| !k.is_empty())
 }
 
-// --- Request/response shape of OpenAI-compatible chat-completions(subset for the adapter) ---
+// --- Request/response shape of OpenAI-compatible chat-completions (subset for the adapter) ---
 
 #[derive(Serialize)]
 struct ChatRequest<'a> {
@@ -108,8 +109,8 @@ struct ChatRequest<'a> {
     max_tokens: Option<u32>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     stop: Vec<String>,
-    // R2 +: logprobs are requested ONLY if the model supports them
-    // . Otherwise the field is NOT sent(`None` -> skip): strict
+    // §6/R2 + D12: logprobs (signal B6 §10.1.2) are requested ONLY if the model supports them
+    // (`capabilities.logprobs` from config D11). Otherwise the field is NOT sent (`None` → skip): strict
     // OpenAI-compatible endpoints answer `400` on an unsupported field and drop the stream. Default is off.
     #[serde(skip_serializing_if = "Option::is_none")]
     logprobs: Option<bool>,
@@ -143,7 +144,7 @@ struct StreamChunk {
 struct StreamChoice {
     #[serde(default)]
     delta: Delta,
-    // Delta logprobs(OpenAI/Groq format): `content[]` with the chosen token + top-k alternatives.
+    // Delta logprobs (OpenAI/Groq format): `content[]` with the chosen token + top-k alternatives.
     #[serde(default)]
     logprobs: Option<ChoiceLogprobs>,
 }
@@ -189,8 +190,8 @@ struct TopLogprobWire {
 }
 
 /// Build the upstream request body from the buyer's canonical request (R1: normalizing the
-/// request into the upstream format). `model` is forced by the market from configuration -- the buyer's `model`
-/// is absent from `CanonRequest` by design.
+/// request into the upstream format). `model` is forced by the market from configuration — the buyer's `model`
+/// is absent from `CanonRequest` by design (the field is not trusted, §10.6/G).
 fn build_request<'a>(cfg: &'a OpenAiConfig, req: &CanonRequest) -> ChatRequest<'a> {
     let messages = req
         .messages
@@ -202,7 +203,7 @@ fn build_request<'a>(cfg: &'a OpenAiConfig, req: &CanonRequest) -> ChatRequest<'
         .collect();
     let (temperature, max_tokens, stop, seed) = match &req.params {
         Some(p) => (
-            // `greedy`(B7 spot-check) forcibly sets temp=0(distinct from 0="not set").
+            // `greedy` (B7 spot-check) forcibly sets temp=0 (distinct from 0="not set").
             if p.greedy {
                 Some(0.0)
             } else {
@@ -210,15 +211,15 @@ fn build_request<'a>(cfg: &'a OpenAiConfig, req: &CanonRequest) -> ChatRequest<'
             },
             (p.max_tokens != 0).then_some(p.max_tokens),
             p.stop.clone(),
-            // Groq exposes a random seed even at temperature=0 for some models(notably gpt-oss). Pin the
+            // Groq exposes a random seed even at temperature=0 for some models (notably gpt-oss). Pin the
             // sampled B7 greedy probe so the seller stream and the reference endpoint compare the same run.
             p.greedy.then_some(0),
         ),
         None => (None, None, Vec::new(), None),
     };
-    // request logprobs only if the model config declared support(capability-aware) --
-    // otherwise don't send the field at all(a strict endpoint must not fail with `400`). Don't fabricate(R3/R4):
-    // absence of logprobs -> lower verification weight at the buyer, not invented values.
+    // D12: request logprobs only if the model config declared support (capability-aware) —
+    // otherwise don't send the field at all (a strict endpoint must not fail with `400`). Don't fabricate (R3/R4):
+    // absence of logprobs → lower verification weight at the buyer, not invented values.
     let (logprobs, top_logprobs) = if cfg.capabilities.logprobs {
         (Some(true), cfg.capabilities.top_logprobs)
     } else {
@@ -246,11 +247,11 @@ fn openrouter_qwen_reasoning(cfg: &OpenAiConfig) -> bool {
         && cfg.model.eq_ignore_ascii_case("qwen/qwen3-32b")
 }
 
-/// Run the real upstream: POST `.../chat/completions` with `stream:true`, parse the SSE and
-/// normalize deltas into `CanonChunk`, yielding incrementally into `tx`(R6). No more than `count`
+/// Run the real upstream: POST `…/chat/completions` with `stream:true`, parse the SSE and
+/// normalize deltas into `CanonChunk`, yielding incrementally into `tx` (R6). No more than `count`
 /// delivered tokens are requested/forwarded. A canonical request is mandatory
-/// . On a missing key/error we
-/// close the stream with an error status(the response buffer does not accumulate).
+/// (the live path goes from interface to consumer, §10.6/G). On a missing key/error we
+/// close the stream with an error status (the response buffer does not accumulate).
 pub async fn run(
     cfg: &OpenAiConfig,
     count: u64,
@@ -276,7 +277,7 @@ pub async fn run(
     };
 
     if let Err(status) = stream_upstream(cfg, &key, count, &req, &tx).await {
-        // Send the error into the channel(if the buyer is still listening) -- without leaking the key into the text.
+        // Send the error into the channel (if the buyer is still listening) — without leaking the key into the text.
         let _ = tx.send(Err(status)).await;
     }
 }
@@ -306,11 +307,11 @@ async fn stream_upstream(
 
     if !resp.status().is_success() {
         let code = resp.status();
-        // The body may carry an upstream error detail, but not our key -- safe to surface the code.
+        // The body may carry an upstream error detail, but not our key — safe to surface the code.
         return Err(Status::unavailable(format!("upstream HTTP {code}")));
     }
 
-    // Incremental SSE parsing over the body's byte stream(R6): accumulate a buffer, split on
+    // Incremental SSE parsing over the body's byte stream (R6): accumulate a buffer, split on
     // `\n\n` boundaries, parse `data:` lines. `data: [DONE]` ends the stream.
     let mut byte_stream = resp.bytes_stream();
     let mut buf = String::new();
@@ -321,34 +322,34 @@ async fn stream_upstream(
         let bytes = item.map_err(|e| Status::unavailable(format!("upstream read failed: {e}")))?;
         buf.push_str(&String::from_utf8_lossy(&bytes));
 
-        // Flush complete SSE events(separated by `\n\n`); an unfinished frame must not grow
-        // the gateway buffer without bound -- a hostile/broken upstream is untrusted(Y3, R6).
+        // Flush complete SSE events (separated by `\n\n`); an unfinished frame must not grow
+        // the gateway buffer without bound — a hostile/broken upstream is untrusted (Y3, R6).
         for event in drain_complete_events(&mut buf)? {
             match parse_event(&event) {
                 ParsedEvent::Done => return Ok(()),
                 ParsedEvent::Delta(text, reasoning, logprobs)
                     if !text.is_empty() || !reasoning.is_empty() =>
                 {
-                    // R3: HONEST declaration -- has_logprobs based on the actual presence of logprobs in the first
-                    // content delta(if the upstream honored `logprobs:true`). Don't fabricate(R4).
+                    // §6/R3: HONEST declaration — has_logprobs based on the actual presence of logprobs in the first
+                    // content delta (if the upstream honored `logprobs:true`). Don't fabricate (R4).
                     let has_lp = !logprobs.is_empty();
                     let delivered_tokens = (logprobs.len() as u64).max(1);
                     let chunk = CanonChunk {
                         text,
                         reasoning,
-                        // R2/R4: Groq chat-completions does not return token-ids in SSE -- do NOT fabricate.
+                        // R2/R4: Groq chat-completions does not return token-ids in SSE — do NOT fabricate.
                         token_ids: Vec::new(),
                         seq,
-                        // R2: delta logprobs(chosen + top-k) -- normalized without loss.
+                        // §6/R2: delta logprobs (chosen + top-k) — normalized without loss.
                         logprobs,
                         manifest: (seq == 0).then(|| SignalManifest {
-                            // Family comes from the model config; the buyer matches the profile.
+                            // Family comes from the model config (Directive 11); the buyer matches the profile.
                             tokenizer_family: cfg.tokenizer_family.clone(),
                             has_token_ids: false,
                             has_logprobs: has_lp,
-                            // Declare the CANONICAL frame model(what the buyer paid for / verifies, B2/B7), NOT
-                            // the upstream served slug -- declaring the slug false-trips. The test-only
-                            // override emits a different declared name to prove a real substitution.
+                            // Declare the CANONICAL frame model (what the buyer paid for / verifies, B2/B7), NOT
+                            // the upstream served slug — declaring the slug false-trips §10.1.3. The test-only
+                            // override (§8, #144) emits a different declared name to prove a real substitution.
                             claimed_model: cfg
                                 .claimed_model_override
                                 .clone()
@@ -357,7 +358,7 @@ async fn stream_upstream(
                     };
                     seq += 1;
                     if tx.send(Ok(chunk)).await.is_err() {
-                        return Ok(()); // buyer disconnected(STOP)
+                        return Ok(()); // buyer disconnected (STOP)
                     }
                     sent_tokens = sent_tokens.saturating_add(delivered_tokens);
                     if sent_tokens >= count {
@@ -371,14 +372,14 @@ async fn stream_upstream(
     Ok(())
 }
 
-/// Cap on an unfinished SSE frame(Y3): a hostile/broken upstream sending bytes without
+/// Cap on an unfinished SSE frame (Y3): a hostile/broken upstream sending bytes without
 /// a `\n\n` separator must not grow the gateway buffer without bound. Legitimate events (a text
-/// delta + top-k logprobs) are 2-3 orders of magnitude smaller -- 1 MiB does not touch them.
+/// delta + top-k logprobs) are 2-3 orders of magnitude smaller — 1 MiB does not touch them.
 const MAX_SSE_FRAME_BYTES: usize = 1 << 20;
 
-/// Drain complete SSE events(`\n\n`-separated) from the buffer in order. If the REMAINDER
-/// (unfinished frame) exceeds the cap -- `resource_exhausted` instead of uncontrolled buffer
-/// growth(Y3, R6). Complete events are always drained before the cap check.
+/// Drain complete SSE events (`\n\n`-separated) from the buffer in order. If the REMAINDER
+/// (unfinished frame) exceeds the cap — `resource_exhausted` instead of uncontrolled buffer
+/// growth (Y3, R6). Complete events are always drained before the cap check.
 // `tonic::Status` is the standard gRPC error type of the whole upstream module; boxing it in a single helper
 // would break `?`-propagation into the loop's `Result<_, Status>`. The large Err variant here is deliberate.
 #[allow(clippy::result_large_err)]
@@ -400,16 +401,16 @@ fn drain_complete_events(buf: &mut String) -> Result<Vec<String>, Status> {
 enum ParsedEvent {
     /// Terminal `data: [DONE]`.
     Done,
-    /// `data: {...}` with content/reasoning deltas(possibly empty) and the delta's token logprobs.
+    /// `data: {…}` with content/reasoning deltas (possibly empty) and the delta's token logprobs (§6).
     Delta(String, String, Vec<TokenLogprobs>),
-    /// Carries no delta(comment, keep-alive, etc.).
+    /// Carries no delta (comment, keep-alive, etc.).
     Other,
 }
 
 /// Parse a single SSE event: join the `data:` lines, recognize `[DONE]`, otherwise extract
 /// `choices[0].delta.content`, provider-separated reasoning, and `choices[0].logprobs.content[]`
-/// . A frame without `data:` or unparsed JSON is
-/// `Other`(we don't break the stream, R6).
+/// (logprobs §6, normalized into the canon without loss — R2). A frame without `data:` or unparsed JSON is
+/// `Other` (we don't break the stream, R6).
 fn parse_event(event: &str) -> ParsedEvent {
     let mut data = String::new();
     for line in event.lines() {
@@ -457,7 +458,7 @@ fn parse_event(event: &str) -> ParsedEvent {
                 .unwrap_or_default();
             ParsedEvent::Delta(text, reasoning, logprobs)
         }
-        // An unparsed frame does not crash the stream -- we skip it(R6: incremental robustness).
+        // An unparsed frame does not crash the stream — we skip it (R6: incremental robustness).
         Err(_) => ParsedEvent::Other,
     }
 }
@@ -493,7 +494,7 @@ mod tests {
         assert!(matches!(delta, ParsedEvent::Delta(t, r, _) if t == "hi" && r.is_empty()));
         assert!(matches!(parse_event("data: [DONE]"), ParsedEvent::Done));
         assert!(matches!(parse_event(": keep-alive"), ParsedEvent::Other));
-        // A delta without content(role-only first frame) -> empty string, not accounted.
+        // A delta without content (role-only first frame) → empty string, not accounted.
         let empty = parse_event("data: {\"choices\":[{\"delta\":{}}]}");
         assert!(matches!(empty, ParsedEvent::Delta(t, r, _) if t.is_empty() && r.is_empty()));
     }
@@ -517,7 +518,7 @@ mod tests {
         }
     }
 
-    /// Y3(regression): complete events are drained in order, the unfinished tail is preserved.
+    /// Y3 (regression): complete events are drained in order, the unfinished tail is preserved.
     #[test]
     fn drain_keeps_partial_frame() {
         let mut buf = String::from("data: a\n\ndata: b\n\ndata: part");
@@ -529,7 +530,7 @@ mod tests {
         );
     }
 
-    /// Y3(negative): an upstream without a `\n\n` separator does not grow the gateway buffer without bound --
+    /// Y3 (negative): an upstream without a `\n\n` separator does not grow the gateway buffer without bound —
     /// when the cap is exceeded the stream closes with `resource_exhausted`, not OOM.
     #[test]
     fn frame_without_separator_is_capped() {
@@ -540,7 +541,7 @@ mod tests {
 
     #[test]
     fn parses_logprobs_into_canon() {
-        // R2: choices[0].logprobs.content[] -> TokenLogprobs(chosen + top-k without loss).
+        // §6/R2: choices[0].logprobs.content[] → TokenLogprobs (chosen + top-k without loss).
         let ev = parse_event(
             "data: {\"choices\":[{\"delta\":{\"content\":\"x\"},\"logprobs\":{\"content\":[{\"token\":\"x\",\"logprob\":-0.4,\"top_logprobs\":[{\"token\":\"x\",\"logprob\":-0.4},{\"token\":\"y\",\"logprob\":-1.5}]}]}}]}",
         );
@@ -577,14 +578,14 @@ mod tests {
         assert_eq!(body.messages.len(), 1);
         assert!(body.stream);
         assert!(body.reasoning.is_none());
-        // Zero-valued parameters are not serialized(the upstream default is used).
+        // Zero-valued parameters are not serialized (the upstream default is used).
         assert!(body.temperature.is_none());
         assert!(body.max_tokens.is_none());
     }
 
     #[test]
     fn build_request_omits_logprobs_when_capability_off() {
-        // a model without logprobs -> the field is NOT in the request body(a strict endpoint won't get a 400).
+        // D12: a model without logprobs → the field is NOT in the request body (a strict endpoint won't get a 400).
         let cfg = OpenAiConfig {
             capabilities: Capabilities {
                 logprobs: false,
@@ -608,7 +609,7 @@ mod tests {
 
     #[test]
     fn build_request_sends_logprobs_when_capability_on() {
-        // a model with logprobs(default caps Groq/qwen) -> the field is present(B6 signals are collected).
+        // D12: a model with logprobs (default caps Groq/qwen) → the field is present (B6 signals are collected).
         let cfg = OpenAiConfig::default();
         let req = CanonRequest {
             messages: vec![],

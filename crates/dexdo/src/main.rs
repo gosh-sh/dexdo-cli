@@ -1,5 +1,5 @@
-//! `dexdo` CLI: `seller` and `buyer` subcommands, each with first-class flags
-//! `--mock-model` and `--mock-chain`.
+//! `dexdo` CLI (§11.1): `seller` and `buyer` subcommands, each with first-class flags
+//! `--mock-model` and `--mock-chain` (mock mode is explicit; real shellnet is behind D10's feature).
 
 use anyhow::Result;
 use clap::{Parser, Subcommand};
@@ -14,7 +14,7 @@ use cli::policy;
 #[command(
     name = "dexdo",
     version,
-    about = "dexdo -- private inference market: seller and buyer clients"
+    about = "dexdo — private inference market: seller and buyer clients"
 )]
 struct Cli {
     #[command(subcommand)]
@@ -23,86 +23,86 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Command {
-    /// Seller client: gateway, authorization, stream handover(headless, R12).
+    /// Seller client: gateway, authorization, stream handover (headless, R12).
     Seller(SellerArgs),
     /// Buyer client: endpoint decryption, challenge signing, stream reception.
     Buyer(BuyerArgs),
-    /// Monitor(R14): human-readable state view **from the loaded note** --
+    /// Monitor (R14): human-readable state view **from the loaded note** (directive 7) —
     /// own offers, deals, by-fact tokens, exposure. Read-only, moves nothing.
     Monitor(MonitorArgs),
-    /// Doctor: read-only shellnet version/pin and market freshness checks. Alias: `health`.
+    /// Doctor (#161): read-only shellnet version/pin and market freshness checks. Alias: `health`.
     #[command(alias = "health")]
     Doctor(DoctorArgs),
-    /// Provision: bring up the InferenceOrderBook + RootModel + per-deal TokenContract for a
-    /// market -- **all note-funded** from the seller note's own ECC[2] (directive, no operator wallet,
-    /// no giver in the operate path) -- and write the manifest with the deployed, active TC address.
+    /// Provision (issue #24): bring up the InferenceOrderBook + RootModel + per-deal TokenContract for a
+    /// market — **all note-funded** from the seller note's own ECC[2] (directive #58, no operator wallet,
+    /// no giver in the operate path) — and write the manifest with the deployed, active TC address.
     Provision(ProvisionArgs),
-    /// Deploy-market: deploy the per-model `InferenceOrderBook`(the shared market for a model) if absent --
-    /// note-funded, the explicit "list this model" step before a seller posts offers. Idempotent
-    /// (the book address is deterministic from `model_hash`; already-deployed -> no-op).
+    /// Deploy-market: deploy the per-model `InferenceOrderBook` (the shared market for a model) if absent —
+    /// note-funded (#58), the explicit "list this model" step before a seller posts offers. Idempotent
+    /// (the book address is deterministic from `model_hash`; already-deployed → no-op).
     #[command(name = "deploy-market")]
     DeployMarket(MarketDeployArgs),
-    /// Destroy: the seller CLOSES a STOPped deal's per-deal `TokenContract` --
+    /// Destroy (#65): the seller CLOSES a STOPped deal's per-deal `TokenContract` —
     /// `TokenContract::destroy(payoutAddress)` -> `selfdestruct`. **DESTRUCTIVE / BURNS:** after the 4.0.8
     /// fund-10 sizing, the unrecovered deploy remainder is expected to be negligible; `--acknowledge-burn`
     /// is an explicit operator confirmation, not a fail-closed guard for the old over-funded reserve.
-    /// Run after the deal STOPs(`!_opened && !_disputed`); seller-signed.
+    /// Run after the deal STOPs (`!_opened && !_disputed`); seller-signed.
     Destroy(DestroyArgs),
-    /// Recover: the BUYER signs **STOP** on an orphaned OPEN deal (its buyer process died, but the
-    /// note/key are intact) -- the normal buyer-STOP split, **without** placing a new buy -- so a stuck
+    /// Recover (#85): the BUYER signs **STOP** on an orphaned OPEN deal (its buyer process died, but the
+    /// note/key are intact) — the normal §4.1 buyer-STOP split, **without** placing a new buy — so a stuck
     /// deal can be closed and the seller can then `destroy` it. Buyer-signed; fails closed if the deal is
     /// not OPEN / is disputed / the note is not the deal's buyer. (Seller-vanished mid-stream is instead the
     /// contract's `reclaimOnTimeout`/`STREAM_TIMEOUT`.)
     Recover(RecoverArgs),
-    /// Dispute: the BUYER opens an on-chain dispute on an OPEN deal -- `streamDispute` -> `TC.dispute()`
-    /// LOCKS both notes until `releaseDispute`/arbitration. The anti-scam lever for an observed
-    /// substitution/fraud -- strictly stronger than `recover`'s STOP (which still pays for delivered
+    /// Dispute (#145): the BUYER opens an on-chain dispute on an OPEN deal — `streamDispute` -> `TC.dispute()`
+    /// LOCKS both notes (§4.2) until `releaseDispute`/arbitration. The anti-scam lever for an observed
+    /// substitution/fraud (#144) — strictly stronger than `recover`'s STOP (which still pays for delivered
     /// ticks). Buyer-signed; fails closed if the deal is not OPEN / already disputed / the note isn't the buyer.
     Dispute(DisputeArgs),
-    /// Reclaim: the BUYER reclaims escrow on seller no-show. OPEN abandoned deals use
+    /// Reclaim (#145/#149): the BUYER reclaims escrow on seller no-show. OPEN abandoned deals use
     /// `streamReclaim` -> `TC.reclaimOnTimeout()` after `STREAM_TIMEOUT`; funded-but-never-opened deals use
     /// `streamCleanup` -> `TC.cleanupUnopened()` after `MATCH_OPEN_TIMEOUT`. Buyer-signed; fails closed locally
     /// on ownership + the timer.
     Reclaim(ReclaimArgs),
-    /// ReleaseDispute: the SELLER concedes a disputed deal -- `TokenContract.releaseDispute()` unlocks
+    /// ReleaseDispute (#160): the SELLER concedes a disputed deal — `TokenContract.releaseDispute()` unlocks
     /// both notes and returns the contested tick/deposit to the buyer. Seller-signed; fails closed if the deal
     /// is not disputed or the signing key is not the TC seller.
     ReleaseDispute(ReleaseDisputeArgs),
-    /// WithdrawShell: the SELLER withdraws finalized `_finalizedOwed` SHELL from a deal TC. This moves
+    /// WithdrawShell (#160): the SELLER withdraws finalized `_finalizedOwed` SHELL from a deal TC. This moves
     /// seller proceeds; `destroy` remains the close/selfdestruct path.
     WithdrawShell(WithdrawShellArgs),
-    /// Markets: read-only discovery of active model order books and depth.
+    /// Markets (#157): read-only discovery of active model order books and depth.
     Markets(MarketsArgs),
-    /// Market: render ONE model's order book as the human-readable box table(`dexdo market <model>`).
+    /// Market (#157): render ONE model's order book as the human-readable box table (`dexdo market <model>`).
     Market(MarketArgs),
-    /// Executable-book: list current buyer-executable asks for one model book.
+    /// Executable-book (#10): list current buyer-executable asks for one model book.
     #[command(name = "executable-book")]
     ExecutableBook(ExecutableBookArgs),
-    /// Quote: compute an executable quote over current order-book depth.
+    /// Quote (#157): compute an executable quote over current order-book depth.
     Quote(QuoteArgs),
-    /// Market-data: read-only Dodex indexer discovery/cache for inference model books.
+    /// Market-data (#192): read-only Dodex indexer discovery/cache for inference model books.
     #[command(name = "market-data", alias = "indexer")]
     MarketData(MarketDataArgs),
-    /// Orders: list/show/cancel this note's resting inference orders.
+    /// Orders (#158): list/show/cancel this note's resting inference orders.
     Orders(OrdersArgs),
-    /// Subscription: place/status/cancel recurring inference buy subscriptions.
+    /// Subscription (#163): place/status/cancel recurring inference buy subscriptions.
     Subscription(SubscriptionArgs),
-    /// Deals: list durable local deal handles saved by seller/buyer flows.
+    /// Deals (#159): list durable local deal handles saved by seller/buyer flows.
     Deals(DealsArgs),
-    /// History: secret-free local trading history, filterable by note/model.
+    /// History (#162): secret-free local trading history, filterable by note/model.
     History(HistoryArgs),
-    /// Dashboard: loopback-only read view of local buyer/seller streams.
+    /// Dashboard (#200): loopback-only read view of local buyer/seller streams.
     Dashboard(DashboardArgs),
-    /// Status: read current state for a local deal handle or raw TokenContract.
+    /// Status (#159): read current state for a local deal handle or raw TokenContract.
     Status(StatusArgs),
-    /// Close: role-aware close/recovery action for a local deal handle or raw TokenContract.
+    /// Close (#159): role-aware close/recovery action for a local deal handle or raw TokenContract.
     Close(CloseArgs),
-    /// Export: secret-free JSON/Markdown evidence for one local deal handle or raw TokenContract.
+    /// Export (#162): secret-free JSON/Markdown evidence for one local deal handle or raw TokenContract.
     Export(ExportArgs),
-    /// Note: manage the actor's shellnet `PrivateNote`s. `note deploy` mints a wallet-funded PN
+    /// Note (#176): manage the actor's shellnet `PrivateNote`s. `note deploy` mints a wallet-funded PN
     /// in-process through `gosh.ackinacki` and folds it into a `DEXDO_PN_POOL` the `seller`/`buyer` consume.
     Note(NoteArgs),
-    /// Oracle: deploy OracleEventList-backed range PMPs tied to inference order books and resolve them.
+    /// Oracle (#26): deploy OracleEventList-backed range PMPs tied to inference order books and resolve them.
     Oracle(OracleArgs),
     /// Persistent failure policy for real buyer/seller startup and runtime recovery choices.
     Policy(PolicyArgs),
@@ -143,9 +143,9 @@ fn raw_machine_operation(args: &[std::ffi::OsString]) -> Option<&'static str> {
     None
 }
 
-/// The operator close signal for `dexdo buyer --local-listen`: SIGINT(Ctrl-C) **and** SIGTERM
+/// The operator close signal for `dexdo buyer --local-listen` (issue #37): SIGINT (Ctrl-C) **and** SIGTERM
 /// (systemd/container/operator). `serve()` runs graceful shutdown on it, then awaits `session.settle("shutdown")`
-/// -- so a `SIGTERM` does NOT bypass the awaited funds-safety terminal into best-effort `Drop`. Non-Unix: Ctrl-C.
+/// — so a `SIGTERM` does NOT bypass the awaited funds-safety terminal into best-effort `Drop`. Non-Unix: Ctrl-C.
 #[cfg(unix)]
 pub(crate) async fn operator_shutdown_signal() {
     let mut sigterm = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
@@ -226,6 +226,7 @@ async fn main() -> Result<()> {
             NoteCommand::Deploy(d) => run_note_deploy(d).await,
             NoteCommand::Recover(r) => run_note_recover(r).await,
             NoteCommand::Withdraw(w) => run_note_withdraw(w).await,
+            NoteCommand::StreamLocks(s) => run_note_stream_locks(s).await,
         },
         Command::Oracle(args) => run_oracle(args).await,
         Command::Policy(args) => policy::run_policy(args),
@@ -236,7 +237,7 @@ async fn main() -> Result<()> {
         }
         if let Some(operation) = machine_operation {
             let code = machine::classify_error(operation, &err);
-            machine::print_short_error(operation, code)?;
+            machine::print_error(operation, code, &err)?;
             std::process::exit(1);
         }
         return Err(err);
@@ -249,17 +250,17 @@ mod buyer_mode_tests {
     use crate::cli::support::oneshot_real_upstream_guard;
     use serde_json::json;
 
-    /// one-shot `dexdo buyer`(no `--local-listen`) is promptless -- it must fail closed
-    /// against a real seller(no `--mock-model`) with an actionable error, instead of a deep gateway
-    /// `InvalidArgument`. `--local-listen`(consumer API supplies the prompt) and `--mock-model` both pass.
+    /// #120 (§5 regression): one-shot `dexdo buyer` (no `--local-listen`) is promptless — it must fail closed
+    /// against a real seller (no `--mock-model`) with an actionable error, instead of a deep gateway
+    /// `InvalidArgument`. `--local-listen` (consumer API supplies the prompt) and `--mock-model` both pass.
     #[test]
     fn oneshot_real_upstream_rejected_promptless() {
         let err = oneshot_real_upstream_guard(false, false).unwrap_err();
         assert!(err.contains("--local-listen"), "{err}");
-        assert!(err.contains(""), "{err}");
-        // one-shot + --mock-model -> OK(the mock seller synthesizes tokens for the promptless stream).
+        assert!(err.contains("issue #120"), "{err}");
+        // one-shot + --mock-model → OK (the mock seller synthesizes tokens for the promptless stream).
         assert!(oneshot_real_upstream_guard(false, true).is_ok());
-        // --local-listen(consumer API supplies the prompt per request) -> OK regardless of --mock-model.
+        // --local-listen (consumer API supplies the prompt per request) → OK regardless of --mock-model.
         assert!(oneshot_real_upstream_guard(true, false).is_ok());
         assert!(oneshot_real_upstream_guard(true, true).is_ok());
     }
@@ -281,7 +282,7 @@ mod recovery_cli_tests {
     use super::{Cli, Command};
     use clap::Parser;
 
-    /// `dexdo dispute` and `dexdo reclaim` parse as buyer-signed subcommands, accepting `--market` (the
+    /// #145: `dexdo dispute` and `dexdo reclaim` parse as buyer-signed subcommands, accepting `--market` (the
     /// single TC source, mirroring `recover`) and `--token-contract` as the alternative.
     #[test]
     fn dispute_reclaim_subcommands_parse() {
@@ -309,7 +310,7 @@ mod recovery_cli_tests {
         assert!(Cli::try_parse_from(["dexdo", "reclaim", "--token-contract", "0:tc"]).is_ok());
     }
 
-    /// seller-side dispute/payout commands parse with either a market manifest or explicit TC.
+    /// #160: seller-side dispute/payout commands parse with either a market manifest or explicit TC.
     #[test]
     fn seller_dispute_payout_subcommands_parse() {
         let c = Cli::try_parse_from([
@@ -350,7 +351,7 @@ mod note_cli_tests {
     const DEST_HALF_1: &str = "1111111111111111111111111111111111111111111111111111111111111111";
     const DEST_HALF_2: &str = "3333333333333333333333333333333333333333333333333333333333333333";
 
-    /// `dexdo note deploy` parses with the required wallet/pool flags and defaults for
+    /// #176: `dexdo note deploy` parses with the required wallet/pool flags and defaults for
     /// nominal/token-type/endpoint.
     #[test]
     fn note_deploy_subcommand_parses() {
@@ -408,7 +409,7 @@ mod note_cli_tests {
             d.recovery,
             Some(PathBuf::from("pn_pool.json.recovery.json"))
         );
-        // The wallet address, one key input, and pool are required -- omitting any fails parse.
+        // The wallet address, one key input, and pool are required — omitting any fails parse.
         assert!(Cli::try_parse_from(["dexdo", "note", "deploy", "--pool", "p.json"]).is_err());
         assert!(Cli::try_parse_from([
             "dexdo",
@@ -440,7 +441,7 @@ mod note_cli_tests {
         .is_err());
     }
 
-    /// `dexdo note recover` finalizes from the crash-safe state without wallet credentials.
+    /// #344: `dexdo note recover` finalizes from the crash-safe state without wallet credentials.
     #[test]
     fn note_recover_subcommand_parses() {
         let c = Cli::try_parse_from([
@@ -467,7 +468,7 @@ mod note_cli_tests {
         );
     }
 
-    /// `dexdo note withdraw` is owner-signed money movement, so the parser surface and destination
+    /// #189: `dexdo note withdraw` is owner-signed money movement, so the parser surface and destination
     /// normalization contract are pinned separately from the live shellnet submit.
     #[test]
     fn note_withdraw_subcommand_parses_and_requires_destination() {
@@ -514,7 +515,7 @@ mod note_cli_tests {
         assert!(dexdo_core::normalize_wallet_address("not-a-wallet").is_err());
     }
 
-    /// `dexdo note balance` is address-only and read-only at the parser surface.
+    /// #205: `dexdo note balance` is address-only and read-only at the parser surface.
     #[test]
     fn note_balance_subcommand_parses_and_requires_note_addr() {
         let c = Cli::try_parse_from([
@@ -525,6 +526,8 @@ mod note_cli_tests {
             NOTE,
             "--contracts",
             "contracts/custom.json",
+            "--endpoint",
+            "new-shellnet.example",
         ])
         .expect("note balance parses");
         let Command::Note(n) = c.command else {
@@ -535,6 +538,7 @@ mod note_cli_tests {
         };
         assert_eq!(b.note_addr, NOTE);
         assert_eq!(b.contracts, PathBuf::from("contracts/custom.json"));
+        assert_eq!(b.endpoint.as_deref(), Some("new-shellnet.example"));
         assert!(Cli::try_parse_from(["dexdo", "note", "balance"]).is_err());
         assert!(Cli::try_parse_from([
             "dexdo",
@@ -597,7 +601,7 @@ mod doctor_cli_tests {
     use super::{Cli, Command};
     use clap::Parser;
 
-    /// `dexdo doctor` is the read-only shellnet health guard; `health` is kept as an alias.
+    /// #161: `dexdo doctor` is the read-only shellnet health guard; `health` is kept as an alias.
     #[test]
     fn doctor_subcommand_parses() {
         let c = Cli::try_parse_from(["dexdo", "doctor"]).expect("doctor parses");
@@ -605,6 +609,21 @@ mod doctor_cli_tests {
         let c = Cli::try_parse_from(["dexdo", "health", "--market", "m.json"])
             .expect("health alias parses");
         assert!(matches!(c.command, Command::Doctor(_)));
+    }
+
+    #[test]
+    fn doctor_accepts_non_shellnet_endpoint() {
+        let c = Cli::try_parse_from([
+            "dexdo",
+            "doctor",
+            "--network",
+            "https://new-shellnet.example/",
+        ])
+        .expect("doctor accepts an endpoint through --network");
+        let Command::Doctor(args) = c.command else {
+            panic!("expected Command::Doctor");
+        };
+        assert_eq!(args.network, "https://new-shellnet.example/");
     }
 }
 
@@ -618,7 +637,7 @@ mod market_orders_cli_tests {
     use clap::Parser;
     use std::path::PathBuf;
 
-    /// market discovery and executable quote commands parse the intended read-only surfaces.
+    /// #157: market discovery and executable quote commands parse the intended read-only surfaces.
     #[test]
     fn markets_and_quote_subcommands_parse() {
         let c = Cli::try_parse_from([
@@ -739,7 +758,7 @@ mod market_orders_cli_tests {
         assert_eq!(b.read_timeout.read_timeout_secs, 11);
     }
 
-    /// read-only Dodex indexer discovery parses independently of shellnet signing flags.
+    /// #192: read-only Dodex indexer discovery parses independently of shellnet signing flags.
     #[test]
     fn market_data_subcommands_parse() {
         let c = Cli::try_parse_from([
@@ -749,6 +768,8 @@ mod market_orders_cli_tests {
             "http://dodex-dev.ackinacki.org:8080",
             "--output",
             "json",
+            "--endpoint",
+            "new-shellnet.example",
             "list",
             "--producer",
             "qwen",
@@ -768,6 +789,7 @@ mod market_orders_cli_tests {
             Some("http://dodex-dev.ackinacki.org:8080")
         );
         assert_eq!(args.output, MarketDataOutput::Json);
+        assert_eq!(args.endpoint.as_deref(), Some("new-shellnet.example"));
         assert_eq!(args.timeout_ms, 10_000);
         let MarketDataCommand::List {
             producer,
@@ -855,7 +877,7 @@ mod market_orders_cli_tests {
         .is_err());
     }
 
-    /// own-order lifecycle commands parse as one note-scoped surface.
+    /// #158: own-order lifecycle commands parse as one note-scoped surface.
     #[test]
     fn orders_subcommands_parse() {
         let c = Cli::try_parse_from([
@@ -938,7 +960,7 @@ mod market_orders_cli_tests {
         ));
     }
 
-    /// subscription lifecycle commands parse the note-scoped inference surface.
+    /// #163: subscription lifecycle commands parse the note-scoped inference surface.
     #[test]
     fn subscription_subcommands_parse() {
         let c = Cli::try_parse_from([
@@ -1070,7 +1092,7 @@ mod deal_handle_cli_tests {
     use clap::Parser;
     use std::path::PathBuf;
 
-    /// durable local deal-handle commands parse without low-level address reassembly for the handle path,
+    /// #159: durable local deal-handle commands parse without low-level address reassembly for the handle path,
     /// while raw TokenContract close can still be made explicit with role/note.
     #[test]
     fn deal_handle_subcommands_parse() {
@@ -1177,7 +1199,7 @@ mod deal_handle_cli_tests {
         );
     }
 
-    /// PR212: explicit `buyer --resume` remains a no-new-buy connect path; model-only resume is covered
+    /// #189/PR212: explicit `buyer --resume` remains a no-new-buy connect path; model-only resume is covered
     /// by the shellnet resume validation tests.
     #[test]
     fn buyer_resume_explicit_deal_parses() {
@@ -1362,7 +1384,7 @@ mod oracle_cli_tests {
     use clap::Parser;
     use std::path::PathBuf;
 
-    /// oracle/PMP lifecycle commands parse as a single shellnet surface.
+    /// #26: oracle/PMP lifecycle commands parse as a single shellnet surface.
     #[test]
     fn oracle_subcommands_parse() {
         let c = Cli::try_parse_from([
@@ -1471,16 +1493,16 @@ mod deposit_tests {
     fn below_floor_deposit_is_rejected_fail_closed() {
         // A deposit whose deposit/2 lands below the constant-derived MIN_DEPLOY_SHELLS floor must error, not
         // silently proceed into an under-funded deploy. Asserted relative to the constant so it survives a
-        // re-sizing of the floor.
+        // re-sizing of the floor (#70: ~10/deploy — MIN_BALANCE gates nothing, the old ~110 was over-funding).
         assert!(
             deposit_per_deploy(MIN_DEPLOY_SHELLS).is_err(),
-            "half the floor per deploy -- must be rejected"
+            "half the floor per deploy — must be rejected"
         );
         assert!(
             deposit_per_deploy(MIN_DEPLOY_SHELLS * 2 - 2).is_err(),
-            "one SHELL/deploy below the floor -- must be rejected"
+            "one SHELL/deploy below the floor — must be rejected"
         );
-        // Exactly at the floor(2xMIN_DEPLOY_SHELLS) is the minimum accepted.
+        // Exactly at the floor (2×MIN_DEPLOY_SHELLS) is the minimum accepted.
         assert!(deposit_per_deploy(MIN_DEPLOY_SHELLS * 2).is_ok());
         assert!(deposit_per_deploy(MIN_DEPLOY_SHELLS * 2 - 1).is_err());
     }
@@ -1599,7 +1621,7 @@ mod tests {
 
     #[test]
     fn default_endpoints_path_is_under_platform_app_dir() {
-        // Pure function(no directory creation) -- no side effects in the test.
+        // Pure function (no directory creation) — no side effects in the test.
         // ProjectDirs == None only without a home directory; otherwise the path is under dexdo/endpoints.json.
         if let Ok(p) = default_endpoints_path() {
             assert!(
@@ -1711,7 +1733,7 @@ mod tests {
         assert_eq!(consumer_api_token_budget(u128::MAX), u64::MAX);
     }
 
-    /// Issue: `--market` feeds `token_contract` + `frame_model` from a provision manifest verbatim
+    /// Issue #24: `--market` feeds `token_contract` + `frame_model` from a provision manifest verbatim
     /// (no hand-editing), and the explicit flags are used when `--market` is absent.
     #[test]
     fn market_loader_resolves_fields() {
@@ -1735,7 +1757,7 @@ mod tests {
             p
         };
 
-        // --market provides token_contract, frame_model AND the deal nonce, verbatim.
+        // --market provides token_contract, frame_model AND the deal nonce, verbatim (review #39).
         let p = write("ok.json", &valid);
         let (tc, fm, nonce) = resolve_market_fields(Some(&p), None, None).unwrap();
         assert_eq!(tc, "0:tc");
@@ -1746,8 +1768,8 @@ mod tests {
             "--market must preserve the manifest's deal nonce for the seller"
         );
 
-        // Flags path: token_contract + optional frame_model(the seller passes None for frame_model).
-        // The explicit path carries no nonce -- the seller must supply it via `--nonce`.
+        // Flags path: token_contract + optional frame_model (the seller passes None for frame_model).
+        // The explicit path carries no nonce — the seller must supply it via `--nonce` (review #39).
         let (tc, fm, nonce) = resolve_market_fields(None, Some("0:flag"), Some("m")).unwrap();
         assert_eq!((tc.as_str(), fm.as_deref()), ("0:flag", Some("m")));
         assert!(
@@ -1757,14 +1779,14 @@ mod tests {
         let (tc, fm, _nonce) = resolve_market_fields(None, Some("0:flag"), None).unwrap();
         assert_eq!((tc.as_str(), fm), ("0:flag", None));
 
-        // Neither --market nor --token-contract -> explicit error.
+        // Neither --market nor --token-contract → explicit error.
         assert!(resolve_market_fields(None, None, None).is_err());
 
-        // Fail-loud: --market is mutually exclusive with the explicit flags(no silent precedence).
+        // Fail-loud: --market is mutually exclusive with the explicit flags (no silent precedence).
         assert!(resolve_market_fields(Some(&p), Some("0:other"), None).is_err());
         assert!(resolve_market_fields(Some(&p), None, Some("other")).is_err());
 
-        // Corrupt manifest(model_hash inconsistent with frame_model) is rejected by load.
+        // Corrupt manifest (model_hash inconsistent with frame_model) is rejected by load.
         let mut bad = valid.clone();
         bad.model_hash = "0xdeadbeef".into();
         let pb = write("bad.json", &bad);
@@ -1779,14 +1801,14 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// Issue(review): the seller fails closed when the `--market` manifest's model does not match
-    /// the `--model` it would serve(no posting the manifest's TC into the wrong order book).
+    /// Issue #24 (review): the seller fails closed when the `--market` manifest's model does not match
+    /// the `--model` it would serve (no posting the manifest's TC into the wrong order book).
     #[test]
     fn market_model_match_fails_closed() {
-        // No manifest model(flags path) or a matching one -- OK.
+        // No manifest model (flags path) or a matching one — OK.
         assert!(check_market_model_match(None, "qwen/qwen3-32b", "qwen").is_ok());
         assert!(check_market_model_match(Some("qwen/qwen3-32b"), "qwen/qwen3-32b", "qwen").is_ok());
-        // Mismatch -- fail closed.
+        // Mismatch — fail closed.
         let err = check_market_model_match(Some("qwen/qwen3-32b"), "llama/llama-3", "llama")
             .unwrap_err()
             .to_string();

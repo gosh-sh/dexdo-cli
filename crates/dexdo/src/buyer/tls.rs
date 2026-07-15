@@ -1,10 +1,12 @@
-//! Pinning of the gateway's TLS certificate on the buyer side.
+//! Pinning of the gateway's TLS certificate on the buyer side (§3.1.3).
+//!
 //! There is no PKI. Trust in the gateway's self-signed certificate comes from the **fingerprint**
-//! that arrived in the note-encrypted handover. The buyer connects over TLS and accepts
+//! that arrived in the note-encrypted handover (§3.1). The buyer connects over TLS and accepts
 //! the connection **only if** the SHA-256 of the presented leaf certificate matches the pinned
-//! fingerprint; otherwise it tears down **before** receiving the stream(fail-closed). An active
+//! fingerprint; otherwise it tears down **before** receiving the stream (fail-closed). An active
 //! MITM with a foreign certificate is repelled this way.
-//! The implementation reuses the rustls stack that tonic already pulls in(tokio-rustls/hyper-util),
+//!
+//! The implementation reuses the rustls stack that tonic already pulls in (tokio-rustls/hyper-util),
 //! without a separate TLS stack: a custom `ServerCertVerifier` checks the fingerprint and delegates
 //! handshake signature verification to the standard rustls webpki provider.
 
@@ -28,10 +30,11 @@ use tower::service_fn;
 
 use crate::seller::tls::fingerprint_der;
 
-/// rustls verifier that pins the gateway's certificate fingerprint.
+/// rustls verifier that pins the gateway's certificate fingerprint (§3.1.3).
+///
 /// `verify_server_cert` accepts the certificate **only** when SHA-256(DER) matches the pinned
-/// fingerprint. The TLS handshake signature is verified by the standard webpki provider -- so
-/// fingerprint pinning complements(does not replace) the cryptographic proof of key ownership.
+/// fingerprint. The TLS handshake signature is verified by the standard webpki provider — so
+/// fingerprint pinning complements (does not replace) the cryptographic proof of key ownership.
 #[derive(Debug)]
 struct PinnedFingerprintVerifier {
     expected: String,
@@ -51,7 +54,7 @@ impl ServerCertVerifier for PinnedFingerprintVerifier {
         if presented == self.expected {
             Ok(ServerCertVerified::assertion())
         } else {
-            // Fail-closed: foreign certificate(MITM) -- rejection BEFORE receiving any stream.
+            // Fail-closed: foreign certificate (MITM) — rejection BEFORE receiving any stream.
             Err(RustlsError::General(format!(
                 "pinned TLS fingerprint mismatch: expected {}, got {presented}",
                 self.expected
@@ -95,7 +98,8 @@ impl ServerCertVerifier for PinnedFingerprintVerifier {
 }
 
 /// Open a gRPC channel to the gateway over TLS, pinning the certificate fingerprint from the
-/// handover.
+/// handover (§3.1.3).
+///
 /// `endpoint` is `https://host:port` from the decrypted handover; `fingerprint` is the pinned
 /// fingerprint from the same place. If the presented certificate does not match, the connection
 /// does not come up.
@@ -140,7 +144,7 @@ pub async fn connect_pinned(endpoint: &str, fingerprint: &str) -> Result<Channel
                     uri.port_u16().unwrap_or(443)
                 );
                 let tcp = tokio::net::TcpStream::connect(host_port).await?;
-                // The gateway certificate's SAN is fixed(`dexdo`) -- trust comes from fingerprint
+                // The gateway certificate's SAN is fixed (`dexdo`) — trust comes from fingerprint
                 // pinning, not the name; we pass a fixed server_name for the SNI handshake.
                 let dns = ServerName::try_from("dexdo")
                     .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidInput, e))?;

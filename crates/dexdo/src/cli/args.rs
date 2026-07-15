@@ -1,4 +1,4 @@
-//! `dexdo` CLI argument structs(clap-derived), split out of `main.rs`(PR3, move-only). The parser surface
+//! `dexdo` CLI argument structs (clap-derived), split out of `main.rs` (PR3, move-only). The parser surface
 //! for `seller`/`buyer`/`monitor`/`provision`/`destroy`/`recover`. Behavior-identical to the pre-split defs.
 
 use anyhow::{bail, Result};
@@ -55,10 +55,10 @@ pub(crate) struct ChainReadTimeoutArgs {
     pub(crate) read_timeout_secs: u64,
 }
 
-/// First-class mock flags -- common to both roles.
+/// First-class mock flags (§11.1) — common to both roles.
 #[derive(Args, Clone)]
 pub(crate) struct MockFlags {
-    /// Mock model: fake tokens instead of a real upstream.
+    /// Mock model: fake tokens instead of a real upstream (AGENTS.md §2).
     #[arg(long)]
     pub(crate) mock_model: bool,
     /// Mock chain: `MockChainBackend` instead of real shellnet.
@@ -67,42 +67,42 @@ pub(crate) struct MockFlags {
 }
 
 impl MockFlags {
-    /// Buyer mock-demo: on a mock chain the upstream is also mock -- there is no real stream, so
-    /// we require `--mock-model`. The chain is selected separately (`--mock-chain` -> mock, otherwise real
-    /// shellnet behind the feature) -- the former `bail!` about "" is removed(the real backend is available).
+    /// Buyer mock-demo (§11.1): on a mock chain the upstream is also mock — there is no real stream, so
+    /// we require `--mock-model`. The chain (with D10) is selected separately (`--mock-chain` → mock, otherwise real
+    /// shellnet behind the feature) — the former `bail!` about "directive 2" is removed (the real backend is available).
     pub(crate) fn require_mock_model(&self) -> Result<()> {
         if !self.mock_model {
-            bail!("the buyer mock chain also requires --mock-model (,); the real path is without --mock-chain");
+            bail!("the buyer mock chain also requires --mock-model (directive 1, §11.1); the real path is without --mock-chain");
         }
         Ok(())
     }
 }
 
-/// Note identity -- common to all subcommands(`seller`/`buyer`/`monitor`).
-/// Path to the root key; dexdo only **reads** it
-/// and derives the note in memory. Same key -> same note -> continuity between runs.
+/// Note identity (directive 7) — common to all subcommands (`seller`/`buyer`/`monitor`).
+/// Path to the root key; dexdo only **reads** it (custody is an external module/wallet §5)
+/// and derives the note in memory. Same key → same note → continuity between runs.
 #[derive(Args, Clone)]
 pub(crate) struct IdentityArgs {
-    /// Path to a file with the 32-byte hex secret of the note's root key -- the **persistent** identity
-    /// . The root key is derivable: identity = the key AND the whole
-    /// tree of(sub)notes under it. Without the flag -- an ephemeral note (a warning; mock-demo only,
+    /// Path to a file with the 32-byte hex secret of the note's root key — the **persistent** identity
+    /// (R11/§3.1.1). The root key is derivable (HD-style, directive 7): identity = the key AND the whole
+    /// tree of (sub)notes under it. Without the flag — an ephemeral note (a warning; mock-demo only,
     /// without continuity). An invalid/inaccessible path is an explicit failure, not a silent `generate()`.
     #[arg(long)]
     pub(crate) note_key: Option<PathBuf>,
-    /// Index of the tree(sub)note this subcommand operates on: one root
-    /// key -> many notes, a specific deal/order lives on a specific sub-note. Reproducible
-    /// (same key+index -> same note). The monitor aggregates over the whole tree(`--tree-width`).
+    /// Index of the tree (sub)note this subcommand operates on (directive 7): one root
+    /// key → many notes, a specific deal/order lives on a specific sub-note. Reproducible
+    /// (same key+index → same note). The monitor aggregates over the whole tree (`--tree-width`).
     #[arg(long, default_value_t = 0)]
     pub(crate) note_index: u32,
-    /// **Real shellnet:** on-chain address of the actor's already **provisioned** `PrivateNote` (minted by
-    /// `mint_pn_pool`). dexdo does NOT create the note -- it only reads/signs it
-    /// with the owner key from `--note-key`(for the real path this is the SDK secret hex, not an HD seed). On the mock path
+    /// **Real shellnet (D10):** on-chain address of the actor's already **provisioned** `PrivateNote` (minted by
+    /// `mint_pn_pool`). dexdo does NOT create the note (custody is external §5) — it only reads/signs it
+    /// with the owner key from `--note-key` (for the real path this is the SDK secret hex, not an HD seed). On the mock path
     /// (`--mock-chain`) it is ignored.
     #[arg(long)]
     pub(crate) note_addr: Option<String>,
 }
 
-/// Issue: explicit client-side ModelRegistry validation config.
+/// Issue #209: explicit client-side ModelRegistry validation config.
 #[derive(Args, Clone, Default)]
 pub(crate) struct ModelRegistryValidationArgs {
     /// Strict JSON config with explicit seller/buyer check_model_registry booleans.
@@ -159,23 +159,23 @@ pub(crate) struct SellerArgs {
     /// Public gateway host:port written to the buyer handover. Defaults to --gateway-listen.
     #[arg(long, value_name = "HOST:PORT")]
     pub(crate) gateway_advertise: Option<GatewayAdvertiseAddr>,
-    /// Endpoints file -- the handover seam. By default, in the platform data directory
+    /// Endpoints file — the handover seam (§3.1). By default, in the platform data directory
     /// (Linux `~/.local/share/dexdo`, macOS App Support, Windows `%APPDATA%`); `--endpoints-file`
-    /// overrides it(D6, portability).
+    /// overrides it (D6, portability).
     #[arg(long)]
     pub(crate) endpoints_file: Option<PathBuf>,
-    /// Local deal-handle directory. Defaults to the platform app data directory.
+    /// Local deal-handle directory (#159). Defaults to the platform app data directory.
     #[arg(long)]
     pub(crate) deals_dir: Option<PathBuf>,
-    /// Deal token_contract address. Optional if `--market` is given(loaded from the manifest).
+    /// Deal token_contract address (§2.1). Optional if `--market` is given (loaded from the manifest).
     #[arg(long)]
     pub(crate) token_contract: Option<String>,
-    /// Issue: load the deal `token_contract` from a `dexdo provision` market manifest instead of
+    /// Issue #24: load the deal `token_contract` from a `dexdo provision` market manifest instead of
     /// passing `--token-contract` by hand. The seller still serves the model named by `--model`.
     #[arg(long)]
     pub(crate) market: Option<PathBuf>,
-    /// Review: deal nonce for the per-deal `TokenContract`(matches `dexdo provision --nonce`).
-    /// Required with an explicit `--token-contract` on real shellnet -- the IOB rejects an offer whose
+    /// Review #39: deal nonce for the per-deal `TokenContract` (matches `dexdo provision --nonce`).
+    /// Required with an explicit `--token-contract` on real shellnet — the IOB rejects an offer whose
     /// `tokenContract` does not derive from `(sellerPubkey, nonce)`. With `--market` it is taken from
     /// the manifest, so do not pass both.
     #[arg(long)]
@@ -187,20 +187,20 @@ pub(crate) struct SellerArgs {
     /// `max_tokens`, capped by the market's `max_ticks * TICK_SIZE`.
     #[arg(long, default_value_t = 8)]
     pub(crate) mock_token_count: u64,
-    /// Model name from the config: a key or `frame_model`. Required on real shellnet
+    /// Model name from the config (Directive 11): a key or `frame_model`. Required on real shellnet
     /// even with `--mock-model`, because it selects the on-chain `modelHash`; optional only for the
     /// `--mock-chain --mock-model` demo.
     #[arg(long)]
     pub(crate) model: Option<String>,
-    /// Path to the models config. Defaults to `models.json` in the working directory.
+    /// Path to the models config (JSON, Directive 11). Defaults to `models.json` in the working directory.
     #[arg(long, default_value = "models.json")]
     pub(crate) models: PathBuf,
-    /// **Real shellnet:** manifest of the deployed contracts(SuperRoot/DappConfig addresses). The release
-    /// places it next to the binary; default -- `contracts/deployed.shellnet.json` in the working directory. The
-    /// probe-commission is posted by the note itself -- no operator wallet.
+    /// **Real shellnet (D10):** manifest of the deployed contracts (SuperRoot/DappConfig addresses). The release
+    /// places it next to the binary; default — `contracts/deployed.shellnet.json` in the working directory. The
+    /// probe-commission is posted by the note itself (`postProbeCommission`, #58) — no operator wallet.
     #[arg(long, default_value = "contracts/deployed.shellnet.json")]
     pub(crate) contracts: PathBuf,
-    /// **Real shellnet:** maximum raw ECC[2] units the seller may post for `fundProbeCommission`.
+    /// **Real shellnet (D10):** maximum raw ECC[2] units the seller may post for `fundProbeCommission`.
     /// The client reads `getProbe().probeCommission` and posts exactly that raw amount; this limit fails
     /// closed if the contract requires more. The default is 1_000_000 raw units, i.e. 0.001 SHELL.
     #[arg(long, default_value_t = 1_000_000)]
@@ -228,33 +228,33 @@ pub(crate) struct BuyerArgs {
     pub(crate) identity: IdentityArgs,
     #[command(flatten)]
     pub(crate) registry: ModelRegistryValidationArgs,
-    /// Endpoints file -- where to read the enc-endpoint from. Default -- the platform data directory
-    /// (see `seller`); `--endpoints-file` overrides it(D6).
+    /// Endpoints file — where to read the enc-endpoint from (§3.1). Default — the platform data directory
+    /// (see `seller`); `--endpoints-file` overrides it (D6).
     #[arg(long)]
     pub(crate) endpoints_file: Option<PathBuf>,
-    /// Local deal-handle directory. Defaults to the platform app data directory.
+    /// Local deal-handle directory (#159). Defaults to the platform app data directory.
     #[arg(long)]
     pub(crate) deals_dir: Option<PathBuf>,
-    /// Deal token_contract address. Optional if `--market` is given(loaded from the manifest).
+    /// Deal token_contract address. Optional if `--market` is given (loaded from the manifest).
     #[arg(long)]
     pub(crate) token_contract: Option<String>,
-    /// **Resume/connect** to an ALREADY-matched deal without placing a new buy -- read the on-chain handover and
+    /// **Resume/connect** to an ALREADY-matched deal without placing a new buy — read the on-chain handover and
     /// stream/serve. Use it after a `buyer` timed out awaiting the seller's `open_stream`, once the seller has
     /// opened it: the escrow is already committed, so a fresh buy would double-pay. Works BOTH model-only
-    /// (default: the deal `TokenContract` is recovered from THIS note's own `InferenceFilledConfirmed` event --
+    /// (default: the deal `TokenContract` is recovered from THIS note's own `InferenceFilledConfirmed` event —
     /// no hand-pasted address) and with an explicit `--token-contract`/`--market`.
     #[arg(long)]
     pub(crate) resume: bool,
-    /// Issue: load `token_contract` + `frame_model` from a `dexdo provision` market manifest
+    /// Issue #24: load `token_contract` + `frame_model` from a `dexdo provision` market manifest
     /// instead of passing them by hand.
     #[arg(long)]
     pub(crate) market: Option<PathBuf>,
     /// One-shot buyer receive cap. In local consumer-API mode, per-request `max_tokens` is honored and capped by
-    /// the purchased deal budget(`--ticks x TICK_SIZE`) instead of this debug/one-shot cap.
+    /// the purchased deal budget (`--ticks × TICK_SIZE`) instead of this debug/one-shot cap.
     #[arg(long, default_value_t = 8)]
     pub(crate) max_tokens: u64,
     /// Local bind/listen address for the OpenAI-compatible consumer endpoint; buyer-side equivalent of seller --gateway-listen.
-    /// If set -- the client brings up an HTTP interface instead of a one-shot stream+STOP.
+    /// If set — the client brings up an HTTP interface instead of a one-shot stream+STOP.
     #[arg(long)]
     pub(crate) local_listen: Option<SocketAddr>,
     /// Continuity mode for --local-listen. proactive keeps a warm next deal ready after idle close,
@@ -266,44 +266,44 @@ pub(crate) struct BuyerArgs {
     /// Emit machine-readable JSONL lifecycle events on stdout.
     #[arg(long)]
     pub(crate) json: bool,
-    /// Additionally bring up an Anthropic-compatible `/v1/messages` via transcoding(B20).
+    /// Additionally bring up an Anthropic-compatible `/v1/messages` via transcoding (B20).
     #[arg(long)]
     pub(crate) anthropic_compat: bool,
-    /// Model id of the configured frame/market(B2/B19) -- the only served model. Alias: --model.
-    /// **Required**(review Y2): it used to silently default to `dexdo-mock`, which on a real deal made
-    /// B7 verify substitution against the wrong model(a silent no-op / false positive). Now the operator
-    /// sets it explicitly(for mock-demo -- `--frame-model dexdo-mock`). Optional if `--market` is given
+    /// Model id of the configured frame/market (B2/B19) — the only served model. Alias: --model.
+    /// **Required** (review Y2): it used to silently default to `dexdo-mock`, which on a real deal made
+    /// B7 verify substitution against the wrong model (a silent no-op / false positive). Now the operator
+    /// sets it explicitly (for mock-demo — `--frame-model dexdo-mock`). Optional if `--market` is given
     /// (loaded from the manifest). Horizon: derive it from the deal's per-model `InferenceOrderBook`.
     #[arg(long, visible_alias = "model")]
     pub(crate) frame_model: Option<String>,
-    /// accept a model whose family has **no content-identity check** (no B8 fingerprint and no B7
+    /// #144: accept a model whose family has **no content-identity check** (no B8 fingerprint and no B7
     /// reference/key) on NAME-only evidence. Without it the buyer refuses to open the consumer API for such a
-    /// model -- a seller could serve a cheaper model under the correct name undetected. When a fingerprint OR a
-    /// reference key IS available the content gate runs regardless of this flag(it cannot be opted out of).
+    /// model — a seller could serve a cheaper model under the correct name undetected. When a fingerprint OR a
+    /// reference key IS available the content gate runs regardless of this flag (it cannot be opted out of).
     #[arg(long)]
     pub(crate) allow_unverified_model: bool,
-    /// path to the models config(JSON) providing the **per-model verification data** (B5 vocab, B8
+    /// #281: path to the models config (JSON) providing the **per-model verification data** (B5 vocab, B8
     /// fingerprints, B7-full reference via base_url/served_model/api_key_env). Defaults to `models.json` in the
-    /// working directory. A model absent from this config has no verification data -> the buyer fails closed
+    /// working directory. A model absent from this config has no verification data → the buyer fails closed
     /// (unless `--allow-unverified-model`).
     #[arg(long, default_value = "models.json")]
     pub(crate) models: PathBuf,
-    /// How many ticks the buyer purchases. Not used on the mock path.
+    /// How many ticks the buyer purchases (D10, real `placeInferenceBuy`). Not used on the mock path.
     #[arg(long, default_value_t = 8)]
     pub(crate) ticks: u128,
-    /// **Real shellnet:** the per-tick price LIMIT(`maxPricePerTick`) -- crosses with ask <= limit.
-    /// Must be >= ask. Book deposit check: `escrow >= ticks x maxPricePerTick x (1 + 2.5 %
-    /// fee)` -- the fee is charged ON TOP of the limit, so `escrow = limit x ticks`(without headroom) does
-    /// not pass; keep the limit noticeably below `escrow /(ticks x 1.025)`.
+    /// **Real shellnet (D10):** the per-tick price LIMIT (`maxPricePerTick`) — crosses with ask ≤ limit.
+    /// Must be ≥ ask. Book deposit check (issue #20): `escrow ≥ ticks × maxPricePerTick × (1 + 2.5 %
+    /// fee)` — the fee is charged ON TOP of the limit, so `escrow = limit × ticks` (without headroom) does
+    /// not pass; keep the limit noticeably below `escrow / (ticks × 1.025)`.
     #[arg(long, default_value_t = 1_000_000)]
     pub(crate) max_price_per_tick: u128,
-    /// **Real shellnet:** escrow(the note's ECC SHELL) for `placeInferenceBuy`. Omit it to use EXACTLY
-    /// the required `ticks x max_price_per_tick x(1 + 2.5 % book fee)`. An
-    /// explicit value must equal `required`: under-funding orphans the escrow; over-funding strands the
-    /// surplus when the buy rests and is filled as a maker. Without `--mock-chain`.
+    /// **Real shellnet (D10):** escrow (the note's ECC SHELL) for `placeInferenceBuy`. Omit it to use EXACTLY
+    /// the required `ticks × max_price_per_tick × (1 + 2.5 % book fee)` (issue #20 — the computed default). An
+    /// explicit value must equal `required`: under-funding orphans the escrow (#20); over-funding strands the
+    /// surplus when the buy rests and is filled as a maker (issue #116 — not refunded). Without `--mock-chain`.
     #[arg(long)]
     pub(crate) escrow: Option<u128>,
-    /// **Real shellnet:** manifest of the deployed contracts(see `seller --contracts`).
+    /// **Real shellnet (D10):** manifest of the deployed contracts (see `seller --contracts`).
     #[arg(long, default_value = "contracts/deployed.shellnet.json")]
     pub(crate) contracts: PathBuf,
     /// Persistent failure policy JSON. Defaults to XDG config (`~/.config/dexdo/policy.json`, Windows
@@ -334,37 +334,40 @@ impl ContinuityModeArg {
     }
 }
 
-/// Monitor arguments -- identity + selected chain; read-only.
+/// Monitor arguments (directive 7, R14) — identity + selected chain; read-only.
 #[derive(Args)]
 pub(crate) struct MonitorArgs {
     #[command(flatten)]
     pub(crate) mock: MockFlags,
     #[command(flatten)]
     pub(crate) identity: IdentityArgs,
-    /// Endpoints/mock-chain-state file(the same one as `seller`/`buyer`). Default -- the platform path.
+    /// Endpoints/mock-chain-state file (the same one as `seller`/`buyer`). Default — the platform path.
     #[arg(long)]
     pub(crate) endpoints_file: Option<PathBuf>,
-    /// How many tree(sub)notes to poll (, R14: the monitor aggregates over ALL notes under
+    /// How many tree (sub)notes to poll (directive 7, R14: the monitor aggregates over ALL notes under
     /// the key, not just the root). The window `index = 0..width` is reproducible from the key. `--note-index`
-    /// is ignored by the monitor(it sees the whole tree, not a single sub-note).
+    /// is ignored by the monitor (it sees the whole tree, not a single sub-note).
     #[arg(long, default_value_t = 8)]
     pub(crate) tree_width: u32,
-    /// **Real shellnet:** the operator's market manifest(s) from `dexdo provision` -- the monitor
+    /// **Real shellnet (issue #23):** the operator's market manifest(s) from `dexdo provision` — the monitor
     /// reads each market's `TokenContract` by-fact state on-chain (a `RealNote` is a single key, not an HD tree,
     /// so the real monitor reads the markets it is given, not a `--tree-width` window). Repeat for many markets.
     #[arg(long)]
     pub(crate) market: Vec<PathBuf>,
-    /// Deployed-contracts manifest(SuperRoot/DappConfig) for the real-chain connection.
+    /// Deployed-contracts manifest (SuperRoot/DappConfig) for the real-chain connection (issue #23).
     #[arg(long, default_value = "contracts/deployed.shellnet.json")]
     pub(crate) contracts: PathBuf,
 }
 
-/// Doctor / health check: read-only shellnet version and manifest freshness guard.
+/// Doctor / health check (#161): read-only shellnet version and manifest freshness guard.
 #[derive(Args)]
 pub(crate) struct DoctorArgs {
-    /// Network to check. Only `shellnet` is currently supported.
+    /// Network name or Block Manager endpoint. `shellnet` uses the manifest/default endpoint.
     #[arg(long, default_value = "shellnet")]
     pub(crate) network: String,
+    /// Block Manager host or URL. Overrides the manifest and `--network` endpoint.
+    #[arg(long, alias = "graphql")]
+    pub(crate) endpoint: Option<String>,
     /// Deployed-contracts manifest.
     #[arg(long, default_value = "contracts/deployed.shellnet.json")]
     pub(crate) contracts: PathBuf,
@@ -417,57 +420,57 @@ pub(crate) enum PolicyRoleArg {
     Both,
 }
 
-/// Provision arguments: bring up a per-deal market from the seller note alone.
+/// Provision arguments (issue #24): bring up a per-deal market from the seller note alone (note-funded, #58).
 #[derive(Args)]
 pub(crate) struct ProvisionArgs {
     #[command(flatten)]
     pub(crate) identity: IdentityArgs,
     #[command(flatten)]
     pub(crate) registry: ModelRegistryValidationArgs,
-    /// Frame model id the market serves(determines the on-chain `modelHash`).
+    /// Frame model id the market serves (determines the on-chain `modelHash`).
     #[arg(long)]
     pub(crate) frame_model: String,
-    /// Deployed-contracts manifest(SuperRoot/DappConfig addresses).
+    /// Deployed-contracts manifest (SuperRoot/DappConfig addresses).
     #[arg(long, default_value = "contracts/deployed.shellnet.json")]
     pub(crate) contracts: PathBuf,
-    /// Deal nonce -- disambiguates multiple `TokenContract`s under one `RootModel`.: REQUIRED and must be
-    /// UNIQUE per deal -- the per-deal `TokenContract` derives from `(sellerPubkey, nonce)`, so a reused/default
-    /// nonce collides(overwrites a prior deal's TC). No unsafe `0` default; pass a distinct value per deal.
+    /// Deal nonce — disambiguates multiple `TokenContract`s under one `RootModel`. #125: REQUIRED and must be
+    /// UNIQUE per deal — the per-deal `TokenContract` derives from `(sellerPubkey, nonce)`, so a reused/default
+    /// nonce collides (overwrites a prior deal's TC). No unsafe `0` default; pass a distinct value per deal.
     #[arg(long)]
     pub(crate) nonce: Option<u64>,
-    /// Tick price P(SHELL) for the deal `TokenContract`.
+    /// Tick price P (SHELL) for the deal `TokenContract`.
     #[arg(long, default_value_t = 1000)]
     pub(crate) price_per_tick: u128,
     /// Max ticks the deal `TokenContract` bounds to.
     #[arg(long, default_value_t = 1024)]
     pub(crate) max_ticks: u128,
-    /// Note ECC[2] allocation in whole SHELL, not raw nano/vmshell(1 SHELL = 1e9 raw).
-    /// Split about `deposit/2` per deploy after `fundDeployShell`(RootModel + TokenContract).
+    /// Note ECC[2] allocation in whole SHELL, not raw nano/vmshell (1 SHELL = 1e9 raw).
+    /// Split about `deposit/2` per deploy after `fundDeployShell` (RootModel + TokenContract).
     /// Unused deploy remainder burns at `destroy`; raise this value if a live TC needs more runtime gas.
     /// Fail-closed: below-floor / overflow is rejected, not clamped. Absent on an interactive terminal prompts.
     #[arg(long)]
     pub(crate) deposit_shells: Option<u128>,
-    /// Output path for the produced market manifest(OB/RootModel + the deployed TC address). `dexdo
+    /// Output path for the produced market manifest (OB/RootModel + the deployed TC address). `dexdo
     /// seller`/`buyer` load it via `--market`.
     #[arg(long, default_value = "market.json")]
     pub(crate) output: PathBuf,
 }
 
-/// Args for `dexdo destroy`: the seller CLOSES a STOPped deal's `TokenContract` (DESTRUCTIVE -- the held
-/// ~a-few-vmshell leftover burns cross-dapp; negligible at the right-sized ~10/deploy funding,).
+/// Args for `dexdo destroy` (#65): the seller CLOSES a STOPped deal's `TokenContract` (DESTRUCTIVE — the held
+/// ~a-few-vmshell leftover burns cross-dapp; negligible at the right-sized ~10/deploy funding, #70).
 #[derive(Args)]
 pub(crate) struct DestroyArgs {
     #[command(flatten)]
     pub(crate) identity: IdentityArgs,
-    /// The deal `TokenContract` to destroy(or pass `--market`).
+    /// The deal `TokenContract` to destroy (or pass `--market`).
     #[arg(long)]
     pub(crate) token_contract: Option<String>,
-    /// A `dexdo provision` market manifest carrying the `token_contract`(alternative to `--token-contract`).
+    /// A `dexdo provision` market manifest carrying the `token_contract` (alternative to `--token-contract`).
     #[arg(long)]
     pub(crate) market: Option<PathBuf>,
-    /// **Optional acknowledgement.** `destroy` `selfdestruct`s the TC; the held leftover burns cross-dapp
+    /// **Optional acknowledgement (#70).** `destroy` `selfdestruct`s the TC; the held leftover burns cross-dapp
     /// (not credited back to the note). At the right-sized ~10/deploy funding that leftover is ~a few vmshell, so
-    /// this flag is no longer required(a fail-closed gate for ~110 was overkill) -- kept for back-compat.
+    /// this flag is no longer required (a fail-closed gate for ~110 was overkill) — kept for back-compat.
     #[arg(long)]
     pub(crate) acknowledge_burn: bool,
     /// Deployed-contracts manifest.
@@ -475,16 +478,16 @@ pub(crate) struct DestroyArgs {
     pub(crate) contracts: PathBuf,
 }
 
-/// Args for `dexdo recover`: the BUYER STOPs an orphaned OPEN deal from its note WITHOUT placing a
-/// new buy, so a stuck deal(the buyer process died) can be closed and the seller can then `destroy` it.
+/// Args for `dexdo recover` (#85): the BUYER STOPs an orphaned OPEN deal from its note WITHOUT placing a
+/// new buy, so a stuck deal (the buyer process died) can be closed and the seller can then `destroy` it.
 #[derive(Args)]
 pub(crate) struct RecoverArgs {
     #[command(flatten)]
     pub(crate) identity: IdentityArgs,
-    /// The OPEN deal `TokenContract` to STOP(or pass `--market`).
+    /// The OPEN deal `TokenContract` to STOP (or pass `--market`).
     #[arg(long)]
     pub(crate) token_contract: Option<String>,
-    /// A `dexdo provision` market manifest carrying the `token_contract`(alternative to `--token-contract`).
+    /// A `dexdo provision` market manifest carrying the `token_contract` (alternative to `--token-contract`).
     #[arg(long)]
     pub(crate) market: Option<PathBuf>,
     /// DEXDO_PN_POOL fallback carrying the note owner key and last matched TokenContract. Defaults to env DEXDO_PN_POOL.
@@ -495,17 +498,17 @@ pub(crate) struct RecoverArgs {
     pub(crate) contracts: PathBuf,
 }
 
-/// Args for `dexdo dispute`: the BUYER opens an on-chain dispute on an OPEN deal -- `streamDispute` ->
-/// `TC.dispute()` LOCKS both notes until `releaseDispute`/arbitration. The anti-scam lever for an
-/// observed substitution/fraud -- strictly stronger than `recover`'s STOP(which still pays for ticks).
+/// Args for `dexdo dispute` (#145): the BUYER opens an on-chain dispute on an OPEN deal — `streamDispute` ->
+/// `TC.dispute()` LOCKS both notes (§4.2) until `releaseDispute`/arbitration. The anti-scam lever for an
+/// observed substitution/fraud (#144) — strictly stronger than `recover`'s STOP (which still pays for ticks).
 #[derive(Args)]
 pub(crate) struct DisputeArgs {
     #[command(flatten)]
     pub(crate) identity: IdentityArgs,
-    /// The OPEN deal `TokenContract` to dispute(or pass `--market`).
+    /// The OPEN deal `TokenContract` to dispute (or pass `--market`).
     #[arg(long)]
     pub(crate) token_contract: Option<String>,
-    /// A `dexdo provision` market manifest carrying the `token_contract`(alternative to `--token-contract`).
+    /// A `dexdo provision` market manifest carrying the `token_contract` (alternative to `--token-contract`).
     #[arg(long)]
     pub(crate) market: Option<PathBuf>,
     /// DEXDO_PN_POOL fallback carrying the note owner key and last matched TokenContract. Defaults to env DEXDO_PN_POOL.
@@ -516,17 +519,17 @@ pub(crate) struct DisputeArgs {
     pub(crate) contracts: PathBuf,
 }
 
-/// Args for `dexdo reclaim`: the BUYER reclaims escrow on seller no-show. OPEN abandoned deals use
+/// Args for `dexdo reclaim` (#145/#149): the BUYER reclaims escrow on seller no-show. OPEN abandoned deals use
 /// `streamReclaim` -> `TC.reclaimOnTimeout()` after `STREAM_TIMEOUT`; funded-but-never-opened deals use
 /// `streamCleanup` -> `TC.cleanupUnopened()` after `MATCH_OPEN_TIMEOUT`. Fails closed locally on ownership + timer.
 #[derive(Args)]
 pub(crate) struct ReclaimArgs {
     #[command(flatten)]
     pub(crate) identity: IdentityArgs,
-    /// The funded/OPEN deal `TokenContract` to reclaim(or pass `--market`).
+    /// The funded/OPEN deal `TokenContract` to reclaim (or pass `--market`).
     #[arg(long)]
     pub(crate) token_contract: Option<String>,
-    /// A `dexdo provision` market manifest carrying the `token_contract`(alternative to `--token-contract`).
+    /// A `dexdo provision` market manifest carrying the `token_contract` (alternative to `--token-contract`).
     #[arg(long)]
     pub(crate) market: Option<PathBuf>,
     /// DEXDO_PN_POOL fallback carrying the note owner key and last matched TokenContract. Defaults to env DEXDO_PN_POOL.
@@ -537,16 +540,16 @@ pub(crate) struct ReclaimArgs {
     pub(crate) contracts: PathBuf,
 }
 
-/// Args for `dexdo release-dispute`: the SELLER concedes an on-chain dispute on its deal TC,
+/// Args for `dexdo release-dispute` (#160): the SELLER concedes an on-chain dispute on its deal TC,
 /// unlocking both notes and returning the contested tick/deposit to the buyer.
 #[derive(Args)]
 pub(crate) struct ReleaseDisputeArgs {
     #[command(flatten)]
     pub(crate) identity: IdentityArgs,
-    /// The disputed deal `TokenContract` to release(or pass `--market`).
+    /// The disputed deal `TokenContract` to release (or pass `--market`).
     #[arg(long)]
     pub(crate) token_contract: Option<String>,
-    /// A `dexdo provision` market manifest carrying the `token_contract`(alternative to `--token-contract`).
+    /// A `dexdo provision` market manifest carrying the `token_contract` (alternative to `--token-contract`).
     #[arg(long)]
     pub(crate) market: Option<PathBuf>,
     /// Deployed-contracts manifest.
@@ -554,15 +557,15 @@ pub(crate) struct ReleaseDisputeArgs {
     pub(crate) contracts: PathBuf,
 }
 
-/// Args for `dexdo withdraw-shell`: the SELLER withdraws finalized `_finalizedOwed` SHELL from a deal TC.
+/// Args for `dexdo withdraw-shell` (#160): the SELLER withdraws finalized `_finalizedOwed` SHELL from a deal TC.
 #[derive(Args)]
 pub(crate) struct WithdrawShellArgs {
     #[command(flatten)]
     pub(crate) identity: IdentityArgs,
-    /// The deal `TokenContract` to withdraw from(or pass `--market`).
+    /// The deal `TokenContract` to withdraw from (or pass `--market`).
     #[arg(long)]
     pub(crate) token_contract: Option<String>,
-    /// A `dexdo provision` market manifest carrying the `token_contract`(alternative to `--token-contract`).
+    /// A `dexdo provision` market manifest carrying the `token_contract` (alternative to `--token-contract`).
     #[arg(long)]
     pub(crate) market: Option<PathBuf>,
     /// Amount to withdraw in the contract's SHELL unit. If omitted, withdraws all current `finalizedOwed`.
@@ -576,24 +579,24 @@ pub(crate) struct WithdrawShellArgs {
     pub(crate) contracts: PathBuf,
 }
 
-/// Deploy the per-model `InferenceOrderBook`(the shared market for a model) if it is not yet on-chain --
-/// note-funded, a separate operate step the seller runs before posting offers. The book address is
-/// deterministic from the model's `model_hash`, so the deploy is idempotent(already-deployed -> no-op).
+/// Deploy the per-model `InferenceOrderBook` (the shared market for a model) if it is not yet on-chain —
+/// note-funded (#58), a separate operate step the seller runs before posting offers. The book address is
+/// deterministic from the model's `model_hash`, so the deploy is idempotent (already-deployed → no-op).
 #[derive(Args)]
 pub(crate) struct MarketDeployArgs {
     #[command(flatten)]
     pub(crate) identity: IdentityArgs,
     #[command(flatten)]
     pub(crate) registry: ModelRegistryValidationArgs,
-    /// Frame model id whose order book to deploy(its `model_hash` derives the book address).
+    /// Frame model id whose order book to deploy (its `model_hash` derives the book address).
     #[arg(long)]
     pub(crate) frame_model: String,
-    /// Deployed-contracts manifest(SuperRoot/DappConfig addresses).
+    /// Deployed-contracts manifest (SuperRoot/DappConfig addresses).
     #[arg(long, default_value = "contracts/deployed.shellnet.json")]
     pub(crate) contracts: PathBuf,
 }
 
-/// Read-only market discovery: list configured/per-manifest inference order books.
+/// Read-only market discovery (#157): list configured/per-manifest inference order books.
 #[derive(Args)]
 pub(crate) struct MarketsArgs {
     /// Emit the stable `dexdo.markets.v1` JSON object.
@@ -626,15 +629,15 @@ pub(crate) struct MarketsArgs {
     pub(crate) contracts: PathBuf,
 }
 
-/// One model's order book as the human-readable box table: the same view the buyer shows before a
-/// buy -- #/price-per-tick/max-ticks + full tokenContract addresses. Read-only, keyed by the canonical model.
+/// One model's order book as the human-readable box table (#157): the same view the buyer shows before a
+/// buy — #/price-per-tick/max-ticks + full tokenContract addresses. Read-only, keyed by the canonical model.
 #[derive(Args)]
 pub(crate) struct MarketArgs {
     #[command(flatten)]
     pub(crate) registry: ModelRegistryValidationArgs,
     #[command(flatten)]
     pub(crate) read_timeout: ChainReadTimeoutArgs,
-    /// Canonical model id(`producer--model--version`, e.g. `qwen--qwen3--32b`) whose book to render.
+    /// Canonical model id (`producer--model--version`, e.g. `qwen--qwen3--32b`) whose book to render.
     pub(crate) model: String,
     /// Any active inference PrivateNote address used to derive the per-model order-book address.
     #[arg(long)]
@@ -642,7 +645,7 @@ pub(crate) struct MarketArgs {
     /// Optional provisioned market manifest. If given, the book is read from it instead of `--note-addr`.
     #[arg(long)]
     pub(crate) market: Option<PathBuf>,
-    /// Models config(used to accept a model KEY as well as a raw canonical frame_model).
+    /// Models config (used to accept a model KEY as well as a raw canonical frame_model).
     #[arg(long, default_value = "models.json")]
     pub(crate) models: PathBuf,
     /// Deployed-contracts manifest.
@@ -657,7 +660,7 @@ pub(crate) struct ExecutableBookArgs {
     pub(crate) registry: ModelRegistryValidationArgs,
     #[command(flatten)]
     pub(crate) read_timeout: ChainReadTimeoutArgs,
-    /// Canonical model id(`producer--model--version`, e.g. `qwen--qwen3--32b`) whose book to inspect.
+    /// Canonical model id (`producer--model--version`, e.g. `qwen--qwen3--32b`) whose book to inspect.
     pub(crate) model: String,
     /// Any active inference PrivateNote address used to derive the per-model order-book address.
     #[arg(long)]
@@ -665,7 +668,7 @@ pub(crate) struct ExecutableBookArgs {
     /// Optional provisioned market manifest. If given, the book is read from it instead of `--note-addr`.
     #[arg(long)]
     pub(crate) market: Option<PathBuf>,
-    /// Models config(used to accept a model KEY as well as a raw canonical frame_model).
+    /// Models config (used to accept a model KEY as well as a raw canonical frame_model).
     #[arg(long, default_value = "models.json")]
     pub(crate) models: PathBuf,
     /// Desired buyer ticks for the executable row filter.
@@ -679,7 +682,7 @@ pub(crate) struct ExecutableBookArgs {
     pub(crate) contracts: PathBuf,
 }
 
-/// Executable quote over current order-book depth.
+/// Executable quote over current order-book depth (#157).
 #[derive(Args)]
 pub(crate) struct QuoteArgs {
     /// Emit the stable `dexdo.quote.v1` JSON object.
@@ -718,9 +721,12 @@ pub(crate) struct QuoteArgs {
     pub(crate) contracts: PathBuf,
 }
 
-/// Read-only Dodex inference market-data indexer discovery.
+/// Read-only Dodex inference market-data indexer discovery (#192).
 #[derive(Args)]
 pub(crate) struct MarketDataArgs {
+    /// Block Manager host or URL for deployment-specific read follow-ups.
+    #[arg(long, alias = "graphql", global = true)]
+    pub(crate) endpoint: Option<String>,
     /// Dodex indexer base URL. Env fallback: DEXDO_INDEXER_URL. Default: http://dodex-dev.ackinacki.org:8080.
     #[arg(long, global = true)]
     pub(crate) indexer_url: Option<String>,
@@ -772,7 +778,7 @@ pub(crate) enum MarketDataCommand {
     },
 }
 
-/// Own order lifecycle: list/show/cancel/cancel-all for one note.
+/// Own order lifecycle (#158): list/show/cancel/cancel-all for one note.
 #[derive(Args)]
 pub(crate) struct OrdersArgs {
     #[command(flatten)]
@@ -813,7 +819,7 @@ pub(crate) enum OrdersCommand {
     CancelAll,
 }
 
-/// Inference subscription lifecycle: recurring buy orders in one model book.
+/// Inference subscription lifecycle (#163): recurring buy orders in one model book.
 #[derive(Args)]
 pub(crate) struct SubscriptionArgs {
     #[command(flatten)]
@@ -886,7 +892,7 @@ pub(crate) enum DealRoleArg {
     Seller,
 }
 
-/// Local deal handle list.
+/// Local deal handle list (#159).
 #[derive(Args)]
 pub(crate) struct DealsArgs {
     /// Directory containing local deal handle JSON files. Defaults to the platform app data directory.
@@ -894,7 +900,7 @@ pub(crate) struct DealsArgs {
     pub(crate) deals_dir: Option<PathBuf>,
 }
 
-/// Secret-free trading history from local deal handles.
+/// Secret-free trading history from local deal handles (#162).
 #[derive(Args)]
 pub(crate) struct HistoryArgs {
     /// Directory containing local deal handle JSON files. Defaults to the platform app data directory.
@@ -908,7 +914,7 @@ pub(crate) struct HistoryArgs {
     pub(crate) model: Option<String>,
 }
 
-/// Loopback-only read dashboard for local open stream handles.
+/// Loopback-only read dashboard for local open stream handles (#200).
 #[derive(Args)]
 pub(crate) struct DashboardArgs {
     /// Loopback HTTP listen address.
@@ -919,7 +925,7 @@ pub(crate) struct DashboardArgs {
     pub(crate) deals_dir: Option<PathBuf>,
 }
 
-/// Read current on-chain state for a local deal handle or a raw TokenContract address.
+/// Read current on-chain state for a local deal handle or a raw TokenContract address (#159).
 #[derive(Args)]
 pub(crate) struct StatusArgs {
     /// Emit the stable `dexdo.status.v1` JSON object.
@@ -941,7 +947,7 @@ pub(crate) struct StatusArgs {
     pub(crate) contracts: Option<PathBuf>,
 }
 
-/// Role-aware close/recovery wrapper for a local deal handle or raw TokenContract address.
+/// Role-aware close/recovery wrapper for a local deal handle or raw TokenContract address (#159).
 #[derive(Args)]
 pub(crate) struct CloseArgs {
     /// Emit the stable `dexdo.close.v1` JSON object.
@@ -973,7 +979,7 @@ pub(crate) struct CloseArgs {
     pub(crate) contracts: Option<PathBuf>,
 }
 
-/// Secret-free audit export for one deal.
+/// Secret-free audit export for one deal (#162).
 #[derive(Args)]
 pub(crate) struct ExportArgs {
     /// Local handle id/path or raw TokenContract address.
@@ -996,7 +1002,7 @@ pub(crate) enum ExportFormatArg {
     Md,
 }
 
-/// Args for `dexdo note`: manage the actor's shellnet PrivateNotes.
+/// Args for `dexdo note` (#137): manage the actor's shellnet PrivateNotes.
 #[derive(Args)]
 pub(crate) struct NoteArgs {
     #[command(subcommand)]
@@ -1005,9 +1011,9 @@ pub(crate) struct NoteArgs {
 
 #[derive(Subcommand)]
 pub(crate) enum NoteCommand {
-    /// Balance: read a PrivateNote's public on-chain balances by address only. No key, no signing.
+    /// Balance (#205): read a PrivateNote's public on-chain balances by address only. No key, no signing.
     Balance(NoteBalanceArgs),
-    /// Deploy: a wallet-funded `PrivateNote` on shellnet in-process through `gosh.ackinacki`, folded
+    /// Deploy (#176): a wallet-funded `PrivateNote` on shellnet in-process through `gosh.ackinacki`, folded
     /// into a `DEXDO_PN_POOL` pool the `seller`/`buyer` consume.
     Deploy(NoteDeployArgs),
     /// Recover/finalize a wallet-funded `PrivateNote` deploy from a crash-safe recovery state file.
@@ -1016,6 +1022,8 @@ pub(crate) enum NoteCommand {
     /// available token balances. This is not a claim that every native/ECC balance is fully retired without
     /// by-fact evidence on the current contract. Fails on-chain if the note is stream-locked.
     Withdraw(NoteWithdrawArgs),
+    /// Read active stream/dispute locks, their deal addresses, and the force-clear deadline.
+    StreamLocks(NoteStreamLocksArgs),
 }
 
 /// Args for `dexdo note balance`: read-only PrivateNote balance by address.
@@ -1024,9 +1032,12 @@ pub(crate) struct NoteBalanceArgs {
     /// PrivateNote address to inspect, `0:<64 hex>`.
     #[arg(long)]
     pub(crate) note_addr: String,
-    /// Deployed-contracts manifest(keeps shellnet connection behavior aligned with the other note commands).
+    /// Deployed-contracts manifest (keeps shellnet connection behavior aligned with the other note commands).
     #[arg(long, default_value = "contracts/deployed.shellnet.json")]
     pub(crate) contracts: PathBuf,
+    /// Block Manager host or URL. Overrides the endpoint in `--contracts`.
+    #[arg(long, alias = "graphql")]
+    pub(crate) endpoint: Option<String>,
 }
 
 /// Args for `dexdo note withdraw`: submit a note token-balance withdrawal to a wallet.
@@ -1034,23 +1045,34 @@ pub(crate) struct NoteBalanceArgs {
 pub(crate) struct NoteWithdrawArgs {
     #[command(flatten)]
     pub(crate) identity: IdentityArgs,
-    /// Destination wallet address -- `half1::half2` or `0:<64 hex>`. Normalized to
+    /// Destination wallet address — `half1::half2` (GOSH display form, #17) or `0:<64 hex>`. Normalized to
     /// `0:<half2>` fail-loud on bad input.
     #[arg(long)]
     pub(crate) to: String,
-    /// Deployed-contracts manifest(SuperRoot/DappConfig addresses).
+    /// Deployed-contracts manifest (SuperRoot/DappConfig addresses).
     #[arg(long, default_value = "contracts/deployed.shellnet.json")]
     pub(crate) contracts: PathBuf,
 }
 
-/// Args for `dexdo note deploy`: deploys the wallet-funded `PrivateNote` in-process through
+/// Args for `dexdo note stream-locks`: read-only PrivateNote lock diagnostics.
+#[derive(Args)]
+pub(crate) struct NoteStreamLocksArgs {
+    /// PrivateNote address to inspect, `0:<64 hex>`.
+    #[arg(long)]
+    pub(crate) note_addr: String,
+    /// Deployed-contracts manifest.
+    #[arg(long, default_value = "contracts/deployed.shellnet.json")]
+    pub(crate) contracts: PathBuf,
+}
+
+/// Args for `dexdo note deploy` (#176): deploys the wallet-funded `PrivateNote` in-process through
 /// `gosh.ackinacki`, then adapts the result into the `DEXDO_PN_POOL` schema.
 #[derive(Args)]
 pub(crate) struct NoteDeployArgs {
-    /// Deployed multisig WALLET address that funds the note(no giver).
+    /// Deployed multisig WALLET address that funds the note (no giver).
     #[arg(long)]
     pub(crate) multisig_address: String,
-    /// File with the multisig wallet's 32-byte secret hex(the funding key); the secret is never logged.
+    /// File with the multisig wallet's 32-byte secret hex (the funding key); the secret is never logged.
     #[arg(
         long,
         value_name = "PATH",
@@ -1075,7 +1097,7 @@ pub(crate) struct NoteDeployArgs {
     /// Shellnet endpoint.
     #[arg(long, default_value = "shellnet.ackinacki.org")]
     pub(crate) endpoint: String,
-    /// The `DEXDO_PN_POOL` JSON to append the deployed note to(created if absent).
+    /// The `DEXDO_PN_POOL` JSON to append the deployed note to (created if absent).
     #[arg(long)]
     pub(crate) pool: PathBuf,
     /// Crash-safe deploy recovery state. Defaults to `<pool>.recovery.json`; carries the note owner secret.
@@ -1107,12 +1129,12 @@ pub(crate) struct NoteRecoverArgs {
     /// Crash-safe recovery state written by `dexdo note deploy`.
     #[arg(long, value_name = "PATH")]
     pub(crate) recovery: PathBuf,
-    /// The `DEXDO_PN_POOL` JSON to append the recovered note to(created if absent).
+    /// The `DEXDO_PN_POOL` JSON to append the recovered note to (created if absent).
     #[arg(long)]
     pub(crate) pool: PathBuf,
 }
 
-/// Args for `dexdo oracle`: OracleEventList/PMP lifecycle for range prediction markets backed by an
+/// Args for `dexdo oracle` (#26): OracleEventList/PMP lifecycle for range prediction markets backed by an
 /// inference `InferenceOrderBook`.
 #[derive(Args)]
 pub(crate) struct OracleArgs {

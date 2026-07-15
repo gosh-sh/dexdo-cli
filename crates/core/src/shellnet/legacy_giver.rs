@@ -10,14 +10,14 @@ use gosh_ackinacki::sdk::{Address, KeyPair};
 use gosh_ackinacki::wallet::contracts::MULTISIG_ABI_JSON;
 use serde_json::{json, Value};
 
-/// LIVE: the seller note posts the probe-commission to its already-deployed per-deal
-/// `TokenContract` from its OWN ECC[2](`postProbeCommission` -> `TC.fundProbeCommission`) -- **no operator
+/// LIVE (#58, note-funded): the seller note posts the probe-commission to its already-deployed per-deal
+/// `TokenContract` from its OWN ECC[2] (`postProbeCommission` → `TC.fundProbeCommission`) — **no operator
 /// wallet**. Asserts `getProbe().probeFunded == true`. Needs a note that already provisioned the deal TC
 /// (`dexdo provision`), passed via env. Run:
-/// `DEXDO_PROOF_NOTE_ADDR=0:.. DEXDO_PROOF_NOTE_KEY=/path/key DEXDO_PROOF_NONCE=7 \
-/// cargo test -p dexdo-core --features shellnet,test-giver live_post_probe_commission -- --ignored --nocapture`
+///   `DEXDO_PROOF_NOTE_ADDR=0:.. DEXDO_PROOF_NOTE_KEY=/path/key DEXDO_PROOF_NONCE=7 \
+///    cargo test -p dexdo-core --features shellnet,test-giver live_post_probe_commission -- --ignored --nocapture`
 #[tokio::test]
-#[ignore = "live : postProbeCommission funds the probe on the deployed TC from the note (no wallet)"]
+#[ignore = "live #58: postProbeCommission funds the probe on the deployed TC from the note (no wallet)"]
 async fn live_post_probe_commission_note_funded() {
     let manifest = concat!(
         env!("CARGO_MANIFEST_DIR"),
@@ -43,12 +43,12 @@ async fn live_post_probe_commission_note_funded() {
         .await
         .expect("TC addr (provision the market first)");
 
-    // Post the probe-commission from the note's OWN ECC[2] -- no operator wallet.
+    // Post the probe-commission from the note's OWN ECC[2] — no operator wallet (#58).
     be.note_post_probe_commission(&note, &keys, nonce, 10_000_000)
         .await
         .expect("postProbeCommission");
 
-    // The internal message settles in a few blocks -> poll getProbe() until probeFunded.
+    // The internal message settles in a few blocks → poll getProbe() until probeFunded.
     let mut funded = false;
     for _ in 0..20 {
         if let Ok(Some(p)) = be.token_contract_probe(&tc).await {
@@ -66,9 +66,9 @@ async fn live_post_probe_commission_note_funded() {
     );
 }
 
-/// A LIVE read-only test against the real Acki Nacki testnet(shellnet): connection,
+/// A LIVE read-only test against the real Acki Nacki testnet (shellnet): connection,
 /// chain liveness, and the fact that the `SuperRoot` from the manifest is an active deployed account.
-/// Without keys/gas. The `#[ignore]` gate -- a normal offline `cargo test` stays green.
+/// Without keys/gas. The `#[ignore]` gate — a normal offline `cargo test` stays green.
 /// Run: `cargo test -p dexdo-core --features shellnet -- --ignored --nocapture`.
 #[tokio::test]
 #[ignore = "live: hits the real Acki Nacki shellnet Block Manager (read-only)"]
@@ -103,7 +103,7 @@ async fn live_shellnet_connect_and_read() {
         "SuperRoot must be active on shellnet"
     );
 
-    // Address derivation from SuperRoot -- on-chain getters(address resolution for ChainBackend).
+    // Address derivation from SuperRoot — on-chain getters (address resolution for ChainBackend).
     let owner = be.superroot_owner_pubkey().await.expect("getOwnerPubkey");
     println!("=== SuperRoot owner pubkey: {owner} ===");
     let rm = be
@@ -122,11 +122,11 @@ async fn live_shellnet_connect_and_read() {
     );
 }
 
-/// A LIVE write test: the executor **provisions** the wallet itself -- generates a key, computes
+/// A LIVE write test: the executor **provisions** the wallet itself — generates a key, computes
 /// the deterministic multisig deploy address and **mints test SHELL from the shellnet giver**
-/// (`0:1111...`, keys in the SDK config). Removes the former blocker "a funded wallet from the
-/// coordinator is required".
-/// This is the first REAL write against shellnet -- it checks that submit goes through from this environment.
+/// (`0:1111…`, keys in the SDK config). Removes the former blocker "a funded wallet from the
+/// coordinator is required" (directive §"The wallet, gas and keys — the executor provisions ITSELF").
+/// This is the first REAL write against shellnet — it checks that submit goes through from this environment.
 #[tokio::test]
 #[ignore = "live: mints testnet SHELL from the shellnet Giver (a real write submit)"]
 async fn live_giver_funds_fresh_wallet() {
@@ -138,7 +138,7 @@ async fn live_giver_funds_fresh_wallet() {
     let cfg = AiRegistryConfig::shellnet();
     let endpoint = "https://shellnet.ackinacki.org";
     let ctx = local_context().expect("client context");
-    // A write(`/v2/messages`) behind Cloudflare: the default reqwest UA is blocked -> browser UA
+    // A write (`/v2/messages`) behind Cloudflare: the default reqwest UA is blocked → browser UA
     // (per the access-notes from the coordinator's comment on 82dbe51).
     let http = reqwest::Client::builder()
         .user_agent("Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36")
@@ -153,7 +153,7 @@ async fn live_giver_funds_fresh_wallet() {
         http.clone(),
     );
 
-    // A fresh key + the deterministic multisig deploy address(one key for all 3 owners -- for the probe).
+    // A fresh key + the deterministic multisig deploy address (one key for all 3 owners — for the probe).
     let kp = KeyPair::generate();
     let params = DeployParams {
         agent_pubkey: kp.public_hex().to_string(),
@@ -165,7 +165,7 @@ async fn live_giver_funds_fresh_wallet() {
     println!("=== fresh wallet deploy address: {} ===", prepared.address);
 
     // Giver diagnostics: whether it exists, whether it is funded, and whether the keys in the SDK config are stale
-    // (after an emergency shellnet restart the genesis contracts were re-keyed -- comment on 82dbe51).
+    // (after an emergency shellnet restart the genesis contracts were re-keyed — comment on 82dbe51).
     {
         let be0 = RealChainBackend::connect(concat!(
             env!("CARGO_MANIFEST_DIR"),
@@ -185,13 +185,13 @@ async fn live_giver_funds_fresh_wallet() {
         }
     }
 
-    // The e2e_airegistry pattern: **fund -> deploy -> wait Active** (on an uninit address the balance reads 0;
+    // The e2e_airegistry pattern: **fund → deploy → wait Active** (on an uninit address the balance reads 0;
     // the criterion is wallet activation after the deploy). `DEPLOY_FUND` = 200 vmshell.
     giver
         .fund_deploy_address(&prepared.address, 200_000_000_000)
         .await
         .expect("giver fund_deploy_address");
-    // Deploy the multisig(the deploy spends the funded gas).
+    // Deploy the multisig (the deploy spends the funded gas).
     gosh_ackinacki::wallet::query::send_message(&http, endpoint, &prepared.message_boc_base64)
         .await
         .expect("deploy submit");
@@ -218,20 +218,20 @@ async fn live_giver_funds_fresh_wallet() {
     println!("=== self-provisioned wallet {addr}: active={active} balance={bal} ===");
     assert!(
         active,
-        "the wallet is deployed and active -- the giver funds, self-provisioning works"
+        "the wallet is deployed and active — the giver funds, self-provisioning works"
     );
 }
 
-/// A LIVE deal test, step 1: a minted note(`mint_pn_pool`) is an **inference `PrivateNote`**
+/// A LIVE deal test, step 1: a minted note (`mint_pn_pool`) is an **inference `PrivateNote`**
 /// (has the owner method `getInferenceOrderBookAddress`), and it **deploys `InferenceOrderBook`**
-/// on shellnet. The path to the pool(owner keys; the secrets are gitignored, outside the repo) is taken from
+/// on shellnet. The path to the pool (owner keys; the secrets are gitignored, outside the repo) is taken from
 /// `DEXDO_PN_POOL`; without it the test is skipped. Run:
 /// `DEXDO_PN_POOL=/abs/pn_pool.json cargo test -p dexdo-core --features shellnet -- --ignored --nocapture live_minted_note`.
 #[tokio::test]
 #[ignore = "live: deploys an InferenceOrderBook on shellnet from a minted note (a real write)"]
 async fn live_minted_note_deploys_inference_orderbook() {
     let Ok(pool_path) = std::env::var("DEXDO_PN_POOL") else {
-        eprintln!("DEXDO_PN_POOL not set -- skipping (needs pn_pool.json with owner keys)");
+        eprintln!("DEXDO_PN_POOL not set — skipping (needs pn_pool.json with owner keys)");
         return;
     };
     let pool: Value = serde_json::from_slice(&std::fs::read(&pool_path).expect("read pool"))
@@ -247,7 +247,7 @@ async fn live_minted_note_deploys_inference_orderbook() {
     );
     let be = RealChainBackend::connect(manifest).expect("connect");
 
-    // The note is active; we print the on-chain code_hash against the embedded PrivateNote.tvc (diagnostic --
+    // The note is active; we print the on-chain code_hash against the embedded PrivateNote.tvc (diagnostic —
     // the deployed gosh-dexdo code may differ by build, but the signatures of the 5 methods are identical).
     let acc = be
         .client()
@@ -273,11 +273,11 @@ async fn live_minted_note_deploys_inference_orderbook() {
     let tick_size: u128 = MODEL_TICK_SIZE;
 
     // (1) Proof of the inference variant: the getter getInferenceOrderBookAddress exists and
-    // returns a deterministic book address(a non-inference note lacks the method -> it would fail).
+    //     returns a deterministic book address (a non-inference note lacks the method → it would fail).
     let ob_addr = be
         .inference_orderbook_address(&note_addr, &model_hash, tick_size)
         .await
-        .expect("getInferenceOrderBookAddress -- meaning the note is an inference note");
+        .expect("getInferenceOrderBookAddress — meaning the note is an inference note");
     println!("=== InferenceOrderBook address (derived) = {ob_addr} ===");
     let before = be
         .client()
@@ -288,7 +288,7 @@ async fn live_minted_note_deploys_inference_orderbook() {
         .unwrap_or(false);
     println!("OB active before deploy = {before}");
 
-    // (2) The note deploys the book(a write, gas from the note's budget).
+    // (2) The note deploys the book (a write, gas from the note's budget).
     let resp = be
         .deploy_inference_orderbook(&note_addr, &owner, &model_hash, &frame_model, tick_size)
         .await
@@ -312,7 +312,7 @@ async fn live_minted_note_deploys_inference_orderbook() {
         "InferenceOrderBook is deployed and active on shellnet"
     );
 
-    // The parameters of the book that came up(modelHash/tickSize/platformFeeBps) -- confirm that
+    // The parameters of the book that came up (modelHash/tickSize/platformFeeBps) — confirm that
     // the book is deployed with the expected parameters and the getters are readable.
     let params = be
         .inference_orderbook_params(&ob_addr)
@@ -322,14 +322,14 @@ async fn live_minted_note_deploys_inference_orderbook() {
     assert!(params.is_some(), "getParams is readable on an active book");
 }
 
-/// A LIVE deal test, step 2: the seller(note0) **provisions a per-deal `TokenContract`** and
+/// A LIVE deal test, step 2: the seller (note0) **provisions a per-deal `TokenContract`** and
 /// **posts an offer into the on-chain book** `InferenceOrderBook`. Checks that the offer actually landed
-/// in the order book(`getStats.orderCount>=1`, `getBestBidAsk.hasAsk`). Deploys the TC at an address that
-/// matches `RootModel.getTokenContractAddress`(cross-check). Requires `DEXDO_PN_POOL`.
-/// DIAGNOSTIC(live, read-only): query the on-chain RootPN `0:1010...1010` for the
+/// in the order book (`getStats.orderCount>=1`, `getBestBidAsk.hasAsk`). Deploys the TC at an address that
+/// matches `RootModel.getTokenContractAddress` (cross-check). Requires `DEXDO_PN_POOL`.
+/// DIAGNOSTIC (live, read-only): query the on-chain RootPN `0:1010…1010` for the
 /// `privateNoteCodeHash` it pins. This decides which PrivateNote code freshly-minted notes get:
-/// `934cf19c...` => the repo(DEXDO) set is current (my pool is current; the path fix is a contract-logic
-/// derivation matter); anything else => the contracts were redeployed and my pool is stale.
+/// `934cf19c…` ⇒ the repo (DEXDO) set is current (my pool is current; the path fix is a contract-logic
+/// / derivation matter); anything else ⇒ the contracts were redeployed and my pool is stale.
 #[tokio::test]
 #[ignore = "live (diag, read-only): RootPN.getDetails().privateNoteCodeHash"]
 async fn diag_rootpn_pinned_code_hash() {
@@ -349,10 +349,10 @@ async fn diag_rootpn_pinned_code_hash() {
         .await
         .expect("RootPN.getDetails");
     println!("=== RootPN 0:1010 getDetails = {details:?} ===");
-    println!("(repo deployed.json claims privateNoteCodeHash = 934cf19c... = DEXDO set)");
+    println!("(repo deployed.json claims privateNoteCodeHash = 934cf19c… = DEXDO set)");
 }
 
-/// DIAGNOSTIC(live, writes): prove the wallet-funded voucher leg before running the full
+/// DIAGNOSTIC (live, writes): prove the #137 wallet-funded voucher leg before running the full
 /// `dexdo note deploy` flow. This mirrors `fund_probe_commission`: internal payload + multisig
 /// `sendTransaction` + attached ECC[2] SHELL, then waits for RootPN's `VoucherGenerated` ext-out
 /// carrying our unique `skUCommit`.
@@ -514,12 +514,12 @@ async fn live_multisig_send_transaction_generates_rootpn_voucher() {
     println!("=== RootPN.VoucherGenerated found for skUCommit 0x{commit_hex}: {event} ===");
 }
 
-/// DIAGNOSTIC(live, read-only) for: the buyer never placed a buy. Reads the Fresh3 buyer + the
-/// (working) seller note `getDetails()` -- `ephemeralPubkey`/`lockedInOrders`/`balance` -- to test the
-/// `onlyOwnerPubkey(_ephemeralPubkey)`(ERR_INVALID_SENDER 101, dex table) / note-state asymmetry, and the IOB
+/// DIAGNOSTIC (live, read-only) for #128: the buyer never placed a buy. Reads the Fresh3 buyer + the
+/// (working) seller note `getDetails()` — `ephemeralPubkey`/`lockedInOrders`/`balance` — to test the
+/// `onlyOwnerPubkey(_ephemeralPubkey)` (ERR_INVALID_SENDER 101, dex table) / note-state asymmetry, and the IOB
 /// `getBestBidAsk`/`getStats` to confirm whether the delivered seller ask actually rests. No key/write.
 #[tokio::test]
-#[ignore = "live (diag, read-only):  buyer-note getDetails + IOB resting ask"]
+#[ignore = "live (diag, read-only): #128 buyer-note getDetails + IOB resting ask"]
 async fn diag_128_buyer_note_and_iob() {
     let manifest = concat!(
         env!("CARGO_MANIFEST_DIR"),
@@ -557,16 +557,16 @@ async fn diag_128_buyer_note_and_iob() {
     println!("=== IOB getStats = {stats:?} ===");
 }
 
-/// DIAGNOSTIC(live, read-only): the note's `ephemeralPubkey` -- the seller key the deployed verifier
+/// DIAGNOSTIC (live, read-only): the note's `ephemeralPubkey` — the seller key the deployed verifier
 /// uses BOTH for the TC derivation (`computeTokenContractAddressFromHash(..., _ephemeralPubkey, nonce)`)
-/// AND for `postSellOffer` auth (`onlyOwnerPubkey(_ephemeralPubkey)`) -- vs the pool's owner pubkey.
+/// AND for `postSellOffer` auth (`onlyOwnerPubkey(_ephemeralPubkey)`) — vs the pool's owner pubkey.
 /// If they differ, the TC must deploy with `_sellerPubkey = ephemeralPubkey` and postSellOffer must be
-/// signed with the matching key -- using the owner pubkey would fail `ERR_BAD_TOKEN_CONTRACT`/auth.
+/// signed with the matching key — using the owner pubkey would fail `ERR_BAD_TOKEN_CONTRACT`/auth.
 #[tokio::test]
 #[ignore = "live (diag, read-only): PrivateNote.getDetails().ephemeralPubkey vs owner pubkey"]
 async fn diag_note_ephemeral_pubkey() {
     let Ok(pool_path) = std::env::var("DEXDO_PN_POOL") else {
-        eprintln!("DEXDO_PN_POOL not set -- skipping");
+        eprintln!("DEXDO_PN_POOL not set — skipping");
         return;
     };
     let pool: Value =
@@ -599,18 +599,18 @@ async fn diag_note_ephemeral_pubkey() {
     );
 }
 
-/// (live, read-only): the guard's behavior on a REAL on-chain note (`DEXDO_PN_POOL` note[0] -- the
+/// §8 (live, read-only): the #128 guard's behavior on a REAL on-chain note (`DEXDO_PN_POOL` note[0] — the
 /// conforming 4.0.11 capture `0:cc625238`). Proves the guard does NOT false-positive on a healthy note
-/// (`getDetails().ephemeralPubkey` matches the owner key -> `note_owner_mismatch_reason` == None, so
+/// (`getDetails().ephemeralPubkey` matches the owner key → `note_owner_mismatch_reason` == None, so
 /// `place_buy`/`post_offer` proceed and `onlyOwnerPubkey` would pass) AND fires fail-closed against a wrong
-/// signing key(the orphaned/rotated-note case -> an actionable re-mint reason). The full gold-standard (a
-/// live `placeInferenceBuy` committing past `onlyOwnerPubkey`) folds into the happy-path; this pins the
-/// guard's two branches against live on-chain state. Read-only -- no giver, no deploy.
+/// signing key (the orphaned/rotated-note case → an actionable re-mint reason). The full gold-standard (a
+/// live `placeInferenceBuy` committing past `onlyOwnerPubkey`) folds into the #120 happy-path; this pins the
+/// guard's two branches against live on-chain state. Read-only — no giver, no deploy.
 #[tokio::test]
-#[ignore = "live (, read-only):  guard vs DEXDO_PN_POOL note[0] on-chain getDetails"]
+#[ignore = "live (§8, read-only): #128 guard vs DEXDO_PN_POOL note[0] on-chain getDetails"]
 async fn diag_128_guard_live_conforming_note() {
     let Ok(pool_path) = std::env::var("DEXDO_PN_POOL") else {
-        eprintln!("DEXDO_PN_POOL not set -- skipping");
+        eprintln!("DEXDO_PN_POOL not set — skipping");
         return;
     };
     let pool: Value =
@@ -637,7 +637,7 @@ async fn diag_128_guard_live_conforming_note() {
     );
     println!("=== pool owner_public_key_hex = 0x{owner_pub} ===");
 
-    // (a) the guard PASSES on the real conforming note -- no false-positive; `onlyOwnerPubkey` would pass.
+    // (a) the guard PASSES on the real conforming note — no false-positive; `onlyOwnerPubkey` would pass.
     let pass = note_owner_mismatch_reason("buyer place_buy", &note, ephemeral, owner_pub);
     println!("=== guard vs owner key (expect None/pass) = {pass:?} ===");
     assert!(
@@ -645,7 +645,7 @@ async fn diag_128_guard_live_conforming_note() {
         "guard false-fired on the conforming note: {pass:?}"
     );
 
-    // (b) the guard FIRES fail-closed against a wrong signing key(the orphaned/rotated-note case).
+    // (b) the guard FIRES fail-closed against a wrong signing key (the orphaned/rotated-note case).
     let wrong = "deadbeef00000000000000000000000000000000000000000000000000000000";
     let fire = note_owner_mismatch_reason("buyer place_buy", &note, ephemeral, wrong)
         .expect("guard must fire on a mismatched signing key");
@@ -656,15 +656,15 @@ async fn diag_128_guard_live_conforming_note() {
     );
 }
 
-/// a note minted JUST NOW by live `mint_pn_pool` (deployed
-/// via RootPN `9ab11582`, 4.0.15) passes the re-pinned note-current guard. Point `DEXDO_PN_POOL` at
+/// §8 (live, read-only, #140/#120 4.0.15 re-pin): a note minted JUST NOW by live `mint_pn_pool` (deployed
+/// via RootPN `9ab11582`, 4.0.15) passes the re-pinned #83/#117 note-current guard. Point `DEXDO_PN_POOL` at
 /// the fresh pool. Proves by-fact that the 4.0.15 re-pin accepts current-chain notes (the exact
-/// `assert_seller_note_current` -> `note_code_hash_current` check that `dexdo provision` runs).
+/// `assert_seller_note_current` → `note_code_hash_current` check that `dexdo provision` runs).
 #[tokio::test]
-#[ignore = "live (, read-only): a fresh 4.0.15 note passes the re-pinned note_code_hash_current"]
+#[ignore = "live (§8, read-only): a fresh 4.0.15 note passes the re-pinned note_code_hash_current"]
 async fn diag_412_repin_fresh_note_passes() {
     let Ok(pool_path) = std::env::var("DEXDO_PN_POOL") else {
-        eprintln!("DEXDO_PN_POOL not set -- skipping");
+        eprintln!("DEXDO_PN_POOL not set — skipping");
         return;
     };
     let pool: Value =
@@ -700,10 +700,10 @@ async fn diag_412_repin_fresh_note_passes() {
     );
 }
 
-/// DIAGNOSTIC(offline): the actual `tvm.hash`(code_hash) of my embedded TC/IOB/PrivateNote TVCs vs
+/// DIAGNOSTIC (offline): the actual `tvm.hash` (code_hash) of my embedded TC/IOB/PrivateNote TVCs vs
 /// the `deployed.json` claim. The deployed note's verifier derives the deal address from its **pinned**
 /// `TOKEN_CONTRACT_CODE_HASH`; if my embedded TC code hash differs, the address I deploy at can never
-/// match -- that is the source/artifact mismatch.
+/// match — that is the source/artifact mismatch (the #24 residual risk).
 #[test]
 fn diag_embedded_code_hashes() {
     let tc = encode_hex(
@@ -734,7 +734,7 @@ fn diag_embedded_code_hashes() {
 #[ignore = "live: deploys a TokenContract + posts a sell offer on shellnet (real writes)"]
 async fn live_seller_posts_offer() {
     let Ok(pool_path) = std::env::var("DEXDO_PN_POOL") else {
-        eprintln!("DEXDO_PN_POOL not set -- skipping");
+        eprintln!("DEXDO_PN_POOL not set — skipping");
         return;
     };
     let pool: Value =
@@ -750,7 +750,7 @@ async fn live_seller_posts_offer() {
     );
     let be = RealChainBackend::connect(manifest).expect("connect");
 
-    // The book(per-model) -- a deterministic address; we deploy it if it is not yet active.
+    // The book (per-model) — a deterministic address; we deploy it if it is not yet active.
     let frame_model = format!("dexdo-d-{}--book-redeploy", std::process::id());
     let model_hash = model_hash_for(&frame_model);
     let ob_tick_size: u128 = MODEL_TICK_SIZE;
@@ -812,7 +812,7 @@ async fn live_seller_posts_offer() {
         println!("=== seller RootModel deployed+active = {deployed_rm} ===");
     }
 
-    // Derive the TC address from(RootModel, sellerPubkey, nonce) -- cross-check against build_deploy.
+    // Derive the TC address from (RootModel, sellerPubkey, nonce) — cross-check against build_deploy.
     let nonce = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap()
@@ -823,7 +823,7 @@ async fn live_seller_posts_offer() {
         .expect("derive TC");
     println!("=== TC derived (RootModel) = {derived} (nonce={nonce}) ===");
 
-    // The seller provisions the TC(build_deploy + giver-fund + submit + wait for Active), passing the
+    // The seller provisions the TC (build_deploy + giver-fund + submit + wait for Active), passing the
     // SAME `frame_model` as the book so the TC's `getModelHash()` == the book `model_hash` (4.0.6 ctor
     // requires `sha256(modelName) == modelHash`). On 4.0.6 the IOB DOES re-derive the canonical TC from
     // `(sellerPubkey, nonce)` and rejects a non-canonical `tokenContract`, so the offer only rests with
@@ -850,7 +850,7 @@ async fn live_seller_posts_offer() {
         "build_deploy address == RootModel derivation (the deal address converges)"
     );
 
-    // 4.0.6 model-name invariant: the deployed TC must report the SAME model as the order book -- i.e. the
+    // 4.0.6 model-name invariant: the deployed TC must report the SAME model as the order book — i.e. the
     // TC was provisioned with the book's `frame_model`, so `getModelHash() == sha256(frame_model) == model_hash`.
     let tc_model_hash = be
         .token_contract_model_hash(&tc)
@@ -862,25 +862,16 @@ async fn live_seller_posts_offer() {
         model_hash.to_lowercase(),
         "4.0.6 model-name invariant: deployed TC getModelHash() must equal the book model_hash"
     );
-    println!("=== TC getModelHash() == book model_hash {model_hash} -- 4.0.6 model identity consistent ===");
+    println!("=== TC getModelHash() == book model_hash {model_hash} — 4.0.6 model identity consistent ===");
 
-    // The seller posts the offer into the book(a note write via submit).
+    // The seller posts the offer into the book (a note write via submit).
     let resp = be
-        .post_sell_offer(
-            &note_addr,
-            &owner,
-            &model_hash,
-            deal_price,
-            deal_max_ticks,
-            &tc,
-            0,
-            nonce,
-        )
+        .post_sell_offer(&note_addr, &owner, 0, nonce)
         .await
         .expect("post sell offer");
     println!("=== postSellOffer resp = {resp} ===");
 
-    // The offer must land in the order book: orderCount>=1(or hasAsk).
+    // The offer must land in the order book: orderCount>=1 (or hasAsk).
     let mut landed = false;
     for _ in 0..20 {
         let stats = be.inference_orderbook_stats(&ob).await.expect("stats");
@@ -903,18 +894,14 @@ async fn live_seller_posts_offer() {
     );
 }
 
-/// ADVERSARIAL. A seller
-/// posts an offer whose `tokenContract` is NOT their canonical TC(an attacker-controlled address). The
-/// 4.0.6 IOB(`4fbb8caf`) enforces `require(tokenContract == _tokenContractAddr(sellerPubkey, nonce))`
-/// derived from the seller's REAL RootModel, so a non-canonical TC is REJECTED: the note's `postSellOffer`
-/// succeeds(exit_code 0, the note forwards the call) but the IOB never rests the ask(orderCount stays 0).
-/// This is the live proof that the PR-escalated 4.0.5 gap(deployed `36404a04` ACCEPTED the fake TC) is
-/// CLOSED on 4.0.6 -- buyer SHELL can never be routed to a non-canonical tokenContract.
+/// Legacy live adversarial setup retained for manual diagnostics. In 4.0.26 the client cannot submit an
+/// attacker-selected TokenContract: `note.postSellOffer(flags, nonce)` derives the canonical TC internally.
+/// This setup deliberately leaves that canonical TC undeployed and verifies that no fake-TC ask can rest.
 #[tokio::test]
-#[ignore = "live (adversarial): 4.0.6 IOB REJECTS a non-canonical tokenContract (no ask rests)"]
-async fn live_offer_fake_tc_rejected_by_iob_4_0_6() {
+#[ignore = "live (adversarial): 4.0.26 note call cannot submit a non-canonical TokenContract"]
+async fn live_offer_cannot_submit_fake_tc_4_0_26() {
     let Ok(pool_path) = std::env::var("DEXDO_PN_POOL") else {
-        eprintln!("DEXDO_PN_POOL not set -- skipping");
+        eprintln!("DEXDO_PN_POOL not set — skipping");
         return;
     };
     let pool: Value =
@@ -929,7 +916,7 @@ async fn live_offer_fake_tc_rejected_by_iob_4_0_6() {
     );
     let be = RealChainBackend::connect(manifest).expect("connect");
 
-    // Fresh per-run OB(unique model hash) -- an empty book, so orderCount is unambiguous.
+    // Fresh per-run OB (unique model hash) — an empty book, so orderCount is unambiguous.
     let frame = format!("dexdo-fake-tc-{}", std::process::id());
     let model_hash = model_hash_for(&frame);
     let ob = be
@@ -963,14 +950,14 @@ async fn live_offer_fake_tc_rejected_by_iob_4_0_6() {
     }
     println!("=== fresh OB {ob} active ===");
 
-    // The seller's canonical TC(derive only, for comparison).
+    // The seller's canonical TC (derive only, for comparison).
     let seller_pubkey = json!(format!("0x{}", owner.public_hex()));
     let rm = be
         .root_model_address_for(&seller_pubkey)
         .await
         .expect("rm addr");
     // 4.0.6: the IOB derives the canonical TC from the seller's REAL RootModel, so it must be active for
-    // the on-chain canonical-TC check to run(and for the canonical comparison below). Provision if absent.
+    // the on-chain canonical-TC check to run (and for the canonical comparison below). Provision if absent.
     if !be
         .client()
         .get_account(&rm)
@@ -1001,14 +988,10 @@ async fn live_offer_fake_tc_rejected_by_iob_4_0_6() {
         canonical_tc.with_workchain(),
         "the fake tc must differ from the canonical TC"
     );
-    println!(
-        "=== posting offer with FAKE tokenContract {fake_tc} (canonical = {canonical_tc}) ==="
-    );
+    println!("=== fake TokenContract {fake_tc}; note-derived canonical TC {canonical_tc} ===");
 
-    let resp = be
-        .post_sell_offer(&note_addr, &owner, &model_hash, 10, 10, &fake_tc, 0, nonce)
-        .await;
-    println!("=== post_sell_offer(fake tc) result = {resp:?} ===");
+    let resp = be.post_sell_offer(&note_addr, &owner, 0, nonce).await;
+    println!("=== note.postSellOffer(flags, nonce) result = {resp:?} ===");
 
     // Does the fake-tc offer rest in the book?
     let mut rested = false;
@@ -1022,48 +1005,35 @@ async fn live_offer_fake_tc_rejected_by_iob_4_0_6() {
         println!("stats={stats:?}");
         if oc >= 1 {
             let order = be.inference_orderbook_order(&ob, 1).await.expect("order");
-            println!("=== fake-tc offer RESTED -- order = {order:?} ===");
+            println!("=== fake-tc offer RESTED — order = {order:?} ===");
             rested = true;
             break;
         }
         tokio::time::sleep(std::time::Duration::from_secs(3)).await;
     }
 
-    // 4.0.6 SECURE INVARIANT(live-proven): the on-chain IOB(`4fbb8caf`) ENFORCES the canonical-TC check --
-    // `placeSellOffer` requires `tokenContract == _tokenContractAddr(sellerPubkey, nonce)` derived from the
-    // seller's REAL RootModel under this SuperRoot. A non-canonical(fake) `tokenContract` is REJECTED: the
-    // note's `postSellOffer` succeeds(exit_code 0, the note forwards the call) but the IOB never rests the
-    // ask(orderCount stays 0). This closes the PR-escalated 4.0.5 gap (deployed `36404a04` accepted the
-    // fake TC); buyer SHELL can never be routed to a non-canonical tokenContract.
     assert!(
         !rested,
-        "4.0.6 canonical-TC invariant: a non-canonical tokenContract MUST be rejected (no ask rests). If \
-         this fails, the IOB has stopped enforcing `tokenContract == _tokenContractAddr(sellerPubkey, nonce)`."
+        "4.0.26 note-derived submission must not rest an attacker-selected TokenContract"
     );
-    println!(
-        "=== 4.0.6 SECURE: the non-canonical tokenContract was REJECTED by the IOB -- no ask rested (PR gap closed) ==="
-    );
-
-    // do NOT add a buyer-side shared-book scan that compares every ask to one expected TC. A shared
-    // book legitimately contains many sellers and many canonical TCs; the invariant belongs at
-    // `placeSellOffer`(proved above). The buyer happy-path -- a canonical ask, escrow proceeds -- is covered
-    // by `live_buyer_matches_offer`. `canonical_tc` is exercised by the `assert_ne!` above(fake != canonical).
+    println!("=== no fake-TC ask rested through the 4.0.26 note-only client call ===");
 }
 
-/// **LEGACY.** Exercises the OLD operator-wallet/giver provisioning path, kept
-/// as `test-giver` regression coverage -- **NOT** the canonical proof. The canonical note-funded seller
+/// **LEGACY (pre-#58, `test-giver` only).** Exercises the OLD operator-wallet/giver provisioning path, kept
+/// as `test-giver` regression coverage — **NOT** the canonical #58 proof. The canonical note-funded seller
 /// proof is [`provision_market`](Self::provision_market) + `live_post_probe_commission_note_funded` + the
 /// note-funded `live_cli` harness.
-/// A LIVE test of the issue operator path: provision a per-deal market -- OB(note-funded) +
-/// RootModel + `TokenContract`(**wallet-funded**, no giver) -- and assemble a `MarketManifest`.
+///
+/// A LIVE test of the issue #24 operator path: provision a per-deal market — OB (note-funded) +
+/// RootModel + `TokenContract` (**wallet-funded**, no giver) — and assemble a `MarketManifest`.
 /// The operator multisig is funded here by the giver to stand in for the operator topping up their
 /// own wallet externally; the deploys themselves use `*_from_wallet`, never the giver. This verifies
 /// the `sendTransaction` funding ABI of [`RealChainBackend::fund_deploy_from_wallet`].
 #[tokio::test]
-#[ignore = "live:  wallet-funded market provisioning on shellnet (writes; deploys OB/RM/TC)"]
+#[ignore = "live: issue #24 wallet-funded market provisioning on shellnet (writes; deploys OB/RM/TC)"]
 async fn live_provision_wallet_funded_market() {
     let Ok(pool_path) = std::env::var("DEXDO_PN_POOL") else {
-        eprintln!("DEXDO_PN_POOL not set -- skipping");
+        eprintln!("DEXDO_PN_POOL not set — skipping");
         return;
     };
     let pool: Value =
@@ -1079,8 +1049,8 @@ async fn live_provision_wallet_funded_market() {
     );
     let be = RealChainBackend::connect(manifest_path).expect("connect");
 
-    // Operator wallet. In production the operator funds it
-    // externally; here the giver stands in for that top-up(native gas, to pay the deploys).
+    // Operator wallet (D10: derived from the same seed). In production the operator funds it
+    // externally; here the giver stands in for that top-up (native gas, to pay the deploys).
     let wallet = RealChainBackend::multisig_address(&owner).expect("wallet addr");
     be.giver_fund(&wallet.with_workchain(), 800_000_000_000)
         .await
@@ -1101,19 +1071,19 @@ async fn live_provision_wallet_funded_market() {
     }
     println!("=== operator wallet {wallet} active ===");
 
-    // (4.0.5): the self-dapp RootModel + per-deal TC deploys are funded with ECC[2] SHELL from the
-    // operator wallet(native to an uninit cross-dapp address needs the giver). Seed the wallet's ECC[2]
-    // balance.
+    // #24 (4.0.5): the self-dapp RootModel + per-deal TC deploys are funded with ECC[2] SHELL from the
+    // operator wallet (native to an uninit cross-dapp address needs the giver). Seed the wallet's ECC[2]
+    // balance (test giver stands in for the operator's external top-up; D13: giver in tests only).
     be.giver_send_shell(&wallet.with_workchain(), 5_000_000_000_000)
         .await
         .expect("seed operator wallet ECC[2] SHELL");
 
-    // A unique frame model per run -> a fresh OB/RootModel/TC(deterministic, no leftover state).
+    // A unique frame model per run -> a fresh OB/RootModel/TC (deterministic, no leftover state).
     let frame_model = format!("dexdo-d24-{}", std::process::id());
     let model_hash = model_hash_for(&frame_model);
     let gas: u128 = 200_000_000_000;
 
-    // 1) OB(note-funded, no giver) -- deploy-if-absent(note-funded deploy does not wait).
+    // 1) OB (note-funded, no giver) — deploy-if-absent (note-funded deploy does not wait).
     let ob = be
         .inference_orderbook_address(&note_addr, &model_hash, MODEL_TICK_SIZE)
         .await
@@ -1154,7 +1124,7 @@ async fn live_provision_wallet_funded_market() {
     }
     println!("=== OB {ob} active (note-funded) ===");
 
-    // 2) RootModel(WALLET-funded) -- deploy-if-absent. Verifies fund_deploy_from_wallet.
+    // 2) RootModel (WALLET-funded) — deploy-if-absent. Verifies fund_deploy_from_wallet.
     let seller_pubkey = json!(format!("0x{}", owner.public_hex()));
     let rm = be
         .root_model_address_for(&seller_pubkey)
@@ -1180,12 +1150,12 @@ async fn live_provision_wallet_funded_market() {
     }
     println!("=== RootModel {rm} active (wallet-funded) ===");
 
-    // 3) Per-deal TokenContract address -- derived from RootModel(`getTokenContractAddress`).
-    // FINDING: the wallet-funded TC *deploy* is blocked by dapp isolation. The TC is a
+    // 3) Per-deal TokenContract address — derived from RootModel (`getTokenContractAddress`).
+    // FINDING (issue #24): the wallet-funded TC *deploy* is blocked by dapp isolation. The TC is a
     // self-dapp deal contract; the operator multisig's `sendTransaction` funds same-dapp (RootModel
-    // + above) but NOT the cross-dapp TC, so the deploy never activates. The giver works only because
-    // it is privileged(`fund_deploy_address` routes cross-dapp), and RootModel has no
-    // The per-deal TC is deployed by `provision_market()` ITSELF(ECC[2] wallet-funded, NO giver) --
+    // ✓ above) but NOT the cross-dapp TC, so the deploy never activates. The giver works only because
+    // it is privileged (`fund_deploy_address` routes cross-dapp), and RootModel has no
+    // The per-deal TC is deployed by `provision_market()` ITSELF (ECC[2] wallet-funded, NO giver) —
     // see below. Here we only derive the expected RootModel-backed address to assert convergence.
     let nonce = std::process::id() as u64;
     let (price, max_ticks): (u128, u128) = (1000, 1024);
@@ -1194,9 +1164,9 @@ async fn live_provision_wallet_funded_market() {
         .await
         .expect("derive TC address");
 
-    // 4) The provision_market orchestrator(the actual `dexdo provision` code path) provisions the FULL
-    // market -- deploy-if-absent the OB/RootModel(already up) AND the per-deal TC (ECC[2] wallet-funded,
-    // NO giver) -- and assembles the MarketManifest. This verifies the shipped orchestrator deploys an
+    // 4) The provision_market orchestrator (the actual `dexdo provision` code path) provisions the FULL
+    // market — deploy-if-absent the OB/RootModel (already up) AND the per-deal TC (ECC[2] wallet-funded,
+    // NO giver) — and assembles the MarketManifest. This verifies the shipped orchestrator deploys an
     // ACTIVE TC end-to-end, not just a derived address.
     let m = be
         .provision_market(
@@ -1213,7 +1183,7 @@ async fn live_provision_wallet_funded_market() {
     assert_eq!(m.inference_order_book, ob.with_workchain(), "OB");
     assert_eq!(m.root_model, rm.with_workchain(), "RootModel");
     assert_eq!(m.token_contract, tc.with_workchain(), "TC derived");
-    // provision_market DEPLOYED the TC(ECC[2] wallet-funded, NO giver) -- assert it is active on-chain,
+    // provision_market DEPLOYED the TC (ECC[2] wallet-funded, NO giver) — assert it is active on-chain,
     // i.e. the orchestrator returns a TC-active market, not just a derived address.
     let tc_active = be
         .client()
@@ -1228,22 +1198,22 @@ async fn live_provision_wallet_funded_market() {
     );
     println!("=== TC {tc} ACTIVE via provision_market (wallet ECC[2], NO giver) ===");
     assert_eq!(m.frame_model, frame_model);
-    // provision_market is note-funded -- `MarketManifest` no longer carries an operator wallet.
+    // #58: provision_market is note-funded — `MarketManifest` no longer carries an operator wallet.
     println!(
         "=== provision_market MarketManifest:\n{} ===",
         m.to_json().unwrap()
     );
 }
 
-/// A LIVE deal test, step 3: the buyer(note1) **matches the seller's offer** in the book. Uses
-/// a fresh `modelHash`(-> an empty book for the run), so the match is deterministic (the buy takes
+/// A LIVE deal test, step 3: the buyer (note1) **matches the seller's offer** in the book. Uses
+/// a fresh `modelHash` (→ an empty book for the run), so the match is deterministic (the buy takes
 /// exactly our ask, not a leftover from past runs). Match criterion: the book funded the
-/// seller `TokenContract` via `fundFromOrderBook` -> `getState.funded == true`. Requires `DEXDO_PN_POOL`.
+/// seller `TokenContract` via `fundFromOrderBook` → `getState.funded == true`. Requires `DEXDO_PN_POOL`.
 #[tokio::test]
 #[ignore = "live: buyer matches a resting offer on shellnet (writes; match funds seller TC)"]
 async fn live_buyer_matches_offer() {
     let Ok(pool_path) = std::env::var("DEXDO_PN_POOL") else {
-        eprintln!("DEXDO_PN_POOL not set -- skipping");
+        eprintln!("DEXDO_PN_POOL not set — skipping");
         return;
     };
     let pool: Value =
@@ -1262,7 +1232,7 @@ async fn live_buyer_matches_offer() {
     );
     let be = RealChainBackend::connect(manifest).expect("connect");
 
-    // A unique nonce -> a fresh modelHash(empty book) and a fresh TC(deterministic match).
+    // A unique nonce → a fresh modelHash (empty book) and a fresh TC (deterministic match).
     let nonce = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap()
@@ -1273,7 +1243,7 @@ async fn live_buyer_matches_offer() {
     let price: u128 = 10;
     let max_ticks: u128 = 2;
 
-    // A fresh book -- we deploy it and wait for Active.
+    // A fresh book — we deploy it and wait for Active.
     let ob = be
         .inference_orderbook_address(&seller_addr, &model_hash, ob_tick_size)
         .await
@@ -1305,7 +1275,7 @@ async fn live_buyer_matches_offer() {
     assert!(ob_ok, "the fresh book is active");
     println!("=== fresh OB {ob} active (model={model_hash}) ===");
 
-    // Seller RootModel(we provision it if absent) + a fresh per-deal TC.
+    // Seller RootModel (we provision it if absent) + a fresh per-deal TC.
     let seller_pubkey = json!(format!("0x{}", seller.public_hex()));
     let rm = be.root_model_address_for(&seller_pubkey).await.expect("rm");
     let rm_active = be
@@ -1334,18 +1304,9 @@ async fn live_buyer_matches_offer() {
     println!("=== seller TC {tc} active ===");
 
     // The seller posts the offer; we wait until it lands in the book as an ask.
-    be.post_sell_offer(
-        &seller_addr,
-        &seller,
-        &model_hash,
-        price,
-        max_ticks,
-        &tc,
-        0,
-        nonce,
-    )
-    .await
-    .expect("offer");
+    be.post_sell_offer(&seller_addr, &seller, 0, nonce)
+        .await
+        .expect("offer");
     let mut rested = false;
     for _ in 0..20 {
         let stats = be.inference_orderbook_stats(&ob).await.expect("stats");
@@ -1363,7 +1324,7 @@ async fn live_buyer_matches_offer() {
     assert!(rested, "the offer landed in the book before the match");
     println!("=== offer rests; buyer now matches ===");
 
-    // The buyer matches: maxPrice >= ask, ticks <= maxTicks, a generous escrow(ECC SHELL from note1's balance).
+    // The buyer matches: maxPrice ≥ ask, ticks ≤ maxTicks, a generous escrow (ECC SHELL from note1's balance).
     let ticks: u128 = max_ticks;
     let escrow: u128 = 1_000_000;
     let resp = be
@@ -1372,7 +1333,7 @@ async fn live_buyer_matches_offer() {
         .expect("buy");
     println!("=== placeInferenceBuy resp = {resp} ===");
 
-    // Match criterion: the book funded the seller TC(getState.funded == true).
+    // Match criterion: the book funded the seller TC (getState.funded == true).
     let mut funded = false;
     for _ in 0..30 {
         let st = be.token_contract_state(&tc).await.expect("tc state");
@@ -1394,14 +1355,14 @@ async fn live_buyer_matches_offer() {
     );
 }
 
-/// LIVE: buyer funds a fresh seller TC through the book, the seller never opens it, then after
+/// LIVE #149: buyer funds a fresh seller TC through the book, the seller never opens it, then after
 /// MATCH_OPEN_TIMEOUT the buyer note sends `streamCleanup` -> `TC.cleanupUnopened()`. This is the
 /// funded-but-never-opened money proof: the deal closes and the buyer's ECC[2] escrow is no longer locked.
 #[tokio::test]
-#[ignore = "live : waits MATCH_OPEN_TIMEOUT (~600s) then streamCleanup refunds a never-opened deal"]
+#[ignore = "live #149: waits MATCH_OPEN_TIMEOUT (~600s) then streamCleanup refunds a never-opened deal"]
 async fn live_never_opened_cleanup_refunds_buyer() {
     let Ok(pool_path) = std::env::var("DEXDO_PN_POOL") else {
-        eprintln!("DEXDO_PN_POOL not set -- skipping");
+        eprintln!("DEXDO_PN_POOL not set — skipping");
         return;
     };
     let pool: Value =
@@ -1441,20 +1402,11 @@ async fn live_never_opened_cleanup_refunds_buyer() {
     assert_eq!(market.model_hash, model_hash);
     let ob = Address::parse(&market.inference_order_book).expect("ob addr");
     let tc = Address::parse(&market.token_contract).expect("tc addr");
-    println!("===  fresh market via note-funded provision_market: OB {ob} TC {tc} ===");
+    println!("=== #149 fresh market via note-funded provision_market: OB {ob} TC {tc} ===");
 
-    be.post_sell_offer(
-        &seller_addr,
-        &seller,
-        &model_hash,
-        price,
-        max_ticks,
-        &tc,
-        0,
-        nonce,
-    )
-    .await
-    .expect("offer");
+    be.post_sell_offer(&seller_addr, &seller, 0, nonce)
+        .await
+        .expect("offer");
     let mut rested = false;
     for _ in 0..20 {
         let order_count = be
@@ -1471,7 +1423,7 @@ async fn live_never_opened_cleanup_refunds_buyer() {
         }
         tokio::time::sleep(std::time::Duration::from_secs(3)).await;
     }
-    assert!(rested, " offer rests before buyer match");
+    assert!(rested, "#149 offer rests before buyer match");
 
     let ticks: u128 = 2;
     let escrow: u128 = 1_000_000;
@@ -1479,19 +1431,19 @@ async fn live_never_opened_cleanup_refunds_buyer() {
         .place_inference_buy(&buyer_addr, &buyer, &model_hash, price, ticks, escrow, 0, 0)
         .await
         .expect("buy");
-    println!("===  placeInferenceBuy resp = {resp} ===");
+    println!("=== #149 placeInferenceBuy resp = {resp} ===");
 
     let mut funded_time = None;
     for _ in 0..40 {
         let st = be.token_contract_state(&tc).await.expect("tc state");
-        println!("===  pre-cleanup TC state={st:?} ===");
+        println!("=== #149 pre-cleanup TC state={st:?} ===");
         if let Some(st) = st.as_ref() {
             let funded = st["funded"].as_bool().unwrap_or(false);
             let opened = st["opened"].as_bool().unwrap_or(false);
             if funded {
                 assert!(
                     !opened,
-                    "seller must not open in the  never-opened scenario"
+                    "seller must not open in the #149 never-opened scenario"
                 );
                 funded_time = st["fundedTime"]
                     .as_str()
@@ -1507,7 +1459,7 @@ async fn live_never_opened_cleanup_refunds_buyer() {
     if now < cleanup_at {
         let wait = cleanup_at - now + 3;
         println!(
-            "===  waiting {wait}s for MATCH_OPEN_TIMEOUT: fundedTime={funded_time} cleanup_at={cleanup_at} now={now} ==="
+            "=== #149 waiting {wait}s for MATCH_OPEN_TIMEOUT: fundedTime={funded_time} cleanup_at={cleanup_at} now={now} ==="
         );
         tokio::time::sleep(std::time::Duration::from_secs(wait)).await;
     }
@@ -1517,9 +1469,9 @@ async fn live_never_opened_cleanup_refunds_buyer() {
         .expect("streamCleanup");
     for _ in 0..40 {
         let st = be.token_contract_state(&tc).await.expect("tc state");
-        println!("===  post-cleanup TC state={st:?} ===");
+        println!("=== #149 post-cleanup TC state={st:?} ===");
         let Some(st) = st.as_ref() else {
-            println!("===  cleanup applied: TokenContract closed (state=None) ===");
+            println!("=== #149 cleanup applied: TokenContract closed (state=None) ===");
             return;
         };
         let funded = st["funded"].as_bool().unwrap_or(false);
@@ -1529,12 +1481,12 @@ async fn live_never_opened_cleanup_refunds_buyer() {
             .and_then(|s| s.parse::<u128>().ok())
             .unwrap_or(0);
         if !funded && !opened && deposit == 0 {
-            println!("===  cleanup applied: funded=false opened=false deposit=0 ===");
+            println!("=== #149 cleanup applied: funded=false opened=false deposit=0 ===");
             return;
         }
         tokio::time::sleep(std::time::Duration::from_secs(3)).await;
     }
-    panic!(" streamCleanup did not close/refund the never-opened TC");
+    panic!("#149 streamCleanup did not close/refund the never-opened TC");
 }
 
 fn now_secs() -> u64 {
@@ -1563,8 +1515,8 @@ async fn wait_active(be: &RealChainBackend, addr: &Address) {
     panic!("{addr} did not activate");
 }
 
-/// Provisions a fresh deal up to the "TC funded" state(steps 1-3): a fresh book +
-/// the seller's RootModel + a per-deal TC + an offer + a buyer match. Returns(ob, tc).
+/// Provisions a fresh deal up to the "TC funded" state (steps 1-3): a fresh book +
+/// the seller's RootModel + a per-deal TC + an offer + a buyer match. Returns (ob, tc).
 #[allow(clippy::too_many_arguments)]
 async fn setup_funded_deal(
     be: &RealChainBackend,
@@ -1606,18 +1558,9 @@ async fn setup_funded_deal(
         )
         .await
         .expect("deploy tc");
-    be.post_sell_offer(
-        seller_addr,
-        seller,
-        &model_hash,
-        price,
-        max_ticks,
-        &tc,
-        0,
-        nonce,
-    )
-    .await
-    .expect("offer");
+    be.post_sell_offer(seller_addr, seller, 0, nonce)
+        .await
+        .expect("offer");
     let mut rested = false;
     for _ in 0..20 {
         let oc = be
@@ -1657,20 +1600,21 @@ async fn setup_funded_deal(
     (ob, tc)
 }
 
-/// **LEGACY.** Its deal SETUP routes through the OLD operator-wallet/giver path
-/// (`deploy_multisig` + `fund_probe_commission`), kept as `test-giver` regression coverage -- **NOT** the
-/// canonical proof. The canonical note-funded probe-commission proof is
-/// `live_post_probe_commission_note_funded`(and `RealDealBackend::open_stream` itself is note-funded now).
-/// A LIVE deal test, step 4(open + stop on the probe): from a funded deal the seller
-/// posts the probe-commission(via the operational wallet) and opens the stream `open(endpointCipher)`;
-/// the handover **round-trips through the chain**(the buyer decrypts the endpoint); then the buyer
-/// **stops on the probe** `streamStop` -> `ProbeBurned`. Requires `DEXDO_PN_POOL`.
+/// **LEGACY (pre-#58, `test-giver` only).** Its deal SETUP routes through the OLD operator-wallet/giver path
+/// (`deploy_multisig` + `fund_probe_commission`), kept as `test-giver` regression coverage — **NOT** the
+/// canonical #58 proof. The canonical note-funded probe-commission proof is
+/// `live_post_probe_commission_note_funded` (and `RealDealBackend::open_stream` itself is note-funded now).
+///
+/// A LIVE deal test, step 4 (open + stop on the probe): from a funded deal the seller
+/// posts the probe-commission (via the operational wallet) and opens the stream `open(endpointCipher)`;
+/// the handover §3.1 **round-trips through the chain** (the buyer decrypts the endpoint); then the buyer
+/// **stops on the probe** `streamStop` → `ProbeBurned` (§3.1.2). Requires `DEXDO_PN_POOL`.
 #[tokio::test]
 #[ignore = "live: stream open + handover + buyer stop-on-probe (ProbeBurned) on shellnet"]
 async fn live_stream_open_and_probe_burn() {
     use crate::note::Note;
     let Ok(pool_path) = std::env::var("DEXDO_PN_POOL") else {
-        eprintln!("DEXDO_PN_POOL not set -- skipping");
+        eprintln!("DEXDO_PN_POOL not set — skipping");
         return;
     };
     let pool: Value =
@@ -1689,7 +1633,7 @@ async fn live_stream_open_and_probe_burn() {
     );
     let be = RealChainBackend::connect(manifest).expect("connect");
 
-    // A deal with a NON-ZERO probe commission: price=10000 -> commission=250(= price*250bps).
+    // A deal with a NON-ZERO probe commission: price=10000 → commission=250 (= price·250bps).
     let price: u128 = 10_000;
     let (_ob, tc) = setup_funded_deal(
         &be,
@@ -1705,14 +1649,14 @@ async fn live_stream_open_and_probe_burn() {
     .await;
     println!("=== funded TC {tc} (price={price}) ===");
 
-    // The seller posts the probe-commission from the operational wallet(an internal call with SHELL ECC).
+    // The seller posts the probe-commission from the operational wallet (an internal call with SHELL ECC).
     let wallet_keys = KeyPair::generate();
     let wallet = be
         .deploy_multisig(&wallet_keys)
         .await
         .expect("deploy wallet");
-    // The wallet needs ECC[2] SHELL to attach to `fundProbeCommission` -- we top it up from the
-    // giver(flag 1; deploy-funding only gives native gas).
+    // The wallet needs ECC[2] SHELL to attach to `fundProbeCommission` — we top it up from the
+    // giver (flag 1; deploy-funding only gives native gas).
     be.giver_send_shell(&wallet.with_workchain(), 100_000_000)
         .await
         .expect("send shell to wallet");
@@ -1758,7 +1702,7 @@ async fn live_stream_open_and_probe_burn() {
         "the probe-commission is posted (probeFunded==true)"
     );
 
-    // Handover: the seller encrypts the endpoint to the buyer's x25519 pubkey; open writes the cipher.
+    // Handover §3.1: the seller encrypts the endpoint to the buyer's x25519 pubkey; open writes the cipher.
     let buyer_rn = RealNote::from_keypair(KeyPair::from_secret_hex(b_sec).expect("brn"))
         .expect("buyer real note");
     let seller_rn = RealNote::from_keypair(KeyPair::from_secret_hex(s_sec).expect("srn"))
@@ -1792,11 +1736,11 @@ async fn live_stream_open_and_probe_burn() {
     assert_eq!(
         buyer_rn.decrypt(&onchain).expect("decrypt"),
         endpoint,
-        "the handover round-trips through the chain -- the buyer decrypted the endpoint"
+        "the handover round-trips through the chain — the buyer decrypted the endpoint"
     );
     println!("=== handover round-trips through chain ===");
 
-    // The buyer stops ON THE PROBE(before accept): stop -> ProbeBurned.
+    // The buyer stops ON THE PROBE (before accept): stop → ProbeBurned (§3.1.2).
     be.stream_stop(&buyer_addr, &buyer, &tc)
         .await
         .expect("stop");
@@ -1822,15 +1766,15 @@ async fn live_stream_open_and_probe_burn() {
     );
 }
 
-/// A LIVE anti-scam test of: from an open stream the buyer opens a dispute
-/// `streamDispute` -> `TC.dispute()` -> **both notes are actually locked**. We check `disputed==true`
-/// on the TC and `disputeCount>0` on the seller's note -- direct on-chain proof of `ERR_STREAM_LOCKED`
+/// A LIVE anti-scam test of directive 5 (§4.2): from an open stream the buyer opens a dispute
+/// `streamDispute` → `TC.dispute()` → **both notes are actually locked**. We check `disputed==true`
+/// on the TC and `disputeCount>0` on the seller's note — direct on-chain proof of `ERR_STREAM_LOCKED`
 /// (a new offer/withdrawal from a locked note is rejected until the dispute is resolved). Requires `DEXDO_PN_POOL`.
 #[tokio::test]
 #[ignore = "live: buyer streamDispute -> TC.dispute() locks both notes (disputeCount>0) on shellnet"]
 async fn live_stream_dispute_locks_note() {
     let Ok(pool_path) = std::env::var("DEXDO_PN_POOL") else {
-        eprintln!("DEXDO_PN_POOL not set -- skipping");
+        eprintln!("DEXDO_PN_POOL not set — skipping");
         return;
     };
     let pool: Value =
@@ -1875,7 +1819,7 @@ async fn live_stream_dispute_locks_note() {
         "the stream is open before the dispute"
     );
 
-    // The buyer opens a dispute: streamDispute -> TC.dispute() locks BOTH notes.
+    // The buyer opens a dispute: streamDispute → TC.dispute() locks BOTH notes (§4.2).
     be.stream_dispute(&buyer_addr, &buyer, &tc)
         .await
         .expect("dispute");
@@ -1895,7 +1839,7 @@ async fn live_stream_dispute_locks_note() {
     }
     assert!(disputed, "TC.dispute() went through: disputed==true");
 
-    // Direct proof that "the note is locked": the seller has disputeCount > 0(streamDisputeLock).
+    // Direct proof that "the note is locked": the seller has disputeCount > 0 (streamDisputeLock).
     let dispute_count = |locks: &Option<Value>| -> u64 {
         locks
             .as_ref()
@@ -1918,11 +1862,11 @@ async fn live_stream_dispute_locks_note() {
     }
     assert!(
         seller_locked,
-        "the seller's note is actually locked by the dispute (disputeCount>0 -> ERR_STREAM_LOCKED)"
+        "the seller's note is actually locked by the dispute (disputeCount>0 → ERR_STREAM_LOCKED)"
     );
     println!("=== seller note dispute-locked on chain (ERR_STREAM_LOCKED) ===");
 
-    // the seller CONCEDES -- releaseDispute() unlocks both notes and returns the tick to the buyer.
+    // §4.2: the seller CONCEDES — releaseDispute() unlocks both notes and returns the tick to the buyer.
     be.release_dispute(&tc, &seller)
         .await
         .expect("releaseDispute");
@@ -1949,7 +1893,7 @@ async fn live_stream_dispute_locks_note() {
     println!("=== releaseDispute resolved: notes unlocked, tick returned to buyer ===");
 }
 
-/// Helper: the seller posts the probe-commission(a fresh operational wallet + ECC[2] from the giver) and
+/// Helper: the seller posts the probe-commission (a fresh operational wallet + ECC[2] from the giver) and
 /// opens the stream with the handover cipher of the endpoint to the buyer. On exit: TC `opened`, `probeFunded`.
 async fn open_stream_with_probe(
     be: &RealChainBackend,
@@ -2023,15 +1967,15 @@ fn u128_field(v: &Option<Value>, key: &str) -> u128 {
         .unwrap_or(0)
 }
 
-/// A LIVE deal test, step 4b(accept path + two-tick invariant + clean stop): from an open
-/// stream the seller waits for `SETTLE_WINDOW` and `advance` -- the probe is accepted (probe-tick -> seller,
-/// the commission is returned), and the **two-tick invariant** is established(`prepaid==P && frozen==P`);
-/// then the buyer `stop` -- a standard split, the stream is closed. Slow(~5 min due to 180s).
+/// A LIVE deal test, step 4b (accept path + two-tick invariant + clean stop): from an open
+/// stream the seller waits for `SETTLE_WINDOW` and `advance` — the probe is accepted (probe-tick → seller,
+/// the commission is returned), and the **two-tick invariant** is established (`prepaid==P && frozen==P`);
+/// then the buyer `stop` — a standard split (§4.1), the stream is closed. Slow (~5 min due to 180s).
 #[tokio::test]
 #[ignore = "live: stream advance(accept) + two-tick invariant + stop on shellnet (~5min: 180s settle)"]
 async fn live_stream_advance_and_stop() {
     let Ok(pool_path) = std::env::var("DEXDO_PN_POOL") else {
-        eprintln!("DEXDO_PN_POOL not set -- skipping");
+        eprintln!("DEXDO_PN_POOL not set — skipping");
         return;
     };
     let pool: Value =
@@ -2050,7 +1994,7 @@ async fn live_stream_advance_and_stop() {
     );
     let be = RealChainBackend::connect(manifest).expect("connect");
 
-    // ticks=4(depo=4*P=40000) -- enough for the probe-tick at open(P) + the two-tick invariant(2P+fee).
+    // ticks=4 (depo=4·P=40000) — enough for the probe-tick at open (P) + the two-tick invariant (2P+fee).
     let price: u128 = 10_000;
     let (_ob, tc) = setup_funded_deal(
         &be,
@@ -2078,7 +2022,7 @@ async fn live_stream_advance_and_stop() {
         u128_field(&st, "deposit")
     );
 
-    // advance requires block.timestamp >= _prepaidTime + SETTLE_WINDOW(180s).
+    // advance requires block.timestamp >= _prepaidTime + SETTLE_WINDOW (180s).
     println!("=== waiting for SETTLE_WINDOW (185s) ===");
     tokio::time::sleep(std::time::Duration::from_secs(185)).await;
     be.advance_stream(&tc, &seller).await.expect("advance");
@@ -2114,7 +2058,7 @@ async fn live_stream_advance_and_stop() {
         "=== two-tick invariant established: prepaid={prepaid} frozen={frozen} (P={price}) ==="
     );
 
-    // The buyer closes the stream -- a standard split: the delivered tick to the seller, the remainder to the buyer.
+    // The buyer closes the stream — a standard split (§4.1): the delivered tick to the seller, the remainder to the buyer.
     be.stream_stop(&buyer_addr, &buyer, &tc)
         .await
         .expect("stop");
@@ -2145,15 +2089,15 @@ async fn live_stream_advance_and_stop() {
     );
 }
 
-/// A LIVE test, the **seller no-show** scenario: the deal is open, but the seller does NOT advance
+/// A LIVE test, the **seller no-show** scenario (§3.4/§9.1): the deal is open, but the seller does NOT advance
 /// the ticks; after `STREAM_TIMEOUT` the buyer reclaims. Expectation: the stream is closed, the probe is **not accepted**,
-/// the commission(250) -> the seller as `finalizedOwed`, probe+deposit -> the buyer, **no burn** (a no-show is not
-/// slashed). Slow(~12 min due to 600s). Requires `DEXDO_PN_POOL`.
+/// the commission (250) → the seller as `finalizedOwed`, probe+deposit → the buyer, **no burn** (a no-show is not
+/// slashed). Slow (~12 min due to 600s). Requires `DEXDO_PN_POOL`.
 #[tokio::test]
 #[ignore = "live: seller no-show reclaim on shellnet (~12min: 600s STREAM_TIMEOUT)"]
 async fn live_stream_seller_no_show() {
     let Ok(pool_path) = std::env::var("DEXDO_PN_POOL") else {
-        eprintln!("DEXDO_PN_POOL not set -- skipping");
+        eprintln!("DEXDO_PN_POOL not set — skipping");
         return;
     };
     let pool: Value =
@@ -2197,7 +2141,7 @@ async fn live_stream_seller_no_show() {
         u128_field(&be.token_contract_state(&tc).await.expect("st"), "deposit"),
     );
 
-    // The seller stays silent for exactly STREAM_TIMEOUT(600s) -- then the buyer reclaims.
+    // The seller stays silent for exactly STREAM_TIMEOUT (600s) — then the buyer reclaims.
     println!("=== waiting for STREAM_TIMEOUT (605s), the seller does not advance the ticks ===");
     tokio::time::sleep(std::time::Duration::from_secs(605)).await;
     be.reclaim_on_timeout(&buyer_addr, &buyer, &tc)
@@ -2238,23 +2182,24 @@ async fn live_stream_seller_no_show() {
         Some(false),
         "the probe is NOT accepted (the seller did not show up)"
     );
-    // to the seller -- only the returned commission(250 = price*250bps); probe+deposit to the buyer; no burn.
+    // §3.4: to the seller — only the returned commission (250 = price·250bps); probe+deposit to the buyer; no burn.
     assert_eq!(
         finalized, 250,
         "no-show: the seller's finalizedOwed == the returned commission (250), the tick did NOT go to the seller"
     );
     println!(
-        "=== seller no-show: reclaimed, no burn, commission(250)->seller, probe+deposit->buyer ==="
+        "=== seller no-show: reclaimed, no burn, commission(250)→seller, probe+deposit→buyer ==="
     );
 }
 
-/// **LEGACY.** Its deal SETUP routes through the OLD operator-wallet/giver path
-/// (`deploy_multisig`), kept as `test-giver` regression coverage -- **NOT** the canonical proof (though
+/// **LEGACY (pre-#58, `test-giver` only).** Its deal SETUP routes through the OLD operator-wallet/giver path
+/// (`deploy_multisig`), kept as `test-giver` regression coverage — **NOT** the canonical #58 proof (though
 /// `RealDealBackend::open_stream` itself posts the probe-commission note-funded). The canonical note-funded
 /// seller proof is [`provision_market`](Self::provision_market) + `live_post_probe_commission_note_funded`.
+///
 /// A LIVE trait-level smoke test: drives a deal **through the adapter methods** of `RealDealBackend`
-/// (`post_offer`->`place_buy`->`read_match`->`open_stream`->`read_handover`->`accept_probe`->`stop`)
-/// on shellnet -- checks the wiring of step 5 end-to-end. Slow(~6 min: 185s SETTLE_WINDOW). Requires `DEXDO_PN_POOL`.
+/// (`post_offer`→`place_buy`→`read_match`→`open_stream`→`read_handover`→`accept_probe`→`stop`)
+/// on shellnet — checks the wiring of step 5 end-to-end. Slow (~6 min: 185s SETTLE_WINDOW). Requires `DEXDO_PN_POOL`.
 #[tokio::test]
 #[ignore = "live: drive a deal through the RealDealBackend ChainBackend trait on shellnet (~6min)"]
 async fn live_real_deal_backend_trait() {
@@ -2263,7 +2208,7 @@ async fn live_real_deal_backend_trait() {
     use crate::note::Note;
 
     let Ok(pool_path) = std::env::var("DEXDO_PN_POOL") else {
-        eprintln!("DEXDO_PN_POOL not set -- skipping");
+        eprintln!("DEXDO_PN_POOL not set — skipping");
         return;
     };
     let pool: Value =
@@ -2289,7 +2234,7 @@ async fn live_real_deal_backend_trait() {
     let model_hash = model_hash_for(&frame_model);
 
     // Provisioning the deal with low-level helpers: the book, the seller's RootModel, the per-deal TC,
-    // the operational wallet(+ECC[2] SHELL).
+    // the operational wallet (+ECC[2] SHELL).
     let ob = chain
         .inference_orderbook_address(&seller_addr, &model_hash, 1000)
         .await
@@ -2347,7 +2292,7 @@ async fn live_real_deal_backend_trait() {
         tokio::time::sleep(std::time::Duration::from_secs(3)).await;
     }
 
-    // The actors' notes for the x25519 handover(encrypt/decrypt).
+    // The actors' notes for the x25519 handover (encrypt/decrypt).
     let seller_rn = RealNote::from_keypair(kp(s_sec)).expect("seller real note");
     let buyer_rn = RealNote::from_keypair(kp(b_sec)).expect("buyer real note");
 
@@ -2432,7 +2377,7 @@ async fn live_real_deal_backend_trait() {
     println!("=== Settlement via trait = {settlement:?} ===");
     assert!(
         matches!(settlement, Settlement::AmicableSplit { .. }),
-        "a clean stop after accept -> AmicableSplit"
+        "a clean stop after accept → AmicableSplit"
     );
     let snap = backend.snapshot(&tc_s).await.expect("snapshot");
     assert!(snap.closed, "snapshot.closed after stop via the trait");
@@ -2442,22 +2387,22 @@ async fn live_real_deal_backend_trait() {
     );
 }
 
-/// live: `dexdo recover`'s STOP path cleanly closes an **orphaned OPEN** deal(AmicableSplit).
-/// Drives a real deal to STREAMING(probe accepted) exactly like `live_real_deal_backend_trait`, then --
-/// instead of the buyer's normal stop -- the buyer process "dies" and we invoke the RECOVER path from a
+/// #85 §8 live: `dexdo recover`'s STOP path cleanly closes an **orphaned OPEN** deal (AmicableSplit).
+/// Drives a real deal to STREAMING (probe accepted) exactly like `live_real_deal_backend_trait`, then —
+/// instead of the buyer's normal stop — the buyer process "dies" and we invoke the RECOVER path from a
 /// FRESH connection: `RealChainBackend::stream_stop(buyer_note, buyer_keys, tc)`, the exact call
 /// `dexdo recover` makes after its preflight. Asserts the deal STOPs cleanly (opened=false, the snapshot
-/// is closed -> AmicableSplit: the seller is paid the accepted tick, the buyer refunded the rest, no
+/// is closed → AmicableSplit: the seller is paid the accepted tick, the buyer refunded the rest, no
 /// BurnBoth), and that `destroy` then closes the TC. The CLI preflight (not-OPEN / disputed / wrong note
-/// addr / wrong key) is offline-proven. Slow(~6min: 185s SETTLE_WINDOW).
+/// addr / wrong key) is offline-proven (§5, `chain::recover_tests`). Slow (~6min: 185s SETTLE_WINDOW).
 #[tokio::test]
-#[ignore = "live:  recover STOPs an orphaned OPEN streaming deal (AmicableSplit) on shellnet (~6min)"]
+#[ignore = "live: #85 recover STOPs an orphaned OPEN streaming deal (AmicableSplit) on shellnet (~6min)"]
 async fn live_recover_stops_orphaned_open_deal() {
     use crate::chain::{ChainBackend, SellOffer};
     use crate::note::Note;
 
     let Ok(pool_path) = std::env::var("DEXDO_PN_POOL") else {
-        eprintln!("DEXDO_PN_POOL not set -- skipping");
+        eprintln!("DEXDO_PN_POOL not set — skipping");
         return;
     };
     let pool: Value =
@@ -2482,7 +2427,7 @@ async fn live_recover_stops_orphaned_open_deal() {
     let frame_model = format!("dexdo-recover--{nonce:016x}");
     let model_hash = model_hash_for(&frame_model);
 
-    // -- provision the deal(OB + RootModel + per-deal TC) --
+    // ── provision the deal (OB + RootModel + per-deal TC) ──
     let ob = chain
         .inference_orderbook_address(&seller_addr, &model_hash, 1000)
         .await
@@ -2585,7 +2530,7 @@ async fn live_recover_stops_orphaned_open_deal() {
         .await
         .expect("open_stream");
 
-    println!("=== deal OPEN; wait SETTLE_WINDOW (185s) then accept the probe (-> streaming) ===");
+    println!("=== deal OPEN; wait SETTLE_WINDOW (185s) then accept the probe (→ streaming) ===");
     tokio::time::sleep(std::time::Duration::from_secs(185)).await;
     backend.accept_probe(&tc_s).await.expect("accept_probe");
     let mut accepted = false;
@@ -2603,11 +2548,11 @@ async fn live_recover_stops_orphaned_open_deal() {
     }
     assert!(
         accepted,
-        "probe accepted (seller_received>0) -> the deal is STREAMING (post-probe)"
+        "probe accepted (seller_received>0) → the deal is STREAMING (post-probe)"
     );
 
-    // -- the buyer process "dies" here(no normal stop) -> the deal is ORPHANED OPEN. RECOVER from a FRESH
-    // connection -- the exact call `dexdo recover` makes after its preflight. --
+    // ── the buyer process "dies" here (no normal stop) → the deal is ORPHANED OPEN. RECOVER from a FRESH
+    //    connection — the exact call `dexdo recover` makes after its preflight. ──
     let recover_chain = RealChainBackend::connect(manifest).expect("recover connect");
     let pre = recover_chain
         .token_contract_state(&tc)
@@ -2624,8 +2569,8 @@ async fn live_recover_stops_orphaned_open_deal() {
         .await
         .expect("recover: streamStop -> TC.stop()");
 
-    // -- the streamStop submits async; wait for the stop to APPLY(opened->false), exactly as the buyer-STOP
-    // path does(`RealBuyerBackend::stop` blocks on opened=false). Then verify AmicableSplit. --
+    // ── the streamStop submits async; wait for the stop to APPLY (opened→false), exactly as the buyer-STOP
+    //    path does (`RealBuyerBackend::stop` blocks on opened=false). Then verify AmicableSplit. ──
     let mut post = None;
     for _ in 0..30 {
         let st = recover_chain
@@ -2654,7 +2599,7 @@ async fn live_recover_stops_orphaned_open_deal() {
         Some(false),
         "recover is a clean STOP, not a dispute (no BurnBoth)"
     );
-    // AmicableSplit: post-probe-accept stop pays the seller for the delivered tick(finalizedOwed>0); a
+    // AmicableSplit: post-probe-accept stop pays the seller for the delivered tick (finalizedOwed>0); a
     // BurnBoth/ProbeBurn would not credit the seller. This is the directive's "AmicableSplit, zero BurnBoth".
     let owed: u128 = post["finalizedOwed"]
         .as_str()
@@ -2670,11 +2615,11 @@ async fn live_recover_stops_orphaned_open_deal() {
         "recover closed the deal (AmicableSplit: seller paid the accepted tick, buyer refunded the rest)"
     );
     println!(
-        "===: `dexdo recover` (stream_stop) STOPped the orphaned OPEN deal -- closed={} ===",
+        "=== #85 §8: `dexdo recover` (stream_stop) STOPped the orphaned OPEN deal — closed={} ===",
         snap.closed
     );
 
-    // -- destroy closes the STOPped TC(only succeeds when !_opened && !_disputed -> confirms a clean STOP). --
+    // ── destroy closes the STOPped TC (only succeeds when !_opened && !_disputed → confirms a clean STOP). ──
     recover_chain
         .destroy_token_contract(&tc, &seller_addr, &kp(s_sec))
         .await

@@ -15,7 +15,11 @@
 				{"name":"oracleCodeHash","type":"uint256"},
 				{"name":"oracleCodeDepth","type":"uint16"},
 				{"name":"oracleEventListCodeHash","type":"uint256"},
-				{"name":"oracleEventListCodeDepth","type":"uint16"}
+				{"name":"oracleEventListCodeDepth","type":"uint16"},
+				{"name":"tokenContractCodeHash","type":"uint256"},
+				{"name":"tokenContractCodeDepth","type":"uint16"},
+				{"name":"rootModelCodeHash","type":"uint256"},
+				{"name":"rootModelCodeDepth","type":"uint16"}
 			],
 			"outputs": [
 			]
@@ -31,7 +35,8 @@
 		{
 			"name": "streamLock",
 			"inputs": [
-				{"name":"deal","type":"address"}
+				{"name":"sellerPubkey","type":"uint256"},
+				{"name":"nonce","type":"uint64"}
 			],
 			"outputs": [
 			]
@@ -39,7 +44,8 @@
 		{
 			"name": "streamUnlock",
 			"inputs": [
-				{"name":"deal","type":"address"}
+				{"name":"sellerPubkey","type":"uint256"},
+				{"name":"nonce","type":"uint64"}
 			],
 			"outputs": [
 			]
@@ -47,7 +53,8 @@
 		{
 			"name": "streamDisputeLock",
 			"inputs": [
-				{"name":"deal","type":"address"}
+				{"name":"sellerPubkey","type":"uint256"},
+				{"name":"nonce","type":"uint64"}
 			],
 			"outputs": [
 			]
@@ -55,7 +62,8 @@
 		{
 			"name": "streamDisputeUnlock",
 			"inputs": [
-				{"name":"deal","type":"address"}
+				{"name":"sellerPubkey","type":"uint256"},
+				{"name":"nonce","type":"uint64"}
 			],
 			"outputs": [
 			]
@@ -124,10 +132,6 @@
 		{
 			"name": "postSellOffer",
 			"inputs": [
-				{"name":"modelHash","type":"uint256"},
-				{"name":"pricePerTick","type":"uint128"},
-				{"name":"maxTicks","type":"uint128"},
-				{"name":"tokenContract","type":"address"},
 				{"name":"flags","type":"uint8"},
 				{"name":"nonce","type":"uint64"}
 			],
@@ -155,6 +159,16 @@
 				{"name":"ticks","type":"uint128"},
 				{"name":"escrow","type":"uint128"},
 				{"name":"autoRenew","type":"bool"}
+			],
+			"outputs": [
+			]
+		},
+		{
+			"name": "claimInferenceForfeit",
+			"inputs": [
+				{"name":"modelHash","type":"uint256"},
+				{"name":"orderId","type":"uint128"},
+				{"name":"cycle","type":"uint8"}
 			],
 			"outputs": [
 			]
@@ -905,6 +919,10 @@
 		{"init":false,"name":"_oracleCodeDepth","type":"uint16"},
 		{"init":false,"name":"_oracleEventListCodeHash","type":"uint256"},
 		{"init":false,"name":"_oracleEventListCodeDepth","type":"uint16"},
+		{"init":false,"name":"_tokenContractCodeHash","type":"uint256"},
+		{"init":false,"name":"_tokenContractCodeDepth","type":"uint16"},
+		{"init":false,"name":"_rootModelCodeHash","type":"uint256"},
+		{"init":false,"name":"_rootModelCodeDepth","type":"uint16"},
 		{"init":false,"name":"_orderBookCode","type":"cell"},
 		{"init":false,"name":"_inferenceOrderBookCode","type":"cell"},
 		{"components":[{"name":"amount","type":"uint128[]"},{"name":"debtAmount","type":"uint128[]"},{"name":"couponsAmount","type":"uint128[]"},{"name":"candidateAmount","type":"uint128"},{"name":"candidateOutcome","type":"uint32"},{"name":"candidateBetType","type":"uint8"},{"name":"tokenType","type":"uint32"},{"name":"oracleListHash","type":"uint256"}],"init":false,"name":"_stakes","type":"map(uint256,tuple)"},

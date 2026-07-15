@@ -1,33 +1,34 @@
-//! Oracle/PMP prediction-market provisioning manifest: the dex-side artifact a `dexdo`
-//! oracle/PMP provisioning run produces -- the addresses + range-event parameters of a per-event
-//! prediction market(`OracleEventList` + range event + `PMP`) tied to an inference `InferenceOrderBook`.
-//! Pure data(no chain, no feature gate); the output/parsing contract for, consumed by tests and
+//! Oracle/PMP prediction-market provisioning manifest (issue #26): the dex-side artifact a `dexdo`
+//! oracle/PMP provisioning run produces — the addresses + range-event parameters of a per-event
+//! prediction market (`OracleEventList` + range event + `PMP`) tied to an inference `InferenceOrderBook`.
+//!
+//! Pure data (no chain, no feature gate); the output/parsing contract for #26, consumed by tests and
 //! later CLI flows without hand-editing. `validate()` mirrors the on-chain
-//! `OracleEventList.addRangeEvent` invariants (>=1 strictly-increasing bound; outcomes == bounds + 1;
+//! `OracleEventList.addRangeEvent` invariants (≥1 strictly-increasing bound; outcomes == bounds + 1;
 //! < 20 outcomes), so a bad range config is rejected offline before any deploy.
 
 use serde::{Deserialize, Serialize};
 
-/// `uint256::MAX`(2^256 - 1) as a 78-digit decimal string -- for an offline range check, no bigint dep.
+/// `uint256::MAX` (2^256 - 1) as a 78-digit decimal string — for an offline range check, no bigint dep.
 const UINT256_MAX_DEC: &str =
     "115792089237316195423570985008687907853269984665640564039457584007913129639935";
 
-/// Compare two non-negative decimal integer strings as numbers(no bigint dep): strip leading zeros, then
-/// a longer string is the larger number; equal lengths compare lexicographically(decimal digits ordered).
+/// Compare two non-negative decimal integer strings as numbers (no bigint dep): strip leading zeros, then
+/// a longer string is the larger number; equal lengths compare lexicographically (decimal digits ordered).
 fn cmp_uint_dec(a: &str, b: &str) -> std::cmp::Ordering {
     let a = a.trim_start_matches('0');
     let b = b.trim_start_matches('0');
     a.len().cmp(&b.len()).then_with(|| a.cmp(b))
 }
 
-/// `s` is a decimal `uint256`: non-empty, all ASCII digits, and `<= uint256::MAX`(the contract type).
+/// `s` is a decimal `uint256`: non-empty, all ASCII digits, and `<= uint256::MAX` (the contract type).
 fn is_uint256_dec(s: &str) -> bool {
     !s.is_empty()
         && s.bytes().all(|c| c.is_ascii_digit())
         && cmp_uint_dec(s, UINT256_MAX_DEC) != std::cmp::Ordering::Greater
 }
 
-/// `s` is a `uint256` hash in `0x`-hex: `0x` + 1..=64 hex nibbles(<= 256 bits).
+/// `s` is a `uint256` hash in `0x`-hex: `0x` + 1..=64 hex nibbles (≤ 256 bits).
 fn is_uint256_hex(s: &str) -> bool {
     let Some(hex) = s.strip_prefix("0x") else {
         return false;
@@ -35,43 +36,43 @@ fn is_uint256_hex(s: &str) -> bool {
     (1..=64).contains(&hex.len()) && hex.bytes().all(|c| c.is_ascii_hexdigit())
 }
 
-/// A provisioned dex prediction-market. `bounds` are the range-event boundaries (uint256
+/// A provisioned dex prediction-market (issue #26). `bounds` are the range-event boundaries (uint256
 /// prices, kept as decimal strings); `outcome_names` label the `bounds.len() + 1` ranges. Addresses are
-/// `workchain:hex`. No secrets -- public/derivable only.
+/// `workchain:hex`. No secrets — public/derivable only.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct OracleMarketManifest {
-    /// Network the market is deployed on(e.g. `shellnet`).
+    /// Network the market is deployed on (e.g. `shellnet`).
     pub network: String,
-    /// `RootOracle` address(the dex root that deploys oracles).
+    /// `RootOracle` address (the dex root that deploys oracles).
     pub root_oracle: String,
-    /// Per-owner `Oracle` address(deploys `OracleEventList`s).
+    /// Per-owner `Oracle` address (deploys `OracleEventList`s).
     pub oracle: String,
-    /// Per-oracle `OracleEventList` address(holds the range events).
+    /// Per-oracle `OracleEventList` address (holds the range events).
     pub oracle_event_list: String,
-    /// Hash of the PMP oracle list(`oracleListHash`).
+    /// Hash of the PMP oracle list (`oracleListHash`).
     pub oracle_list_hash: String,
-    /// Event identifier hash(`eventId`).
+    /// Event identifier hash (`eventId`).
     pub event_id: String,
     /// Human-readable event name.
     pub event_name: String,
-    /// Per-event `PMP`(prediction-market pool) address.
+    /// Per-event `PMP` (prediction-market pool) address.
     pub pmp: String,
     /// PMP token type.
     pub token_type: u32,
-    /// The inference `InferenceOrderBook` the range event resolves against(the price source).
+    /// The inference `InferenceOrderBook` the range event resolves against (the price source).
     pub inference_order_book: String,
-    /// The OB's model identity(`frame_model`), so the market's price source is unambiguous.
+    /// The OB's model identity (`frame_model`), so the market's price source is unambiguous.
     pub frame_model: String,
-    /// Resolution deadline(`deadline`, doubles as the PMP result-start).
+    /// Resolution deadline (`deadline`, doubles as the PMP result-start).
     pub deadline: u64,
-    /// Range-event boundaries(uint256 prices as decimal strings), strictly increasing.
+    /// Range-event boundaries (uint256 prices as decimal strings), strictly increasing.
     pub bounds: Vec<String>,
-    /// Outcome labels -- exactly `bounds.len() + 1`(one per range).
+    /// Outcome labels — exactly `bounds.len() + 1` (one per range).
     pub outcome_names: Vec<String>,
 }
 
 impl OracleMarketManifest {
-    /// Serialize to pretty JSON(the on-disk output format).
+    /// Serialize to pretty JSON (the on-disk output format).
     pub fn to_json(&self) -> Result<String, serde_json::Error> {
         serde_json::to_string_pretty(self)
     }
@@ -81,10 +82,10 @@ impl OracleMarketManifest {
         serde_json::from_str(s)
     }
 
-    /// Integrity check -- mirrors the on-chain `OracleEventList.addRangeEvent` requires so a
+    /// Integrity check (issue #26) — mirrors the on-chain `OracleEventList.addRangeEvent` requires so a
     /// bad range config is rejected offline, before a real-money deploy:
     /// - every address/identity field is non-empty;
-    /// - `bounds` has >=1 entry, each a valid `uint256` decimal price, strictly increasing;
+    /// - `bounds` has ≥1 entry, each a valid `uint256` decimal price, strictly increasing;
     /// - `outcome_names` has exactly `bounds.len() + 1` entries, and fewer than 20 total.
     pub fn validate(&self) -> Result<(), String> {
         for (field, val) in [
@@ -120,8 +121,8 @@ impl OracleMarketManifest {
         if n < 1 {
             return Err("bounds must have at least one boundary (>= 2 outcomes)".to_string());
         }
-        // `bounds` is the contract's `uint256[]` -- validate + compare as uint256(decimal), NOT u128, so a
-        // valid bound above u128::MAX is accepted and one above uint256::MAX is rejected(mirror the chain).
+        // `bounds` is the contract's `uint256[]` — validate + compare as uint256 (decimal), NOT u128, so a
+        // valid bound above u128::MAX is accepted and one above uint256::MAX is rejected (mirror the chain).
         let mut prev: Option<&str> = None;
         for (i, b) in self.bounds.iter().enumerate() {
             if !is_uint256_dec(b) {
@@ -183,7 +184,7 @@ mod tests {
         }
     }
 
-    /// Output/parsing contract: round-trips losslessly.
+    /// Output/parsing contract (issue #26): round-trips losslessly.
     #[test]
     fn oracle_manifest_roundtrips() {
         let m = sample();
@@ -194,7 +195,7 @@ mod tests {
         assert_eq!(OracleMarketManifest::from_json(&json).unwrap(), m);
     }
 
-    /// Privacy: no secret/seed/owner key may appear in the manifest.
+    /// Privacy (issue #26): no secret/seed/owner key may appear in the manifest.
     #[test]
     fn oracle_manifest_carries_no_secret_fields() {
         let j = sample().to_json().unwrap().to_lowercase();
@@ -203,8 +204,8 @@ mod tests {
         }
     }
 
-    /// Integrity: `validate()` accepts a consistent range config and rejects the bad cases
-    /// the contract's `addRangeEvent` rejects(non-increasing bounds, wrong outcome count, empty fields).
+    /// Integrity (issue #26): `validate()` accepts a consistent range config and rejects the bad cases
+    /// the contract's `addRangeEvent` rejects (non-increasing bounds, wrong outcome count, empty fields).
     #[test]
     fn oracle_manifest_validate_mirrors_contract() {
         assert!(sample().validate().is_ok());
@@ -249,8 +250,8 @@ mod tests {
         assert!(too_many.validate().unwrap_err().contains("too many"));
     }
 
-    /// Issue(review): `event_id`/`oracle_list_hash` are uint256 identifiers,
-    /// and `bounds` are uint256(NOT u128) -- a bound above u128::MAX is accepted, above uint256::MAX rejected.
+    /// Issue #26 (review): `event_id`/`oracle_list_hash` are uint256 identifiers,
+    /// and `bounds` are uint256 (NOT u128) — a bound above u128::MAX is accepted, above uint256::MAX rejected.
     #[test]
     fn oracle_manifest_validates_uint256_identifiers() {
         let mut decimal_ids = sample();
@@ -278,7 +279,7 @@ mod tests {
             .unwrap_err()
             .contains("oracle_list_hash"));
 
-        // bounds are uint256, not u128: a value above u128::MAX is ACCEPTED(when ordered).
+        // bounds are uint256, not u128: a value above u128::MAX is ACCEPTED (when ordered).
         let above_u128 = "340282366920938463463374607431768211456"; // u128::MAX + 1
         let mut big = sample();
         big.bounds = vec!["1".into(), above_u128.into()];
@@ -288,7 +289,7 @@ mod tests {
             "a bound above u128::MAX must be accepted"
         );
 
-        // non-increasing huge(uint256) values are rejected.
+        // non-increasing huge (uint256) values are rejected.
         let mut not_incr_big = sample();
         not_incr_big.bounds = vec![above_u128.into(), above_u128.into()];
         not_incr_big.outcome_names = vec!["a".into(), "b".into(), "c".into()];

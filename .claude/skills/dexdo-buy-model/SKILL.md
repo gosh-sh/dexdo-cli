@@ -162,6 +162,13 @@ Allowed values (the scaffold also lists these under `_legend.allowed`):
 
 Confirm with `dexdo policy show`.
 
+`policy.json` is the recovery control point. Manage it with `dexdo policy init`,
+`dexdo policy show`, and `dexdo policy edit`: it decides how no handover, malformed handover, a
+dead gateway, an empty or stalled stream, or suspected scam is handled. A stop closes the deal and
+honors finalized delivery, a dispute freezes both notes for arbitration, reclaim waits for the
+contract timeout and returns eligible escrow, and `next_seller` performs bounded failover within the
+configured seller and spend caps.
+
 ## Phase 7. Buy and bring up the local endpoint
 
 ```sh
@@ -231,18 +238,49 @@ It shows how much SHELL you paid (`finalized_owed`), the lifecycle `state=`
 `probe_accepted`), and what is locked (`buyer_locked`, <= 2 ticks -- the invariant). Stream responses
 also carry `usage` per request. Run these in a separate terminal while the buyer is up.
 
-## Phase 10. If something goes wrong
+## Phase 10. Anti-abuse and recovery
 
-If the buyer process is killed or crashes (not a clean Ctrl-C), or the seller misbehaves, recover
-from the note -- all take `--note-addr`/`--note-key` and either `--token-contract 0:<TC>` or
-`--market market.json`:
+`dexdo note withdraw` can refuse with `ERR_STREAM_LOCKED (405)` while a stream or dispute is live.
+It can also return `ERR_NOTE_BUSY (121)` when another note operation or stake state makes withdrawal
+unsafe. These gates are intentional, not a bug: the note lock prevents either side from reusing the
+same capital during a live deal or dispute, which makes wash trading, freeriding, and note hopping
+unprofitable (spec sections 4.3 and 4.4).
 
-- `dexdo recover ...` -- STOP an orphaned OPEN deal (e.g. the buyer process died) so it can be closed
-  without placing a new buy.
-- `dexdo reclaim ...` -- reclaim escrow on seller no-show after the timeout (a funded-but-never-opened
-  or abandoned OPEN deal).
-- `dexdo dispute ...` -- open an on-chain dispute on an OPEN deal for observed fraud/substitution; it
-  locks both notes until arbitration (stronger than `recover`, which still pays for delivered ticks).
+Use the recovery action that matches the failure:
+
+```text
++--------------------------------------+-------------------------------------+-------------------------------------------------------------+
+| Situation                            | Command                             | What it gives you                                           |
++--------------------------------------+-------------------------------------+-------------------------------------------------------------+
+| Buyer process died on an OPEN deal   | dexdo recover                       | Stops the orphan; finalized delivered ticks are still paid. |
+| Seller no-show or deal never opened  | dexdo reclaim                       | Returns eligible escrow after the contract timeout.         |
+| Fraud or model substitution observed | dexdo dispute                       | Locks both notes pending arbitration.                       |
+| Withdrawal fails with 405            | dexdo note stream-locks             | Lists locks, deal addresses, and the force-clear deadline.  |
+| Stale locks past the max-lock window | PrivateNote.forceClearStreamLocks() | Owner backstop clears stale locks after the deadline.       |
++--------------------------------------+-------------------------------------+-------------------------------------------------------------+
+```
+
+The three buyer deal commands take `--note-addr` and `--note-key`, plus either
+`--token-contract 0:<TC>` or `--market market.json`. For example:
+
+```sh
+dexdo recover --note-addr "$NOTE_ADDR" --note-key note.secret.hex \
+  --token-contract 0:<TOKEN-CONTRACT> --contracts contracts/deployed.shellnet.json
+```
+
+Replace `recover` with `reclaim` or `dispute` for those situations. Inspect a blocked withdrawal
+without signing anything:
+
+```sh
+dexdo note stream-locks --note-addr "$NOTE_ADDR" \
+  --contracts contracts/deployed.shellnet.json
+```
+
+First bring every listed deal to a clean end: stop or settle it, resolve its dispute, or let the
+stream/dispute timeout expire. Once no stream or dispute lock remains, `dexdo note withdraw` passes
+the lock gate. After the reported max-lock deadline, `PrivateNote.forceClearStreamLocks()` is the
+owner-only backstop for stale locks. The current CLI reports that deadline but does not expose the
+force-clear call as a subcommand or flag; it must be submitted with an owner-signing contract tool.
 
 ## Wrap-up
 

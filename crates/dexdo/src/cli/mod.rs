@@ -1,4 +1,4 @@
-//! `dexdo` CLI surface, split out of `main.rs`(PR3, move-only / behavior-stable, `refactoring-plan.md`).
+//! `dexdo` CLI surface, split out of `main.rs` (PR3, move-only / behavior-stable, `refactoring-plan.md`).
 //! `main.rs` keeps parse + logging + shutdown signal + dispatch; the subcommand argument structs, helpers,
 //! and command handlers live here.
 

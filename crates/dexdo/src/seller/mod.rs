@@ -1,5 +1,5 @@
-//! Seller client: gateway + authorization + mock upstream + stream opening.
-//! Headless(R12): starts without a GUI and serves the stream as a daemon.
+//! Seller client (§10.3, §10.5): gateway + authorization + mock upstream + stream opening.
+//! Headless (R12): starts without a GUI and serves the stream as a daemon.
 
 pub mod advance;
 pub mod auth;
@@ -27,18 +27,20 @@ use tonic::transport::{Identity, Server, ServerTlsConfig};
 
 pub const DEFAULT_MATCH_POLL_INTERVAL: Duration = Duration::from_secs(30);
 const SELLER_MATCH_WATCH_CURSOR_VERSION: u32 = 1;
+const SELLER_OPEN_STATE_READ_ATTEMPTS: usize = 3;
+const SELLER_OPEN_STATE_INITIAL_BACKOFF: Duration = Duration::from_millis(100);
 
-/// Seller configuration for one stream.
+/// Seller configuration for one stream (minimum for Directive 1).
 pub struct SellerConfig {
-    /// Contract -- the deal's handover point.
+    /// Contract — the deal's handover point (§2.1).
     pub token_contract: TokenContract,
-    /// Tick price `P` in SHELL.
+    /// Tick price `P` in SHELL (§1).
     pub price_per_tick: u64,
     /// Maximum ticks in the offer.
     pub max_ticks: u64,
-    /// Public gateway host:port that will be encrypted to the buyer(R15).
+    /// Public gateway host:port that will be encrypted to the buyer (R15).
     pub gateway_advertise: String,
-    /// How many fake tokens to yield(mock model). `0` = a deliberate seller no-show.
+    /// How many fake tokens to yield (mock model). `0` = a deliberate seller no-show (§3.1.2).
     /// Real upstreams are limited by the buyer request's `max_tokens` and the market cap
     /// (`max_ticks * TICK_SIZE`), not by this debug fixture.
     pub mock_token_count: u64,
@@ -47,12 +49,12 @@ pub struct SellerConfig {
 /// A running seller gateway: state handle + handle to the server's background task.
 pub struct RunningSeller {
     pub state: Arc<GatewayState>,
-    /// The seller's note -- **polymorphic**: `LocalNote`(mock path) OR `RealNote` (real shellnet,
-    /// one SDK key for signing+handover). The gateway encrypts the endpoint `note.encrypt_to(buyer_pubkey)` -- on
-    /// the real path `buyer_pubkey` is reconstructed by the seller from on-chain ed25519(F1).
+    /// The seller's note — **polymorphic** (D10): `LocalNote` (mock path) OR `RealNote` (real shellnet,
+    /// one SDK key for signing+handover). The gateway encrypts the endpoint `note.encrypt_to(buyer_pubkey)` — on
+    /// the real path `buyer_pubkey` is reconstructed by the seller from on-chain ed25519 (F1).
     pub note: Arc<dyn Note>,
     pub server_task: tokio::task::JoinHandle<()>,
-    /// Fingerprint of the gateway's self-signed TLS certificate -- goes into the handover.
+    /// Fingerprint of the gateway's self-signed TLS certificate (§3.1.3) — goes into the handover.
     pub tls_fingerprint: String,
 }
 
@@ -146,7 +148,7 @@ fn now_unix() -> Result<u64> {
         .as_secs())
 }
 
-/// Bring up the seller's gRPC gateway(headless) **over TLS**: a self-signed certificate
+/// Bring up the seller's gRPC gateway (headless) **over TLS** (§3.1.3): a self-signed certificate
 /// is generated at startup, its fingerprint is returned for recording in the handover. Returns
 /// handles for orchestrating the stream.
 pub async fn start_gateway(addr: SocketAddr) -> Result<RunningSeller> {
@@ -154,17 +156,17 @@ pub async fn start_gateway(addr: SocketAddr) -> Result<RunningSeller> {
 }
 
 /// Like [`start_gateway`], but with an upstream choice (mock model or real OpenAI-compatible,
-/// ). The mock path(`UpstreamConfig::Mock`) is identical to.
+/// Directive 3). The mock path (`UpstreamConfig::Mock`) is identical to Directive 1.
 pub async fn start_gateway_with(
     addr: SocketAddr,
     upstream: UpstreamConfig,
 ) -> Result<RunningSeller> {
-    // The ephemeral note is a mock fixture; the production path is `start_gateway_with_note`.
+    // The ephemeral note is a mock fixture (Directive 7); the production path is `start_gateway_with_note`.
     start_gateway_with_note(addr, upstream, Arc::new(LocalNote::generate())).await
 }
 
-/// Like [`start_gateway_with`], but with a **loaded persistent** seller note:
-/// the identity(from `--note-key`/wallet) is reused across runs -- its offer/deals are
+/// Like [`start_gateway_with`], but with a **loaded persistent** seller note (Directive 7):
+/// the identity (from `--note-key`/wallet) is reused across runs — its offer/deals are
 /// visible in the next run. `start_gateway_with` substitutes an ephemeral `generate()` here.
 pub async fn start_gateway_with_note(
     addr: SocketAddr,
@@ -174,11 +176,11 @@ pub async fn start_gateway_with_note(
     let state = Arc::new(GatewayState::with_upstream(upstream));
     let service = GatewayService::new(state.clone()).into_server();
 
-    // Both rustls providers(ring/aws-lc-rs) are present in the tree; pin the process
-    // default explicitly(ring) -- otherwise rustls panics, unable to pick on its own. Idempotent.
+    // Both rustls providers (ring/aws-lc-rs) are present in the tree; pin the process
+    // default explicitly (ring) — otherwise rustls panics, unable to pick on its own. Idempotent.
     tls::ensure_crypto_provider();
 
-    // the gateway's self-signed TLS certificate; trust comes from the encrypted handover.
+    // §3.1.3: the gateway's self-signed TLS certificate; trust comes from the encrypted handover.
     let gw_tls = GatewayTls::generate()?;
     let tls_fingerprint = gw_tls.fingerprint.clone();
     let identity = Identity::from_pem(gw_tls.cert_pem, gw_tls.key_pem);
@@ -202,7 +204,7 @@ pub async fn start_gateway_with_note(
     })
 }
 
-/// Post a sell offer from the note into the book. Done before the
+/// Post a sell offer from the note into the book (§10.3 step 2, §2.1). Done before the
 /// buyer places a buy order.
 pub async fn post_offer(
     seller: &RunningSeller,
@@ -228,11 +230,11 @@ pub async fn post_offer_with_note(
     Ok(())
 }
 
-/// Open the stream for a match:
-/// 1. reads the match(the buyer's pubkey is recorded in the contract);
-/// 2. encrypts the endpoint to the buyer's pubkey and `open_stream` (probe freeze +
-/// `SELLER_PROBE_COMMISSION` + writing the enc-endpoint into the endpoints file);
-/// 3. registers the buyer's pubkey and the fake-token budget in the gateway for authorization.
+/// Open the stream for a match (§10.3 step 3):
+///  1. reads the match (the buyer's pubkey is recorded in the contract);
+///  2. encrypts the endpoint to the buyer's pubkey and `open_stream` (probe freeze +
+///     `SELLER_PROBE_COMMISSION` + writing the enc-endpoint into the endpoints file);
+///  3. registers the buyer's pubkey and the fake-token budget in the gateway for authorization.
 pub async fn serve_match(
     seller: &RunningSeller,
     chain: &dyn ChainBackend,
@@ -242,9 +244,42 @@ pub async fn serve_match(
     provision_match(seller, chain, cfg, m).await
 }
 
-/// Provision access for a known match: register gateway authorization, then write the encrypted handover
-/// only if it is not already on-chain. The second branch lets a restarted gateway resume an already-opened
-/// deal by rebuilding in-memory auth without calling `open_stream` again.
+async fn read_opened_with_retry(
+    chain: &dyn ChainBackend,
+    token_contract: &TokenContract,
+) -> Result<bool> {
+    let mut last_failure = String::new();
+    for attempt in 1..=SELLER_OPEN_STATE_READ_ATTEMPTS {
+        match chain.deal_state(token_contract).await {
+            Ok(Some(state)) => return Ok(state.opened),
+            Ok(None) => {
+                last_failure = "getState returned no TokenContract state".to_string();
+            }
+            Err(error) => {
+                last_failure = format!("getState failed: {error}");
+            }
+        }
+        if attempt < SELLER_OPEN_STATE_READ_ATTEMPTS {
+            let delay = SELLER_OPEN_STATE_INITIAL_BACKOFF * attempt as u32;
+            tracing::warn!(
+                token_contract = %token_contract,
+                attempt,
+                max_attempts = SELLER_OPEN_STATE_READ_ATTEMPTS,
+                backoff_ms = delay.as_millis(),
+                failure = %last_failure,
+                "seller open decision state read failed; retrying"
+            );
+            tokio::time::sleep(delay).await;
+        }
+    }
+    bail!(
+        "TokenContract {token_contract} getState unreadable after {SELLER_OPEN_STATE_READ_ATTEMPTS} attempts; refusing to skip open_stream: {last_failure}"
+    )
+}
+
+/// Provision access for a known match: register gateway authorization, then open the stream only when the
+/// authoritative on-chain `getState.opened` flag is false. A restarted gateway always rebuilds in-memory auth,
+/// while an already-opened deal skips the duplicate chain write.
 pub async fn provision_match(
     seller: &RunningSeller,
     chain: &dyn ChainBackend,
@@ -258,8 +293,8 @@ pub async fn provision_match(
             cfg.token_contract
         );
     }
-    // the handover {gateway endpoint, TLS fingerprint} is encrypted to the buyer's pubkey.
-    // The endpoint points at the GATEWAY over TLS(R15); the buyer pins the fingerprint on connect.
+    // §3.1/§3.1.3: the handover {gateway endpoint, TLS fingerprint} is encrypted to the buyer's pubkey.
+    // The endpoint points at the GATEWAY over TLS (R15); the buyer pins the fingerprint on connect.
     let handover = Handover {
         endpoint: format!("https://{}", cfg.gateway_advertise),
         tls_fingerprint: seller.tls_fingerprint.clone(),
@@ -268,11 +303,11 @@ pub async fn provision_match(
         .note
         .encrypt_to(&m.buyer_pubkey, &handover.to_bytes());
 
-    // the gateway must authorize the matched buyer BEFORE that buyer can connect.
+    // §3.1.1: the gateway must authorize the matched buyer BEFORE that buyer can connect.
     // Register buyer+budget BEFORE writing the handover on-chain: the buyer learns the endpoint only
-    // after reading the on-chain ciphertext(written by `open_stream`), so register-before-open rules out a race. Otherwise on a
-    // real(slow) chain the buyer manages to knock in the window between open_stream and register_stream
-    // -> the gateway still has no pubkey -> `challenge-response failed`(the mock timing did not expose this).
+    // after reading the on-chain ciphertext (written by `open_stream`), so register-before-open rules out a race. Otherwise on a
+    // real (slow) chain the buyer manages to knock in the window between open_stream and register_stream
+    // → the gateway still has no pubkey → `challenge-response failed` (the mock timing did not expose this).
     seller.state.register_stream(
         &cfg.token_contract,
         m.buyer_pubkey,
@@ -280,14 +315,14 @@ pub async fn provision_match(
         cfg.max_ticks,
         DobParams::canonical().tick_size,
     );
-    if chain.read_handover(&cfg.token_contract).await?.is_none() {
+    if !read_opened_with_retry(chain, &cfg.token_contract).await? {
         chain
             .open_stream(&cfg.token_contract, enc, seller.note.as_ref())
             .await?;
     } else {
         tracing::info!(
             token_contract = %cfg.token_contract,
-            "seller gateway restored auth for existing handover; skipping duplicate open_stream"
+            "seller gateway restored auth for opened deal; skipping duplicate open_stream"
         );
     }
     Ok(())
@@ -337,7 +372,8 @@ pub async fn watch_and_serve_match(
 mod tests {
     use super::*;
     use dexdo_core::{
-        ChainError, LocalNote, NotePubkey, OfferListing, SellOffer, Settlement, StreamSnapshot,
+        ChainError, DealChainState, LocalNote, NotePubkey, OfferListing, SellOffer, Settlement,
+        StreamSnapshot,
     };
     use std::sync::atomic::{AtomicU64, Ordering};
     use std::sync::Mutex;
@@ -346,6 +382,9 @@ mod tests {
         matched: Option<Match>,
         handover: Mutex<Option<Vec<u8>>>,
         opens: AtomicU64,
+        opened: bool,
+        state_failures_remaining: AtomicU64,
+        state_reads: AtomicU64,
         expect_last_seen: Option<i64>,
         record_created_at: i64,
     }
@@ -360,19 +399,30 @@ mod tests {
                 matched,
                 handover: Mutex::new(None),
                 opens: AtomicU64::new(0),
+                opened: false,
+                state_failures_remaining: AtomicU64::new(0),
+                state_reads: AtomicU64::new(0),
                 expect_last_seen,
                 record_created_at,
             }
         }
 
-        fn with_handover(matched: Match) -> Self {
+        fn with_state(matched: Match, handover_present: bool, opened: bool) -> Self {
             Self {
                 matched: Some(matched),
-                handover: Mutex::new(Some(b"existing-handover".to_vec())),
+                handover: Mutex::new(handover_present.then(|| b"existing-handover".to_vec())),
                 opens: AtomicU64::new(0),
+                opened,
+                state_failures_remaining: AtomicU64::new(0),
+                state_reads: AtomicU64::new(0),
                 expect_last_seen: None,
                 record_created_at: 1,
             }
+        }
+
+        fn with_state_failures(mut self, failures: u64) -> Self {
+            self.state_failures_remaining = AtomicU64::new(failures);
+            self
         }
     }
 
@@ -435,6 +485,26 @@ mod tests {
 
         async fn seller_timeout(&self, _: &TokenContract) -> Result<Settlement, ChainError> {
             unimplemented!()
+        }
+
+        async fn deal_state(
+            &self,
+            _: &TokenContract,
+        ) -> Result<Option<DealChainState>, ChainError> {
+            self.state_reads.fetch_add(1, Ordering::Relaxed);
+            if self.state_failures_remaining.load(Ordering::Relaxed) > 0 {
+                self.state_failures_remaining
+                    .fetch_sub(1, Ordering::Relaxed);
+                return Err(ChainError::Chain("transient getState failure".to_string()));
+            }
+            Ok(Some(DealChainState {
+                funded: true,
+                opened: self.opened,
+                disputed: false,
+                probe_accepted: false,
+                funded_time: Some(1),
+                last_advance: 0,
+            }))
         }
 
         async fn snapshot(&self, _: &TokenContract) -> Option<StreamSnapshot> {
@@ -516,11 +586,32 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn existing_handover_restores_auth_without_duplicate_open_stream() {
+    async fn handover_present_and_opened_false_calls_open_stream() {
+        let seller = test_seller();
+        let cfg = test_cfg("tc-partial-open");
+        let buyer = LocalNote::generate();
+        let backend =
+            PollBackend::with_state(sample_match("tc-partial-open", buyer.pubkey()), true, false);
+
+        provision_match(
+            &seller,
+            &backend,
+            &cfg,
+            sample_match("tc-partial-open", buyer.pubkey()),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(backend.opens.load(Ordering::Relaxed), 1);
+    }
+
+    #[tokio::test]
+    async fn opened_true_skips_duplicate_open_stream_and_restores_auth() {
         let seller = test_seller();
         let cfg = test_cfg("tc-opened");
         let buyer = LocalNote::generate();
-        let backend = PollBackend::with_handover(sample_match("tc-opened", buyer.pubkey()));
+        let backend =
+            PollBackend::with_state(sample_match("tc-opened", buyer.pubkey()), true, true);
 
         provision_match(
             &seller,
@@ -546,6 +637,80 @@ mod tests {
             seller.state.auth.verify_response("tc-opened", nonce, &sig),
             "gateway auth was restored for the matched buyer"
         );
+    }
+
+    #[tokio::test]
+    async fn handover_absent_and_opened_false_calls_open_stream() {
+        let seller = test_seller();
+        let cfg = test_cfg("tc-fresh-open");
+        let buyer = LocalNote::generate();
+        let backend =
+            PollBackend::with_state(sample_match("tc-fresh-open", buyer.pubkey()), false, false);
+
+        provision_match(
+            &seller,
+            &backend,
+            &cfg,
+            sample_match("tc-fresh-open", buyer.pubkey()),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(backend.opens.load(Ordering::Relaxed), 1);
+    }
+
+    #[tokio::test]
+    async fn transient_get_state_failure_retries_then_opens() {
+        let seller = test_seller();
+        let cfg = test_cfg("tc-transient-state");
+        let buyer = LocalNote::generate();
+        let backend = PollBackend::with_state(
+            sample_match("tc-transient-state", buyer.pubkey()),
+            true,
+            false,
+        )
+        .with_state_failures(1);
+
+        provision_match(
+            &seller,
+            &backend,
+            &cfg,
+            sample_match("tc-transient-state", buyer.pubkey()),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(backend.state_reads.load(Ordering::Relaxed), 2);
+        assert_eq!(backend.opens.load(Ordering::Relaxed), 1);
+    }
+
+    #[tokio::test]
+    async fn unreadable_get_state_fails_loud_without_opening() {
+        let seller = test_seller();
+        let cfg = test_cfg("tc-unreadable-state");
+        let buyer = LocalNote::generate();
+        let backend = PollBackend::with_state(
+            sample_match("tc-unreadable-state", buyer.pubkey()),
+            true,
+            false,
+        )
+        .with_state_failures(SELLER_OPEN_STATE_READ_ATTEMPTS as u64);
+
+        let error = provision_match(
+            &seller,
+            &backend,
+            &cfg,
+            sample_match("tc-unreadable-state", buyer.pubkey()),
+        )
+        .await
+        .expect_err("unreadable getState must fail closed");
+
+        assert!(error
+            .to_string()
+            .contains("getState unreadable after 3 attempts"));
+        assert!(error.to_string().contains("refusing to skip open_stream"));
+        assert_eq!(backend.state_reads.load(Ordering::Relaxed), 3);
+        assert_eq!(backend.opens.load(Ordering::Relaxed), 0);
     }
 
     #[tokio::test]

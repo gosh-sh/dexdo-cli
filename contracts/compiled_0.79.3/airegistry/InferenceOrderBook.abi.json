@@ -24,10 +24,10 @@
 			"inputs": [
 				{"name":"pricePerTick","type":"uint128"},
 				{"name":"maxTicks","type":"uint128"},
-				{"name":"tokenContract","type":"address"},
 				{"name":"flags","type":"uint8"},
 				{"name":"sellerPubkey","type":"uint256"},
-				{"name":"nonce","type":"uint64"}
+				{"name":"nonce","type":"uint64"},
+				{"name":"ownerNote","type":"address"}
 			],
 			"outputs": [
 			]
@@ -317,14 +317,13 @@
 		{"components":[{"name":"note","type":"address"},{"name":"buyerPubkey","type":"uint256"},{"name":"tokenContract","type":"address"},{"name":"price","type":"uint256"},{"name":"amount","type":"uint128"},{"name":"initialAmount","type":"uint128"},{"name":"filledAccum","type":"uint128"},{"name":"escrow","type":"uint128"},{"name":"deadline","type":"uint64"},{"name":"ts","type":"uint64"},{"name":"flags","type":"uint8"},{"name":"isBuy","type":"bool"},{"name":"nextAtPrice","type":"uint128"},{"name":"prevAtPrice","type":"uint128"},{"name":"nextInOwner","type":"uint128"},{"name":"prevInOwner","type":"uint128"}],"init":false,"name":"_orders","type":"map(uint128,tuple)"},
 		{"init":false,"name":"_nextOrderId","type":"uint128"},
 		{"init":false,"name":"_orderCount","type":"uint128"},
-		{"init":false,"name":"_sellTcInUse","type":"map(address,bool)"},
 		{"init":false,"name":"_levels","type":"optional(cell)"},
 		{"init":false,"name":"_ownerHead","type":"map(address,uint128)"},
 		{"init":false,"name":"_ownerTail","type":"map(address,uint128)"},
 		{"init":false,"name":"_executedNotional","type":"uint128"},
 		{"init":false,"name":"_executedTicks","type":"uint128"},
 		{"init":false,"name":"_matchSeq","type":"uint64"},
-		{"components":[{"name":"entryType","type":"uint8"},{"name":"owner","type":"address"},{"name":"buyerPubkey","type":"uint256"},{"name":"isBuy","type":"bool"},{"name":"flags","type":"uint8"},{"name":"price","type":"uint256"},{"name":"amount","type":"uint128"},{"name":"escrow","type":"uint128"},{"name":"tokenContract","type":"address"},{"name":"deadline","type":"uint64"},{"name":"targetOrderId","type":"uint128"},{"name":"contOrderId","type":"uint128"},{"name":"contRemaining","type":"uint128"},{"name":"contLeftover","type":"uint128"}],"init":false,"name":"_queue","type":"map(uint8,tuple)"},
+		{"components":[{"name":"entryType","type":"uint8"},{"name":"owner","type":"address"},{"name":"buyerPubkey","type":"uint256"},{"name":"isBuy","type":"bool"},{"name":"flags","type":"uint8"},{"name":"price","type":"uint256"},{"name":"amount","type":"uint128"},{"name":"escrow","type":"uint128"},{"name":"tokenContract","type":"address"},{"name":"deadline","type":"uint64"},{"name":"targetOrderId","type":"uint128"},{"name":"contOrderId","type":"uint128"},{"name":"contRemaining","type":"uint128"},{"name":"contLeftover","type":"uint128"},{"name":"contScanOrder","type":"uint128"}],"init":false,"name":"_queue","type":"map(uint8,tuple)"},
 		{"init":false,"name":"_queueHead","type":"uint8"},
 		{"init":false,"name":"_queueTail","type":"uint8"},
 		{"init":false,"name":"_queueSize","type":"uint8"},

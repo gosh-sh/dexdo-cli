@@ -37,7 +37,7 @@ impl CanonStreamDriver {
         match self.upstream.next().await {
             Some(Ok(chunk)) => {
                 if let Verdict::Bail(reason) = self.verifier.verify(&chunk) {
-                    tracing::warn!(%reason, "verify: bail -- bailing off the stream (B10)");
+                    tracing::warn!(%reason, "verify: bail — bailing off the stream (B10)");
                     self.bailed = true;
                     CanonStreamNext::Bailed
                 } else {

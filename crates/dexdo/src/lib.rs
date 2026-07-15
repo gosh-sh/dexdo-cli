@@ -1,5 +1,5 @@
-//! `dexdo` -- a binary with `seller`/`buyer` subcommands(clap) and the shared library of their logic.
-//! Mock mode(`--mock-model`, `--mock-chain`) is a standard mode in production code.
+//! `dexdo` — a binary with `seller`/`buyer` subcommands (clap) and the shared library of their logic.
+//! Mock mode (`--mock-model`, `--mock-chain`) is a standard mode in production code (AGENTS.md §2).
 
 pub mod buyer;
 pub mod registry;

@@ -7,15 +7,15 @@ members = [
 ]
 
 [workspace.package]
-version = "0.0.9"
+version = "0.0.11"
 edition = "2021"
 license = "MIT"
 
 [workspace.dependencies]
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "time", "sync", "io-util", "signal"] }
 tonic = { version = "0.12", features = ["tls"] }
-# self-signed TLS certificate of the gateway + fingerprint in the handover, pinned by the buyer.
-# We reuse the rustls stack that tonic already pulls in(tokio-rustls/hyper-util), without a new TLS stack.
+# §3.1.3: self-signed TLS certificate of the gateway + fingerprint in the handover, pinned by the buyer.
+# We reuse the rustls stack that tonic already pulls in (tokio-rustls/hyper-util), without a new TLS stack.
 rcgen = "0.14"
 sha2 = "0.10"
 tokio-rustls = "0.26"
@@ -24,7 +24,7 @@ tower = "0.4"
 http = "1"
 prost = "0.13"
 tonic-build = "0.12"
-# D6: vendored protoc -- a fallback in build.rs when PROTOC is not set, so that building
+# D6: vendored protoc — a fallback in build.rs when PROTOC is not set, so that building
 # proto does not require a system protoc on Linux/macOS/Windows.
 protoc-bin-vendored = "3"
 clap = { version = "4", features = ["derive"] }
@@ -49,22 +49,47 @@ proptest = "1"
 async-trait = "0.1"
 futures = "0.3"
 tokio-stream = "0.1"
-# Local interface to the consumer: OpenAI/Anthropic-compatible HTTP.
-# axum 0.7 on the same hyper-1/tower stack that tonic already pulls in -- without a second HTTP stack.
+# Local interface to the consumer (§10.6/G, B19/B20): OpenAI/Anthropic-compatible HTTP.
+# axum 0.7 on the same hyper-1/tower stack that tonic already pulls in — without a second HTTP stack.
 axum = "0.7"
 async-stream = "0.3"
-# In-process HTTP client for the e2e consumer interface -- the same hyper-1 stack as tonic/axum.
+# In-process HTTP client for the e2e consumer interface — the same hyper-1 stack as tonic/axum.
 hyper = { version = "1", features = ["client", "http1"] }
 http-body-util = "0.1"
-# real OpenAI-compatible upstream(Groq), streaming SSE. rustls (not native
-# OpenSSL), without a blocking stack; SSE parsing -- manually on top of bytes_stream(without a second HTTP stack).
+# Directive 3: real OpenAI-compatible upstream (Groq), streaming SSE. rustls (not native
+# OpenSSL), without a blocking stack; SSE parsing — manually on top of bytes_stream (without a second HTTP stack).
 reqwest = { version = "0.12", default-features = false, features = ["json", "stream", "rustls-tls", "http2"] }
-# D6: platform config/data directories(Linux XDG / macOS App Support / Windows APPDATA)
-# for the default endpoints-file path -- without hardcoding cwd and without assuming a separator.
+# D6: platform config/data directories (Linux XDG / macOS App Support / Windows APPDATA)
+# for the default endpoints-file path — without hardcoding cwd and without assuming a separator.
 directories = "5"
-# regression tests compare the in-process derivation against the pinned TVM SDK default directly.
+# #204 regression tests compare the in-process derivation against the pinned TVM SDK default directly.
 tvm_client = { git = "https://github.com/tvmlabs/tvm-sdk.git", tag = "v3.0.3-rc.an" }
 
-# D6: the Windows blocker(tvm-sdk carried test files with ':' in the path, NTFS-invalid) is fixed UPSTREAM --
-# tvmlabs/tvm-sdk, tag `v3.0.3-rc.an`. The fork `Futurizt/tvm-sdk` is removed, `[patch]` is dropped: gosh-ackinacki
-# and the direct tvm pins point to clean upstream. Win/Linux/macOS build without workarounds.
+# D6: the Windows blocker (tvm-sdk carried test files with ':' in the path, NTFS-invalid) is fixed upstream.
+# Pin the entire tvmlabs source at v3.0.4-rc.an so direct dependencies and gosh-ackinacki's transitive
+# v3.0.3-rc.an dependencies resolve to one revision with ExtOutMsgInfoV2 action support.
+[patch."https://github.com/tvmlabs/tvm-sdk.git"]
+tvm_abi = { git = "https://github.com/Futurizt/tvm-sdk.git", rev = "88d50d3883c5bef619e29db8534002eb5e65eb4b" }
+tvm_block = { git = "https://github.com/Futurizt/tvm-sdk.git", rev = "88d50d3883c5bef619e29db8534002eb5e65eb4b" }
+tvm_block_json = { git = "https://github.com/Futurizt/tvm-sdk.git", rev = "88d50d3883c5bef619e29db8534002eb5e65eb4b" }
+tvm_client = { git = "https://github.com/Futurizt/tvm-sdk.git", rev = "88d50d3883c5bef619e29db8534002eb5e65eb4b" }
+tvm_client_processing = { git = "https://github.com/Futurizt/tvm-sdk.git", rev = "88d50d3883c5bef619e29db8534002eb5e65eb4b" }
+tvm_executor = { git = "https://github.com/Futurizt/tvm-sdk.git", rev = "88d50d3883c5bef619e29db8534002eb5e65eb4b" }
+tvm_sdk = { git = "https://github.com/Futurizt/tvm-sdk.git", rev = "88d50d3883c5bef619e29db8534002eb5e65eb4b" }
+tvm_struct = { git = "https://github.com/Futurizt/tvm-sdk.git", rev = "88d50d3883c5bef619e29db8534002eb5e65eb4b" }
+tvm_types = { git = "https://github.com/Futurizt/tvm-sdk.git", rev = "88d50d3883c5bef619e29db8534002eb5e65eb4b" }
+tvm_vm = { git = "https://github.com/Futurizt/tvm-sdk.git", rev = "88d50d3883c5bef619e29db8534002eb5e65eb4b" }
+
+# Cargo does not inherit patch tables from a git dependency's workspace root. Mirror the
+# v3.0.4 stable-Rust compatibility patches required by tvm_vm's Halo2 dependency graph.
+[patch.crates-io]
+halo2-base = { git = "https://github.com/gosh-sh/halo2-lib-zkevm-sha256-and-bls12-381", branch = "bump-halo2-lib-v0.4.1" }
+halo2-axiom = { git = "https://github.com/gosh-sh/halo2-axiom", branch = "main" }
+
+[patch."https://github.com/axiom-crypto/halo2-lib.git"]
+halo2-base = { git = "https://github.com/gosh-sh/halo2-lib-zkevm-sha256-and-bls12-381", branch = "bump-halo2-lib-v0.4.1" }
+halo2-ecc = { git = "https://github.com/gosh-sh/halo2-lib-zkevm-sha256-and-bls12-381", branch = "bump-halo2-lib-v0.4.1" }
+zkevm-hashes = { git = "https://github.com/gosh-sh/halo2-lib-zkevm-sha256-and-bls12-381", branch = "bump-halo2-lib-v0.4.1" }
+
+[patch."https://github.com/axiom-crypto/axiom-eth"]
+axiom-eth = { git = "https://github.com/gosh-sh/axiom-eth", rev = "1d61be00a63ec73b3f709d74eb9e6b09b754b911" }

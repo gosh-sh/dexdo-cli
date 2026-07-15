@@ -1,4 +1,5 @@
-//! Client-side ModelRegistry policy for issue.
+//! Client-side ModelRegistry policy for issue #209.
+//!
 //! The registry is an on-chain authority. This module keeps the local pieces
 //! reusable and testable: strict operator config, read-only registry facts, and
 //! role-neutral validation against dexdo's own model hash/book derivation.
@@ -827,7 +828,7 @@ mod tests {
         let address = default_registry_address(&contracts).unwrap();
         assert_eq!(
             address,
-            "0:19a88a103f949df6ce5532a91e935a04acd708872d4bd4e2e5e446d0d78140b9"
+            "0:0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d"
         );
     }
 

@@ -27,19 +27,19 @@ tokio-stream.workspace = true
 rand.workspace = true
 serde.workspace = true
 serde_json.workspace = true
-# TLS channel, fingerprint pinning.
+# §3.1.3: TLS channel, fingerprint pinning.
 rcgen.workspace = true
 sha2.workspace = true
 tokio-rustls.workspace = true
 hyper-util.workspace = true
 tower.workspace = true
 http.workspace = true
-# G, B19/B20: local OpenAI/Anthropic-compatible consumer HTTP endpoint.
+# §10.6/G, B19/B20: local OpenAI/Anthropic-compatible consumer HTTP endpoint.
 axum.workspace = true
 async-stream.workspace = true
-# real OpenAI-compatible upstream(Groq), streaming SSE.
+# Directive 3: real OpenAI-compatible upstream (Groq), streaming SSE.
 reqwest.workspace = true
-# D6: default platform path for the endpoints file(config/data dir).
+# D6: default platform path for the endpoints file (config/data dir).
 directories.workspace = true
 ed25519-dalek.workspace = true
 hex.workspace = true
@@ -51,14 +51,14 @@ zeroize.workspace = true
 tvm_client = { workspace = true, optional = true }
 
 [features]
-# real shellnet backend in the `dexdo` binary itself(per-role `RealSellerBackend`/`RealBuyerBackend`).
-# OFF by default -- the default(mock) build stays lightweight and cross-platform(D6); the real path
+# D10: real shellnet backend in the `dexdo` binary itself (per-role `RealSellerBackend`/`RealBuyerBackend`).
+# OFF by default — the default (mock) build stays lightweight and cross-platform (D6); the real path
 # (TVM SDK v3 via `dexdo-core/shellnet`) only under this feature.
 shellnet = ["dexdo-core/shellnet", "dep:tvm_client"]
-# (hard rule): the giver(test faucet) is test-only -- gated behind this NON-DEFAULT feature so the
+# D13 (hard rule): the giver (test faucet) is test-only — gated behind this NON-DEFAULT feature so the
 # production `dexdo` binary contains zero giver. Only the live `live_cli` harness enables it.
 test-giver = ["shellnet", "dexdo-core/test-giver"]
 
 [dev-dependencies]
-# invariant property tests for routing/frame.
+# Directive 5 / AGENTS.md §5: invariant property tests for routing/frame.
 proptest.workspace = true

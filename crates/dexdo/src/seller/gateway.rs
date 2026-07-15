@@ -1,4 +1,4 @@
-//! Seller gateway: accepting buyer connections, stream-session
+//! Seller gateway (§10.3, R1/R6/R15/R16): accepting buyer connections, stream-session
 //! authorization and incremental yielding of the canonical fake-token stream.
 
 use crate::seller::auth::{challenge_bytes, AuthRegistry};
@@ -16,18 +16,18 @@ use tokio::sync::mpsc;
 use tokio_stream::{wrappers::ReceiverStream, Stream};
 use tonic::{Request, Response, Status};
 
-/// How many fake tokens to yield per stream(mock model).
+/// How many fake tokens to yield per stream (mock model).
 #[derive(Clone, Copy)]
 pub struct TokenBudget(pub u64);
 
-/// Per-deal delivery tracking. `count` is the **cumulative** number of canonical tokens the gateway
-/// has delivered to the buyer across ALL of this deal's gRPC streams -- a deal/session serves many sequential
+/// Per-deal delivery tracking (#37/#89). `count` is the **cumulative** number of canonical tokens the gateway
+/// has delivered to the buyer across ALL of this deal's gRPC streams — a deal/session serves many sequential
 /// requests on one `token_contract`, so each stream's relay adds to the same counter. `done` means **no more
-/// tokens will ever arrive for this deal/session** -- it is owned by the buyer **session lifecycle**, NOT
+/// tokens will ever arrive for this deal/session** — it is owned by the buyer **session lifecycle** (#37), NOT
 /// by any single stream: one gRPC stream ending is NOT the session ending. The seller's `drive_advance` reads
-/// both(Acquire) so finalized ticks never exceed delivered tokens, and only stops waiting once the session is
-/// truly `done`(or the deal closes on-chain). A per-stream relay that set `done` would make the driver exit
-/// after the first request and under-finalize a sustained session -- so the relay only ever touches `count`.
+/// both (Acquire) so finalized ticks never exceed delivered tokens, and only stops waiting once the session is
+/// truly `done` (or the deal closes on-chain). A per-stream relay that set `done` would make the driver exit
+/// after the first request and under-finalize a sustained session — so the relay only ever touches `count`.
 #[derive(Clone, Default)]
 pub struct DealDelivery {
     pub count: Arc<AtomicU64>,
@@ -46,19 +46,19 @@ pub struct GatewayState {
     pub auth: AuthRegistry,
     /// Per-deal limits. An empty/zero mock entry = seller no-show in mock mode.
     limits: Mutex<HashMap<String, StreamLimits>>,
-    /// Per-deal delivered-token tracking, created on first access.
+    /// Per-deal delivered-token tracking (#37/#89), created on first access.
     delivered: Mutex<HashMap<String, DealDelivery>>,
-    /// Upstream choice(mock model vs the real adapter). Immutable for the gateway's lifetime.
+    /// Upstream choice (mock model vs the real adapter). Immutable for the gateway's lifetime.
     upstream: UpstreamConfig,
 }
 
 impl GatewayState {
-    /// Gateway with the mock model.
+    /// Gateway with the mock model (`--mock-model`, Directive 1).
     pub fn new() -> Self {
         Self::with_upstream(UpstreamConfig::Mock)
     }
 
-    /// Gateway with the chosen upstream.
+    /// Gateway with the chosen upstream (mock or real OpenAI-compatible, Directive 3).
     pub fn with_upstream(upstream: UpstreamConfig) -> Self {
         Self {
             auth: AuthRegistry::new(),
@@ -112,9 +112,9 @@ impl GatewayState {
             .unwrap_or(market_cap)
     }
 
-    /// The per-deal [`DealDelivery`] tracker(created on first access, shared across the deal's streams). Each
-    /// stream's relay adds delivered tokens to the cumulative `count`; `done` is NOT set here -- it means "no
-    /// more tokens will ever arrive for this deal/session" and is owned by the buyer session lifecycle,
+    /// The per-deal [`DealDelivery`] tracker (created on first access, shared across the deal's streams). Each
+    /// stream's relay adds delivered tokens to the cumulative `count`; `done` is NOT set here — it means "no
+    /// more tokens will ever arrive for this deal/session" and is owned by the buyer session lifecycle (#37),
     /// never by a single stream. The seller driver reads both to bound finalized ticks by delivered tokens.
     pub fn delivery(&self, token_contract: &str) -> DealDelivery {
         self.delivered
@@ -138,9 +138,9 @@ impl Default for GatewayState {
 }
 
 /// Relay one gRPC stream's upstream chunks to the buyer while adding delivered canonical tokens to the deal's
-/// CUMULATIVE `count`. Only successfully-sent `Ok` chunks count(`count`, Release). It is handed only the
-/// counter -- NOT the `DealDelivery` -- by design: a single stream ending is not the deal/session ending, so the
-/// relay must never set the deal-level `done`(the buyer session lifecycle owns that, see [`DealDelivery`]).
+/// CUMULATIVE `count` (#37). Only successfully-sent `Ok` chunks count (`count`, Release). It is handed only the
+/// counter — NOT the `DealDelivery` — by design: a single stream ending is not the deal/session ending, so the
+/// relay must never set the deal-level `done` (the buyer session lifecycle owns that, see [`DealDelivery`]).
 /// Multiple sequential streams on the same deal all add to the same `count`. Pairs with `drive_advance`'s
 /// Acquire reads, which translate delivered tokens to ticks.
 async fn relay_counting(
@@ -151,7 +151,7 @@ async fn relay_counting(
     while let Some(chunk) = up_rx.recv().await {
         let delivered_tokens = chunk.as_ref().ok().map(accounted_tokens);
         if tx.send(chunk).await.is_err() {
-            break; // buyer disconnected -- the chunk was not delivered
+            break; // buyer disconnected — the chunk was not delivered
         }
         if let Some(tokens) = delivered_tokens {
             count.fetch_add(tokens, Ordering::Release);
@@ -185,7 +185,7 @@ type ChunkStream = Pin<Box<dyn Stream<Item = Result<CanonChunk, Status>> + Send>
 
 #[tonic::async_trait]
 impl Gateway for GatewayService {
-    /// Authorization step 1: issue a nonce bound to the token_contract.
+    /// Authorization step 1 (§3.1.1): issue a nonce bound to the token_contract.
     async fn get_challenge(
         &self,
         request: Request<ChallengeRequest>,
@@ -202,8 +202,8 @@ impl Gateway for GatewayService {
 
     type OpenStreamStream = ChunkStream;
 
-    /// Step 2: verify the signature against the pubkey from the contract. Without a valid
-    /// signature the connection closes BEFORE forwarding. Otherwise -- an incremental stream(R6).
+    /// Step 2 (§3.1.1, R16): verify the signature against the pubkey from the contract. Without a valid
+    /// signature the connection closes BEFORE forwarding. Otherwise — an incremental stream (R6).
     async fn open_stream(
         &self,
         request: Request<StreamRequest>,
@@ -216,7 +216,7 @@ impl Gateway for GatewayService {
         sig.copy_from_slice(&req.signature);
         let signature = Signature(sig);
 
-        // Authorization BEFORE any forwarding: a scan/address leak without a key = rejection.
+        // Authorization BEFORE any forwarding (§3.1.1): a scan/address leak without a key = rejection.
         if !self
             .state
             .auth
@@ -224,7 +224,7 @@ impl Gateway for GatewayService {
         {
             return Err(Status::unauthenticated("challenge-response failed"));
         }
-        // (challenge_bytes is used both here and on the buyer's side -- the same domain.)
+        // (challenge_bytes is used both here and on the buyer's side — the same domain.)
         let _ = challenge_bytes(&req.token_contract, &req.nonce);
 
         let request = req.request;
@@ -235,17 +235,17 @@ impl Gateway for GatewayService {
         let count =
             self.state
                 .stream_token_limit(&req.token_contract, request.as_ref(), mock_upstream);
-        // R1: the upstream adapts the CANONICAL request(OpenAI shape) that arrived in the opening
+        // R1: the upstream adapts the CANONICAL request (OpenAI shape) that arrived in the opening
         // call alongside authorization. The mock model builds fake output from the prompt; the real
-        // OpenAI-compatible upstream(Groq) proxies the request and normalizes the SSE(R1/R5/R6).
+        // OpenAI-compatible upstream (Groq) proxies the request and normalizes the SSE (R1/R5/R6).
         let upstream = self.state.upstream.clone();
         // The per-deal delivery tracker is shared across all of this deal's streams (the gateway map returns
         // the same `DealDelivery`), so `count` accumulates over sequential requests. The relay is handed only
-        // the counter -- `done` stays owned by the buyer session lifecycle, never set per-stream.
+        // the counter — `done` stays owned by the buyer session lifecycle (#37), never set per-stream.
         let delivered = self.state.delivery(&req.token_contract).count;
-        // Incremental yielding(R6): without buffering. The upstream feeds an internal channel;
+        // Incremental yielding (R6): without buffering. The upstream feeds an internal channel;
         // `relay_counting` forwards each chunk to the buyer AND adds the delivered token count to the deal's
-        // cumulative count, so the seller's `drive_advance` can bill only real delivered ticks.
+        // cumulative count (#37/#89), so the seller's `drive_advance` can bill only real delivered ticks.
         let (up_tx, up_rx) = mpsc::channel::<Result<CanonChunk, Status>>(16);
         tokio::spawn(async move {
             upstream.run(count, request, up_tx).await;
@@ -294,9 +294,9 @@ mod tests {
         forwarded
     }
 
-    /// the relay adds only delivered(`Ok`, successfully-sent) chunks to the deal `count`, and forwards
-    /// every item(incl. errors) to the buyer -- but it MUST NOT mark the deal-level `done`: a single gRPC
-    /// stream ending is not the deal/session ending(the buyer session lifecycle owns `done`).
+    /// #37: the relay adds only delivered (`Ok`, successfully-sent) chunks to the deal `count`, and forwards
+    /// every item (incl. errors) to the buyer — but it MUST NOT mark the deal-level `done`: a single gRPC
+    /// stream ending is not the deal/session ending (the buyer session lifecycle owns `done`).
     #[tokio::test]
     async fn relay_counts_delivered_chunks_without_marking_deal_done() {
         let delivery = DealDelivery::default();
@@ -316,9 +316,9 @@ mod tests {
         );
     }
 
-    /// a deal/session serves MANY sequential streams on one `token_contract`. Fetching the
+    /// #37 (PR #49 review): a deal/session serves MANY sequential streams on one `token_contract`. Fetching the
     /// tracker by tc returns the SAME per-deal counter, so `count` accumulates across streams, and no stream may
-    /// prematurely mark the deal `done` -- otherwise the seller `drive_advance` would catch up to only the first
+    /// prematurely mark the deal `done` — otherwise the seller `drive_advance` would catch up to only the first
     /// request and exit, under-finalizing a sustained by-fact session.
     #[tokio::test]
     async fn two_sequential_streams_accumulate_count_and_never_mark_deal_done() {
@@ -336,7 +336,7 @@ mod tests {
             !d1.done.load(Ordering::Acquire),
             "deal not done after the first stream"
         );
-        // Second request's stream -- fetched by tc anew, as a fresh `open_stream` would: the same tracker,
+        // Second request's stream — fetched by tc anew, as a fresh `open_stream` would: the same tracker,
         // still usable, already carrying the first stream's count.
         let d2 = state.delivery(tc);
         assert_eq!(
@@ -357,7 +357,7 @@ mod tests {
         );
         assert!(
             !d2.done.load(Ordering::Acquire),
-            "still not done -- only the session lifecycle sets it"
+            "still not done — only the session lifecycle sets it"
         );
     }
 

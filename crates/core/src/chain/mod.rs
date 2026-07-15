@@ -1,7 +1,8 @@
-//! On-chain abstraction and the mock implementation for.
-//! brings up **only what e2e needs**: offer/match, `open_stream`
+//! On-chain abstraction (`ChainBackend`, §5) and the mock implementation for Directive 1.
+//!
+//! Directive 1 brings up **only what e2e needs**: offer/match, `open_stream`
 //! (freezing the probe tick + locking `SELLER_PROBE_COMMISSION` + writing the enc-endpoint to
-//! the endpoints file), `advance_tick`, `read_handover`, `stop`(incl. `BurnBoth` on the probe),
+//! the endpoints file), `advance_tick`, `read_handover`, `stop` (incl. `BurnBoth` on the probe),
 //! `seller_timeout`/settle. No networked on-chain.
 
 use crate::machine::Settlement;
@@ -15,36 +16,37 @@ pub use accounting::*;
 pub use mock::*;
 pub use types::*;
 
-/// On-chain abstraction. In -- `MockChainBackend`; in -- the shellnet adapter.
-/// Brings up the minimum for e2e: discovery/book/oracle and subscriptions are the horizon.
+/// On-chain abstraction. In Directive 1 — `MockChainBackend`; in Directive 2 — the shellnet adapter.
+///
+/// Brings up the minimum for e2e (AGENTS.md §1): discovery/book/oracle and subscriptions are the horizon.
 #[async_trait]
 pub trait ChainBackend: Send + Sync {
-    /// Book discovery: the list of current offers with their sellers. The buyer
-    /// filters/ranks against its frame(`buyer::routing::eligible_ranked`). Mock -- all offers;
-    /// real -- reading `InferenceOrderBook`.
+    /// Book discovery (Directive 5, B1): the list of current offers with their sellers. The buyer
+    /// filters/ranks against its frame (`buyer::routing::eligible_ranked`). Mock — all offers;
+    /// real — reading `InferenceOrderBook`.
     async fn discover_offers(&self) -> Result<Vec<OfferListing>, ChainError>;
-    /// The seller posts an offer from a note.
+    /// The seller posts an offer from a note (§2.1).
     async fn post_offer(&self, offer: SellOffer, note: &dyn Note) -> Result<(), ChainError>;
-    /// ensure THIS backend's note carries the current contract code before publishing an offer. The
-    /// seller daemon path(`run_seller -> post_offer`) does NOT go through `provision_market`'s note-current
-    /// gate, so a note orphaned by a contract redeploy(stale code_hash) would hit a raw `TVM_ERROR` from
-    /// `postSellOffer`. Default `Ok(())`(mock/buyer/deal backends are not gated); the real seller backend
+    /// #117: ensure THIS backend's note carries the current contract code before publishing an offer. The
+    /// seller daemon path (`run_seller → post_offer`) does NOT go through `provision_market`'s note-current
+    /// gate, so a note orphaned by a contract redeploy (stale code_hash) would hit a raw `TVM_ERROR` from
+    /// `postSellOffer`. Default `Ok(())` (mock/buyer/deal backends are not gated); the real seller backend
     /// overrides with the on-chain code_hash check, failing closed with an actionable "re-mint" message.
     async fn assert_note_current(&self) -> Result<(), ChainError> {
         Ok(())
     }
-    /// before any seller write that can reach `PrivateNote.postSellOffer`, ensure the note was not
+    /// #335: before any seller write that can reach `PrivateNote.postSellOffer`, ensure the note was not
     /// permanently withdrawn. A withdrawn note is final by contract semantics and `postSellOffer` would revert
     /// with `ERR_INVALID_STATE` 151; real shellnet overrides this with a read-only `getDetails().hasWithdrawn`
     /// preflight so the CLI can report a clear "use a fresh note" error before submitting.
     async fn assert_note_can_post_sell_offer(&self) -> Result<(), ChainError> {
         Ok(())
     }
-    /// ensure the per-deal `TokenContract` being advertised is FRESH(deployed but unused) before resting
-    /// an ask on it. A deterministic `(sellerPubkey, nonce)` TC is a single-use per-deal resource -- if a prior
-    /// deal already `opened`/`funded`/`disputed` it(or left residual deposit/prepaid/frozen/finalized), the
-    /// seller's pre-stream steps(`fundProbeCommission`/`open`) revert with a raw `TVM_ERROR` (`ERR_ALREADY_OPEN`
-    /// 321 and kin). Default `Ok(())`(mock/buyer/deal backends are not gated); the real seller backend overrides
+    /// #117: ensure the per-deal `TokenContract` being advertised is FRESH (deployed but unused) before resting
+    /// an ask on it. A deterministic `(sellerPubkey, nonce)` TC is a single-use per-deal resource — if a prior
+    /// deal already `opened`/`funded`/`disputed` it (or left residual deposit/prepaid/frozen/finalized), the
+    /// seller's pre-stream steps (`fundProbeCommission`/`open`) revert with a raw `TVM_ERROR` (`ERR_ALREADY_OPEN`
+    /// 321 and kin). Default `Ok(())` (mock/buyer/deal backends are not gated); the real seller backend overrides
     /// with the on-chain `getState` check, failing closed with an actionable "use a fresh nonce / recover+destroy".
     async fn assert_token_contract_fresh(
         &self,
@@ -52,22 +54,12 @@ pub trait ChainBackend: Send + Sync {
     ) -> Result<(), ChainError> {
         Ok(())
     }
-    /// after `post_offer`, confirm the accepted sell submit reached an IOB-acceptable outcome before
-    /// opening the gateway. A note-level `postSellOffer` can submit OK while no ask rests; that is valid only if
-    /// the same TC immediately matched/funded or the seller note has the matching fill event. Default `Ok(())`
-    /// for backends without a live IOB; the real seller backend accepts either this TC's resting ask or this TC's
-    /// immediate match evidence, otherwise it fails closed with IOB/TC/RootModel evidence.
-    async fn assert_offer_rested(&self, _token_contract: &TokenContract) -> Result<(), ChainError> {
-        Ok(())
-    }
-    /// before posting a sell offer, ensure the same `TokenContract` is not already represented by a
-    /// resting/active ask in the model book. Fill/cancel/cleanup removes the old order first; only then may the
-    /// seller repost. Default `Ok(())` for backends without a model order book.
-    async fn assert_no_active_sell_order(
+    /// After `post_offer`, confirm the seller-visible on-chain outcome. Backends without a live IOB return `None`.
+    async fn confirm_offer_outcome(
         &self,
         _token_contract: &TokenContract,
-    ) -> Result<(), ChainError> {
-        Ok(())
+    ) -> Result<Option<SellOfferOutcome>, ChainError> {
+        Ok(None)
     }
     /// Read the authoritative sell-offer terms for a real per-deal `TokenContract`. The real seller path uses
     /// this before posting an ask so CLI defaults/prompts cannot diverge from the already-deployed TC config.
@@ -78,16 +70,16 @@ pub trait ChainBackend: Send + Sync {
     ) -> Result<Option<(u64, u64)>, ChainError> {
         Ok(None)
     }
-    /// The buyer sends a buy order; the order book records its pubkey into `token_contract`.
+    /// The buyer sends a buy order; the order book records its pubkey into `token_contract` (§2.3).
     async fn place_buy(
         &self,
         token_contract: &TokenContract,
         note: &dyn Note,
     ) -> Result<(), ChainError>;
-    /// Model-only buy: place a limit buy by the backend's `model_hash` WITHOUT a pre-known per-deal
-    /// `TokenContract`, for the order the buyer CHOSE after seeing the book -- `ticks` at up to
-    /// `max_price_per_tick`, funded by `escrow`. `placeInferenceBuy` is model-book-wide, so the buyer
-    /// does not name a target -- it learns the matched TC afterwards from its OWN note's fill event
+    /// Model-only buy (B1/§2.3): place a limit buy by the backend's `model_hash` WITHOUT a pre-known per-deal
+    /// `TokenContract`, for the order the buyer CHOSE after seeing the book — `ticks` at up to
+    /// `max_price_per_tick`, funded by `escrow`. `placeInferenceBuy` is model-book-wide (#150), so the buyer
+    /// does not name a target — it learns the matched TC afterwards from its OWN note's fill event
     /// ([`Self::wait_matched_token_contract`]). Default: unsupported; the real shellnet buyer backend overrides it.
     async fn place_buy_by_model(
         &self,
@@ -100,7 +92,75 @@ pub trait ChainBackend: Send + Sync {
             "place_buy_by_model: model-only buy is only supported on the real shellnet buyer backend".into(),
         ))
     }
-    /// Read-only guard for automated model-only buyer selection. Real shellnet `placeInferenceBuy(modelHash,...)`
+    /// Stable identity of the model-scoped order book used for durable recovery.
+    fn model_buy_order_book_identity(&self) -> Option<String> {
+        None
+    }
+    /// Submit one model buy while exposing the exact signed-BOC identity and final fill cursor
+    /// immediately before the single money POST.
+    #[allow(clippy::too_many_arguments)]
+    async fn place_buy_by_model_with_submit_identity(
+        &self,
+        _note: &dyn Note,
+        _quoted_order: Option<&OrderBookOrder>,
+        _ticks: u128,
+        _max_price_per_tick: u128,
+        _escrow: u128,
+        _cursor: &mut MatchWatchCursor,
+        _before_post: &mut (dyn FnMut(String, MatchWatchCursor) -> Result<(), ChainError> + Send),
+    ) -> Result<(), ChainError> {
+        Err(ChainError::Chain(
+            "backend cannot expose an exact pre-POST submit identity; no BOC was sent".into(),
+        ))
+    }
+    /// Poll new buyer fills for an explicitly journaled order book.
+    async fn poll_matched_model_buys_for_order_book(
+        &self,
+        _order_book: &str,
+        _cursor: &mut MatchWatchCursor,
+    ) -> Result<Vec<MatchedFill>, ChainError> {
+        Err(ChainError::Chain(
+            "buyer fill polling for an explicit order book is not supported by this backend".into(),
+        ))
+    }
+    /// Poll owner-facing buyer fills with the buyer order id retained for subscription attribution.
+    async fn poll_attributed_model_buys_for_order_book(
+        &self,
+        _order_book: &str,
+        _cursor: &mut MatchWatchCursor,
+    ) -> Result<Vec<(u128, MatchedFill)>, ChainError> {
+        Err(ChainError::Chain(
+            "attributed buyer fill polling is not supported by this backend".to_string(),
+        ))
+    }
+    /// Accepted subscription placements at or above a pre-POST order-id floor.
+    #[allow(clippy::too_many_arguments)]
+    async fn subscription_placements_since(
+        &self,
+        _order_book: &str,
+        _buyer_note: &str,
+        _order_id_floor: u128,
+        _max_price_per_tick: u128,
+        _ticks: u128,
+        _cycle_budget: u128,
+        _auto_renew: bool,
+    ) -> Result<Vec<InferenceSubscriptionPlacement>, ChainError> {
+        Err(ChainError::Chain(
+            "subscription placement reconciliation is not supported by this backend".to_string(),
+        ))
+    }
+    /// Whether one order still rests as a BUY owned by this note.
+    async fn buyer_order_is_active_for_owner(
+        &self,
+        _order_book: &str,
+        _order_id: u128,
+        _buyer_note: &str,
+    ) -> Result<bool, ChainError> {
+        Err(ChainError::Chain(
+            "buyer order activity reconciliation is not supported by this backend".to_string(),
+        ))
+    }
+    /// Read-only guard for automated model-only buyer selection. Real shellnet `placeInferenceBuy(modelHash, ...)`
     /// cannot name an order id or `TokenContract`, so an executable quote is submit-safe only when the raw
     /// on-chain price/time matcher would reach the same ask. Default `Ok(())` keeps mock backends simple; the
     /// real buyer backend fails closed on stale raw heads before emitting a machine `quote_selected` event.
@@ -112,7 +172,7 @@ pub trait ChainBackend: Send + Sync {
         Ok(())
     }
     /// Read-only guard for explicit `--token-contract` buyer selection. A displayed quote is submit-safe only
-    /// if the model-wide `placeInferenceBuy(modelHash,...)` matcher would actually fund this TokenContract,
+    /// if the model-wide `placeInferenceBuy(modelHash, ...)` matcher would actually fund this TokenContract,
     /// and the selected TC is still unused. Default `Ok(())` keeps mock backends simple; real shellnet fails
     /// closed before the CLI emits `quote_selected` or sends escrow.
     async fn assert_explicit_buy_matches_executable_quote(
@@ -141,14 +201,14 @@ pub trait ChainBackend: Send + Sync {
         false
     }
     /// After a model-only buy, learn the matched per-deal `TokenContract` from THIS note's owner-facing
-    /// `InferenceFilledConfirmed` ext-out -- each side reads only its own note,
+    /// `InferenceFilledConfirmed` ext-out (§3.1, vendored 4.0.15 mirror) — each side reads only its own note,
     /// no shared-book index. `since_unix` drops a prior deal's fill on a reused note. Default: unsupported;
     /// the real shellnet buyer backend overrides it.
     async fn wait_matched_token_contract(
         &self,
         _since_unix: i64,
         _timeout: std::time::Duration,
-    ) -> Result<TokenContract, ChainError> {
+    ) -> Result<Option<MatchedFill>, ChainError> {
         Err(ChainError::Chain(
             "wait_matched_token_contract: only supported on the real shellnet buyer backend".into(),
         ))
@@ -165,7 +225,7 @@ pub trait ChainBackend: Send + Sync {
         )))
     }
     /// Non-blocking seller resume probe. Returns `Some(match)` only when the per-deal TC is already matched and
-    /// still openable by the seller(funded, no prior handover/stream state). This is intentionally separate
+    /// still openable by the seller (funded, no prior handover/stream state). This is intentionally separate
     /// from [`Self::read_match`], which may wait for a future match after the seller has posted an offer.
     async fn read_openable_match_now(
         &self,
@@ -185,7 +245,7 @@ pub trait ChainBackend: Send + Sync {
     }
     /// The seller waits for/reads the match on its own `token_contract`.
     async fn read_match(&self, token_contract: &TokenContract) -> Result<Match, ChainError>;
-    /// The seller opens a stream: freezes the probe tick, locks
+    /// The seller opens a stream (§3.1, §3.1.2): freezes the probe tick, locks
     /// `SELLER_PROBE_COMMISSION`, writes `encrypt_to(buyer_pubkey, endpoint)` to the endpoints file.
     async fn open_stream(
         &self,
@@ -193,29 +253,29 @@ pub trait ChainBackend: Send + Sync {
         enc_endpoint: Vec<u8>,
         note: &dyn Note,
     ) -> Result<(), ChainError>;
-    /// The buyer reads the endpoint ciphertext from the endpoints file.
+    /// The buyer reads the endpoint ciphertext from the endpoints file (the same seam in Directive 2, §3.1).
     async fn read_handover(
         &self,
         token_contract: &TokenContract,
     ) -> Result<Option<Vec<u8>>, ChainError>;
-    /// The seller advances a tick on cadence.
+    /// The seller advances a tick on cadence (optimistic claim, §3.3).
     async fn advance_tick(
         &self,
         token_contract: &TokenContract,
         note: &dyn Note,
     ) -> Result<(), ChainError>;
-    /// Acceptance of the probe tick: `Probe` -> `Streaming`.
+    /// Acceptance of the probe tick (silence through `SETTLE_WINDOW`, §3.1.2): `Probe` → `Streaming`.
     async fn accept_probe(&self, token_contract: &TokenContract) -> Result<(), ChainError>;
-    /// Buyer STOP; on the probe -> `BurnBoth`.
+    /// Buyer STOP (§4.1); on the probe → `BurnBoth` (§3.1.2).
     async fn stop(
         &self,
         token_contract: &TokenContract,
         note: &dyn Note,
     ) -> Result<Settlement, ChainError>;
-    /// The buyer opens a dispute on the stream: the seller's note
-    /// is locked (`streamDispute(tc)`->`TC.dispute()`) -- new offers/withdrawals are rejected with
+    /// The buyer opens a dispute on the stream (Directive 5, anti-scam, §3.1.2/§4.2): the seller's note
+    /// is locked (`streamDispute(tc)`→`TC.dispute()`) — new offers/withdrawals are rejected with
     /// `ERR_STREAM_LOCKED`, until arbitration resolves the dispute. Default implementation: STOP (lower
-    /// bound -- scam revenue=0); backends with disputes(mock/shellnet) override it to actually lock the scammer's note.
+    /// bound — scam revenue=0); backends with disputes (mock/shellnet) override it to actually lock the scammer's note.
     async fn dispute(
         &self,
         token_contract: &TokenContract,
@@ -223,9 +283,9 @@ pub trait ChainBackend: Send + Sync {
     ) -> Result<Settlement, ChainError> {
         self.stop(token_contract, note).await
     }
-    /// The seller **concedes the dispute**: `releaseDispute()` -> unlocks the notes and
-    /// **returns the frozen tick to the buyer**(on the probe -- without burn). Default: not supported (backends
-    /// with disputes -- mock/shellnet -- override it). Symmetric to `dispute`.
+    /// The seller **concedes the dispute** (Directive 5, §4.2): `releaseDispute()` → unlocks the notes and
+    /// **returns the frozen tick to the buyer** (on the probe — without burn). Default: not supported (backends
+    /// with disputes — mock/shellnet — override it). Symmetric to `dispute`.
     async fn release_dispute(
         &self,
         token_contract: &TokenContract,
@@ -234,13 +294,13 @@ pub trait ChainBackend: Send + Sync {
             "release_dispute not supported for {token_contract}"
         )))
     }
-    /// The seller is gone: no-show/inactivity timeout -> refund to the buyer, without burn.
+    /// The seller is gone: no-show/inactivity timeout → refund to the buyer, without burn (§3.1.2/§3.4).
     async fn seller_timeout(
         &self,
         token_contract: &TokenContract,
     ) -> Result<Settlement, ChainError>;
     /// The seller never opened a funded match: after MATCH_OPEN_TIMEOUT the buyer can clean up the unopened
-    /// deal(`streamCleanup` -> `TC.cleanupUnopened`) and recover escrow. Default unsupported; real buyer
+    /// deal (`streamCleanup` -> `TC.cleanupUnopened`) and recover escrow. Default unsupported; real buyer
     /// backends override it.
     async fn cleanup_unopened(
         &self,
@@ -259,13 +319,13 @@ pub trait ChainBackend: Send + Sync {
     ) -> Result<Option<DealChainState>, ChainError> {
         Ok(None)
     }
-    /// Snapshot of locks and burned SHELL for the contract -- for e2e checks.
+    /// Snapshot of locks and burned SHELL for the contract — for e2e checks.
     async fn snapshot(&self, token_contract: &TokenContract) -> Option<StreamSnapshot>;
 
-    /// Observability **from the note**: a snapshot of the note's state -- its own orders,
-    /// deals(role + anonymous counterparty + by-fact), exposure. **Read only** (the monitor moves
-    /// nothing). Default -- own offers from discovery (enumerating deals requires indexing on the
-    /// backend side, so the mock overrides it with a full scan). "From whom" = the note's pubkey.
+    /// Observability **from the note** (Directive 7, R11/R14): a snapshot of the note's state — its own orders,
+    /// deals (role + anonymous counterparty + by-fact), exposure. **Read only** (the monitor moves
+    /// nothing). Default — own offers from discovery (enumerating deals requires indexing on the
+    /// backend side, so the mock overrides it with a full scan). "From whom" = the note's pubkey (§2.2).
     async fn note_snapshot(&self, note: &NotePubkey) -> Result<NoteSnapshot, ChainError> {
         let note_id = note_id_hex(note);
         let offers: Vec<OfferListing> = self
@@ -282,8 +342,8 @@ pub trait ChainBackend: Send + Sync {
         })
     }
 
-    /// Per-deal stream-phase cadence (`getConfig().settleWindow`,, dynamic since 4.0.5) for the
-    /// seller-driven advance loop. Default zero(mock/fast paths + the buyer/deal backends); the real
+    /// Per-deal stream-phase cadence (`getConfig().settleWindow`, §9.1, dynamic since 4.0.5) for the
+    /// seller-driven advance loop (#37). Default zero (mock/fast paths + the buyer/deal backends); the real
     /// **seller** backend overrides it to read the deal's on-chain `getConfig`.
     async fn deal_settle_window(
         &self,
@@ -293,8 +353,8 @@ pub trait ChainBackend: Send + Sync {
     }
 }
 
-/// Note identifier for the blacklist/lock: hex of the ed-pubkey. The same kind of id
-/// for the seller(`offer_sellers`) and the buyer(`Match.buyer_pubkey`), so both notes can be locked.
+/// Note identifier for the blacklist/lock (Directive 5): hex of the ed-pubkey. The same kind of id
+/// for the seller (`offer_sellers`) and the buyer (`Match.buyer_pubkey`), so both notes can be locked.
 pub(crate) fn note_id_hex(pk: &NotePubkey) -> String {
     pk.ed.iter().map(|b| format!("{b:02x}")).collect()
 }
@@ -305,34 +365,39 @@ mod tests {
     use crate::note::LocalNote;
     use crate::params::{DobParams, ProtocolConsts, Shell};
 
-    /// regression: after dropping the buyer-side shared-book scan, canonical-TC safety must remain at the
+    /// #100 regression: after dropping the buyer-side shared-book scan, canonical-TC safety must remain at the
     /// order-book entry point. The buyer cannot derive per-ask `(sellerPubkey, nonce)` from `getOrder`, so the
     /// on-chain `placeSellOffer` require is the source of truth.
     #[test]
     fn orderbook_source_enforces_canonical_sell_offer_tc() {
         let source = include_str!("../../../../contracts/airegistry/InferenceOrderBook.sol");
+        // 4.0.21: the TokenContract posts its own offer, so the book proves canonical-TC by requiring the
+        // caller IS the derived TC (`msg.sender == _tokenContractAddr(...)`) rather than a caller-supplied
+        // `tokenContract` argument. Same invariant (canonical-TC enforced at the order-book entry point).
         assert!(
             source.contains(
-                "require(tokenContract == _tokenContractAddr(sellerPubkey, nonce), ERR_BAD_TOKEN_CONTRACT);"
+                "require(msg.sender == _tokenContractAddr(sellerPubkey, nonce), ERR_BAD_TOKEN_CONTRACT);"
             ),
             "InferenceOrderBook.placeSellOffer must reject non-canonical token contracts before an ask can rest"
         );
     }
 
-    /// regression: the contract source must reserve one active/resting sell order per TokenContract and
-    /// clear that reservation when the old order leaves the book.
+    /// #208 regression: one active/resting sell order per TokenContract, with the reservation cleared when
+    /// the order leaves the book. In 4.0.21 the deal TokenContract posts its own offer, so this is enforced
+    /// TC-side (the IOB `_sellTcInUse` map was dropped): `placeSellOffer` refuses to re-register while an
+    /// offer is live (`_offerPosted`), and `onSellClosed` releases the reservation when the offer is off the book.
     #[test]
     fn orderbook_source_rejects_duplicate_active_sell_tc() {
-        let source = include_str!("../../../../contracts/airegistry/InferenceOrderBook.sol");
-        assert!(source.contains("mapping(address => bool) _sellTcInUse;"));
-        assert!(source.contains("if (!o.isBuy) { _sellTcInUse[o.tokenContract] = true; }"));
-        assert!(source.contains("if (!o.isBuy) { delete _sellTcInUse[o.tokenContract]; }"));
-        assert!(source.contains("if (!e.isBuy && _sellTcInUse.exists(e.tokenContract))"));
+        let source = include_str!("../../../../contracts/airegistry/TokenContract.sol");
+        // Reserve: cannot post a second offer while one is already live on the book.
+        assert!(source.contains("require(!_offerPosted, ERR_ALREADY_REGISTERED)"));
+        // Release: the reservation is cleared when the offer leaves the book.
+        assert!(source.contains("_offerPosted = false;"));
     }
 
-    /// regression: the buyer must not resurrect the old "every shared-book ask must equal my TC"
-    /// canonicality scan(it false-closed on unrelated valid sellers), but the real shellnet path now has a
-    /// narrower target preflight because `placeInferenceBuy(modelHash,...)` cannot name a TokenContract.
+    /// #100/#150 regression: the buyer must not resurrect the old "every shared-book ask must equal my TC"
+    /// canonicality scan (it false-closed on unrelated valid sellers), but the real shellnet path now has a
+    /// narrower target preflight because `placeInferenceBuy(modelHash, ...)` cannot name a TokenContract.
     #[test]
     fn buyer_path_has_targeted_preflight_without_old_canonical_guard() {
         let source = include_str!("../shellnet/backends.rs");
@@ -342,24 +407,24 @@ mod tests {
         assert!(source.contains("placeInferenceBuy cannot target a TokenContract"));
     }
 
-    /// Issue(track-1, negative): the book's deposit check charges 2.5 % ON TOP of the limit price, so
-    /// `escrow = maxPricePerTick x ticks`(without headroom) NEVER passes. The client must reject
+    /// Issue #20 (track-1, negative): the book's deposit check charges 2.5 % ON TOP of the limit price, so
+    /// `escrow = maxPricePerTick × ticks` (without headroom) NEVER passes. The client must reject
     /// such a configuration in advance, otherwise the SHELL will orphan in the book.
     #[test]
     fn deposit_headroom_rejects_insufficient_escrow() {
-        // Original numbers from: ticks=2, maxPrice=50M, escrow=100M. Requires 2x50Mx1.025 = 102.5M.
+        // Original numbers from #20: ticks=2, maxPrice=50M, escrow=100M. Requires 2×50M×1.025 = 102.5M.
         assert_eq!(required_escrow_for_buy(2, 50_000_000), 102_500_000);
         let err = check_buy_deposit_headroom(100_000_000, 2, 50_000_000).unwrap_err();
         assert!(err.contains("ERR_INSUFFICIENT_DEPOSIT"), "{err}");
-        // Any `escrow == maxPrice x ticks`(the old bug `maxPrice = escrow/ticks`) -- always falls short.
+        // Any `escrow == maxPrice × ticks` (the old bug `maxPrice = escrow/ticks`) — always falls short.
         assert!(check_buy_deposit_headroom(2_000_000, 2, 1_000_000).is_err());
-        // Exactly 1 SHELL below the minimum -- rejected(the boundary is strict, check `>=`).
+        // Exactly 1 SHELL below the minimum — rejected (the boundary is strict, check `>=`).
         let req = required_escrow_for_buy(2, 1_000_000);
         assert!(check_buy_deposit_headroom(req - 1, 2, 1_000_000).is_err());
     }
 
-    /// Issue +(positive/boundary): the escrow must equal EXACTLY `required`(fee-inclusive) --
-    /// under-funding orphans, over-funding strands on a maker fill. Exactly-required passes.
+    /// Issue #20 + #116 (positive/boundary): the escrow must equal EXACTLY `required` (fee-inclusive) —
+    /// under-funding orphans (#20), over-funding strands on a maker fill (#116). Exactly-required passes.
     #[test]
     fn deposit_headroom_accepts_exactly_required() {
         assert_eq!(required_escrow_for_buy(2, 1_000_000), 2_050_000);
@@ -370,17 +435,17 @@ mod tests {
         assert!(check_buy_deposit_headroom(r8, 8, 1_000_000).is_ok());
     }
 
-    /// Issue(over-funding rejected): the surplus `escrow - required` is debited but NOT refunded when
-    /// the buy rests and is filled as a maker(live-proven on 4.0.10) -- the client now fails-closed on it.
+    /// Issue #116 (over-funding rejected): the surplus `escrow − required` is debited but NOT refunded when
+    /// the buy rests and is filled as a maker (live-proven on 4.0.10) — the client now fails-closed on it.
     #[test]
     fn deposit_headroom_rejects_over_funding() {
         let req = required_escrow_for_buy(2, 1_000_000); // 2_050_000
         assert!(check_buy_deposit_headroom(req + 1, 2, 1_000_000).is_err());
-        // The exact case in: escrow=100M, 8 ticks x maxPrice 1M(required 8.2M) -> over-funded surplus.
+        // The exact case in #116: escrow=100M, 8 ticks × maxPrice 1M (required 8.2M) → over-funded surplus.
         assert_eq!(required_escrow_for_buy(8, 1_000_000), 8_200_000);
         let err = check_buy_deposit_headroom(100_000_000, 8, 1_000_000).unwrap_err();
-        assert!(err.contains(""), "{err}");
-        // The old over-funded control(110M, ticks=2, maxPrice=50M; required 102.5M) is now rejected.
+        assert!(err.contains("issue #116"), "{err}");
+        // The old over-funded control (110M, ticks=2, maxPrice=50M; required 102.5M) is now rejected.
         assert!(check_buy_deposit_headroom(110_000_000, 2, 50_000_000).is_err());
     }
 
@@ -399,7 +464,7 @@ mod tests {
         }
     }
 
-    /// quote consumes the book in price/time order and includes the 2.5% book fee in totals.
+    /// #157 §5: quote consumes the book in price/time order and includes the 2.5% book fee in totals.
     #[test]
     fn executable_quote_uses_price_time_depth_and_fee() {
         let q = executable_quote(
@@ -421,7 +486,7 @@ mod tests {
         );
     }
 
-    /// equivalent duplicate active asks for one TokenContract coalesce to one deterministic candidate.
+    /// #226: equivalent duplicate active asks for one TokenContract coalesce to one deterministic candidate.
     #[test]
     fn executable_quote_coalesces_equivalent_duplicate_active_tc_asks() {
         let mut later_dup = ask(2, "0:DUP", 900, 4);
@@ -444,7 +509,7 @@ mod tests {
         assert_eq!(q.total_with_fee, required_escrow_for_buy(4, 900));
     }
 
-    /// negative: duplicate active asks with conflicting terms/state remain ambiguous and fail closed.
+    /// #226 negative: duplicate active asks with conflicting terms/state remain ambiguous and fail closed.
     #[test]
     fn executable_quote_rejects_conflicting_duplicate_active_tc_asks() {
         let err = executable_quote(
@@ -461,7 +526,7 @@ mod tests {
         );
     }
 
-    /// negative: a fill event is not enough. The matched TC must read funded=true before the buyer
+    /// #208 negative: a fill event is not enough. The matched TC must read funded=true before the buyer
     /// waits for handover.
     #[test]
     fn reported_match_with_unfunded_tc_fails_before_handover() {
@@ -483,7 +548,7 @@ mod tests {
         assert!(err.contains("refusing to wait for handover"), "{err}");
     }
 
-    /// funded-but-never-opened is recognized as cleanup-eligible only after MATCH_OPEN_TIMEOUT.
+    /// #208: funded-but-never-opened is recognized as cleanup-eligible only after MATCH_OPEN_TIMEOUT.
     #[test]
     fn funded_never_opened_cleanup_readiness_is_timeout_gated() {
         let early = check_matched_token_contract_state(
@@ -535,7 +600,7 @@ mod tests {
         );
     }
 
-    /// negative: insufficient depth returns an incomplete quote instead of inventing liquidity.
+    /// #157 negative: insufficient depth returns an incomplete quote instead of inventing liquidity.
     #[test]
     fn executable_quote_reports_incomplete_depth() {
         let q = executable_quote(&[ask(1, "0:one", 1000, 2)], Some(3), None).unwrap();
@@ -543,7 +608,7 @@ mod tests {
         assert_eq!(q.filled_ticks, 2);
     }
 
-    /// budget mode: the executable tick count is bounded by fee-inclusive unit cost.
+    /// #157 budget mode: the executable tick count is bounded by fee-inclusive unit cost.
     #[test]
     fn executable_quote_budget_mode_respects_fee_inclusive_budget() {
         let q = executable_quote(&[ask(1, "0:one", 1000, 10)], None, Some(3075)).unwrap();
@@ -619,24 +684,25 @@ mod tests {
         assert_eq!(q.total_with_fee, required_escrow_for_buy(4, 1000));
     }
 
-    /// Issue(track-1, fail-closed): absurdly large `ticks`/`maxPricePerTick` must NOT panic
-    /// (debug) and must NOT wrap(release) -- `required` saturates to `u128::MAX`, and the guard rejects.
-    /// On the old code(`p * FEE_BPS` without `saturating_mul`) this test would have panicked on overflow.
+    /// Issue #20 (track-1, fail-closed): absurdly large `ticks`/`maxPricePerTick` must NOT panic
+    /// (debug) and must NOT wrap (release) — `required` saturates to `u128::MAX`, and the guard rejects.
+    /// On the old code (`p * FEE_BPS` without `saturating_mul`) this test would have panicked on overflow.
     #[test]
     fn deposit_headroom_fails_closed_on_overflow() {
-        // Overflowing inputs saturate(the wrapper) instead of panicking/wrapping.
+        // Overflowing inputs saturate (the wrapper) instead of panicking/wrapping.
         assert_eq!(required_escrow_for_buy(u128::MAX, u128::MAX), u128::MAX);
-        assert_eq!(required_escrow_for_buy(1, u128::MAX), u128::MAX); // checked pxFEE_BPS overflows -> saturates
-                                                                      // Any real escrow < the saturated minimum -> reject(fail-closed, without a panic).
+        assert_eq!(required_escrow_for_buy(1, u128::MAX), u128::MAX); // checked p×FEE_BPS overflows → saturates
+                                                                      // Any real escrow < the saturated minimum → reject (fail-closed, without a panic).
         assert!(check_buy_deposit_headroom(u128::MAX - 1, u128::MAX, u128::MAX).is_err());
-        // review: a SATURATED `required` must reject even when `escrow == required == u128::MAX`
+        // #116 review: a SATURATED `required` must reject even when `escrow == required == u128::MAX`
         // (the exact-equality upper bound alone would otherwise let this absurd config slip through).
         assert!(check_buy_deposit_headroom(u128::MAX, u128::MAX, u128::MAX).is_err());
         assert!(check_buy_deposit_headroom(1_000_000_000, u128::MAX, 1_000_000).is_err());
         assert!(check_buy_deposit_headroom(0, 1, u128::MAX).is_err());
-        // (`/ 10000`) back BELOW u128::MAX -- a truncated value a final `required == u128::MAX` check alone
-        // would miss, accepting `escrow == required`(the garbage). The guard now rejects ANY arithmetic
-        // overflow via the checked helper. p = u128::MAX/100 -> px250 overflows in the fee product.
+        // #118 re-review: the INTERMEDIATE `p × FEE_BPS` fee product can overflow and then be divided
+        // (`/ 10000`) back BELOW u128::MAX — a truncated value a final `required == u128::MAX` check alone
+        // would miss, accepting `escrow == required` (the garbage). The guard now rejects ANY arithmetic
+        // overflow via the checked helper. p = u128::MAX/100 → p×250 overflows in the fee product.
         let p_fee_overflow = u128::MAX / 100;
         assert!(check_buy_deposit_headroom(
             required_escrow_for_buy(1, p_fee_overflow),
@@ -645,14 +711,14 @@ mod tests {
         )
         .is_err());
         assert!(check_buy_deposit_headroom(0, 1, p_fee_overflow).is_err());
-        // A large but NON-overflowing value -- exact computation without saturation(= the contract's).
+        // A large but NON-overflowing value — exact computation without saturation (= the contract's).
         assert_eq!(
             required_escrow_for_buy(1, 1_000_000_000_000),
             1_025_000_000_000
         );
     }
 
-    /// regression: a shared book can hold a foreign seller's ask and the intended seller's ask at the
+    /// #100 regression: a shared book can hold a foreign seller's ask and the intended seller's ask at the
     /// same time; buying the intended TC must not fail closed merely because another valid seller has a
     /// different canonical TC.
     #[tokio::test]
@@ -707,7 +773,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(&base);
     }
 
-    /// duplicate active sell posts for the same TC fail, but once a fill consumes the old active ask,
+    /// #208: duplicate active sell posts for the same TC fail, but once a fill consumes the old active ask,
     /// a fresh post is allowed by the book-level guard.
     #[tokio::test]
     async fn mock_duplicate_sell_post_fails_until_fill_removes_old_order() {
@@ -748,8 +814,8 @@ mod tests {
         let _ = std::fs::remove_dir_all(&base);
     }
 
-    /// (R11): `note_snapshot` shows the note's offers, its deals and the **anonymous**
-    /// counterparty(the note's pubkey, not an identity); another note sees nothing.
+    /// Directive 7 (R11): `note_snapshot` shows the note's offers, its deals and the **anonymous**
+    /// counterparty (the note's pubkey, not an identity); another note sees nothing.
     #[tokio::test]
     async fn note_snapshot_shows_offers_deals_and_anon_counterparty() {
         let base = std::env::temp_dir().join(format!("dexdo-snap-{}", std::process::id()));
@@ -786,7 +852,7 @@ mod tests {
         assert_eq!(
             s.deals[0].counterparty.as_deref(),
             Some(note_id_hex(&buyer.pubkey()).as_str()),
-            "the seller's counterparty = the buyer's anonymous pubkey ()"
+            "the seller's counterparty = the buyer's anonymous pubkey (§2.2)"
         );
 
         let b = chain.note_snapshot(&buyer.pubkey()).await.unwrap();
@@ -796,7 +862,7 @@ mod tests {
         assert_eq!(
             b.deals[0].counterparty.as_deref(),
             Some(note_id_hex(&seller.pubkey()).as_str()),
-            "the buyer's counterparty = the seller's anonymous pubkey ()"
+            "the buyer's counterparty = the seller's anonymous pubkey (§2.2)"
         );
 
         let stranger = LocalNote::from_seed(&[9u8; 32]);
@@ -809,7 +875,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(&base);
     }
 
-    // ---- issue: per-model by-fact accounting breakdown(pure) ----
+    // ---- issue #23: per-model by-fact accounting breakdown (pure) ----
 
     fn snap(
         received: Shell,
@@ -820,7 +886,7 @@ mod tests {
         StreamSnapshot {
             seller_locked,
             buyer_locked,
-            buyer_lead: buyer_locked, // test helper: treat the lock as the at-risk lead(the two-tick tests)
+            buyer_lead: buyer_locked, // test helper: treat the lock as the at-risk lead (the two-tick tests)
             seller_received: received,
             buyer_refunded: 0,
             burned,
@@ -846,7 +912,7 @@ mod tests {
     }
 
     /// The seller view groups deals by served model, then by anonymous counterparty, summing the by-fact
-    /// figures; the per-model roll-up is the sum across its counterparties(tokens = `received / price`).
+    /// figures; the per-model roll-up is the sum across its counterparties (tokens = `received / price`).
     #[test]
     fn breakdown_groups_by_model_then_counterparty_with_rollup() {
         let deals = vec![
@@ -911,7 +977,7 @@ mod tests {
         assert_eq!(buyer[0].tokens, 4, "buyer's spent ticks = settled ticks");
     }
 
-    /// Finalized ticks = `received / price`. A zero price(a malformed/uninitialised deal) yields zero ticks
+    /// Finalized ticks = `received / price`. A zero price (a malformed/uninitialised deal) yields zero ticks
     /// rather than dividing by zero.
     #[test]
     fn breakdown_ticks_from_price_and_zero_price_guard() {
@@ -953,7 +1019,7 @@ mod tests {
         assert_eq!(b[0].tokens, 2);
     }
 
-    /// The view is per role: a seller-role query never includes buyer-role deals(and vice versa).
+    /// The view is per role: a seller-role query never includes buyer-role deals (and vice versa).
     #[test]
     fn breakdown_skips_the_other_role() {
         let deals = vec![
@@ -977,8 +1043,8 @@ mod tests {
         assert_eq!(seller[0].model, "s-model");
     }
 
-    /// Visibility of anomalies: a deal that locked SHELL but finalized nothing(`received=0`)
-    /// still appears -- non-zero `locked`, zero `tokens`/`money` -- so a lock-without-delivery is not hidden.
+    /// Visibility of anomalies (#18/#20): a deal that locked SHELL but finalized nothing (`received=0`)
+    /// still appears — non-zero `locked`, zero `tokens`/`money` — so a lock-without-delivery is not hidden.
     /// A deal with no stream snapshot at all also appears with all-zero figures.
     #[test]
     fn breakdown_shows_lock_without_delivery_and_no_snapshot() {
@@ -1001,7 +1067,7 @@ mod tests {
     }
 
     /// Multiple deals with the SAME model and SAME counterparty collapse into one counterparty tally that
-    /// sums them -- the per-counterparty roll-up the accounting view needs.
+    /// sums them — the per-counterparty roll-up the accounting view needs.
     #[test]
     fn breakdown_sums_repeated_counterparty() {
         let deals = vec![
@@ -1029,9 +1095,9 @@ mod tests {
         assert_eq!(c.burned, 30);
     }
 
-    // ---- issue: by-fact anomaly surfacing(pure) ----
+    // ---- issue #23: by-fact anomaly surfacing (pure) ----
 
-    /// An orphaned lock: SHELL frozen with NO matched counterparty -> `LockedNoMatch`.
+    /// An orphaned lock (#20): SHELL frozen with NO matched counterparty → `LockedNoMatch`.
     #[test]
     fn anomalies_flag_orphaned_lock_no_match() {
         let d = deal(
@@ -1047,7 +1113,7 @@ mod tests {
         );
     }
 
-    /// A lock that survived a STOP: the deal is closed but SHELL is still locked ->
+    /// A lock that survived a STOP (#18 mismatch): the deal is closed but SHELL is still locked →
     /// `LockedAfterClose`.
     #[test]
     fn anomalies_flag_lock_surviving_close() {
@@ -1060,13 +1126,13 @@ mod tests {
         );
     }
 
-    /// The two-tick invariant: the ceiling is `2 x _unit(price)` and `_unit` **includes the book
-    /// fee**(`p + pxFEE_BPS/10000`). A legitimate two-tick lock -- which the buyer escrows WITH the fee -- is
-    /// NOT an anomaly; the bug was a fee-less `2 x p` ceiling that false-flagged every real two-tick deal.
+    /// The two-tick invariant (§3.2 / #84): the ceiling is `2 × _unit(price)` and `_unit` **includes the book
+    /// fee** (`p + p×FEE_BPS/10000`). A legitimate two-tick lock — which the buyer escrows WITH the fee — is
+    /// NOT an anomaly; the bug was a fee-less `2 × p` ceiling that false-flagged every real two-tick deal.
     #[test]
     fn anomalies_flag_buyer_lock_over_two_ticks_fee_inclusive() {
-        // The repro: price 10000 -> by-fact 2-tick lock = 2 x(10000 + 10000x250/10000) = 2 x 10250 = 20500.
-        // The old fee-less ceiling(20000) false-flagged this legitimate lock; the fee-inclusive ceiling(20500)
+        // The #84 repro: price 10000 → by-fact 2-tick lock = 2 × (10000 + 10000×250/10000) = 2 × 10250 = 20500.
+        // The old fee-less ceiling (20000) false-flagged this legitimate lock; the fee-inclusive ceiling (20500)
         // does not.
         let legit = deal(
             DealRole::Buyer,
@@ -1079,7 +1145,7 @@ mod tests {
             deal_anomalies(&legit).is_empty(),
             "a legitimate two-tick lock (book fee included) is not an anomaly"
         );
-        // One SHELL above the fee-inclusive two-tick ceiling -> flagged(a real over-lock).
+        // One SHELL above the fee-inclusive two-tick ceiling → flagged (a real over-lock).
         let over = deal(
             DealRole::Buyer,
             Some("m"),
@@ -1096,10 +1162,10 @@ mod tests {
         );
     }
 
-    /// regression: the two-tick check bounds the at-risk LEAD(`prepaid + frozen`), NOT the total
-    /// `buyer_locked`(which carries the unspent deposit for the remaining ticks). A legitimate 8-tick deal
-    /// locks `8 x _unit(1000) = 8200` total but keeps its lead within 2 ticks -- it must NOT false-flag; only
-    /// an oversized lead does.
+    /// #126 regression: the two-tick check bounds the at-risk LEAD (`prepaid + frozen`), NOT the total
+    /// `buyer_locked` (which carries the unspent deposit for the remaining ticks). A legitimate 8-tick deal
+    /// locks `8 × _unit(1000) = 8200` total but keeps its lead within 2 ticks — it must NOT false-flag; only
+    /// an oversized lead does. (Before #126 the check compared the total 8200 against the 2050 ceiling.)
     #[test]
     fn two_tick_bounds_lead_not_total_lock() {
         let snap_lead = |buyer_locked: Shell, buyer_lead: Shell| StreamSnapshot {
@@ -1111,7 +1177,7 @@ mod tests {
             burned: 0,
             closed: false,
         };
-        // 8-tick total lock 8200, lead within the 2-tick ceiling(2050) -> NOT flagged.
+        // 8-tick total lock 8200, lead within the 2-tick ceiling (2050) → NOT flagged.
         let ok = deal(
             DealRole::Buyer,
             Some("m"),
@@ -1121,9 +1187,9 @@ mod tests {
         );
         assert!(
             deal_anomalies(&ok).is_empty(),
-            "an 8-tick total lock with a <=2-tick lead is not an anomaly ()"
+            "an 8-tick total lock with a ≤2-tick lead is not an anomaly (#126)"
         );
-        // Same total, but a lead one SHELL over the 2-tick ceiling -> flagged on the LEAD.
+        // Same total, but a lead one SHELL over the 2-tick ceiling → flagged on the LEAD.
         let bad = deal(
             DealRole::Buyer,
             Some("m"),
@@ -1155,7 +1221,7 @@ mod tests {
         assert!(deal_anomalies(&no_snap).is_empty());
     }
 
-    /// A zero price skips the two-tick check(no division/ceiling) rather than panicking or false-flagging.
+    /// A zero price skips the two-tick check (no division/ceiling) rather than panicking or false-flagging.
     #[test]
     fn anomalies_price_zero_skips_two_tick_check() {
         let d = deal(
@@ -1176,15 +1242,15 @@ mod tests {
 mod recover_tests {
     use super::check_recoverable;
 
-    /// an OPEN, undisputed deal whose recorded buyer matches the recover note -> recoverable.
+    /// #85 §5: an OPEN, undisputed deal whose recorded buyer matches the recover note → recoverable.
     #[test]
     fn recoverable_ok_on_open_owned() {
         let me = [7u8; 32];
         assert!(check_recoverable(true, false, Some("0:buyer"), "0:buyer", Some(&me), &me).is_ok());
     }
 
-    /// negatives -- each precondition fails closed with an actionable message, BEFORE any on-chain
-    /// STOP: not-OPEN, disputed, a foreign note(not the deal's buyer), and an unmatched deal(no buyer).
+    /// #85 §5 negatives — each precondition fails closed with an actionable message, BEFORE any on-chain
+    /// STOP: not-OPEN, disputed, a foreign note (not the deal's buyer), and an unmatched deal (no buyer).
     #[test]
     fn recoverable_fails_closed_on_each_precondition() {
         let me = [7u8; 32];
@@ -1229,7 +1295,7 @@ mod dispute_reclaim_tests {
         check_withdrawable_shell, MATCH_OPEN_TIMEOUT_SECS,
     };
 
-    /// -- `check_disputable`: an OPEN, undisputed deal owned by THIS buyer is disputable; each
+    /// #145 §5 — `check_disputable`: an OPEN, undisputed deal owned by THIS buyer is disputable; each
     /// precondition fails closed BEFORE any on-chain `streamDispute`.
     #[test]
     fn disputable_gates() {
@@ -1258,7 +1324,7 @@ mod dispute_reclaim_tests {
         );
     }
 
-    /// -- `check_reclaimable` is a fail-loud timer gate:
+    /// #145/#149 §5 (§10 Bug 2 matrix) — `check_reclaimable` is a fail-loud timer gate:
     /// opened+past-timeout -> ok; opened+too-early -> reject; funded-never-opened before
     /// MATCH_OPEN_TIMEOUT -> reject; funded-never-opened after MATCH_OPEN_TIMEOUT -> ok; not-funded /
     /// disputed / foreign-note / wrong-key / unmatched -> reject.
@@ -1266,7 +1332,7 @@ mod dispute_reclaim_tests {
     fn reclaimable_gates() {
         let me = [7u8; 32];
         let other = [9u8; 32];
-        // opened + past STREAM_TIMEOUT(now 1000 >= lastAdvance 100 + streamTimeout 600), owned -> ok
+        // opened + past STREAM_TIMEOUT (now 1000 >= lastAdvance 100 + streamTimeout 600), owned → ok
         assert!(check_reclaimable(
             true,
             true,
@@ -1282,7 +1348,7 @@ mod dispute_reclaim_tests {
             MATCH_OPEN_TIMEOUT_SECS
         )
         .is_ok());
-        // opened, before STREAM_TIMEOUT(now 500 < 700) -> reject
+        // opened, before STREAM_TIMEOUT (now 500 < 700) → reject
         assert!(check_reclaimable(
             true,
             true,
@@ -1316,7 +1382,7 @@ mod dispute_reclaim_tests {
         )
         .unwrap_err()
         .contains("MATCH_OPEN_TIMEOUT"));
-        // funded but never opened after MATCH_OPEN_TIMEOUT -> ok(streamCleanup path).
+        // funded but never opened after MATCH_OPEN_TIMEOUT -> ok (streamCleanup path).
         assert!(check_reclaimable(
             true,
             false,
@@ -1332,7 +1398,7 @@ mod dispute_reclaim_tests {
             MATCH_OPEN_TIMEOUT_SECS
         )
         .is_ok());
-        // not funded -> reject
+        // not funded → reject
         assert!(check_reclaimable(
             false,
             true,
@@ -1349,7 +1415,7 @@ mod dispute_reclaim_tests {
         )
         .unwrap_err()
         .contains("not funded"));
-        // disputed -> reject
+        // disputed → reject
         assert!(check_reclaimable(
             true,
             true,
@@ -1366,7 +1432,7 @@ mod dispute_reclaim_tests {
         )
         .unwrap_err()
         .contains("DISPUTED"));
-        // foreign note -> reject
+        // foreign note → reject
         assert!(check_reclaimable(
             true,
             true,
@@ -1383,7 +1449,7 @@ mod dispute_reclaim_tests {
         )
         .unwrap_err()
         .contains("not the deal's buyer note"));
-        // wrong key -> reject
+        // wrong key → reject
         assert!(check_reclaimable(
             true,
             true,
@@ -1400,7 +1466,7 @@ mod dispute_reclaim_tests {
         )
         .unwrap_err()
         .contains("not the deal's buyer key"));
-        // unmatched -> reject
+        // unmatched → reject
         assert!(check_reclaimable(
             true,
             true,
@@ -1419,7 +1485,7 @@ mod dispute_reclaim_tests {
         .contains("no recorded buyer note"));
     }
 
-    /// seller-side dispute/payout commands fail closed before on-chain submission where state/key checks
+    /// #160: seller-side dispute/payout commands fail closed before on-chain submission where state/key checks
     /// already prove the call would revert.
     #[test]
     fn seller_release_and_withdraw_gates() {

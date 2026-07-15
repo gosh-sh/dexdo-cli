@@ -13,43 +13,44 @@ tracing.workspace = true
 x25519-dalek.workspace = true
 ed25519-dalek.workspace = true
 chacha20poly1305.workspace = true
-# Handover: HKDF-SHA256 over the DH output -- a canonical ECIES-KDF instead of the raw
-# x25519 secret as the AEAD key(security review O1). `sha2` is already in the graph(ed25519-dalek).
+# Handover (§3.1.3): HKDF-SHA256 over the DH output — a canonical ECIES-KDF instead of the raw
+# x25519 secret as the AEAD key (security review O1). `sha2` is already in the graph (ed25519-dalek).
 sha2.workspace = true
 hkdf = "0.12"
 rand.workspace = true
 tokio = { workspace = true }
-# real shellnet backend on top of the gosh.ackinacki SDK. Optional behind the
-# `shellnet` feature -- mock mode(directives 1/3) builds by default without the heavy TVM dependency.
-# Cross-platform(D6): the previous Windows blocker (tvm-sdk carried a test file with ':' in its path,
-# which NTFS would not check out) is fixed upstream -- tvm-sdk, tag `v3.0.3-rc.an`. The pins point
-# at clean upstream(fork removed, `[patch]` deleted), Windows/Linux/macOS build without workarounds.
+# Directive 2: real shellnet backend on top of the gosh.ackinacki SDK. Optional behind the
+# `shellnet` feature — mock mode (directives 1/3) builds by default without the heavy TVM dependency.
+# Cross-platform (D6): the previous Windows blocker (tvm-sdk carried a test file with ':' in its path,
+# which NTFS would not check out) is fixed upstream — tvm-sdk#270, tag `v3.0.3-rc.an`. The pins point
+# at clean upstream (fork removed, `[patch]` deleted), Windows/Linux/macOS build without workarounds.
 anyhow = { workspace = true, optional = true }
-gosh-ackinacki = { git = "https://github.com/gosh-dot-ai/gosh.ackinacki", tag = "gosh-ackinacki-v0.4.0", default-features = false, features = ["private-note"], optional = true }
-# Extracting the code-cell from.tvc to deploy InferenceOrderBook (the same logic as the SDK's
-# `airegistry::abi::Contract::code_cell`). Same crate/tag that gosh.ackinacki pulls in --
-# already in the build graph(transitive), so this direct dep adds no compilation.
-tvm_block = { git = "https://github.com/tvmlabs/tvm-sdk.git", tag = "v3.0.3-rc.an", optional = true }
-tvm_types = { git = "https://github.com/tvmlabs/tvm-sdk.git", tag = "v3.0.3-rc.an", optional = true }
-# Decoding the note's ext-out event bodies: the buyer reads the matched
-# deal `tokenContract` from ITS OWN note's event -- no shared-book index. Same tvm-sdk git source/tag that
-# `gosh.ackinacki` already pulls in(transitive in the build graph) -- NOT a second SDK, so the single-SDK
-# invariant(`ci/check-single-sdk.sh`) holds.
-tvm_abi = { git = "https://github.com/tvmlabs/tvm-sdk.git", tag = "v3.0.3-rc.an", optional = true }
+gosh-ackinacki = { git = "https://github.com/gosh-dot-ai/gosh.ackinacki", tag = "gosh-ackinacki-v0.4.1", default-features = false, features = ["private-note"], optional = true }
+# Extracting the code-cell from .tvc to deploy InferenceOrderBook (the same logic as the SDK's
+# `airegistry::abi::Contract::code_cell`). The workspace patch unifies this direct dependency
+# with the version gosh.ackinacki pulls into the build graph transitively.
+tvm_block = { git = "https://github.com/tvmlabs/tvm-sdk.git", tag = "v3.0.4-rc.an", optional = true }
+tvm_types = { git = "https://github.com/tvmlabs/tvm-sdk.git", tag = "v3.0.4-rc.an", optional = true }
+# Decoding the note's ext-out event bodies (`InferenceFilledConfirmed`, §3.1): the buyer reads the matched
+# deal `tokenContract` from ITS OWN note's event - no shared-book index. The workspace patch unifies it
+# with the tvm-sdk source gosh.ackinacki pulls transitively, so the single-SDK
+# invariant (`ci/check-single-sdk.sh`) holds.
+tvm_abi = { git = "https://github.com/tvmlabs/tvm-sdk.git", tag = "v3.0.4-rc.an", optional = true }
 base64 = { version = "0.22", optional = true }
-# Browser User-Agent for writes(`/v2/messages` behind Cloudflare): ChainClient uses the
-# default reqwest UA(fine for getters), but submitting messages needs a browser UA -- the backend
-# keeps its own http client. reqwest is already in the graph(via gosh.ackinacki).
+# Browser User-Agent for writes (`/v2/messages` behind Cloudflare): ChainClient uses the
+# default reqwest UA (fine for getters), but submitting messages needs a browser UA — the backend
+# keeps its own http client. reqwest is already in the graph (via gosh.ackinacki).
 reqwest = { workspace = true, optional = true }
 
 [features]
-# Real on-chain(Acki Nacki testnet) behind the ChainBackend/Note trait. Disabled by
+# Real on-chain (Acki Nacki testnet) behind the ChainBackend/Note trait. Disabled by
 # default: the mock e2e stays green without TVM SDK v3.
 shellnet = ["dep:gosh-ackinacki", "dep:anyhow", "dep:tvm_block", "dep:tvm_types", "dep:tvm_abi", "dep:base64", "dep:reqwest"]
-# (hard rule): the giver(test faucet) lives ONLY behind this NON-DEFAULT feature, so production
-# builds(the `dexdo` binary + default/`shellnet` `dexdo-core`) contain zero giver -- deploy/gas come from
-# the operator wallet. Only the live test harness enables it. Implies `shellnet`(the giver is on-chain).
+# D13 (hard rule): the giver (test faucet) lives ONLY behind this NON-DEFAULT feature, so production
+# builds (the `dexdo` binary + default/`shellnet` `dexdo-core`) contain zero giver — deploy/gas come from
+# the operator wallet. Only the live test harness enables it. Implies `shellnet` (the giver is on-chain).
 test-giver = ["shellnet"]
 
 [dev-dependencies]
 proptest.workspace = true
+http.workspace = true

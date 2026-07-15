@@ -1,7 +1,7 @@
-//! `dexdo note deploy`: deploy a wallet-funded `PrivateNote` on shellnet in-process through
+//! `dexdo note deploy` (#176): deploy a wallet-funded `PrivateNote` on shellnet in-process through
 //! `gosh.ackinacki`, then fold the CLI-compatible result into a `DEXDO_PN_POOL` pool the `seller`/`buyer`
 //! already consume. The chain call lives in `commands.rs::run_note_deploy`; the pure schema adapters
-//! live here.
+//! (offline §5) live here.
 
 use anyhow::{anyhow, bail, Result};
 use ed25519_dalek::SigningKey;
@@ -10,10 +10,12 @@ use serde_json::{json, Value};
 use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
 
+#[allow(dead_code)]
 const UNIT_SCALE: u128 = 1_000_000_000;
 const SHELL_ECC_ID: u32 = 2;
 const NOTE_DEPLOY_RECOVERY_VERSION: u32 = 1;
 
+#[allow(dead_code)]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct NoteAccountSnapshot {
     pub(crate) address: String,
@@ -23,24 +25,28 @@ pub(crate) struct NoteAccountSnapshot {
     pub(crate) code_hash: Option<String>,
 }
 
+#[allow(dead_code)]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum NoteBalanceMap {
     Known(Vec<(u32, u128)>),
     Unknown(String),
 }
 
+#[allow(dead_code)]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct NoteGetterBalanceMaps {
     pub(crate) balance: NoteBalanceMap,
     pub(crate) locked_in_orders: NoteBalanceMap,
 }
 
+#[allow(dead_code)]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct NoteBalanceView {
     pub(crate) account: NoteAccountSnapshot,
     pub(crate) getters: NoteGetterBalanceMaps,
 }
 
+#[allow(dead_code)]
 pub(crate) fn build_note_balance_view(
     note_addr: &str,
     account: Option<NoteAccountSnapshot>,
@@ -54,6 +60,7 @@ pub(crate) fn build_note_balance_view(
     Ok(NoteBalanceView { account, getters })
 }
 
+#[allow(dead_code)]
 pub(crate) fn note_getter_balance_maps(details: Option<&Value>) -> NoteGetterBalanceMaps {
     let Some(details) = details else {
         return NoteGetterBalanceMaps {
@@ -67,6 +74,7 @@ pub(crate) fn note_getter_balance_maps(details: Option<&Value>) -> NoteGetterBal
     }
 }
 
+#[allow(dead_code)]
 pub(crate) fn unknown_note_getter_balance_maps(reason: impl Into<String>) -> NoteGetterBalanceMaps {
     let reason = reason.into();
     NoteGetterBalanceMaps {
@@ -75,6 +83,7 @@ pub(crate) fn unknown_note_getter_balance_maps(reason: impl Into<String>) -> Not
     }
 }
 
+#[allow(dead_code)]
 pub(crate) fn render_note_balance(view: &NoteBalanceView) -> String {
     let mut out = String::new();
     let account = &view.account;
@@ -118,6 +127,7 @@ pub(crate) fn render_note_balance(view: &NoteBalanceView) -> String {
 }
 
 impl NoteAccountSnapshot {
+    #[allow(dead_code)]
     fn ecc_value(&self, id: u32) -> u128 {
         self.ecc
             .iter()
@@ -127,6 +137,7 @@ impl NoteAccountSnapshot {
     }
 }
 
+#[allow(dead_code)]
 fn render_ecc_map(out: &mut String, title: &str, map: &NoteBalanceMap) {
     writeln!(out, "{title}:").unwrap();
     match map {
@@ -155,10 +166,12 @@ fn render_ecc_map(out: &mut String, title: &str, map: &NoteBalanceMap) {
     }
 }
 
+#[allow(dead_code)]
 fn decimal_units(raw: u128) -> String {
     format!("{}.{:09}", raw / UNIT_SCALE, raw % UNIT_SCALE)
 }
 
+#[allow(dead_code)]
 fn parse_balance_map(value: &Value, name: &str) -> NoteBalanceMap {
     if value.is_null() {
         return NoteBalanceMap::Unknown(format!("{name} field unavailable"));
@@ -200,6 +213,7 @@ fn parse_balance_map(value: &Value, name: &str) -> NoteBalanceMap {
     NoteBalanceMap::Unknown(format!("{name} has unexpected JSON shape"))
 }
 
+#[allow(dead_code)]
 fn parse_u32_key(raw: &str) -> Option<u32> {
     raw.parse::<u32>().ok().or_else(|| {
         raw.strip_prefix("0x")
@@ -208,6 +222,7 @@ fn parse_u32_key(raw: &str) -> Option<u32> {
     })
 }
 
+#[allow(dead_code)]
 fn parse_u32_value(value: &Value) -> Option<u32> {
     value
         .as_u64()
@@ -215,6 +230,7 @@ fn parse_u32_value(value: &Value) -> Option<u32> {
         .or_else(|| value.as_str().and_then(parse_u32_key))
 }
 
+#[allow(dead_code)]
 fn parse_u128_value(value: &Value) -> Option<u128> {
     value.as_u64().map(u128::from).or_else(|| {
         let raw = value.as_str()?.trim();
@@ -268,6 +284,7 @@ pub(crate) fn ensure_pool_note_keypair_matches(
     Ok(derived)
 }
 
+#[allow(dead_code)]
 pub(crate) fn ensure_onchain_owner_matches_pool_key(
     role: &str,
     note_addr: &str,
@@ -296,7 +313,7 @@ pub(crate) fn ensure_onchain_owner_matches_pool_key(
     Ok(())
 }
 
-/// crash-safe state for wallet-funded note deploy. This file carries the randomly generated note owner
+/// #344: crash-safe state for wallet-funded note deploy. This file carries the randomly generated note owner
 /// secret and is written before any wallet spend. Later deploy steps add the on-chain note identifiers so
 /// `dexdo note recover` can finalize the pool without repeating an already completed deploy.
 #[cfg_attr(not(feature = "shellnet"), allow(dead_code))]
@@ -826,8 +843,40 @@ pub(crate) fn default_note_deploy_recovery_path(pool: &Path) -> PathBuf {
 }
 
 #[cfg_attr(not(feature = "shellnet"), allow(dead_code))]
+pub(crate) fn resolve_private_file_path(path: &Path, label: &str) -> Result<PathBuf> {
+    let resolved = match std::fs::canonicalize(path) {
+        Ok(path) => path,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            let parent = path
+                .parent()
+                .filter(|parent| !parent.as_os_str().is_empty())
+                .unwrap_or_else(|| Path::new("."));
+            let parent = std::fs::canonicalize(parent).map_err(|e| {
+                anyhow!(
+                    "resolve parent directory for {label} {}: {e}",
+                    path.display()
+                )
+            })?;
+            let name = path
+                .file_name()
+                .ok_or_else(|| anyhow!("{label} path {} has no file name", path.display()))?;
+            parent.join(name)
+        }
+        Err(e) => bail!("resolve {label} {}: {e}", path.display()),
+    };
+
+    match std::fs::symlink_metadata(&resolved) {
+        Ok(metadata) if metadata.file_type().is_file() => Ok(resolved),
+        Ok(_) => bail!("{label} {} must resolve to a regular file", path.display()),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(resolved),
+        Err(e) => bail!("inspect {label} {}: {e}", path.display()),
+    }
+}
+
+#[cfg_attr(not(feature = "shellnet"), allow(dead_code))]
 pub(crate) fn load_note_deploy_recovery(path: &Path) -> Result<Option<NoteDeployRecoveryState>> {
-    let bytes = match std::fs::read(path) {
+    let path = resolve_private_file_path(path, "note deploy recovery")?;
+    let bytes = match std::fs::read(&path) {
         Ok(bytes) => bytes,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
         Err(e) => bail!("read note deploy recovery {}: {e}", path.display()),
@@ -842,15 +891,226 @@ pub(crate) fn load_note_deploy_recovery(path: &Path) -> Result<Option<NoteDeploy
     Ok(Some(state))
 }
 
+struct NoteDeployRecoveryWriteLock {
+    path: PathBuf,
+}
+
+impl Drop for NoteDeployRecoveryWriteLock {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.path);
+    }
+}
+
+fn acquire_note_deploy_recovery_write_lock(
+    recovery_path: &Path,
+) -> Result<NoteDeployRecoveryWriteLock> {
+    use std::io::Write;
+
+    let mut lock_name = recovery_path.as_os_str().to_os_string();
+    lock_name.push(".lock");
+    let lock_path = PathBuf::from(lock_name);
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    match options.open(&lock_path) {
+        Ok(mut lock) => {
+            if let Err(e) = writeln!(lock, "{}", std::process::id()) {
+                let _ = std::fs::remove_file(&lock_path);
+                return Err(anyhow!(
+                    "write note deploy recovery lock {}: {e}",
+                    lock_path.display()
+                ));
+            }
+            Ok(NoteDeployRecoveryWriteLock { path: lock_path })
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => bail!(
+            "note deploy recovery {} is being updated by another process; refusing a concurrent overwrite. \
+             Retry after that deploy exits; remove lock {} only after confirming no note deploy is running.",
+            recovery_path.display(),
+            lock_path.display()
+        ),
+        Err(e) => bail!(
+            "create note deploy recovery lock {}: {e}",
+            lock_path.display()
+        ),
+    }
+}
+
+fn load_existing_note_deploy_recovery_for_write(
+    path: &Path,
+) -> Result<Option<NoteDeployRecoveryState>> {
+    let bytes = match std::fs::read(path) {
+        Ok(bytes) => bytes,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => bail!("read existing note deploy recovery {}: {e}", path.display()),
+    };
+    let state: NoteDeployRecoveryState = serde_json::from_slice(&bytes).map_err(|e| {
+        anyhow!(
+            "existing note deploy recovery {} is invalid JSON; refusing to overwrite it: {e}. \
+             Preserve it and pass --recovery <different-file>.",
+            path.display()
+        )
+    })?;
+    state.validate().map_err(|e| {
+        anyhow!(
+            "existing note deploy recovery {} is invalid; refusing to overwrite it: {e}. \
+             Preserve it and pass --recovery <different-file>.",
+            path.display()
+        )
+    })?;
+    Ok(Some(state))
+}
+
+fn same_note_deploy_owner(left: &NoteDeployRecoveryState, right: &NoteDeployRecoveryState) -> bool {
+    left.owner_public_key_hex == right.owner_public_key_hex
+        && left.owner_secret_key_hex == right.owner_secret_key_hex
+}
+
+fn note_deploy_request_fields_match(
+    left: &NoteDeployRecoveryState,
+    right: &NoteDeployRecoveryState,
+) -> bool {
+    left.endpoint == right.endpoint
+        && left.nominal == right.nominal
+        && left.token_type == right.token_type
+        && left.raw_value == right.raw_value
+        && left.ecc_shell_deposit == right.ecc_shell_deposit
+        && left.funding_multisig_address == right.funding_multisig_address
+}
+
+fn note_deploy_recovery_has_no_possible_spend(state: &NoteDeployRecoveryState) -> bool {
+    fn voucher_has_no_possible_spend(voucher: Option<&NoteDeployVoucherCheckpoint>) -> bool {
+        voucher.is_none_or(|voucher| {
+            !voucher.submit_maybe_sent && voucher.event.is_none() && voucher.proof.is_none()
+        })
+    }
+
+    state.pn_address.is_none()
+        && state.deposit_identifier_hash.is_none()
+        && state.deployed_at_unix.is_none()
+        && !state.shell_funded
+        && !state.sanity_checked
+        && voucher_has_no_possible_spend(state.deposit_voucher.as_ref())
+        && voucher_has_no_possible_spend(state.shell_voucher.as_ref())
+}
+
+fn ensure_same_recovery_can_advance(
+    path: &Path,
+    existing: &NoteDeployRecoveryState,
+    next: &NoteDeployRecoveryState,
+) -> Result<()> {
+    if !same_note_deploy_owner(existing, next) || !note_deploy_request_fields_match(existing, next)
+    {
+        bail!(
+            "note deploy recovery {} belongs to a different deploy owner or request; refusing to overwrite it. \
+             Resume the existing state or pass --recovery <different-file>.",
+            path.display()
+        );
+    }
+    if existing
+        .pn_address
+        .as_ref()
+        .is_some_and(|address| next.pn_address.as_ref() != Some(address))
+        || existing
+            .deposit_identifier_hash
+            .as_ref()
+            .is_some_and(|hash| next.deposit_identifier_hash.as_ref() != Some(hash))
+    {
+        bail!(
+            "note deploy recovery {} already holds a different deployed PrivateNote identity; refusing to \
+             clobber its recovery key. Pass --recovery <different-file>.",
+            path.display()
+        );
+    }
+    Ok(())
+}
+
+fn write_note_deploy_recovery_locked(path: &Path, state: &NoteDeployRecoveryState) -> Result<()> {
+    let json = serde_json::to_vec_pretty(state)?;
+    write_private_atomic(path, &json)
+        .map_err(|e| anyhow!("write note deploy recovery {}: {e}", path.display()))
+}
+
 #[cfg_attr(not(feature = "shellnet"), allow(dead_code))]
 pub(crate) fn write_note_deploy_recovery(
     path: &Path,
     state: &NoteDeployRecoveryState,
 ) -> Result<()> {
     state.validate()?;
-    let json = serde_json::to_vec_pretty(state)?;
-    write_private_atomic(path, &json)
-        .map_err(|e| anyhow!("write note deploy recovery {}: {e}", path.display()))
+    let path = resolve_private_file_path(path, "note deploy recovery")?;
+    let _lock = acquire_note_deploy_recovery_write_lock(&path)?;
+    if let Some(existing) = load_existing_note_deploy_recovery_for_write(&path)? {
+        ensure_same_recovery_can_advance(&path, &existing, state)?;
+    }
+    write_note_deploy_recovery_locked(&path, state)
+}
+
+/// Refresh the recovery file only after the deployed note's on-chain owner was validated.
+/// A different recorded note or a different owner's possibly submitted spend is never overwritten.
+#[cfg_attr(not(feature = "shellnet"), allow(dead_code))]
+pub(crate) fn refresh_note_deploy_recovery_after_success(
+    path: &Path,
+    state: &NoteDeployRecoveryState,
+) -> Result<()> {
+    state.validate()?;
+    state.ensure_ready_for_pool()?;
+    let path = resolve_private_file_path(path, "note deploy recovery")?;
+    let _lock = acquire_note_deploy_recovery_write_lock(&path)?;
+    if let Some(existing) = load_existing_note_deploy_recovery_for_write(&path)? {
+        if same_note_deploy_owner(&existing, state) {
+            ensure_same_recovery_can_advance(&path, &existing, state)?;
+        } else if let Some(existing_note) = existing.pn_address.as_deref() {
+            if state.pn_address.as_deref() != Some(existing_note) {
+                bail!(
+                    "note deploy recovery {} already holds recovery for different deployed PrivateNote \
+                     {existing_note}; refusing to clobber its only recovery key. Keep this file and pass \
+                     --recovery <different-file> for the successful deploy.",
+                    path.display()
+                );
+            }
+        } else if !note_deploy_recovery_has_no_possible_spend(&existing) {
+            bail!(
+                "note deploy recovery {} holds possible wallet-spend recovery material for a different owner; \
+                 refusing to clobber it. Resume that attempt with this file, or pass \
+                 --recovery <different-file> for the successful deploy.",
+                path.display()
+            );
+        }
+    }
+    write_note_deploy_recovery_locked(&path, state)
+}
+
+#[cfg_attr(not(feature = "shellnet"), allow(dead_code))]
+pub(crate) fn ensure_recovery_owner_matches_target_note(
+    path: &Path,
+    state: &NoteDeployRecoveryState,
+    onchain_owner_pubkey: Option<&str>,
+) -> Result<()> {
+    state.validate()?;
+    let note_addr = state.pn_address.as_deref().ok_or_else(|| {
+        anyhow!(
+            "note recovery {} has no target PrivateNote address; refusing to guess",
+            path.display()
+        )
+    })?;
+    let derived_owner = derive_owner_pubkey_from_secret_hex(&state.owner_secret_key_hex)?;
+    ensure_onchain_owner_matches_pool_key(
+        "note recover",
+        note_addr,
+        onchain_owner_pubkey,
+        &derived_owner,
+    )
+    .map_err(|e| {
+        anyhow!(
+            "{e} Recovery file {} was left unchanged because its owner key does not own target PrivateNote \
+             {note_addr}; pass the recovery file that belongs to this note.",
+            path.display()
+        )
+    })
 }
 
 #[cfg_attr(not(feature = "shellnet"), allow(dead_code))]
@@ -867,6 +1127,7 @@ pub(crate) fn recovery_owner_key_written_message(path: &Path) -> String {
 
 #[cfg_attr(not(feature = "shellnet"), allow(dead_code))]
 pub(crate) fn write_private_atomic(path: &Path, bytes: &[u8]) -> Result<()> {
+    let path = resolve_private_file_path(path, "secret file")?;
     let dir = path
         .parent()
         .filter(|p| !p.as_os_str().is_empty())
@@ -880,7 +1141,7 @@ pub(crate) fn write_private_atomic(path: &Path, bytes: &[u8]) -> Result<()> {
         .map_err(|e| anyhow!("system clock before epoch: {e}"))?
         .as_nanos();
     let tmp = dir.join(format!(".{name}.tmp.{}.{nanos}", std::process::id()));
-    write_private_atomic_via_temp(path, &tmp, bytes)
+    write_private_atomic_via_temp(&path, &tmp, bytes)
 }
 
 #[cfg_attr(not(feature = "shellnet"), allow(dead_code))]
@@ -908,7 +1169,7 @@ pub(crate) fn write_private_atomic_via_temp(path: &Path, tmp: &Path, bytes: &[u8
     Ok(())
 }
 
-fn sync_parent_dir(path: &Path) -> Result<()> {
+pub(crate) fn sync_parent_dir(path: &Path) -> Result<()> {
     #[cfg(unix)]
     {
         let dir = path
@@ -951,10 +1212,11 @@ fn validate_hex_u256(raw: &str, label: &str) -> Result<()> {
     normalize_secret_like_hex(raw, label).map(|_| ())
 }
 
-/// CLI-compatible note deploy state. A subset of its fields -- exactly those the pool needs. **Carries the owner
-/// secret key** -- never log it.
-/// `allow(dead_code)` off `shellnet`: the only non-test consumer(`run_note_deploy`) is shellnet-gated, and the
-/// `cfg(test)` suite does not save these from clippy's non-test `-D warnings` pass on the default bin.
+/// CLI-compatible note deploy state. A subset of its fields — exactly those the pool needs. **Carries the owner
+/// secret key** — never log it.
+///
+/// `allow(dead_code)` off `shellnet`: the only non-test consumer (`run_note_deploy`) is shellnet-gated, and the
+/// `cfg(test)` §5 suite does not save these from clippy's non-test `-D warnings` pass on the default bin.
 #[cfg_attr(not(feature = "shellnet"), allow(dead_code))]
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub(crate) struct OnboardPnState {
@@ -992,29 +1254,29 @@ impl From<dexdo_core::private_note::DeployPrivateNoteResult> for OnboardPnState 
     }
 }
 
-/// output adapter: build a single DEXDO_PN_POOL **note** object from a fully deployed note state. Fails
-/// loud if deploy did not complete(missing `pn_address`/keys, or not `shell_funded`/`sanity_checked`) -- folding a
+/// #137/#176 output adapter: build a single DEXDO_PN_POOL **note** object from a fully deployed note state. Fails
+/// loud if deploy did not complete (missing `pn_address`/keys, or not `shell_funded`/`sanity_checked`) — folding a
 /// half-deployed note into the pool would later strand the `seller`/`buyer` on an unusable note.
 #[cfg_attr(not(feature = "shellnet"), allow(dead_code))]
 pub(crate) fn pn_state_to_pool_note(s: &OnboardPnState) -> Result<Value> {
     let address = s.pn_address.as_deref().ok_or_else(|| {
-        anyhow!("pn_state has no pn_address -- note deploy did not reach deployPrivateNote (step 1)")
+        anyhow!("pn_state has no pn_address — note deploy did not reach deployPrivateNote (step 1)")
     })?;
     let dih = s.deposit_identifier_hash.as_deref().ok_or_else(|| {
-        anyhow!("pn_state has no deposit_identifier_hash -- incomplete note deploy")
+        anyhow!("pn_state has no deposit_identifier_hash — incomplete note deploy")
     })?;
     let pubkey = s
         .owner_public_key_hex
         .as_deref()
-        .ok_or_else(|| anyhow!("pn_state has no owner_public_key_hex -- incomplete note deploy"))?;
+        .ok_or_else(|| anyhow!("pn_state has no owner_public_key_hex — incomplete note deploy"))?;
     let seckey = s
         .owner_secret_key_hex
         .as_deref()
-        .ok_or_else(|| anyhow!("pn_state has no owner_secret_key_hex -- incomplete note deploy"))?;
+        .ok_or_else(|| anyhow!("pn_state has no owner_secret_key_hex — incomplete note deploy"))?;
     ensure_pool_note_keypair_matches(address, pubkey, seckey)?;
     if !s.shell_funded || !s.sanity_checked {
         bail!(
-            "note deploy state not fully deployed (shell_funded={}, sanity_checked={}) -- the PN has no gas / failed its \
+            "note deploy state not fully deployed (shell_funded={}, sanity_checked={}) — the PN has no gas / failed its \
              getDetails check; re-run `dexdo note deploy` (idempotent at the step boundary) before pooling it.",
             s.shell_funded,
             s.sanity_checked
@@ -1031,10 +1293,10 @@ pub(crate) fn pn_state_to_pool_note(s: &OnboardPnState) -> Result<Value> {
     }))
 }
 
-/// output adapter: append `note` to a `DEXDO_PN_POOL` JSON, creating the pool with the pool-level fields
-/// from the deploy state(endpoint/nominal/token_type/raw_value/ecc) when it does not yet exist, or appending to an
+/// #137/#176 output adapter: append `note` to a `DEXDO_PN_POOL` JSON, creating the pool with the pool-level fields
+/// from the deploy state (endpoint/nominal/token_type/raw_value/ecc) when it does not yet exist, or appending to an
 /// existing matching pool. Refuses to mix nominals/token-types in one pool (the consumers assume a homogeneous
-/// pool), and refuses to add a duplicate note `address`. Pure(takes the existing pool JSON, returns the new one).
+/// pool), and refuses to add a duplicate note `address`. Pure (takes the existing pool JSON, returns the new one).
 #[cfg_attr(not(feature = "shellnet"), allow(dead_code))]
 pub(crate) fn pool_with_note_added(
     existing: Option<Value>,
@@ -1058,10 +1320,10 @@ pub(crate) fn pool_with_note_added(
             "notes": [],
         }),
     };
-    // Homogeneity: a pool is one nominal + token_type(the seller/buyer pick any note assuming uniform value).
+    // Homogeneity: a pool is one nominal + token_type (the seller/buyer pick any note assuming uniform value).
     if pool["nominal"] != json!(s.nominal) || pool["token_type"] != json!(s.token_type) {
         bail!(
-            "pool nominal/token_type ({}/{}) != this note's ({}/{}): the consumers assume a homogeneous pool -- \
+            "pool nominal/token_type ({}/{}) != this note's ({}/{}): the consumers assume a homogeneous pool — \
              use a separate --pool file per nominal/token-type.",
             pool["nominal"],
             pool["token_type"],
@@ -1106,12 +1368,13 @@ pub(crate) fn pool_with_note_added(
         .iter()
         .any(|n| n["address"].as_str() == Some(new_addr))
     {
-        bail!("note {new_addr} is already in the pool -- refusing to add a duplicate");
+        bail!("note {new_addr} is already in the pool — refusing to add a duplicate");
     }
     notes.push(note);
     Ok(pool)
 }
 
+#[allow(dead_code)]
 pub(crate) fn pool_with_note_token_contract_recorded(
     mut pool: Value,
     note_addr: &str,
@@ -1156,6 +1419,7 @@ pub(crate) fn pool_with_note_token_contract_recorded(
     }
 }
 
+#[allow(dead_code)]
 pub(crate) fn pool_has_unique_note_entry(pool: &Value, note_addr: &str) -> Result<()> {
     let note_addr = dexdo_core::normalize_wallet_address(note_addr)
         .map_err(|e| anyhow!("note address {note_addr}: {e}"))?;
@@ -1178,7 +1442,10 @@ pub(crate) fn pool_has_unique_note_entry(pool: &Value, note_addr: &str) -> Resul
     }
 }
 
-pub(crate) fn pool_note_recovery_records(pool: &Value) -> Result<Vec<(String, String, String)>> {
+#[allow(dead_code)]
+pub(crate) fn pool_note_recovery_records(
+    pool: &Value,
+) -> Result<Vec<(String, String, String, String)>> {
     let notes = pool["notes"]
         .as_array()
         .ok_or_else(|| anyhow!("DEXDO_PN_POOL: malformed (\"notes\" is not an array)"))?;
@@ -1193,12 +1460,19 @@ pub(crate) fn pool_note_recovery_records(pool: &Value) -> Result<Vec<(String, St
         let Some(token_contract) = note["token_contract"].as_str() else {
             continue;
         };
+        let role = note["token_contract_role"].as_str().unwrap_or("unknown");
+        if role != "buyer" && role != "seller" && role != "unknown" {
+            bail!(
+                "DEXDO_PN_POOL token_contract_role must be buyer, seller, or unknown, got `{role}`"
+            );
+        }
         out.push((
             dexdo_core::normalize_wallet_address(note_addr)
                 .map_err(|e| anyhow!("DEXDO_PN_POOL note address {note_addr}: {e}"))?,
             owner_secret.to_string(),
             dexdo_core::normalize_wallet_address(token_contract)
                 .map_err(|e| anyhow!("DEXDO_PN_POOL token_contract {token_contract}: {e}"))?,
+            role.to_string(),
         ));
     }
     Ok(out)
@@ -1231,6 +1505,7 @@ mod note_deploy_tests {
         }
     }
 
+    #[cfg(feature = "shellnet")]
     fn tvm_tonos_fixture_phrase() -> String {
         const WORD_INDICES: [u16; 12] = [
             1636, 1293, 905, 102, 1057, 1956, 1247, 1750, 597, 881, 1302, 3,
@@ -1278,6 +1553,23 @@ mod note_deploy_tests {
         }
     }
 
+    fn recovery_state_for_owner(
+        secret: &str,
+        note_address: Option<&str>,
+    ) -> NoteDeployRecoveryState {
+        let mut state = complete_recovery_state();
+        state.owner_secret_key_hex = secret.to_string();
+        state.owner_public_key_hex = derive_owner_pubkey_from_secret_hex(secret).unwrap();
+        state.pn_address = note_address.map(ToOwned::to_owned);
+        state.deposit_identifier_hash =
+            note_address.map(|address| address.trim_start_matches("0:").chars().take(64).collect());
+        state.deployed_at_unix = note_address.map(|_| 1000);
+        state.shell_funded = note_address.is_some();
+        state.sanity_checked = note_address.is_some();
+        state.validate().unwrap();
+        state
+    }
+
     struct TempDirCleanup(std::path::PathBuf);
 
     impl Drop for TempDirCleanup {
@@ -1299,7 +1591,7 @@ mod note_deploy_tests {
         (dir.clone(), TempDirCleanup(dir))
     }
 
-    /// account-reader data formats SHELL/ECC[2] and native gas in readable units plus raw units.
+    /// #205: account-reader data formats SHELL/ECC[2] and native gas in readable units plus raw units.
     #[test]
     fn note_balance_formats_shell_and_native_balances() {
         let view = build_note_balance_view(
@@ -1335,7 +1627,7 @@ mod note_deploy_tests {
         assert!(out.contains("unknown (getter unavailable)"), "{out}");
     }
 
-    /// negative: a null/unreadable account is not rendered as zero.
+    /// #205 negative: a null/unreadable account is not rendered as zero.
     #[test]
     fn note_balance_null_account_fails_loud() {
         let err = build_note_balance_view(
@@ -1349,7 +1641,7 @@ mod note_deploy_tests {
         assert!(err.contains("refusing to report zero"), "{err}");
     }
 
-    /// `getDetails` maps preserve unknown vs empty and parse known token maps.
+    /// #205: `getDetails` maps preserve unknown vs empty and parse known token maps.
     #[test]
     fn note_balance_getter_maps_preserve_unknown() {
         let maps = note_getter_balance_maps(Some(&json!({
@@ -1370,7 +1662,7 @@ mod note_deploy_tests {
         assert_eq!(maps.locked_in_orders, NoteBalanceMap::Known(vec![]));
     }
 
-    /// the command body is read-only and address-only: no key read and no signed/write helper.
+    /// #205: the command body is read-only and address-only: no key read and no signed/write helper.
     #[test]
     fn note_balance_command_path_is_read_only() {
         let source = include_str!("commands.rs");
@@ -1399,7 +1691,7 @@ mod note_deploy_tests {
         }
     }
 
-    /// a fully deployed note state maps to the exact pool note schema the seller/buyer consume.
+    /// #137/#176 §5: a fully deployed note state maps to the exact pool note schema the seller/buyer consume.
     #[test]
     fn pn_state_to_note_exact_schema() {
         let state = complete_state();
@@ -1415,7 +1707,7 @@ mod note_deploy_tests {
         assert_eq!(n["native_funded"], true);
     }
 
-    /// (negatives): an incomplete deploy state fails loud -- never pooled.
+    /// #137/#176 §5 (negatives): an incomplete deploy state fails loud — never pooled.
     #[test]
     fn incomplete_onboard_fails_loud() {
         let mut s = complete_state();
@@ -1438,7 +1730,7 @@ mod note_deploy_tests {
             .contains("not fully deployed"));
     }
 
-    /// regression: a pool entry whose stored secret cannot derive the recorded owner pubkey is
+    /// #19/#338 regression: a pool entry whose stored secret cannot derive the recorded owner pubkey is
     /// rejected before the bad DEXDO_PN_POOL entry is serialized. Without this, later owner-signed writes fail
     /// opaquely with ERR_INVALID_SENDER 101.
     #[test]
@@ -1454,7 +1746,7 @@ mod note_deploy_tests {
         assert!(err.contains("--pool <new_file>"), "{err}");
     }
 
-    /// regression: deploy must compare the freshly deployed PrivateNote's on-chain owner key
+    /// #19/#338 regression: deploy must compare the freshly deployed PrivateNote's on-chain owner key
     /// (`getDetails().ephemeralPubkey`) against the saved pool key before writing the pool file.
     #[test]
     fn onchain_owner_check_rejects_mismatched_pool_key() {
@@ -1482,7 +1774,7 @@ mod note_deploy_tests {
         assert!(err.contains("--pool <new_file>"), "{err}");
     }
 
-    /// a fresh pool is created from the pn_state pool-level fields; a second note appends.
+    /// #137 §5: a fresh pool is created from the pn_state pool-level fields; a second note appends.
     #[test]
     fn pool_create_then_append() {
         let s = complete_state();
@@ -1502,7 +1794,7 @@ mod note_deploy_tests {
         assert_eq!(pool["notes"].as_array().unwrap().len(), 2);
     }
 
-    /// residual: the pool entry itself carries the current TokenContract so buyer recovery/reclaim does not
+    /// #338 residual: the pool entry itself carries the current TokenContract so buyer recovery/reclaim does not
     /// depend on a side manifest or scraped logs.
     #[test]
     fn pool_records_token_contract_next_to_note_entry() {
@@ -1526,12 +1818,13 @@ mod note_deploy_tests {
             vec![(
                 note_addr.to_string(),
                 s.owner_secret_key_hex.clone().unwrap(),
-                tc
+                tc,
+                "buyer".to_string(),
             )]
         );
     }
 
-    /// negative: do not silently claim recovery metadata was persisted if the active pool is not the note's
+    /// #338 negative: do not silently claim recovery metadata was persisted if the active pool is not the note's
     /// pool.
     #[test]
     fn pool_token_contract_record_requires_matching_note() {
@@ -1566,7 +1859,7 @@ mod note_deploy_tests {
         assert!(err.contains("no note entry"), "{err}");
     }
 
-    /// (negatives): duplicate address + mixed nominal are refused.
+    /// #137 §5 (negatives): duplicate address + mixed nominal are refused.
     #[test]
     fn pool_refuses_duplicate_and_mixed() {
         let s = complete_state();
@@ -1592,7 +1885,7 @@ mod note_deploy_tests {
             .contains("homogeneous pool"));
     }
 
-    /// rewards provenance is root-level and cannot silently mix funding multisigs or backfill legacy pools.
+    /// #170: rewards provenance is root-level and cannot silently mix funding multisigs or backfill legacy pools.
     #[test]
     fn pool_records_and_guards_funding_multisig_provenance() {
         let s = complete_state();
@@ -1642,8 +1935,9 @@ mod note_deploy_tests {
         assert!(err.contains("unknown origin"), "{err}");
     }
 
-    /// the funding wallet seed phrase is an input-only credential. The pool stores only the deployed note
+    /// #204: the funding wallet seed phrase is an input-only credential. The pool stores only the deployed note
     /// material the runtime consumes; seed words must not appear in serialized pool output.
+    #[cfg(feature = "shellnet")]
     #[test]
     fn pool_output_does_not_contain_seed_words() {
         let phrase = tvm_tonos_fixture_phrase();
@@ -1666,7 +1960,7 @@ mod note_deploy_tests {
         }
     }
 
-    /// the recovery file is the durable owner-key copy and must be private, atomic JSON.
+    /// #344: the recovery file is the durable owner-key copy and must be private, atomic JSON.
     #[test]
     fn recovery_file_writes_owner_key_with_private_mode() {
         let (dir, _cleanup) = temp_dir("dexdo-note-recovery-test");
@@ -1694,7 +1988,182 @@ mod note_deploy_tests {
         }
     }
 
-    /// recovery state contains note recovery material, but never the funding wallet secret.
+    /// Public #33 regression: a successful deploy may replace an owner-only stale attempt because no wallet
+    /// spend or live note can depend on that old key.
+    #[test]
+    fn successful_deploy_refreshes_stale_unspent_recovery_owner() {
+        let (dir, _cleanup) = temp_dir("dexdo-note-recovery-refresh-test");
+        let path = dir.join("pn_pool.json.recovery.json");
+        let stale = recovery_state_for_owner(&"31".repeat(32), None);
+        let successful =
+            recovery_state_for_owner(&"42".repeat(32), Some(&format!("0:{}", "2".repeat(64))));
+        write_note_deploy_recovery(&path, &stale).unwrap();
+
+        refresh_note_deploy_recovery_after_success(&path, &successful).unwrap();
+        let loaded = load_note_deploy_recovery(&path).unwrap().unwrap();
+
+        assert_eq!(loaded.owner_public_key_hex, successful.owner_public_key_hex);
+        assert_eq!(loaded.owner_secret_key_hex, successful.owner_secret_key_hex);
+        assert_eq!(loaded.pn_address, successful.pn_address);
+        assert_eq!(
+            loaded.deposit_identifier_hash,
+            successful.deposit_identifier_hash
+        );
+    }
+
+    /// Public #33 happy path: final success writes the deployed note recovery when no prior file exists.
+    #[test]
+    fn successful_deploy_writes_recovery_when_path_is_absent() {
+        let (dir, _cleanup) = temp_dir("dexdo-note-recovery-success-test");
+        let path = dir.join("pn_pool.json.recovery.json");
+        let successful =
+            recovery_state_for_owner(&"42".repeat(32), Some(&format!("0:{}", "2".repeat(64))));
+
+        refresh_note_deploy_recovery_after_success(&path, &successful).unwrap();
+        let loaded = load_note_deploy_recovery(&path).unwrap().unwrap();
+
+        assert_eq!(loaded.owner_secret_key_hex, successful.owner_secret_key_hex);
+        assert_eq!(loaded.pn_address, successful.pn_address);
+    }
+
+    /// Public #33 money-safety: a recovery path that already holds another deployed note is never clobbered.
+    #[test]
+    fn successful_deploy_refuses_different_live_note_without_clobber() {
+        let (dir, _cleanup) = temp_dir("dexdo-note-recovery-live-key-test");
+        let path = dir.join("pn_pool.json.recovery.json");
+        let existing =
+            recovery_state_for_owner(&"31".repeat(32), Some(&format!("0:{}", "1".repeat(64))));
+        let successful =
+            recovery_state_for_owner(&"42".repeat(32), Some(&format!("0:{}", "2".repeat(64))));
+        write_note_deploy_recovery(&path, &existing).unwrap();
+        let before = std::fs::read(&path).unwrap();
+
+        let err = refresh_note_deploy_recovery_after_success(&path, &successful)
+            .unwrap_err()
+            .to_string();
+
+        assert!(err.contains("different deployed PrivateNote"), "{err}");
+        assert!(err.contains("refusing to clobber"), "{err}");
+        assert!(err.contains("--recovery <different-file>"), "{err}");
+        assert_eq!(std::fs::read(&path).unwrap(), before);
+        let loaded = load_note_deploy_recovery(&path).unwrap().unwrap();
+        assert_eq!(loaded.owner_secret_key_hex, existing.owner_secret_key_hex);
+        assert_eq!(loaded.pn_address, existing.pn_address);
+    }
+
+    /// Public #33 money-safety: an address-less state can still carry an uncertain wallet spend and must not be
+    /// treated as an unspent stale attempt.
+    #[test]
+    fn successful_deploy_refuses_different_owner_with_uncertain_spend() {
+        let (dir, _cleanup) = temp_dir("dexdo-note-recovery-pending-spend-test");
+        let path = dir.join("pn_pool.json.recovery.json");
+        let mut existing = recovery_state_for_owner(&"31".repeat(32), None);
+        let mut voucher = NoteDeployVoucherCheckpoint::new(
+            &existing.owner_public_key_hex,
+            existing.token_type,
+            existing.raw_value,
+            false,
+            "51".repeat(32),
+            "61".repeat(32),
+        )
+        .unwrap();
+        voucher.submit_maybe_sent = true;
+        existing
+            .set_voucher_checkpoint(NoteDeployVoucherKind::Deposit, voucher)
+            .unwrap();
+        let successful =
+            recovery_state_for_owner(&"42".repeat(32), Some(&format!("0:{}", "2".repeat(64))));
+        write_note_deploy_recovery(&path, &existing).unwrap();
+        let before = std::fs::read(&path).unwrap();
+
+        let err = refresh_note_deploy_recovery_after_success(&path, &successful)
+            .unwrap_err()
+            .to_string();
+
+        assert!(
+            err.contains("possible wallet-spend recovery material"),
+            "{err}"
+        );
+        assert!(err.contains("--recovery <different-file>"), "{err}");
+        assert_eq!(std::fs::read(&path).unwrap(), before);
+    }
+
+    /// Public #33 load-time safety: recovery must refuse a target note whose on-chain owner is not the saved key.
+    #[test]
+    fn loaded_recovery_refuses_target_note_owner_mismatch() {
+        let (dir, _cleanup) = temp_dir("dexdo-note-recovery-owner-check-test");
+        let path = dir.join("pn_pool.json.recovery.json");
+        let state =
+            recovery_state_for_owner(&"42".repeat(32), Some(&format!("0:{}", "2".repeat(64))));
+        write_note_deploy_recovery(&path, &state).unwrap();
+        let before = std::fs::read(&path).unwrap();
+        let loaded = load_note_deploy_recovery(&path).unwrap().unwrap();
+
+        let err = ensure_recovery_owner_matches_target_note(
+            &path,
+            &loaded,
+            Some(&format!("0x{}", "99".repeat(32))),
+        )
+        .unwrap_err()
+        .to_string();
+
+        assert!(err.contains("does not own target PrivateNote"), "{err}");
+        assert!(err.contains("pass the recovery file"), "{err}");
+        assert_eq!(std::fs::read(&path).unwrap(), before);
+    }
+
+    /// #377 regression: recovery read, write, and cleanup use one canonical target, leaving no secret-bearing
+    /// target behind when the CLI was given a symlink alias.
+    #[cfg(unix)]
+    #[test]
+    fn recovery_symlink_resolves_once_for_read_write_and_cleanup() {
+        let (dir, _cleanup) = temp_dir("dexdo-note-recovery-symlink-test");
+        let target = dir.join("recovery-target.json");
+        let alias = dir.join("recovery-alias.json");
+        let mut state = complete_recovery_state();
+        write_note_deploy_recovery(&target, &state).unwrap();
+        std::os::unix::fs::symlink(&target, &alias).unwrap();
+
+        let resolved = resolve_private_file_path(&alias, "--recovery").unwrap();
+        assert_eq!(resolved, std::fs::canonicalize(&target).unwrap());
+        let loaded = load_note_deploy_recovery(&resolved).unwrap().unwrap();
+        assert_eq!(loaded.owner_secret_key_hex, state.owner_secret_key_hex);
+
+        state.sanity_checked = false;
+        write_note_deploy_recovery(&resolved, &state).unwrap();
+        assert!(std::fs::symlink_metadata(&alias)
+            .unwrap()
+            .file_type()
+            .is_symlink());
+        assert!(
+            !load_note_deploy_recovery(&target)
+                .unwrap()
+                .unwrap()
+                .sanity_checked
+        );
+
+        std::fs::remove_file(&resolved).unwrap();
+        assert!(!target.exists());
+        assert!(std::fs::symlink_metadata(&alias)
+            .unwrap()
+            .file_type()
+            .is_symlink());
+    }
+
+    /// #377 negative regression: a recovery target that resolves to a directory is rejected before use.
+    #[test]
+    fn recovery_non_regular_target_is_rejected() {
+        let (dir, _cleanup) = temp_dir("dexdo-note-recovery-nonregular-test");
+        let sentinel = dir.join("recovery-directory");
+        std::fs::create_dir(&sentinel).unwrap();
+
+        let err = resolve_private_file_path(&sentinel, "--recovery")
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("regular file"), "{err}");
+    }
+
+    /// #344: recovery state contains note recovery material, but never the funding wallet secret.
     #[test]
     fn recovery_contents_exclude_funding_wallet_secret() {
         let state = complete_recovery_state();
@@ -1713,7 +2182,7 @@ mod note_deploy_tests {
         );
     }
 
-    /// a complete recovery state can rebuild the exact pool entry without wallet credentials/spend.
+    /// #344: a complete recovery state can rebuild the exact pool entry without wallet credentials/spend.
     #[test]
     fn recovery_state_finalizes_pool_entry_without_wallet_secret() {
         let state = complete_recovery_state();
@@ -1732,7 +2201,7 @@ mod note_deploy_tests {
         );
     }
 
-    /// negative: owner-key-only recovery is useful for resume, but not enough to write a pool entry.
+    /// #344 negative: owner-key-only recovery is useful for resume, but not enough to write a pool entry.
     #[test]
     fn incomplete_recovery_refuses_finalize_with_clear_message() {
         let mut state = complete_recovery_state();
@@ -1752,7 +2221,7 @@ mod note_deploy_tests {
         );
     }
 
-    /// regression: voucher-level recovery may contain a wallet-submitted deposit voucher, but without a
+    /// #344 regression: voucher-level recovery may contain a wallet-submitted deposit voucher, but without a
     /// deployed PrivateNote it must resume through `note deploy`, not be folded into a pool.
     #[test]
     fn voucher_submitted_recovery_refuses_pool_finalize_without_note_deploy() {
@@ -1787,7 +2256,7 @@ mod note_deploy_tests {
         );
     }
 
-    /// regression: voucher checkpoints serialize the recovery material required to avoid a second wallet
+    /// #344 regression: voucher checkpoints serialize the recovery material required to avoid a second wallet
     /// spend, but never serialize the funding-wallet credential names or values.
     #[test]
     fn recovery_contents_include_voucher_checkpoint_without_wallet_secret() {
@@ -1830,7 +2299,7 @@ mod note_deploy_tests {
         );
     }
 
-    /// negative: an existing recovery file is tied to the deploy request and cannot be silently reused.
+    /// #344 negative: an existing recovery file is tied to the deploy request and cannot be silently reused.
     #[test]
     fn recovery_rejects_mismatched_request() {
         let state = complete_recovery_state();
@@ -1851,7 +2320,7 @@ mod note_deploy_tests {
         );
     }
 
-    /// user-facing recovery guidance names only paths and actions, not raw key material.
+    /// #344: user-facing recovery guidance names only paths and actions, not raw key material.
     #[test]
     fn recovery_user_message_does_not_log_secret() {
         let path = std::path::Path::new("pn_pool.json.recovery.json");

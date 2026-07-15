@@ -188,6 +188,13 @@ Allowed values (the scaffold also lists these under `_legend.allowed`):
 
 Confirm with `dexdo policy show`.
 
+`policy.json` is the shared recovery control point. Manage it with `dexdo policy init`,
+`dexdo policy show`, and `dexdo policy edit`. The seller section decides whether to clean up,
+retire, or republish after buyer no-show or deal completion, and whether to release or hold a
+dispute. The buyer section classifies no handover, malformed handover, dead gateway, empty or stalled
+stream, and scam: stop honors finalized delivery, dispute freezes both notes, reclaim waits for the
+timeout and returns eligible escrow, and `next_seller` performs bounded failover.
+
 ## Phase 6. Run the seller gateway
 
 ```sh
@@ -237,6 +244,52 @@ dexdo monitor --market market.json --contracts contracts/deployed.shellnet.json
 
 Read-only: ticks delivered, SHELL received, what is locked or burned, whether the deal is closed.
 Repeat `--market` for several markets; run it in a separate terminal.
+
+## Phase 9. Anti-abuse and recovery
+
+`dexdo note withdraw` can refuse with `ERR_STREAM_LOCKED (405)` while a stream or dispute is live.
+It can also return `ERR_NOTE_BUSY (121)` when another note operation or stake state makes withdrawal
+unsafe. These gates are intentional, not a bug: the note lock prevents either side from reusing the
+same capital during a live deal or dispute, which makes wash trading, freeriding, and note hopping
+unprofitable (spec sections 4.3 and 4.4).
+
+Use the recovery action that matches the failure:
+
+```text
++----------------------------------------+-------------------------------------+-------------------------------------------------------------------+
+| Situation                              | Command                             | What it gives you                                                 |
++----------------------------------------+-------------------------------------+-------------------------------------------------------------------+
+| Concede a dispute                      | dexdo release-dispute               | Unlocks both notes and returns the contested amount to the buyer. |
+| Collect finalized closed-deal earnings | dexdo withdraw-shell                | Moves finalized SHELL owed by the deal to the recipient.          |
+| Cancel one stale resting offer         | dexdo orders cancel <ID>            | Removes that order from the model book.                           |
+| Cancel all stale resting offers        | dexdo orders cancel-all             | Removes all of this note's orders from the model book.            |
+| Withdrawal fails with 405              | dexdo note stream-locks             | Lists locks, deal addresses, and the force-clear deadline.        |
+| Stale locks past the max-lock window   | PrivateNote.forceClearStreamLocks() | Owner backstop clears stale locks after the deadline.             |
++----------------------------------------+-------------------------------------+-------------------------------------------------------------------+
+```
+
+`dexdo release-dispute` and `dexdo withdraw-shell` take `--note-addr` and `--note-key`, plus either
+`--token-contract 0:<TC>` or `--market market.json`. For resting offers, put the shared note and
+market flags before the subcommand:
+
+```sh
+dexdo orders --note-addr "$NOTE_ADDR" --note-key note.secret.hex --market market.json cancel <ID>
+dexdo orders --note-addr "$NOTE_ADDR" --note-key note.secret.hex --market market.json cancel-all
+```
+
+Inspect a blocked withdrawal without signing anything:
+
+```sh
+dexdo note stream-locks --note-addr "$NOTE_ADDR" \
+  --contracts contracts/deployed.shellnet.json
+```
+
+First bring every listed deal to a clean end: stop or settle it, release or otherwise resolve its
+dispute, or let the stream/dispute timeout expire. Once no stream or dispute lock remains,
+`dexdo note withdraw` passes the lock gate. After the reported max-lock deadline,
+`PrivateNote.forceClearStreamLocks()` is the owner-only backstop for stale locks. The current CLI
+reports that deadline but does not expose the force-clear call as a subcommand or flag; it must be
+submitted with an owner-signing contract tool.
 
 ## Wrap-up
 

@@ -381,7 +381,11 @@ fn compact_body(body: &str) -> String {
     if compact.len() <= MAX_BODY {
         compact
     } else {
-        format!("{}...", &compact[..MAX_BODY])
+        let mut end = MAX_BODY;
+        while !compact.is_char_boundary(end) {
+            end -= 1;
+        }
+        format!("{}...", &compact[..end])
     }
 }
 
@@ -519,6 +523,24 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn unicode_http_error_body_truncates_without_panicking() {
+        let body = format!("{}\u{00e9}{}", "a".repeat(2047), "b".repeat(16));
+        let response = format!(
+            "HTTP/1.1 500 Internal Server Error\r\nContent-Length: {}\r\n\r\n{body}",
+            body.len()
+        );
+        let base = serve_once_owned(response, Duration::ZERO).await;
+        let client = IndexerClient::new(base, Duration::from_secs(2)).unwrap();
+        let error = client
+            .markets(MarketsQuery::default())
+            .await
+            .expect_err("remote Unicode error body must return the HTTP failure");
+        let message = error.to_string();
+        assert!(message.contains("HTTP 500"), "{message}");
+        assert!(message.ends_with("..."), "{message}");
+    }
+
+    #[tokio::test]
     async fn timeout_is_fail_loud() {
         let base = serve_once(
             "HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\n{}",
@@ -538,6 +560,10 @@ mod tests {
     }
 
     async fn serve_once(response: &'static str, delay: Duration) -> String {
+        serve_once_owned(response.to_string(), delay).await
+    }
+
+    async fn serve_once_owned(response: String, delay: Duration) -> String {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         tokio::spawn(async move {

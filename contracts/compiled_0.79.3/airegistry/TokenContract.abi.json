@@ -18,6 +18,14 @@
 		{
 			"name": "fund",
 			"inputs": [
+			],
+			"outputs": [
+			]
+		},
+		{
+			"name": "authorizeDirectFund",
+			"inputs": [
+				{"name":"buyerNote","type":"address"},
 				{"name":"buyerPubkey","type":"uint256"}
 			],
 			"outputs": [
@@ -28,6 +36,40 @@
 			"inputs": [
 				{"name":"buyerNote","type":"address"},
 				{"name":"buyerPubkey","type":"uint256"}
+			],
+			"outputs": [
+			]
+		},
+		{
+			"name": "postFromNote",
+			"inputs": [
+				{"name":"iobHash","type":"uint256"},
+				{"name":"iobDepth","type":"uint16"},
+				{"name":"depositIdentifierHash","type":"uint256"},
+				{"name":"flags","type":"uint8"}
+			],
+			"outputs": [
+			]
+		},
+		{
+			"name": "placeSellOffer",
+			"inputs": [
+				{"name":"flags","type":"uint8"}
+			],
+			"outputs": [
+			]
+		},
+		{
+			"name": "onSellClosed",
+			"inputs": [
+			],
+			"outputs": [
+			]
+		},
+		{
+			"name": "close",
+			"inputs": [
+				{"name":"payoutAddress","type":"address"}
 			],
 			"outputs": [
 			]
@@ -130,6 +172,15 @@
 				{"name":"lastAdvance","type":"uint64"},
 				{"name":"disputeTime","type":"uint64"},
 				{"name":"fundedTime","type":"uint64"}
+			]
+		},
+		{
+			"name": "getOffer",
+			"inputs": [
+			],
+			"outputs": [
+				{"name":"offerPosted","type":"bool"},
+				{"name":"closing","type":"bool"}
 			]
 		},
 		{
@@ -372,16 +423,25 @@
 		{"init":true,"name":"_sellerPubkey","type":"uint256"},
 		{"init":true,"name":"_rootModelAddress","type":"address"},
 		{"init":true,"name":"_nonce","type":"uint64"},
+		{"init":false,"name":"_iobHash","type":"uint256"},
+		{"init":false,"name":"_iobDepth","type":"uint16"},
+		{"init":false,"name":"_noteAuthorized","type":"bool"},
+		{"init":false,"name":"_offerPosted","type":"bool"},
+		{"init":false,"name":"_closing","type":"bool"},
+		{"init":false,"name":"_closePayout","type":"address"},
 		{"init":false,"name":"_modelName","type":"string"},
 		{"init":false,"name":"_modelHash","type":"uint256"},
 		{"init":false,"name":"_pricePerTick","type":"uint128"},
 		{"init":false,"name":"_maxTicks","type":"uint128"},
 		{"init":false,"name":"_buyer","type":"address"},
 		{"init":false,"name":"_buyerPubkey","type":"uint256"},
+		{"init":false,"name":"_authorizedBuyer","type":"address"},
+		{"init":false,"name":"_authorizedBuyerPubkey","type":"uint256"},
 		{"init":false,"name":"_sellerNote","type":"address"},
 		{"init":false,"name":"_endpointCipher","type":"bytes"},
 		{"init":false,"name":"_funded","type":"bool"},
 		{"init":false,"name":"_opened","type":"bool"},
+		{"init":false,"name":"_everOpened","type":"bool"},
 		{"init":false,"name":"_probeAccepted","type":"bool"},
 		{"init":false,"name":"_disputed","type":"bool"},
 		{"init":false,"name":"_sellerProbeFunded","type":"bool"},

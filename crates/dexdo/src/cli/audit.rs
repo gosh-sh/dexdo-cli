@@ -1,4 +1,4 @@
-//! Secret-free deal history/export helpers.
+//! Secret-free deal history/export helpers (#162).
 #![cfg_attr(not(feature = "shellnet"), allow(dead_code))]
 
 use crate::cli::deals::{DealHandle, DealHandleRole, DealStateKind, DealStateSummary};

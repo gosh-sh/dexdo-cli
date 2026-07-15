@@ -1,4 +1,4 @@
-//! Local deal handles: small public JSON records that let operators run
+//! Local deal handles (#159): small public JSON records that let operators run
 //! `deals`/`status`/`close` without reassembling low-level addresses.
 
 use anyhow::{bail, Result};

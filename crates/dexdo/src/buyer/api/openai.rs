@@ -1,5 +1,5 @@
-//! OpenAI-compatible consumer endpoint: the primary unified interface, as in
-//! OpenRouter. `POST /v1/chat/completions`(SSE when `stream:true`, otherwise a single JSON) and
+//! OpenAI-compatible consumer endpoint (B19, §10.6/G): the primary unified interface, as in
+//! OpenRouter. `POST /v1/chat/completions` (SSE when `stream:true`, otherwise a single JSON) and
 //! `GET /v1/models`. The model is forced by the frame; the request's `model` field is not trusted.
 
 use crate::buyer::api::stream::{CanonStreamDriver, CanonStreamNext};
@@ -18,7 +18,7 @@ use http::StatusCode;
 use std::convert::Infallible;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-/// `GET /v1/models`(B19): lists the model id of the buyer's configured frame/market.
+/// `GET /v1/models` (B19): lists the model id of the buyer's configured frame/market.
 pub async fn models(State(state): State<ApiState>) -> Json<serde_json::Value> {
     Json(serde_json::json!({
         "object": "list",
@@ -30,13 +30,13 @@ pub async fn models(State(state): State<ApiState>) -> Json<serde_json::Value> {
     }))
 }
 
-/// `POST /v1/chat/completions`(B19). `stream:true` -> SSE deltas + `[DONE]`; otherwise a single
+/// `POST /v1/chat/completions` (B19). `stream:true` → SSE deltas + `[DONE]`; otherwise a single
 /// aggregated `chat.completion` JSON.
 pub async fn chat_completions(
     State(state): State<ApiState>,
     Json(req): Json<OpenAiChatRequest>,
 ) -> Response {
-    // The model is forced by the market(B2/B19): a request outside the frame -- reject BEFORE opening the stream.
+    // The model is forced by the market (B2/B19): a request outside the frame — reject BEFORE opening the stream.
     if let Err(reason) = state.check_model(req.model.as_deref()) {
         return reject(StatusCode::BAD_REQUEST, &reason);
     }
@@ -45,7 +45,7 @@ pub async fn chat_completions(
         Err(reason) => return reject(deal_init_error_status(&reason), &reason),
     };
     let request_guard = deal.begin_request(now_secs());
-    // Session-scoped lifecycle: once the local deal is closed (terminal settlement landed or policy
+    // Session-scoped lifecycle (issue #37): once the local deal is closed (terminal settlement landed or policy
     // recovery is pending) no new request may open a stream on the closed deal.
     if deal.session.is_closed() {
         return reject(StatusCode::GONE, "deal session closed; open a new session");
@@ -59,7 +59,7 @@ pub async fn chat_completions(
     if let Err(reason) = deal.session.ensure_open_for_serving().await {
         return reject(StatusCode::BAD_GATEWAY, &reason);
     }
-    // one-per-deal content-identity gate(B8 + B7-full), run ONCE before the first paid stream. The inline
+    // #144: one-per-deal content-identity gate (B8 + B7-full), run ONCE before the first paid stream. The inline
     // StreamVerifier below only runs B5/B6 + the cheap declared-NAME B7; a seller declaring the correct model
     // NAME while serving a cheaper model is caught only here. On a bail the gate closes the deal and attempts
     // policy recovery; a transport error is not cached, so a later request retries.
@@ -81,7 +81,7 @@ pub async fn chat_completions(
     let model = state.frame_model.clone();
     let created = now_secs();
 
-    // Open an authorized TLS gRPC stream to the(mock) seller with the canonical request(R1).
+    // Open an authorized TLS gRPC stream to the (mock) seller with the canonical request (R1).
     let upstream = match state
         .buyer
         .open_canon_stream(
@@ -124,9 +124,9 @@ pub async fn chat_completions(
     };
 
     let max_tokens = request_token_limit(requested_max_tokens, deal.remaining_tokens());
-    // Session-scoped: the deal is NOT STOPped at this request's end -- it lives for the next
-    // request and is settled once at session end(graceful shutdown) or on a verification-bail. The handler
-    // settles the shared session ONLY on a bail(the seller cheated -> end the session, bail off B3/B10).
+    // Session-scoped (issue #37): the deal is NOT STOPped at this request's end — it lives for the next
+    // request and is settled once at session end (graceful shutdown) or on a verification-bail. The handler
+    // settles the shared session ONLY on a bail (the seller cheated → end the session, bail off B3/B10).
     if stream {
         sse_response(
             upstream,
@@ -153,8 +153,8 @@ pub async fn chat_completions(
     }
 }
 
-/// Re-render the canonical stream to OpenAI-SSE(B19, R6): `chat.completion.chunk` deltas ->
-/// terminal chunk with `finish_reason` -> `data: [DONE]`. Accounting/verification happen before
+/// Re-render the canonical stream to OpenAI-SSE (B19, R6): `chat.completion.chunk` deltas →
+/// terminal chunk with `finish_reason` → `data: [DONE]`. Accounting/verification happen before
 /// re-rendering.
 fn sse_response(
     upstream: tonic::Streaming<CanonChunk>,
@@ -173,7 +173,7 @@ fn sse_response(
         loop {
             let chunk = match driver.next().await {
                 CanonStreamNext::Chunk(c) => c,
-                // upstream transport error -- do NOT pass it off as a clean stop(see finish_reason below).
+                // #5: upstream transport error — do NOT pass it off as a clean stop (see finish_reason below).
                 CanonStreamNext::Errored(e) => {
                     stream_error = Some(e);
                     break;
@@ -193,9 +193,9 @@ fn sse_response(
             }
             deal.record_delivered(driver.received().saturating_sub(before));
         }
-        // Session-scoped: completion / max_tokens / upstream-error do NOT STOP -- the deal lives for
+        // Session-scoped (issue #37): completion / max_tokens / upstream-error do NOT STOP — the deal lives for
         // the next request and is settled once at session end. ONLY a verification-bail ends the session early
-        // (the seller cheated -> STOP this deal + bail off, B3/B10). `errored` still drives the finish_reason below.
+        // (the seller cheated → STOP this deal + bail off, B3/B10). `errored` still drives the finish_reason below.
         let bailed = driver.bailed();
         let received = driver.received();
         drop(driver);
@@ -206,13 +206,11 @@ fn sse_response(
         } else if received == 0 {
             deal.session.settle_empty_stream("empty-stream").await;
         }
-        // the terminal chunk does NOT pass off a bail or an upstream error as a clean `stop` --
-        // bail -> `content_filter`, transport error -> `error`, otherwise an honest `stop`.
+        // #5: the terminal chunk does NOT pass off a bail or an upstream error as a clean `stop` —
+        // bail → `content_filter`, transport error → `error`, otherwise an honest `stop`.
         let finish_reason = if bailed {
             "content_filter"
-        } else if stream_error.is_some() {
-            "error"
-        } else if received == 0 {
+        } else if stream_error.is_some() || received == 0 {
             "error"
         } else {
             "stop"
@@ -223,7 +221,7 @@ fn sse_response(
     Sse::new(sse)
 }
 
-/// Non-streaming(B19): collect the entire canonical stream into a single `chat.completion`.
+/// Non-streaming (B19): collect the entire canonical stream into a single `chat.completion`.
 async fn aggregate_response(
     upstream: tonic::Streaming<CanonChunk>,
     id: String,
@@ -250,8 +248,8 @@ async fn aggregate_response(
             break;
         }
     }
-    // Session-scoped: a clean completion / max_tokens does NOT STOP -- the deal lives for the next
-    // request. ONLY a verification-bail ends the session early(STOP + bail off, B3/B10).
+    // Session-scoped (issue #37): a clean completion / max_tokens does NOT STOP — the deal lives for the next
+    // request. ONLY a verification-bail ends the session early (STOP + bail off, B3/B10).
     let bailed = driver.bailed();
     let received = driver.received();
     drop(driver);
@@ -265,7 +263,7 @@ async fn aggregate_response(
         deal.session.settle_empty_stream("empty-stream").await;
         return reject(StatusCode::BAD_GATEWAY, "upstream produced an empty stream");
     }
-    // verification bail -> `content_filter`, so the consumer can tell an aborted response apart.
+    // #5: verification bail → `content_filter`, so the consumer can tell an aborted response apart.
     let finish_reason = if bailed { "content_filter" } else { "stop" };
     let body = render::openai_completion(&id, &model, created, &content, finish_reason);
     ([(http::header::CONTENT_TYPE, "application/json")], body).into_response()

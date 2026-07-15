@@ -1,4 +1,4 @@
-//! Local read-only dashboard for open stream handles.
+//! Local read-only dashboard for open stream handles (#200).
 
 use crate::cli::deals::{self, DealHandle, DealHandleRole};
 use anyhow::{bail, Result};
@@ -525,7 +525,7 @@ pub(crate) fn render_html(snapshot: &DashboardSnapshot) -> String {
     out.push_str("</style></head><body><main>");
     out.push_str("<h1>dexdo stream dashboard</h1>");
     out.push_str(&format!(
-        "<p class=\"muted\">JSON: <code>{}</code> * handles: <span id=\"handle-count\">{}</span></p>",
+        "<p class=\"muted\">JSON: <code>{}</code> · handles: <span id=\"handle-count\">{}</span></p>",
         DASHBOARD_JSON_PATH, snapshot.source.handle_count
     ));
     render_section(&mut out, "Buyer Streams", "buyer-rows", &snapshot.buyer);
@@ -539,7 +539,7 @@ fn dashboard_script() -> &'static str {
     r#"<script>
 function dashEscape(value){
   return String(value).replace(/[&<>"']/g,function(ch){
-    return {'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&;'}[ch];
+    return {'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[ch];
   });
 }
 function dashValue(value){
@@ -686,7 +686,7 @@ fn escape_html(s: &str) -> String {
             '<' => out.push_str("&lt;"),
             '>' => out.push_str("&gt;"),
             '"' => out.push_str("&quot;"),
-            '\'' => out.push_str("&;"),
+            '\'' => out.push_str("&#39;"),
             _ => out.push(c),
         }
     }

@@ -1,3 +1,9 @@
+## v0.0.11
+
+- release(v0.0.11): fix note deploy on the relaunched shellnet -- Hermez KZG voucher prover (gosh-ackinacki v0.4.1) so deployPrivateNote verifies against the node post-rotation DEX verifier (was ERR_INVALID_ZKPROOF/exit 137)
+- release(v0.0.11): re-pin to 4.0.27 / dapp-4; RootPN v1 hash; tvm-sdk v3.0.4 (getDetails v2 out-actions)
+- proven live: note deploy exit 0, full trade e2e (offer rests, deal funds, real qwen stream, settle)
+
 ## v0.0.9
 
 - directive(v0.0.9): item 12 -- withdraw fail-closed on prev-gen note (public fund loss)
