@@ -10372,7 +10372,7 @@ pub(crate) async fn run_reclaim(args: ReclaimArgs) -> Result<()> {
     let tc =
         Address::parse(&tc_str).map_err(|e| anyhow::anyhow!("token_contract {tc_str}: {e}"))?;
 
-    // Fail-loud pre-flight (#145/#149 §5, review §10 Bug 2): owned by THIS buyer + funded + not disputed + the
+    // Fail-loud pre-flight (#145/#149 §5, §10 Bug 2): owned by THIS buyer + funded + not disputed + the
     // relevant timeout reached. OPEN deals use STREAM_TIMEOUT (streamReclaim); funded-but-never-opened deals use
     // MATCH_OPEN_TIMEOUT from fundedTime (streamCleanup). Reject locally rather than letting the contract revert.
     let state = chain.token_contract_state(&tc).await?.ok_or_else(|| {

@@ -27,7 +27,7 @@ pub fn model_hash_for(frame_model: &str) -> String {
 }
 
 /// Validate that a model identifier is the **canonical `producer--model--version`** form — exactly three
-/// non-empty `--`-separated parts (e.g. `qwen--qwen3--32b`, `qwen--qwen3--32b`). This is the string
+/// non-empty `--`-separated parts (e.g. `openai--gpt--4.1`, `qwen--qwen3--32b`). This is the string
 /// hashed into the on-chain `modelHash` (and stored as the book's `getModelName`), and it is what the model
 /// indexer parses (`split("--")`, three parts) to show a human-readable market name; a non-canonical name
 /// (e.g. the OpenAI slug `qwen/qwen3-32b`) deploys a book the indexer can only key by its raw hash. Fail-loud
@@ -139,7 +139,7 @@ mod tests {
     /// three non-empty `--`-parts. An OpenAI slug (`qwen/qwen3-32b`) or a 2/4-part name is rejected fail-loud.
     #[test]
     fn validate_canonical_model_id_requires_three_parts() {
-        assert!(validate_canonical_model_id("qwen--qwen3--32b").is_ok());
+        assert!(validate_canonical_model_id("openai--gpt--4.1").is_ok());
         assert!(validate_canonical_model_id("qwen--qwen3--32b").is_ok());
         // Non-canonical: OpenAI slug, too few / too many parts, empty part.
         assert!(validate_canonical_model_id("qwen/qwen3-32b").is_err());

@@ -1,3 +1,8 @@
+## v0.0.12
+
+- release(v0.0.12): order-management scan skips filled/consumed orders instead of aborting (#433) -- a filled order lingering in the book (getOrder amount=0) no longer aborts `dexdo orders list` or the buyer's book scan before it reaches live orders behind it
+- proven live (4.0.27/dapp-4): on a book with filled/zeroed slots and a live ask, the scan skips the dead slots and lists the live order
+
 ## v0.0.11
 
 - release(v0.0.11): fix note deploy on the relaunched shellnet -- Hermez KZG voucher prover (gosh-ackinacki v0.4.1) so deployPrivateNote verifies against the node post-rotation DEX verifier (was ERR_INVALID_ZKPROOF/exit 137)

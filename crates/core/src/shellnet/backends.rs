@@ -1043,17 +1043,27 @@ fn parse_uint256_to_u128(value: &str) -> Uint256ToU128 {
 }
 
 fn orderbook_order_from_getter(order_id: u128, order: &Value) -> Result<Option<OrderBookOrder>> {
+    let ticks = order_u128(order, &["amount"])
+        .ok_or_else(|| anyhow!("getOrder({order_id}) missing/invalid amount: {order}"))?;
+    // A zero-tick slot is not a live, matchable order: either a cleanly removed slot
+    // (`_removeFromBook` -> `delete _orders[id]`, all fields zero) or an order filled /
+    // consumed to zero remaining ticks but not yet swept from the book (its owner note can
+    // linger until a `cancelInferenceOrder`). Neither can be matched, so skip it rather than
+    // letting a strict parse of a lingering filled order abort the whole book scan (#433).
+    if ticks == 0 {
+        return Ok(None);
+    }
     let owner_note = order["note"]
         .as_str()
         .filter(|note| !note.trim().is_empty())
         .ok_or_else(|| anyhow!("getOrder({order_id}) missing/invalid note: {order}"))?
         .to_string();
-    let ticks = order_u128(order, &["amount"])
-        .ok_or_else(|| anyhow!("getOrder({order_id}) missing/invalid amount: {order}"))?;
-    let note_is_zero = zero_address_like(&owner_note);
-    let amount_is_zero = ticks == 0;
-    if note_is_zero && amount_is_zero {
-        return Ok(None);
+    // A non-zero amount with a zero/absent owner note is genuinely malformed (ticks with no
+    // owner) — keep it fail-loud.
+    if zero_address_like(&owner_note) {
+        return Err(anyhow!(
+            "getOrder({order_id}) malformed: non-zero amount with zero owner note: {order}"
+        ));
     }
     let is_buy = order["isBuy"]
         .as_bool()
@@ -1096,11 +1106,6 @@ fn orderbook_order_from_getter(order_id: u128, order: &Value) -> Result<Option<O
         .map_err(|_| anyhow!("getOrder({order_id}) flags exceed uint8: {order}"))?;
     let timestamp = order_u64(order, &["ts"])
         .ok_or_else(|| anyhow!("getOrder({order_id}) missing/invalid ts: {order}"))?;
-    if note_is_zero || amount_is_zero {
-        return Err(anyhow!(
-            "getOrder({order_id}) malformed empty-order sentinel: amount must be zero if and only if note is the zero address: {order}"
-        ));
-    }
     Ok(Some(OrderBookOrder {
         order_id,
         owner_note,
@@ -1113,6 +1118,24 @@ fn orderbook_order_from_getter(order_id: u128, order: &Value) -> Result<Option<O
         flags,
         timestamp,
     }))
+}
+
+/// Build the live-order list from raw per-id `getOrder` reads, skipping empty/filled slots
+/// (`Ok(None)`) and lingering/unparseable slots (`Err`, logged) so one non-live or corrupt
+/// order never blinds the whole book scan (#433). Transport/chain read errors are surfaced by
+/// the caller before the raw values reach here.
+fn collect_live_orders(raw: impl IntoIterator<Item = (u128, Value)>) -> Vec<OrderBookOrder> {
+    let mut orders = Vec::new();
+    for (id, order) in raw {
+        match orderbook_order_from_getter(id, &order) {
+            Ok(Some(parsed)) => orders.push(parsed),
+            Ok(None) => {}
+            Err(error) => {
+                tracing::warn!(order_id = id, error = %format!("{error:#}"), "skipping unparseable order in book scan");
+            }
+        }
+    }
+    orders
 }
 
 #[cfg(test)]
@@ -1422,10 +1445,10 @@ fn orderbook_stats_from_getter(stats: &Value) -> OrderBookStats {
 #[cfg(test)]
 mod offer_rested_match_tests {
     use super::{
-        check_expected_buy_target, check_model_buy_full_fill, executable_resting_asks_by_state,
-        next_matching_ask, orderbook_order_from_getter, resting_ask_from_order,
-        selected_model_buy_ask, selected_model_buy_ask_matching_executable_depth,
-        submit_safe_executable_book_asks,
+        check_expected_buy_target, check_model_buy_full_fill, collect_live_orders,
+        executable_resting_asks_by_state, next_matching_ask, orderbook_order_from_getter,
+        resting_ask_from_order, selected_model_buy_ask,
+        selected_model_buy_ask_matching_executable_depth, submit_safe_executable_book_asks,
     };
     use serde_json::{json, Value};
     use std::collections::BTreeMap;
@@ -1634,22 +1657,65 @@ mod offer_rested_match_tests {
     }
 
     #[test]
-    fn order_parser_rejects_partial_empty_order_sentinels() {
-        let zero_note_nonzero_amount = json!({
-            "note": "0:000000", "tokenContract": "0:tc", "price": "1", "amount": "1",
-            "escrow": "0", "deadline": "0", "flags": "0", "ts": "0", "isBuy": false
-        });
-        let error = orderbook_order_from_getter(382, &zero_note_nonzero_amount)
-            .expect_err("zero note with nonzero amount is malformed, not absent");
-        assert!(error.to_string().contains("malformed empty-order sentinel"));
-
-        let nonzero_note_zero_amount = json!({
+    fn order_parser_skips_filled_zero_tick_order_and_rejects_ownerless_amount() {
+        // #433: a filled / consumed order lingers in the book as a real owner note with ZERO
+        // remaining ticks until a `cancelInferenceOrder` sweeps it. It is not matchable, so the
+        // parser SKIPS it (Ok(None)) instead of erroring — otherwise a single filled order at a
+        // low id would abort the whole book scan before it reaches the live orders behind it.
+        let filled_zero_tick = json!({
             "note": "0:seller", "tokenContract": "0:tc", "price": "1", "amount": "0",
             "escrow": "0", "deadline": "0", "flags": "0", "ts": "0", "isBuy": false
         });
-        let error = orderbook_order_from_getter(382, &nonzero_note_zero_amount)
-            .expect_err("zero amount with nonzero note is malformed, not absent");
-        assert!(error.to_string().contains("malformed empty-order sentinel"));
+        assert!(
+            orderbook_order_from_getter(382, &filled_zero_tick)
+                .expect("a filled zero-tick order is skipped, not an error")
+                .is_none(),
+            "a filled (zero-tick) order must be skipped so the scan reaches the live orders"
+        );
+
+        // A non-zero amount with a zero owner note is genuinely malformed (ticks with no owner)
+        // and stays fail-loud.
+        let ownerless_amount = json!({
+            "note": "0:000000", "tokenContract": "0:tc", "price": "1", "amount": "1",
+            "escrow": "0", "deadline": "0", "flags": "0", "ts": "0", "isBuy": false
+        });
+        let error = orderbook_order_from_getter(382, &ownerless_amount)
+            .expect_err("nonzero amount with zero owner note is malformed, not absent");
+        assert!(error.to_string().contains("zero owner note"), "{error:#}");
+    }
+
+    #[test]
+    fn book_scan_skips_filled_and_unparseable_orders_and_keeps_live_ones() {
+        // #433 end to end at the scan layer: a book with a filled order at id 1 and an
+        // unparseable/corrupt slot at id 2 must still surface the live order at id 3, in order,
+        // rather than aborting on the first non-live id.
+        let raw = vec![
+            (
+                1u128,
+                json!({
+                    "note": "0:seller", "tokenContract": "0:tc1", "price": "1", "amount": "0",
+                    "escrow": "0", "deadline": "0", "flags": "0", "ts": "0", "isBuy": false
+                }),
+            ),
+            (
+                2u128,
+                json!({
+                    "note": "0:000000", "tokenContract": "0:tc2", "price": "1", "amount": "5",
+                    "escrow": "0", "deadline": "0", "flags": "0", "ts": "0", "isBuy": false
+                }),
+            ),
+            (
+                3u128,
+                json!({
+                    "note": "0:seller", "tokenContract": "0:tc3", "price": "7", "amount": "9",
+                    "escrow": "0", "deadline": "0", "flags": "0", "ts": "0", "isBuy": false
+                }),
+            ),
+        ];
+        let live = collect_live_orders(raw);
+        assert_eq!(live.len(), 1, "only the live order should survive: {live:?}");
+        assert_eq!(live[0].order_id, 3);
+        assert_eq!(live[0].ticks, 9);
     }
 
     #[test]
@@ -2399,15 +2465,16 @@ impl RealChainBackend {
             });
         };
         let stats = orderbook_stats_from_getter(&stats_value);
-        let mut orders = Vec::new();
+        let mut raw = Vec::new();
         for id in 1..stats.next_order_id {
-            let Some(order) = self.inference_orderbook_order(order_book, id).await? else {
-                continue;
-            };
-            if let Some(parsed) = orderbook_order_from_getter(id, &order)? {
-                orders.push(parsed);
+            // A per-id transport/chain read failure is a real error and surfaces here; a
+            // `None` is an absent slot. Parsing (and the #433 skip of filled/unparseable
+            // orders) happens in `collect_live_orders`.
+            if let Some(order) = self.inference_orderbook_order(order_book, id).await? {
+                raw.push((id, order));
             }
         }
+        let orders = collect_live_orders(raw);
         Ok(OrderBookSnapshot {
             frame_model: frame_model.to_string(),
             model_hash: model_hash.to_string(),
