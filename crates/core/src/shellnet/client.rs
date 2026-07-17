@@ -862,20 +862,20 @@ mod oracle_getter_tests {
     }
 }
 
-/// Manifest of the deployed shellnet contracts (`contracts/deployed.shellnet.json`).
-/// The address source for the adapter and e2e (directive 2). `InferenceOrderBook` (per-model) and
-/// `TokenContract` (per-deal) are derived/discovered on the fly, so they are not pinned here.
+/// Manifest of the deployed shellnet contracts(`contracts/deployed.shellnet.json`).
+/// The address source for the adapter and e2e. `InferenceOrderBook`(per-model) and
+/// `TokenContract`(per-deal) are derived/discovered on the fly, so they are not pinned here.
 #[derive(Debug, Clone, Deserialize)]
 pub struct Deployed {
-    /// Network label (for shellnet, `"shellnet"`).
+    /// Network label(for shellnet, `"shellnet"`).
     pub network: String,
-    /// `SuperRoot` airegistry — the derivation point for `RootModel`/`InferenceOrderBook`.
+    /// `SuperRoot` airegistry -- the derivation point for `RootModel`/`InferenceOrderBook`.
     pub superroot: String,
-    /// `DappConfig` (a DApp with unlimited credit for deploys).
+    /// `DappConfig`(a DApp with unlimited credit for deploys).
     pub dapp_config: String,
-    /// `dapp_id` (= account_id of `SuperRoot`).
+    /// `dapp_id`(= account_id of `SuperRoot`).
     pub dapp_id: String,
-    /// The seller's probe-tick commission in bps (an order-book deploy parameter, §3.1.2).
+    /// The seller's probe-tick commission in bps.
     pub seller_probe_commission_bps: u16,
     /// Optional Block Manager endpoint. `graphql` is accepted for deployed-manifest compatibility.
     #[serde(default, alias = "graphql")]
@@ -883,7 +883,7 @@ pub struct Deployed {
 }
 
 impl Deployed {
-    /// Read the manifest from a file (`contracts/deployed.shellnet.json`).
+    /// Read the manifest from a file(`contracts/deployed.shellnet.json`).
     pub fn load(path: impl AsRef<Path>) -> anyhow::Result<Self> {
         let bytes = std::fs::read(path.as_ref())?;
         Ok(serde_json::from_slice(&bytes)?)
@@ -922,7 +922,7 @@ pub fn resolve_endpoint(explicit: Option<&str>, manifest: &Deployed) -> anyhow::
     )
 }
 
-/// Real on-chain backend on top of `gosh.ackinacki` `ChainClient` (directive 2).
+/// Real on-chain backend on top of `gosh.ackinacki` `ChainClient`.
 /// Carries a live connection to shellnet and the root addresses from the manifest.
 pub struct RealChainBackend {
     client: ChainClient,
@@ -934,10 +934,10 @@ pub struct RealChainBackend {
     deployed: Deployed,
 }
 
-/// True iff `e` is the BK REST `/v2/account` lookup 404 — the destination account is not yet in the
-/// block-manager index (a **funded-uninit deploy target**). Matched on the specific endpoint **and**
+/// True iff `e` is the BK REST `/v2/account` lookup 404 -- the destination account is not yet in the
+/// block-manager index(a **funded-uninit deploy target**). Matched on the specific endpoint **and**
 /// status, NOT a blanket "contains 404": a 404 from any other URL/cause still propagates as a real
-/// error, and this only ever flips routing for a deploy-message send (`submit_once(.., deploy=true)`). #68.
+/// error, and this only ever flips routing for a deploy-message send (`submit_once(.., deploy=true)`)..
 pub(super) fn is_uninit_account_404(e: &str) -> bool {
     e.contains("/v2/account") && e.contains("404")
 }
@@ -1275,22 +1275,17 @@ impl RealChainBackend {
         read_book_event_fold(&self.http, self.client.endpoint(), order_book, previous).await
     }
 
-    /// Low-level chain client (for the trait adapter in the next step).
+    /// Low-level chain client(for the trait adapter in the next step).
     pub fn client(&self) -> &ChainClient {
         &self.client
     }
 
-    /// The `SuperRoot` address — the derivation point for `RootModel`/`InferenceOrderBook`.
+    /// The `SuperRoot` address -- the derivation point for `RootModel`/`InferenceOrderBook`.
     pub fn superroot(&self) -> &Address {
         &self.superroot
     }
 
-    /// Manifest of the deployed contracts.
-    pub fn deployed(&self) -> &Deployed {
-        &self.deployed
-    }
-
-    /// Chain liveness check — confirms a working connection to shellnet.
+    /// Chain liveness check -- confirms a working connection to shellnet.
     pub async fn liveness(&self) -> Result<ChainLiveness> {
         self.client.chain_liveness().await
     }
@@ -1364,7 +1359,7 @@ impl RealChainBackend {
         })
     }
 
-    /// Read-only shellnet readiness report (#161): compare this binary's embedded/pinned contract images against
+    /// Read-only shellnet readiness report: compare this binary's embedded/pinned contract images against
     /// live shellnet and, when supplied, verify that a market manifest still points at active IOB/TC accounts.
     pub async fn doctor(&self, market: Option<&MarketManifest>) -> Result<ShellnetDoctorReport> {
         let mut checks = Vec::new();
@@ -1505,7 +1500,7 @@ impl RealChainBackend {
         })
     }
 
-    /// The `SuperRoot` owner pubkey (on-chain getter `getOwnerPubkey`).
+    /// The `SuperRoot` owner pubkey(on-chain getter `getOwnerPubkey`).
     pub async fn superroot_owner_pubkey(&self) -> Result<Value> {
         let v = self
             .client
@@ -1515,9 +1510,9 @@ impl RealChainBackend {
         Ok(v["value0"].clone())
     }
 
-    /// The `RootModel` address for a given owner pubkey — the deterministic SuperRoot on-chain getter
-    /// `getRootModelAddress(ownerPubkey)`. RootModel is per-owner: for the seller (model owner)
-    /// it is derived from their pubkey (see [`Self::deploy_root_model`]).
+    /// The `RootModel` address for a given owner pubkey -- the deterministic SuperRoot on-chain getter
+    /// `getRootModelAddress(ownerPubkey)`. RootModel is per-owner: for the seller(model owner)
+    /// it is derived from their pubkey(see [`Self::deploy_root_model`]).
     pub async fn root_model_address_for(&self, owner_pubkey: &Value) -> Result<Address> {
         let v = self
             .client
@@ -1532,7 +1527,7 @@ impl RealChainBackend {
         Address::parse(v["value0"].as_str().ok_or_else(|| anyhow!("no address"))?)
     }
 
-    /// Derive the `RootModel` address of the `SuperRoot` owner (part of address resolution for `ChainBackend`).
+    /// Derive the `RootModel` address of the `SuperRoot` owner(part of address resolution for `ChainBackend`).
     pub async fn resolve_root_model(&self) -> Result<Address> {
         let owner = self.superroot_owner_pubkey().await?;
         self.root_model_address_for(&owner).await
@@ -1559,8 +1554,8 @@ impl RealChainBackend {
         Ok((Address::parse(&msg.address)?, msg.message_boc_b64))
     }
 
-    /// Derive the per-deal `TokenContract` address from `RootModel` (`getTokenContractAddress`)
-    /// by the seller's pubkey and the deal nonce — a deterministic on-chain getter.
+    /// Derive the per-deal `TokenContract` address from `RootModel`(`getTokenContractAddress`)
+    /// by the seller's pubkey and the deal nonce -- a deterministic on-chain getter.
     pub async fn resolve_token_contract(
         &self,
         root_model: &Address,
@@ -1580,15 +1575,14 @@ impl RealChainBackend {
         Address::parse(v["value0"].as_str().ok_or_else(|| anyhow!("no address"))?)
     }
 
-    /// Derive the per-deal `TokenContract` address from the deploy **INIT-DATA (stateInit)** — the
-    /// getter-free, offline counterpart to [`resolve_token_contract`](Self::resolve_token_contract) (#68).
-    ///
+    /// Derive the per-deal `TokenContract` address from the deploy **INIT-DATA(stateInit)** -- the
+    /// getter-free, offline counterpart to [`resolve_token_contract`](Self::resolve_token_contract).
     /// `provision_market`'s idempotency check must NOT depend on the RootModel `getTokenContractAddress`
     /// network getter: on a fresh provision the RootModel deploy was just sent but is not yet `Active`, so the
     /// getter 404s and `resolve_token_contract`'s `"RootModel is not active"` error would abort the **entire**
-    /// idempotent provision — exactly the case the check exists to handle. The TC address is `hash(stateInit)`
+    /// idempotent provision -- exactly the case the check exists to handle. The TC address is `hash(stateInit)`
     /// over `{code, varInit {_sellerPubkey,_rootModelAddress,_nonce,_pubkey}}`; it needs no RootModel account,
-    /// no network, and cannot 404. (Bit-for-bit the address the deploy creates — cross-checked against the
+    /// no network, and cannot 404. (Bit-for-bit the address the deploy creates -- cross-checked against the
     /// getter only on the idempotent-skip branch, where the RootModel is guaranteed `Active`.)
     #[allow(clippy::too_many_arguments)]
     pub async fn token_contract_deploy_address(
@@ -1616,8 +1610,8 @@ impl RealChainBackend {
             .0)
     }
 
-    /// Read the endpoint ciphertext from `TokenContract` (handover §3.1) — getter
-    /// `getEndpointCipher`. The same `Handover` format as in directive 1 (the buyer
+    /// Read the endpoint ciphertext from `TokenContract` -- getter
+    /// `getEndpointCipher`. The same `Handover` format as in (the buyer
     /// decrypts with the note key). `None` if the contract is not active or the endpoint is not yet written.
     pub async fn read_handover(&self, token_contract: &Address) -> Result<Option<Vec<u8>>> {
         let Some(v) = self
@@ -1642,7 +1636,7 @@ impl RealChainBackend {
 
     /// The deployed TC's stored `_modelHash` (4.0.6 `getModelHash() = sha256(modelName)`), normalized to
     /// `0x` + 64 lowercase hex. Used to assert the deal TC is for the SAME model as the order book
-    /// (`model_hash`) before posting — the 4.0.6 end-to-end model-name invariant.
+    /// (`model_hash`) before posting -- the 4.0.6 end-to-end model-name invariant.
     pub async fn token_contract_model_hash(&self, tc: &Address) -> Result<Option<String>> {
         let Some(v) = self
             .client
@@ -1659,8 +1653,8 @@ impl RealChainBackend {
         Ok(Some(format!("0x{}", format!("{hex:0>64}").to_lowercase())))
     }
 
-    /// The TC's on-chain **model display name** (`getModelName() -> string`, 4.0.6) — the authoritative name
-    /// for the accounting view (issue #23): the manifest's `frame_model` is operator-supplied and must NOT be
+    /// The TC's on-chain **model display name** (`getModelName() -> string`, 4.0.6) -- the authoritative name
+    /// for the accounting view: the manifest's `frame_model` is operator-supplied and must NOT be
     /// trusted as chain truth. `None` if the TC is not active or the name is empty.
     pub async fn token_contract_model_name(&self, tc: &Address) -> Result<Option<String>> {
         let Some(v) = self
@@ -1677,8 +1671,8 @@ impl RealChainBackend {
         Ok(Some(name.to_string()))
     }
 
-    /// The TC's on-chain **price per tick** (`getDeal() -> (tickSize, pricePerTick, maxTicks)`, 4.0.6) — the
-    /// authoritative deal price for the accounting view (issue #23), NOT the operator-supplied manifest value.
+    /// The TC's on-chain **price per tick** (`getDeal() ->(tickSize, pricePerTick, maxTicks)`, 4.0.6) -- the
+    /// authoritative deal price for the accounting view, NOT the operator-supplied manifest value.
     /// `uint128` decimal string. `None` if the TC is not active.
     pub async fn token_contract_price_per_tick(&self, tc: &Address) -> Result<Option<u128>> {
         let Some(v) = self
@@ -1717,11 +1711,11 @@ impl RealChainBackend {
         Ok(Some((tick_size, price_per_tick, max_ticks)))
     }
 
-    /// Read the **buyer's ed25519 pubkey** from `TokenContract` (`getBuyerPubkey`, uint256) — the book
-    /// records it on a match (`placeInferenceBuy`). From it the seller **reconstructs the x25519 handover**
-    /// ([`crate::note::x25519_pub_from_ed25519_pub`], Montgomery form, D10) and encrypts the endpoint to
-    /// the recovered pubkey — no separate x25519 channel is needed. `None` if the TC is not active or the buyer
-    /// is not yet recorded (zero pubkey). The pubkey round-trips as `0x`-hex (like `getOwnerPubkey`).
+    /// Read the **buyer's ed25519 pubkey** from `TokenContract`(`getBuyerPubkey`, uint256) -- the book
+    /// records it on a match(`placeInferenceBuy`). From it the seller **reconstructs the x25519 handover**
+    /// and encrypts the endpoint to
+    /// the recovered pubkey -- no separate x25519 channel is needed. `None` if the TC is not active or the buyer
+    /// is not yet recorded(zero pubkey). The pubkey round-trips as `0x`-hex(like `getOwnerPubkey`).
     pub async fn token_contract_buyer_pubkey(&self, tc: &Address) -> Result<Option<[u8; 32]>> {
         let Some(v) = self
             .client
@@ -1735,7 +1729,7 @@ impl RealChainBackend {
         if hex.is_empty() {
             return Ok(None);
         }
-        // uint256 → 32 bytes BE (the pubkey may have arrived without leading zeros — left-pad to 64 hex).
+        // uint256 -> 32 bytes BE(the pubkey may have arrived without leading zeros -- left-pad to 64 hex).
         let bytes = decode_hex(&format!("{hex:0>64}"))?;
         if bytes.len() != 32 {
             return Err(anyhow!(
@@ -1802,9 +1796,9 @@ impl RealChainBackend {
         Ok(Some(hex))
     }
 
-    /// The `InferenceOrderBook` code-cell as base64-BOC — the `code` argument for
+    /// The `InferenceOrderBook` code-cell as base64-BOC -- the `code` argument for
     /// `deployInferenceOrderBook`/`getInferenceOrderBookAddress`. Extracted from the embedded
-    /// `.tvc` (StateInit → `.code`), like `airegistry::abi::Contract::code_boc_b64` in the SDK.
+    /// `.tvc`(StateInit -> `.code`), like `airegistry::abi::Contract::code_boc_b64` in the SDK.
     pub fn inference_orderbook_code_b64() -> Result<String> {
         code_boc_b64(INFERENCE_ORDERBOOK_TVC)
     }
@@ -1813,9 +1807,9 @@ impl RealChainBackend {
         inference_orderbook_address_from_model_hash(model_hash)
     }
 
-    /// Deterministic `InferenceOrderBook` address for (model, tick size) — the note's on-chain getter
+    /// Deterministic `InferenceOrderBook` address for(model, tick size) -- the note's on-chain getter
     /// `getInferenceOrderBookAddress(code, modelHash, tickSize)`. Success = the note has this
-    /// method (meaning it is an inference note). `model_hash` is `0x…` uint256, `tick_size` is uint128.
+    /// method(meaning it is an inference note). `model_hash` is `0x...` uint256, `tick_size` is uint128.
     pub async fn inference_orderbook_address(
         &self,
         note: &Address,
@@ -1840,7 +1834,7 @@ impl RealChainBackend {
         Address::parse(v["value0"].as_str().ok_or_else(|| anyhow!("no address"))?)
     }
 
-    /// Parameters of the deployed `InferenceOrderBook` — getter `getParams` (`modelHash`, `tickSize`,
+    /// Parameters of the deployed `InferenceOrderBook` -- getter `getParams` (`modelHash`, `tickSize`,
     /// `platformFeeBps`). Confirms that the book came up with the expected parameters. `None` if
     /// the book is not yet active.
     pub async fn inference_orderbook_params(&self, ob: &Address) -> Result<Option<Value>> {
@@ -1849,10 +1843,10 @@ impl RealChainBackend {
             .await
     }
 
-    /// A signed external contract call (write) through the backend's **browser-UA** http
-    /// client: `encode_external_call` (the same codec as `ChainClient::call`) → submit to
-    /// `/v2/messages`. The ChainClient is not used for writes — its default UA is blocked by
-    /// Cloudflare (getters through it work fine). Returns the submit response.
+    /// A signed external contract call(write) through the backend's **browser-UA** http
+    /// client: `encode_external_call`(the same codec as `ChainClient::call`) -> submit to
+    /// `/v2/messages`. The ChainClient is not used for writes -- its default UA is blocked by
+    /// Cloudflare(getters through it work fine). Returns the submit response.
     async fn encode_signed_call_boc(
         addr: &Address,
         abi_json: &str,
@@ -1905,16 +1899,16 @@ impl RealChainBackend {
         Ok((endpoint, boc, account_id, dapp_id))
     }
 
-    /// Submit `boc` to `/v2/messages`. `deploy` selects the routing (#65/#68):
-    /// - `false` — a regular write to an **existing** contract (call/fund): `send_message`, which
-    ///   reads the real `dapp_id` via the BK REST `/v2/account`. A 404 there is a real error → propagates.
-    /// - `true` — a **deploy-message send** whose destination is a not-yet-deployed self-dapp address:
-    ///   read the real `dapp_id`, but on the **specific `/v2/account` uninit-404** ([`is_uninit_account_404`])
-    ///   fall back to `dapp_id = account_id` (self-dapp) and submit via `send_message_routed` (which skips
-    ///   the `/v2/account` read). This lets one `dexdo provision` land a fresh deploy in a SINGLE shot
-    ///   instead of dying on the first attempt and forcing a cumulative re-funded retry.
-    ///   **Scoped:** only the deploy/fund submit sites pass `deploy = true`; every regular write keeps the
-    ///   unchanged `send_message` path. Any non-`/v2/account` 404 (or other error) still propagates.
+    /// Submit `boc` to `/v2/messages`. `deploy` selects the routing:
+    /// - `false` -- a regular write to an **existing** contract(call/fund): `send_message`, which
+    /// reads the real `dapp_id` via the BK REST `/v2/account`. A 404 there is a real error -> propagates.
+    /// - `true` -- a **deploy-message send** whose destination is a not-yet-deployed self-dapp address:
+    /// read the real `dapp_id`, but on the **specific `/v2/account` uninit-404**([`is_uninit_account_404`])
+    /// fall back to `dapp_id = account_id`(self-dapp) and submit via `send_message_routed` (which skips
+    /// the `/v2/account` read). This lets one `dexdo provision` land a fresh deploy in a SINGLE shot
+    /// instead of dying on the first attempt and forcing a cumulative re-funded retry.
+    /// **Scoped:** only the deploy/fund submit sites pass `deploy = true`; every regular write keeps the
+    /// unchanged `send_message` path. Any non-`/v2/account` 404(or other error) still propagates.
     async fn submit_once(&self, boc: &str, deploy: bool) -> Result<Value> {
         let endpoint = self.client.endpoint();
         if !deploy {
@@ -1938,14 +1932,14 @@ impl RealChainBackend {
     }
 
     /// Submit a message to shellnet with retry on **transient** infrastructure failures:
-    /// (1) overflow of the block manager's write queue (`QUEUE_OVERFLOW` — "message queue is full");
+    /// (1) overflow of the block manager's write queue(`QUEUE_OVERFLOW` -- "message queue is full");
     /// (2) **transient gateway 5xx** (`502 Bad Gateway` / `503` / `504` from the reverse proxy, when
-    /// the backend is briefly unavailable — observed to flicker on shellnet under load). The node is alive and moving
-    /// blocks; we wait (exponential backoff, cap 8s) and retry — this is resilience to a real network,
-    /// not a test crutch. Other (logical) errors propagate immediately. `deploy` is threaded to
+    /// the backend is briefly unavailable -- observed to flicker on shellnet under load). The node is alive and moving
+    /// blocks; we wait(exponential backoff, cap 8s) and retry -- this is resilience to a real network,
+    /// not a test crutch. Other(logical) errors propagate immediately. `deploy` is threaded to
     /// [`submit_once`] so only deploy-message sends get the funded-uninit `/v2/account` 404 tolerance.
     async fn retry_submit(&self, boc: &str, deploy: bool) -> Result<Value> {
-        // Transient marker: the queue is full OR a temporary gateway failure (5xx) that clears on its own.
+        // Transient marker: the queue is full OR a temporary gateway failure(5xx) that clears on its own.
         fn is_transient(msg: &str) -> bool {
             msg.contains("QUEUE_OVERFLOW")
                 || msg.contains("502")
@@ -1969,17 +1963,17 @@ impl RealChainBackend {
                 Err(e) => return Err(e),
             }
         }
-        // Final attempt — pass the result through as-is (Ok or the final error).
+        // Final attempt -- pass the result through as-is(Ok or the final error).
         self.submit_once(boc, deploy).await
     }
 
-    /// Regular write to an **existing** contract (call/fund) — unchanged `send_message` routing.
+    /// Regular write to an **existing** contract(call/fund) -- unchanged `send_message` routing.
     pub(super) async fn send_with_retry(&self, boc: &str) -> Result<Value> {
         self.retry_submit(boc, false).await
     }
 
-    /// A **deploy-message** send (its destination is a not-yet-deployed self-dapp address): tolerates
-    /// the funded-uninit `/v2/account` 404 via self-dapp routing (#65/#68). Use ONLY for deploy submits.
+    /// A **deploy-message** send(its destination is a not-yet-deployed self-dapp address): tolerates
+    /// the funded-uninit `/v2/account` 404 via self-dapp routing. Use ONLY for deploy submits.
     async fn send_deploy_with_retry(&self, boc: &str) -> Result<Value> {
         self.retry_submit(boc, true).await
     }
@@ -1998,8 +1992,8 @@ impl RealChainBackend {
     ) -> Result<Value> {
         let code = Self::inference_orderbook_code_b64()?;
         // 4.0.6: the book's ctor verifies `sha256(modelName) == modelHash`, so `model_hash` MUST be
-        // `sha256(model_name)` (the canonical preimage). `inferenceOrderBookCode`/`tickSize` are not in
-        // the 2-arg ABI (the OB code is stored on the note) — harmless extra keys, the encoder ignores them.
+        // `sha256(model_name)`(the canonical preimage). `inferenceOrderBookCode`/`tickSize` are not in
+        // the 2-arg ABI(the OB code is stored on the note) -- harmless extra keys, the encoder ignores them.
         self.submit(
             note,
             PRIVATENOTE_ABI,
@@ -2015,7 +2009,7 @@ impl RealChainBackend {
         .await
     }
 
-    /// The book's `getBestBidAsk` getter (`hasBid`, `bid`, `hasAsk`, `ask`) — a check that the offer landed
+    /// The book's `getBestBidAsk` getter(`hasBid`, `bid`, `hasAsk`, `ask`) -- a check that the offer landed
     /// in the order book as an ask. `None` if the book is not active.
     pub async fn inference_orderbook_best_bid_ask(&self, ob: &Address) -> Result<Option<Value>> {
         self.client
@@ -2023,7 +2017,7 @@ impl RealChainBackend {
             .await
     }
 
-    /// Poll THIS note's owner-facing `InferenceFilledConfirmed` ext-out (§3.1, vendored 4.0.15 mirror)
+    /// Poll THIS note's owner-facing `InferenceFilledConfirmed` ext-out
     /// and advance a durable cursor. The side is owner-relative: `want_is_buy=true` for the buyer's note,
     /// `false` for the seller's note. The caller decides whether/how long to sleep between polls.
     pub async fn poll_inference_filled_tcs(
@@ -2278,12 +2272,12 @@ impl RealChainBackend {
         Ok(out)
     }
 
-    /// Wait for THIS note's owner-facing `InferenceFilledConfirmed` ext-out (§3.1, vendored 4.0.15 mirror)
-    /// and return the matched per-deal `TokenContract`. The buyer learns its deal from JUST its own note —
+    /// Wait for THIS note's owner-facing `InferenceFilledConfirmed` ext-out
+    /// and return the matched per-deal `TokenContract`. The buyer learns its deal from JUST its own note --
     /// no shared-book index. Polls the note's ext-out via the chain GraphQL (the same `messages(ExtOut)`
     /// surface the live giver diag uses), decodes each body, and returns the first fill that is this note's
     /// BUY side on the derived `order_book`, ignoring events older than `since_unix` (a note may carry a
-    /// prior deal's fill). Fails closed on timeout — never a silent empty.
+    /// prior deal's fill). Fails closed on timeout -- never a silent empty.
     pub async fn wait_inference_filled_tc(
         &self,
         note: &Address,
@@ -2323,7 +2317,7 @@ impl RealChainBackend {
         .await
     }
 
-    /// The book's `getStats` getter (`nextOrderId`, `orderCount`, `executedNotional`, `executedTicks`).
+    /// The book's `getStats` getter(`nextOrderId`, `orderCount`, `executedNotional`, `executedTicks`).
     pub async fn inference_orderbook_stats(&self, ob: &Address) -> Result<Option<Value>> {
         self.client
             .run_getter(ob, INFERENCE_ORDERBOOK_ABI, "getStats", json!({}))
@@ -2410,7 +2404,7 @@ impl RealChainBackend {
             .map(Some)
     }
 
-    /// The book's `getOrder(id)` getter — resolves a specific order/offer (note, `tokenContract`, price…).
+    /// The book's `getOrder(id)` getter -- resolves a specific order/offer(note, `tokenContract`, price...).
     pub async fn inference_orderbook_order(&self, ob: &Address, id: u128) -> Result<Option<Value>> {
         self.client
             .run_getter(
@@ -2450,7 +2444,7 @@ impl RealChainBackend {
     }
 
     /// The book's `getSubscription(orderId)` getter. `exists=false` means the order is not a live
-    /// subscription (it may be a plain order, cancelled, filled, or expired).
+    /// subscription(it may be a plain order, cancelled, filled, or expired).
     pub async fn inference_orderbook_subscription(
         &self,
         ob: &Address,
@@ -2534,10 +2528,10 @@ impl RealChainBackend {
         .await
     }
 
-    /// The buyer (note) places a limit buy for inference — `placeInferenceBuy(modelHash,
-    /// maxPricePerTick, ticks, escrow, flags, deadline)` (signed with the note's owner key). The escrow is ECC
-    /// SHELL (currency 2): the note moves `escrow` from its ECC balance into the book. `deadline=0` = GTC.
-    /// If `maxPricePerTick` ≥ the resting ask — a match happens immediately (the book calls `fundFromOrderBook` on the TC).
+    /// The buyer(note) places a limit buy for inference -- `placeInferenceBuy(modelHash,
+    /// maxPricePerTick, ticks, escrow, flags, deadline)`(signed with the note's owner key). The escrow is ECC
+    /// SHELL(currency 2): the note moves `escrow` from its ECC balance into the book. `deadline=0` = GTC.
+    /// If `maxPricePerTick` >= the resting ask -- a match happens immediately(the book calls `fundFromOrderBook` on the TC).
     #[allow(clippy::too_many_arguments)]
     pub async fn place_inference_buy(
         &self,
@@ -2617,7 +2611,7 @@ impl RealChainBackend {
         .await
     }
 
-    /// The buyer (note) places a recurring inference subscription through
+    /// The buyer(note) places a recurring inference subscription through
     /// `PrivateNote.placeInferenceSubscription`. The escrow is exact fee-inclusive SHELL selected by
     /// the CLI; surplus is intentionally not sent.
     #[allow(clippy::too_many_arguments)]
@@ -2764,7 +2758,7 @@ impl RealChainBackend {
     }
 
     /// The `getState` getter of the `TokenContract` deal (`funded`, `opened`, `probeAccepted`, `disputed`,
-    /// `deposit`, `prepaid`, `frozen`, `finalizedOwed`, …). After a match `funded` becomes `true`
+    /// `deposit`, `prepaid`, `frozen`, `finalizedOwed`,...). After a match `funded` becomes `true`
     /// (the book funded the TC via `fundFromOrderBook`). `None` if the TC is not active.
     pub async fn token_contract_state(&self, tc: &Address) -> Result<Option<Value>> {
         self.client
@@ -2772,27 +2766,27 @@ impl RealChainBackend {
             .await
     }
 
-    /// The `getProbe` getter of the deal (`probeFunded`, `probeLocked`, `probeCommission`).
+    /// The `getProbe` getter of the deal(`probeFunded`, `probeLocked`, `probeCommission`).
     pub async fn token_contract_probe(&self, tc: &Address) -> Result<Option<Value>> {
         self.client
             .run_getter(tc, TOKENCONTRACT_ABI, "getProbe", json!({}))
             .await
     }
 
-    /// The `getConfig` getter of the deal (`TokenContract`, 4.0.5 `view`): the per-deal
-    /// `settleWindow`/`streamTimeout` (dynamic, scaled by `pricePerTick`) plus `platformFeeBps` and
+    /// The `getConfig` getter of the deal(`TokenContract`, 4.0.5 `view`): the per-deal
+    /// `settleWindow`/`streamTimeout`(dynamic, scaled by `pricePerTick`) plus `platformFeeBps` and
     /// `disputeWindow`. The seller advance driver reads this per deal to time the stream cadence
-    /// (`settleWindow`) and reclaim/timeout (`streamTimeout`); the fixed probe window is NOT in here
-    /// (§9.1, issue #37). `None` if the TC is not active.
+    /// (`settleWindow`) and reclaim/timeout(`streamTimeout`); the fixed probe window is NOT in here
+    /// . `None` if the TC is not active.
     pub async fn token_contract_config(&self, tc: &Address) -> Result<Option<Value>> {
         self.client
             .run_getter(tc, TOKENCONTRACT_ABI, "getConfig", json!({}))
             .await
     }
 
-    /// The `getStreamLocks` getter of the `PrivateNote` note (`streamCount`, `disputeCount`, `lastChange`):
-    /// direct proof that "the note is locked" (directive 5, §4.2). After `TC.dispute()` both notes have
-    /// `disputeCount > 0` — until the dispute is resolved, a new offer/withdrawal from the note is rejected
+    /// The `getStreamLocks` getter of the `PrivateNote` note(`streamCount`, `disputeCount`, `lastChange`):
+    /// direct proof that "the note is locked". After `TC.dispute()` both notes have
+    /// `disputeCount > 0` -- until the dispute is resolved, a new offer/withdrawal from the note is rejected
     /// (`ERR_STREAM_LOCKED`). `None` if the note is not active.
     pub async fn note_stream_locks(&self, note: &Address) -> Result<Option<Value>> {
         self.client
@@ -3002,7 +2996,7 @@ impl RealChainBackend {
         buyer_note_withdrawn_guard(note, details.as_ref())
     }
 
-    /// #335: read-only seller preflight for the contract's final-withdrawal latch. `withdrawTokens` sets
+    /// read-only seller preflight for the contract's final-withdrawal latch. `withdrawTokens` sets
     /// `_hasWithdrawn=true`; after that `PrivateNote.postSellOffer` is permanently blocked by
     /// `ERR_INVALID_STATE` 151. Keep that semantics and fail before any seller write.
     pub async fn assert_note_can_post_sell_offer(&self, note: &Address) -> Result<()> {
@@ -3024,9 +3018,9 @@ impl RealChainBackend {
         Ok(())
     }
 
-    /// Directive #58 — the note pre-funds its own RootModel + TC **uninit deploy addresses** from its ECC[2],
-    /// via the `PrivateNote` owner-method `fundDeployShell(nonce, rootModelShell, tcShell)` (4.0.7). The note
-    /// derives both targets internally from `(ephemeralPubkey, nonce)`, so no caller-supplied address — this
+    /// Directive -- the note pre-funds its own RootModel + TC **uninit deploy addresses** from its ECC[2],
+    /// via the `PrivateNote` owner-method `fundDeployShell(nonce, rootModelShell, tcShell)`(4.0.7). The note
+    /// derives both targets internally from `(ephemeralPubkey, nonce)`, so no caller-supplied address -- this
     /// replaces the operator multisig's [`fund_deploy_from_wallet_ecc`](Self::fund_deploy_from_wallet_ecc) on the
     /// operate path. The RootModel/TC *deploys* stay external seller-signed; this call only pre-funds. The call is
     /// an external owner-signed message to the note, exactly like [`deploy_inference_orderbook`](Self::deploy_inference_orderbook).
@@ -3109,7 +3103,7 @@ impl RealChainBackend {
         );
     }
 
-    /// #70: before an active RootModel / per-deal TC write, ensure the contract still has native
+    /// before an active RootModel / per-deal TC write, ensure the contract still has native
     /// vmshell gas. `fundDeployShell` is seller-note-owned and derives both targets from
     /// `(seller pubkey, nonce)`, so only call this from paths that hold the seller note/key/nonce.
     pub async fn ensure_deal_contract_gas(
@@ -3159,8 +3153,8 @@ impl RealChainBackend {
         Ok(())
     }
 
-    /// Directive #58 — the note posts the probe-commission to the nonce-derived `TokenContract` from its own
-    /// ECC[2], via the `PrivateNote` owner-method `postProbeCommission(nonce, amount)` (4.0.7) — replaces the
+    /// Directive -- the note posts the probe-commission to the nonce-derived `TokenContract` from its own
+    /// ECC[2], via the `PrivateNote` owner-method `postProbeCommission(nonce, amount)`(4.0.7) -- replaces the
     /// operator multisig's [`fund_probe_commission`](Self::fund_probe_commission). External owner-signed message.
     pub async fn note_post_probe_commission(
         &self,
@@ -3182,9 +3176,9 @@ impl RealChainBackend {
         .await
     }
 
-    /// The seller opens a stream session: `open(endpointCipher)` (external signature `_sellerPubkey`).
-    /// Freezes a probe-tick from the deposit (`_frozen=P`, `_opened=true`, `_probeAccepted=false`, §3.1.2)
-    /// and writes the endpoint cipher — handover §3.1 (`RealNote::encrypt_to` to the buyer's x25519 pubkey).
+    /// The seller opens a stream session: `open(endpointCipher)`(external signature `_sellerPubkey`).
+    /// Freezes a probe-tick from the deposit
+    /// and writes the endpoint cipher -- handover(`RealNote::encrypt_to` to the buyer's x25519 pubkey).
     pub async fn open_stream(
         &self,
         tc: &Address,
@@ -3201,23 +3195,23 @@ impl RealChainBackend {
         .await
     }
 
-    /// The seller advances the stream: `advance()` (external signature `_sellerPubkey`). The first call after
-    /// `SETTLE_WINDOW` (180s) accepts the probe (probe-tick → seller, commission is returned, sets the
+    /// The seller advances the stream: `advance()`(external signature `_sellerPubkey`). The first call after
+    /// `SETTLE_WINDOW`(180s) accepts the probe (probe-tick -> seller, commission is returned, sets the
     /// two-tick invariant); afterwards it finalizes the delivered tick.
     pub async fn advance_stream(&self, tc: &Address, seller_keys: &KeyPair) -> Result<Value> {
         self.submit(tc, TOKENCONTRACT_ABI, "advance", json!({}), seller_keys)
             .await
     }
 
-    /// #65: the seller CLOSES a STOPped deal's `TokenContract`. `destroy(payoutAddress)` is
+    /// the seller CLOSES a STOPped deal's `TokenContract`. `destroy(payoutAddress)` is
     /// `onlyOwnerPubkey(_sellerPubkey)`, gated `!_opened && !_disputed` (the buyer's `stop()` clears
-    /// `_opened` on close), and calls `selfdestruct(payoutAddress)` (`contracts/airegistry/TokenContract.sol:651`).
-    /// External call, signed by the seller owner key (matches `_sellerPubkey`).
-    /// **DESTRUCTIVE / BURNS (by-fact, 4.0.7):** the held ~`MIN_BALANCE` reserve does NOT recover to `payout`
-    /// when `payout` is the cross-dapp note — the note balance does not increase (reproduced ×2). The deploy
-    /// *funding* crossed dapps via `fundDeployShell` flag:16 (credited); the raw `selfdestruct` *return* crossing
-    /// the boundary is not credited → the reserve is **burned at destroy**. So this closes the TC; reclaiming the
-    /// reserve to the note would need a `TokenContract` flag:16/dapp-credit return fix (contract-side).
+    /// `_opened` on close), and calls `selfdestruct(payoutAddress)`(`contracts/airegistry/TokenContract.sol:651`).
+    /// External call, signed by the seller owner key(matches `_sellerPubkey`).
+    /// **DESTRUCTIVE / BURNS(by-fact, 4.0.7):** the held ~`MIN_BALANCE` reserve does NOT recover to `payout`
+    /// when `payout` is the cross-dapp note -- the note balance does not increase(reproduced x2). The deploy
+    /// *funding* crossed dapps via `fundDeployShell` flag:16(credited); the raw `selfdestruct` *return* crossing
+    /// the boundary is not credited -> the reserve is **burned at destroy**. So this closes the TC; reclaiming the
+    /// reserve to the note would need a `TokenContract` flag:16/dapp-credit return fix(contract-side).
     /// NOT the dex/PMP oracle lifecycle.
     pub async fn destroy_token_contract(
         &self,
@@ -3235,10 +3229,10 @@ impl RealChainBackend {
         .await
     }
 
-    /// The seller **concedes the dispute**: `releaseDispute()` on the TC (`onlyOwnerPubkey(_sellerPubkey)`) →
+    /// The seller **concedes the dispute**: `releaseDispute()` on the TC (`onlyOwnerPubkey(_sellerPubkey)`) ->
     /// unlocks BOTH notes and **returns the tick to the buyer** (on the probe: probe+deposit to the buyer,
-    /// commission to the seller, NO burn — a concession is not a stop, §4.2/§3.1.2). Symmetric to `stream_dispute`,
-    /// closing the anti-scam cycle of directive 5 (lock → resolution → tick return).
+    /// commission to the seller, NO burn -- a concession is not a stop,/). Symmetric to `stream_dispute`,
+    /// closing the anti-scam cycle of(lock -> resolution -> tick return).
     pub async fn release_dispute(&self, tc: &Address, seller_keys: &KeyPair) -> Result<Value> {
         self.submit(
             tc,
@@ -3273,8 +3267,8 @@ impl RealChainBackend {
     }
 
     /// Submit owner-signed `PrivateNote.withdrawTokens(destWalletAddr, dapp_id)` for a note's available token
-    /// balances. `dapp_id` is event metadata only (surfaced in `TokensWithdrawn`, drives no logic) — taken from
-    /// the deployed manifest. Fails on-chain if the note is stream-locked (`ERR_STREAM_LOCKED`, §4.2). Returns
+    /// balances. `dapp_id` is event metadata only(surfaced in `TokensWithdrawn`, drives no logic) -- taken from
+    /// the deployed manifest. Fails on-chain if the note is stream-locked. Returns
     /// the submit result. Do not treat this helper as proof that every native/ECC balance is fully retired
     /// without by-fact evidence on the current deployed contract.
     pub async fn withdraw_note_tokens(
@@ -3285,7 +3279,7 @@ impl RealChainBackend {
     ) -> Result<Value> {
         // One-shot guard: `withdrawTokens` sets `_hasWithdrawn=true` and reverts `ERR_INVALID_STATE` on a
         // re-call. Read `getDetails().hasWithdrawn` and fail
-        // LOUD with a clear reason instead of the opaque `TVM_ERROR (compute phase)` the revert would produce.
+        // LOUD with a clear reason instead of the opaque `TVM_ERROR(compute phase)` the revert would produce.
         if let Some(d) = self
             .client
             .run_getter(note, PRIVATENOTE_ABI, "getDetails", json!({}))
@@ -3294,7 +3288,7 @@ impl RealChainBackend {
             let already = details_has_withdrawn(&d).unwrap_or(false);
             if already {
                 return Err(anyhow!(
-                    "note {note} was already withdrawn — `withdrawTokens` is one-shot per note. Re-check the \
+                    "note {note} was already withdrawn -- `withdrawTokens` is one-shot per note. Re-check the \
                      note/wallet on-chain before assuming any remaining balance is withdrawable."
                 ));
             }
@@ -3310,9 +3304,9 @@ impl RealChainBackend {
         .await
     }
 
-    /// The buyer stops the stream via their note: `streamStop(tokenContract)` → `TC.stop()`
-    /// (the TC checks `msg.sender == _buyer`). On the probe (before accept) — burns the probe-tick and commission
-    /// (ProbeBurned, §3.1.2) + returns the remaining deposit; in Streaming — a standard split (§4.1).
+    /// The buyer stops the stream via their note: `streamStop(tokenContract)` -> `TC.stop()`
+    /// (the TC checks `msg.sender == _buyer`). On the probe(before accept) -- burns the probe-tick and commission
+    /// + returns the remaining deposit; in Streaming -- a standard split.
     pub async fn stream_stop(
         &self,
         buyer_note: &Address,
@@ -3329,11 +3323,11 @@ impl RealChainBackend {
         .await
     }
 
-    /// The buyer **opens a dispute** via their note: `streamDispute(tokenContract)` → `TC.dispute()`
+    /// The buyer **opens a dispute** via their note: `streamDispute(tokenContract)` -> `TC.dispute()`
     /// (the TC checks `msg.sender == _buyer`). `TC.dispute()` locks **both** notes (`streamDisputeLock` on
-    /// `_buyer` and `_sellerNote`, §4.2): until the dispute is resolved, new offers/withdrawals from a locked note
-    /// are rejected (`ERR_STREAM_LOCKED`); `releaseDispute()` then returns the tick. The anti-scam `Dispute`
-    /// of directive 5 — a real on-chain lock of the scammer's note (strictly stronger than `streamStop`).
+    /// `_buyer` and `_sellerNote`,): until the dispute is resolved, new offers/withdrawals from a locked note
+    /// are rejected(`ERR_STREAM_LOCKED`); `releaseDispute()` then returns the tick. The anti-scam `Dispute`
+    /// of -- a real on-chain lock of the scammer's note(strictly stronger than `streamStop`).
     pub async fn stream_dispute(
         &self,
         buyer_note: &Address,
@@ -3350,10 +3344,10 @@ impl RealChainBackend {
         .await
     }
 
-    /// The buyer reclaims the deal on a **seller-inactivity timeout** (§3.4): the note sends
-    /// `streamReclaim(tokenContract)` → `TC.reclaimOnTimeout()`. Requires `block.timestamp >=
-    /// _lastAdvance + STREAM_TIMEOUT` (600s) and `_opened`. On the probe (seller no-show) — **no burn**:
-    /// the probe and deposit are returned to the buyer, the commission to the seller (§9.1, a no-show is not slashed).
+    /// The buyer reclaims the deal on a **seller-inactivity timeout**: the note sends
+    /// `streamReclaim(tokenContract)` -> `TC.reclaimOnTimeout()`. Requires `block.timestamp >=
+    /// _lastAdvance + STREAM_TIMEOUT`(600s) and `_opened`. On the probe(seller no-show) -- **no burn**:
+    /// the probe and deposit are returned to the buyer, the commission to the seller.
     pub async fn reclaim_on_timeout(
         &self,
         buyer_note: &Address,
@@ -3389,14 +3383,14 @@ impl RealChainBackend {
         .await
     }
 
-    /// Directive #58 — `RootModel` deploy on the **note-funded** path: builds the same deploy message as
+    /// Directive -- `RootModel` deploy on the **note-funded** path: builds the same deploy message as
     /// [`deploy_root_model_from_wallet`](Self::deploy_root_model_from_wallet) but assumes the note has already
     /// pre-funded the uninit address with ECC[2] (via [`note_fund_deploy_shell`](Self::note_fund_deploy_shell));
     /// it only sends the external seller-signed deploy and waits for `Active`. No operator wallet.
     pub async fn deploy_root_model_note_funded(&self, owner: &KeyPair) -> Result<Address> {
         let (addr, message_boc_b64) = self.root_model_deploy_msg(owner).await?;
-        // The note already pre-funded the uninit address (`fundDeployShell`); just send the deploy + wait.
-        // Deploy-message send → `send_deploy_with_retry` tolerates the funded-uninit `/v2/account` 404 (#65/#68).
+        // The note already pre-funded the uninit address(`fundDeployShell`); just send the deploy + wait.
+        // Deploy-message send -> `send_deploy_with_retry` tolerates the funded-uninit `/v2/account` 404.
         let submit_err = self.send_deploy_with_retry(&message_boc_b64).await.err();
         if self.wait_active(&addr, 40).await {
             if let Some(e) = submit_err {
@@ -3414,11 +3408,11 @@ impl RealChainBackend {
         }
     }
 
-    /// Build the per-deal `TokenContract` deploy message **and its INIT-DATA (stateInit) address** — offline,
+    /// Build the per-deal `TokenContract` deploy message **and its INIT-DATA(stateInit) address** -- offline,
     /// no send (`build_deploy` + `local_context()`). The single source of the per-deal TC derivation, shared by
     /// [`token_contract_deploy_address`](Self::token_contract_deploy_address) (the getter-free idempotency
-    /// address, #68) and [`deploy_token_contract_note_funded`](Self::deploy_token_contract_note_funded) (the
-    /// actual deploy) — so the address checked for idempotency is bit-for-bit the one the deploy creates. The
+    /// address,) and [`deploy_token_contract_note_funded`](Self::deploy_token_contract_note_funded) (the
+    /// actual deploy) -- so the address checked for idempotency is bit-for-bit the one the deploy creates. The
     /// address is `hash(stateInit)` over `{code, varInit {_sellerPubkey,_rootModelAddress,_nonce,_pubkey}}`;
     /// the ctor args do **not** enter the address but `build_deploy` needs them to encode the message body.
     #[allow(clippy::too_many_arguments)]
@@ -3458,9 +3452,9 @@ impl RealChainBackend {
         Ok((Address::parse(&msg.address)?, msg.message_boc_b64))
     }
 
-    /// Directive #58 — per-deal `TokenContract` deploy on the **note-funded** path: builds the deploy message
+    /// Directive -- per-deal `TokenContract` deploy on the **note-funded** path: builds the deploy message
     /// (the note pre-funded the uninit address via `fundDeployShell`) and sends it, waiting for `Active`. No
-    /// wallet. Shares [`token_contract_deploy_msg`](Self::token_contract_deploy_msg) with the #68 idempotency
+    /// wallet. Shares [`token_contract_deploy_msg`](Self::token_contract_deploy_msg) with the idempotency
     /// derivation, so the deployed address equals the pre-derived one by construction.
     #[allow(clippy::too_many_arguments)]
     pub async fn deploy_token_contract_note_funded(
@@ -3485,8 +3479,8 @@ impl RealChainBackend {
                 seller_note,
             )
             .await?;
-        // The note already pre-funded the uninit address (`fundDeployShell`); just send the deploy + wait.
-        // Deploy-message send → `send_deploy_with_retry` tolerates the funded-uninit `/v2/account` 404 (#65/#68).
+        // The note already pre-funded the uninit address(`fundDeployShell`); just send the deploy + wait.
+        // Deploy-message send -> `send_deploy_with_retry` tolerates the funded-uninit `/v2/account` 404.
         let submit_err = self.send_deploy_with_retry(&message_boc_b64).await.err();
         if self.wait_active(&addr, 40).await {
             if let Some(e) = submit_err {
@@ -3504,17 +3498,16 @@ impl RealChainBackend {
         }
     }
 
-    /// Provision a per-deal market for the seller (issue #24; **note-funded, #58** — NO operator wallet, NO
+    /// Provision a per-deal market for the seller (issue; **note-funded,** -- NO operator wallet, NO
     /// giver in the operate path): deploy-if-absent the per-model `InferenceOrderBook`, the per-owner
     /// `RootModel`, and the per-deal `TokenContract`, **all funded from the seller note's own ECC[2]**. Returns a
     /// [`MarketManifest`] whose `token_contract` is the **active** deployed address.
-    ///
-    /// The per-deal `TokenContract` (and `RootModel`) is a self-dapp contract whose uninit cross-dapp deploy
-    /// address cannot be funded with privileged native gas (the 404). Instead the note pre-funds each uninit
+    /// The per-deal `TokenContract`(and `RootModel`) is a self-dapp contract whose uninit cross-dapp deploy
+    /// address cannot be funded with privileged native gas(the 404). Instead the note pre-funds each uninit
     /// deploy address with **ECC[2] SHELL** via [`note_fund_deploy_shell`](Self::note_fund_deploy_shell)
     /// (`PrivateNote.fundDeployShell`, a single `flag:16` send so the ECC lands as spendable native balance), and
-    /// the external seller-signed deploy then activates it — the permission-free mechanism, no privileged giver,
-    /// no separate operational wallet (the funding source is the anonymous note itself). `gas` is the ECC[2]
+    /// the external seller-signed deploy then activates it -- the permission-free mechanism, no privileged giver,
+    /// no separate operational wallet(the funding source is the anonymous note itself). `gas` is the ECC[2]
     /// SHELL pre-funded per uninit deploy address.
     #[allow(clippy::too_many_arguments)]
     pub async fn provision_market(
@@ -3527,10 +3520,10 @@ impl RealChainBackend {
         max_ticks: u128,
         gas: u128,
     ) -> Result<crate::MarketManifest> {
-        // #83: fail-closed up front if the seller note is orphaned by a contract redeploy — a clear
-        // "re-mint" error instead of a downstream bare TVM_ERROR (stale note) or "note is not active".
+        // fail-closed up front if the seller note is orphaned by a contract redeploy -- a clear
+        // "re-mint" error instead of a downstream bare TVM_ERROR(stale note) or "note is not active".
         self.assert_seller_note_current(note).await?;
-        // 1) Per-model InferenceOrderBook — note-funded (owner-method). Deploy-if-absent.
+        // 1) Per-model InferenceOrderBook -- note-funded(owner-method). Deploy-if-absent.
         let model_hash = model_hash_for(frame_model);
         let ob = self
             .inference_orderbook_address(note, &model_hash, MODEL_TICK_SIZE)
@@ -3548,14 +3541,14 @@ impl RealChainBackend {
                 return Err(anyhow!("InferenceOrderBook {ob} did not activate"));
             }
         }
-        // 2) RootModel + per-deal TokenContract — NOTE-FUNDED (#58): no operator multisig. The note pre-funds
-        //    each uninit deploy address from its own ECC[2] (`fundDeployShell`, the note derives the targets from
-        //    `(ephemeralPubkey, nonce)`), then the external seller-signed deploy activates it. ORDER MATTERS: the
-        //    RootModel is deployed first so the per-deal TC registers into it in its ctor; the TC address itself is
-        //    derived **locally from the deploy INIT-DATA** (#68, `token_contract_deploy_address`), NOT by querying
-        //    the RootModel `getTokenContractAddress` getter — so neither a fixed-superroot shellnet restart nor
-        //    a not-yet-`Active` RootModel can 404 the idempotency check. The getter is used only as a post-`Active`
-        //    cross-check below.
+        // 2) RootModel + per-deal TokenContract -- NOTE-FUNDED: no operator multisig. The note pre-funds
+        // each uninit deploy address from its own ECC[2] (`fundDeployShell`, the note derives the targets from
+        // `(ephemeralPubkey, nonce)`), then the external seller-signed deploy activates it. ORDER MATTERS: the
+        // RootModel is deployed first so the per-deal TC registers into it in its ctor; the TC address itself is
+        // derived **locally from the deploy INIT-DATA**, NOT by querying
+        // the RootModel `getTokenContractAddress` getter -- so neither a fixed-superroot shellnet restart nor
+        // a not-yet-`Active` RootModel can 404 the idempotency check. The getter is used only as a post-`Active`
+        // cross-check below.
         let seller_pubkey = json!(format!("0x{}", seed_keys.public_hex()));
         let (rm, _) = self.root_model_deploy_msg(seed_keys).await?;
         let tc = self
@@ -3572,7 +3565,7 @@ impl RealChainBackend {
             .await?;
         let rm_absent = !self.wait_active(&rm, 1).await;
         if rm_absent {
-            // Pre-fund the RootModel's (and the TC's — same nonce) uninit deploy addresses, then deploy the RM.
+            // Pre-fund the RootModel's(and the TC's -- same nonce) uninit deploy addresses, then deploy the RM.
             self.log_deploy_prefund_snapshot("before fundDeployShell", note, &rm, &tc)
                 .await;
             let prefund = self
@@ -3591,12 +3584,12 @@ impl RealChainBackend {
         }
         self.ensure_deal_contract_gas(note, seed_keys, nonce, Some(&rm), None)
             .await?;
-        // The per-deal TC address is derived from the deploy INIT-DATA (stateInit), NOT the RootModel
-        // `getTokenContractAddress` network getter (#68): on a fresh provision the RootModel deploy was just
-        // sent (step above) but is not yet `Active`, so the getter would 404 and abort this idempotent check.
+        // The per-deal TC address is derived from the deploy INIT-DATA(stateInit), NOT the RootModel
+        // `getTokenContractAddress` network getter: on a fresh provision the RootModel deploy was just
+        // sent(step above) but is not yet `Active`, so the getter would 404 and abort this idempotent check.
         if self.wait_active(&tc, 1).await {
-            // Idempotent skip: the TC is already `Active` ⇒ the RootModel is guaranteed `Active`, so the getter
-            // is safe here — cross-check it agrees with the INIT-DATA derivation (catch a code-hash/derivation
+            // Idempotent skip: the TC is already `Active` => the RootModel is guaranteed `Active`, so the getter
+            // is safe here -- cross-check it agrees with the INIT-DATA derivation (catch a code-hash/derivation
             // divergence between the embedded TC image and the deployed RootModel).
             let getter_tc = self
                 .resolve_token_contract(&rm, &seller_pubkey, nonce)
@@ -3607,7 +3600,7 @@ impl RealChainBackend {
                 ));
             }
         } else {
-            // Deploy-if-absent. If the RootModel was already active (idempotent re-run), the TC was not
+            // Deploy-if-absent. If the RootModel was already active(idempotent re-run), the TC was not
             // pre-funded above.
             if !rm_absent {
                 self.log_deploy_prefund_snapshot("before fundDeployShell", note, &rm, &tc)
@@ -4111,23 +4104,23 @@ impl RealChainBackend {
         ))
     }
 
-    /// #83 fail-closed pre-flight: the seller note must be Active on-chain AND carry the **current**
-    /// `PrivateNote` code (the embedded `PRIVATENOTE_TVC` hash). A `pn_pool` minted before a SuperRoot /
-    /// PrivateNote redeploy is orphaned — the note is either gone (a later getter 404s as "note is not
+    /// fail-closed pre-flight: the seller note must be Active on-chain AND carry the **current**
+    /// `PrivateNote` code(the embedded `PRIVATENOTE_TVC` hash). A `pn_pool` minted before a SuperRoot /
+    /// PrivateNote redeploy is orphaned -- the note is either gone (a later getter 404s as "note is not
     /// active") or runs stale code whose deploy/registration into the rotated SuperRoot throws a bare
     /// `TVM_ERROR` in the compute phase. Catch both here with an actionable "re-mint your pool" message
     /// instead of letting provision fail opaquely downstream.
     pub async fn assert_seller_note_current(&self, note: &Address) -> Result<()> {
         let acc = self.client.get_account(note).await?.ok_or_else(|| {
             anyhow!(
-                "seller note {note} is not on-chain — the pn_pool is likely orphaned by a contract redeploy \
+                "seller note {note} is not on-chain -- the pn_pool is likely orphaned by a contract redeploy \
                  (SuperRoot/PrivateNote rotation). Re-mint against the current contracts (`mint_pn_pool`) and \
                  point DEXDO_PN_POOL at the fresh pool."
             )
         })?;
         if !acc.is_active() {
             return Err(anyhow!(
-                "seller note {note} is {}, not Active — re-mint the pn_pool against the current contracts \
+                "seller note {note} is {}, not Active -- re-mint the pn_pool against the current contracts \
                  (`mint_pn_pool`); a pool minted before a SuperRoot redeploy is orphaned.",
                 acc.status
             ));
@@ -4135,9 +4128,9 @@ impl RealChainBackend {
         note_code_hash_current(note, acc.code_hash.as_deref())
     }
 
-    /// Fund-safety guard for `note withdraw` (public dexdo-cli#37). A PrivateNote deployed by a
-    /// PREVIOUS contract generation — its on-chain `code_hash` != the current
-    /// `PRIVATENOTE_PINNED_CODE_HASH` — still accepts the current-generation `withdrawTokens`
+    /// Fund-safety guard for `note withdraw`. A PrivateNote deployed by a
+    /// PREVIOUS contract generation -- its on-chain `code_hash` != the current
+    /// `PRIVATENOTE_PINNED_CODE_HASH` -- still accepts the current-generation `withdrawTokens`
     /// message: it ZEROES the note's balance but does NOT credit the destination wallet, so the
     /// SHELL is lost. Refuse the withdraw BEFORE any on-chain write when the note is not the current
     /// generation. This does not recover funds already lost; it prevents zeroing a still-funded
@@ -4157,11 +4150,11 @@ impl RealChainBackend {
         note_withdraw_generation_ok(note, acc.code_hash.as_deref())
     }
 
-    /// #128: read the note's on-chain owner key (`getDetails().ephemeralPubkey`) and fail closed if it does not
-    /// match the key the client will sign the owner-authenticated write with — turning the opaque pre-accept
-    /// `onlyOwnerPubkey` revert (branch 3: a non-conforming/orphaned note) into an actionable error. The buyer's
+    /// read the note's on-chain owner key (`getDetails().ephemeralPubkey`) and fail closed if it does not
+    /// match the key the client will sign the owner-authenticated write with -- turning the opaque pre-accept
+    /// `onlyOwnerPubkey` revert(branch 3: a non-conforming/orphaned note) into an actionable error. The buyer's
     /// `place_buy` calls it before `placeInferenceBuy`; the seller's `post_offer` before `postSellOffer`. An
-    /// absent/empty `getDetails` (uninit/orphaned note) is itself a fail-closed re-mint case.
+    /// absent/empty `getDetails`(uninit/orphaned note) is itself a fail-closed re-mint case.
     pub async fn assert_note_owner_matches(
         &self,
         role: &str,
@@ -4174,7 +4167,7 @@ impl RealChainBackend {
             .await?
             .ok_or_else(|| {
                 anyhow!(
-                    "{role} aborted: note {note} returned no getDetails (not on-chain/active) — the pn_pool is \
+                    "{role} aborted: note {note} returned no getDetails (not on-chain/active) -- the pn_pool is \
                      likely orphaned by a contract redeploy. Re-mint against the current contracts \
                      (`mint_pn_pool`) and point DEXDO_PN_POOL at the fresh pool."
                 )
@@ -4190,9 +4183,9 @@ impl RealChainBackend {
         }
     }
 
-    /// Poll `get_account(addr).is_active()` up to `tries` times (3s apart; `tries=1` = a single check).
-    /// A query error or a not-yet-existent account (e.g. a self-dapp uninit address that 404s) counts
-    /// as "not active" — the caller then deploys or fails with a clear message.
+    /// Poll `get_account(addr).is_active()` up to `tries` times(3s apart; `tries=1` = a single check).
+    /// A query error or a not-yet-existent account(e.g. a self-dapp uninit address that 404s) counts
+    /// as "not active" -- the caller then deploys or fails with a clear message.
     async fn wait_active(&self, addr: &Address, tries: u32) -> bool {
         for i in 0..tries {
             if let Ok(Some(a)) = self.client.get_account(addr).await {

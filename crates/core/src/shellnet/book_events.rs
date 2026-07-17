@@ -99,7 +99,6 @@ enum BookEvent {
 }
 
 /// Fold pages returned by an async closure. The closure receives the GraphQL `before` cursor.
-///
 /// Pages may overlap. Message ids are deduplicated, events are applied in chronological order, and
 /// an existing fold stops once its `last_seen_id` is reached. A missing prior id fails closed rather
 /// than replaying incomplete history into an existing state.

@@ -1,22 +1,21 @@
-//! Protocol parameters (Appx. A, §9.1). Fixed constants and order book deploy parameters.
-//!
-//! These are pure types without networking. Values are taken from the spec (`private-inference-market-design.md` §9.1, A.1).
+//! Protocol parameters. Fixed constants and order book deploy parameters.
+//! These are pure types without networking. Values are taken from the spec.
 
 use std::time::Duration;
 
-/// SHELL — the system's settlement unit (§1). Integer count of minimal units.
+/// SHELL -- the system's settlement unit. Integer count of minimal units.
 pub type Shell = u64;
 
-/// Fixed protocol constants (§9.1, A.1).
+/// Fixed protocol constants.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ProtocolConsts {
-    /// Platform fee, bps (on the buyer side, by-fact). `PLATFORM_FEE_BPS = 250`.
+    /// Platform fee, bps(on the buyer side, by-fact). `PLATFORM_FEE_BPS = 250`.
     pub platform_fee_bps: u32,
     /// Optimistic tick-acceptance window. `SETTLE_WINDOW = 180s`.
     pub settle_window: Duration,
-    /// Stream inactivity timeout (no new tokens). `STREAM_TIMEOUT = 600s`.
+    /// Stream inactivity timeout(no new tokens). `STREAM_TIMEOUT = 600s`.
     pub stream_timeout: Duration,
-    /// Dispute window; on timeout → split. `DISPUTE_WINDOW = 600s`.
+    /// Dispute window; on timeout -> split. `DISPUTE_WINDOW = 600s`.
     pub dispute_window: Duration,
     /// Rebate rate cap, bps; strictly < `platform_fee_bps`. `REBATE_MAX_BPS = 200`.
     pub rebate_max_bps: u32,
@@ -25,9 +24,8 @@ pub struct ProtocolConsts {
 }
 
 impl ProtocolConsts {
-    /// Canonical values from §9.1 / A.1.
-    ///
-    /// The invariant `rebate_max_bps < platform_fee_bps` (anti-wash, §5.3) is checked here:
+    /// Canonical values from / A.1.
+    /// The invariant `rebate_max_bps < platform_fee_bps` is checked here:
     /// otherwise the net burn could become non-positive.
     pub const fn canonical() -> Self {
         let c = Self {
@@ -52,19 +50,19 @@ impl Default for ProtocolConsts {
     }
 }
 
-/// Order book deploy parameters (§9.2, A.2). In directive 1 they are filled by a mock; in production they are read from on-chain.
+/// Order book deploy parameters. In they are filled by a mock; in production they are read from on-chain.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct DobParams {
-    /// Tick size in tokens; reference value 1M (§1).
+    /// Tick size in tokens; reference value 1M.
     pub tick_size: u64,
-    /// Seller's probe commission on the first (probe) tick (§3.1.2). Reference: the fee from a single tick.
+    /// Seller's probe commission on the first(probe) tick. Reference: the fee from a single tick.
     pub seller_probe_commission: Shell,
 }
 
 impl DobParams {
-    /// Canonical reference for directive 1: `TICK_SIZE = 1M`,
-    /// `SELLER_PROBE_COMMISSION` ≈ the platform fee from a single tick at `P = 1000`
-    /// (on the order of `PLATFORM_FEE_BPS` of a tick, §9.1) — the concrete number is chosen by the deploy.
+    /// Canonical reference for: `TICK_SIZE = 1M`,
+    /// `SELLER_PROBE_COMMISSION` ~ the platform fee from a single tick at `P = 1000`
+    /// -- the concrete number is chosen by the deploy.
     pub const fn canonical() -> Self {
         Self {
             tick_size: 1_000_000,

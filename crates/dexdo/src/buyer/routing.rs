@@ -1,8 +1,8 @@
-//! Buyer routing (Directive 5, B1–B4/B16): a smart client auto-executes the user's frame
+//! Buyer routing: a smart client auto-executes the user's frame
 //! across many sellers. Contains **candidate selection** (`eligible_ranked`: frame filter + blacklist
-//! avoidance + ranking) and the **routing loop** (`route_capped_buy`: discovery → ranking →
-//! iteration with failover; on scam/no-show — anti-scam reaction + blacklist + next seller).
-//! The deal+verification itself (stream, D4) lives behind the [`DealRunner`] seam (real — gateway; test — script).
+//! avoidance + ranking) and the **routing loop** (`route_capped_buy`: discovery -> ranking ->
+//! iteration with failover; on scam/no-show -- anti-scam reaction + blacklist + next seller).
+//! The deal+verification itself(stream, D4) lives behind the [`DealRunner`] seam(real -- gateway; test -- script).
 
 use super::api::content_check_policy;
 use super::verify::{reference_endpoint_for, StreamVerifier, Verdict};
@@ -15,47 +15,47 @@ use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use tokio_stream::StreamExt;
 
-/// Buyer's reaction to a caught scammer (Directive 5, §anti-scam). Set **EXPLICITLY** at
-/// client setup (no silent default): the trade-off "get service fast" vs "recover the tick / don't
+/// Buyer's reaction to a caught scammer. Set **EXPLICITLY** at
+/// client setup(no silent default): the trade-off "get service fast" vs "recover the tick / don't
 /// let the scammer go".
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ScammerReaction {
-    /// `stop()` → `BurnBoth` on the probe (scam revenue = 0), blacklist, instant failover. The buyer's
+    /// `stop()` -> `BurnBoth` on the probe(scam revenue = 0), blacklist, instant failover. The buyer's
     /// own probe tick is burned.
     Stop,
-    /// `dispute()` → locks the scammer's note (cannot sell or withdraw) until `releaseDispute()`
-    /// returns the tick to the buyer; the buyer's note is also locked for the duration of the dispute (§4.2). The stake is not slashed.
+    /// `dispute()` -> locks the scammer's note(cannot sell or withdraw) until `releaseDispute()`
+    /// returns the tick to the buyer; the buyer's note is also locked for the duration of the dispute. The stake is not slashed.
     Dispute,
 }
 
-/// User frame for `CappedBuy` (B2): what / at what price / how much. The client does not exceed it.
+/// User frame for `CappedBuy`(B2): what / at what price / how much. The client does not exceed it.
 #[derive(Debug, Clone)]
 pub struct CappedBuy {
-    /// The market frame's declared model — only it is served (B2).
+    /// The market frame's declared model -- only it is served(B2).
     pub model: String,
     /// Price ceiling per tick: an offer more expensive than this is not eligible.
     pub price_cap: u128,
-    /// How many ticks to buy (needs an offer with `max_ticks` ≥ this).
+    /// How many ticks to buy(needs an offer with `max_ticks` >= this).
     pub ticks: u128,
-    /// Reaction to a scammer (set explicitly at client setup).
+    /// Reaction to a scammer(set explicitly at client setup).
     pub scammer_reaction: ScammerReaction,
-    /// Base rate of the B7-full spot-check / B8 (§10.1.3, lead's decision): Bernoulli per request,
-    /// default ~0.03 (range 1–5%). For a seller with a low/unknown score — more often (`spotcheck_rate_for`);
-    /// `0.0` — disabled.
+    /// Base rate of the B7-full spot-check / B8: Bernoulli per request,
+    /// default ~0.03(range 1-5%). For a seller with a low/unknown score -- more often(`spotcheck_rate_for`);
+    /// `0.0` -- disabled.
     pub spot_check_rate: f64,
 }
 
-/// Default base rate of the B7-full spot-check / B8 sampling (§10.1.3, lead's decision): Bernoulli per request,
-/// ~3% (the 1–5% range). `spotcheck_rate_for` scales it per-seller (unknown/low score → more often).
+/// Default base rate of the B7-full spot-check / B8 sampling: Bernoulli per request,
+/// ~3%(the 1-5% range). `spotcheck_rate_for` scales it per-seller(unknown/low score -> more often).
 pub const DEFAULT_SPOT_CHECK_RATE: f64 = 0.03;
 
 impl CappedBuy {
-    /// **Production** constructor for a buy frame (Directive 5): the frame carries the safe **default**
-    /// B7-full/B8 sampling rate ([`DEFAULT_SPOT_CHECK_RATE`]), so a production buy ALWAYS samples — the
-    /// content-identity layers fire on a fraction of requests (#144), never silently `0.0`. Deterministic
+    /// **Production** constructor for a buy frame: the frame carries the safe **default**
+    /// B7-full/B8 sampling rate([`DEFAULT_SPOT_CHECK_RATE`]), so a production buy ALWAYS samples -- the
+    /// content-identity layers fire on a fraction of requests, never silently `0.0`. Deterministic
     /// ranking/contrast tests build the struct literally with `spot_check_rate: 0.0` (sampling off, for a
     /// reproducible outcome); any non-test buy path must construct the frame through `new`. NB: the routing
-    /// loop ([`route_capped_buy`]) is not yet wired into the `dexdo` CLI binary (Directive 5 horizon); when it
+    /// loop([`route_capped_buy`]) is not yet wired into the `dexdo` CLI binary; when it
     /// is, it constructs the frame here and so inherits the non-zero default.
     pub fn new(
         model: String,
@@ -73,26 +73,26 @@ impl CappedBuy {
     }
 }
 
-/// Effective spot-check rate for a seller (Directive 5 @43057bd): the "score" = the buyer's **local private
+/// Effective spot-check rate for a seller: the "score" = the buyer's **local private
 /// memory B16** keyed by the **anonymous note public** (THIS buyer's history, not global
-/// reputation — §2.2 intact). **Safe default:** an unknown/new note (`score ≤ 0`) → check it
-/// **MORE OFTEN** (×4), NOT "trust by default". Only a note that this buyer
-/// has itself checked clean many times gets a reduced rate (`score > 0` → asymptotically rarer). A scammer rotating notes
-/// is always "unknown" → always under maximum scrutiny. Clamped to [0, 1].
+/// reputation -- intact). **Safe default:** an unknown/new note(`score <= 0`) -> check it
+/// **MORE OFTEN**(x4), NOT "trust by default". Only a note that this buyer
+/// has itself checked clean many times gets a reduced rate(`score > 0` -> asymptotically rarer). A scammer rotating notes
+/// is always "unknown" -> always under maximum scrutiny. Clamped to [0, 1].
 pub fn spotcheck_rate_for(base_rate: f64, score: i64) -> f64 {
     let factor = if score <= 0 {
-        4.0 // unfamiliar/caught — elevated rate (safe default)
+        4.0 // unfamiliar/caught -- elevated rate(safe default)
     } else {
         1.0 / (1.0 + score as f64 * 0.5) // the more stable the LOCAL history, the rarer
     };
     (base_rate * factor).clamp(0.0, 1.0)
 }
 
-/// A candidate offer from discovery (B1): the seller (note-id for the blacklist), its per-deal `TokenContract`
+/// A candidate offer from discovery(B1): the seller(note-id for the blacklist), its per-deal `TokenContract`
 /// and the offer's price/volume.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Candidate {
-    /// Seller identifier (note address) — the blacklist key (B16).
+    /// Seller identifier(note address) -- the blacklist key(B16).
     pub seller_id: String,
     /// Address of the offer's per-deal `TokenContract`.
     pub token_contract: String,
@@ -100,7 +100,7 @@ pub struct Candidate {
     pub max_ticks: u128,
 }
 
-/// Local **private** memory of caught sellers (B16): not global reputation — we avoid those
+/// Local **private** memory of caught sellers(B16): not global reputation -- we avoid those
 /// this buyer itself caught on scam/quality.
 #[derive(Debug, Clone, Default)]
 pub struct Blacklist {
@@ -111,7 +111,7 @@ impl Blacklist {
     pub fn new() -> Self {
         Self::default()
     }
-    /// Add a seller (by note-id) to the blacklist after being caught (`Bail`/no-show).
+    /// Add a seller(by note-id) to the blacklist after being caught(`Bail`/no-show).
     pub fn mark(&mut self, seller_id: &str) {
         self.sellers.insert(seller_id.to_string());
     }
@@ -126,9 +126,9 @@ impl Blacklist {
     }
 }
 
-/// Per-seller **verification score** (Directive 5, B16/B4): accumulates D4 verdicts (Pass `+1` / Bail `−1`)
-/// in local private memory and influences **ranking** — at equal price the seller with the better
-/// history is taken first. Complements the hard blacklist (binary "avoid") with a soft quality signal:
+/// Per-seller **verification score**: accumulates D4 verdicts(Pass `+1` / Bail `-1`)
+/// in local private memory and influences **ranking** -- at equal price the seller with the better
+/// history is taken first. Complements the hard blacklist(binary "avoid") with a soft quality signal:
 /// a caught scammer is blacklisted anyway, but among the REMAINING ones the one who passed more often is preferred.
 #[derive(Debug, Clone, Default)]
 pub struct SellerScores {
@@ -139,24 +139,24 @@ impl SellerScores {
     pub fn new() -> Self {
         Self::default()
     }
-    /// Successful verification (D4 `Pass` / delivery) — the seller is more reliable.
+    /// Successful verification(D4 `Pass` / delivery) -- the seller is more reliable.
     pub fn record_pass(&mut self, seller_id: &str) {
         *self.scores.entry(seller_id.to_string()).or_insert(0) += 1;
     }
-    /// Bail/no-show (D4 `Bail` / no-show) — the seller is worse for the frame.
+    /// Bail/no-show(D4 `Bail` / no-show) -- the seller is worse for the frame.
     pub fn record_bail(&mut self, seller_id: &str) {
         *self.scores.entry(seller_id.to_string()).or_insert(0) -= 1;
     }
-    /// Current score of a seller (`0` — unfamiliar).
+    /// Current score of a seller(`0` -- unfamiliar).
     pub fn score_of(&self, seller_id: &str) -> i64 {
         self.scores.get(seller_id).copied().unwrap_or(0)
     }
 }
 
-/// Select candidates for the frame (B1–B2): **price ≤ cap**, `max_ticks` ≥ required, **not blacklisted** —
-/// in preference order: cheaper first; at equal price — **higher verification score** (B4); on ties
-/// stably by `seller_id`. Returns an ordered list for iteration with failover. Empty →
-/// no eligible sellers (frame/blacklist).
+/// Select candidates for the frame(B1-B2): **price <= cap**, `max_ticks` >= required, **not blacklisted** --
+/// in preference order: cheaper first; at equal price -- **higher verification score**(B4); on ties
+/// stably by `seller_id`. Returns an ordered list for iteration with failover. Empty ->
+/// no eligible sellers(frame/blacklist).
 pub fn eligible_ranked(
     frame: &CappedBuy,
     offers: &[Candidate],
@@ -173,7 +173,7 @@ pub fn eligible_ranked(
     out.sort_by(|a, b| {
         a.price_per_tick
             .cmp(&b.price_per_tick)
-            // at equal price — the seller with the BETTER score first (higher score → smaller in the sort).
+            // at equal price -- the seller with the BETTER score first(higher score -> smaller in the sort).
             .then_with(|| {
                 scores
                     .score_of(&b.seller_id)
@@ -184,7 +184,7 @@ pub fn eligible_ranked(
     out
 }
 
-/// Discovery listings (`OfferListing`, chain width u64) → frame candidates (u128) for ranking.
+/// Discovery listings(`OfferListing`, chain width u64) -> frame candidates(u128) for ranking.
 fn listings_to_candidates(offers: &[OfferListing]) -> Vec<Candidate> {
     offers
         .iter()
@@ -197,43 +197,43 @@ fn listings_to_candidates(offers: &[OfferListing]) -> Vec<Candidate> {
         .collect()
 }
 
-/// Outcome of a single deal with a candidate (after stream+verification D4).
+/// Outcome of a single deal with a candidate(after stream+verification D4).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum DealOutcome {
-    /// The stream passed verification (D4 Pass) — the user received the answer.
+    /// The stream passed verification(D4 Pass) -- the user received the answer.
     Delivered,
-    /// Verification returned `Bail` (substitution/scam); the string is the reason for the report.
+    /// Verification returned `Bail`(substitution/scam); the string is the reason for the report.
     Scam(String),
-    /// The seller did not open the stream / vanished (no handover, inactivity timeout).
+    /// The seller did not open the stream / vanished(no handover, inactivity timeout).
     NoShow,
 }
 
-/// Deal+verification with one candidate — the seam between routing orchestration and the gateway stream.
+/// Deal+verification with one candidate -- the seam between routing orchestration and the gateway stream.
 /// Real: read the handover from the chain, open an authorized TLS gRPC stream, run `StreamVerifier`
-/// (D4) over the chunks. Returns the outcome; the on-chain reaction (`stop`/`dispute`) and blacklist are applied by
-/// the **routing loop**, not the runner (the runner does not know the frame policy).
+/// (D4) over the chunks. Returns the outcome; the on-chain reaction(`stop`/`dispute`) and blacklist are applied by
+/// the **routing loop**, not the runner(the runner does not know the frame policy).
 #[async_trait]
 pub trait DealRunner: Send + Sync {
-    /// Execute the deal with a candidate. `spot_check` — the request is **sampled** for a full audit
-    /// (§10.1.3, lead's decision): on a `Delivered` outcome the real runner additionally runs a shadow
-    /// B7-full (`reference_spotcheck`) + B8 (`behavioral_probe`); a mismatch → `Scam`.
+    /// Execute the deal with a candidate. `spot_check` -- the request is **sampled** for a full audit
+    /// on a `Delivered` outcome the real runner additionally runs a shadow
+    /// B7-full(`reference_spotcheck`) + B8(`behavioral_probe`); a mismatch -> `Scam`.
     async fn run(&self, candidate: &Candidate, spot_check: bool) -> DealOutcome;
 }
 
-/// A single iteration attempt (for the failover report/audit).
+/// A single iteration attempt(for the failover report/audit).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Attempt {
     pub seller_id: String,
     pub token_contract: String,
     pub outcome: DealOutcome,
-    /// The applied anti-scam reaction (`Some` only for `Scam`).
+    /// The applied anti-scam reaction(`Some` only for `Scam`).
     pub reaction: Option<ScammerReaction>,
 }
 
-/// Result of CappedBuy routing: who (if anyone) delivered + the log of attempts.
+/// Result of CappedBuy routing: who(if anyone) delivered + the log of attempts.
 #[derive(Debug, Clone)]
 pub struct RouteOutcome {
-    /// The `seller_id` whose stream delivered; `None` — no seller in the frame succeeded.
+    /// The `seller_id` whose stream delivered; `None` -- no seller in the frame succeeded.
     pub served_by: Option<String>,
     /// Iteration in order: who was tried and with what outcome.
     pub attempts: Vec<Attempt>,
@@ -245,17 +245,16 @@ impl RouteOutcome {
     }
 }
 
-/// **CappedBuy routing loop** (Directive 5, B1–B4): book discovery → ranking for the frame →
-/// iteration over candidates with failover. For each: `place_buy` (the order book writes the buyer's public into the TC, §2.3)
-/// → deal+verification (`runner`):
-///  - `Delivered` → delivered, return (we do not close an honest seller's stream);
-///  - `Scam` → anti-scam per the **explicit** frame policy (`Stop` → `stop()`/BurnBoth, scam revenue=0;
-///    `Dispute` → `dispute()`, note lock) + `blacklist.mark` + next;
-///  - `NoShow` → `seller_timeout()` (tick refund without burn, §3.4) + `blacklist.mark` + next.
-///
-/// Exposure is bounded by the frame and the machine invariant (≤ 2 ticks per stream): failover tries sellers
+/// **CappedBuy routing loop**: book discovery -> ranking for the frame ->
+/// iteration over candidates with failover. For each: `place_buy`
+/// -> deal+verification(`runner`):
+/// - `Delivered` -> delivered, return(we do not close an honest seller's stream);
+/// - `Scam` -> anti-scam per the **explicit** frame policy (`Stop` -> `stop()`/BurnBoth, scam revenue=0;
+/// `Dispute` -> `dispute()`, note lock) + `blacklist.mark` + next;
+/// - `NoShow` -> `seller_timeout()` + `blacklist.mark` + next.
+/// Exposure is bounded by the frame and the machine invariant(<= 2 ticks per stream): failover tries sellers
 /// sequentially, not multiplying risk. The reaction and `seller_timeout` are best-effort: their error does not break
-/// failover (the `attempts` record remains), the buyer still tries the next one.
+/// failover(the `attempts` record remains), the buyer still tries the next one.
 pub async fn route_capped_buy(
     chain: &dyn ChainBackend,
     note: &dyn Note,
@@ -274,11 +273,11 @@ pub async fn route_capped_buy(
             }
         }
     };
-    // Ranking accounts for the accumulated verification score (B4): the better history is taken first.
+    // Ranking accounts for the accumulated verification score(B4): the better history is taken first.
     let candidates = eligible_ranked(frame, &listings_to_candidates(&offers), blacklist, scores);
 
     for c in candidates {
-        // The buyer sends a buy order (§2.3). On failure — skip the seller (as a no-show).
+        // The buyer sends a buy order. On failure -- skip the seller(as a no-show).
         if chain.place_buy(&c.token_contract, note).await.is_err() {
             blacklist.mark(&c.seller_id);
             scores.record_bail(&c.seller_id);
@@ -291,9 +290,9 @@ pub async fn route_capped_buy(
             continue;
         }
 
-        // §10.1.3 (lead's decision): sample the request for a full spot-check/B8 via Bernoulli with
-        // a rate adjusted by the per-seller score (low/unknown → more often). On a sample the real runner
-        // runs a shadow audit; Bail → Scam (like the inline layers).
+        // (lead's decision): sample the request for a full spot-check/B8 via Bernoulli with
+        // a rate adjusted by the per-seller score(low/unknown -> more often). On a sample the real runner
+        // runs a shadow audit; Bail -> Scam(like the inline layers).
         let rate = spotcheck_rate_for(frame.spot_check_rate, scores.score_of(&c.seller_id));
         let spot_check = rate > 0.0 && rand::random::<f64>() < rate;
 
@@ -312,7 +311,7 @@ pub async fn route_capped_buy(
                 };
             }
             DealOutcome::Scam(reason) => {
-                // §4 anti-scam: reaction per the explicit frame policy (no silent default).
+                // anti-scam: reaction per the explicit frame policy(no silent default).
                 let reaction = frame.scammer_reaction;
                 let _ = match reaction {
                     ScammerReaction::Stop => chain.stop(&c.token_contract, note).await,
@@ -326,15 +325,15 @@ pub async fn route_capped_buy(
                     outcome: DealOutcome::Scam(reason),
                     reaction: Some(reaction),
                 });
-                // §4.2 (lead's decision): `dispute` locks BOTH notes → the buyer's note is locked,
-                // failover of this request is impossible — it WAITS for `release_dispute`/timeout. Only `stop`
-                // (no buyer lock) fails over to the next one. So on `Dispute` — exit.
+                // (lead's decision): `dispute` locks BOTH notes -> the buyer's note is locked,
+                // failover of this request is impossible -- it WAITS for `release_dispute`/timeout. Only `stop`
+                // (no buyer lock) fails over to the next one. So on `Dispute` -- exit.
                 if reaction == ScammerReaction::Dispute {
                     break;
                 }
             }
             DealOutcome::NoShow => {
-                // The seller vanished: refund of the frozen tick without burn (§3.4).
+                // The seller vanished: refund of the frozen tick without burn.
                 let _ = chain.seller_timeout(&c.token_contract).await;
                 blacklist.mark(&c.seller_id);
                 scores.record_bail(&c.seller_id);
@@ -355,25 +354,25 @@ pub async fn route_capped_buy(
 }
 
 /// Production [`DealRunner`]: executes the deal via the buyer's gateway stream. Resolves the handover
-/// from the chain (absent → `NoShow`), opens an authorized TLS gRPC canonical stream (§3.1.1, B18) with
-/// the user's request, and runs `StreamVerifier` (D4, B5–B9) over the chunks BEFORE accepting: `Bail` → `Scam`
-/// (B10 bail), a clean finish with ≥1 accepted chunk → `Delivered`, an empty/severed stream → `NoShow`.
-/// The on-chain reaction (`stop`/`dispute`) and blacklist on top of this are applied by [`route_capped_buy`].
+/// from the chain(absent -> `NoShow`), opens an authorized TLS gRPC canonical stream with
+/// the user's request, and runs `StreamVerifier`(D4, B5-B9) over the chunks BEFORE accepting: `Bail` -> `Scam`
+/// (B10 bail), a clean finish with >=1 accepted chunk -> `Delivered`, an empty/severed stream -> `NoShow`.
+/// The on-chain reaction(`stop`/`dispute`) and blacklist on top of this are applied by [`route_capped_buy`].
 pub struct GatewayDealRunner<'a> {
     buyer: &'a Buyer,
     chain: &'a dyn ChainBackend,
-    /// The user's canonical request (B19); the model is forced by the frame, so it is the same for all.
+    /// The user's canonical request(B19); the model is forced by the frame, so it is the same for all.
     request: CanonRequest,
-    /// The expected frame model (B7): checked against the one declared by the seller in the manifest.
+    /// The expected frame model(B7): checked against the one declared by the seller in the manifest.
     expected_model: String,
     /// Budget of accepted canonical chunks for this request.
     max_tokens: u64,
-    /// Loaded model config — B5/B8/B7 verification data is data-driven from it, and the pre-`Delivered`
-    /// content-identity gate (Path A fail-closed) mirrors the consumer-API `content_check_policy`.
+    /// Loaded model config -- B5/B8/B7 verification data is data-driven from it, and the pre-`Delivered`
+    /// content-identity gate(Path A fail-closed) mirrors the consumer-API `content_check_policy`.
     models: Arc<ModelsConfig>,
-    /// `--mock-model`: mock tokens are fake by design (§2) → the content gate is skipped.
+    /// `--mock-model`: mock tokens are fake by design -> the content gate is skipped.
     mock_model: bool,
-    /// `--allow-unverified-model`: opt into paying a model with no content-identity check (name-only).
+    /// `--allow-unverified-model`: opt into paying a model with no content-identity check(name-only).
     allow_unverified: bool,
 }
 
@@ -402,9 +401,9 @@ impl<'a> GatewayDealRunner<'a> {
     }
 }
 
-/// Path A fail-closed (#281): mirror the consumer-API `content_check_policy`. A frame model with NO B8
-/// fingerprint AND NO B7 reference key (in env) has no content layer that can catch a substituted model, so we
-/// refuse to complete the deal (seller not paid) unless `--allow-unverified-model` was passed. This closes the
+/// Path A fail-closed: mirror the consumer-API `content_check_policy`. A frame model with NO B8
+/// fingerprint AND NO B7 reference key(in env) has no content layer that can catch a substituted model, so we
+/// refuse to complete the deal(seller not paid) unless `--allow-unverified-model` was passed. This closes the
 /// gap where the gateway path used to degrade both content layers to `Pass` and `Deliver` an unverifiable
 /// model. Returns `Some(reason)` when delivery must be blocked, `None` when it may proceed. Pure/offline
 /// (`std::env` read for the reference key only) so it is unit-testable without a live gateway.
@@ -436,7 +435,7 @@ pub(crate) fn gateway_content_refusal(
 #[async_trait]
 impl DealRunner for GatewayDealRunner<'_> {
     async fn run(&self, candidate: &Candidate, spot_check: bool) -> DealOutcome {
-        // The handover has not yet been written by the seller → it did not open the stream (no-show).
+        // The handover has not yet been written by the seller -> it did not open the stream(no-show).
         let handover = match self
             .buyer
             .resolve_endpoint(self.chain, &candidate.token_contract)
@@ -445,7 +444,7 @@ impl DealRunner for GatewayDealRunner<'_> {
             Ok(h) => h,
             Err(_) => return DealOutcome::NoShow,
         };
-        // Authorized canonical stream (B18); a connection/authorization failure is also a no-show.
+        // Authorized canonical stream(B18); a connection/authorization failure is also a no-show.
         let mut stream = match self
             .buyer
             .open_canon_stream(&handover, &candidate.token_contract, self.request.clone())
@@ -454,8 +453,8 @@ impl DealRunner for GatewayDealRunner<'_> {
             Ok(s) => s,
             Err(_) => return DealOutcome::NoShow,
         };
-        // D4: verification BEFORE accepting; Bail → Scam (bail, exposure ≤ 2 ticks). B5 vocab is data-driven
-        // from the loaded config (falls back to the family mapping for unconfigured families).
+        // D4: verification BEFORE accepting; Bail -> Scam(bail, exposure <= 2 ticks). B5 vocab is data-driven
+        // from the loaded config(falls back to the family mapping for unconfigured families).
         let mut verifier = StreamVerifier::with_expected_model_and_models(
             self.expected_model.clone(),
             self.models.clone(),
@@ -464,7 +463,7 @@ impl DealRunner for GatewayDealRunner<'_> {
         while let Some(item) = stream.next().await {
             let chunk = match item {
                 Ok(c) => c,
-                Err(_) => break, // transport break — exit, evaluate by what was accepted
+                Err(_) => break, // transport break -- exit, evaluate by what was accepted
             };
             if let Verdict::Bail(reason) = verifier.verify(&chunk) {
                 return DealOutcome::Scam(reason);
@@ -477,10 +476,10 @@ impl DealRunner for GatewayDealRunner<'_> {
         if received == 0 {
             return DealOutcome::NoShow; // the stream opened but delivered nothing
         }
-        // §10.1.3 (lead's decision): on a sampled request — a shadow run of B7-full
-        // (`reference_spotcheck`: greedy vs official endpoint) + B8 (`behavioral_probe`); any
-        // mismatch → `Scam` (the same reaction as the inline layers). No reference/key/model →
-        // degradation (Pass) inside the methods. Extra tick budget is spent only on the sample (1–5%).
+        // (lead's decision): on a sampled request -- a shadow run of B7-full
+        // (`reference_spotcheck`: greedy vs official endpoint) + B8(`behavioral_probe`); any
+        // mismatch -> `Scam`(the same reaction as the inline layers). No reference/key/model ->
+        // degradation(Pass) inside the methods. Extra tick budget is spent only on the sample(1-5%).
         if spot_check {
             if let Ok(Verdict::Bail(reason)) = self
                 .buyer
@@ -509,10 +508,10 @@ impl DealRunner for GatewayDealRunner<'_> {
                 return DealOutcome::Scam(format!("spot-check B8: {reason}"));
             }
         }
-        // Path A fail-closed (#281): mirror Path B `content_check_policy`. If this frame model has NO content
-        // check available (no B8 fingerprint AND no B7 reference key) and the operator did not opt into
-        // name-only (`--allow-unverified-model`), REFUSE — do not pay a model whose identity no layer can
-        // verify. The inline B5–B7 name layers above cannot catch a same-name cheaper-model substitution.
+        // Path A fail-closed: mirror Path B `content_check_policy`. If this frame model has NO content
+        // check available(no B8 fingerprint AND no B7 reference key) and the operator did not opt into
+        // name-only(`--allow-unverified-model`), REFUSE -- do not pay a model whose identity no layer can
+        // verify. The inline B5-B7 name layers above cannot catch a same-name cheaper-model substitution.
         if let Some(reason) = gateway_content_refusal(
             &self.expected_model,
             &self.models,
@@ -529,7 +528,7 @@ impl DealRunner for GatewayDealRunner<'_> {
 mod tests {
     use super::*;
 
-    // ---- Path A fail-closed content-identity gate (#281) ----
+    // ---- Path A fail-closed content-identity gate ----
 
     fn qwen_models_for_routing() -> ModelsConfig {
         ModelsConfig::from_json(
@@ -550,8 +549,8 @@ mod tests {
 
     #[test]
     fn path_a_refuses_model_with_no_verification_data() {
-        // A real (non-mock) frame model with NO fingerprint (not in config) and NO reference key → the gate
-        // returns a refusal reason, so `run()` returns Scam (seller-not-paid), NOT Delivered.
+        // A real(non-mock) frame model with NO fingerprint(not in config) and NO reference key -> the gate
+        // returns a refusal reason, so `run()` returns Scam(seller-not-paid), NOT Delivered.
         let cfg = qwen_models_for_routing();
         let refusal = gateway_content_refusal("meta-llama/llama-3.1-8b", &cfg, false, false);
         assert!(
@@ -563,7 +562,7 @@ mod tests {
 
     #[test]
     fn path_a_allows_unverified_model_with_opt_in() {
-        // The explicit --allow-unverified-model opt-out lets the same name-only model through (name-only).
+        // The explicit --allow-unverified-model opt-out lets the same name-only model through(name-only).
         let cfg = qwen_models_for_routing();
         assert!(
             gateway_content_refusal("meta-llama/llama-3.1-8b", &cfg, false, true).is_none(),
@@ -573,16 +572,16 @@ mod tests {
 
     #[test]
     fn path_a_allows_model_with_fingerprint() {
-        // qwen HAS a B8 fingerprint in config → the content gate can run → delivery may proceed (no refusal).
+        // qwen HAS a B8 fingerprint in config -> the content gate can run -> delivery may proceed(no refusal).
         let cfg = qwen_models_for_routing();
         assert!(gateway_content_refusal("qwen--qwen3--32b", &cfg, false, false).is_none());
-        // The served + registry spellings resolve to the same fingerprint → also allowed.
+        // The served + registry spellings resolve to the same fingerprint -> also allowed.
         assert!(gateway_content_refusal("qwen/qwen3-32b", &cfg, false, false).is_none());
     }
 
     #[test]
     fn path_a_mock_model_is_exempt() {
-        // --mock-model: fake tokens by design (§2) → no content gate, delivery allowed even with no fingerprint.
+        // --mock-model: fake tokens by design -> no content gate, delivery allowed even with no fingerprint.
         let cfg = qwen_models_for_routing();
         assert!(gateway_content_refusal("dexdo-mock", &cfg, true, false).is_none());
     }
@@ -627,7 +626,7 @@ mod tests {
 
     #[test]
     fn over_cap_excluded() {
-        // Negative (§5): an offer more expensive than the ceiling is not taken (frame B2 is not violated).
+        // Negative: an offer more expensive than the ceiling is not taken(frame B2 is not violated).
         let offers = vec![cand("cheap", 50, 10), cand("expensive", 150, 10)];
         let ranked = eligible_ranked(
             &frame(100, 5),
@@ -641,7 +640,7 @@ mod tests {
 
     #[test]
     fn blacklisted_seller_excluded() {
-        // Negative (§5): a caught seller (B16) is avoided even at a better price.
+        // Negative: a caught seller(B16) is avoided even at a better price.
         let offers = vec![cand("scammer", 5, 10), cand("honest", 20, 10)];
         let mut bl = Blacklist::new();
         bl.mark("scammer");
@@ -655,7 +654,7 @@ mod tests {
 
     #[test]
     fn insufficient_capacity_excluded() {
-        // Negative (§5): an offer cannot carry the required tick volume — not eligible.
+        // Negative: an offer cannot carry the required tick volume -- not eligible.
         let offers = vec![cand("small", 10, 3), cand("big", 20, 10)];
         let ranked = eligible_ranked(
             &frame(100, 5),
@@ -682,11 +681,11 @@ mod tests {
     #[test]
     fn scores_accumulate_pass_and_bail() {
         let mut s = SellerScores::new();
-        assert_eq!(s.score_of("a"), 0, "unfamiliar seller — 0");
+        assert_eq!(s.score_of("a"), 0, "unfamiliar seller -- 0");
         s.record_pass("a");
         s.record_pass("a");
         s.record_bail("a");
-        assert_eq!(s.score_of("a"), 1, "2 pass − 1 bail = 1");
+        assert_eq!(s.score_of("a"), 1, "2 pass - 1 bail = 1");
         s.record_bail("b");
         assert_eq!(s.score_of("b"), -1);
     }
@@ -711,7 +710,7 @@ mod tests {
 
     #[test]
     fn price_dominates_score() {
-        // Price takes priority over score: cheap-unfamiliar before expensive-with-good-history (frame B2).
+        // Price takes priority over score: cheap-unfamiliar before expensive-with-good-history(frame B2).
         let offers = vec![cand("cheap_new", 10, 10), cand("pricey_good", 20, 10)];
         let mut scores = SellerScores::new();
         scores.record_pass("pricey_good");
@@ -725,39 +724,39 @@ mod tests {
 
     #[test]
     fn spotcheck_rate_scales_with_score() {
-        // Lead's decision: unfamiliar/low score → more often (×4); stable history → rarer; clamp [0,1].
+        // Lead's decision: unfamiliar/low score -> more often(x4); stable history -> rarer; clamp [0,1].
         let base = 0.03;
-        // Unfamiliar (score 0) and caught (score < 0) — elevated rate.
+        // Unfamiliar(score 0) and caught(score < 0) -- elevated rate.
         assert!(
             (spotcheck_rate_for(base, 0) - 0.12).abs() < 1e-9,
-            "score 0 → base×4"
+            "score 0 -> basex4"
         );
         assert!(
             (spotcheck_rate_for(base, -2) - 0.12).abs() < 1e-9,
-            "score<0 → base×4"
+            "score<0 -> basex4"
         );
-        // Stable history — rarer than base.
+        // Stable history -- rarer than base.
         assert!(
             spotcheck_rate_for(base, 4) < base,
-            "good score → rarer than base"
+            "good score -> rarer than base"
         );
         assert!(
             spotcheck_rate_for(base, 10) < spotcheck_rate_for(base, 4),
-            "even better score → even rarer"
+            "even better score -> even rarer"
         );
         // Disabled / clamp.
-        assert_eq!(spotcheck_rate_for(0.0, 0), 0.0, "0 base → disabled");
+        assert_eq!(spotcheck_rate_for(0.0, 0), 0.0, "0 base -> disabled");
         assert_eq!(
             spotcheck_rate_for(1.0, 0),
             1.0,
-            "clamp to 1.0 (base 1.0, score 0 → ×4 → 1.0)"
+            "clamp to 1.0 (base 1.0, score 0 -> x4 -> 1.0)"
         );
     }
 
     #[test]
     fn unknown_note_always_max_scrutiny() {
-        // Directive @43057bd: safe default — an unknown note (score 0) is checked NO LESS OFTEN than
-        // any note with local history. A scammer rotating notes is always "unknown" → always
+        // Directive @43057bd: safe default -- an unknown note(score 0) is checked NO LESS OFTEN than
+        // any note with local history. A scammer rotating notes is always "unknown" -> always
         // under maximum scrutiny; relaxation only for a note that has been clean many times.
         let base = 0.03;
         let unknown = spotcheck_rate_for(base, 0);
@@ -769,15 +768,15 @@ mod tests {
         }
         assert!(
             unknown > base,
-            "unknown note — elevated rate, not trust by default"
+            "unknown note -- elevated rate, not trust by default"
         );
     }
 
     #[test]
     fn new_frame_carries_default_spot_check_rate() {
-        // Finding 3 (#144): a frame built through the PRODUCTION constructor samples by default — the
-        // B7-full/B8 content-identity layers are never silently disabled (`0.0`). Test fixtures opt out
-        // literally (`spot_check_rate: 0.0`) for deterministic ranking; a production buy goes through `new`.
+        // Finding 3: a frame built through the PRODUCTION constructor samples by default -- the
+        // B7-full/B8 content-identity layers are never silently disabled(`0.0`). Test fixtures opt out
+        // literally(`spot_check_rate: 0.0`) for deterministic ranking; a production buy goes through `new`.
         let f = CappedBuy::new("qwen/qwen3-32b".to_string(), 100, 1, ScammerReaction::Stop);
         assert_eq!(
             f.spot_check_rate, DEFAULT_SPOT_CHECK_RATE,
@@ -792,9 +791,9 @@ mod tests {
     use proptest::prelude::*;
 
     proptest! {
-        /// Invariant (§5, property): whatever comes as input, the selected candidates are ALWAYS in the frame
-        /// (price ≤ cap, volume ≥ required) and NOT in the blacklist, and ordered by non-decreasing price —
-        /// the frame (B2) and blacklist (B16) are not violated on any set of offers.
+        /// Invariant: whatever comes as input, the selected candidates are ALWAYS in the frame
+        /// (price <= cap, volume >= required) and NOT in the blacklist, and ordered by non-decreasing price --
+        /// the frame(B2) and blacklist(B16) are not violated on any set of offers.
         #[test]
         fn ranked_respects_frame_and_blacklist(
             cap in 1u128..1000,

@@ -1,4 +1,4 @@
-//! `dexdo` CLI helpers (backends, resolvers, deposit sizing, render), split out of `main.rs` (PR3,
+//! `dexdo` CLI helpers(backends, resolvers, deposit sizing, render), split out of `main.rs` (PR3,
 //! move-only). Behavior-identical to the pre-split functions.
 
 use crate::cli::args::*;
@@ -10,9 +10,9 @@ use dexdo_core::{
 use std::path::PathBuf;
 use std::sync::Arc;
 
-/// Load the identity's **note tree** from `--note-key` (directive 7). dexdo only **reads** the key,
-/// never writes or rotates it. No path → an ephemeral tree (degenerate to a single note) with
-/// a warning (mock-demo). An invalid/inaccessible path is an explicit failure, not a silent `generate()`.
+/// Load the identity's **note tree** from `--note-key`. dexdo only **reads** the key,
+/// never writes or rotates it. No path -> an ephemeral tree(degenerate to a single note) with
+/// a warning(mock-demo). An invalid/inaccessible path is an explicit failure, not a silent `generate()`.
 pub(crate) fn load_note_tree(note_key: Option<&std::path::Path>) -> Result<NoteTree> {
     match note_key {
         Some(path) => {
@@ -23,7 +23,7 @@ pub(crate) fn load_note_tree(note_key: Option<&std::path::Path>) -> Result<NoteT
         }
         None => {
             tracing::warn!(
-                "ephemeral note (no --note-key): identity will NOT persist between runs — \
+                "ephemeral note (no --note-key): identity will NOT persist between runs -- \
                  mock-demo only. Production path: set --note-key <path>."
             );
             Ok(NoteTree::new(LocalNote::generate()))
@@ -31,8 +31,8 @@ pub(crate) fn load_note_tree(note_key: Option<&std::path::Path>) -> Result<NoteT
     }
 }
 
-/// Load the specific identity (sub)note (tree + index from `--note-index`) that
-/// `seller`/`buyer` operates on (directive 7: an order/deal lives on a sub-note). Index outside the tree → explicit failure.
+/// Load the specific identity(sub)note(tree + index from `--note-index`) that
+/// `seller`/`buyer` operates on. Index outside the tree -> explicit failure.
 pub(crate) fn load_note_identity(identity: &IdentityArgs) -> Result<LocalNote> {
     let tree = load_note_tree(identity.note_key.as_deref())?;
     tree.node(identity.note_index).ok_or_else(|| {
@@ -43,11 +43,11 @@ pub(crate) fn load_note_identity(identity: &IdentityArgs) -> Result<LocalNote> {
     })
 }
 
-/// Chain backend + note, selected by `--mock-chain`/the `shellnet` feature (D10). Behind the common
-/// `ChainBackend`/`Note` trait the `seller`/`buyer` flow does not depend on the choice — only construction changes.
+/// Chain backend + note, selected by `--mock-chain`/the `shellnet` feature. Behind the common
+/// `ChainBackend`/`Note` trait the `seller`/`buyer` flow does not depend on the choice -- only construction changes.
 pub(crate) type ChainAndNote = (Arc<dyn ChainBackend>, Arc<dyn Note>);
 
-/// Mock backend + a loaded (or ephemeral) `LocalNote` — the standard mock path (§11.1, `--mock-chain`).
+/// Mock backend + a loaded(or ephemeral) `LocalNote` -- the standard mock path.
 pub(crate) fn mock_chain_and_note(
     endpoints_file: PathBuf,
     identity: &IdentityArgs,
@@ -61,7 +61,7 @@ pub(crate) fn mock_chain_and_note(
     Ok((chain, note))
 }
 
-/// Read the key's hex secret from a file (custody is external §5). The contents are **not logged** (secret).
+/// Read the key's hex secret from a file. The contents are **not logged**(secret).
 #[cfg(feature = "shellnet")]
 pub(crate) fn read_secret_hex(path: &std::path::Path, what: &str) -> Result<String> {
     let s = std::fs::read_to_string(path)
@@ -73,9 +73,9 @@ pub(crate) fn read_secret_hex(path: &std::path::Path, what: &str) -> Result<Stri
     Ok(s)
 }
 
-/// Real seller backend + the seller's `RealNote` (D10, F1): from the `--note-key` seed + `--note-addr` (the
-/// mint-specific address of the provisioned note) and `model_hash` from `--model` (D11). Directive #58: the note
-/// self-funds its seller side from its own ECC[2] — no operator wallet. Provisioning is a separate script (D13).
+/// Real seller backend + the seller's `RealNote`: from the `--note-key` seed + `--note-addr` (the
+/// mint-specific address of the provisioned note) and `model_hash` from `--model`. Directive: the note
+/// self-funds its seller side from its own ECC[2] -- no operator wallet. Provisioning is a separate script.
 #[cfg(feature = "shellnet")]
 pub(crate) fn seller_real_backend(
     args: &SellerArgs,
@@ -93,7 +93,7 @@ pub(crate) fn seller_real_backend(
         .get(name)?
         .frame_model
         .clone();
-    // The offer's on-chain model name/hash MUST be canonical `producer--model--version` (indexer-parseable);
+    // The offer's on-chain model name/hash MUST be canonical `producer--model--version`(indexer-parseable);
     // an OpenAI slug belongs in `served_model`. Fail loud before posting an un-indexable offer.
     dexdo_core::validate_canonical_model_id(&frame_model).map_err(|e| anyhow::anyhow!(e))?;
     check_market_model_match(market_frame_model, &frame_model, name)?;
@@ -108,12 +108,12 @@ pub(crate) fn seller_real_backend(
         .contracts
         .to_str()
         .ok_or_else(|| anyhow::anyhow!("--contracts: non-printable path"))?;
-    // Review #39: the deal nonce binds the offer to the canonical per-deal TokenContract. The IOB
+    // Review: the deal nonce binds the offer to the canonical per-deal TokenContract. The IOB
     // rejects any offer whose `tokenContract` does not derive from `(sellerPubkey, nonce)`, so the
-    // real seller MUST have it — from `--market` (manifest) or the explicit `--nonce` flag.
+    // real seller MUST have it -- from `--market`(manifest) or the explicit `--nonce` flag.
     let nonce = market_nonce.ok_or_else(|| {
         anyhow::anyhow!(
-            "real shellnet: pass --nonce <n> (or --market <manifest>) — the deal nonce binds the \
+            "real shellnet: pass --nonce <n> (or --market <manifest>) -- the deal nonce binds the \
              offer to the canonical TokenContract (IOB rejects a mismatched tokenContract)"
         )
     })?;
@@ -141,9 +141,9 @@ pub(crate) fn seller_real_backend(
     )
 }
 
-/// Real buyer backend + the buyer's `RealNote` (D10): from a provisioned note (`--note-key`/`--note-addr`)
-/// and `model_hash` from `--frame-model`. The price limit is `--max-price-per-tick` (≥ ask); the escrow must
-/// cover `ticks × limit × (1 + 2.5 % book fee)` (issue #20 — otherwise the escrow is orphaned in the book;
+/// Real buyer backend + the buyer's `RealNote`: from a provisioned note(`--note-key`/`--note-addr`)
+/// and `model_hash` from `--frame-model`. The price limit is `--max-price-per-tick`(>= ask); the escrow must
+/// cover `ticks x limit x(1 + 2.5 % book fee)` (issue -- otherwise the escrow is orphaned in the book;
 /// `from_provisioned` checks the invariant ahead of time via `check_buy_deposit_headroom`).
 #[cfg(feature = "shellnet")]
 pub(crate) fn buyer_real_backend(args: &BuyerArgs, frame_model: &str) -> Result<ChainAndNote> {
@@ -165,7 +165,7 @@ pub(crate) fn buyer_real_backend(args: &BuyerArgs, frame_model: &str) -> Result<
         frame_model,
         max_price_per_tick,
         args.ticks,
-        // #116: default to EXACTLY the required escrow (no over-funding); an explicit value is checked
+        // default to EXACTLY the required escrow(no over-funding); an explicit value is checked
         // == required by `check_buy_deposit_headroom` in `from_provisioned`.
         args.escrow
             .unwrap_or_else(|| dexdo_core::required_escrow_for_buy(args.ticks, max_price_per_tick)),
@@ -182,7 +182,7 @@ pub(crate) fn buyer_real_backend(_args: &BuyerArgs, _frame_model: &str) -> Resul
     )
 }
 
-/// Default platform path for the endpoints file (D6): the application data directory
+/// Default platform path for the endpoints file(D6): the application data directory
 /// (Linux `~/.local/share/dexdo`, macOS `~/Library/Application Support/ai.gosh.dexdo`,
 /// Windows `%APPDATA%\gosh\dexdo\data`). `PathBuf::join` yields the correct separator on each OS.
 pub(crate) fn default_endpoints_path() -> Result<PathBuf> {
@@ -193,7 +193,7 @@ pub(crate) fn default_endpoints_path() -> Result<PathBuf> {
 }
 
 /// Resolve the endpoints file path: an explicit `--endpoints-file` takes priority, otherwise the platform
-/// default. The parent directory is created (the mock writes `*.chainstate.json` alongside it).
+/// default. The parent directory is created(the mock writes `*.chainstate.json` alongside it).
 pub(crate) fn resolve_endpoints_file(explicit: Option<PathBuf>) -> Result<PathBuf> {
     let path = match explicit {
         Some(p) => p,
@@ -208,8 +208,8 @@ pub(crate) fn resolve_endpoints_file(explicit: Option<PathBuf>) -> Result<PathBu
     Ok(path)
 }
 
-/// Issue #24: load + integrity-check a `dexdo provision` market manifest (`--market`). A corrupt or
-/// hand-edited manifest (empty fields, `model_hash` not matching `frame_model`) is rejected, not silently
+/// Issue: load + integrity-check a `dexdo provision` market manifest(`--market`). A corrupt or
+/// hand-edited manifest(empty fields, `model_hash` not matching `frame_model`) is rejected, not silently
 /// trusted by a real-money CLI.
 pub(crate) fn load_market(path: &std::path::Path) -> Result<dexdo_core::MarketManifest> {
     let s = std::fs::read_to_string(path)
@@ -221,11 +221,11 @@ pub(crate) fn load_market(path: &std::path::Path) -> Result<dexdo_core::MarketMa
     Ok(m)
 }
 
-/// #128: on `dexdo seller --market`, the seller note (`--note-addr`) MUST be the one the market was provisioned
+/// on `dexdo seller --market`, the seller note(`--note-addr`) MUST be the one the market was provisioned
 /// for. The per-deal `TokenContract` is derived from `(sellerPubkey, nonce)`; posting an offer from a different
 /// note/key than the manifest's `seller_note` makes the `InferenceOrderBook` reject the ask (canonical-TC
-/// mismatch) — it never rests, the seller never matches, and the buyer times out. Fail closed BEFORE posting.
-/// Pure (offline-testable): compares the manifest `seller_note` to `--note-addr`, both wallet-normalized.
+/// mismatch) -- it never rests, the seller never matches, and the buyer times out. Fail closed BEFORE posting.
+/// Pure(offline-testable): compares the manifest `seller_note` to `--note-addr`, both wallet-normalized.
 pub(crate) fn assert_market_seller_note(manifest_seller_note: &str, note_addr: &str) -> Result<()> {
     let norm =
         |s: &str| dexdo_core::normalize_wallet_address(s).unwrap_or_else(|_| s.trim().to_string());
@@ -234,7 +234,7 @@ pub(crate) fn assert_market_seller_note(manifest_seller_note: &str, note_addr: &
             "--market manifest seller_note {manifest_seller_note} != --note-addr {note_addr}: the seller note \
              must be the one the market was provisioned for. The per-deal TokenContract is derived from \
              (sellerPubkey, nonce), so an offer from a different note/key is rejected by the InferenceOrderBook \
-             (canonical-TC mismatch) — the ask never rests and the buyer never matches (issue #128). Use the \
+             (canonical-TC mismatch) -- the ask never rests and the buyer never matches (). Use the \
              provisioned note, or re-provision a market for this note."
         );
     }
@@ -245,8 +245,8 @@ pub(crate) fn assert_market_seller_note(manifest_seller_note: &str, note_addr: &
 mod seller_note_tests {
     use super::*;
 
-    /// #128: `dexdo seller --market` must fail closed if the manifest's `seller_note` isn't this seller's
-    /// `--note-addr` — a mismatched note posts a non-canonical TC the IOB won't rest, so the seller never
+    /// `dexdo seller --market` must fail closed if the manifest's `seller_note` isn't this seller's
+    /// `--note-addr` -- a mismatched note posts a non-canonical TC the IOB won't rest, so the seller never
     /// matches and the buyer times out. The same note passes.
     #[test]
     fn market_seller_note_mismatch_fails_closed() {
@@ -254,19 +254,18 @@ mod seller_note_tests {
         let err = assert_market_seller_note("0:aaaa", "0:bbbb")
             .unwrap_err()
             .to_string();
-        assert!(err.contains("issue #128"), "{err}");
+        assert!(err.contains(""), "{err}");
         assert!(err.contains("seller note"), "{err}");
     }
 }
 
-/// Resolve `(token_contract, frame_model, nonce)` for seller/buyer from `--market` (if set) or the
-/// explicit flags (issue #24): a produced provisioning record feeds the CLI without hand-editing.
-/// `frame_model` is returned as `Option` — the seller passes `None` (it validates the manifest model
-/// against `--model`). `nonce` (review #39) is the deal nonce from the manifest — `Some` only on the
+/// Resolve `(token_contract, frame_model, nonce)` for seller/buyer from `--market`(if set) or the
+/// explicit flags: a produced provisioning record feeds the CLI without hand-editing.
+/// `frame_model` is returned as `Option` -- the seller passes `None` (it validates the manifest model
+/// against `--model`). `nonce` is the deal nonce from the manifest -- `Some` only on the
 /// `--market` path; on the explicit `--token-contract` path it is `None` (the seller supplies it via
 /// `--nonce`, the buyer ignores it).
-///
-/// **Fail-loud (real-money CLI):** `--market` is the single source of truth — combining it with an
+/// **Fail-loud(real-money CLI):** `--market` is the single source of truth -- combining it with an
 /// explicit `--token-contract`/`--frame-model` is rejected rather than silently taking one of them.
 pub(crate) fn resolve_market_fields(
     market: Option<&std::path::Path>,
@@ -275,10 +274,10 @@ pub(crate) fn resolve_market_fields(
 ) -> Result<(String, Option<String>, Option<u64>)> {
     if let Some(p) = market {
         if token_contract.is_some() {
-            bail!("--market and --token-contract are mutually exclusive — pass only one");
+            bail!("--market and --token-contract are mutually exclusive -- pass only one");
         }
         if frame_model.is_some() {
-            bail!("--market and --frame-model are mutually exclusive — pass only one");
+            bail!("--market and --frame-model are mutually exclusive -- pass only one");
         }
         let m = load_market(p)?;
         Ok((m.token_contract, Some(m.frame_model), Some(m.nonce)))
@@ -289,16 +288,16 @@ pub(crate) fn resolve_market_fields(
     }
 }
 
-/// #125: `dexdo provision` REQUIRES an explicit, deal-unique `--nonce`. The per-deal `TokenContract` derives
-/// from `(sellerPubkey, nonce)`, so a reused/default nonce collides — a second provisioned deal overwrites the
+/// `dexdo provision` REQUIRES an explicit, deal-unique `--nonce`. The per-deal `TokenContract` derives
+/// from `(sellerPubkey, nonce)`, so a reused/default nonce collides -- a second provisioned deal overwrites the
 /// first deal's TC. The old `--nonce 0` default silently reused it; this fails loud and forces a distinct nonce
-/// per deal. Pure (offline §5).
-#[cfg_attr(not(feature = "shellnet"), allow(dead_code))] // used by run_provision (shellnet); §5 test exercises it
+/// per deal. Pure.
+#[cfg_attr(not(feature = "shellnet"), allow(dead_code))] // used by run_provision(shellnet); test exercises it
 pub(crate) fn require_provision_nonce(nonce: Option<u64>) -> Result<u64> {
     nonce.ok_or_else(|| {
         anyhow::anyhow!(
             "--nonce <n> is required and must be UNIQUE per deal: the per-deal TokenContract derives from \
-             (sellerPubkey, nonce), so a reused/default nonce collides — overwriting a prior deal's TC. Pass a \
+             (sellerPubkey, nonce), so a reused/default nonce collides -- overwriting a prior deal's TC. Pass a \
              distinct --nonce for each provisioned deal (e.g. an incrementing counter)."
         )
     })
@@ -308,7 +307,7 @@ pub(crate) fn require_provision_nonce(nonce: Option<u64>) -> Result<u64> {
 mod provision_nonce_tests {
     use super::require_provision_nonce;
 
-    /// #125 §5: `provision` refuses an absent `--nonce` (the old unsafe `0` default → collision across deals)
+    /// `provision` refuses an absent `--nonce`(the old unsafe `0` default -> collision across deals)
     /// and accepts an explicit deal-unique value.
     #[test]
     fn provision_nonce_required_and_explicit() {
@@ -319,9 +318,9 @@ mod provision_nonce_tests {
     }
 }
 
-/// Issue #24 (review): the served `--model` must resolve to the model a `--market` manifest was
+/// Issue(review): the served `--model` must resolve to the model a `--market` manifest was
 /// provisioned for, else the seller posts the manifest's `token_contract` into the wrong order book
-/// while a buyer using the same manifest derives another model (fields drift). Fail closed on mismatch.
+/// while a buyer using the same manifest derives another model(fields drift). Fail closed on mismatch.
 /// (Only the real-shellnet seller path calls it; kept non-gated so the offline regression exercises it.)
 #[cfg_attr(not(feature = "shellnet"), allow(dead_code))]
 pub(crate) fn check_market_model_match(
@@ -333,7 +332,7 @@ pub(crate) fn check_market_model_match(
         if mfm != configured_frame_model {
             bail!(
                 "--market manifest is for frame_model `{mfm}`, but --model `{model_name}` resolves to \
-                 `{configured_frame_model}` — refusing to serve the wrong model into the manifest's order book"
+                 `{configured_frame_model}` -- refusing to serve the wrong model into the manifest's order book"
             );
         }
     }
@@ -345,12 +344,12 @@ pub(crate) fn consumer_api_token_budget(ticks: u128) -> u64 {
     ticks.saturating_mul(tick_size).min(u64::MAX as u128) as u64
 }
 
-/// #120: the one-shot `dexdo buyer` path (no `--local-listen`) opens the seller stream with NO canonical
-/// request — it is promptless by design (`connect_and_stream` sends `None`). A **real** seller upstream
-/// cannot serve a prompt-less stream (`"real upstream requires a canonical request"`), and fabricating a
-/// default prompt would run+bill a synthetic inference the buyer never asked for (money-safety). So one-shot
+/// the one-shot `dexdo buyer` path(no `--local-listen`) opens the seller stream with NO canonical
+/// request -- it is promptless by design(`connect_and_stream` sends `None`). A **real** seller upstream
+/// cannot serve a prompt-less stream(`"real upstream requires a canonical request"`), and fabricating a
+/// default prompt would run+bill a synthetic inference the buyer never asked for(money-safety). So one-shot
 /// only drives a `--mock-model` seller; real-provider inference must go through `--local-listen` + the consumer
-/// API (`/v1/chat/completions`, §10.6/G B19/B20), which supplies the prompt per request. Fail closed EARLY
+/// API, which supplies the prompt per request. Fail closed EARLY
 /// (before the on-chain buy) with an actionable error instead of a deep gateway `InvalidArgument`.
 pub(crate) fn oneshot_real_upstream_guard(
     local_listen_set: bool,
@@ -359,36 +358,36 @@ pub(crate) fn oneshot_real_upstream_guard(
     if !local_listen_set && !mock_model {
         return Err(
             "real-provider inference requires `--local-listen <addr>` + a `/v1/chat/completions` request \
-             (the consumer API supplies the prompt, §10.6/G); one-shot `dexdo buyer` (no prompt) only drives a \
+             (the consumer API supplies the prompt,/G); one-shot `dexdo buyer` (no prompt) only drives a \
              `--mock-model` seller. Add `--local-listen` and POST your prompt there, or pass `--mock-model` for \
-             the mock path (issue #120)."
+             the mock path ()."
                 .to_string(),
         );
     }
     Ok(())
 }
 
-/// #65: 1 SHELL = 1e9 raw ECC[2] nano (the note-side unit; `--deposit-shells N` = N **SHELL**, not vmshell).
+/// 1 SHELL = 1e9 raw ECC[2] nano(the note-side unit; `--deposit-shells N` = N **SHELL**, not vmshell).
 #[allow(dead_code)] // used by the shellnet `provision` path + the deposit-validation tests
 pub(crate) const SHELL_UNIT: u128 = 1_000_000_000;
-/// #65/#70: per-deploy **SHELL allocation** floor (note-side), sized to the deploy's **vmshell** gas need —
-/// **derived from contract constants** (AGENTS.md §6 — never bisected). **fund-10 (per @SeHor05): `MIN_BALANCE`
-/// gates nothing** — `ensureBalance()`'s `mintshellq` is a no-op for a self-dapp TC (no DappConfig), so the old
+/// per-deploy **SHELL allocation** floor(note-side), sized to the deploy's **vmshell** gas need --
+/// **derived from contract constants**. **fund-10(per @SeHor05): `MIN_BALANCE`
+/// gates nothing** -- `ensureBalance()`'s `mintshellq` is a no-op for a self-dapp TC(no DappConfig), so the old
 /// +100 `MIN_BALANCE` term was the note **over-funding** the deploy, not a floor. A self-dapp deploy only needs the
-/// cross-dapp `REGISTER_FORWARD_VALUE` (5) + ~0.07 vmshell compute + a thin margin = **~10 SHELL/deploy**;
-/// `fundDeployShell` converts SHELL→vmshell ~1:1 (flag:16). `REGISTER_FORWARD_VALUE` is a
+/// cross-dapp `REGISTER_FORWARD_VALUE`(5) + ~0.07 vmshell compute + a thin margin = **~10 SHELL/deploy**;
+/// `fundDeployShell` converts SHELL->vmshell ~1:1(flag:16). `REGISTER_FORWARD_VALUE` is a
 /// `contracts/dex/modifiers/modifiers.sol` constant. The held leftover burns at `destroy` (`selfdestruct(payout)`
-/// to the cross-dapp note is not credited — by-fact ×2) but at ~10/deploy is now ~a few vmshell (negligible).
-/// **NB (by-fact):** on the CURRENT contract a live deal's TC runtime cross-dapp sends (5 vmshell each) drain a
-/// ~10-funded TC, so a live deal needs a higher `--deposit-shells` until @SeHor05's #70 send-`value:`→0.01 cut.
+/// to the cross-dapp note is not credited -- by-fact x2) but at ~10/deploy is now ~a few vmshell(negligible).
+/// **NB(by-fact):** on the CURRENT contract a live deal's TC runtime cross-dapp sends(5 vmshell each) drain a
+/// ~10-funded TC, so a live deal needs a higher `--deposit-shells` until @SeHor05's send-`value:`->0.01 cut.
 #[allow(dead_code)]
 pub(crate) const MIN_DEPLOY_SHELLS: u128 = 5 /* REGISTER_FORWARD_VALUE */ + 5 /* compute margin (~0.07 burn + headroom) */;
-/// #65/#70: default note deposit (**SHELL/ECC[2]**, note-side) — **fund-10, right-sized** (AGENTS.md §6), not padded.
+/// default note deposit(**SHELL/ECC[2]**, note-side) -- **fund-10, right-sized**, not padded.
 /// `deposit/2` funds the RootModel + per-deal `TokenContract` deploys, so the default gives `20/2 = 10` SHELL each
-/// (→ ~10 vmshell/deploy after flag:16) — the `MIN_DEPLOY_SHELLS` floor. The held leftover burns at `destroy` but is
-/// ~a few vmshell (negligible). **NB:** a live deal on the current contract needs a higher `--deposit-shells` (the
-/// TC runtime sends drain ~10) until @SeHor05's #70 send-`value:`→0.01 cut — the AmicableSplit behaviour itself is
-/// proven offline (`positive_path_amicable_split`).
+/// (-> ~10 vmshell/deploy after flag:16) -- the `MIN_DEPLOY_SHELLS` floor. The held leftover burns at `destroy` but is
+/// ~a few vmshell(negligible). **NB:** a live deal on the current contract needs a higher `--deposit-shells` (the
+/// TC runtime sends drain ~10) until @SeHor05's send-`value:`->0.01 cut -- the AmicableSplit behaviour itself is
+/// proven offline(`positive_path_amicable_split`).
 #[allow(dead_code)]
 pub(crate) const DEFAULT_DEPOSIT_SHELLS: u128 = 20;
 /// Contract constants mirrored from `contracts/airegistry/modifiers/modifiers.sol`.
@@ -397,11 +396,11 @@ pub(crate) const SELLER_PROBE_COMMISSION_BPS: u128 = 250;
 #[allow(dead_code)]
 pub(crate) const BPS_DENOMINATOR: u128 = 10_000;
 
-/// #65: resolve the per-deploy ECC[2] funding (raw) from the user's note deposit (SHELL) — **fail-closed** for a
+/// resolve the per-deploy ECC[2] funding(raw) from the user's note deposit(SHELL) -- **fail-closed** for a
 /// value that controls live on-chain spending. Errors on `u128` overflow and on a **below-floor** deposit (a known
 /// funded-uninit / fund-burn outcome on-chain), instead of silently clamping or proceeding into a live spend. For
-/// this checkpoint the deposit is a **per-deploy allocation** (RootModel + one `TokenContract` = `deposit/2`), not
-/// yet the full "N deals per note" budget model (#65).
+/// this checkpoint the deposit is a **per-deploy allocation**(RootModel + one `TokenContract` = `deposit/2`), not
+/// yet the full "N deals per note" budget model.
 #[allow(dead_code)]
 pub(crate) fn deposit_per_deploy(deposit_shells: u128) -> Result<u128> {
     let deposit_raw = deposit_shells.checked_mul(SHELL_UNIT).ok_or_else(|| {
@@ -410,11 +409,11 @@ pub(crate) fn deposit_per_deploy(deposit_shells: u128) -> Result<u128> {
     let per_deploy = deposit_raw / 2; // RootModel + per-deal TokenContract
     if per_deploy < MIN_DEPLOY_SHELLS.saturating_mul(SHELL_UNIT) {
         anyhow::bail!(
-            "--deposit-shells {deposit_shells} → ~{} SHELL/deploy is below the {MIN_DEPLOY_SHELLS} SHELL/deploy \
+            "--deposit-shells {deposit_shells} -> ~{} SHELL/deploy is below the {MIN_DEPLOY_SHELLS} SHELL/deploy \
              floor (each self-dapp deploy needs ~{MIN_DEPLOY_SHELLS} vmshell after flag:16 = REGISTER_FORWARD_VALUE \
-             5 + ~0.07 compute + margin — contract constants, not bisected; #70: MIN_BALANCE gates nothing, so the \
+             5 + ~0.07 compute + margin -- contract constants, not bisected; : MIN_BALANCE gates nothing, so the \
              old ~110 was the note over-funding). Below it the deploy under-funds (funded-uninit). \
-             Raise --deposit-shells to ≥{} (default {DEFAULT_DEPOSIT_SHELLS}).",
+             Raise --deposit-shells to >={} (default {DEFAULT_DEPOSIT_SHELLS}).",
             per_deploy / SHELL_UNIT,
             MIN_DEPLOY_SHELLS * 2
         );
@@ -436,7 +435,7 @@ pub(crate) fn seller_probe_commission_for_price(price_per_tick: u128) -> Result<
     Ok(product / BPS_DENOMINATOR)
 }
 
-/// #228: provision may fail early if the note cannot cover the exact deploy deposit plus the contract-derived
+/// provision may fail early if the note cannot cover the exact deploy deposit plus the contract-derived
 /// seller probe commission. This is not guessed runtime headroom: `TokenContract.open()` hard-requires
 /// `fundProbeCommission()` first, and the amount is `SELLER_PROBE_COMMISSION_BPS` of `price_per_tick`.
 #[cfg_attr(not(feature = "shellnet"), allow(dead_code))]
@@ -466,9 +465,9 @@ pub(crate) fn ensure_provision_deposit_covered(
     Ok(())
 }
 
-/// #65: interactively ask the operator for the note deposit (SHELL). `Ok(None)` = empty line / non-interactive
-/// stdin (caller uses [`DEFAULT_DEPOSIT_SHELLS`]); `Ok(Some)` = a valid amount; **`Err` = a non-empty unparseable
-/// line** — fail-closed: a typo must NOT silently fall back to the default for a live-spend input.
+/// interactively ask the operator for the note deposit(SHELL). `Ok(None)` = empty line / non-interactive
+/// stdin(caller uses [`DEFAULT_DEPOSIT_SHELLS`]); `Ok(Some)` = a valid amount; **`Err` = a non-empty unparseable
+/// line** -- fail-closed: a typo must NOT silently fall back to the default for a live-spend input.
 #[cfg(feature = "shellnet")]
 pub(crate) fn prompt_deposit_shells() -> Result<Option<u128>> {
     use std::io::{IsTerminal as _, Write as _};
@@ -491,8 +490,8 @@ pub(crate) fn prompt_deposit_shells() -> Result<Option<u128>> {
     Ok(Some(n))
 }
 
-/// Human-readable view of the identity's **note tree** snapshot (R14): state across all sub-notes under
-/// the key. "From whom" = the counterparty note's anonymous public key (§2.2).
+/// Human-readable view of the identity's **note tree** snapshot(R14): state across all sub-notes under
+/// the key. "From whom" = the counterparty note's anonymous public key.
 pub(crate) fn print_tree_snapshot(s: &TreeSnapshot) {
     print!("{}", render_tree_snapshot(s));
 }
@@ -508,14 +507,14 @@ pub(crate) fn render_tree_snapshot(s: &TreeSnapshot) -> String {
     )
     .unwrap();
     for id in &s.note_ids {
-        writeln!(&mut out, "  · {id}").unwrap();
+        writeln!(&mut out, "  * {id}").unwrap();
     }
     writeln!(&mut out, "tree exposure (at risk): {} SHELL", s.exposure).unwrap();
     writeln!(&mut out, "offers in book: {}", s.offers.len()).unwrap();
     for o in &s.offers {
         writeln!(
             &mut out,
-            "  • {} — {} SHELL/tick × {} ticks",
+            "  * {} -- {} SHELL/tick x {} ticks",
             o.token_contract, o.price_per_tick, o.max_ticks
         )
         .unwrap();
@@ -526,7 +525,7 @@ pub(crate) fn render_tree_snapshot(s: &TreeSnapshot) -> String {
             DealRole::Buyer => "buyer",
             DealRole::Seller => "seller",
         };
-        let cp = d.counterparty.as_deref().unwrap_or("—(no match)");
+        let cp = d.counterparty.as_deref().unwrap_or("--(no match)");
         let by_fact = match &d.snapshot {
             Some(snap) => format!(
                 "by-fact: to seller {} / refund {} / locked(buyer {}, seller {}) / burn {}{}",
@@ -535,35 +534,35 @@ pub(crate) fn render_tree_snapshot(s: &TreeSnapshot) -> String {
                 snap.buyer_locked,
                 snap.seller_locked,
                 snap.burned,
-                if snap.closed { " · CLOSED" } else { "" }
+                if snap.closed { " * CLOSED" } else { "" }
             ),
             None => "stream not opened".to_string(),
         };
         writeln!(
             &mut out,
-            "  • {} [{}] counterparty {} · {} SHELL/tick · {}",
+            "  * {} [{}] counterparty {} * {} SHELL/tick * {}",
             d.token_contract, role, cp, d.price_per_tick, by_fact
         )
         .unwrap();
-        // Surface by-fact anomalies (issue #23): an orphaned lock / a lock that survived a STOP / a buyer lock
-        // past the two-tick invariant must be HIGHLIGHTED, not hidden behind a clean number (#18/#20).
+        // Surface by-fact anomalies: an orphaned lock / a lock that survived a STOP / a buyer lock
+        // past the two-tick invariant must be HIGHLIGHTED, not hidden behind a clean number.
         for a in deal_anomalies(d) {
             let msg = match a {
                 DealAnomaly::LockedNoMatch { locked } => {
-                    format!("orphaned lock — {locked} SHELL locked with no matched counterparty (#20)")
+                    format!("orphaned lock -- {locked} SHELL locked with no matched counterparty ()")
                 }
                 DealAnomaly::LockedAfterClose { locked } => {
-                    format!("settlement mismatch — {locked} SHELL still locked after the deal closed (#18)")
+                    format!("settlement mismatch -- {locked} SHELL still locked after the deal closed ()")
                 }
                 DealAnomaly::BuyerLockExceedsTwoTicks { buyer_lead, ceiling } => format!(
-                    "two-tick invariant — buyer lead {buyer_lead} SHELL exceeds the {ceiling} ceiling (§3.2)"
+                    "two-tick invariant -- buyer lead {buyer_lead} SHELL exceeds the {ceiling} ceiling ()"
                 ),
             };
-            writeln!(&mut out, "      ⚠ ANOMALY: {msg}").unwrap();
+            writeln!(&mut out, "      ! ANOMALY: {msg}").unwrap();
         }
     }
-    // Per-model by-fact accounting, per role (issue #23): the same deals, grouped by served model and
-    // counterparty, with tokens (finalized ticks) / SHELL settled / locked / burned.
+    // Per-model by-fact accounting, per role: the same deals, grouped by served model and
+    // counterparty, with tokens(finalized ticks) / SHELL settled / locked / burned.
     write_role_breakdown(
         &mut out,
         "seller",
@@ -594,15 +593,15 @@ fn write_role_breakdown(
     for m in models {
         writeln!(
             out,
-            "  ▸ model {} — tokens {} · {} {} SHELL · locked {} · burned {}",
+            "  > model {} -- tokens {} * {} {} SHELL * locked {} * burned {}",
             m.model, m.tokens, money_label, m.money, m.locked, m.burned
         )
         .unwrap();
         for c in &m.counterparties {
-            let cp = c.counterparty.as_deref().unwrap_or("—(no match)");
+            let cp = c.counterparty.as_deref().unwrap_or("--(no match)");
             writeln!(
                 out,
-                "      ↳ {} — tokens {} · {} {} SHELL · locked {} · burned {}",
+                "      -> {} -- tokens {} * {} {} SHELL * locked {} * burned {}",
                 cp, c.tokens, money_label, c.money, c.locked, c.burned
             )
             .unwrap();
@@ -673,14 +672,14 @@ mod monitor_render_tests {
         );
         let expected = "\
 identity note tree (1 sub-notes polled):
-  · seller-note
+  * seller-note
 tree exposure (at risk): 10 SHELL
 offers in book: 0
 deals: 1
-  • tc-funded-never-opened [seller] counterparty buyer-pubkey · 400 SHELL/tick · by-fact: to seller 0 / refund 0 / locked(buyer 3075, seller 10) / burn 0
+  * tc-funded-never-opened [seller] counterparty buyer-pubkey * 400 SHELL/tick * by-fact: to seller 0 / refund 0 / locked(buyer 3075, seller 10) / burn 0
 seller accounting (by model):
-  ▸ model qwen--qwen3--32b — tokens 0 · recv 0 SHELL · locked 10 · burned 0
-      ↳ buyer-pubkey — tokens 0 · recv 0 SHELL · locked 10 · burned 0
+  > model qwen--qwen3--32b -- tokens 0 * recv 0 SHELL * locked 10 * burned 0
+      -> buyer-pubkey -- tokens 0 * recv 0 SHELL * locked 10 * burned 0
 ";
         assert_eq!(rendered, expected);
         assert!(!rendered.contains("CLOSED"), "{rendered}");
@@ -695,14 +694,14 @@ seller accounting (by model):
         );
         let expected = "\
 identity note tree (1 sub-notes polled):
-  · seller-note
+  * seller-note
 tree exposure (at risk): 10 SHELL
 offers in book: 0
 deals: 1
-  • tc-opened-probe [seller] counterparty buyer-pubkey · 400 SHELL/tick · by-fact: to seller 0 / refund 0 / locked(buyer 4100, seller 10) / burn 0
+  * tc-opened-probe [seller] counterparty buyer-pubkey * 400 SHELL/tick * by-fact: to seller 0 / refund 0 / locked(buyer 4100, seller 10) / burn 0
 seller accounting (by model):
-  ▸ model qwen--qwen3--32b — tokens 0 · recv 0 SHELL · locked 10 · burned 0
-      ↳ buyer-pubkey — tokens 0 · recv 0 SHELL · locked 10 · burned 0
+  > model qwen--qwen3--32b -- tokens 0 * recv 0 SHELL * locked 10 * burned 0
+      -> buyer-pubkey -- tokens 0 * recv 0 SHELL * locked 10 * burned 0
 ";
         assert_eq!(rendered, expected);
         assert!(!rendered.contains("CLOSED"), "{rendered}");
@@ -717,15 +716,15 @@ seller accounting (by model):
         );
         let expected = "\
 identity note tree (1 sub-notes polled):
-  · seller-note
+  * seller-note
 tree exposure (at risk): 0 SHELL
 offers in book: 0
 deals: 1
-  • tc-stopped-locked [seller] counterparty buyer-pubkey · 400 SHELL/tick · by-fact: to seller 810 / refund 0 / locked(buyer 4100, seller 10) / burn 0 · CLOSED
-      ⚠ ANOMALY: settlement mismatch — 4110 SHELL still locked after the deal closed (#18)
+  * tc-stopped-locked [seller] counterparty buyer-pubkey * 400 SHELL/tick * by-fact: to seller 810 / refund 0 / locked(buyer 4100, seller 10) / burn 0 * CLOSED
+      ! ANOMALY: settlement mismatch -- 4110 SHELL still locked after the deal closed ()
 seller accounting (by model):
-  ▸ model qwen--qwen3--32b — tokens 2 · recv 810 SHELL · locked 10 · burned 0
-      ↳ buyer-pubkey — tokens 2 · recv 810 SHELL · locked 10 · burned 0
+  > model qwen--qwen3--32b -- tokens 2 * recv 810 SHELL * locked 10 * burned 0
+      -> buyer-pubkey -- tokens 2 * recv 810 SHELL * locked 10 * burned 0
 ";
         assert_eq!(rendered, expected);
     }

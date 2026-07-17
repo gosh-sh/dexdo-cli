@@ -1,5 +1,5 @@
-//! Seller client (§10.3, §10.5): gateway + authorization + mock upstream + stream opening.
-//! Headless (R12): starts without a GUI and serves the stream as a daemon.
+//! Seller client: gateway + authorization + mock upstream + stream opening.
+//! Headless(R12): starts without a GUI and serves the stream as a daemon.
 
 pub mod advance;
 pub mod auth;
@@ -30,17 +30,17 @@ const SELLER_MATCH_WATCH_CURSOR_VERSION: u32 = 1;
 const SELLER_OPEN_STATE_READ_ATTEMPTS: usize = 3;
 const SELLER_OPEN_STATE_INITIAL_BACKOFF: Duration = Duration::from_millis(100);
 
-/// Seller configuration for one stream (minimum for Directive 1).
+/// Seller configuration for one stream.
 pub struct SellerConfig {
-    /// Contract — the deal's handover point (§2.1).
+    /// Contract -- the deal's handover point.
     pub token_contract: TokenContract,
-    /// Tick price `P` in SHELL (§1).
+    /// Tick price `P` in SHELL.
     pub price_per_tick: u64,
     /// Maximum ticks in the offer.
     pub max_ticks: u64,
-    /// Public gateway host:port that will be encrypted to the buyer (R15).
+    /// Public gateway host:port that will be encrypted to the buyer(R15).
     pub gateway_advertise: String,
-    /// How many fake tokens to yield (mock model). `0` = a deliberate seller no-show (§3.1.2).
+    /// How many fake tokens to yield(mock model). `0` = a deliberate seller no-show.
     /// Real upstreams are limited by the buyer request's `max_tokens` and the market cap
     /// (`max_ticks * TICK_SIZE`), not by this debug fixture.
     pub mock_token_count: u64,
@@ -49,12 +49,12 @@ pub struct SellerConfig {
 /// A running seller gateway: state handle + handle to the server's background task.
 pub struct RunningSeller {
     pub state: Arc<GatewayState>,
-    /// The seller's note — **polymorphic** (D10): `LocalNote` (mock path) OR `RealNote` (real shellnet,
-    /// one SDK key for signing+handover). The gateway encrypts the endpoint `note.encrypt_to(buyer_pubkey)` — on
-    /// the real path `buyer_pubkey` is reconstructed by the seller from on-chain ed25519 (F1).
+    /// The seller's note -- **polymorphic**: `LocalNote`(mock path) OR `RealNote` (real shellnet,
+    /// one SDK key for signing+handover). The gateway encrypts the endpoint `note.encrypt_to(buyer_pubkey)` -- on
+    /// the real path `buyer_pubkey` is reconstructed by the seller from on-chain ed25519(F1).
     pub note: Arc<dyn Note>,
     pub server_task: tokio::task::JoinHandle<()>,
-    /// Fingerprint of the gateway's self-signed TLS certificate (§3.1.3) — goes into the handover.
+    /// Fingerprint of the gateway's self-signed TLS certificate -- goes into the handover.
     pub tls_fingerprint: String,
 }
 
@@ -148,7 +148,7 @@ fn now_unix() -> Result<u64> {
         .as_secs())
 }
 
-/// Bring up the seller's gRPC gateway (headless) **over TLS** (§3.1.3): a self-signed certificate
+/// Bring up the seller's gRPC gateway(headless) **over TLS**: a self-signed certificate
 /// is generated at startup, its fingerprint is returned for recording in the handover. Returns
 /// handles for orchestrating the stream.
 pub async fn start_gateway(addr: SocketAddr) -> Result<RunningSeller> {
@@ -156,17 +156,17 @@ pub async fn start_gateway(addr: SocketAddr) -> Result<RunningSeller> {
 }
 
 /// Like [`start_gateway`], but with an upstream choice (mock model or real OpenAI-compatible,
-/// Directive 3). The mock path (`UpstreamConfig::Mock`) is identical to Directive 1.
+/// ). The mock path(`UpstreamConfig::Mock`) is identical to.
 pub async fn start_gateway_with(
     addr: SocketAddr,
     upstream: UpstreamConfig,
 ) -> Result<RunningSeller> {
-    // The ephemeral note is a mock fixture (Directive 7); the production path is `start_gateway_with_note`.
+    // The ephemeral note is a mock fixture; the production path is `start_gateway_with_note`.
     start_gateway_with_note(addr, upstream, Arc::new(LocalNote::generate())).await
 }
 
-/// Like [`start_gateway_with`], but with a **loaded persistent** seller note (Directive 7):
-/// the identity (from `--note-key`/wallet) is reused across runs — its offer/deals are
+/// Like [`start_gateway_with`], but with a **loaded persistent** seller note:
+/// the identity(from `--note-key`/wallet) is reused across runs -- its offer/deals are
 /// visible in the next run. `start_gateway_with` substitutes an ephemeral `generate()` here.
 pub async fn start_gateway_with_note(
     addr: SocketAddr,
@@ -176,11 +176,11 @@ pub async fn start_gateway_with_note(
     let state = Arc::new(GatewayState::with_upstream(upstream));
     let service = GatewayService::new(state.clone()).into_server();
 
-    // Both rustls providers (ring/aws-lc-rs) are present in the tree; pin the process
-    // default explicitly (ring) — otherwise rustls panics, unable to pick on its own. Idempotent.
+    // Both rustls providers(ring/aws-lc-rs) are present in the tree; pin the process
+    // default explicitly(ring) -- otherwise rustls panics, unable to pick on its own. Idempotent.
     tls::ensure_crypto_provider();
 
-    // §3.1.3: the gateway's self-signed TLS certificate; trust comes from the encrypted handover.
+    // the gateway's self-signed TLS certificate; trust comes from the encrypted handover.
     let gw_tls = GatewayTls::generate()?;
     let tls_fingerprint = gw_tls.fingerprint.clone();
     let identity = Identity::from_pem(gw_tls.cert_pem, gw_tls.key_pem);
@@ -204,7 +204,7 @@ pub async fn start_gateway_with_note(
     })
 }
 
-/// Post a sell offer from the note into the book (§10.3 step 2, §2.1). Done before the
+/// Post a sell offer from the note into the book. Done before the
 /// buyer places a buy order.
 pub async fn post_offer(
     seller: &RunningSeller,
@@ -230,11 +230,11 @@ pub async fn post_offer_with_note(
     Ok(())
 }
 
-/// Open the stream for a match (§10.3 step 3):
-///  1. reads the match (the buyer's pubkey is recorded in the contract);
-///  2. encrypts the endpoint to the buyer's pubkey and `open_stream` (probe freeze +
-///     `SELLER_PROBE_COMMISSION` + writing the enc-endpoint into the endpoints file);
-///  3. registers the buyer's pubkey and the fake-token budget in the gateway for authorization.
+/// Open the stream for a match:
+/// 1. reads the match(the buyer's pubkey is recorded in the contract);
+/// 2. encrypts the endpoint to the buyer's pubkey and `open_stream` (probe freeze +
+/// `SELLER_PROBE_COMMISSION` + writing the enc-endpoint into the endpoints file);
+/// 3. registers the buyer's pubkey and the fake-token budget in the gateway for authorization.
 pub async fn serve_match(
     seller: &RunningSeller,
     chain: &dyn ChainBackend,
@@ -293,8 +293,8 @@ pub async fn provision_match(
             cfg.token_contract
         );
     }
-    // §3.1/§3.1.3: the handover {gateway endpoint, TLS fingerprint} is encrypted to the buyer's pubkey.
-    // The endpoint points at the GATEWAY over TLS (R15); the buyer pins the fingerprint on connect.
+    // the handover {gateway endpoint, TLS fingerprint} is encrypted to the buyer's pubkey.
+    // The endpoint points at the GATEWAY over TLS(R15); the buyer pins the fingerprint on connect.
     let handover = Handover {
         endpoint: format!("https://{}", cfg.gateway_advertise),
         tls_fingerprint: seller.tls_fingerprint.clone(),
@@ -303,11 +303,11 @@ pub async fn provision_match(
         .note
         .encrypt_to(&m.buyer_pubkey, &handover.to_bytes());
 
-    // §3.1.1: the gateway must authorize the matched buyer BEFORE that buyer can connect.
+    // the gateway must authorize the matched buyer BEFORE that buyer can connect.
     // Register buyer+budget BEFORE writing the handover on-chain: the buyer learns the endpoint only
-    // after reading the on-chain ciphertext (written by `open_stream`), so register-before-open rules out a race. Otherwise on a
-    // real (slow) chain the buyer manages to knock in the window between open_stream and register_stream
-    // → the gateway still has no pubkey → `challenge-response failed` (the mock timing did not expose this).
+    // after reading the on-chain ciphertext(written by `open_stream`), so register-before-open rules out a race. Otherwise on a
+    // real(slow) chain the buyer manages to knock in the window between open_stream and register_stream
+    // -> the gateway still has no pubkey -> `challenge-response failed`(the mock timing did not expose this).
     seller.state.register_stream(
         &cfg.token_contract,
         m.buyer_pubkey,

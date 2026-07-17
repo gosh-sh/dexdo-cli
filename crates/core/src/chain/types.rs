@@ -1,9 +1,9 @@
-//! `chain` data types — offers/match, deal/stream snapshots, accounting tallies, errors (PR4 move-only).
+//! `chain` data types -- offers/match, deal/stream snapshots, accounting tallies, errors(PR4 move-only).
 use crate::note::NotePubkey;
 use crate::params::Shell;
 use serde::{Deserialize, Serialize};
 
-/// `token_contract` address (the deal's handover point, §2.1). In the mock — an identifier string.
+/// `token_contract` address. In the mock -- an identifier string.
 pub type TokenContract = String;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -12,7 +12,7 @@ pub enum SellOfferOutcome {
     Matched,
 }
 
-/// Sell offer in the book (§2.1): the endpoint is NOT published.
+/// Sell offer in the book: the endpoint is NOT published.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SellOffer {
     pub price_per_tick: Shell,
@@ -20,9 +20,9 @@ pub struct SellOffer {
     pub token_contract: TokenContract,
 }
 
-/// Book discovery item (Directive 5, B1): offer + **seller identifier** (note) — for
-/// ranking and the blacklist (B16). In the mock `seller_id` = hex of the seller's note ed-pubkey; on the
-/// real chain — the seller from the `InferenceOrderBook` order.
+/// Book discovery item: offer + **seller identifier**(note) -- for
+/// ranking and the blacklist(B16). In the mock `seller_id` = hex of the seller's note ed-pubkey; on the
+/// real chain -- the seller from the `InferenceOrderBook` order.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct OfferListing {
     pub seller_id: String,
@@ -32,7 +32,6 @@ pub struct OfferListing {
 }
 
 /// One active order in an `InferenceOrderBook`.
-///
 /// Sell offers have `is_buy = false` and a non-empty `token_contract`. Resting buy orders have
 /// `is_buy = true`, no target `token_contract`, and carry their still-held `escrow`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -121,7 +120,6 @@ pub struct MatchedFill {
 }
 
 /// Accepted `InferenceSubscriptionPlaced` fact from the model order book.
-///
 /// The order id is the durable correlation key for later owner-facing fills.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -144,7 +142,7 @@ pub struct ExecutableQuote {
     pub fills: Vec<QuoteFill>,
 }
 
-/// Match result: the seller sees the buyer's recorded pubkey (§2.3).
+/// Match result: the seller sees the buyer's recorded pubkey.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Match {
     pub token_contract: TokenContract,
@@ -153,9 +151,8 @@ pub struct Match {
 }
 
 /// Durable source cursor for a seller gateway match watcher.
-///
-/// The concrete source may be note ext-out events (real shellnet) or an equivalent
-/// authoritative state source (mock / direct TC state). The cursor is intentionally
+/// The concrete source may be note ext-out events(real shellnet) or an equivalent
+/// authoritative state source(mock / direct TC state). The cursor is intentionally
 /// small and secret-free so the CLI can persist it next to local deal handles.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -241,7 +238,7 @@ pub enum ChainError {
     NoStream(TokenContract),
     #[error("endpoints file: {0}")]
     EndpointsFile(String),
-    /// Error from the real on-chain adapter (Directive 2): submit/getter/shellnet provisioning.
+    /// Error from the real on-chain adapter: submit/getter/shellnet provisioning.
     #[error("shellnet: {0}")]
     Chain(String),
     /// The RPC/HTTP transport failed before a by-fact chain result was available.
@@ -262,43 +259,41 @@ pub enum ChainError {
     /// A non-idempotent money POST returned a decoded protocol/contract rejection.
     #[error("shellnet money submit was rejected: {0}")]
     MoneySubmitRejected(String),
-    /// Note locked by a dispute/stream (§4.2/§4.3) — cannot trade/withdraw (Directive 5, anti-scam;
+    /// Note locked by a dispute/stream -- cannot trade/withdraw (, anti-scam;
     /// analog of the contract's `ERR_STREAM_LOCKED`).
     #[error("note locked (dispute/stream): {0}")]
     Locked(String),
-    /// The agreed deal limit was exceeded (e.g. the offer's `max_ticks`). The real TC bounds it
-    /// by deposit; the mock holds the same invariant with a guard (review #4).
+    /// The agreed deal limit was exceeded(e.g. the offer's `max_ticks`). The real TC bounds it
+    /// by deposit; the mock holds the same invariant with a guard.
     #[error("deal limit exceeded: {0}")]
     Limit(String),
 }
 
-/// Snapshot of the stream's state in the mock (for e2e acceptance).
+/// Snapshot of the stream's state in the mock(for e2e acceptance).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct StreamSnapshot {
-    /// Locked at the seller (stake/probe commission).
+    /// Locked at the seller(stake/probe commission).
     pub seller_locked: Shell,
-    /// Locked at the buyer (deposited ticks) — the TOTAL escrow still held (`prepaid + frozen + deposit`).
+    /// Locked at the buyer(deposited ticks) -- the TOTAL escrow still held(`prepaid + frozen + deposit`).
     pub buyer_locked: Shell,
-    /// #126: the buyer's at-risk **lead** (`prepaid + frozen`) — the §3.2 two-tick invariant bounds THIS
-    /// (seller ≤ ~2 ticks ahead of finalized), NOT the total `buyer_locked` (which also carries the unspent
+    /// the buyer's at-risk **lead**(`prepaid + frozen`) -- the two-tick invariant bounds THIS
+    /// (seller <= ~2 ticks ahead of finalized), NOT the total `buyer_locked` (which also carries the unspent
     /// `deposit` for the remaining ticks of a multi-tick deal). On the mock path the lock IS the lead.
     pub buyer_lead: Shell,
-    /// Ticks sent to the seller (finalized).
+    /// Ticks sent to the seller(finalized).
     pub seller_received: Shell,
     /// Refunded to the buyer.
     pub buyer_refunded: Shell,
     /// Total SHELL burned for the contract.
     pub burned: Shell,
     /// Stream terminal/STOPped according to the TokenContract lifecycle.
-    ///
     /// This is not `!opened`: funded-but-never-opened and disputed TCs can hold escrow while still active.
     pub closed: bool,
 }
 
 /// Minimal by-fact lifecycle read for a live `TokenContract`.
-///
 /// This is intentionally smaller than the raw chain getter JSON: service orchestrators need only the phase
-/// booleans and timeout anchors (`fundedTime`, `lastAdvance`) to decide cleanup/reclaim/renewal actions.
+/// booleans and timeout anchors(`fundedTime`, `lastAdvance`) to decide cleanup/reclaim/renewal actions.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DealChainState {
     pub funded: bool,
@@ -311,7 +306,6 @@ pub struct DealChainState {
 
 impl DealChainState {
     /// Match `dexdo status` lifecycle semantics for a STOPped/settled deal.
-    ///
     /// `opened=false` alone is not terminal: a matched buyer can leave the TC in
     /// funded-but-never-opened, and a dispute can also hold escrow without being
     /// a clean closed settlement.
@@ -335,7 +329,7 @@ mod tests {
         }
     }
 
-    /// #249: monitor CLOSED semantics must match `dexdo status`: funded-never-opened,
+    /// monitor CLOSED semantics must match `dexdo status`: funded-never-opened,
     /// probe, streaming, and disputed deals are active; only STOPped/settled is terminal.
     #[test]
     fn chain_state_stopped_semantics_match_status() {
@@ -378,91 +372,91 @@ pub enum MatchedTokenContractStatus {
     },
 }
 
-/// The note's role in a deal (Directive 7, observability R11).
+/// The note's role in a deal.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DealRole {
     Buyer,
     Seller,
 }
 
-/// View of one of the note's deals for the monitor (Directive 7, R11): contract, role, **anonymous**
-/// counterparty (§2.2 — the note's pubkey, not an identity), tick price and the by-fact settlement (`StreamSnapshot`).
+/// View of one of the note's deals for the monitor: contract, role, **anonymous**
+/// counterparty, tick price and the by-fact settlement(`StreamSnapshot`).
 #[derive(Debug, Clone)]
 pub struct DealView {
     pub token_contract: TokenContract,
     pub role: DealRole,
-    /// The counterparty's anonymous note pubkey (hex), if a match has already happened.
+    /// The counterparty's anonymous note pubkey(hex), if a match has already happened.
     pub counterparty: Option<String>,
     pub price_per_tick: Shell,
-    /// The deal's served frame model id (issue #23: per-model accounting). `None` when the source cannot
-    /// name it — the mock book does not track a per-deal model, so it resolves on the real-chain reader
-    /// (the `TokenContract`'s `RootModel` → model name). The breakdown buckets `None` as `(unknown)`.
+    /// The deal's served frame model id. `None` when the source cannot
+    /// name it -- the mock book does not track a per-deal model, so it resolves on the real-chain reader
+    /// (the `TokenContract`'s `RootModel` -> model name). The breakdown buckets `None` as `(unknown)`.
     pub model: Option<String>,
-    /// The by-fact settlement (ticks/tokens/burn/closed), if the stream is open.
+    /// The by-fact settlement(ticks/tokens/burn/closed), if the stream is open.
     pub snapshot: Option<StreamSnapshot>,
 }
 
-/// Snapshot of the note's state for observability (Directive 7, R11/R14): own orders in the book,
-/// deals (role + anonymous counterparty + by-fact), total exposure (at risk). "From whom"
-/// = the note's anonymous pubkey (§2.2). Read only — the monitor moves nothing.
+/// Snapshot of the note's state for observability: own orders in the book,
+/// deals(role + anonymous counterparty + by-fact), total exposure(at risk). "From whom"
+/// = the note's anonymous pubkey. Read only -- the monitor moves nothing.
 #[derive(Debug, Clone)]
 pub struct NoteSnapshot {
-    /// The note's own anonymous pubkey (hex).
+    /// The note's own anonymous pubkey(hex).
     pub note_id: String,
-    /// Own offers in the book (the seller's orders).
+    /// Own offers in the book(the seller's orders).
     pub offers: Vec<OfferListing>,
     /// Deals where the note is the seller or the buyer.
     pub deals: Vec<DealView>,
-    /// At risk: the sum locked by the note in open (not closed) deals.
+    /// At risk: the sum locked by the note in open(not closed) deals.
     pub exposure: Shell,
 }
 
-/// Aggregated snapshot of **the entire note tree** of a single identity (Directive 7, R14): the monitor
-/// shows the state across ALL (sub)notes under the root key, not only the root. We fold the
-/// per-note snapshots (`ChainBackend::note_snapshot` for each pubkey from `NoteTree::node_pubkeys`):
-/// offers and deals are concatenated (each lives on its own subnote), exposure is summed.
-/// "From whom" remains the counterparty note's anonymous pubkey (§2.2). Read only.
+/// Aggregated snapshot of **the entire note tree** of a single identity: the monitor
+/// shows the state across ALL(sub)notes under the root key, not only the root. We fold the
+/// per-note snapshots(`ChainBackend::note_snapshot` for each pubkey from `NoteTree::node_pubkeys`):
+/// offers and deals are concatenated(each lives on its own subnote), exposure is summed.
+/// "From whom" remains the counterparty note's anonymous pubkey. Read only.
 #[derive(Debug, Clone)]
 pub struct TreeSnapshot {
-    /// Anonymous pubkeys of all the tree's (sub)notes that were aggregated over (hex).
+    /// Anonymous pubkeys of all the tree's(sub)notes that were aggregated over(hex).
     pub note_ids: Vec<String>,
-    /// All the tree's offers in the book (across all subnotes).
+    /// All the tree's offers in the book(across all subnotes).
     pub offers: Vec<OfferListing>,
-    /// All the tree's deals (across all subnotes), role + anonymous counterparty + by-fact.
+    /// All the tree's deals(across all subnotes), role + anonymous counterparty + by-fact.
     pub deals: Vec<DealView>,
     /// The tree's total exposure: the sum locked across all open deals of all subnotes.
     pub exposure: Shell,
 }
 
-/// Placeholder model id for a deal whose served model is unknown to the source (issue #23): the mock book
+/// Placeholder model id for a deal whose served model is unknown to the source: the mock book
 /// tracks no per-deal model, so its deals bucket here until the real-chain reader resolves real names.
 pub const UNKNOWN_MODEL: &str = "(unknown)";
 
-/// One counterparty's by-fact tally inside a model bucket (issue #23): the anonymous counterparty note
+/// One counterparty's by-fact tally inside a model bucket: the anonymous counterparty note
 /// pubkey and the by-fact figures summed across that counterparty's deals for one role.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CounterpartyTally {
-    /// The counterparty's anonymous note pubkey (hex); `None` if no match happened yet.
+    /// The counterparty's anonymous note pubkey(hex); `None` if no match happened yet.
     pub counterparty: Option<String>,
-    /// Finalized ticks (tokens) settled by-fact, summed: `seller_received / price_per_tick`.
+    /// Finalized ticks(tokens) settled by-fact, summed: `seller_received / price_per_tick`.
     pub tokens: u64,
-    /// SHELL settled by-fact (seller: received; buyer: paid out of escrow) — `seller_received`, summed.
+    /// SHELL settled by-fact(seller: received; buyer: paid out of escrow) -- `seller_received`, summed.
     pub money: Shell,
-    /// SHELL still frozen for this role (seller: `seller_locked`; buyer: `buyer_locked`), summed.
+    /// SHELL still frozen for this role(seller: `seller_locked`; buyer: `buyer_locked`), summed.
     pub locked: Shell,
-    /// SHELL burned (net fee / dispute), summed.
+    /// SHELL burned(net fee / dispute), summed.
     pub burned: Shell,
 }
 
-/// Per-model by-fact breakdown for ONE role (issue #23): the note's deals grouped by served model, then by
-/// anonymous counterparty, summing tokens / money / lock / burn. Pure (no network) — the offline core of the
+/// Per-model by-fact breakdown for ONE role: the note's deals grouped by served model, then by
+/// anonymous counterparty, summing tokens / money / lock / burn. Pure(no network) -- the offline core of the
 /// seller/buyer accounting view. The roll-up fields are the model's totals across all its counterparties.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ModelBreakdown {
     /// The served model id, or [`UNKNOWN_MODEL`] for deals with no known model.
     pub model: String,
     pub role: DealRole,
-    /// Per-counterparty tallies, in first-seen order (deterministic).
+    /// Per-counterparty tallies, in first-seen order(deterministic).
     pub counterparties: Vec<CounterpartyTally>,
     pub tokens: u64,
     pub money: Shell,
@@ -470,19 +464,19 @@ pub struct ModelBreakdown {
     pub burned: Shell,
 }
 
-/// A by-fact accounting anomaly on a deal (issue #23): a #18/#20-class problem the accounting view must
-/// **surface** rather than paper over (the lead's acceptance: "show the mismatch", "highlight orphaned lock").
+/// A by-fact accounting anomaly on a deal: a-class problem the accounting view must
+/// **surface** rather than paper over(the lead's acceptance: "show the mismatch", "highlight orphaned lock").
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum DealAnomaly {
-    /// SHELL is locked but no counterparty matched — an **orphaned lock** (#20): funds frozen with no deal.
+    /// SHELL is locked but no counterparty matched -- an **orphaned lock**: funds frozen with no deal.
     LockedNoMatch { locked: Shell },
-    /// The deal is **closed** (STOP/settled) yet SHELL is still locked — STOP should have moved it to
-    /// received/refunded (#18 settlement mismatch), not left it frozen.
+    /// The deal is **closed**(STOP/settled) yet SHELL is still locked -- STOP should have moved it to
+    /// received/refunded, not left it frozen.
     LockedAfterClose { locked: Shell },
-    /// The buyer's at-risk **lead** (`prepaid + frozen`) exceeds the **two-tick invariant** ceiling (§3.2: the
-    /// seller may be at most ~2 ticks ahead of finalized) — `buyer_lead > 2 × _unit(price_per_tick)`, where the
-    /// per-tick unit **includes the book fee** (`_unit(p) = p + p×FEE_BPS/10000`, #84). #126: this bounds the
+    /// The buyer's at-risk **lead**(`prepaid + frozen`) exceeds the **two-tick invariant** ceiling (: the
+    /// seller may be at most ~2 ticks ahead of finalized) -- `buyer_lead > 2 x _unit(price_per_tick)`, where the
+    /// per-tick unit **includes the book fee** (`_unit(p) = p + pxFEE_BPS/10000`,).: this bounds the
     /// LEAD, not the total `buyer_locked` (which carries the unspent `deposit` for a multi-tick deal's remaining
-    /// ticks) — comparing the total false-flagged every legitimate `maxTicks > 2` deal.
+    /// ticks) -- comparing the total false-flagged every legitimate `maxTicks > 2` deal.
     BuyerLockExceedsTwoTicks { buyer_lead: Shell, ceiling: Shell },
 }

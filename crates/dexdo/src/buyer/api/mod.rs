@@ -1,13 +1,11 @@
-//! Local consumer interface (§10.6/G, B19/B20): an OpenAI-compatible HTTP endpoint
+//! Local consumer interface: an OpenAI-compatible HTTP endpoint
 //! (`/v1/chat/completions`, `/v1/models`) and an optional Anthropic-compatible transcode
-//! (`/v1/messages`). The endpoint listens on **loopback** by default (§10.6/G).
-//!
-//! Request path (B19): receive → build `CanonRequest` → route to the (mock) seller →
-//! authorized TLS gRPC stream → receive `CanonChunk` → re-render to SSE in the desired format.
+//! (`/v1/messages`). The endpoint listens on **loopback** by default.
+//! Request path(B19): receive -> build `CanonRequest` -> route to the(mock) seller ->
+//! authorized TLS gRPC stream -> receive `CanonChunk` -> re-render to SSE in the desired format.
 //! Tick accounting/verification happen on the canonical stream BEFORE re-rendering
 //! ([`crate::buyer::verify::StreamVerifier`]).
-//!
-//! The model is forced by the market/frame (B2, B19): the request's `model` field is NOT trusted;
+//! The model is forced by the market/frame(B2, B19): the request's `model` field is NOT trusted;
 //! a request outside the configured model frame is rejected. Any API key is accepted: this is a
 //! loopback endpoint.
 
@@ -118,9 +116,9 @@ impl Default for BuyerApiFailurePolicy {
     }
 }
 
-/// Route to the (mock) seller + model frame, shared by the HTTP handlers (B1/B2/B19).
-/// In directive 1 "routing" is a single fixed match (one seller, mock chain); semantic orders
-/// and seller selection are the horizon of directive 3.
+/// Route to the(mock) seller + model frame, shared by the HTTP handlers(B1/B2/B19).
+/// In "routing" is a single fixed match(one seller, mock chain); semantic orders
+/// and seller selection are the horizon of.
 #[derive(Clone)]
 pub struct Route {
     pub handover: Handover,
@@ -195,7 +193,6 @@ impl Drop for ConsumerRequestGuard {
 }
 
 /// Mutable active deal for a long-running local API service.
-///
 /// Single-shot/legacy callers build one deal and never replace it. The buyer continuity monitor can prepare a
 /// next handover first, STOP the old session, then atomically publish that next deal. That keeps the local
 /// OpenAI/Anthropic endpoint alive across deal boundaries without serving a request on a closed TC.
@@ -337,33 +334,33 @@ fn is_request_scoped_upstream_rejection(error: &str) -> bool {
         .any(|rest| rest.as_bytes().first() == Some(&b'4'))
 }
 
-/// Token cap for the one-per-deal content-identity probe (#144). It is **≪ `tick_size`** (1_000_000), so the
-/// probe stays on the probe tick — preserving the §3.2 two-tick exposure invariant (the content gate spends at
+/// Token cap for the one-per-deal content-identity probe. It is **<< `tick_size`**(1_000_000), so the
+/// probe stays on the probe tick -- preserving the two-tick exposure invariant (the content gate spends at
 /// most the probe tick, never a second deal tick worth of budget).
 pub(crate) const CONTENT_PROBE_MAX_TOKENS: u64 = 64;
 
-/// Content-identity check selected for a deal (#144). The buyer pays for a model by NAME (B2); a seller
+/// Content-identity check selected for a deal. The buyer pays for a model by NAME(B2); a seller
 /// declaring the correct name but serving a cheaper model is caught only by the **content** layers B8
-/// ([`Buyer::behavioral_probe`]) + B7-full ([`Buyer::reference_spotcheck`]). `Skip` — no content
-/// fingerprint/reference for the exact model id (degradation R3, name-only) or the mock path; `Probe` — run the
+/// ([`Buyer::behavioral_probe`]) + B7-full([`Buyer::reference_spotcheck`]). `Skip` -- no content
+/// fingerprint/reference for the exact model id(degradation R3, name-only) or the mock path; `Probe` -- run the
 /// content gate once for that exact/reference model id.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ContentCheck {
-    /// No content-identity layer applies (mock, or no B8 fingerprint and no B7 reference/key) — name-only.
+    /// No content-identity layer applies(mock, or no B8 fingerprint and no B7 reference/key) -- name-only.
     Skip,
-    /// Run the one-per-deal content gate (B8 + B7-full) for this exact/reference model id.
+    /// Run the one-per-deal content gate(B8 + B7-full) for this exact/reference model id.
     Probe { model_id: String },
 }
 
-/// #144/#281: decide the content-identity policy for a frame model BEFORE paying/serving. **Shared by BOTH
-/// buyer paths** — the consumer API (Path B, `cli`) and the gateway routing runner (Path A, `buyer::routing`) —
+/// decide the content-identity policy for a frame model BEFORE paying/serving. **Shared by BOTH
+/// buyer paths** -- the consumer API(Path B, `cli`) and the gateway routing runner(Path A, `buyer::routing`) --
 /// so neither silently pays a model that no content layer can verify. Pure w.r.t. env (`has_ref_key` is computed
 /// by the caller). A seller can declare the correct model NAME yet serve a cheaper model; only the CONTENT layers
 /// (B8 fingerprint / B7-full reference) catch that, and they are **data-driven** from `models`. Policy:
-///  - `mock_model` → `Skip` (mock tokens are fake by design, §2);
-///  - a model id with a B8 fingerprint OR a B7 reference key in env → `Probe` (run the content gate);
-///  - otherwise `allow_unverified` → `Skip` with a loud warning (name-only, operator opted in);
-///  - else **refuse** (fail closed): buying/paying on name-only evidence is rejected.
+/// - `mock_model` -> `Skip`;
+/// - a model id with a B8 fingerprint OR a B7 reference key in env -> `Probe`(run the content gate);
+/// - otherwise `allow_unverified` -> `Skip` with a loud warning(name-only, operator opted in);
+/// - else **refuse**(fail closed): buying/paying on name-only evidence is rejected.
 pub fn content_check_policy(
     frame_model: &str,
     identity_model: Option<&str>,
@@ -387,7 +384,7 @@ pub fn content_check_policy(
         tracing::warn!(
             %frame_model, %family,
             "CONTENT IDENTITY UNVERIFIED (name-only): no B8 fingerprint and no B7 reference/key for this \
-             exact model — proceeding on name-only evidence (--allow-unverified-model). A seller serving a cheaper \
+             exact model -- proceeding on name-only evidence (--allow-unverified-model). A seller serving a cheaper \
              model under this name cannot be caught by content checks on this deal."
         );
         return Ok(ContentCheck::Skip);
@@ -399,17 +396,17 @@ pub fn content_check_policy(
     )
 }
 
-/// One-per-deal content-identity gate (#144). The inline [`StreamVerifier`](crate::buyer::verify::StreamVerifier)
+/// One-per-deal content-identity gate. The inline [`StreamVerifier`](crate::buyer::verify::StreamVerifier)
 /// on the consumer-API path only runs B5/B6 + the cheap declared-NAME B7; the strong **content** layers (B8
 /// fingerprint + B7-full reference spot-check) were never invoked there, so a seller serving a cheaper model
 /// under the correct NAME was paid undetected. This gate runs those layers ONCE, before the first paid stream on
 /// each renderer, and caches the **definitive** verdict so later requests do not re-probe. A transport error is
-/// NOT cached (the next request retries). On a bail the deal is closed to later requests and policy recovery is
+/// NOT cached(the next request retries). On a bail the deal is closed to later requests and policy recovery is
 /// attempted.
 pub struct ContentGate {
     check: ContentCheck,
-    /// Loaded model config — needed for the `Probe` path (B8 fingerprints / B7-full reference are
-    /// data-driven per model). `None` for `Skip` (which never probes).
+    /// Loaded model config -- needed for the `Probe` path (B8 fingerprints / B7-full reference are
+    /// data-driven per model). `None` for `Skip`(which never probes).
     models: Option<Arc<ModelsConfig>>,
     /// Cached definitive verdict: `Ok(())` pass, `Err(reason)` bail. A transport error is the cell's init error
     /// (NOT stored) so the gate retries on the next request.
@@ -425,7 +422,7 @@ impl ContentGate {
         }
     }
 
-    /// A gate that performs no content check (mock / name-only degradation). Needs no config.
+    /// A gate that performs no content check(mock / name-only degradation). Needs no config.
     pub fn skip() -> Self {
         Self {
             check: ContentCheck::Skip,
@@ -444,8 +441,8 @@ impl ContentGate {
         }
     }
 
-    /// Run the content-identity gate once per deal (#144). `Skip` → `Ok(())`. `Probe` → run B8 then B7-full
-    /// ONCE (cached): the cached `Ok(())`/`Err(reason)` is the definitive verdict (pass/bail); a transport error
+    /// Run the content-identity gate once per deal. `Skip` -> `Ok(())`. `Probe` -> run B8 then B7-full
+    /// ONCE(cached): the cached `Ok(())`/`Err(reason)` is the definitive verdict(pass/bail); a transport error
     /// is propagated as `Err` WITHOUT being cached, so the next request retries. On a bail the deal is closed
     /// to new requests before the verdict is cached and returned.
     pub async fn ensure_verified(
@@ -459,17 +456,17 @@ impl ContentGate {
             ContentCheck::Probe { model_id } => {
                 let Some(models) = self.models.as_deref() else {
                     // A Probe gate is only built via `new`/`probe`, both of which carry the config; a missing
-                    // config is a construction bug — fail closed rather than silently pass a content check.
+                    // config is a construction bug -- fail closed rather than silently pass a content check.
                     return Err(
                         "content gate: Probe selected without a loaded models config".to_string(),
                     );
                 };
-                // OUTER Err = transport error (NOT cached → retried next request); INNER `Result<(), String>` =
+                // OUTER Err = transport error(NOT cached -> retried next request); INNER `Result<(), String>` =
                 // the cached definitive verdict (`Ok(())` pass, `Err(reason)` bail).
                 let cached: &Result<(), String> = self
                     .verdict
                     .get_or_try_init::<String, _, _>(|| async {
-                        // B8 content fingerprint. The `?` makes a transport error the OUTER Err (not cached);
+                        // B8 content fingerprint. The `?` makes a transport error the OUTER Err(not cached);
                         // a definitive verdict goes through `Ok(...)`.
                         let v8 = buyer
                             .behavioral_probe(
@@ -487,7 +484,7 @@ impl ContentGate {
                                 .await;
                             return Ok(Err(r));
                         }
-                        // B7-full reference spot-check (greedy vs the official endpoint).
+                        // B7-full reference spot-check(greedy vs the official endpoint).
                         let v7 = buyer
                             .reference_spotcheck(
                                 &route.handover,
@@ -517,18 +514,18 @@ impl ContentGate {
 #[derive(Clone)]
 pub struct ApiState {
     pub buyer: Arc<Buyer>,
-    /// The configured market/frame model id — the only one that is served (B2/B19).
-    /// The request's `model` field is checked against it; outside the frame — reject.
+    /// The configured market/frame model id -- the only one that is served(B2/B19).
+    /// The request's `model` field is checked against it; outside the frame -- reject.
     pub frame_model: String,
     /// Active deal slot. A one-shot service never replaces it; continuous service mode may publish the next
     /// already-opened handover here while keeping the local HTTP listener alive.
     pub deals: Arc<RouteManager>,
 }
 
-/// Session-scoped deal settlement (issue #37; revises the #18 per-request STOP). The consumer endpoint serves
-/// ONE deal (`route.token_contract`) across MANY requests; the deal is STOPped **once at session end**, not per
+/// Session-scoped deal settlement. The consumer endpoint serves
+/// ONE deal(`route.token_contract`) across MANY requests; the deal is STOPped **once at session end**, not per
 /// request. A single shared `Arc<SessionSettle>` lives on [`ApiState`]. The funds-safety guarantee is an
-/// **awaited** STOP — a verification-bail/dispute (`settle().await` in a handler) or graceful shutdown
+/// **awaited** STOP -- a verification-bail/dispute (`settle().await` in a handler) or graceful shutdown
 /// (`serve()` awaits `settle("shutdown")`). [`Drop`] is ONLY a best-effort backup for abnormal teardown
 /// (crash/SIGKILL), never the guarantee. `settled` is set only after a terminal recovery action lands; `closed`
 /// gates the local API immediately after a policy incident even when recovery is still pending.
@@ -618,8 +615,7 @@ impl SessionSettle {
     }
 
     /// Fail closed before any user-visible response is rendered unless the chain proves this deal is open.
-    ///
-    /// A decrypted handover and a reachable gateway are not enough: #264 showed that a stale handover can let the
+    /// A decrypted handover and a reachable gateway are not enough: showed that a stale handover can let the
     /// local endpoint serve a response while the TokenContract remains funded-but-never-opened and unaccounted.
     pub async fn ensure_open_for_serving(&self) -> Result<(), String> {
         let state = match self.chain.deal_state(&self.token_contract).await {
@@ -701,7 +697,7 @@ impl SessionSettle {
         }
     }
 
-    /// Mark the session terminal after an external recovery path (`streamCleanup` / `streamReclaim`) already
+    /// Mark the session terminal after an external recovery path(`streamCleanup` / `streamReclaim`) already
     /// closed or reclaimed the deal. This prevents a later route swap from sending a duplicate STOP to the
     /// recovered TC.
     pub fn mark_recovered(&self, reason: &str) -> bool {
@@ -713,7 +709,7 @@ impl SessionSettle {
         true
     }
 
-    /// STOP the deal once. `&self` — the session is `Arc`-shared across the handlers. Returns whether THIS
+    /// STOP the deal once. `&self` -- the session is `Arc`-shared across the handlers. Returns whether THIS
     /// call landed a terminal STOP. A STOP error is returned and leaves the session explicitly recoverable;
     /// `Drop` must not issue an untracked retry after an awaited failure.
     pub async fn settle(&self, reason: &str) -> Result<bool, dexdo_core::ChainError> {
@@ -855,7 +851,7 @@ impl SessionSettle {
         }
     }
 
-    /// Apply the explicit #214 `bad_output_scam` policy on a verification bail. `dispute` uses the
+    /// Apply the explicit `bad_output_scam` policy on a verification bail. `dispute` uses the
     /// existing streamDispute lever and warns about the note lock. `stop_and_blacklist` is not silently
     /// degraded in the consumer API surface because this surface has no seller-id blacklist store.
     pub async fn settle_verification_bail(&self, reason: &str) -> bool {
@@ -1062,9 +1058,9 @@ fn not_safely_open_reason(
 
 impl Drop for SessionSettle {
     fn drop(&mut self) {
-        // BEST-EFFORT BACKUP ONLY (issue #37 review): the awaited terminal (graceful shutdown / bail) is the
-        // funds-safety guarantee. If the session ended with no explicit settle (abnormal teardown), spawn a
-        // last-chance STOP — a crash/SIGKILL/runtime teardown may still skip it, and the on-chain
+        // BEST-EFFORT BACKUP ONLY: the awaited terminal(graceful shutdown / bail) is the
+        // funds-safety guarantee. If the session ended with no explicit settle(abnormal teardown), spawn a
+        // last-chance STOP -- a crash/SIGKILL/runtime teardown may still skip it, and the on-chain
         // `seller_timeout` is the ultimate backstop.
         if self.settled.load(Ordering::SeqCst) || !self.drop_backup_enabled.load(Ordering::SeqCst) {
             return;
@@ -1125,7 +1121,7 @@ impl ApiState {
         self.deals.current_or_prepare().await
     }
 
-    /// The model is forced by the market (B2/B19): an empty/None `model` is ok (there is a single
+    /// The model is forced by the market(B2/B19): an empty/None `model` is ok (there is a single
     /// frame), otherwise we require a match with `frame_model`. Returns `Err` with a
     /// human-readable reject reason.
     pub fn check_model(&self, requested: Option<&str>) -> Result<(), String> {
@@ -1141,7 +1137,7 @@ impl ApiState {
     }
 }
 
-/// Build the consumer-interface axum router. The Anthropic transcode (B20) is mounted only
+/// Build the consumer-interface axum router. The Anthropic transcode(B20) is mounted only
 /// when `anthropic_compat = true`.
 pub fn router(state: ApiState, anthropic_compat: bool) -> axum::Router {
     use axum::routing::{get, post};
@@ -1154,11 +1150,11 @@ pub fn router(state: ApiState, anthropic_compat: bool) -> axum::Router {
     app.with_state(state)
 }
 
-/// Bring up the local consumer interface on `bind` (loopback by default, §10.6/G). Returns the actual address
+/// Bring up the local consumer interface on `bind`. Returns the actual address
 /// and a handle to the server's background task. `shutdown` is the session terminal signal (the CLI passes
-/// `ctrl_c`/SIGTERM): on it the server drains in-flight requests (graceful shutdown), then the session deal is
-/// STOPped via an **awaited** `session.settle("shutdown")` before the task ends — the #37 funds-safety
-/// guarantee (`SessionSettle::Drop` is only a backup). Tests pass a never-completing signal and abort the task.
+/// `ctrl_c`/SIGTERM): on it the server drains in-flight requests(graceful shutdown), then the session deal is
+/// STOPped via an **awaited** `session.settle("shutdown")` before the task ends -- the funds-safety
+/// guarantee(`SessionSettle::Drop` is only a backup). Tests pass a never-completing signal and abort the task.
 pub async fn serve(
     bind: SocketAddr,
     state: ApiState,
@@ -1174,8 +1170,8 @@ pub async fn serve(
         if let Err(e) = server.await {
             tracing::error!("consumer API server stopped: {e}");
         }
-        // Awaited session terminal (issue #37): after graceful shutdown drains in-flight requests, STOP the
-        // deal once before exit. This awaited path — not `Drop` — is the funds-safety guarantee.
+        // Awaited session terminal: after graceful shutdown drains in-flight requests, STOP the
+        // deal once before exit. This awaited path -- not `Drop` -- is the funds-safety guarantee.
         if let Err(error) = deals.settle_active("shutdown").await {
             tracing::error!(%error, "consumer API: graceful shutdown STOP failed");
         }
@@ -1187,10 +1183,10 @@ pub async fn serve(
 mod tests {
     use super::*;
 
-    // #144/#281: fail-loud content-identity policy (pure), shared by both buyer paths. A seller can declare the
-    // correct model NAME yet serve a cheaper model; only the CONTENT layers (B8 fingerprint / B7 reference)
+    // fail-loud content-identity policy(pure), shared by both buyer paths. A seller can declare the
+    // correct model NAME yet serve a cheaper model; only the CONTENT layers(B8 fingerprint / B7 reference)
     // catch that. A real model identity with neither must FAIL CLOSED unless the operator opts into name-only.
-    // Data-driven: a config with qwen (fingerprint) but NOT llama exercises probe vs fail-closed.
+    // Data-driven: a config with qwen(fingerprint) but NOT llama exercises probe vs fail-closed.
     fn policy_models() -> ModelsConfig {
         ModelsConfig::from_json(
             r#"{ "models": { "qwen": {
@@ -1357,7 +1353,7 @@ mod tests {
 
     #[test]
     fn policy_real_family_no_fingerprint_no_key_fails_closed() {
-        // llama: a real model with NO B8 fingerprint (not in config) and NO B7 reference key → refuse (fail
+        // llama: a real model with NO B8 fingerprint(not in config) and NO B7 reference key -> refuse (fail
         // closed) without --allow-unverified-model.
         let cfg = policy_models();
         let r = content_check_policy("meta-llama/llama-3.1-8b", None, false, false, false, &cfg);
@@ -2203,12 +2199,12 @@ mod tests {
                 0,
             ),
             StreamErrorPolicyAction::DeadGateway,
-            "generic pre-token stream errors keep #214 dead-gateway policy"
+            "generic pre-token stream errors keep  dead-gateway policy"
         );
         assert_eq!(
             stream_error_policy_action("upstream SSE frame exceeds buffer cap", 2),
             StreamErrorPolicyAction::SellerStallsMidStream,
-            "generic post-delivery stream errors keep #214 seller-stall policy"
+            "generic post-delivery stream errors keep  seller-stall policy"
         );
     }
 
@@ -2219,7 +2215,7 @@ mod tests {
         for source in [openai, anthropic] {
             assert!(
                 source.contains("handle_stream_error_policy(&deal, received"),
-                "both consumer surfaces must route stream errors through the shared #245/#214 classifier"
+                "both consumer surfaces must route stream errors through the shared  classifier"
             );
         }
         let api = include_str!("mod.rs");

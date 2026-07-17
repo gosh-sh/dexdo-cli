@@ -1,3 +1,31 @@
+## v0.0.13
+
+- mitigate: harden dexdo note-deploy Hermez SRS preflight
+- Directive: release under LIVE shellnet 4.0.27 (supersedes 362/4.0.21)
+- refactor(cli): move buyer command core to cli/buyer.rs (C15)
+- refactor(cli): move run_monitor to cli/monitor.rs (C14)
+- refactor(cli): move run_seller to cli/seller.rs (C13)
+- refactor(cli): move run_note_withdraw handler to cli/note_cmd.rs (C12)
+- refactor(cli): move markets list handlers to cli/markets.rs (C11)
+- refactor(cli): move provision/market-deploy/destroy admin handlers to cli/admin.rs (C10)
+- fix: restore read-only test coverage + correct C7/C8/C9/C-FIX/lint evidence (foreground recovery, supersedes PR465)
+- chore(cli): fix pre-existing shellnet-binary clippy lints + enforce the gate
+- fix(cli): repair dexdo shellnet binary build (C8/C9 regression) + add binary-shellnet ci gate
+- refactor(cli): move note balance/deploy handlers to cli/note_cmd.rs (C9)
+- refactor(cli): move note recover/stream-lock handlers to cli/note_cmd.rs (C8)
+- refactor(cli): move deal-close handlers to cli/close.rs (C7)
+- refactor(cli): move run_orders order-book view handler to cli/orders.rs (C6)
+- refactor(cli): move market-data/quote view handlers to cli/market_views.rs (C5)
+- refactor(cli): move reporting/view handlers to cli/reports.rs (C4)
+- refactor(c3): move seller policy helpers to cli/seller_policy.rs (move-only)
+- refactor(c2): move recovery handlers to cli/recover.rs (move-only)
+- refactor(c1): move oracle handlers to cli/oracle.rs (move-only) [review -- merge awaits owner]
+- refactor(a1): drop 5 dead Real* shellnet backend accessors (A1.d)
+- Directive amendment: merge authority for refactor track (unblock Coordinator)
+- refactor(a1): drop dead accessor StreamVerifier::claimed_model (A1.c)
+- refactor(a1): drop dead pub struct TokenBudget (A1.b)
+- chore(PR-0): canonicalize the one un-fmt'd assert (unblock ci-local fmt gate)
+
 ## v0.0.12
 
 - release(v0.0.12): order-management scan skips filled/consumed orders instead of aborting (#433) -- a filled order lingering in the book (getOrder amount=0) no longer aborts `dexdo orders list` or the buyer's book scan before it reaches live orders behind it

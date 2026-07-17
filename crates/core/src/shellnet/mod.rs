@@ -1,14 +1,13 @@
-//! Real shellnet backend (directive 2) — an on-chain adapter on top of the **`gosh.ackinacki`
-//! SDK** (`gosh_ackinacki::sdk`). The wallet/keys/chain interaction are not rewritten — they are
-//! taken from the SDK (AGENTS.md, dexdo-cli §5).
-//!
-//! This module covers **step 1 of the START signal** (`directives/02-real-shellnet.md`):
+//! Real shellnet backend -- an on-chain adapter on top of the **`gosh.ackinacki`
+//! SDK**(`gosh_ackinacki::sdk`). The wallet/keys/chain interaction are not rewritten -- they are
+//! taken from the SDK.
+//! This module covers **step 1 of the START signal**:
 //! connecting to the manifest-selected Block Manager endpoint and reading the deployed contracts
 //! (`contracts/deployed.shellnet.json`). The `ChainBackend` trait implementation
 //! (offer/match in `InferenceOrderBook`, probe/`advance`/`stop`/burn in `TokenContract`, notes in
-//! `PrivateNote`) is layered on top of this `ChainClient` in the next step — its money choreography
-//! is verified against the real on-chain (funded keys required), so no trait
-//! stubs are introduced here (AGENTS.md §3).
+//! `PrivateNote`) is layered on top of this `ChainClient` in the next step -- its money choreography
+//! is verified against the real on-chain(funded keys required), so no trait
+//! stubs are introduced here.
 
 mod backends;
 mod book_events;

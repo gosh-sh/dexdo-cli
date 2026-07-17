@@ -1,5 +1,5 @@
-//! `dexdo-proto` — the canonical stream format and the gateway's gRPC service (§3.1.1, §6, R2/R6/R16).
-//! In directive 1 the canonical chunk carries fake tokens (mock model).
+//! `dexdo-proto` -- the canonical stream format and the gateway's gRPC service.
+//! In the canonical chunk carries fake tokens(mock model).
 
 /// Generated tonic/prost types for the `dexdo.v1` package.
 pub mod v1 {

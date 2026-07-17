@@ -312,31 +312,30 @@ mod model_only_resume_tests {
     }
 }
 
-/// A note on top of `gosh.ackinacki` (directive 2). The **ed25519 signature** of the chain/challenge (§3.1.1) — from
+/// A note on top of `gosh.ackinacki`. The **ed25519 signature** of the chain/challenge -- from
 /// the SDK [`KeyPair`] (the same pubkey is registered on-chain as `buyerPubkey`, against which the gateway checks
-/// the signature). The **x25519 handover** (§3.1) — on the dexdo crypto of directive 1 ([`LocalNote`]): the SDK
-/// by-design does not expose X25519 (the agent's root identity is a different layer). `pubkey()` carries both pubkeys, as in the mock.
+/// the signature). The **x25519 handover** -- on the dexdo crypto of([`LocalNote`]): the SDK
+/// by-design does not expose X25519(the agent's root identity is a different layer). `pubkey()` carries both pubkeys, as in the mock.
 pub struct RealNote {
     handover: LocalNote,
     keypair: KeyPair,
 }
 
 impl RealNote {
-    /// A fresh note: ed25519 SDK `KeyPair` (signature/chain) + x25519 handover, **derived from
-    /// it** (see `from_keypair`). A freshly generated `KeyPair` always carries a valid
-    /// 32-byte ed25519 seed (the `KeyPair::generate` invariant), so the reconstruction does not fail.
+    /// A fresh note: ed25519 SDK `KeyPair`(signature/chain) + x25519 handover, **derived from
+    /// it**(see `from_keypair`). A freshly generated `KeyPair` always carries a valid
+    /// 32-byte ed25519 seed(the `KeyPair::generate` invariant), so the reconstruction does not fail.
     pub fn generate() -> Self {
         Self::from_keypair(KeyPair::generate())
             .expect("freshly generated SDK KeyPair carries a valid 32-byte ed25519 seed")
     }
 
-    /// A note on a given ed25519 key (an on-chain actor). D10: the x25519 handover **is derived from
-    /// ed25519** (Montgomery form), so that the seller reconstructs the buyer's pubkey from on-chain
-    /// `getBuyerPubkey` (ed25519) — no separate x25519 channel is needed. Requires a standard ed25519 seed
-    /// for the SDK key (the invariant is pinned by the test `realnote_x25519_handover_derives_from_ed25519`).
-    ///
-    /// This is the **production path** (the actor loads the key from `--note-key`): the external secret may be malformed,
-    /// so we return a typed [`NoteError::BadKey`] rather than panic (D10 security review F2).
+    /// A note on a given ed25519 key(an on-chain actor).: the x25519 handover **is derived from
+    /// ed25519**(Montgomery form), so that the seller reconstructs the buyer's pubkey from on-chain
+    /// `getBuyerPubkey`(ed25519) -- no separate x25519 channel is needed. Requires a standard ed25519 seed
+    /// for the SDK key(the invariant is pinned by the test `realnote_x25519_handover_derives_from_ed25519`).
+    /// This is the **production path**(the actor loads the key from `--note-key`): the external secret may be malformed,
+    /// so we return a typed [`NoteError::BadKey`] rather than panic.
     pub fn from_keypair(keypair: KeyPair) -> Result<Self, NoteError> {
         let secret = keypair.secret_hex();
         let bytes = decode_hex(secret.trim_start_matches("0x")).map_err(|_| NoteError::BadKey)?;
@@ -350,17 +349,12 @@ impl RealNote {
         Ok(Self { handover, keypair })
     }
 
-    /// A note from an SDK key's hex secret — a convenience constructor for the CLI (D10): the actor loads the owner key
+    /// A note from an SDK key's hex secret -- a convenience constructor for the CLI: the actor loads the owner key
     /// of the minted `PrivateNote` from `--note-key`. Builds a `KeyPair` from hex and derives the handover from ed25519.
-    /// Malformed hex / non-ed25519 seed → a typed [`NoteError::BadKey`] (not a panic).
+    /// Malformed hex / non-ed25519 seed -> a typed [`NoteError::BadKey`](not a panic).
     pub fn from_secret_hex(secret_hex: &str) -> Result<Self, NoteError> {
         let keypair = KeyPair::from_secret_hex(secret_hex.trim()).map_err(|_| NoteError::BadKey)?;
         Self::from_keypair(keypair)
-    }
-
-    /// The ed25519 `KeyPair` — `RealChainBackend` signs chain calls with it (`ChainClient::call`).
-    pub fn keypair(&self) -> &KeyPair {
-        &self.keypair
     }
 }
 
@@ -394,13 +388,13 @@ impl Note for RealNote {
 }
 
 /// The context of a SINGLE deal on the real chain for the [`RealDealBackend`] adapter: everything not present in
-/// the mock form of the `ChainBackend` trait — the book address, the actors' notes+keys (+ nonce), the buyer's
-/// x25519 pubkey and the deal terms. The seller side is **note-funded** (#58): the probe-commission is posted by
-/// the seller note itself (`postProbeCommission` from its own ECC[2]) — no operator wallet. Provisioned ahead of
-/// time by [`RealChainBackend::provision_market`] (note-funded), then placed here.
+/// the mock form of the `ChainBackend` trait -- the book address, the actors' notes+keys(+ nonce), the buyer's
+/// x25519 pubkey and the deal terms. The seller side is **note-funded**: the probe-commission is posted by
+/// the seller note itself(`postProbeCommission` from its own ECC[2]) -- no operator wallet. Provisioned ahead of
+/// time by [`RealChainBackend::provision_market`](note-funded), then placed here.
 pub struct DealContext {
     pub order_book: Address,
-    /// `modelHash` (uint256 hex) - buyer placement, book deployment, and getters use it.
+    /// `modelHash`(uint256 hex) - buyer placement, book deployment, and getters use it.
     /// The 4.0.26 seller note instead derives the model and book from its runtime fields.
     pub model_hash: String,
     /// The seller's deal nonce: the `_nonce` static the per-deal `TokenContract` is deployed with and the
@@ -413,39 +407,33 @@ pub struct DealContext {
     pub buyer_pubkey: NotePubkey,
     pub price_per_tick: u128,
     pub max_ticks: u128,
-    /// How many ticks the buyer buys (budget/escrow for `placeInferenceBuy`).
+    /// How many ticks the buyer buys(budget/escrow for `placeInferenceBuy`).
     pub ticks: u128,
     pub escrow: u128,
-    /// SHELL (ECC[2]) attached to `fundProbeCommission` (≥ probe-commission; the excess is returned).
+    /// SHELL(ECC[2]) attached to `fundProbeCommission`(>= probe-commission; the excess is returned).
     pub probe_shell: u128,
 }
 
-/// A `ChainBackend` trait adapter (§5) on top of [`RealChainBackend`] for a SINGLE deal on shellnet
-/// (directive 2). The trait `token_contract: String` = the on-chain `TokenContract` address.
-///
-/// **Impedance** (the trait is calibrated to the mock of directive 1 — see the session 9 report; the mock e2e is left untouched):
-/// - `Shell`(u64) ← the raw on-chain value (testnet magnitudes fit);
-/// - `Settlement` (`stop`/`seller_timeout`) is computed from the TC state **before** the call — without events;
-/// - `snapshot.burned`/`buyer_refunded` are not in `getState` (payout/burn are outside the getter) — `0` in the snapshot;
-///   the actual magnitudes are carried by `Settlement` from `stop`/`seller_timeout`.
+/// A `ChainBackend` trait adapter on top of [`RealChainBackend`] for a SINGLE deal on shellnet
+/// . The trait `token_contract: String` = the on-chain `TokenContract` address.
+/// **Impedance**:
+/// - `Shell`(u64) <- the raw on-chain value(testnet magnitudes fit);
+/// - `Settlement`(`stop`/`seller_timeout`) is computed from the TC state **before** the call -- without events;
+/// - `snapshot.burned`/`buyer_refunded` are not in `getState`(payout/burn are outside the getter) -- `0` in the snapshot;
+/// the actual magnitudes are carried by `Settlement` from `stop`/`seller_timeout`.
 pub struct RealDealBackend {
     chain: RealChainBackend,
     ctx: DealContext,
 }
 
 impl RealDealBackend {
-    /// Assemble the adapter from an (already connected) low-level backend and a provisioned deal context.
+    /// Assemble the adapter from an(already connected) low-level backend and a provisioned deal context.
     pub fn new(chain: RealChainBackend, ctx: DealContext) -> Self {
         Self { chain, ctx }
     }
 
-    /// Low-level backend (provisioning/getters).
-    pub fn chain(&self) -> &RealChainBackend {
-        &self.chain
-    }
-
-    /// Wait for a boolean TC state flag. `submit` is asynchronous (the contract executes across blocks),
-    /// so the trait's transition methods wait for the effect to be applied before returning (the trait's synchronous semantics).
+    /// Wait for a boolean TC state flag. `submit` is asynchronous(the contract executes across blocks),
+    /// so the trait's transition methods wait for the effect to be applied before returning(the trait's synchronous semantics).
     async fn wait_state_bool(&self, tc: &Address, key: &str, want: bool) -> Result<(), ChainError> {
         for _ in 0..40 {
             if let Some(st) = self.chain.token_contract_state(tc).await.map_err(map_err)? {
@@ -474,8 +462,8 @@ impl RealDealBackend {
     }
 }
 
-/// `(opened, probeAccepted, prepaid, frozen, deposit, probeLocked)` from the TC — for computing
-/// `Settlement`/the snapshot (§3.1.2/§4.1).
+/// `(opened, probeAccepted, prepaid, frozen, deposit, probeLocked)` from the TC -- for computing
+/// `Settlement`/the snapshot.
 async fn tc_settle_state(
     chain: &RealChainBackend,
     tc: &Address,
@@ -522,7 +510,7 @@ fn message_is_contract_failure(message: &str) -> bool {
         || lower.contains("action_result_code=");
 
     // Some SDK paths expose only the named contract error. Do not turn our own fail-closed
-    // preflight explanations (which describe what *would* revert) into chain results.
+    // preflight explanations(which describe what *would* revert) into chain results.
     let named_contract_error = message.contains("ERR_")
         && !lower.contains("would revert")
         && !lower.contains("would fail")
@@ -1049,7 +1037,7 @@ fn orderbook_order_from_getter(order_id: u128, order: &Value) -> Result<Option<O
     // (`_removeFromBook` -> `delete _orders[id]`, all fields zero) or an order filled /
     // consumed to zero remaining ticks but not yet swept from the book (its owner note can
     // linger until a `cancelInferenceOrder`). Neither can be matched, so skip it rather than
-    // letting a strict parse of a lingering filled order abort the whole book scan (#433).
+    // letting a strict parse of a lingering filled order abort the whole book scan.
     if ticks == 0 {
         return Ok(None);
     }
@@ -1059,7 +1047,7 @@ fn orderbook_order_from_getter(order_id: u128, order: &Value) -> Result<Option<O
         .ok_or_else(|| anyhow!("getOrder({order_id}) missing/invalid note: {order}"))?
         .to_string();
     // A non-zero amount with a zero/absent owner note is genuinely malformed (ticks with no
-    // owner) — keep it fail-loud.
+    // owner) -- keep it fail-loud.
     if zero_address_like(&owner_note) {
         return Err(anyhow!(
             "getOrder({order_id}) malformed: non-zero amount with zero owner note: {order}"
@@ -1121,8 +1109,8 @@ fn orderbook_order_from_getter(order_id: u128, order: &Value) -> Result<Option<O
 }
 
 /// Build the live-order list from raw per-id `getOrder` reads, skipping empty/filled slots
-/// (`Ok(None)`) and lingering/unparseable slots (`Err`, logged) so one non-live or corrupt
-/// order never blinds the whole book scan (#433). Transport/chain read errors are surfaced by
+/// (`Ok(None)`) and lingering/unparseable slots(`Err`, logged) so one non-live or corrupt
+/// order never blinds the whole book scan. Transport/chain read errors are surfaced by
 /// the caller before the raw values reach here.
 fn collect_live_orders(raw: impl IntoIterator<Item = (u128, Value)>) -> Vec<OrderBookOrder> {
     let mut orders = Vec::new();
@@ -1427,7 +1415,7 @@ fn seller_post_sell_offer_timeout_message(
         "seller postSellOffer submit timed out after {}s before shellnet returned an accepted/rejected \
          /v2/messages response; no message_hash/tx_hash is available. InferenceOrderBook {ob} model_hash={model_hash} \
          nonce={nonce} seller_note={seller_note} token_contract={token_contract}. {canonical_evidence}. \
-         {tc_state_evidence}. This is issue #349 submit-timeout evidence; retry may be safe only after checking \
+         {tc_state_evidence}. This is  submit-timeout evidence; retry may be safe only after checking \
          whether the chain later shows a matching message/order for this exact TC.",
         timeout.as_secs()
     )
@@ -1658,9 +1646,9 @@ mod offer_rested_match_tests {
 
     #[test]
     fn order_parser_skips_filled_zero_tick_order_and_rejects_ownerless_amount() {
-        // #433: a filled / consumed order lingers in the book as a real owner note with ZERO
+        // a filled / consumed order lingers in the book as a real owner note with ZERO
         // remaining ticks until a `cancelInferenceOrder` sweeps it. It is not matchable, so the
-        // parser SKIPS it (Ok(None)) instead of erroring — otherwise a single filled order at a
+        // parser SKIPS it (Ok(None)) instead of erroring -- otherwise a single filled order at a
         // low id would abort the whole book scan before it reaches the live orders behind it.
         let filled_zero_tick = json!({
             "note": "0:seller", "tokenContract": "0:tc", "price": "1", "amount": "0",
@@ -1673,7 +1661,7 @@ mod offer_rested_match_tests {
             "a filled (zero-tick) order must be skipped so the scan reaches the live orders"
         );
 
-        // A non-zero amount with a zero owner note is genuinely malformed (ticks with no owner)
+        // A non-zero amount with a zero owner note is genuinely malformed(ticks with no owner)
         // and stays fail-loud.
         let ownerless_amount = json!({
             "note": "0:000000", "tokenContract": "0:tc", "price": "1", "amount": "1",
@@ -1686,7 +1674,7 @@ mod offer_rested_match_tests {
 
     #[test]
     fn book_scan_skips_filled_and_unparseable_orders_and_keeps_live_ones() {
-        // #433 end to end at the scan layer: a book with a filled order at id 1 and an
+        // end to end at the scan layer: a book with a filled order at id 1 and an
         // unparseable/corrupt slot at id 2 must still surface the live order at id 3, in order,
         // rather than aborting on the first non-live id.
         let raw = vec![
@@ -1713,7 +1701,11 @@ mod offer_rested_match_tests {
             ),
         ];
         let live = collect_live_orders(raw);
-        assert_eq!(live.len(), 1, "only the live order should survive: {live:?}");
+        assert_eq!(
+            live.len(),
+            1,
+            "only the live order should survive: {live:?}"
+        );
         assert_eq!(live[0].order_id, 3);
         assert_eq!(live[0].ticks, 9);
     }
@@ -1869,8 +1861,8 @@ mod offer_rested_match_tests {
         let err = selected_model_buy_ask_matching_executable_depth(&asks, &executable, 100, 1024)
             .expect_err("raw head blocks later executable ask for submit");
         assert!(err.contains("raw order-book matcher would select"), "{err}");
-        assert!(err.contains("order #14"), "{err}");
-        assert!(err.contains("executable quote selected order #35"), "{err}");
+        assert!(err.contains("order "), "{err}");
+        assert!(err.contains("executable quote selected order "), "{err}");
         assert!(err.contains("Refusing to send escrow"), "{err}");
     }
 
@@ -1907,8 +1899,8 @@ mod offer_rested_match_tests {
             selected_model_buy_ask_matching_executable_depth(&raw_asks, &executable, 100, 1024)
                 .expect_err("raw unreadable head blocks later executable ask for submit");
         assert!(err.contains("raw order-book matcher would select"), "{err}");
-        assert!(err.contains("order #10"), "{err}");
-        assert!(err.contains("executable quote selected order #11"), "{err}");
+        assert!(err.contains("order "), "{err}");
+        assert!(err.contains("executable quote selected order "), "{err}");
     }
 
     #[test]
@@ -1930,8 +1922,8 @@ mod offer_rested_match_tests {
         )
         .expect_err("model-only preflight must not follow skip-only executable depth");
         assert!(err.contains("raw order-book matcher would select"), "{err}");
-        assert!(err.contains("order #14"), "{err}");
-        assert!(err.contains("executable quote selected order #35"), "{err}");
+        assert!(err.contains("order "), "{err}");
+        assert!(err.contains("executable quote selected order "), "{err}");
     }
 
     #[test]
@@ -1984,7 +1976,7 @@ mod offer_rested_match_tests {
 
         assert!(rows.is_empty(), "{rows:?}");
         let reason = reason.expect("empty stale-blocked list carries reason");
-        assert!(reason.contains("non-executable order #11"), "{reason}");
+        assert!(reason.contains("non-executable order "), "{reason}");
         assert!(reason.contains("Refusing to list"), "{reason}");
     }
 
@@ -2030,7 +2022,7 @@ mod offer_rested_match_tests {
         let reason = reason.expect("empty insufficient-head-blocked list carries reason");
         assert!(reason.contains("insufficient head"), "{reason}");
         assert!(reason.contains("refusing multi-ask fill"), "{reason}");
-        assert!(reason.contains("order #11"), "{reason}");
+        assert!(reason.contains("order "), "{reason}");
     }
 
     #[test]
@@ -2093,7 +2085,7 @@ mod offer_rested_match_tests {
             parsed_ask(2, "0:expected", 1000, 10),
         ];
         let err = check_expected_buy_target(&asks, "0:expected", 1000, 2).unwrap_err();
-        assert!(err.contains("would match order #1"), "{err}");
+        assert!(err.contains("would match order "), "{err}");
         assert!(
             err.contains("before expected tokenContract 0:expected"),
             "{err}"
@@ -2107,7 +2099,7 @@ mod offer_rested_match_tests {
             parsed_ask(2, "0:expected", 1000, 10),
         ];
         let err = check_expected_buy_target(&asks, "0:expected", 1000, 2).unwrap_err();
-        assert!(err.contains("would match order #1"), "{err}");
+        assert!(err.contains("would match order "), "{err}");
         assert!(err.contains("tokenContract 0:foreign"), "{err}");
     }
 
@@ -2150,12 +2142,12 @@ mod offer_rested_match_tests {
     }
 }
 
-/// #117 (pure, offline-testable): is a per-deal `TokenContract` already USED (not fresh/reusable)? A fresh
-/// active TC is unfunded/unopened — all `getState` flags false, all amounts 0 → `None`. Any of
+/// (pure, offline-testable): is a per-deal `TokenContract` already USED(not fresh/reusable)? A fresh
+/// active TC is unfunded/unopened -- all `getState` flags false, all amounts 0 -> `None`. Any of
 /// `opened`/`funded`/`disputed`/`probeAccepted`, or a non-zero `deposit`/`prepaid`/`frozen`/`finalizedOwed`,
 /// means a prior deal used this `(sellerPubkey, nonce)` TC; resting a new ask reverts the seller's pre-stream
-/// steps (`fundProbeCommission`/`open`) with a raw `TVM_ERROR` (`ERR_ALREADY_OPEN` 321 and kin). Returns
-/// `Some(reason)` (the offending flags/amounts) when used. Numeric fields are `getState`'s uint128 strings.
+/// steps(`fundProbeCommission`/`open`) with a raw `TVM_ERROR`(`ERR_ALREADY_OPEN` 321 and kin). Returns
+/// `Some(reason)`(the offending flags/amounts) when used. Numeric fields are `getState`'s uint128 strings.
 fn token_contract_used_reason(state: &Value) -> Option<String> {
     let flag = |k: &str| state[k].as_bool().unwrap_or(false);
     let amount = |k: &str| state[k].as_str().and_then(parse_order_u128).unwrap_or(0);
@@ -2216,8 +2208,8 @@ where
     Ok(executable)
 }
 
-/// A seller gateway may resume either before first handover write (`funded` but unopened) or after a live
-/// `open_stream` (`opened=true`) so restart can rebuild in-memory gateway authorization. Completed/abandoned
+/// A seller gateway may resume either before first handover write(`funded` but unopened) or after a live
+/// `open_stream`(`opened=true`) so restart can rebuild in-memory gateway authorization. Completed/abandoned
 /// deals can keep `funded=true`, so terminal/disputed states still must not bypass the single-use TC freshness
 /// guard.
 fn token_contract_resume_blocker(state: &Value) -> Option<String> {
@@ -2251,15 +2243,15 @@ fn token_contract_resume_blocker(state: &Value) -> Option<String> {
     (!blockers.is_empty()).then(|| blockers.join(", "))
 }
 
-/// #128 (pure, offline-testable): the note's on-chain owner key (`getDetails().ephemeralPubkey` — what the
+/// (pure, offline-testable): the note's on-chain owner key (`getDetails().ephemeralPubkey` -- what the
 /// `onlyOwnerPubkey(_ephemeralPubkey)` gate checks `msg.pubkey()` against) must equal the key the client signs
-/// the owner-authenticated write (`placeInferenceBuy` / `postSellOffer`) with. If the note's `_ephemeralPubkey`
-/// was rotated (`changeOwner`, `PrivateNote.sol:381`) or the pool records a different/orphaned owner, that gate
-/// rejects the write PRE-accept (`ERR_INVALID_SENDER` 101, dex table — `contracts/dex/modifiers/errors.sol`) →
-/// no tx commits → the buyer silently 300s-times out in `read_match` (and a seller's ask never rests, #130).
+/// the owner-authenticated write(`placeInferenceBuy` / `postSellOffer`) with. If the note's `_ephemeralPubkey`
+/// was rotated(`changeOwner`, `PrivateNote.sol:381`) or the pool records a different/orphaned owner, that gate
+/// rejects the write PRE-accept(`ERR_INVALID_SENDER` 101, dex table -- `contracts/dex/modifiers/errors.sol`) ->
+/// no tx commits -> the buyer silently 300s-times out in `read_match`.
 /// Returns the actionable fail-closed reason, or `None` when they match. Both keys are normalized
-/// (lower-case, strip `0x`) before comparing — the getter returns `0x…` (possibly upper-case), `public_hex()`
-/// has no prefix. This is the #128 branch-3 (non-conforming/orphaned note) guard; the async
+/// (lower-case, strip `0x`) before comparing -- the getter returns `0x...`(possibly upper-case), `public_hex()`
+/// has no prefix. This is the branch-3(non-conforming/orphaned note) guard; the async
 /// [`RealChainBackend::assert_note_owner_matches`] wraps it with the on-chain `getDetails` read.
 pub(super) fn note_owner_mismatch_reason(
     role: &str,
@@ -2276,19 +2268,19 @@ pub(super) fn note_owner_mismatch_reason(
     Some(format!(
         "{role} aborted: --note-key pubkey 0x{signing} does not match note {note}'s on-chain owner key \
          _ephemeralPubkey {onchain} (ownership rotated via changeOwner, or a stale/wrong/orphaned pool). The \
-         note's onlyOwnerPubkey gate rejects msg.pubkey() pre-accept (ERR_INVALID_SENDER 101, dex table) — the \
+         note's onlyOwnerPubkey gate rejects msg.pubkey() pre-accept (ERR_INVALID_SENDER 101, dex table) -- the \
          write never commits (no order rests; the buyer then 300s-times out in read_match). Re-mint the note \
          against the current contracts (`mint_pn_pool`) and point DEXDO_PN_POOL at the fresh pool, or use the \
          correct --note-key."
     ))
 }
 
-// ─── Shared helpers for the per-role CLI backends (D10) ───────────────────────────────────────
+// --- Shared helpers for the per-role CLI backends ---------------------------------------
 // Free functions reused by `RealSellerBackend`/`RealBuyerBackend`. `RealDealBackend`
-// (the in-process form of D2) is intentionally NOT touched (a 10/10 do-not-break) — it has its own inline bodies; the small
-// duplication of formulas here is the deliberate price of "leaving D2 as is" (lead, D10 §97).
+// (the in-process form of D2) is intentionally NOT touched(a 10/10 do-not-break) -- it has its own inline bodies; the small
+// duplication of formulas here is the deliberate price of "leaving D2 as is".
 
-/// Wait for a boolean TC `getState` flag (the trait's transitions are synchronous — they wait for `submit` to apply).
+/// Wait for a boolean TC `getState` flag(the trait's transitions are synchronous -- they wait for `submit` to apply).
 async fn wait_tc_bool(
     chain: &RealChainBackend,
     tc: &Address,
@@ -2308,7 +2300,7 @@ async fn wait_tc_bool(
     )))
 }
 
-/// A snapshot of the locks/burned amounts for a TC (§3.1.2/§4.1) — the same reads as in `RealDealBackend::snapshot`.
+/// A snapshot of the locks/burned amounts for a TC -- the same reads as in `RealDealBackend::snapshot`.
 async fn real_tc_snapshot(
     chain: &RealChainBackend,
     token_contract: &TokenContract,
@@ -2325,8 +2317,8 @@ async fn real_tc_snapshot(
     Some(StreamSnapshot {
         seller_locked: pr.as_ref().map(|p| g(p, "probeLocked")).unwrap_or(0) as Shell,
         buyer_locked: (g(&st, "prepaid") + g(&st, "frozen") + g(&st, "deposit")) as Shell,
-        // #126: the at-risk lead is `prepaid + frozen` only — the unspent `deposit` is not part of the §3.2
-        // two-tick bound (it funds the remaining ticks of a multi-tick deal).
+        // the at-risk lead is `prepaid + frozen` only -- the unspent `deposit` is not part of the
+        // two-tick bound(it funds the remaining ticks of a multi-tick deal).
         buyer_lead: (g(&st, "prepaid") + g(&st, "frozen")) as Shell,
         seller_received: g(&st, "finalizedOwed") as Shell,
         buyer_refunded: 0,
@@ -2335,17 +2327,17 @@ async fn real_tc_snapshot(
     })
 }
 
-/// Read one market's deal into a monitor [`DealView`] from the **authoritative on-chain getters** (issue #23,
+/// Read one market's deal into a monitor [`DealView`] from the **authoritative on-chain getters** (issue,
 /// real-chain reader). The operator's [`crate::MarketManifest`] supplies only the `TokenContract` ADDRESS to
-/// read + the `model_hash` to integrity-check against; every accounting field comes from the CHAIN — model from
+/// read + the `model_hash` to integrity-check against; every accounting field comes from the CHAIN -- model from
 /// `getModelName`, price from `getDeal().pricePerTick`, by-fact from `getState`/`getProbe`, counterparty from
 /// `getBuyerPubkey`. The manifest is operator-supplied and is NOT trusted as chain truth: this **fails loud**
 /// rather than rendering a stale/hand-edited manifest or hiding a broken/undeployed TC as empty data. Errors on:
-/// a `token_contract` that does not parse; an undeployed/inactive TC (no `getState`); unreadable
+/// a `token_contract` that does not parse; an undeployed/inactive TC(no `getState`); unreadable
 /// `getModelName`/`getDeal`; or an on-chain `getModelHash` that does NOT match the manifest's `model_hash` (the
 /// manifest points at a TC for a different model). The operator is the SELLER of their own market, so
 /// `role = Seller`. The view feeds `print_tree_snapshot` + `deal_anomalies` like the mock path. (Refund/burn are
-/// not live-readable — `real_tc_snapshot` leaves them `0`.) The caller adds the `--market <path>` context.
+/// not live-readable -- `real_tc_snapshot` leaves them `0`.) The caller adds the `--market <path>` context.
 pub async fn real_market_deal_view(
     chain: &RealChainBackend,
     manifest: &crate::MarketManifest,
@@ -2353,18 +2345,18 @@ pub async fn real_market_deal_view(
     let tc = manifest.token_contract.as_str();
     let addr =
         Address::parse(tc).map_err(|e| anyhow!("token_contract {tc}: invalid address: {e}"))?;
-    // Fail loud: an undeployed / inactive TC is NOT a valid accounting row — never render it as empty data.
+    // Fail loud: an undeployed / inactive TC is NOT a valid accounting row -- never render it as empty data.
     let snapshot = real_tc_snapshot(chain, &manifest.token_contract)
         .await
         .ok_or_else(|| {
             anyhow!("TokenContract {tc} is not readable (undeployed/inactive/getState failed)")
         })?;
-    // Model: authoritative on-chain getModelName (NOT the manifest's frame_model).
+    // Model: authoritative on-chain getModelName(NOT the manifest's frame_model).
     let model = chain
         .token_contract_model_name(&addr)
         .await?
         .ok_or_else(|| anyhow!("TokenContract {tc}: getModelName empty/unreadable"))?;
-    // Integrity: the on-chain modelHash MUST match the manifest's — else the manifest points at the wrong TC.
+    // Integrity: the on-chain modelHash MUST match the manifest's -- else the manifest points at the wrong TC.
     let on_chain_hash = chain
         .token_contract_model_hash(&addr)
         .await?
@@ -2376,12 +2368,12 @@ pub async fn real_market_deal_view(
             manifest.model_hash
         ));
     }
-    // Price: authoritative on-chain getDeal().pricePerTick (NOT the manifest's).
+    // Price: authoritative on-chain getDeal().pricePerTick(NOT the manifest's).
     let price = chain
         .token_contract_price_per_tick(&addr)
         .await?
         .ok_or_else(|| anyhow!("TokenContract {tc}: getDeal/pricePerTick unreadable"))?;
-    // Counterparty: the matched buyer's anonymous pubkey (none before a match).
+    // Counterparty: the matched buyer's anonymous pubkey(none before a match).
     let counterparty = chain
         .token_contract_buyer_pubkey(&addr)
         .await?
@@ -2397,7 +2389,7 @@ pub async fn real_market_deal_view(
     })
 }
 
-/// The STOP outcome from the TC state BEFORE the call (§3.1.2/§4.1): on the probe — `BurnBoth`, otherwise `AmicableSplit`.
+/// The STOP outcome from the TC state BEFORE the call: on the probe -- `BurnBoth`, otherwise `AmicableSplit`.
 fn settle_stop(
     accepted: bool,
     prepaid: u128,
@@ -2418,8 +2410,8 @@ fn settle_stop(
     }
 }
 
-/// The expected post-release outcome for the buyer (§4.2): a dispute/concession/timeout returns the tick to the buyer
-/// without burn — on the probe, probe+deposit to the buyer, commission to the seller; otherwise a split with a refund.
+/// The expected post-release outcome for the buyer: a dispute/concession/timeout returns the tick to the buyer
+/// without burn -- on the probe, probe+deposit to the buyer, commission to the seller; otherwise a split with a refund.
 fn settle_release(accepted: bool, frozen: u128, deposit: u128, commission: u128) -> Settlement {
     if !accepted {
         Settlement::SellerNoShow {
@@ -2434,17 +2426,17 @@ fn settle_release(accepted: bool, frozen: u128, deposit: u128, commission: u128)
     }
 }
 
-/// A "wrong role" error: a counterparty's method was called on a per-role backend (D10 — CLI per-process).
+/// A "wrong role" error: a counterparty's method was called on a per-role backend.
 fn wrong_role(method: &str, want: &str) -> ChainError {
     ChainError::Chain(format!(
-        "{method}: a `{want}` role action on a backend of a different role — run `dexdo {want}`"
+        "{method}: a `{want}` role action on a backend of a different role -- run `dexdo {want}`"
     ))
 }
 
-/// The canonical `tickSize` (uint128) for CLI derivation of the `InferenceOrderBook` address (D10): both sides
+/// The canonical `tickSize`(uint128) for CLI derivation of the `InferenceOrderBook` address: both sides
 /// derive the book address from `(model_hash, tick_size)`, so the tick size is fixed in code (a single source
-/// of truth, not a flag — otherwise the sides desync). #89/§9: a tick is the canonical `TICK_SIZE` =
-/// **1,000,000 delivered tokens** (`params::DobParams::canonical().tick_size`, spec §1), NOT an ad-hoc `1000`.
+/// of truth, not a flag -- otherwise the sides desync).: a tick is the canonical `TICK_SIZE` =
+/// **1,000,000 delivered tokens** (`params::DobParams::canonical().tick_size`, spec), NOT an ad-hoc `1000`.
 /// Both the book-address derivation here and the seller's tick-finalization cadence read this one value.
 pub const MODEL_TICK_SIZE: u128 = crate::params::DobParams::canonical().tick_size as u128;
 
@@ -2468,7 +2460,7 @@ impl RealChainBackend {
         let mut raw = Vec::new();
         for id in 1..stats.next_order_id {
             // A per-id transport/chain read failure is a real error and surfaces here; a
-            // `None` is an absent slot. Parsing (and the #433 skip of filled/unparseable
+            // `None` is an absent slot. Parsing (and the skip of filled/unparseable
             // orders) happens in `collect_live_orders`.
             if let Some(order) = self.inference_orderbook_order(order_book, id).await? {
                 raw.push((id, order));
@@ -2621,16 +2613,16 @@ impl RealChainBackend {
 #[async_trait]
 impl ChainBackend for RealDealBackend {
     async fn discover_offers(&self) -> Result<Vec<crate::chain::OfferListing>, ChainError> {
-        // The adapter is configured for a SINGLE deal (directive 2): book discovery (many offers,
-        // directive 5, B1) is a read of `InferenceOrderBook` via the low-level `RealChainBackend`
-        // (getStats/getOrder), not the job of the single-deal wrapper. Here — empty.
+        // The adapter is configured for a SINGLE deal: book discovery (many offers,
+        // B1) is a read of `InferenceOrderBook` via the low-level `RealChainBackend`
+        // (getStats/getOrder), not the job of the single-deal wrapper. Here -- empty.
         Ok(Vec::new())
     }
 
     async fn post_offer(&self, _offer: SellOffer, _note: &dyn Note) -> Result<(), ChainError> {
         // 4.0.25: one seller call. PrivateNote.postSellOffer(flags, nonce) derives the canonical per-deal
         // TokenContract locally and hands it the baked InferenceOrderBook hash; the TC posts its own resting
-        // ask (msg.sender == TC). No RootPN round-trip.
+        // ask(msg.sender == TC). No RootPN round-trip.
         self.chain
             .post_sell_offer(
                 &self.ctx.seller_note,
@@ -2648,7 +2640,7 @@ impl ChainBackend for RealDealBackend {
         _token_contract: &TokenContract,
         _note: &dyn Note,
     ) -> Result<(), ChainError> {
-        // #100: the shared order book may contain valid asks from many sellers, each with its own canonical TC.
+        // the shared order book may contain valid asks from many sellers, each with its own canonical TC.
         // The IOB itself enforces `tokenContract == _tokenContractAddr(sellerPubkey, nonce)` at
         // `placeSellOffer`, so a client-side scan against this buyer's single expected TC is both redundant and
         // wrong for shared books.
@@ -2683,7 +2675,7 @@ impl ChainBackend for RealDealBackend {
                 if let Some(reason) = token_contract_resume_blocker(state) {
                     return Err(ChainError::Chain(format!(
                         "TokenContract {token_contract} is matched but not openable for seller resume \
-                         ({reason}) — use a fresh --nonce / --market, or close/recover the previous deal"
+                         ({reason}) -- use a fresh --nonce / --market, or close/recover the previous deal"
                     )));
                 }
                 return Ok(Match {
@@ -2705,8 +2697,8 @@ impl ChainBackend for RealDealBackend {
     ) -> Result<(), ChainError> {
         let tc = parse_tc(token_contract)?;
         self.ensure_tc_gas(&tc).await?;
-        // §3.1.2 + #58: the note posts the probe-commission to the nonce-derived TC from its own ECC[2]
-        // (`postProbeCommission`) — no operator wallet.
+        // +: the note posts the probe-commission to the nonce-derived TC from its own ECC[2]
+        // (`postProbeCommission`) -- no operator wallet.
         post_probe_commission_and_wait(
             &self.chain,
             &self.ctx.seller_note,
@@ -2717,7 +2709,7 @@ impl ChainBackend for RealDealBackend {
             self.ctx.probe_shell,
         )
         .await?;
-        // §3.1: the enc endpoint (handover) is written to the TC. Wait for open() to apply (opened==true).
+        // the enc endpoint(handover) is written to the TC. Wait for open() to apply(opened==true).
         self.ensure_tc_gas(&tc).await?;
         self.chain
             .open_stream(&tc, &self.ctx.seller_keys, &enc_endpoint)
@@ -2776,7 +2768,7 @@ impl ChainBackend for RealDealBackend {
     }
 
     async fn accept_probe(&self, token_contract: &TokenContract) -> Result<(), ChainError> {
-        // On the real chain the probe is accepted by the same `advance()` (the first call after SETTLE_WINDOW).
+        // On the real chain the probe is accepted by the same `advance()`(the first call after SETTLE_WINDOW).
         let tc = parse_tc(token_contract)?;
         self.ensure_tc_gas(&tc).await?;
         self.chain
@@ -2800,7 +2792,7 @@ impl ChainBackend for RealDealBackend {
             .await
             .map_err(map_err)?;
         self.wait_state_bool(&tc, "opened", false).await?;
-        // §3.1.2/§4.1: the outcome is computed from the state BEFORE stop.
+        // the outcome is computed from the state BEFORE stop.
         if !accepted {
             Ok(Settlement::BurnBoth(ProbeBurn {
                 buyer: frozen as Shell,
@@ -2823,16 +2815,16 @@ impl ChainBackend for RealDealBackend {
         let (_opened, accepted, _prepaid, frozen, deposit, commission) =
             tc_settle_state(&self.chain, &tc).await.map_err(map_err)?;
         self.ensure_tc_gas(&tc).await?;
-        // §4.2: the dispute locks BOTH notes (`streamDispute`→`TC.dispute()`→`streamDisputeLock`) and
-        // FREEZES the deal (does not close it — `_opened` stays true, we wait for `disputed==true`).
+        // the dispute locks BOTH notes (`streamDispute`->`TC.dispute()`->`streamDisputeLock`) and
+        // FREEZES the deal(does not close it -- `_opened` stays true, we wait for `disputed==true`).
         self.chain
             .stream_dispute(&self.ctx.buyer_note, &self.ctx.buyer_keys, &tc)
             .await
             .map_err(map_err)?;
         self.wait_state_bool(&tc, "disputed", true).await?;
-        // The final settlement is on `releaseDispute` (the seller concedes / dispute timeout). We return
+        // The final settlement is on `releaseDispute`(the seller concedes / dispute timeout). We return
         // the EXPECTED post-release outcome for the buyer: on the probe the tick and deposit are returned, the commission
-        // to the seller, NO burn (§4.2 — for the buyer strictly no worse than `stop`, the tick is not burned).
+        // to the seller, NO burn.
         if !accepted {
             Ok(Settlement::SellerNoShow {
                 to_buyer_refund: (frozen + deposit) as Shell,
@@ -2854,8 +2846,8 @@ impl ChainBackend for RealDealBackend {
         let (_opened, accepted, _prepaid, frozen, deposit, commission) =
             tc_settle_state(&self.chain, &tc).await.map_err(map_err)?;
         self.ensure_tc_gas(&tc).await?;
-        // §4.2: the seller concedes — `TC.releaseDispute()` unlocks both notes and returns the tick
-        // to the buyer (on the probe: probe+deposit to the buyer, commission to the seller, no burn).
+        // the seller concedes -- `TC.releaseDispute()` unlocks both notes and returns the tick
+        // to the buyer(on the probe: probe+deposit to the buyer, commission to the seller, no burn).
         self.chain
             .release_dispute(&tc, &self.ctx.seller_keys)
             .await
@@ -2959,31 +2951,31 @@ impl ChainBackend for RealDealBackend {
         Some(StreamSnapshot {
             seller_locked: pr.as_ref().map(|p| g(p, "probeLocked")).unwrap_or(0) as Shell,
             buyer_locked: (g(&st, "prepaid") + g(&st, "frozen") + g(&st, "deposit")) as Shell,
-            // #126: the at-risk lead is `prepaid + frozen` only — the unspent `deposit` is not part of the §3.2
-            // two-tick bound (it funds the remaining ticks of a multi-tick deal).
+            // the at-risk lead is `prepaid + frozen` only -- the unspent `deposit` is not part of the
+            // two-tick bound(it funds the remaining ticks of a multi-tick deal).
             buyer_lead: (g(&st, "prepaid") + g(&st, "frozen")) as Shell,
             seller_received: g(&st, "finalizedOwed") as Shell,
-            buyer_refunded: 0, // not in getState — the actual magnitude is carried by Settlement from stop/seller_timeout
-            burned: 0,         // not in getState — the net burn §5.4 is outside the getter
+            buyer_refunded: 0, // not in getState -- the actual magnitude is carried by Settlement from stop/seller_timeout
+            burned: 0, // not in getState -- the net burn is outside the getter
             closed: lifecycle.is_stopped(),
         })
     }
 }
 
-/// The per-role CLI backend of the **SELLER** (D10): the `ChainBackend` trait for the `dexdo seller` process. Unlike
-/// [`RealDealBackend`] (both sides in-process, D2) it holds ONLY the seller's identity (note+keys +
-/// `model_hash` from D11) and **reads the counterparty/state from the chain** — the buyer's
-/// pubkey is taken from on-chain `getBuyerPubkey` after the match (F1), not from arguments. The seller side is
-/// **note-funded** (#58): no operator wallet — the note self-funds the deploy pre-fund + probe-commission from its
-/// own ECC[2]. It reuses [`RealChainBackend`] helpers (deploy OB/offer/probe/advance) — it does not duplicate
-/// submit/provisioning. Provisioning (note/keys) is NOT here (§5, custody is external): the backend only reads/signs.
+/// The per-role CLI backend of the **SELLER**: the `ChainBackend` trait for the `dexdo seller` process. Unlike
+/// [`RealDealBackend`](both sides in-process, D2) it holds ONLY the seller's identity (note+keys +
+/// `model_hash` from) and **reads the counterparty/state from the chain** -- the buyer's
+/// pubkey is taken from on-chain `getBuyerPubkey` after the match(F1), not from arguments. The seller side is
+/// **note-funded**: no operator wallet -- the note self-funds the deploy pre-fund + probe-commission from its
+/// own ECC[2]. It reuses [`RealChainBackend`] helpers(deploy OB/offer/probe/advance) -- it does not duplicate
+/// submit/provisioning. Provisioning(note/keys) is NOT here: the backend only reads/signs.
 pub struct RealSellerBackend {
     chain: RealChainBackend,
     note: Address,
     keys: KeyPair,
     model_hash: String,
-    /// Canonical model name (4.0.6): forwarded into `deployInferenceOrderBook(modelHash, modelName)`
-    /// so the book verifies `sha256(modelName)==modelHash` (`ERR_BAD_MODEL_NAME`).
+    /// Canonical model name(4.0.6): forwarded into `deployInferenceOrderBook(modelHash, modelName)`
+    /// so the book verifies `sha256(modelName)==modelHash`(`ERR_BAD_MODEL_NAME`).
     model_name: String,
     /// Deal nonce for the per-deal `TokenContract`: the `_nonce` static the TC is deployed with and the
     /// nonce passed to the 4.0.26 `note.postSellOffer(flags, nonce)` call.
@@ -3018,13 +3010,13 @@ impl RealSellerBackend {
         }
     }
 
-    /// Assemble the seller backend and the seller's note from the `--note-key` seed (D10). Directive #58: the
-    /// seller has **no operator multisig** — the note self-funds its seller side (RootModel/TC deploy pre-fund
+    /// Assemble the seller backend and the seller's note from the `--note-key` seed. Directive: the
+    /// seller has **no operator multisig** -- the note self-funds its seller side (RootModel/TC deploy pre-fund
     /// via `fundDeployShell`, probe-commission via `postProbeCommission`) from its own ECC[2], so there is no
-    /// wallet to derive. The note address `note_addr` is mint-specific (`depositIdentifier`), not derivable, so
-    /// it is passed in (the D13 provisioning script writes it). dexdo does NOT create keys and does NOT fund from
-    /// the giver (custody is external §5). `model_hash` — from `frame_model` (D11). Returns the backend + a
-    /// `RealNote` for the gateway. All SDK types stay in the core — the CLI passes strings.
+    /// wallet to derive. The note address `note_addr` is mint-specific(`depositIdentifier`), not derivable, so
+    /// it is passed in. dexdo does NOT create keys and does NOT fund from
+    /// the giver. `model_hash` -- from `frame_model`. Returns the backend + a
+    /// `RealNote` for the gateway. All SDK types stay in the core -- the CLI passes strings.
     pub fn from_provisioned(
         manifest_path: &str,
         note_addr: &str,
@@ -3053,11 +3045,6 @@ impl RealSellerBackend {
         Ok((backend, rn))
     }
 
-    /// Low-level backend (getters/address derivation).
-    pub fn chain(&self) -> &RealChainBackend {
-        &self.chain
-    }
-
     async fn ensure_tc_gas(&self, tc: &Address) -> Result<(), ChainError> {
         self.chain
             .ensure_deal_contract_gas(&self.note, &self.keys, self.nonce, None, Some(tc))
@@ -3084,10 +3071,10 @@ impl RealSellerBackend {
         if let Some(reason) = token_contract_resume_blocker(&state) {
             return Err(ChainError::Chain(format!(
                 "TokenContract {token_contract} is matched but not openable for seller resume \
-                 ({reason}) — use a fresh --nonce / --market, or close/recover the previous deal"
+                 ({reason}) -- use a fresh --nonce / --market, or close/recover the previous deal"
             )));
         }
-        // F1 (D10 security review): the buyer's pubkey is FROM THE CHAIN (`getBuyerPubkey`, ed25519),
+        // F1: the buyer's pubkey is FROM THE CHAIN(`getBuyerPubkey`, ed25519),
         // not from arguments. Reconstruct the x25519 handover key from it.
         let ed = self
             .chain
@@ -3172,8 +3159,8 @@ impl RealSellerBackend {
 
 #[async_trait]
 impl ChainBackend for RealSellerBackend {
-    /// #117: the seller daemon publishes offers without `provision_market`'s note-current gate; enforce it here
-    /// so a note orphaned by a contract redeploy (stale code_hash) fails closed with an actionable "re-mint"
+    /// the seller daemon publishes offers without `provision_market`'s note-current gate; enforce it here
+    /// so a note orphaned by a contract redeploy(stale code_hash) fails closed with an actionable "re-mint"
     /// message instead of a raw `TVM_ERROR` from `postSellOffer`.
     async fn assert_note_current(&self) -> Result<(), ChainError> {
         retry_seller_read("seller note code", || async {
@@ -3184,7 +3171,7 @@ impl ChainBackend for RealSellerBackend {
         })
         .await
     }
-    /// #335: `PrivateNote._hasWithdrawn=true` permanently blocks `postSellOffer`. Read it before seller writes
+    /// `PrivateNote._hasWithdrawn=true` permanently blocks `postSellOffer`. Read it before seller writes
     /// so users get the fresh-note action instead of raw `ERR_INVALID_STATE` 151.
     async fn assert_note_can_post_sell_offer(&self) -> Result<(), ChainError> {
         retry_seller_read("seller note post eligibility", || async {
@@ -3195,10 +3182,10 @@ impl ChainBackend for RealSellerBackend {
         })
         .await
     }
-    /// #117: the per-deal TC (sellerPubkey + nonce) is single-use; before resting an ask, fail closed if it is
-    /// already USED (a prior deal opened/funded/disputed it or left residual), so the operator gets an
-    /// actionable message instead of a raw `TVM_ERROR` (`ERR_ALREADY_OPEN` 321) from the pre-stream steps. A
-    /// not-yet-active (undeployed) TC is not "used" — let the deploy path handle it.
+    /// the per-deal TC(sellerPubkey + nonce) is single-use; before resting an ask, fail closed if it is
+    /// already USED(a prior deal opened/funded/disputed it or left residual), so the operator gets an
+    /// actionable message instead of a raw `TVM_ERROR`(`ERR_ALREADY_OPEN` 321) from the pre-stream steps. A
+    /// not-yet-active(undeployed) TC is not "used" -- let the deploy path handle it.
     async fn assert_token_contract_fresh(&self, tc: &TokenContract) -> Result<(), ChainError> {
         let addr = parse_tc(tc)?;
         let Some(state) = retry_seller_read("seller TokenContract freshness", || async {
@@ -3213,15 +3200,15 @@ impl ChainBackend for RealSellerBackend {
         };
         if let Some(reason) = token_contract_used_reason(&state) {
             return Err(ChainError::Chain(format!(
-                "deal TokenContract {tc} is already USED ({reason}) — a per-deal TC (sellerPubkey + nonce) is \
+                "deal TokenContract {tc} is already USED ({reason}) -- a per-deal TC (sellerPubkey + nonce) is \
                  single-use, not reusable capacity. Use a fresh --nonce / fresh --market, or close the prior \
-                 deal (`dexdo recover` as the buyer, then `dexdo destroy` as the seller) before re-offering (issue #117)."
+                 deal (`dexdo recover` as the buyer, then `dexdo destroy` as the seller) before re-offering ()."
             )));
         }
         Ok(())
     }
-    /// #37: the deal's dynamic stream-phase cadence from the on-chain `getConfig().settleWindow` (the seller
-    /// driver pairs it with the fixed `PROBE_WINDOW`). Fail-loud if the deal exposes no `settleWindow` — the
+    /// the deal's dynamic stream-phase cadence from the on-chain `getConfig().settleWindow` (the seller
+    /// driver pairs it with the fixed `PROBE_WINDOW`). Fail-loud if the deal exposes no `settleWindow` -- the
     /// driver must not silently use a wrong cadence.
     async fn deal_settle_window(
         &self,
@@ -3253,9 +3240,9 @@ impl ChainBackend for RealSellerBackend {
     async fn post_offer(&self, offer: SellOffer, _note: &dyn Note) -> Result<(), ChainError> {
         let tc = parse_tc(&offer.token_contract)?;
         self.assert_note_can_post_sell_offer().await?;
-        // #128/#130 (symmetric branch-3 guard): fail closed if this note's on-chain owner key
-        // (`getDetails().ephemeralPubkey`) is not the key we sign `postSellOffer` with — otherwise
-        // `onlyOwnerPubkey` reverts pre-accept (ERR_INVALID_SENDER 101) and the ask never rests (only an
+        // (symmetric branch-3 guard): fail closed if this note's on-chain owner key
+        // (`getDetails().ephemeralPubkey`) is not the key we sign `postSellOffer` with -- otherwise
+        // `onlyOwnerPubkey` reverts pre-accept(ERR_INVALID_SENDER 101) and the ask never rests (only an
         // opaque TVM_ERROR). Run it before the IOB deploy / offer write.
         retry_seller_read("seller note owner", || async {
             self.chain
@@ -3264,8 +3251,8 @@ impl ChainBackend for RealSellerBackend {
                 .map_err(map_err)
         })
         .await?;
-        // An operate exception (D10 §118–120): if the per-model `InferenceOrderBook` is not yet deployed —
-        // deploy it (model listing; the address is derived from `model_hash`). This is operate, NOT actor provisioning.
+        // An operate exception: if the per-model `InferenceOrderBook` is not yet deployed --
+        // deploy it(model listing; the address is derived from `model_hash`). This is operate, NOT actor provisioning.
         let ob = retry_seller_read("seller order-book address", || async {
             self.chain
                 .inference_orderbook_address(&self.note, &self.model_hash, self.tick_size)
@@ -3485,8 +3472,8 @@ impl ChainBackend for RealSellerBackend {
     ) -> Result<(), ChainError> {
         let tc = parse_tc(token_contract)?;
         self.ensure_tc_gas(&tc).await?;
-        // §3.1.2 + #58: the note posts the probe-commission to the nonce-derived TC from its own ECC[2]
-        // (`postProbeCommission`) — no operator wallet.
+        // +: the note posts the probe-commission to the nonce-derived TC from its own ECC[2]
+        // (`postProbeCommission`) -- no operator wallet.
         post_probe_commission_and_wait(
             &self.chain,
             &self.note,
@@ -3615,9 +3602,9 @@ impl ChainBackend for RealSellerBackend {
     }
 }
 
-/// The per-role CLI backend of the **BUYER** (D10): the `ChainBackend` trait for the `dexdo buyer` process. It holds
-/// the buyer's identity (note+keys + `model_hash`/`tick_size` from D11 + purchase parameters) and **reads
-/// the book/state from the chain** (`discover_offers` scans `InferenceOrderBook`). Seller actions
+/// The per-role CLI backend of the **BUYER**: the `ChainBackend` trait for the `dexdo buyer` process. It holds
+/// the buyer's identity and **reads
+/// the book/state from the chain**(`discover_offers` scans `InferenceOrderBook`). Seller actions
 /// (`post_offer`/`read_match`/`open_stream`/`advance_tick`/`accept_probe`/`release_dispute`) are an explicit error.
 pub struct RealBuyerBackend {
     chain: RealChainBackend,
@@ -3679,9 +3666,9 @@ impl RealBuyerBackend {
         }
     }
 
-    /// Assemble the buyer backend + the buyer's note from an **already provisioned** actor (D10): a minted
-    /// `PrivateNote` (`note_addr` + owner key). The buyer needs no wallet (the escrow is the note's ECC).
-    /// `model_hash` is derived from `frame_model` (D11). Returns the backend and a `RealNote` (handover decryption).
+    /// Assemble the buyer backend + the buyer's note from an **already provisioned** actor: a minted
+    /// `PrivateNote`(`note_addr` + owner key). The buyer needs no wallet(the escrow is the note's ECC).
+    /// `model_hash` is derived from `frame_model`. Returns the backend and a `RealNote`(handover decryption).
     #[allow(clippy::too_many_arguments)]
     pub fn from_provisioned(
         manifest_path: &str,
@@ -3692,8 +3679,8 @@ impl RealBuyerBackend {
         ticks: u128,
         escrow: u128,
     ) -> Result<(Self, RealNote)> {
-        // Issue #20 (track 1): reject an insufficient escrow BEFORE any network call — otherwise the book
-        // accepts the SHELL and orphans it (no match, no bid, no refund). Fail-fast instead of a silent loss.
+        // Issue(track 1): reject an insufficient escrow BEFORE any network call -- otherwise the book
+        // accepts the SHELL and orphans it(no match, no bid, no refund). Fail-fast instead of a silent loss.
         check_buy_deposit_headroom(escrow, ticks, max_price_per_tick)
             .map_err(|e| anyhow!("{e}"))?;
         let chain = RealChainBackend::connect(manifest_path)?;
@@ -3714,11 +3701,6 @@ impl RealBuyerBackend {
             escrow,
         );
         Ok((backend, rn))
-    }
-
-    /// Low-level backend (getters/address derivation).
-    pub fn chain(&self) -> &RealChainBackend {
-        &self.chain
     }
 
     async fn require_tc_gas(&self, tc: &Address) -> Result<(), ChainError> {
@@ -3814,8 +3796,8 @@ impl ChainBackend for RealBuyerBackend {
     }
 
     async fn discover_offers(&self) -> Result<Vec<crate::chain::OfferListing>, ChainError> {
-        // Reading the per-model book from the chain (D5 B1 / D10 §86–89): the address is derived from `model_hash`,
-        // each offer carries its own `tokenContract`. The book is not active → no offers.
+        // Reading the per-model book from the chain: the address is derived from `model_hash`,
+        // each offer carries its own `tokenContract`. The book is not active -> no offers.
         let snapshot = self.orderbook_snapshot().await?;
         let asks = self
             .chain
@@ -3845,9 +3827,9 @@ impl ChainBackend for RealBuyerBackend {
     ) -> Result<(), ChainError> {
         let expected = parse_tc(token_contract)?;
         self.require_tc_gas(&expected).await?;
-        // #128 (branch-3 guard): fail closed if this note's on-chain owner key (`getDetails().ephemeralPubkey`)
-        // is not the `--note-key` we sign `placeInferenceBuy` with — otherwise `onlyOwnerPubkey` reverts
-        // pre-accept (ERR_INVALID_SENDER 101) and the buyer silently 300s-times out in `read_match`.
+        // (branch-3 guard): fail closed if this note's on-chain owner key (`getDetails().ephemeralPubkey`)
+        // is not the `--note-key` we sign `placeInferenceBuy` with -- otherwise `onlyOwnerPubkey` reverts
+        // pre-accept(ERR_INVALID_SENDER 101) and the buyer silently 300s-times out in `read_match`.
         self.chain
             .assert_note_owner_matches("buyer place_buy", &self.note, &self.keys)
             .await
@@ -3856,8 +3838,8 @@ impl ChainBackend for RealBuyerBackend {
             .assert_note_can_place_inference_buy(&self.note)
             .await
             .map_err(map_err)?;
-        // #150: `placeInferenceBuy` is model-book-wide and cannot name a target TC. Fail before moving escrow
-        // unless the book's price→time matcher would fund the TC from this market manifest.
+        // `placeInferenceBuy` is model-book-wide and cannot name a target TC. Fail before moving escrow
+        // unless the book's price->time matcher would fund the TC from this market manifest.
         let order_book = self
             .assert_expected_buy_target(&expected, self.ticks, self.max_price_per_tick)
             .await?;
@@ -3971,10 +3953,10 @@ impl ChainBackend for RealBuyerBackend {
         true
     }
 
-    /// Model-only buy (no pre-known TC): the buyer derives the book from `--frame-model` and places a limit
-    /// buy by `model_hash`, accepting whatever resting ask the book's price→time matcher fills. The matched
+    /// Model-only buy(no pre-known TC): the buyer derives the book from `--frame-model` and places a limit
+    /// buy by `model_hash`, accepting whatever resting ask the book's price->time matcher fills. The matched
     /// per-deal `TokenContract` is learned afterwards from this note's own fill event
-    /// ([`Self::wait_matched_token_contract`]) — so the buyer needs only the model name, no seller hand-off.
+    /// ([`Self::wait_matched_token_contract`]) -- so the buyer needs only the model name, no seller hand-off.
     async fn place_buy_by_model(
         &self,
         _note: &dyn Note,
@@ -3983,8 +3965,8 @@ impl ChainBackend for RealBuyerBackend {
         escrow: u128,
     ) -> Result<(), ChainError> {
         check_buy_deposit_headroom(escrow, ticks, max_price_per_tick).map_err(ChainError::Chain)?;
-        // Same owner-key guard as `place_buy` (#128): the on-chain note owner must be the `--note-key` we sign
-        // `placeInferenceBuy` with, else `onlyOwnerPubkey` reverts pre-accept (ERR_INVALID_SENDER 101).
+        // Same owner-key guard as `place_buy`: the on-chain note owner must be the `--note-key` we sign
+        // `placeInferenceBuy` with, else `onlyOwnerPubkey` reverts pre-accept(ERR_INVALID_SENDER 101).
         self.chain
             .assert_note_owner_matches("buyer place_buy_by_model", &self.note, &self.keys)
             .await
@@ -4215,7 +4197,7 @@ impl ChainBackend for RealBuyerBackend {
     }
 
     /// Learn the matched per-deal `TokenContract` from THIS note's owner-facing `InferenceFilledConfirmed`
-    /// ext-out (§3.1, 4.0.15 mirror): derive the per-model book from `model_hash`, then read the note's own
+    /// ext-out: derive the per-model book from `model_hash`, then read the note's own
     /// fill event for this book's BUY side. No shared-book index.
     async fn wait_matched_token_contract(
         &self,
@@ -4461,8 +4443,8 @@ mod note_tests {
     use super::*;
     use crate::note::verify;
 
-    /// Offline (no chain/keys): the SDK `KeyPair` (ed25519) signature is verified by dexdo `verify`
-    /// (meaning the §3.1.1 challenge will pass with `RealNote`), and the x25519 handover round-trips.
+    /// Offline(no chain/keys): the SDK `KeyPair`(ed25519) signature is verified by dexdo `verify`
+    /// and the x25519 handover round-trips.
     #[test]
     fn real_note_sign_verifies_and_handover_roundtrips() {
         let note = RealNote::generate();
@@ -4483,22 +4465,22 @@ mod note_tests {
 mod codecell_tests {
     use super::*;
 
-    /// Offline (no network): extracting the code-cell from the embedded `.tvc` works — `InferenceOrderBook`
-    /// yields a non-empty base64-BOC (the `code` argument for deploying the book) and a stable 32-byte
+    /// Offline(no network): extracting the code-cell from the embedded `.tvc` works -- `InferenceOrderBook`
+    /// yields a non-empty base64-BOC(the `code` argument for deploying the book) and a stable 32-byte
     /// code-hash; `PrivateNote.tvc` also parses. Meaning a book deploy will not hit the chain codec.
     #[test]
     fn tvc_code_cell_extraction() {
         let ob_code = RealChainBackend::inference_orderbook_code_b64().expect("OB code b64");
         assert!(!ob_code.is_empty(), "OB code-cell base64 is non-empty");
         let ob_hash = code_hash(INFERENCE_ORDERBOOK_TVC).expect("OB code hash");
-        assert_eq!(ob_hash.len(), 64, "code-hash — 32 bytes in hex");
+        assert_eq!(ob_hash.len(), 64, "code-hash -- 32 bytes in hex");
         let pn_hash = code_hash(PRIVATENOTE_TVC).expect("PN code hash");
         assert_eq!(pn_hash.len(), 64);
         println!("InferenceOrderBook code_hash = {ob_hash}");
         println!("PrivateNote        code_hash = {pn_hash}");
     }
 
-    /// #161 pure regression: stale binary pins fail loud with actionable text, while matching pins pass.
+    /// pure regression: stale binary pins fail loud with actionable text, while matching pins pass.
     #[test]
     fn doctor_code_hash_compare_flags_stale_binary() {
         let ok = code_hash_check(
@@ -4524,7 +4506,7 @@ mod codecell_tests {
         );
     }
 
-    /// #161 pure regression: manifest freshness is a fail-closed active-account check.
+    /// pure regression: manifest freshness is a fail-closed active-account check.
     #[test]
     fn doctor_manifest_active_check_fails_stale_manifest() {
         let addr =
@@ -4537,22 +4519,22 @@ mod codecell_tests {
         assert!(stale.message.contains("inactive"), "{}", stale.message);
     }
 
-    /// #68 regression: the deploy-send 404 tolerance is SPECIFIC to the BK `/v2/account` lookup (a
+    /// regression: the deploy-send 404 tolerance is SPECIFIC to the BK `/v2/account` lookup (a
     /// funded-uninit deploy target), NOT a blanket "contains 404". A 404 from any other URL/cause, or
-    /// any non-404 error, must classify as NOT-uninit so it propagates as a real error — and so the
+    /// any non-404 error, must classify as NOT-uninit so it propagates as a real error -- and so the
     /// self-dapp fallback can only ever flip routing for the funded-uninit deploy case.
     #[test]
     fn uninit_account_404_is_specific() {
-        // The exact reqwest error `fetch_dapp_id` produces on a funded-uninit deploy target → uninit.
+        // The exact reqwest error `fetch_dapp_id` produces on a funded-uninit deploy target -> uninit.
         assert!(is_uninit_account_404(
             "HTTP status client error (404 Not Found) for url \
              (https://shellnet.ackinacki.org/v2/account?account_id=6606&dapp_id=6606)"
         ));
-        // A 404 from a DIFFERENT endpoint is NOT the uninit-account case → must propagate.
+        // A 404 from a DIFFERENT endpoint is NOT the uninit-account case -> must propagate.
         assert!(!is_uninit_account_404(
             "HTTP status client error (404 Not Found) for url (https://shellnet.ackinacki.org/v2/messages)"
         ));
-        // A non-404 error on `/v2/account` (transport/5xx) is NOT uninit → must propagate.
+        // A non-404 error on `/v2/account`(transport/5xx) is NOT uninit -> must propagate.
         assert!(!is_uninit_account_404(
             "HTTP status server error (502 Bad Gateway) for url \
              (https://shellnet.ackinacki.org/v2/account?account_id=x&dapp_id=x)"
@@ -4563,7 +4545,7 @@ mod codecell_tests {
         assert!(!is_uninit_account_404(""));
     }
 
-    /// #70 regression: an active contract at or below the gas-health floor must get topped up before the
+    /// regression: an active contract at or below the gas-health floor must get topped up before the
     /// next RootModel/TC poke; above the floor it is left alone.
     #[test]
     fn gas_health_top_up_is_thresholded_and_targets_working_level() {
@@ -4581,21 +4563,21 @@ mod codecell_tests {
         );
     }
 
-    /// D10 (offline): the `RealNote` x25519 handover is derived from its ed25519 — the seller **reconstructs
-    /// the buyer's pubkey from on-chain `getBuyerPubkey` (ed25519)**, no separate x25519 channel is needed.
+    /// (offline): the `RealNote` x25519 handover is derived from its ed25519 -- the seller **reconstructs
+    /// the buyer's pubkey from on-chain `getBuyerPubkey`(ed25519)**, no separate x25519 channel is needed.
     /// This removes the per-role blocker: the seller encrypts the handover to the pubkey recovered from the chain.
     #[test]
     fn realnote_x25519_handover_derives_from_ed25519() {
         use crate::note::{verify, x25519_pub_from_ed25519_pub, NotePubkey};
-        // F2 (D10 security review): pin the SDK-seed INVARIANT — `from_keypair` slices
+        // F2: pin the SDK-seed INVARIANT -- `from_keypair` slices
         // `secret_hex()[..32]`, assuming it is the ed25519 seed. If the SDK changes the secret format,
         // the handover derivation from ed will become silently incorrect. So we check explicitly that
-        // `SigningKey::from_bytes(seed).verifying_key() == public_hex()` BEFORE building the note —
+        // `SigningKey::from_bytes(seed).verifying_key() == public_hex()` BEFORE building the note --
         // the invariant must survive any refactor of the test.
         let keypair = KeyPair::generate();
         let seed_bytes =
             decode_hex(keypair.secret_hex().trim_start_matches("0x")).expect("secret hex");
-        assert!(seed_bytes.len() >= 32, "SDK ed25519 secret ≥ 32 bytes");
+        assert!(seed_bytes.len() >= 32, "SDK ed25519 secret >= 32 bytes");
         let mut seed = [0u8; 32];
         seed.copy_from_slice(&seed_bytes[..32]);
         let sdk_pub =
@@ -4610,13 +4592,13 @@ mod codecell_tests {
 
         let note = RealNote::from_keypair(keypair).expect("real note from valid SDK keypair");
         let pk = note.pubkey();
-        // The handover's x25519 == Montgomery(ed25519) → reconstructible from on-chain ed25519.
+        // The handover's x25519 == Montgomery(ed25519) -> reconstructible from on-chain ed25519.
         assert_eq!(
             x25519_pub_from_ed25519_pub(&pk.ed),
             Some(pk.x),
             "x25519 is derived from the note's ed25519"
         );
-        // Round-trip through the pubkey RECONSTRUCTED from ed (the seller's path from getBuyerPubkey):
+        // Round-trip through the pubkey RECONSTRUCTED from ed(the seller's path from getBuyerPubkey):
         let recon_x = x25519_pub_from_ed25519_pub(&pk.ed).unwrap();
         let seller = RealNote::generate();
         let ct = seller.encrypt_to(
@@ -4631,7 +4613,7 @@ mod codecell_tests {
             b"endpoint|fp",
             "round-trip through the x25519 reconstructed from ed25519"
         );
-        // The §3.1.1 challenge on the same ed25519 note key — the signature verifies.
+        // The challenge on the same ed25519 note key -- the signature verifies.
         let sig = note.sign(b"challenge");
         assert!(
             verify(&pk, b"challenge", &sig),
@@ -4640,8 +4622,8 @@ mod codecell_tests {
     }
 
     /// Offline guard for step 2: the embedded `TokenContract.tvc` code-hash matches the
-    /// `RootModel.TOKEN_CONTRACT_CODE_HASH` pin. Otherwise the TC deploy is useless — RootModel rejects
-    /// the deal registration (the derived address won't match `msg.sender`). Catches a desync between the
+    /// `RootModel.TOKEN_CONTRACT_CODE_HASH` pin. Otherwise the TC deploy is useless -- RootModel rejects
+    /// the deal registration(the derived address won't match `msg.sender`). Catches a desync between the
     /// embedded image and the RootModel deployed on shellnet BEFORE any write.
     #[test]
     fn token_contract_code_hash_matches_rootmodel_pin() {
@@ -4653,7 +4635,7 @@ mod codecell_tests {
             "TokenContract.tvc code-hash must == RootModel.TOKEN_CONTRACT_CODE_HASH"
         );
 
-        // RootModel.tvc code-hash == SuperRoot.ROOT_MODEL_CODE_HASH — otherwise SuperRoot rejects
+        // RootModel.tvc code-hash == SuperRoot.ROOT_MODEL_CODE_HASH -- otherwise SuperRoot rejects
         // registerRoot and the seller cannot provision their RootModel.
         let rm_hash = code_hash(ROOTMODEL_TVC).expect("RM code hash");
         println!("RootModel code_hash = {rm_hash}");
@@ -4664,7 +4646,7 @@ mod codecell_tests {
         );
     }
 
-    /// #83 offline guard for `assert_seller_note_current`: the embedded `PrivateNote.tvc` code-hash matches
+    /// offline guard for `assert_seller_note_current`: the embedded `PrivateNote.tvc` code-hash matches
     /// the deployed 4.0.15 PrivateNote. The runtime guard rejects a note whose on-chain `code_hash` !=
     /// `code_hash(PRIVATENOTE_TVC)`; if the embedded image drifted from the deployed code this pin breaks,
     /// warning that the guard would false-reject valid fresh notes. Keeps the guard's baseline honest.
@@ -4675,14 +4657,14 @@ mod codecell_tests {
         println!("deployed pinned       = {PRIVATENOTE_PINNED_CODE_HASH}");
         assert_eq!(
             pn_hash, PRIVATENOTE_PINNED_CODE_HASH,
-            "embedded PrivateNote.tvc code-hash must == deployed 4.0.15 PrivateNote (else the #83 guard false-rejects)"
+            "embedded PrivateNote.tvc code-hash must == deployed 4.0.15 PrivateNote (else the  guard false-rejects)"
         );
     }
 
-    /// #117 (§5 regression): the offline code_hash gate behind `assert_seller_note_current` (now also enforced
+    /// the offline code_hash gate behind `assert_seller_note_current` (now also enforced
     /// on the seller-daemon offer-publish path via `RealSellerBackend::assert_note_current`). A note whose
-    /// on-chain code_hash != the pinned current PrivateNote — orphaned by a redeploy, e.g. the live `00028b50…`
-    /// 4.0.8-era note probed for #117 — is rejected with an actionable "re-mint" message; the current pin passes.
+    /// on-chain code_hash != the pinned current PrivateNote -- orphaned by a redeploy, e.g. the live `00028b50...`
+    /// 4.0.8-era note probed for -- is rejected with an actionable "re-mint" message; the current pin passes.
     #[test]
     fn note_code_hash_current_rejects_stale_with_remint() {
         let note =
@@ -4696,16 +4678,16 @@ mod codecell_tests {
         .to_string();
         assert!(err.contains("Re-mint"), "{err}");
         assert!(err.contains("code_hash"), "{err}");
-        // A missing code_hash (uninit/none) is also rejected fail-closed.
+        // A missing code_hash(uninit/none) is also rejected fail-closed.
         assert!(note_code_hash_current(&note, None).is_err());
         // The current pinned hash passes.
         assert!(note_code_hash_current(&note, Some(PRIVATENOTE_PINNED_CODE_HASH)).is_ok());
     }
 
-    /// #117 (§5 regression): the per-deal TC freshness gate behind `RealSellerBackend::assert_token_contract_fresh`.
-    /// A fresh active-but-unfunded TC (all flags false, all amounts "0") is reusable → `None`; a TC already used
-    /// by a prior deal — opened (the live 321 case) / funded / disputed / residual deposit/prepaid/frozen/finalized
-    /// — is rejected with the offending reason so the seller fails closed before `postSellOffer`.
+    /// the per-deal TC freshness gate behind `RealSellerBackend::assert_token_contract_fresh`.
+    /// A fresh active-but-unfunded TC(all flags false, all amounts "0") is reusable -> `None`; a TC already used
+    /// by a prior deal -- opened(the live 321 case) / funded / disputed / residual deposit/prepaid/frozen/finalized
+    /// -- is rejected with the offending reason so the seller fails closed before `postSellOffer`.
     #[test]
     fn token_contract_used_reason_flags_used_states() {
         let fresh = json!({"funded": false, "opened": false, "probeAccepted": false, "disputed": false,
@@ -4718,7 +4700,7 @@ mod codecell_tests {
             unreadable.contains("not readable by getState"),
             "{unreadable}"
         );
-        // The live #117 case: opened (+ funded + a frozen probe tick) → used, reason names each.
+        // The live case: opened(+ funded + a frozen probe tick) -> used, reason names each.
         let opened = json!({"funded": true, "opened": true, "probeAccepted": false, "disputed": false,
             "deposit": "0", "prepaid": "0", "frozen": "1000", "finalizedOwed": "0"});
         let r = token_contract_used_reason(&opened).expect("opened TC must be flagged used");
@@ -4732,7 +4714,7 @@ mod codecell_tests {
             "{selected}"
         );
         assert!(selected.contains("funded"), "{selected}");
-        // Residual deposit alone (a closed-but-not-destroyed deal) → used.
+        // Residual deposit alone(a closed-but-not-destroyed deal) -> used.
         assert_eq!(
             token_contract_used_reason(&json!({"funded": false, "opened": false, "probeAccepted": false,
                 "disputed": false, "deposit": "500", "prepaid": "0", "frozen": "0", "finalizedOwed": "0"}))
@@ -4746,15 +4728,15 @@ mod codecell_tests {
         )
         .expect_err("residual selected TC must fail closed")
         .contains("deposit=500"));
-        // Disputed alone → used.
+        // Disputed alone -> used.
         assert!(token_contract_used_reason(&json!({"opened": false, "funded": false, "disputed": true,
             "probeAccepted": false, "deposit": "0", "prepaid": "0", "frozen": "0", "finalizedOwed": "0"}))
             .unwrap()
             .contains("disputed"));
     }
 
-    /// #189/#198 resume regression: seller resume may skip `postSellOffer` for a funded pre-stream TC and for
-    /// an active already-opened stream (gateway restart must rebuild auth). Terminal/disputed states still block.
+    /// resume regression: seller resume may skip `postSellOffer` for a funded pre-stream TC and for
+    /// an active already-opened stream(gateway restart must rebuild auth). Terminal/disputed states still block.
     #[test]
     fn token_contract_resume_blocker_rejects_used_stream_state() {
         let pre_open = json!({"funded": true, "opened": false, "probeAccepted": false, "disputed": false,
@@ -4855,7 +4837,7 @@ mod codecell_tests {
         );
     }
 
-    /// #349 negative regression: a shellnet submit stall must not leave `dexdo seller` hanging forever or
+    /// negative regression: a shellnet submit stall must not leave `dexdo seller` hanging forever or
     /// pretend a message hash exists. The operator gets exact TC/book context and the by-fact derivation state.
     #[test]
     fn seller_post_sell_offer_timeout_message_is_precise_and_hash_free() {
@@ -4888,25 +4870,25 @@ mod codecell_tests {
         assert!(!msg.contains("seller offer did not rest"), "{msg}");
     }
 
-    /// #128 (§5 regression): the buyer/seller pre-write owner-key gate behind `assert_note_owner_matches`. A note
-    /// whose on-chain `_ephemeralPubkey` equals the client's signing pubkey (case- and `0x`-insensitive — the
-    /// getter returns `0x…`, `public_hex()` has no prefix) passes; a rotated/orphaned note (different or absent
+    /// the buyer/seller pre-write owner-key gate behind `assert_note_owner_matches`. A note
+    /// whose on-chain `_ephemeralPubkey` equals the client's signing pubkey (case- and `0x`-insensitive -- the
+    /// getter returns `0x...`, `public_hex()` has no prefix) passes; a rotated/orphaned note (different or absent
     /// `ephemeralPubkey`) is rejected fail-closed with an actionable re-mint message naming both keys and the
-    /// pre-accept `ERR_INVALID_SENDER 101` cause — instead of the opaque pre-accept revert + silent 300s
-    /// `read_match` timeout (the #128 branch-3 symptom). Pure/offline (no chain, no giver).
+    /// pre-accept `ERR_INVALID_SENDER 101` cause -- instead of the opaque pre-accept revert + silent 300s
+    /// `read_match` timeout. Pure/offline(no chain, no giver).
     #[test]
     fn note_owner_mismatch_reason_flags_rotated_note() {
         let note =
             Address::parse("0:988322d9cbffc133b491ef09885d3811ce03a54ef5ae8ac94019bddea4d3736e")
                 .expect("parse note address");
         let signing = "10b129e8000000000000000000000000000000000000000000000000000006a9";
-        // A healthy note: the match is case- and `0x`-insensitive (getter yields `0x…`, possibly upper-case).
+        // A healthy note: the match is case- and `0x`-insensitive(getter yields `0x...`, possibly upper-case).
         let onchain_match = "0x10B129E8000000000000000000000000000000000000000000000000000006A9";
         assert_eq!(
             note_owner_mismatch_reason("buyer place_buy", &note, Some(onchain_match), signing),
             None
         );
-        // A rotated/wrong owner key → rejected fail-closed, naming both keys + the pre-accept cause + remedy.
+        // A rotated/wrong owner key -> rejected fail-closed, naming both keys + the pre-accept cause + remedy.
         let rotated = "0xdeadbeef00000000000000000000000000000000000000000000000000000000";
         let err = note_owner_mismatch_reason("buyer place_buy", &note, Some(rotated), signing)
             .expect("a rotated note must be flagged");
@@ -4914,31 +4896,31 @@ mod codecell_tests {
         assert!(err.contains("ERR_INVALID_SENDER 101"), "{err}");
         assert!(err.contains("_ephemeralPubkey"), "{err}");
         assert!(err.contains(signing), "{err}");
-        // An absent on-chain `ephemeralPubkey` (uninit/orphaned note) is rejected fail-closed too, by role.
+        // An absent on-chain `ephemeralPubkey`(uninit/orphaned note) is rejected fail-closed too, by role.
         let none = note_owner_mismatch_reason("seller post_offer", &note, None, signing)
             .expect("an absent ephemeralPubkey must be flagged");
         assert!(none.contains("<none>"), "{none}");
         assert!(none.contains("seller post_offer"), "{none}");
     }
 
-    /// Offline regression for **#68**: the per-deal TC address is derived from the deploy INIT-DATA
-    /// (stateInit), NOT the RootModel `getTokenContractAddress` getter — so `provision_market`'s idempotency
+    /// Offline regression for ****: the per-deal TC address is derived from the deploy INIT-DATA
+    /// (stateInit), NOT the RootModel `getTokenContractAddress` getter -- so `provision_market`'s idempotency
     /// check works on a fresh provision where the RootModel is still uninit (the getter would 404 and abort
     /// the whole provision). No network, no giver. Two properties, exactly:
     /// **(a)** `token_contract_deploy_address` == `build_deploy(...).address` bit-for-bit (it IS the address the
     /// deploy creates); **(b)** it returns `Ok` against a RootModel address whose account does **not** exist
-    /// on-chain — proving the getter (and any account query) is never called.
+    /// on-chain -- proving the getter(and any account query) is never called.
     #[tokio::test]
     async fn token_contract_deploy_address_is_init_data_derived_and_getter_free() {
         let manifest = concat!(
             env!("CARGO_MANIFEST_DIR"),
             "/../../contracts/deployed.shellnet.json"
         );
-        // `connect` is offline: it loads the manifest + builds client config — no network call.
+        // `connect` is offline: it loads the manifest + builds client config -- no network call.
         let be = RealChainBackend::connect(manifest)
             .expect("offline connect (manifest load, no network)");
         let seller = KeyPair::generate();
-        // (b) A RootModel address whose account does NOT exist on-chain — the derivation must NOT query it.
+        // (b) A RootModel address whose account does NOT exist on-chain -- the derivation must NOT query it.
         let never_deployed_rm =
             Address::parse("0:00000000000000000000000000000000000000000000000000000000deadbeef")
                 .expect("rm addr");
@@ -4978,7 +4960,7 @@ mod codecell_tests {
             "4.0.18 TokenContract constructor is 5-arg; tickSize is a fixed getDeal() constant"
         );
 
-        // (b) getter-free / 404-proof: succeeds against a never-deployed RootModel (no account query).
+        // (b) getter-free / 404-proof: succeeds against a never-deployed RootModel(no account query).
         let derived = be
             .token_contract_deploy_address(
                 &seller,
@@ -4991,9 +4973,9 @@ mod codecell_tests {
                 &note,
             )
             .await
-            .expect("Ok — INIT-DATA derivation needs no RootModel account, no network, cannot 404");
+            .expect("Ok -- INIT-DATA derivation needs no RootModel account, no network, cannot 404");
 
-        // (a) bit-for-bit == build_deploy(...).address — the exact address the deploy will create.
+        // (a) bit-for-bit == build_deploy(...).address -- the exact address the deploy will create.
         let ctx = local_context().expect("local ctx");
         let init_data = json!({
             "_sellerPubkey": format!("0x{}", seller.public_hex()),
@@ -5030,8 +5012,8 @@ mod codecell_tests {
     /// locally and hands it the baked `InferenceOrderBook` hash via `TokenContract.postFromNote`; the TC
     /// posts the resting ask itself via `InferenceOrderBook.placeSellOffer(...)` (`msg.sender == TC`, so the
     /// book proves canonical-TC ownership without a caller-supplied `tokenContract`). No RootPN round-trip.
-    /// This guard pins the `postSellOffer` selector — name + ordered input types, which is what the TVM
-    /// function ID is derived from — so the Rust client's `post_sell_offer` submit cannot silently drift
+    /// This guard pins the `postSellOffer` selector -- name + ordered input types, which is what the TVM
+    /// function ID is derived from -- so the Rust client's `post_sell_offer` submit cannot silently drift
     /// from the deployed ABI, and asserts the superseded `confirmDeal` is gone.
     #[test]
     fn post_sell_offer_abi_selector_is_flags_nonce() {
@@ -5112,7 +5094,7 @@ mod codecell_tests {
         }
     }
 
-    /// #149 offline selector guard: the live 4.0.14 client path depends on the note-level
+    /// offline selector guard: the live 4.0.14 client path depends on the note-level
     /// `streamCleanup(address)` wrapper and `TokenContract.getState().fundedTime` timer field.
     #[test]
     fn never_opened_cleanup_abi_surface_is_present() {
@@ -5178,8 +5160,8 @@ mod codecell_tests {
         );
     }
 
-    /// #183 review regression: a model-only buyer chooses ticks/price after seeing the book. The real backend must
-    /// re-run the #20/#116 escrow invariant on that final tuple immediately before the shellnet write.
+    /// review regression: a model-only buyer chooses ticks/price after seeing the book. The real backend must
+    /// re-run the escrow invariant on that final tuple immediately before the shellnet write.
     #[test]
     fn model_only_buy_revalidates_chosen_escrow_before_submit() {
         let source = include_str!("backends.rs");
@@ -5248,7 +5230,7 @@ mod codecell_tests {
         );
     }
 
-    /// #226 review regression: after duplicate-TC coalescing chooses one representative ask, the real buyer must
+    /// review regression: after duplicate-TC coalescing chooses one representative ask, the real buyer must
     /// read that TC's state and fail closed on funded/opened/disputed/residual states before moving escrow.
     #[test]
     fn buyer_checks_selected_tc_state_before_submit() {
@@ -5292,7 +5274,7 @@ mod codecell_tests {
         );
     }
 
-    /// #183 review regression: seller offers must be bound to the deployed TC's `getDeal` terms, not interactive
+    /// review regression: seller offers must be bound to the deployed TC's `getDeal` terms, not interactive
     /// or stale CLI defaults, so advertised IOB terms cannot diverge from settlement config.
     #[test]
     fn real_seller_post_offer_uses_onchain_deal_terms() {
@@ -5328,7 +5310,7 @@ mod codecell_tests {
         );
     }
 
-    /// #198 live regression: the gateway-owned seller watcher calls `read_handover` while provisioning
+    /// live regression: the gateway-owned seller watcher calls `read_handover` while provisioning
     /// or restoring a match. Real seller backends must read the TC handover instead of failing as the buyer role.
     #[test]
     fn real_seller_backend_allows_handover_read_for_watcher_resume() {
@@ -5380,6 +5362,6 @@ mod codecell_tests {
     }
 }
 
-// D13: the live shellnet tests drive the giver (test faucet), which is gated behind `test-giver`.
+// the live shellnet tests drive the giver(test faucet), which is gated behind `test-giver`.
 // Run with `--features shellnet,test-giver -- --ignored`. Without `test-giver` they are compiled out,
-// so a default/`shellnet` build (and its test compile) contains no giver.
+// so a default/`shellnet` build(and its test compile) contains no giver.

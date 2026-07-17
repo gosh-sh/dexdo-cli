@@ -1,8 +1,8 @@
-//! Decoding the buyer/seller note's **owner-facing** ext-out events (§3.1, vendored 4.0.15
+//! Decoding the buyer/seller note's **owner-facing** ext-out events (, vendored 4.0.15
 //! `PrivateNote`). On a match the `InferenceOrderBook` pushes `onInferenceFilled` into BOTH notes, so
-//! each owner reads the matched deal `tokenContract` from JUST its own note's ext-out — no shared-book
+//! each owner reads the matched deal `tokenContract` from JUST its own note's ext-out -- no shared-book
 //! index. This module decodes the `InferenceFilledConfirmed(orderBook, tokenContract, orderId, ticks,
-//! clearingPrice, isBuy)` event body with `tvm_abi` (same single tvm-sdk source as `gosh.ackinacki`).
+//! clearingPrice, isBuy)` event body with `tvm_abi`(same single tvm-sdk source as `gosh.ackinacki`).
 
 use anyhow::{anyhow, Result};
 use base64::Engine as _;
@@ -82,12 +82,12 @@ pub(super) fn decode_inference_placed(body_b64: &str) -> Result<Option<Inference
     }
 }
 
-/// One decoded `InferenceFilledConfirmed` ext-out from a note (the fields the client needs).
+/// One decoded `InferenceFilledConfirmed` ext-out from a note(the fields the client needs).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(super) struct InferenceFilled {
-    /// The per-model `InferenceOrderBook` that emitted the fill (caller filters by the derived book).
+    /// The per-model `InferenceOrderBook` that emitted the fill(caller filters by the derived book).
     pub order_book: String,
-    /// The matched per-deal `TokenContract` (`0:<hex>`) — what the buyer/seller then reads.
+    /// The matched per-deal `TokenContract`(`0:<hex>`) -- what the buyer/seller then reads.
     pub token_contract: String,
     /// Number of ticks filled by this match.
     pub ticks: u128,
@@ -97,11 +97,10 @@ pub(super) struct InferenceFilled {
     pub is_buy: bool,
 }
 
-/// Decode one ext-out message body (base64 BOC) as `InferenceFilledConfirmed`.
-///
-/// Returns `Ok(None)` when the body is a DIFFERENT note event (another event id) — the caller scans all
+/// Decode one ext-out message body(base64 BOC) as `InferenceFilledConfirmed`.
+/// Returns `Ok(None)` when the body is a DIFFERENT note event(another event id) -- the caller scans all
 /// of a note's ext-out and skips non-matches. Errors only on a body that claims this event id but does not
-/// decode (a real ABI/selector drift, which must fail loud, not be silently skipped).
+/// decode(a real ABI/selector drift, which must fail loud, not be silently skipped).
 pub(super) fn decode_inference_filled(body_b64: &str) -> Result<Option<InferenceFilled>> {
     let bytes = match base64::engine::general_purpose::STANDARD.decode(body_b64.trim()) {
         Ok(bytes) => bytes,
@@ -121,21 +120,21 @@ pub(super) fn decode_inference_filled(body_b64: &str) -> Result<Option<Inference
     // The first 32 bits of an event body are the event function id.
     let id = match Event::decode_id(slice.clone()) {
         Ok(id) => id,
-        // No leading id (not an ABI event body) — not our event.
+        // No leading id(not an ABI event body) -- not our event.
         Err(_) => return Ok(None),
     };
     let contract = Contract::load(PRIVATENOTE_ABI.as_bytes())
         .map_err(|e| anyhow!("load PrivateNote ABI: {e}"))?;
     let event = match contract.event_by_id(id) {
         Ok(e) => e,
-        // A valid id but not a PrivateNote event we know — skip.
+        // A valid id but not a PrivateNote event we know -- skip.
         Err(_) => return Ok(None),
     };
     if event.name != "InferenceFilledConfirmed" {
         return Ok(None);
     }
 
-    // It IS our event id — a decode failure now is a real selector/ABI drift: fail loud.
+    // It IS our event id -- a decode failure now is a real selector/ABI drift: fail loud.
     let tokens = event
         .decode_input(slice, true)
         .map_err(|e| anyhow!("decode InferenceFilledConfirmed body: {e}"))?;
@@ -280,7 +279,7 @@ mod tests {
 
     /// Offline selector guard: the decoder extracts fields BY NAME, so the deployed event must keep this
     /// exact shape. If the vendored `PrivateNote` ABI renames/reorders these, the decoder silently stops
-    /// finding `tokenContract` — pin the layout so that drift fails this test, not a live buy.
+    /// finding `tokenContract` -- pin the layout so that drift fails this test, not a live buy.
     #[test]
     fn inference_filled_confirmed_abi_shape_is_pinned() {
         let abi: Value = serde_json::from_str(PRIVATENOTE_ABI).expect("parse PrivateNote ABI");
@@ -311,7 +310,7 @@ mod tests {
                 ("clearingPrice", "uint256"),
                 ("isBuy", "bool"),
             ],
-            "InferenceFilledConfirmed selector drifted — the buyer's tokenContract decode depends on it"
+            "InferenceFilledConfirmed selector drifted -- the buyer's tokenContract decode depends on it"
         );
     }
 
@@ -379,7 +378,7 @@ mod tests {
         );
     }
 
-    /// The ABI loads into a `tvm_abi::Contract` and the event resolves both by name and by its derived id —
+    /// The ABI loads into a `tvm_abi::Contract` and the event resolves both by name and by its derived id --
     /// the two lookups the decoder relies on.
     #[test]
     fn private_note_abi_loads_and_event_resolves() {
@@ -391,7 +390,7 @@ mod tests {
         assert_eq!(by_id.name, "InferenceFilledConfirmed");
     }
 
-    /// A body that is not an ABI event (random bytes / empty) is skipped, not an error.
+    /// A body that is not an ABI event(random bytes / empty) is skipped, not an error.
     #[test]
     fn non_event_body_is_skipped() {
         assert_eq!(decode_inference_filled("").unwrap(), None);

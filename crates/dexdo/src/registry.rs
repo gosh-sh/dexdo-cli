@@ -1,5 +1,4 @@
-//! Client-side ModelRegistry policy for issue #209.
-//!
+//! Client-side ModelRegistry policy for issue.
 //! The registry is an on-chain authority. This module keeps the local pieces
 //! reusable and testable: strict operator config, read-only registry facts, and
 //! role-neutral validation against dexdo's own model hash/book derivation.
@@ -976,7 +975,7 @@ mod tests {
         let mut found = None;
         for frame_model in frame_models {
             if let Some(entry) = reader
-                .model(&frame_model)
+                .model(frame_model)
                 .await
                 .unwrap_or_else(|e| panic!("read live ModelRegistry {frame_model}: {e}"))
             {

@@ -1,38 +1,35 @@
-//! Gateway mock model (`--mock-model`, Directive 1): fake tokens instead of calling a real model
-//! (AGENTS.md §2, dexdo-cli §8 `mock.rs`). A standard debug mode in production code, not a
-//! `#[cfg(test)]` crutch. Retained even after the real upstream appears (Directive 3).
+//! Gateway mock model: fake tokens instead of calling a real model
+//! . A standard debug mode in production code, not a
+//! `#[cfg(test)]` crutch. Retained even after the real upstream appears.
 
 use dexdo_proto::{CanonChunk, CanonRequest, SignalManifest, TokenLogprobs};
 use tokio::sync::mpsc;
 use tonic::Status;
 
 /// Run the mock upstream: build up to `count` deterministic fake tokens **from the prompt**
-/// of the canonical request (R1) and send them incrementally into `tx` (R6, token-by-token). Each mock
+/// of the canonical request(R1) and send them incrementally into `tx`(R6, token-by-token). Each mock
 /// chunk carries one fake token id, so gateway accounting sees one delivered token. Both sides know the tokens are fake (`--mock-model` on
-/// both, §2). When there is no request (compatibility with Directive 1) — neutral `mock-token-*`.
+/// both,). When there is no request -- neutral `mock-token-*`.
 pub async fn run(
     count: u64,
     req: Option<&CanonRequest>,
     tx: mpsc::Sender<Result<CanonChunk, Status>>,
     scammer: bool,
 ) {
-    // §Directive 4 acceptance: a marker prompt switches the mock into the "model substitution" fixture — the seller
-    // claims a DIFFERENT (real) model than the market's frame model → the buyer's verification (B7) rejects it.
-    // `scammer` (Directive 5, instance scammer) makes the substitution UNCONDITIONAL — a seller instance that always
-    // serves the wrong model regardless of the prompt (for the multi-seller failover e2e).
+    // claims a DIFFERENT(real) model than the market's frame model -> the buyer's verification(B7) rejects it.
+    // `scammer` makes the substitution UNCONDITIONAL -- a seller instance that always
+    // serves the wrong model regardless of the prompt(for the multi-seller failover e2e).
     let substitute = scammer
         || req
             .map(last_user_message)
             .map(|p| p.contains("DEXDO_FIXTURE_SUBSTITUTE"))
             .unwrap_or(false);
-    // §acceptance: the "bad logprobs" fixture — the gateway claims logprobs but yields an invalid
-    // log-probability (>0) → the buyer's verification (B6, logprobs shape) → Bail.
+    // log-probability(>0) -> the buyer's verification(B6, logprobs shape) -> Bail.
     let bad_logprobs = req
         .map(last_user_message)
         .map(|p| p.contains("DEXDO_FIXTURE_BADLOGPROBS"))
         .unwrap_or(false);
-    // §acceptance: the "foreign tokenizer" fixture — the gateway claims a real family (qwen) but yields
-    // token_ids OUTSIDE its vocabulary → the buyer's verification (B5, tokenizer check) → Bail.
+    // token_ids OUTSIDE its vocabulary -> the buyer's verification(B5, tokenizer check) -> Bail.
     let foreign = req
         .map(last_user_message)
         .map(|p| p.contains("DEXDO_FIXTURE_FOREIGN"))
@@ -45,14 +42,14 @@ pub async fn run(
         let chunk = CanonChunk {
             text,
             reasoning: String::new(),
-            // Fake token-ids: by seq (R2, fake §2); in "foreign tokenizer" — outside the qwen vocabulary.
+            // Fake token-ids: by seq; in "foreign tokenizer" -- outside the qwen vocabulary.
             token_ids: if foreign {
                 vec![999_999]
             } else {
                 vec![seq as u32]
             },
             seq: seq as u64,
-            // The mock yields no logprobs; in the "bad logprobs" fixture — invalid (>0) for B6.
+            // The mock yields no logprobs; in the "bad logprobs" fixture -- invalid(>0) for B6.
             logprobs: if bad_logprobs {
                 vec![TokenLogprobs {
                     logprob: 1.0,
@@ -61,11 +58,11 @@ pub async fn run(
             } else {
                 Vec::new()
             },
-            // §6/R3: the gateway declares the available signals on the first chunk. The mock yields (fake)
+            // R3: the gateway declares the available signals on the first chunk. The mock yields(fake)
             // token_ids, no logprobs; the tokenizer family is the mock profile.
             manifest: (seq == 0).then(|| {
                 if substitute {
-                    // Fixture: real family + a foreign model (≠ frame) → buyer's B7 → Bail.
+                    // Fixture: real family + a foreign model(!= frame) -> buyer's B7 -> Bail.
                     SignalManifest {
                         tokenizer_family: "qwen".to_string(),
                         has_token_ids: true,
@@ -73,8 +70,8 @@ pub async fn run(
                         claimed_model: "substituted/cheap-model".to_string(),
                     }
                 } else if foreign {
-                    // Claims the qwen tokenizer, but token_ids are outside the qwen vocabulary → B5 → Bail.
-                    // claimed_model is empty (R4, don't fabricate) → B7 doesn't run; B5 is what catches it.
+                    // Claims the qwen tokenizer, but token_ids are outside the qwen vocabulary -> B5 -> Bail.
+                    // claimed_model is empty(R4, don't fabricate) -> B7 doesn't run; B5 is what catches it.
                     SignalManifest {
                         tokenizer_family: "qwen".to_string(),
                         has_token_ids: true,
@@ -82,7 +79,7 @@ pub async fn run(
                         claimed_model: String::new(),
                     }
                 } else {
-                    // Mock (Permissive — B5/B7 pass). In the bad-logprobs fixture we declare
+                    // Mock(Permissive -- B5/B7 pass). In the bad-logprobs fixture we declare
                     // has_logprobs so that B6 runs and rejects the invalid shape.
                     SignalManifest {
                         tokenizer_family: "mock".to_string(),
@@ -94,12 +91,12 @@ pub async fn run(
             }),
         };
         if tx.send(Ok(chunk)).await.is_err() {
-            break; // buyer disconnected (STOP)
+            break; // buyer disconnected(STOP)
         }
     }
 }
 
-/// The last `user`-role message in the canonical request (the prompt the output is built from).
+/// The last `user`-role message in the canonical request(the prompt the output is built from).
 fn last_user_message(req: &CanonRequest) -> &str {
     req.messages
         .iter()
@@ -110,17 +107,17 @@ fn last_user_message(req: &CanonRequest) -> &str {
 }
 
 /// Deterministic fake output from the prompt: a prefix marker + echo of the words of the last
-/// user message, one delta token per word, truncated to `count` (mock model).
+/// user message, one delta token per word, truncated to `count`(mock model).
 fn derive_tokens(req: &CanonRequest, count: u64) -> Vec<String> {
     let prompt = last_user_message(req);
     let mut out: Vec<String> = Vec::new();
-    // Mock marker + echo of the prompt token-by-token (R6: incrementality is preserved).
+    // Mock marker + echo of the prompt token-by-token(R6: incrementality is preserved).
     out.push("mock-reply: ".to_string());
     for word in prompt.split_whitespace() {
         out.push(format!("{word} "));
     }
     if out.len() == 1 {
-        // Empty prompt — still yield something deterministic.
+        // Empty prompt -- still yield something deterministic.
         out.push("(empty) ".to_string());
     }
     out.truncate(count as usize);

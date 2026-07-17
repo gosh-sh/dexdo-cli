@@ -1,7 +1,7 @@
-//! Optional Anthropic-compatible endpoint (B20, §10.6/G): `POST /v1/messages`,
-//! a **local transcode** to the same `CanonRequest` (OpenAI shape) and back `CanonChunk` →
+//! Optional Anthropic-compatible endpoint: `POST /v1/messages`,
+//! a **local transcode** to the same `CanonRequest`(OpenAI shape) and back `CanonChunk` ->
 //! Anthropic-SSE, for Anthropic-native clients. The transcode is off-chain, on the
-//! buyer side: the wire (gRPC) and the canonical format are not touched.
+//! buyer side: the wire(gRPC) and the canonical format are not touched.
 
 use crate::buyer::api::stream::{CanonStreamDriver, CanonStreamNext};
 use crate::buyer::api::{
@@ -19,14 +19,14 @@ use http::StatusCode;
 use std::convert::Infallible;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-/// `POST /v1/messages` (B20). Transcodes the request → `CanonRequest`, opens the same
+/// `POST /v1/messages`(B20). Transcodes the request -> `CanonRequest`, opens the same
 /// authorized TLS gRPC stream and re-renders `CanonChunk` into Anthropic-SSE
-/// (`message_start` → `content_block_*` → `message_delta` → `message_stop`).
+/// (`message_start` -> `content_block_*` -> `message_delta` -> `message_stop`).
 pub async fn messages(
     State(state): State<ApiState>,
     Json(req): Json<AnthropicRequest>,
 ) -> Response {
-    // The model is forced by the market (B2/B19) — the same check as for the OpenAI path.
+    // The model is forced by the market(B2/B19) -- the same check as for the OpenAI path.
     if let Err(reason) = state.check_model(req.model.as_deref()) {
         return reject(StatusCode::BAD_REQUEST, &reason);
     }
@@ -35,7 +35,7 @@ pub async fn messages(
         Err(reason) => return reject(StatusCode::SERVICE_UNAVAILABLE, &reason),
     };
     let request_guard = deal.begin_request(message_started_secs());
-    // Session-scoped lifecycle (issue #37): no new request once the local deal is closed.
+    // Session-scoped lifecycle: no new request once the local deal is closed.
     if deal.session.is_closed() {
         return reject(StatusCode::GONE, "deal session closed; open a new session");
     }
@@ -48,7 +48,7 @@ pub async fn messages(
     if let Err(reason) = deal.session.ensure_open_for_serving().await {
         return reject(StatusCode::BAD_GATEWAY, &reason);
     }
-    // #144: one-per-deal content-identity gate (B8 + B7-full), run ONCE before the first paid stream — the same
+    // one-per-deal content-identity gate(B8 + B7-full), run ONCE before the first paid stream -- the same
     // gate as the OpenAI path. The inline StreamVerifier only runs B5/B6 + the cheap declared-NAME B7; a seller
     // serving a cheaper model under the correct NAME is caught only here. On a bail the gate closes the deal and
     // attempts policy recovery; a transport error is not cached, so a later request retries.
@@ -111,8 +111,8 @@ pub async fn messages(
     };
 
     let max_tokens = request_token_limit(requested_max_tokens, deal.remaining_tokens());
-    // Session-scoped (issue #37): no per-request STOP — the shared session settles once at session end / on a
-    // verification-bail (as in the OpenAI path).
+    // Session-scoped: no per-request STOP -- the shared session settles once at session end / on a
+    // verification-bail(as in the OpenAI path).
     if stream {
         sse_response(upstream, id, model, max_tokens, deal, request_guard).into_response()
     } else {
@@ -122,7 +122,7 @@ pub async fn messages(
     }
 }
 
-/// Re-render the canonical stream to Anthropic-SSE (B20, R6). Accounting/verification happen before re-rendering.
+/// Re-render the canonical stream to Anthropic-SSE(B20, R6). Accounting/verification happen before re-rendering.
 fn sse_response(
     upstream: tonic::Streaming<CanonChunk>,
     id: String,
@@ -140,7 +140,7 @@ fn sse_response(
         loop {
             let chunk = match driver.next().await {
                 CanonStreamNext::Chunk(c) => c,
-                // #5: upstream transport error — do not pass it off as a clean `end_turn`.
+                // upstream transport error -- do not pass it off as a clean `end_turn`.
                 CanonStreamNext::Errored(e) => {
                     stream_error = Some(e);
                     break;
@@ -157,8 +157,8 @@ fn sse_response(
             }
             deal.record_delivered(driver.received().saturating_sub(before));
         }
-        // Session-scoped (issue #37): completion / max_tokens / upstream-error do NOT STOP — only a
-        // verification-bail ends the session early (STOP + bail off). `errored` still drives stop_reason below.
+        // Session-scoped: completion / max_tokens / upstream-error do NOT STOP -- only a
+        // verification-bail ends the session early(STOP + bail off). `errored` still drives stop_reason below.
         let bailed = driver.bailed();
         let received = driver.received();
         drop(driver);
@@ -169,8 +169,8 @@ fn sse_response(
         } else if received == 0 {
             deal.session.settle_empty_stream("empty-stream").await;
         }
-        // #5: stop_reason does NOT pass off a bail/error as an honest `end_turn` — bail → `refusal`,
-        // transport error → `error`, otherwise `end_turn`.
+        // stop_reason does NOT pass off a bail/error as an honest `end_turn` -- bail -> `refusal`,
+        // transport error -> `error`, otherwise `end_turn`.
         let stop_reason = if bailed {
             "refusal"
         } else if stream_error.is_some() || received == 0 {
@@ -185,13 +185,13 @@ fn sse_response(
     Sse::new(sse)
 }
 
-/// Build an axum SSE `Event` from `(name, JSON data)` (B20). A single source of truth for the
-/// frame — the HTTP layer adds `event:`/`data:`.
+/// Build an axum SSE `Event` from `(name, JSON data)`(B20). A single source of truth for the
+/// frame -- the HTTP layer adds `event:`/`data:`.
 fn event((name, data): render::AnthropicEvent) -> Event {
     Event::default().event(name).data(data)
 }
 
-/// Non-streaming Anthropic response (B20): a single `message` JSON with aggregated text.
+/// Non-streaming Anthropic response(B20): a single `message` JSON with aggregated text.
 async fn aggregate_response(
     upstream: tonic::Streaming<CanonChunk>,
     id: String,
@@ -217,8 +217,8 @@ async fn aggregate_response(
             break;
         }
     }
-    // Session-scoped (issue #37): a clean completion / max_tokens does NOT STOP — only a verification-bail ends
-    // the session early (STOP + bail off).
+    // Session-scoped: a clean completion / max_tokens does NOT STOP -- only a verification-bail ends
+    // the session early(STOP + bail off).
     let bailed = driver.bailed();
     let received = driver.received();
     drop(driver);
@@ -232,7 +232,7 @@ async fn aggregate_response(
         deal.session.settle_empty_stream("empty-stream").await;
         return reject(StatusCode::BAD_GATEWAY, "upstream produced an empty stream");
     }
-    // #5: verification bail → `refusal` (distinguishable from an honest `end_turn`).
+    // verification bail -> `refusal`(distinguishable from an honest `end_turn`).
     let stop_reason = if bailed { "refusal" } else { "end_turn" };
     let body = serde_json::json!({
         "id": id,

@@ -757,7 +757,7 @@ mod tests {
             ),
             (
                 anyhow::anyhow!(
-                    "buyer model-only preflight failed for InferenceOrderBook 0:book: raw order-book matcher would select order #14, but executable quote selected order #35"
+                    "buyer model-only preflight failed for InferenceOrderBook 0:book: raw order-book matcher would select order , but executable quote selected order "
                 ),
                 ErrorCode::NoLiquidity,
             ),
