@@ -521,6 +521,8 @@ pub(crate) struct CloseResponse {
 pub(crate) struct BuyerEventWriter {
     seq: u64,
     session_id: String,
+    #[cfg(all(test, feature = "shellnet"))]
+    captured: Option<std::sync::Arc<std::sync::Mutex<Vec<Value>>>>,
 }
 
 impl BuyerEventWriter {
@@ -530,7 +532,17 @@ impl BuyerEventWriter {
         Self {
             seq: 0,
             session_id: format!("buyer-{}", hex::encode(bytes)),
+            #[cfg(all(test, feature = "shellnet"))]
+            captured: None,
         }
+    }
+
+    #[cfg(all(test, feature = "shellnet"))]
+    pub(crate) fn capturing() -> (Self, std::sync::Arc<std::sync::Mutex<Vec<Value>>>) {
+        let captured = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let mut writer = Self::new();
+        writer.captured = Some(captured.clone());
+        (writer, captured)
     }
 
     pub(crate) fn event(
@@ -543,7 +555,7 @@ impl BuyerEventWriter {
         let mut obj = self.envelope(BUYER_EVENT_SCHEMA, operation)?;
         obj.insert("event".to_string(), json!(event));
         merge_fields(&mut obj, fields);
-        print_json(&Value::Object(obj))
+        self.write(Value::Object(obj))
     }
 
     pub(crate) fn error(
@@ -559,7 +571,7 @@ impl BuyerEventWriter {
         obj.insert("message".to_string(), json!(code.safe_message()));
         obj.insert("retryable".to_string(), json!(code.retryable()));
         merge_fields(&mut obj, fields);
-        print_json(&Value::Object(obj))
+        self.write(Value::Object(obj))
     }
 
     pub(crate) fn error_with_cause(
@@ -587,6 +599,17 @@ impl BuyerEventWriter {
         obj.insert("session_id".to_string(), json!(self.session_id));
         obj.insert("operation".to_string(), json!(operation));
         Ok(obj)
+    }
+
+    fn write(&self, value: Value) -> Result<()> {
+        #[cfg(all(test, feature = "shellnet"))]
+        if let Some(captured) = &self.captured {
+            captured
+                .lock()
+                .expect("buyer event capture lock poisoned")
+                .push(value.clone());
+        }
+        print_json(&value)
     }
 }
 

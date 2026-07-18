@@ -19,6 +19,7 @@ use crate::seller::ModelsConfig;
 use anyhow::Result;
 use dexdo_core::{ChainBackend, Handover, Note, TokenContract, MATCH_OPEN_TIMEOUT_SECS};
 use dexdo_proto::CanonChunk;
+use std::fmt;
 use std::future::Future;
 use std::net::SocketAddr;
 use std::pin::Pin;
@@ -27,9 +28,87 @@ use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tokio::sync::{Mutex, OnceCell, RwLock};
 
-pub type DealInitFuture = Pin<Box<dyn Future<Output = Result<ApiDeal, String>> + Send>>;
+pub type DealInitFuture = Pin<Box<dyn Future<Output = Result<ApiDeal, DealInitError>> + Send>>;
 pub type DealInitializer = Arc<dyn Fn() -> DealInitFuture + Send + Sync>;
 const DEFAULT_DEAL_INIT_TIMEOUT: Duration = Duration::from_secs(MATCH_OPEN_TIMEOUT_SECS);
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct BuyerSubmitRecoveryAnchor {
+    #[serde(serialize_with = "serialize_u128_decimal")]
+    pub order_id: u128,
+    pub token_contract: TokenContract,
+}
+
+fn serialize_u128_decimal<S>(value: &u128, serializer: S) -> Result<S::Ok, S::Error>
+where
+    S: serde::Serializer,
+{
+    serializer.serialize_str(&value.to_string())
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum BuyerSubmitReconciliationState {
+    FreshUnresolved,
+    DurableUnresolved,
+    RecoveredProven,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum BuyerSubmitReconciliationOrigin {
+    FreshSubmit,
+    DurableJournal,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct BuyerSubmitReconciliation {
+    pub submit_identity: String,
+    pub recovery_anchor: BuyerSubmitRecoveryAnchor,
+    pub state: BuyerSubmitReconciliationState,
+    pub origin: BuyerSubmitReconciliationOrigin,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DealInitError {
+    message: String,
+    reconciliation: Option<BuyerSubmitReconciliation>,
+}
+
+impl DealInitError {
+    pub fn new(message: impl Into<String>) -> Self {
+        Self {
+            message: message.into(),
+            reconciliation: None,
+        }
+    }
+
+    pub fn with_reconciliation(
+        message: impl Into<String>,
+        reconciliation: BuyerSubmitReconciliation,
+    ) -> Self {
+        Self {
+            message: message.into(),
+            reconciliation: Some(reconciliation),
+        }
+    }
+
+    pub fn message(&self) -> &str {
+        &self.message
+    }
+
+    pub fn reconciliation(&self) -> Option<&BuyerSubmitReconciliation> {
+        self.reconciliation.as_ref()
+    }
+}
+
+impl fmt::Display for DealInitError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(&self.message)
+    }
+}
+
+impl std::error::Error for DealInitError {}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum VerificationBailAction {
@@ -226,7 +305,7 @@ impl RouteManager {
         self.active.read().await.clone()
     }
 
-    pub async fn current_or_prepare(&self) -> Result<ApiDeal, String> {
+    pub async fn current_or_prepare(&self) -> Result<ApiDeal, DealInitError> {
         if let Some(active) = self.current().await {
             return Ok(active);
         }
@@ -237,14 +316,14 @@ impl RouteManager {
         let initializer = self
             .initializer
             .as_ref()
-            .ok_or_else(|| "consumer API has no active deal".to_string())?;
+            .ok_or_else(|| DealInitError::new("consumer API has no active deal"))?;
         let prepared = tokio::time::timeout(self.initializer_timeout, initializer())
             .await
             .map_err(|_| {
-                format!(
+                DealInitError::new(format!(
                     "on-demand purchase timed out after {}s before a deal became ready",
                     self.initializer_timeout.as_secs()
-                )
+                ))
             })??;
         *self.active.write().await = Some(prepared.clone());
         Ok(prepared)
@@ -1117,7 +1196,7 @@ impl ApiState {
         }
     }
 
-    pub async fn current_deal(&self) -> Result<ApiDeal, String> {
+    pub async fn current_deal(&self) -> Result<ApiDeal, DealInitError> {
         self.deals.current_or_prepare().await
     }
 
@@ -1258,7 +1337,7 @@ mod tests {
                 let init_calls = init_calls_for_state.clone();
                 Box::pin(async move {
                     init_calls.fetch_add(1, Ordering::SeqCst);
-                    futures::future::pending::<Result<ApiDeal, String>>().await
+                    futures::future::pending::<Result<ApiDeal, DealInitError>>().await
                 }) as DealInitFuture
             }),
             Duration::from_millis(50),
@@ -1307,7 +1386,7 @@ mod tests {
                 Box::pin(async move {
                     init_calls.fetch_add(1, Ordering::SeqCst);
                     tokio::time::sleep(Duration::from_secs(60)).await;
-                    Err("slow chain init should have timed out".to_string())
+                    Err(DealInitError::new("slow chain init should have timed out"))
                 }) as DealInitFuture
             }),
             Duration::from_millis(50),

@@ -634,6 +634,55 @@ async fn note_deploy_submit_voucher_boc(
 }
 
 #[cfg(feature = "shellnet")]
+fn is_note_deploy_wallet_submit_busy_error(error: &anyhow::Error) -> bool {
+    error
+        .to_string()
+        .contains("submit Multisig.sendTransaction -> RootPN.generateVoucher:")
+        && is_note_deploy_wallet_busy_error(error)
+}
+
+#[cfg(feature = "shellnet")]
+fn note_deploy_resume_error(funding_multisig_address: &str, error: anyhow::Error) -> anyhow::Error {
+    if is_note_deploy_wallet_submit_busy_error(&error) {
+        note_deploy_error(funding_multisig_address, error)
+    } else {
+        anyhow::anyhow!("deploy PrivateNote from wallet {funding_multisig_address}: {error}")
+    }
+}
+
+#[cfg(feature = "shellnet")]
+async fn run_note_deploy_with_wallet_busy_retry<T, Op, Sleep>(
+    funding_multisig_address: &str,
+    mut op: Op,
+    mut sleeper: Sleep,
+) -> Result<T>
+where
+    Op: AsyncFnMut(u64) -> Result<T>,
+    Sleep: AsyncFnMut(std::time::Duration),
+{
+    let mut attempt = 1u64;
+    loop {
+        match op(attempt).await {
+            Ok(value) => return Ok(value),
+            Err(error) => {
+                if is_note_deploy_wallet_submit_busy_error(&error) && attempt < 3 {
+                    let backoff_secs = attempt.saturating_mul(10);
+                    eprintln!(
+                        "note deploy: funding wallet {funding_multisig_address} looks busy/out-of-sync; retrying \
+                         attempt {} after {backoff_secs}s",
+                        attempt + 1
+                    );
+                    sleeper(std::time::Duration::from_secs(backoff_secs)).await;
+                    attempt = attempt.saturating_add(1);
+                    continue;
+                }
+                return Err(note_deploy_resume_error(funding_multisig_address, error));
+            }
+        }
+    }
+}
+
+#[cfg(feature = "shellnet")]
 #[allow(clippy::too_many_arguments)]
 async fn note_deploy_mint_voucher_recoverable(
     client: &dexdo_core::ChainClient,
@@ -1683,41 +1732,27 @@ impl NoteDeployResolvedOps for NoteDeployProductionOps<'_> {
         let pn_keys = self.pn_keys.as_ref().ok_or_else(|| {
             anyhow::anyhow!("note deploy recovery was not loaded before chain resume")
         })?;
-        let mut attempt = 1u64;
-        loop {
-            let multisig_address = dexdo_core::Address::parse(self.funding_multisig_address)
-                .map_err(|e| anyhow::anyhow!("--multisig-address: {e}"))?;
-            let multisig_keys = note_deploy_multisig_keys(self.args)?;
-            match deploy_private_note_from_multisig_recoverable(
-                self.client,
-                self.recovery_path,
-                recovery,
-                &multisig_address,
-                &multisig_keys,
-                pn_keys,
-                self.halo2_paths,
-                self.voucher_failpoints,
-            )
-            .await
-            {
-                Ok(state) => return Ok(state),
-                Err(error) => {
-                    if is_note_deploy_wallet_busy_error(&error) && attempt < 3 {
-                        let backoff_secs = attempt.saturating_mul(10);
-                        eprintln!(
-                            "note deploy: funding wallet {} looks busy/out-of-sync; retrying attempt {} after \
-                             {backoff_secs}s",
-                            self.funding_multisig_address,
-                            attempt + 1
-                        );
-                        tokio::time::sleep(std::time::Duration::from_secs(backoff_secs)).await;
-                        attempt = attempt.saturating_add(1);
-                        continue;
-                    }
-                    return Err(note_deploy_error(self.funding_multisig_address, error));
-                }
-            }
-        }
+        run_note_deploy_with_wallet_busy_retry(
+            self.funding_multisig_address,
+            async |_attempt| {
+                let multisig_address = dexdo_core::Address::parse(self.funding_multisig_address)
+                    .map_err(|e| anyhow::anyhow!("--multisig-address: {e}"))?;
+                let multisig_keys = note_deploy_multisig_keys(self.args)?;
+                deploy_private_note_from_multisig_recoverable(
+                    self.client,
+                    self.recovery_path,
+                    recovery,
+                    &multisig_address,
+                    &multisig_keys,
+                    pn_keys,
+                    self.halo2_paths,
+                    self.voucher_failpoints,
+                )
+                .await
+            },
+            async |duration| tokio::time::sleep(duration).await,
+        )
+        .await
     }
 
     async fn finalize_pool(
@@ -1964,6 +1999,185 @@ pub(crate) async fn run_note_withdraw(_args: NoteWithdrawArgs) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
+    #[cfg(feature = "shellnet")]
+    #[test]
+    fn note_deploy_wallet_replay_conflict_is_busy_retryable_and_actionable() {
+        let raw = anyhow::anyhow!(
+            "submit Multisig.sendTransaction -> RootPN.generateVoucher: block manager rejected \
+             message code=TVM_ERROR; exit-code:52 nonce desynchronized"
+        );
+
+        assert!(crate::cli::commands::is_note_deploy_wallet_busy_error(&raw));
+        assert!(super::is_note_deploy_wallet_submit_busy_error(&raw));
+        let error = crate::cli::commands::note_deploy_error("0:wallet", raw).to_string();
+        assert!(error.contains("wallet busy/out-of-sync"), "{error}");
+    }
+
+    #[cfg(feature = "shellnet")]
+    #[test]
+    fn note_deploy_root_pn_compute_revert_is_not_wallet_busy_and_keeps_cause() {
+        let raw = anyhow::anyhow!(
+            "deployPrivateNote reverted: tvm_error exit_code=60 contract execution failed"
+        );
+
+        assert!(!crate::cli::commands::is_note_deploy_wallet_busy_error(
+            &raw
+        ));
+        let error = crate::cli::commands::note_deploy_error("0:wallet", raw).to_string();
+        assert!(error.contains("exit_code=60"), "{error}");
+        assert!(!error.contains("wallet busy"), "{error}");
+    }
+
+    #[cfg(feature = "shellnet")]
+    #[test]
+    fn note_deploy_prover_and_later_stage_replay_errors_are_not_relabeled() {
+        let prover = anyhow::anyhow!("prove deposit voucher: ERR_INVALID_ZKPROOF in halo2 prover");
+        assert!(!crate::cli::commands::is_note_deploy_wallet_busy_error(
+            &prover
+        ));
+        let prover_error = crate::cli::commands::note_deploy_error("0:wallet", prover).to_string();
+        assert!(
+            prover_error.contains("ERR_INVALID_ZKPROOF"),
+            "{prover_error}"
+        );
+        assert!(!prover_error.contains("wallet busy"), "{prover_error}");
+
+        let later_stage = anyhow::anyhow!(
+            "RootPN.deployPrivateNote: block manager rejected message code=TVM_ERROR; \
+             exit_code=52 replay protection exception"
+        );
+        assert!(crate::cli::commands::is_note_deploy_wallet_busy_error(
+            &later_stage
+        ));
+        assert!(!super::is_note_deploy_wallet_submit_busy_error(
+            &later_stage
+        ));
+        let later_stage_error =
+            super::note_deploy_resume_error("0:wallet", later_stage).to_string();
+        assert!(later_stage_error.contains("RootPN.deployPrivateNote"));
+        assert!(later_stage_error.contains("exit_code=52"));
+        assert!(!later_stage_error.contains("wallet busy"));
+    }
+
+    #[cfg(feature = "shellnet")]
+    #[tokio::test]
+    async fn note_deploy_wallet_submit_retry_loop_succeeds_on_third_attempt_with_expected_backoff()
+    {
+        let mut attempts = Vec::new();
+        let mut backoffs = Vec::new();
+
+        let state = super::run_note_deploy_with_wallet_busy_retry(
+            "0:wallet",
+            async |attempt| {
+                attempts.push(attempt);
+                if attempt < 3 {
+                    Err(anyhow::anyhow!(
+                        "submit Multisig.sendTransaction -> RootPN.generateVoucher: \
+                         tvm_error exit-code:52 nonce desynchronized"
+                    ))
+                } else {
+                    Ok("deployed")
+                }
+            },
+            async |duration| backoffs.push(duration),
+        )
+        .await
+        .expect("wallet-submit retry should succeed on attempt 3");
+
+        assert_eq!(state, "deployed");
+        assert_eq!(attempts, vec![1, 2, 3]);
+        assert_eq!(
+            backoffs,
+            vec![
+                std::time::Duration::from_secs(10),
+                std::time::Duration::from_secs(20)
+            ]
+        );
+    }
+
+    #[cfg(feature = "shellnet")]
+    #[tokio::test]
+    async fn note_deploy_wallet_submit_retry_loop_exhausts_three_attempts_with_expected_backoff() {
+        let mut attempts = Vec::new();
+        let mut backoffs = Vec::new();
+
+        let result: anyhow::Result<()> = super::run_note_deploy_with_wallet_busy_retry(
+            "0:wallet",
+            async |attempt| {
+                attempts.push(attempt);
+                Err(anyhow::anyhow!(
+                    "submit Multisig.sendTransaction -> RootPN.generateVoucher: \
+                     tvm_error exit-code:52 nonce desynchronized"
+                ))
+            },
+            async |duration| backoffs.push(duration),
+        )
+        .await;
+
+        let error = result.expect_err("wallet-submit retry should stop after attempt 3");
+        assert!(error.to_string().contains("wallet busy/out-of-sync"));
+        assert_eq!(attempts, vec![1, 2, 3]);
+        assert_eq!(
+            backoffs,
+            vec![
+                std::time::Duration::from_secs(10),
+                std::time::Duration::from_secs(20)
+            ]
+        );
+    }
+
+    #[cfg(feature = "shellnet")]
+    #[tokio::test]
+    async fn note_deploy_retry_loop_does_not_retry_root_pn_exit_52() {
+        let mut attempts = Vec::new();
+        let mut backoffs = Vec::new();
+
+        let result: anyhow::Result<()> = super::run_note_deploy_with_wallet_busy_retry(
+            "0:wallet",
+            async |attempt| {
+                attempts.push(attempt);
+                Err(anyhow::anyhow!(
+                    "RootPN.deployPrivateNote reverted: tvm_error exit-code:52 replay protection"
+                ))
+            },
+            async |duration| backoffs.push(duration),
+        )
+        .await;
+
+        let error = result.expect_err("non-wallet RootPN exit 52 must fail immediately");
+        let message = error.to_string();
+        assert!(message.contains("exit-code:52"), "{message}");
+        assert!(!message.contains("wallet busy"), "{message}");
+        assert_eq!(attempts, vec![1]);
+        assert!(backoffs.is_empty());
+    }
+
+    #[cfg(feature = "shellnet")]
+    #[tokio::test]
+    async fn note_deploy_retry_loop_does_not_retry_downstream_tvm_exit_60() {
+        let mut attempts = Vec::new();
+        let mut backoffs = Vec::new();
+
+        let result: anyhow::Result<()> = super::run_note_deploy_with_wallet_busy_retry(
+            "0:wallet",
+            async |attempt| {
+                attempts.push(attempt);
+                Err(anyhow::anyhow!(
+                    "downstream deploy failed: tvm_error exit_code=60"
+                ))
+            },
+            async |duration| backoffs.push(duration),
+        )
+        .await;
+
+        let error = result.expect_err("downstream TVM exit 60 must fail immediately");
+        let message = error.to_string();
+        assert!(message.contains("tvm_error exit_code=60"), "{message}");
+        assert!(!message.contains("wallet busy"), "{message}");
+        assert_eq!(attempts, vec![1]);
+        assert!(backoffs.is_empty());
+    }
+
     #[cfg(feature = "shellnet")]
     fn write_test_file(dir: &std::path::Path, name: &str, bytes: &[u8]) {
         std::fs::write(dir.join(name), bytes).expect("write test fixture");

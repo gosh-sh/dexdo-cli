@@ -6,7 +6,7 @@
 use crate::buyer::api::stream::{CanonStreamDriver, CanonStreamNext};
 use crate::buyer::api::{
     handle_stream_error_policy, request_token_limit, ApiDeal, ApiState, ConsumerRequestGuard,
-    DeadGatewayAction,
+    DeadGatewayAction, DealInitError,
 };
 use crate::buyer::render::{self, AnthropicRequest};
 use axum::extract::State;
@@ -32,7 +32,7 @@ pub async fn messages(
     }
     let deal = match state.current_deal().await {
         Ok(deal) => deal,
-        Err(reason) => return reject(StatusCode::SERVICE_UNAVAILABLE, &reason),
+        Err(error) => return deal_init_rejection(&error),
     };
     let request_guard = deal.begin_request(message_started_secs());
     // Session-scoped lifecycle: no new request once the local deal is closed.
@@ -253,6 +253,20 @@ async fn aggregate_response(
 fn reject(status: StatusCode, message: &str) -> Response {
     let body = serde_json::json!({ "type": "error", "error": { "type": "invalid_request_error", "message": message } });
     (status, Json(body)).into_response()
+}
+
+fn deal_init_rejection(error: &DealInitError) -> Response {
+    let mut body = serde_json::json!({
+        "type": "error",
+        "error": {
+            "type": "invalid_request_error",
+            "message": error.message()
+        }
+    });
+    if let Some(reconciliation) = error.reconciliation() {
+        body["error"]["submit_reconciliation"] = serde_json::json!(reconciliation);
+    }
+    (StatusCode::SERVICE_UNAVAILABLE, Json(body)).into_response()
 }
 
 fn message_id() -> String {

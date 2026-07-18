@@ -423,11 +423,13 @@ fn persist_pool_recovery_record_locked(record: &PoolRecoveryRecord) -> Result<()
 #[cfg(feature = "shellnet")]
 pub(crate) fn is_note_deploy_wallet_busy_error(error: &anyhow::Error) -> bool {
     let msg = error.to_string().to_ascii_lowercase();
-    msg.contains("tvm_error")
-        || msg.contains("replay protection")
-        || msg.contains("exit code 52")
-        || msg.contains("nonce")
-        || msg.contains("seqno")
+    let norm = msg.replace(['_', '=', ':', '-'], " ");
+    // bare `tvm_error` is not a busy signal; matching it masked real
+    // deployPrivateNote reverts behind retries that never surfaced the cause.
+    norm.contains("replay protection")
+        || norm.contains("exit code 52")
+        || norm.contains("nonce")
+        || norm.contains("seqno")
 }
 
 #[cfg(feature = "shellnet")]

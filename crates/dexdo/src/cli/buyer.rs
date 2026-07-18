@@ -400,6 +400,38 @@ fn validate_buyer_submit_identity(identity: &str, label: &str) -> Result<()> {
 }
 
 #[cfg(feature = "shellnet")]
+fn buyer_submit_recovery_anchor(
+    order: &OrderBookOrder,
+) -> Result<dexdo::buyer::api::BuyerSubmitRecoveryAnchor> {
+    let token_contract = order
+        .token_contract
+        .as_deref()
+        .ok_or_else(|| anyhow::anyhow!("buyer recovery anchor has no TokenContract"))?;
+    let token_contract = dexdo_core::Address::parse(token_contract)
+        .map_err(|error| anyhow::anyhow!("buyer recovery anchor TokenContract: {error}"))?
+        .with_workchain();
+    Ok(dexdo::buyer::api::BuyerSubmitRecoveryAnchor {
+        order_id: order.order_id,
+        token_contract,
+    })
+}
+
+#[cfg(feature = "shellnet")]
+fn buyer_submit_reconciliation(
+    journal: &BuyerSubmitJournal,
+    state: dexdo::buyer::api::BuyerSubmitReconciliationState,
+    origin: dexdo::buyer::api::BuyerSubmitReconciliationOrigin,
+) -> Result<dexdo::buyer::api::BuyerSubmitReconciliation> {
+    validate_buyer_submit_identity(&journal.submit_identity, "buyer submit journal")?;
+    Ok(dexdo::buyer::api::BuyerSubmitReconciliation {
+        submit_identity: journal.submit_identity.clone(),
+        recovery_anchor: buyer_submit_recovery_anchor(&journal.quoted_order)?,
+        state,
+        origin,
+    })
+}
+
+#[cfg(feature = "shellnet")]
 #[allow(dead_code)]
 impl BuyerSubscriptionSubmitJournal {
     fn validate(&self, expected_note_addr: &str) -> Result<()> {
@@ -903,7 +935,9 @@ fn is_ambiguous_submit_error(error: &anyhow::Error) -> bool {
         matches!(
             cause.downcast_ref::<ChainError>(),
             Some(ChainError::AmbiguousSubmit(_))
-        )
+        ) || cause
+            .downcast_ref::<dexdo::buyer::api::DealInitError>()
+            .is_some_and(|error| error.reconciliation().is_some())
     })
 }
 
@@ -1713,7 +1747,6 @@ async fn reconcile_pending_buyer_submit(
 enum DurableBuyerSubmitStart {
     Submitted {
         result: Result<()>,
-        was_unambiguous: bool,
     },
     Reconciled {
         proof: BuyerJournalResumeProof,
@@ -1728,6 +1761,7 @@ enum DurableBuyerSubmitStart {
 struct BuyerJournalResumeProof {
     order_book: String,
     submit_identity: String,
+    submit_reconciliation: dexdo::buyer::api::BuyerSubmitReconciliation,
     intent: BuyerSubmitIntent,
     expected_token_contract: Option<dexdo_core::TokenContract>,
     quoted_order: OrderBookOrder,
@@ -1738,11 +1772,16 @@ struct BuyerJournalResumeProof {
 }
 
 #[cfg(feature = "shellnet")]
-impl From<&BuyerSubmitJournal> for BuyerJournalResumeProof {
-    fn from(journal: &BuyerSubmitJournal) -> Self {
-        Self {
+impl BuyerJournalResumeProof {
+    fn from_journal(journal: &BuyerSubmitJournal) -> Result<Self> {
+        Ok(Self {
             order_book: journal.order_book.clone(),
             submit_identity: journal.submit_identity.clone(),
+            submit_reconciliation: buyer_submit_reconciliation(
+                journal,
+                dexdo::buyer::api::BuyerSubmitReconciliationState::RecoveredProven,
+                dexdo::buyer::api::BuyerSubmitReconciliationOrigin::DurableJournal,
+            )?,
             intent: journal.intent.clone(),
             expected_token_contract: journal.expected_token_contract.clone(),
             quoted_order: journal.quoted_order.clone(),
@@ -1750,7 +1789,55 @@ impl From<&BuyerSubmitJournal> for BuyerJournalResumeProof {
             ticks: journal.ticks,
             max_price_per_tick: journal.max_price_per_tick,
             escrow: journal.escrow,
-        }
+        })
+    }
+}
+
+#[cfg(feature = "shellnet")]
+#[derive(Debug)]
+struct DurableBuyerSubmitReconciliationError {
+    deal_init: dexdo::buyer::api::DealInitError,
+    source: ChainError,
+}
+
+#[cfg(feature = "shellnet")]
+impl std::fmt::Display for DurableBuyerSubmitReconciliationError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.deal_init.fmt(formatter)
+    }
+}
+
+#[cfg(feature = "shellnet")]
+impl std::error::Error for DurableBuyerSubmitReconciliationError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(&self.source)
+    }
+}
+
+#[cfg(feature = "shellnet")]
+fn durable_buyer_submit_reconciliation_error(
+    error: anyhow::Error,
+    journal: &BuyerSubmitJournal,
+) -> anyhow::Error {
+    if !is_ambiguous_submit_error(&error) {
+        return error;
+    }
+    let message = format!("{error:#}");
+    match buyer_submit_reconciliation(
+        journal,
+        dexdo::buyer::api::BuyerSubmitReconciliationState::DurableUnresolved,
+        dexdo::buyer::api::BuyerSubmitReconciliationOrigin::DurableJournal,
+    ) {
+        Ok(reconciliation) => anyhow::Error::new(DurableBuyerSubmitReconciliationError {
+            deal_init: dexdo::buyer::api::DealInitError::with_reconciliation(
+                message.clone(),
+                reconciliation,
+            ),
+            source: ChainError::AmbiguousSubmit(message),
+        }),
+        Err(reconciliation_error) => error.context(format!(
+            "could not preserve durable buyer submit recovery facts: {reconciliation_error:#}"
+        )),
     }
 }
 
@@ -1762,7 +1849,7 @@ struct BuyerQuoteSubmitOutcome {
     ticks: u128,
     max_price_per_tick: u128,
     escrow: u128,
-    reconciled_submit_identity: Option<String>,
+    submit_reconciliation: Option<dexdo::buyer::api::BuyerSubmitReconciliation>,
 }
 
 #[cfg(feature = "shellnet")]
@@ -1848,7 +1935,7 @@ async fn raise_pending_buyer_money_before_fresh_reads(
             ticks: proof.ticks,
             max_price_per_tick: proof.max_price_per_tick,
             escrow: proof.escrow,
-            reconciled_submit_identity: Some(proof.submit_identity),
+            submit_reconciliation: Some(proof.submit_reconciliation),
         })),
         DurableBuyerSubmitStart::Submitted { .. } => unreachable!(
             "a durable journal loaded before fresh reads cannot start a second submission"
@@ -1906,9 +1993,10 @@ async fn raise_pending_buyer_money_before_fresh_reads(
 }
 
 #[allow(dead_code)]
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 struct BuyerSubmitProgress {
     reconciled_ambiguous_submit: bool,
+    submit_reconciliation: Option<dexdo::buyer::api::BuyerSubmitReconciliation>,
 }
 
 #[cfg(feature = "shellnet")]
@@ -1987,10 +2075,12 @@ async fn start_durable_buyer_submit(
             escrow,
         )?;
         if let Some((token_contract, status)) =
-            reconcile_pending_buyer_submit(chain, note_addr, journal_path, None).await?
+            reconcile_pending_buyer_submit(chain, note_addr, journal_path, None)
+                .await
+                .map_err(|error| durable_buyer_submit_reconciliation_error(error, &pending))?
         {
             return Ok(DurableBuyerSubmitStart::Reconciled {
-                proof: BuyerJournalResumeProof::from(&pending),
+                proof: BuyerJournalResumeProof::from_journal(&pending)?,
                 token_contract,
                 status,
             });
@@ -2012,11 +2102,7 @@ async fn start_durable_buyer_submit(
         journal_path,
     )
     .await;
-    let was_unambiguous = result.is_ok();
-    Ok(DurableBuyerSubmitStart::Submitted {
-        result,
-        was_unambiguous,
-    })
+    Ok(DurableBuyerSubmitStart::Submitted { result })
 }
 
 #[allow(dead_code, clippy::too_many_arguments)]
@@ -2068,6 +2154,7 @@ where
             } => {
                 on_submit_observed(BuyerSubmitProgress {
                     reconciled_ambiguous_submit: true,
+                    submit_reconciliation: Some(proof.submit_reconciliation.clone()),
                 })
                 .await?;
                 return Ok(BuyerQuoteSubmitOutcome {
@@ -2076,17 +2163,48 @@ where
                     ticks: proof.ticks,
                     max_price_per_tick: proof.max_price_per_tick,
                     escrow: proof.escrow,
-                    reconciled_submit_identity: Some(proof.submit_identity),
+                    submit_reconciliation: Some(proof.submit_reconciliation),
                 });
             }
-            DurableBuyerSubmitStart::Submitted {
-                result,
-                was_unambiguous,
-            } => {
+            DurableBuyerSubmitStart::Submitted { result } => {
+                let ambiguous_submit = result.as_ref().is_err_and(is_ambiguous_submit_error);
+                let submit_reconciliation = if ambiguous_submit {
+                    let journal = load_buyer_submit_journal(&journal_path, &journal_note)?
+                        .ok_or_else(|| {
+                            anyhow::anyhow!(
+                                "buyer submit journal {} disappeared after an ambiguous money submit",
+                                journal_path.display()
+                            )
+                        })?;
+                    Some(buyer_submit_reconciliation(
+                        &journal,
+                        dexdo::buyer::api::BuyerSubmitReconciliationState::FreshUnresolved,
+                        dexdo::buyer::api::BuyerSubmitReconciliationOrigin::FreshSubmit,
+                    )?)
+                } else {
+                    None
+                };
                 on_submit_observed(BuyerSubmitProgress {
-                    reconciled_ambiguous_submit: !was_unambiguous,
+                    reconciled_ambiguous_submit: ambiguous_submit,
+                    submit_reconciliation: submit_reconciliation.clone(),
                 })
                 .await?;
+                if intent.kind == BuyerSubmitIntentKind::OnDemand {
+                    if let Some(reconciliation) = submit_reconciliation.clone() {
+                        let anchor = &reconciliation.recovery_anchor;
+                        return Err(anyhow::Error::new(
+                            dexdo::buyer::api::DealInitError::with_reconciliation(
+                                format!(
+                                    "ambiguous submit {}; recovery anchor order {} / {}; durable journal retained -- resume without creating a fresh BOC",
+                                    reconciliation.submit_identity,
+                                    anchor.order_id,
+                                    anchor.token_contract
+                                ),
+                                reconciliation,
+                            ),
+                        ));
+                    }
+                }
                 let (token_contract, status) = complete_buyer_submit_with_journal(
                     chain,
                     selection.quoted_order.as_ref(),
@@ -2103,7 +2221,7 @@ where
                     ticks,
                     max_price_per_tick,
                     escrow,
-                    reconciled_submit_identity: None,
+                    submit_reconciliation,
                 });
             }
         }
@@ -2117,6 +2235,7 @@ where
         buyer.place_buy(chain, &token_contract).await?;
         on_submit_observed(BuyerSubmitProgress {
             reconciled_ambiguous_submit: false,
+            submit_reconciliation: None,
         })
         .await?;
         let status = validate_reported_match_state(chain, &token_contract).await?;
@@ -2126,7 +2245,7 @@ where
             ticks,
             max_price_per_tick,
             escrow,
-            reconciled_submit_identity: None,
+            submit_reconciliation: None,
         });
     }
 
@@ -2143,6 +2262,7 @@ where
     .await?;
     on_submit_observed(BuyerSubmitProgress {
         reconciled_ambiguous_submit: false,
+        submit_reconciliation: None,
     })
     .await?;
     let fill = chain
@@ -2162,7 +2282,7 @@ where
         ticks,
         max_price_per_tick,
         escrow,
-        reconciled_submit_identity: None,
+        submit_reconciliation: None,
     })
 }
 
@@ -2601,14 +2721,37 @@ fn buyer_submit_event_fields(
     escrow: u128,
     progress: BuyerSubmitProgress,
 ) -> serde_json::Value {
-    json!({
+    let mut fields = json!({
         "frame_model": frame_model,
         "order_book": order_book,
         "ticks": machine::amount(ticks),
         "max_price_per_tick": machine::amount(max_price_per_tick),
         "escrow": machine::amount(escrow),
         "reconciled_ambiguous_submit": progress.reconciled_ambiguous_submit
-    })
+    });
+    if let Some(reconciliation) = progress.submit_reconciliation {
+        fields["submit_reconciliation"] = json!(reconciliation);
+    }
+    fields
+}
+
+fn recovered_buyer_resume_selected_fields(
+    frame_model: &str,
+    outcome: &BuyerQuoteSubmitOutcome,
+) -> Result<serde_json::Value> {
+    let submit_reconciliation = outcome.submit_reconciliation.as_ref().ok_or_else(|| {
+        anyhow::anyhow!("recovered buyer resume has no durable submit reconciliation")
+    })?;
+    let token_contract = dexdo_core::normalize_wallet_address(&outcome.token_contract)
+        .map_err(|error| anyhow::anyhow!("recovered buyer TokenContract: {error}"))?;
+    Ok(json!({
+        "token_contract": token_contract,
+        "role": "buyer",
+        "source": "durable_journal",
+        "deal_handle": deals::make_handle_id(&token_contract),
+        "frame_model": frame_model,
+        "submit_reconciliation": submit_reconciliation
+    }))
 }
 
 fn fail_buyer_quote_selection(
@@ -4146,11 +4289,53 @@ fn spawn_buyer_service_renewal(
     });
 }
 
+#[derive(Clone, Copy)]
+enum BuyerShellnetPreflight {
+    Production,
+    #[cfg(all(test, feature = "shellnet"))]
+    OfflineTest,
+}
+
+impl BuyerShellnetPreflight {
+    fn should_run(self) -> bool {
+        match self {
+            Self::Production => true,
+            #[cfg(all(test, feature = "shellnet"))]
+            Self::OfflineTest => false,
+        }
+    }
+}
+
+type BuyerShutdownSignal =
+    std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send + 'static>>;
+
+struct BuyerCommandRuntime {
+    backend: Option<ChainAndNote>,
+    shellnet_preflight: BuyerShellnetPreflight,
+    shutdown: BuyerShutdownSignal,
+}
+
+impl BuyerCommandRuntime {
+    fn production() -> Self {
+        Self {
+            backend: None,
+            shellnet_preflight: BuyerShellnetPreflight::Production,
+            shutdown: Box::pin(operator_shutdown_signal()),
+        }
+    }
+}
+
 pub(crate) async fn run_buyer(args: BuyerArgs) -> Result<()> {
     let json_mode = args.json;
     let mut machine_events = json_mode.then(machine::BuyerEventWriter::new);
     let mut machine_context = BuyerMachineErrorContext::default();
-    let result = run_buyer_inner(args, &mut machine_events, &mut machine_context).await;
+    let result = run_buyer_inner(
+        args,
+        &mut machine_events,
+        &mut machine_context,
+        BuyerCommandRuntime::production(),
+    )
+    .await;
     if let Err(err) = result {
         if machine::is_printed_error(&err) {
             return Err(err);
@@ -4321,6 +4506,23 @@ fn is_replay_protection_error(err: &anyhow::Error) -> bool {
     msg.contains("exit code 52") || msg.contains("replay protection")
 }
 
+fn buyer_deal_init_error(err: anyhow::Error) -> dexdo::buyer::api::DealInitError {
+    #[cfg(feature = "shellnet")]
+    if let Some(error) = err
+        .chain()
+        .find_map(|cause| cause.downcast_ref::<DurableBuyerSubmitReconciliationError>())
+    {
+        return error.deal_init.clone();
+    }
+    if let Some(error) = err
+        .chain()
+        .find_map(|cause| cause.downcast_ref::<dexdo::buyer::api::DealInitError>())
+    {
+        return error.clone();
+    }
+    dexdo::buyer::api::DealInitError::new(format!("{err:#}"))
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn prepare_lazy_buyer_api_deal_with_replay_backoff(
     chain: Arc<dyn ChainBackend>,
@@ -4334,7 +4536,8 @@ async fn prepare_lazy_buyer_api_deal_with_replay_backoff(
     api_failure_policy: dexdo::buyer::api::BuyerApiFailurePolicy,
     events: SharedBuyerEvents,
     raised_money: Option<BuyerQuoteSubmitOutcome>,
-) -> Result<dexdo::buyer::api::ApiDeal, String> {
+    shellnet_preflight: BuyerShellnetPreflight,
+) -> std::result::Result<dexdo::buyer::api::ApiDeal, dexdo::buyer::api::DealInitError> {
     const MAX_ATTEMPTS: u64 = 3;
     let mut attempt = 1u64;
     loop {
@@ -4350,35 +4553,22 @@ async fn prepare_lazy_buyer_api_deal_with_replay_backoff(
             api_failure_policy,
             events.clone(),
             raised_money.clone(),
-            attempt,
+            shellnet_preflight,
         )
         .await;
         match result {
             Ok(deal) => return Ok(deal),
             Err(err) if is_replay_protection_error(&err) && attempt < MAX_ATTEMPTS => {
                 let backoff_secs = attempt.saturating_mul(2);
-                let _ = emit_shared_buyer_event(
-                    &events,
-                    "purchase_progress",
-                    machine::OP_BUYER_RUNTIME,
-                    json!({
-                        "stage": "replay_protection_backoff",
-                        "attempt": attempt,
-                        "next_attempt": attempt + 1,
-                        "backoff_secs": backoff_secs,
-                        "diagnostic": "shellnet replay protection exit 52; retrying after backoff"
-                    }),
-                )
-                .await;
                 tokio::time::sleep(std::time::Duration::from_secs(backoff_secs)).await;
                 attempt = attempt.saturating_add(1);
             }
             Err(err) if is_replay_protection_error(&err) => {
-                return Err(format!(
+                return Err(dexdo::buyer::api::DealInitError::new(format!(
                     "on-demand purchase failed after replay-protection retries: {err:#}"
-                ));
+                )));
             }
-            Err(err) => return Err(format!("{err:#}")),
+            Err(err) => return Err(buyer_deal_init_error(err)),
         }
     }
 }
@@ -4396,7 +4586,7 @@ async fn prepare_lazy_buyer_api_deal_once(
     api_failure_policy: dexdo::buyer::api::BuyerApiFailurePolicy,
     events: SharedBuyerEvents,
     raised_money: Option<BuyerQuoteSubmitOutcome>,
-    attempt: u64,
+    shellnet_preflight: BuyerShellnetPreflight,
 ) -> Result<dexdo::buyer::api::ApiDeal> {
     let raised_money = if args.mock.mock_chain {
         raised_money
@@ -4417,30 +4607,8 @@ async fn prepare_lazy_buyer_api_deal_once(
         .await?
         .or(raised_money)
     };
-    emit_shared_buyer_event(
-        &events,
-        "purchase_progress",
-        machine::OP_BUYER_RUNTIME,
-        json!({
-            "stage": "started",
-            "attempt": attempt,
-            "frame_model": frame_model.clone()
-        }),
-    )
-    .await?;
     require_stream_buy_ticks(args.ticks)?;
-    if !args.mock.mock_chain {
-        emit_shared_buyer_event(
-            &events,
-            "purchase_progress",
-            machine::OP_BUYER_RUNTIME,
-            json!({
-                "stage": "shellnet_preflight",
-                "attempt": attempt,
-                "frame_model": frame_model.clone()
-            }),
-        )
-        .await?;
+    if !args.mock.mock_chain && shellnet_preflight.should_run() {
         shellnet_doctor_preflight(&args.contracts, args.market.as_deref()).await?;
         if let Some(policy) = load_enabled_model_registry_policy(
             RegistryRole::Buyer,
@@ -4477,31 +4645,43 @@ async fn prepare_lazy_buyer_api_deal_once(
         }
     }
 
-    let reconciled_submit_identity = raised_money
+    let adopted_submit_identity = raised_money
         .as_ref()
-        .and_then(|outcome| outcome.reconciled_submit_identity.clone());
+        .and_then(|outcome| outcome.submit_reconciliation.as_ref())
+        .map(|reconciliation| reconciliation.submit_identity.clone());
     let mut service_renewal: Option<(u128, u128, u128)> = None;
     let (mut token_contract, buy_ticks) = if let Some(outcome) = raised_money {
-        emit_shared_buyer_event(
-            &events,
-            "buy_submitted",
-            machine::OP_BUYER_START,
-            buyer_submit_event_fields(
-                &frame_model,
-                if explicit_tc.is_some() {
-                    "explicit_token_contract"
-                } else {
-                    "model_order_book"
-                },
-                outcome.ticks,
-                outcome.max_price_per_tick,
-                outcome.escrow,
-                BuyerSubmitProgress {
-                    reconciled_ambiguous_submit: true,
-                },
-            ),
-        )
-        .await?;
+        if args.resume {
+            emit_shared_buyer_event(
+                &events,
+                "resume_selected",
+                machine::OP_BUYER_START,
+                recovered_buyer_resume_selected_fields(&frame_model, &outcome)?,
+            )
+            .await?;
+        } else {
+            emit_shared_buyer_event(
+                &events,
+                "buy_submitted",
+                machine::OP_BUYER_START,
+                buyer_submit_event_fields(
+                    &frame_model,
+                    if explicit_tc.is_some() {
+                        "explicit_token_contract"
+                    } else {
+                        "model_order_book"
+                    },
+                    outcome.ticks,
+                    outcome.max_price_per_tick,
+                    outcome.escrow,
+                    BuyerSubmitProgress {
+                        reconciled_ambiguous_submit: true,
+                        submit_reconciliation: outcome.submit_reconciliation.clone(),
+                    },
+                ),
+            )
+            .await?;
+        }
         (outcome.token_contract, outcome.ticks)
     } else {
         match explicit_tc.clone() {
@@ -4833,7 +5013,7 @@ async fn prepare_lazy_buyer_api_deal_once(
 
     clear_adopted_buyer_money_journal(
         args.identity.note_addr.as_deref(),
-        reconciled_submit_identity.as_deref(),
+        adopted_submit_identity.as_deref(),
         &token_contract,
     )?;
     let session = Arc::new(dexdo::buyer::api::SessionSettle::new_with_failure_policy(
@@ -4857,10 +5037,10 @@ async fn prepare_lazy_buyer_api_deal_once(
 }
 
 #[allow(clippy::too_many_arguments)]
-async fn run_buyer_on_demand_local_api(
-    args: BuyerArgs,
+fn build_on_demand_buyer_api_state(
     chain: Arc<dyn ChainBackend>,
-    buyer: dexdo::buyer::Buyer,
+    buyer: Arc<dexdo::buyer::Buyer>,
+    args: Arc<BuyerArgs>,
     explicit_tc: Option<String>,
     frame_model: String,
     content_check: dexdo::buyer::api::ContentCheck,
@@ -4869,29 +5049,8 @@ async fn run_buyer_on_demand_local_api(
     api_failure_policy: dexdo::buyer::api::BuyerApiFailurePolicy,
     events: SharedBuyerEvents,
     raised_money: Option<BuyerQuoteSubmitOutcome>,
-) -> Result<()> {
-    use dexdo::buyer::api::{self, ApiState};
-
-    let bind = args
-        .local_listen
-        .ok_or_else(|| anyhow::anyhow!("on-demand local API requires --local-listen"))?;
-    let buyer = Arc::new(buyer);
-    let args = Arc::new(args);
-    let pending_token_contract = "pending:on-demand";
-    let pending_deal_handle = "pending:on-demand";
-    emit_shared_buyer_event(
-        &events,
-        "endpoint_binding",
-        machine::OP_BUYER_START,
-        json!({
-            "token_contract": pending_token_contract,
-            "deal_handle": pending_deal_handle,
-            "requested_bind_addr": bind.to_string(),
-            "allow_port_zero": bind.port() == 0
-        }),
-    )
-    .await?;
-
+    shellnet_preflight: BuyerShellnetPreflight,
+) -> dexdo::buyer::api::ApiState {
     let initializer = {
         let chain = chain.clone();
         let buyer = buyer.clone();
@@ -4927,26 +5086,113 @@ async fn run_buyer_on_demand_local_api(
                     api_failure_policy,
                     events,
                     raised_money,
+                    shellnet_preflight,
                 )
                 .await
             }) as dexdo::buyer::api::DealInitFuture
         }) as dexdo::buyer::api::DealInitializer
     };
-    let state = ApiState::lazy(
+    dexdo::buyer::api::ApiState::lazy(
         buyer,
-        frame_model.clone(),
+        frame_model,
         initializer,
         std::time::Duration::from_secs(DEAL_WAIT_SECS),
-    );
-    let deals = state.deals.clone();
-    let (addr, task) = match api::serve(
-        bind,
-        state,
-        args.anthropic_compat,
-        operator_shutdown_signal(),
     )
-    .await
-    {
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn run_buyer_on_demand_local_api(
+    args: BuyerArgs,
+    chain: Arc<dyn ChainBackend>,
+    buyer: dexdo::buyer::Buyer,
+    explicit_tc: Option<String>,
+    frame_model: String,
+    content_check: dexdo::buyer::api::ContentCheck,
+    models_cfg: Arc<dexdo::seller::ModelsConfig>,
+    buyer_policy: Option<policy::BuyerRuntimePolicy>,
+    api_failure_policy: dexdo::buyer::api::BuyerApiFailurePolicy,
+    events: SharedBuyerEvents,
+    raised_money: Option<BuyerQuoteSubmitOutcome>,
+    shellnet_preflight: BuyerShellnetPreflight,
+    shutdown: BuyerShutdownSignal,
+) -> Result<()> {
+    use dexdo::buyer::api;
+
+    let bind = args
+        .local_listen
+        .ok_or_else(|| anyhow::anyhow!("on-demand local API requires --local-listen"))?;
+    let buyer = Arc::new(buyer);
+    let args = Arc::new(args);
+    let pre_adopted_deal = if args.resume {
+        Some(
+            prepare_lazy_buyer_api_deal_with_replay_backoff(
+                chain.clone(),
+                buyer.clone(),
+                args.clone(),
+                explicit_tc.clone(),
+                frame_model.clone(),
+                content_check.clone(),
+                models_cfg.clone(),
+                buyer_policy.clone(),
+                api_failure_policy,
+                events.clone(),
+                raised_money.clone(),
+                shellnet_preflight,
+            )
+            .await?,
+        )
+    } else {
+        None
+    };
+    let endpoint_token_contract = pre_adopted_deal
+        .as_ref()
+        .map(|deal| deal.route.token_contract.as_str())
+        .or(explicit_tc.as_deref())
+        .map(|token_contract| {
+            dexdo_core::normalize_wallet_address(token_contract)
+                .map_err(|error| anyhow::anyhow!("on-demand endpoint TokenContract: {error}"))
+        })
+        .transpose()?;
+    let endpoint_deal_handle = endpoint_token_contract
+        .as_deref()
+        .map(deals::make_handle_id);
+    emit_shared_buyer_event(
+        &events,
+        "endpoint_binding",
+        machine::OP_BUYER_START,
+        json!({
+            "token_contract": endpoint_token_contract,
+            "deal_handle": endpoint_deal_handle,
+            "requested_bind_addr": bind.to_string(),
+            "allow_port_zero": bind.port() == 0
+        }),
+    )
+    .await?;
+
+    let state = if let Some(deal) = pre_adopted_deal {
+        api::ApiState {
+            buyer,
+            frame_model: frame_model.clone(),
+            deals: Arc::new(api::RouteManager::new(deal)),
+        }
+    } else {
+        build_on_demand_buyer_api_state(
+            chain,
+            buyer,
+            args.clone(),
+            explicit_tc,
+            frame_model.clone(),
+            content_check,
+            models_cfg,
+            buyer_policy,
+            api_failure_policy,
+            events.clone(),
+            raised_money,
+            shellnet_preflight,
+        )
+    };
+    let deals = state.deals.clone();
+    let (addr, task) = match api::serve(bind, state, args.anthropic_compat, shutdown).await {
         Ok(ok) => ok,
         Err(err) => {
             if let Some(events) = &events {
@@ -5019,8 +5265,8 @@ async fn run_buyer_on_demand_local_api(
         "endpoint_ready",
         machine::OP_BUYER_RUNTIME,
         json!({
-            "token_contract": pending_token_contract,
-            "deal_handle": pending_deal_handle,
+            "token_contract": endpoint_token_contract,
+            "deal_handle": endpoint_deal_handle,
             "bind_addr": addr.to_string(),
             "base_url": base_url,
             "models_url": models_url,
@@ -5044,12 +5290,8 @@ async fn run_buyer_on_demand_local_api(
             let handle = deals::make_handle_id(&tc);
             (tc, handle)
         })
-        .unwrap_or_else(|| {
-            (
-                pending_token_contract.to_string(),
-                pending_deal_handle.to_string(),
-            )
-        });
+        .or_else(|| endpoint_token_contract.zip(endpoint_deal_handle))
+        .unwrap_or_default();
     emit_shared_buyer_event(
         &events,
         "stopping",
@@ -5107,7 +5349,13 @@ async fn run_buyer_inner(
     args: BuyerArgs,
     machine_events: &mut Option<machine::BuyerEventWriter>,
     machine_context: &mut BuyerMachineErrorContext,
+    runtime: BuyerCommandRuntime,
 ) -> Result<()> {
+    let BuyerCommandRuntime {
+        backend,
+        shellnet_preflight,
+        shutdown,
+    } = runtime;
     // Issue: token_contract + frame_model come from `--market`(a provision manifest) or the flags.
     // The buyer ignores the deal nonce: it places a buy, it does not post the offer.
     // Model-only buy: with neither
@@ -5212,7 +5460,9 @@ async fn run_buyer_inner(
     }
     // The chain is selected by a flag: `--mock-chain` -> mock(as in D1, also requires `--mock-model`), otherwise
     // real shellnet(per-role buyer backend behind the `shellnet` feature; without the feature -> explicit failure).
-    let (chain, note) = if args.mock.mock_chain {
+    let (chain, note) = if let Some(backend) = backend {
+        backend
+    } else if args.mock.mock_chain {
         args.mock.require_mock_model()?;
         let endpoints_file = resolve_endpoints_file(args.endpoints_file.clone())?;
         mock_chain_and_note(endpoints_file, &args.identity)?
@@ -5274,6 +5524,8 @@ async fn run_buyer_inner(
             api_failure_policy,
             events,
             raised_money,
+            shellnet_preflight,
+            shutdown,
         )
         .await;
     }
@@ -5315,31 +5567,41 @@ async fn run_buyer_inner(
     }
     // Resolve the deal `TokenContract`: explicit(flag/manifest) or model-only (book -> choose -> buy -> fill
     // event). `buy_ticks` is the chosen volume(the consumer-API token budget tracks it).
-    let reconciled_submit_identity = raised_money
+    let adopted_submit_identity = raised_money
         .as_ref()
-        .and_then(|outcome| outcome.reconciled_submit_identity.clone());
+        .and_then(|outcome| outcome.submit_reconciliation.as_ref())
+        .map(|reconciliation| reconciliation.submit_identity.clone());
     let mut service_renewal: Option<(u128, u128, u128)> = None;
     let (mut token_contract, buy_ticks) = if let Some(outcome) = raised_money {
         machine_context.set_token_contract(&outcome.token_contract);
         if let Some(events) = machine_events.as_mut() {
-            events.event(
-                "buy_submitted",
-                machine::OP_BUYER_START,
-                buyer_submit_event_fields(
-                    &frame_model,
-                    if explicit_tc.is_some() {
-                        "explicit_token_contract"
-                    } else {
-                        "model_order_book"
-                    },
-                    outcome.ticks,
-                    outcome.max_price_per_tick,
-                    outcome.escrow,
-                    BuyerSubmitProgress {
-                        reconciled_ambiguous_submit: true,
-                    },
-                ),
-            )?;
+            if args.resume {
+                events.event(
+                    "resume_selected",
+                    machine::OP_BUYER_START,
+                    recovered_buyer_resume_selected_fields(&frame_model, &outcome)?,
+                )?;
+            } else {
+                events.event(
+                    "buy_submitted",
+                    machine::OP_BUYER_START,
+                    buyer_submit_event_fields(
+                        &frame_model,
+                        if explicit_tc.is_some() {
+                            "explicit_token_contract"
+                        } else {
+                            "model_order_book"
+                        },
+                        outcome.ticks,
+                        outcome.max_price_per_tick,
+                        outcome.escrow,
+                        BuyerSubmitProgress {
+                            reconciled_ambiguous_submit: true,
+                            submit_reconciliation: outcome.submit_reconciliation.clone(),
+                        },
+                    ),
+                )?;
+            }
         }
         (outcome.token_contract, outcome.ticks)
     } else {
@@ -5766,7 +6028,7 @@ async fn run_buyer_inner(
     }
     clear_adopted_buyer_money_journal(
         args.identity.note_addr.as_deref(),
-        reconciled_submit_identity.as_deref(),
+        adopted_submit_identity.as_deref(),
         &token_contract,
     )?;
     // B19/B20: if `--local-listen` is set, bring up a local interface to
@@ -9620,6 +9882,52 @@ mod tests {
     }
 
     #[cfg(feature = "shellnet")]
+    #[derive(Debug, serde::Serialize, serde::Deserialize)]
+    #[serde(deny_unknown_fields)]
+    struct PreviousBuyerSubmitJournalV2 {
+        schema: String,
+        note_addr: String,
+        order_book: String,
+        intent: super::BuyerSubmitIntent,
+        expected_token_contract: Option<dexdo_core::TokenContract>,
+        quoted_order: dexdo_core::OrderBookOrder,
+        quote: dexdo_core::ExecutableQuote,
+        cursor: dexdo_core::MatchWatchCursor,
+        ticks: u128,
+        max_price_per_tick: u128,
+        escrow: u128,
+        submit_identity: String,
+        created_at_unix: u64,
+        #[serde(default)]
+        resolved_match: Option<super::BuyerJournalMatch>,
+        #[serde(default)]
+        resolved_matches: Vec<super::BuyerJournalMatch>,
+    }
+
+    #[cfg(feature = "shellnet")]
+    impl From<&super::BuyerSubmitJournal> for PreviousBuyerSubmitJournalV2 {
+        fn from(journal: &super::BuyerSubmitJournal) -> Self {
+            Self {
+                schema: journal.schema.clone(),
+                note_addr: journal.note_addr.clone(),
+                order_book: journal.order_book.clone(),
+                intent: journal.intent.clone(),
+                expected_token_contract: journal.expected_token_contract.clone(),
+                quoted_order: journal.quoted_order.clone(),
+                quote: journal.quote.clone(),
+                cursor: journal.cursor.clone(),
+                ticks: journal.ticks,
+                max_price_per_tick: journal.max_price_per_tick,
+                escrow: journal.escrow,
+                submit_identity: journal.submit_identity.clone(),
+                created_at_unix: journal.created_at_unix,
+                resolved_match: journal.resolved_match.clone(),
+                resolved_matches: journal.resolved_matches.clone(),
+            }
+        }
+    }
+
+    #[cfg(feature = "shellnet")]
     struct JournalPipelineChain {
         submit_error: Option<&'static str>,
         fill: Option<dexdo_core::MatchedFill>,
@@ -9636,7 +9944,12 @@ mod tests {
             &self,
         ) -> Result<Vec<dexdo_core::OfferListing>, dexdo_core::ChainError> {
             self.sequence.lock().unwrap().push("fresh_read");
-            Ok(Vec::new())
+            Ok(vec![dexdo_core::OfferListing {
+                seller_id: format!("0:{}", "4".repeat(64)),
+                token_contract: format!("0:{}", "3".repeat(64)),
+                price_per_tick: 1_000_000,
+                max_ticks: 2,
+            }])
         }
 
         async fn stop(
@@ -9796,6 +10109,155 @@ mod tests {
     }
 
     #[cfg(feature = "shellnet")]
+    struct ResumeCommandChain {
+        fill: dexdo_core::MatchedFill,
+        handover: Vec<u8>,
+        post_count: std::sync::atomic::AtomicUsize,
+        poll_count: std::sync::atomic::AtomicUsize,
+        stop_count: std::sync::atomic::AtomicUsize,
+    }
+
+    #[cfg(feature = "shellnet")]
+    #[async_trait::async_trait]
+    impl dexdo_core::ChainBackend for ResumeCommandChain {
+        async fn discover_offers(
+            &self,
+        ) -> Result<Vec<dexdo_core::OfferListing>, dexdo_core::ChainError> {
+            panic!("retained-journal resume must not perform fresh offer discovery")
+        }
+
+        async fn post_offer(
+            &self,
+            _offer: dexdo_core::SellOffer,
+            _note: &dyn dexdo_core::Note,
+        ) -> Result<(), dexdo_core::ChainError> {
+            unimplemented!("not used by buyer resume")
+        }
+
+        async fn place_buy(
+            &self,
+            _token_contract: &dexdo_core::TokenContract,
+            _note: &dyn dexdo_core::Note,
+        ) -> Result<(), dexdo_core::ChainError> {
+            self.post_count
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Err(dexdo_core::ChainError::Chain(
+                "resume attempted a forbidden second money POST".to_string(),
+            ))
+        }
+
+        fn model_buy_order_book_identity(&self) -> Option<String> {
+            Some(format!("0:{}", "2".repeat(64)))
+        }
+
+        async fn place_buy_by_model_with_submit_identity(
+            &self,
+            _note: &dyn dexdo_core::Note,
+            _quoted_order: Option<&dexdo_core::OrderBookOrder>,
+            _ticks: u128,
+            _max_price_per_tick: u128,
+            _escrow: u128,
+            _cursor: &mut dexdo_core::MatchWatchCursor,
+            _before_post: &mut (dyn FnMut(
+                String,
+                dexdo_core::MatchWatchCursor,
+            ) -> Result<(), dexdo_core::ChainError>
+                      + Send),
+        ) -> Result<(), dexdo_core::ChainError> {
+            self.post_count
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Err(dexdo_core::ChainError::Chain(
+                "resume attempted a forbidden second money POST".to_string(),
+            ))
+        }
+
+        async fn poll_matched_model_buys_for_order_book(
+            &self,
+            _order_book: &str,
+            _cursor: &mut dexdo_core::MatchWatchCursor,
+        ) -> Result<Vec<dexdo_core::MatchedFill>, dexdo_core::ChainError> {
+            self.poll_count
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Ok(vec![self.fill.clone()])
+        }
+
+        async fn read_match(
+            &self,
+            _token_contract: &dexdo_core::TokenContract,
+        ) -> Result<dexdo_core::Match, dexdo_core::ChainError> {
+            unimplemented!("not used by retained-journal resume")
+        }
+
+        async fn open_stream(
+            &self,
+            _token_contract: &dexdo_core::TokenContract,
+            _enc_endpoint: Vec<u8>,
+            _note: &dyn dexdo_core::Note,
+        ) -> Result<(), dexdo_core::ChainError> {
+            unimplemented!("handover is already authoritative")
+        }
+
+        async fn read_handover(
+            &self,
+            token_contract: &dexdo_core::TokenContract,
+        ) -> Result<Option<Vec<u8>>, dexdo_core::ChainError> {
+            assert_eq!(token_contract, &self.fill.token_contract);
+            Ok(Some(self.handover.clone()))
+        }
+
+        async fn advance_tick(
+            &self,
+            _token_contract: &dexdo_core::TokenContract,
+            _note: &dyn dexdo_core::Note,
+        ) -> Result<(), dexdo_core::ChainError> {
+            Ok(())
+        }
+
+        async fn accept_probe(
+            &self,
+            _token_contract: &dexdo_core::TokenContract,
+        ) -> Result<(), dexdo_core::ChainError> {
+            Ok(())
+        }
+
+        async fn stop(
+            &self,
+            token_contract: &dexdo_core::TokenContract,
+            _note: &dyn dexdo_core::Note,
+        ) -> Result<dexdo_core::Settlement, dexdo_core::ChainError> {
+            assert_eq!(token_contract, &self.fill.token_contract);
+            self.stop_count
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Ok(dexdo_core::Settlement::AmicableSplit {
+                to_seller_ticks: 1,
+                to_buyer_refund: 1,
+            })
+        }
+
+        async fn seller_timeout(
+            &self,
+            _token_contract: &dexdo_core::TokenContract,
+        ) -> Result<dexdo_core::Settlement, dexdo_core::ChainError> {
+            unimplemented!("healthy stream settles through buyer STOP")
+        }
+
+        async fn deal_state(
+            &self,
+            token_contract: &dexdo_core::TokenContract,
+        ) -> Result<Option<dexdo_core::DealChainState>, dexdo_core::ChainError> {
+            assert_eq!(token_contract, &self.fill.token_contract);
+            Ok(Some(deal_state(true, true, false, true)))
+        }
+
+        async fn snapshot(
+            &self,
+            _token_contract: &dexdo_core::TokenContract,
+        ) -> Option<dexdo_core::StreamSnapshot> {
+            None
+        }
+    }
+
+    #[cfg(feature = "shellnet")]
     fn journal_pipeline_selection() -> super::BuyerQuoteSelection {
         let journal = buyer_submit_test_journal();
         super::BuyerQuoteSelection {
@@ -9870,6 +10332,581 @@ mod tests {
             1,
             "reconciliation must never resubmit"
         );
+    }
+
+    #[cfg(feature = "shellnet")]
+    // This test must serialize process-global DEXDO_PN_POOL for the full async scenario.
+    #[allow(clippy::await_holding_lock)]
+    #[tokio::test]
+    async fn on_demand_production_initializer_two_requests_return_fresh_then_durable_typed_503_without_second_post(
+    ) {
+        let _env_lock = dexdo_pn_pool_env_lock().lock().unwrap();
+        let (dir, _cleanup) = buyer_journal_test_dir("buyer-issue-61-http-ambiguous");
+        let pool_path = dir.join("pool.json");
+        let mut fixture = buyer_submit_test_journal();
+        fixture.intent = super::BuyerSubmitIntent::on_demand();
+        fixture.expected_token_contract = None;
+        std::fs::write(
+            &pool_path,
+            serde_json::to_vec_pretty(&serde_json::json!({
+                "notes": [{
+                    "address": fixture.note_addr,
+                    "owner_secret_key_hex": "00"
+                }]
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        let _env = EnvVarGuard::set("DEXDO_PN_POOL", pool_path.as_os_str());
+        let money_lock = super::BuyerMoneyLock::open(&fixture.note_addr).unwrap();
+        let _ = std::fs::remove_file(&money_lock.journal_path);
+        let chain = std::sync::Arc::new(JournalPipelineChain {
+            submit_error: Some("ambiguous"),
+            fill: None,
+            expected_journal_path: money_lock.journal_path.clone(),
+            sequence: std::sync::Mutex::new(Vec::new()),
+            post_count: std::sync::atomic::AtomicUsize::new(0),
+            poll_count: std::sync::atomic::AtomicUsize::new(0),
+        });
+        let buyer = std::sync::Arc::new(dexdo::buyer::Buyer::generate());
+        let args = std::sync::Arc::new(super::BuyerArgs {
+            mock: super::MockFlags {
+                mock_model: false,
+                mock_chain: false,
+            },
+            identity: super::IdentityArgs {
+                note_key: None,
+                note_index: 0,
+                note_addr: Some(fixture.note_addr.clone()),
+            },
+            registry: super::ModelRegistryValidationArgs::default(),
+            endpoints_file: None,
+            deals_dir: Some(dir.join("deals")),
+            token_contract: None,
+            resume: false,
+            market: None,
+            max_tokens: 8,
+            local_listen: None,
+            continuity_mode: super::ContinuityModeArg::OnDemand,
+            json: false,
+            anthropic_compat: false,
+            frame_model: Some("qwen--qwen3--32b".to_string()),
+            allow_unverified_model: true,
+            models: dir.join("models.json"),
+            ticks: fixture.ticks,
+            max_price_per_tick: fixture.max_price_per_tick,
+            escrow: Some(fixture.escrow),
+            contracts: dir.join("offline-contracts.json"),
+            policy: None,
+        });
+        let state = super::build_on_demand_buyer_api_state(
+            chain.clone(),
+            buyer,
+            args,
+            None,
+            "qwen--qwen3--32b".to_string(),
+            dexdo::buyer::api::ContentCheck::Skip,
+            std::sync::Arc::new(dexdo::seller::ModelsConfig::empty()),
+            None,
+            dexdo::buyer::api::BuyerApiFailurePolicy::default(),
+            None,
+            None,
+            super::BuyerShellnetPreflight::OfflineTest,
+        );
+        let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel::<()>();
+        let (addr, task) =
+            dexdo::buyer::api::serve("127.0.0.1:0".parse().unwrap(), state, false, async move {
+                let _ = shutdown_rx.await;
+            })
+            .await
+            .expect("bind real lazy Axum API");
+
+        let client = reqwest::Client::builder()
+            .timeout(std::time::Duration::from_secs(2))
+            .build()
+            .unwrap();
+        for (request, expected_state, expected_origin) in [
+            (1, "fresh_unresolved", "fresh_submit"),
+            (2, "durable_unresolved", "durable_journal"),
+        ] {
+            let started = std::time::Instant::now();
+            let response = client
+                .post(format!("http://{addr}/v1/chat/completions"))
+                .json(&serde_json::json!({
+                    "model": "qwen--qwen3--32b",
+                    "messages": [{"role": "user", "content": format!("issue 61 request {request}")}],
+                    "max_tokens": 1,
+                    "stream": false
+                }))
+                .send()
+                .await
+                .unwrap_or_else(|error| panic!("request {request} must return before timeout: {error}"));
+            assert!(
+                started.elapsed() < std::time::Duration::from_secs(2),
+                "request {request} must return before the outer initializer timeout"
+            );
+            assert_eq!(response.status(), reqwest::StatusCode::SERVICE_UNAVAILABLE);
+            let body = response.bytes().await.expect("503 body must be readable");
+            assert!(!body.is_empty(), "request {request} 503 must carry JSON");
+            let body: serde_json::Value =
+                serde_json::from_slice(&body).expect("503 body must be JSON");
+            let recovery = &body["error"]["submit_reconciliation"];
+            assert!(
+                !recovery.is_null(),
+                "request {request} lost typed reconciliation: {body}"
+            );
+            assert_eq!(
+                recovery["submit_identity"],
+                serde_json::json!(fixture.submit_identity)
+            );
+            assert_eq!(recovery["recovery_anchor"]["order_id"], "1");
+            assert_eq!(
+                recovery["recovery_anchor"]["token_contract"],
+                serde_json::json!(fixture.quoted_order.token_contract)
+            );
+            assert_eq!(recovery["state"], expected_state);
+            assert_eq!(recovery["origin"], expected_origin);
+        }
+
+        let stored = super::load_buyer_submit_journal(&money_lock.journal_path, &fixture.note_addr)
+            .unwrap()
+            .expect("ambiguous on-demand submit must retain its durable journal");
+        assert_eq!(stored.submit_identity, fixture.submit_identity);
+        let serialized: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&money_lock.journal_path).unwrap()).unwrap();
+        assert!(
+            serialized.get("reconciled_submit_identity").is_none(),
+            "v2 journal shape must not grow a recovery field"
+        );
+        assert_eq!(
+            chain.post_count.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "the durable second request must not send a second BOC"
+        );
+        let _ = shutdown_tx.send(());
+        task.await.expect("real lazy Axum API joins");
+    }
+
+    #[tokio::test]
+    async fn anthropic_real_router_preserves_typed_submit_reconciliation() {
+        let reconciliation = dexdo::buyer::api::BuyerSubmitReconciliation {
+            submit_identity: format!("boc-sha256:{}", "a".repeat(64)),
+            recovery_anchor: dexdo::buyer::api::BuyerSubmitRecoveryAnchor {
+                order_id: 7,
+                token_contract: format!("0:{}", "3".repeat(64)),
+            },
+            state: dexdo::buyer::api::BuyerSubmitReconciliationState::DurableUnresolved,
+            origin: dexdo::buyer::api::BuyerSubmitReconciliationOrigin::DurableJournal,
+        };
+        let expected = reconciliation.clone();
+        let state = dexdo::buyer::api::ApiState::lazy(
+            std::sync::Arc::new(dexdo::buyer::Buyer::generate()),
+            "qwen--qwen3--32b".to_string(),
+            std::sync::Arc::new(move || {
+                let reconciliation = reconciliation.clone();
+                Box::pin(async move {
+                    Err(dexdo::buyer::api::DealInitError::with_reconciliation(
+                        "durable submit remains unresolved",
+                        reconciliation,
+                    ))
+                }) as dexdo::buyer::api::DealInitFuture
+            }),
+            std::time::Duration::from_secs(2),
+        );
+        let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel::<()>();
+        let (addr, task) =
+            dexdo::buyer::api::serve("127.0.0.1:0".parse().unwrap(), state, true, async move {
+                let _ = shutdown_rx.await;
+            })
+            .await
+            .expect("bind Anthropic-compatible router");
+
+        let response = reqwest::Client::new()
+            .post(format!("http://{addr}/v1/messages"))
+            .json(&serde_json::json!({
+                "model": "qwen--qwen3--32b",
+                "messages": [{"role": "user", "content": "resume"}],
+                "max_tokens": 1,
+                "stream": false
+            }))
+            .send()
+            .await
+            .expect("Anthropic request returns");
+        assert_eq!(response.status(), reqwest::StatusCode::SERVICE_UNAVAILABLE);
+        let body: serde_json::Value = response.json().await.expect("typed Anthropic JSON");
+        assert_eq!(body["type"], "error");
+        assert_eq!(
+            body["error"]["submit_reconciliation"]["submit_identity"],
+            expected.submit_identity
+        );
+        assert_eq!(
+            body["error"]["submit_reconciliation"]["recovery_anchor"]["order_id"],
+            "7"
+        );
+        assert_eq!(
+            body["error"]["submit_reconciliation"]["recovery_anchor"]["token_contract"],
+            expected.recovery_anchor.token_contract
+        );
+        assert_eq!(
+            body["error"]["submit_reconciliation"]["state"],
+            "durable_unresolved"
+        );
+        assert_eq!(
+            body["error"]["submit_reconciliation"]["origin"],
+            "durable_journal"
+        );
+
+        let _ = shutdown_tx.send(());
+        task.await.expect("Anthropic router joins");
+    }
+
+    #[cfg(feature = "shellnet")]
+    // This test must serialize process-global DEXDO_PN_POOL for the full async scenario.
+    #[allow(clippy::await_holding_lock)]
+    #[tokio::test]
+    async fn buyer_recovered_on_demand_resume_emits_exact_canonical_stream_without_second_money_post(
+    ) {
+        let _env_lock = dexdo_pn_pool_env_lock().lock().unwrap();
+        let (dir, _cleanup) = buyer_journal_test_dir("buyer-issue-61-resume");
+        let pool_path = dir.join("pool.json");
+        let mut fixture = buyer_submit_test_journal();
+        fixture.intent = super::BuyerSubmitIntent::on_demand();
+        fixture.expected_token_contract = None;
+        std::fs::write(
+            &pool_path,
+            serde_json::to_vec_pretty(&serde_json::json!({
+                "notes": [{
+                    "address": fixture.note_addr,
+                    "owner_secret_key_hex": "00"
+                }]
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        let _env = EnvVarGuard::set("DEXDO_PN_POOL", pool_path.as_os_str());
+        let money_lock = super::BuyerMoneyLock::open(&fixture.note_addr).unwrap();
+        let _ = std::fs::remove_file(&money_lock.journal_path);
+        let selection = journal_pipeline_selection();
+        let first = JournalPipelineChain {
+            submit_error: Some("ambiguous"),
+            fill: None,
+            expected_journal_path: money_lock.journal_path.clone(),
+            sequence: std::sync::Mutex::new(Vec::new()),
+            post_count: std::sync::atomic::AtomicUsize::new(0),
+            poll_count: std::sync::atomic::AtomicUsize::new(0),
+        };
+        let buyer = dexdo::buyer::Buyer::generate();
+        let error = super::execute_buyer_quote_submit(
+            &first,
+            &buyer,
+            false,
+            Some(&fixture.note_addr),
+            &fixture.intent,
+            None,
+            &selection,
+            fixture.ticks,
+            fixture.max_price_per_tick,
+            fixture.escrow,
+            |_| std::future::ready(Ok(())),
+        )
+        .await
+        .expect_err("first submit is intentionally ambiguous");
+        assert!(super::is_ambiguous_submit_error(&error), "{error:#}");
+        assert_eq!(
+            first.post_count.load(std::sync::atomic::Ordering::SeqCst),
+            1
+        );
+
+        let fill = dexdo_core::MatchedFill {
+            token_contract: fixture.quoted_order.token_contract.clone().unwrap(),
+            ticks: fixture.ticks,
+            price_per_tick: fixture.quoted_order.price_per_tick,
+        };
+        let buyer_note = std::sync::Arc::new(dexdo_core::LocalNote::generate());
+        let gateway_listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("reserve gateway port");
+        let gateway_addr = gateway_listener.local_addr().unwrap();
+        drop(gateway_listener);
+        let seller = dexdo::seller::start_gateway(gateway_addr)
+            .await
+            .expect("start TLS mock-token gateway");
+        let mut gateway_ready = false;
+        for _ in 0..100 {
+            if tokio::net::TcpStream::connect(gateway_addr).await.is_ok() {
+                gateway_ready = true;
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        assert!(gateway_ready, "TLS mock-token gateway must bind");
+        let buyer_pubkey = dexdo_core::Note::pubkey(buyer_note.as_ref());
+        seller.state.register_stream(
+            &fill.token_contract,
+            buyer_pubkey.clone(),
+            2,
+            fixture.ticks as u64,
+            dexdo_core::DobParams::canonical().tick_size,
+        );
+        let handover = dexdo_core::Handover {
+            endpoint: format!("https://{gateway_addr}"),
+            tls_fingerprint: seller.tls_fingerprint.clone(),
+        };
+        let encrypted_handover = seller.note.encrypt_to(&buyer_pubkey, &handover.to_bytes());
+        let resumed = std::sync::Arc::new(ResumeCommandChain {
+            fill: fill.clone(),
+            handover: encrypted_handover,
+            post_count: std::sync::atomic::AtomicUsize::new(0),
+            poll_count: std::sync::atomic::AtomicUsize::new(0),
+            stop_count: std::sync::atomic::AtomicUsize::new(0),
+        });
+
+        let api_listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("reserve local API port");
+        let api_addr = api_listener.local_addr().unwrap();
+        drop(api_listener);
+        let policy_path = dir.join("policy.json");
+        std::fs::write(
+            &policy_path,
+            serde_json::to_vec_pretty(&serde_json::json!({
+                "version": 1,
+                "buyer": {
+                    "on": {
+                        "no_handover_after_match": "fail_closed",
+                        "malformed_handover": "fail_closed",
+                        "dead_gateway": "fail_closed",
+                        "empty_stream": "fail_closed",
+                        "seller_stalls_mid_stream": "accept_delivered_then_reclaim",
+                        "bad_output_scam": "stop"
+                    },
+                    "failover": {
+                        "max_sellers_to_try": 1,
+                        "total_spend_cap_shells": 1000000000
+                    }
+                }
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        let args = super::BuyerArgs {
+            mock: super::MockFlags {
+                mock_model: false,
+                mock_chain: false,
+            },
+            identity: super::IdentityArgs {
+                note_key: None,
+                note_index: 0,
+                note_addr: Some(fixture.note_addr.clone()),
+            },
+            registry: super::ModelRegistryValidationArgs::default(),
+            endpoints_file: None,
+            deals_dir: Some(dir.join("deals")),
+            token_contract: None,
+            resume: true,
+            market: None,
+            max_tokens: 8,
+            local_listen: Some(api_addr),
+            continuity_mode: super::ContinuityModeArg::OnDemand,
+            json: true,
+            anthropic_compat: false,
+            frame_model: Some("qwen--qwen3--32b".to_string()),
+            allow_unverified_model: true,
+            models: dir.join("models.json"),
+            ticks: fixture.ticks,
+            max_price_per_tick: fixture.max_price_per_tick,
+            escrow: Some(fixture.escrow),
+            contracts: dir.join("offline-contracts.json"),
+            policy: Some(policy_path),
+        };
+        let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel::<()>();
+        let command_chain: std::sync::Arc<dyn dexdo_core::ChainBackend> = resumed.clone();
+        let command_note: std::sync::Arc<dyn dexdo_core::Note> = buyer_note;
+        let (machine_writer, captured_machine_events) =
+            crate::cli::machine::BuyerEventWriter::capturing();
+        let command = tokio::spawn(async move {
+            let mut machine_events = Some(machine_writer);
+            let mut machine_context = super::BuyerMachineErrorContext::default();
+            super::run_buyer_inner(
+                args,
+                &mut machine_events,
+                &mut machine_context,
+                super::BuyerCommandRuntime {
+                    backend: Some((command_chain, command_note)),
+                    shellnet_preflight: super::BuyerShellnetPreflight::OfflineTest,
+                    shutdown: Box::pin(async move {
+                        let _ = shutdown_rx.await;
+                    }),
+                },
+            )
+            .await
+        });
+        let client = reqwest::Client::builder()
+            .timeout(std::time::Duration::from_secs(5))
+            .build()
+            .unwrap();
+        let models_url = format!("http://{api_addr}/v1/models");
+        let mut ready = false;
+        for _ in 0..100 {
+            if client
+                .get(&models_url)
+                .send()
+                .await
+                .is_ok_and(|response| response.status().is_success())
+            {
+                ready = true;
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        assert!(ready, "run_buyer_inner must bind the real local API");
+        let response = client
+            .post(format!("http://{api_addr}/v1/chat/completions"))
+            .json(&serde_json::json!({
+                "model": "qwen--qwen3--32b",
+                "messages": [{"role": "user", "content": "resume through the real command"}],
+                "max_tokens": 1,
+                "stream": true
+            }))
+            .send()
+            .await
+            .expect("resumed local request reaches the gateway stream");
+        assert_eq!(response.status(), reqwest::StatusCode::OK);
+        let stream = response.text().await.expect("SSE response body");
+        assert!(stream.contains("data:"), "{stream}");
+        assert!(stream.contains("[DONE]"), "{stream}");
+
+        let _ = shutdown_tx.send(());
+        command
+            .await
+            .expect("run_buyer_inner task joins")
+            .expect("run_buyer_inner resume completes through settlement");
+        assert_eq!(
+            resumed.post_count.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "run_buyer_inner --resume must not send a second money POST"
+        );
+        assert_eq!(
+            resumed.poll_count.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "run_buyer_inner must reconcile the retained journal exactly once"
+        );
+        assert_eq!(
+            resumed.stop_count.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "graceful command shutdown must submit one terminal AmicableSplit STOP"
+        );
+        assert!(
+            super::load_buyer_submit_journal(&money_lock.journal_path, &fixture.note_addr)
+                .unwrap()
+                .is_none(),
+            "authoritatively matched journal must clear only after handover is adopted"
+        );
+        let captured = captured_machine_events
+            .lock()
+            .expect("captured buyer events lock poisoned");
+        let event_names = captured
+            .iter()
+            .filter_map(|event| event["event"].as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            event_names,
+            [
+                "starting",
+                "resume_selected",
+                "handover_waiting",
+                "handover_received",
+                "endpoint_binding",
+                "endpoint_ready",
+                "stopping",
+                "settlement_submitted",
+                "settled",
+                "exiting",
+            ],
+            "recovered on-demand resume must emit only the complete canonical stream"
+        );
+        let canonical_token_contract = dexdo_core::Address::parse(&fill.token_contract)
+            .unwrap()
+            .with_workchain();
+        let canonical_deal_handle = super::deals::make_handle_id(&canonical_token_contract);
+        for event in captured.iter().filter(|event| {
+            matches!(
+                event["event"].as_str(),
+                Some(
+                    "resume_selected"
+                        | "handover_waiting"
+                        | "handover_received"
+                        | "endpoint_binding"
+                        | "endpoint_ready"
+                        | "stopping"
+                        | "settlement_submitted"
+                        | "settled"
+                        | "exiting"
+                )
+            )
+        }) {
+            assert_eq!(
+                event["token_contract"], canonical_token_contract,
+                "every deal-bound event must carry the real normalized TokenContract: {event}"
+            );
+            assert!(
+                !event.to_string().contains("pending:"),
+                "canonical stream must reject pending placeholders: {event}"
+            );
+        }
+        for event_name in [
+            "resume_selected",
+            "handover_received",
+            "endpoint_binding",
+            "endpoint_ready",
+            "stopping",
+            "settlement_submitted",
+            "settled",
+            "exiting",
+        ] {
+            let event = captured
+                .iter()
+                .find(|event| event["event"] == event_name)
+                .unwrap_or_else(|| panic!("missing {event_name} event"));
+            assert_eq!(
+                event["deal_handle"], canonical_deal_handle,
+                "{event_name} must carry the deal handle derived from the real TokenContract"
+            );
+        }
+        assert_eq!(
+            &event_names[..6],
+            [
+                "starting",
+                "resume_selected",
+                "handover_waiting",
+                "handover_received",
+                "endpoint_binding",
+                "endpoint_ready",
+            ],
+            "{event_names:?}"
+        );
+        let resume = captured
+            .iter()
+            .find(|event| event["event"] == "resume_selected")
+            .expect("resume_selected object");
+        assert_eq!(resume["source"], "durable_journal");
+        assert_eq!(
+            resume["token_contract"],
+            serde_json::json!(canonical_token_contract)
+        );
+        assert_eq!(
+            resume["submit_reconciliation"]["submit_identity"],
+            fixture.submit_identity
+        );
+        assert_eq!(
+            resume["submit_reconciliation"]["recovery_anchor"]["order_id"],
+            fixture.quoted_order.order_id.to_string()
+        );
+        assert_eq!(
+            resume["submit_reconciliation"]["recovery_anchor"]["token_contract"],
+            serde_json::json!(canonical_token_contract)
+        );
+        seller.server_task.abort();
     }
 
     #[cfg(feature = "shellnet")]
@@ -10185,7 +11222,10 @@ mod tests {
         );
         super::clear_adopted_buyer_money_journal(
             Some(&fixture.note_addr),
-            outcome.reconciled_submit_identity.as_deref(),
+            outcome
+                .submit_reconciliation
+                .as_ref()
+                .map(|reconciliation| reconciliation.submit_identity.as_str()),
             &outcome.token_contract,
         )
         .unwrap();
@@ -10286,7 +11326,10 @@ mod tests {
             assert_eq!(outcome.ticks, fixture.ticks, "{label} journal budget");
             super::clear_adopted_buyer_money_journal(
                 Some(&fixture.note_addr),
-                outcome.reconciled_submit_identity.as_deref(),
+                outcome
+                    .submit_reconciliation
+                    .as_ref()
+                    .map(|reconciliation| reconciliation.submit_identity.as_str()),
                 &outcome.token_contract,
             )
             .unwrap();
@@ -10377,13 +11420,16 @@ mod tests {
             dexdo::buyer::api::BuyerApiFailurePolicy::default(),
             None,
             None,
+            super::BuyerShellnetPreflight::Production,
         )
         .await
         .err()
         .expect("the real retry wrapper must reach the deliberately failing fresh preflight");
         assert!(
-            error.contains(&missing_contracts.display().to_string())
-                || error.contains("No such file"),
+            error
+                .message()
+                .contains(&missing_contracts.display().to_string())
+                || error.message().contains("No such file"),
             "{error}"
         );
         assert_eq!(
@@ -10690,6 +11736,42 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(loaded, journal);
+    }
+
+    #[cfg(feature = "shellnet")]
+    #[test]
+    fn buyer_submit_journal_v2_previous_and_current_readers_are_bidirectionally_compatible() {
+        let journal = buyer_submit_test_journal();
+
+        let previous_writer = PreviousBuyerSubmitJournalV2::from(&journal);
+        let previous_bytes = serde_json::to_vec_pretty(&previous_writer).unwrap();
+        let loaded_current: super::BuyerSubmitJournal = serde_json::from_slice(&previous_bytes)
+            .expect("previous v2 journal loads on this head");
+        assert_eq!(loaded_current, journal);
+
+        let current_bytes = serde_json::to_vec_pretty(&journal).unwrap();
+        let loaded_previous: PreviousBuyerSubmitJournalV2 = serde_json::from_slice(&current_bytes)
+            .expect(
+                "journal written by this head remains readable by the previous strict v2 reader",
+            );
+        assert_eq!(loaded_previous.schema, super::BUYER_SUBMIT_JOURNAL_SCHEMA);
+        assert_eq!(loaded_previous.submit_identity, journal.submit_identity);
+
+        let current_shape = serde_json::to_value(&journal).unwrap();
+        let previous_shape = serde_json::to_value(previous_writer).unwrap();
+        assert_eq!(
+            current_shape
+                .as_object()
+                .unwrap()
+                .keys()
+                .collect::<Vec<_>>(),
+            previous_shape
+                .as_object()
+                .unwrap()
+                .keys()
+                .collect::<Vec<_>>(),
+            "schema v2 field names must remain byte-shape compatible"
+        );
     }
 
     #[cfg(feature = "shellnet")]

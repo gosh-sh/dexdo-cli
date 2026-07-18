@@ -5,7 +5,7 @@
 use crate::buyer::api::stream::{CanonStreamDriver, CanonStreamNext};
 use crate::buyer::api::{
     handle_stream_error_policy, request_token_limit, ApiDeal, ApiState, ConsumerRequestGuard,
-    DeadGatewayAction,
+    DeadGatewayAction, DealInitError,
 };
 use crate::buyer::render::{self, OpenAiChatRequest};
 use axum::extract::State;
@@ -42,7 +42,7 @@ pub async fn chat_completions(
     }
     let deal = match state.current_deal().await {
         Ok(deal) => deal,
-        Err(reason) => return reject(deal_init_error_status(&reason), &reason),
+        Err(error) => return deal_init_rejection(&error),
     };
     let request_guard = deal.begin_request(now_secs());
     // Session-scoped lifecycle: once the local deal is closed (terminal settlement landed or policy
@@ -273,6 +273,19 @@ fn reject(status: StatusCode, message: &str) -> Response {
     let body =
         serde_json::json!({ "error": { "message": message, "type": "invalid_request_error" } });
     (status, Json(body)).into_response()
+}
+
+fn deal_init_rejection(error: &DealInitError) -> Response {
+    let mut body = serde_json::json!({
+        "error": {
+            "message": error.message(),
+            "type": "invalid_request_error"
+        }
+    });
+    if let Some(reconciliation) = error.reconciliation() {
+        body["error"]["submit_reconciliation"] = serde_json::json!(reconciliation);
+    }
+    (deal_init_error_status(error.message()), Json(body)).into_response()
 }
 
 fn deal_init_error_status(reason: &str) -> StatusCode {
