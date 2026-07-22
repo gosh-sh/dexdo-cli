@@ -322,6 +322,116 @@ async fn live_minted_note_deploys_inference_orderbook() {
     assert!(params.is_some(), "getParams is readable on an active book");
 }
 
+/// destructive live regression: use a sacrificial note whose ECC[2] has been drained, then
+/// submit `fundDeployShell` through the committed production path. The ECC[2] diagnosis is accepted
+/// only when that path correlates the exact external message with a finalized action receipt proving
+/// `result_code=38` and `no_funds=true`. Never prints the pool secret or signed message body.
+#[tokio::test]
+#[ignore = "live : requires a sacrificial zero-ECC[2] DEXDO_PN_POOL note"]
+async fn live_480_fund_deploy_shell_shortfall_is_receipt_backed() {
+    let Ok(pool_path) = std::env::var("DEXDO_PN_POOL") else {
+        eprintln!("DEXDO_PN_POOL not set - skipping destructive  live negative");
+        return;
+    };
+    let pool: Value =
+        serde_json::from_slice(&std::fs::read(&pool_path).expect("read pool")).expect("parse pool");
+    let n0 = &pool["notes"].as_array().expect("pool.notes[]")[0];
+    let note = Address::parse(n0["address"].as_str().expect("note address")).expect("address");
+    let owner_secret = n0["owner_secret_key_hex"].as_str().expect("owner key");
+    let owner = KeyPair::from_secret_hex(owner_secret).expect("owner keypair");
+    let manifest = concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../../contracts/deployed.shellnet.json"
+    );
+    let backend = RealChainBackend::connect(manifest).expect("connect");
+    let account = backend
+        .client()
+        .get_account(&note)
+        .await
+        .expect("read note")
+        .expect("note exists");
+    let shell = account.ecc_balance(2);
+    println!(
+        " note {} ECC[2] before rejected fundDeployShell={shell}",
+        note
+    );
+    assert_eq!(
+        shell, 0,
+        " live negative requires a sacrificial note drained to zero ECC[2]"
+    );
+    let seller_pubkey = json!(format!("0x{}", owner.public_hex()));
+    let root_model = backend
+        .root_model_address_for(&seller_pubkey)
+        .await
+        .expect("derive RootModel before rejected provision funding");
+    let root_model_before = backend
+        .client()
+        .get_account(&root_model)
+        .await
+        .expect("read RootModel before rejected provision funding")
+        .is_some_and(|account| account.is_active());
+
+    let nonce = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .expect("clock")
+        .as_secs();
+    let error = backend
+        .note_fund_deploy_shell(&note, &owner, nonce, 1_000_000_000, 1_000_000_000)
+        .await
+        .expect_err("zero-ECC[2] fundDeployShell must abort");
+    let displayed = format!("{error:#}");
+    println!(" masked operator error: {displayed}");
+    assert!(
+        displayed.contains("insufficient ECC[2]/SHELL"),
+        "{displayed}"
+    );
+    assert!(displayed.contains("action_result_code=38"), "{displayed}");
+    assert!(displayed.contains("no_funds=true"), "{displayed}");
+    assert!(displayed.contains("message_hash="), "{displayed}");
+    assert!(displayed.contains("transaction_hash="), "{displayed}");
+    let shell_after = backend
+        .client()
+        .get_account(&note)
+        .await
+        .expect("read note after rejected provision funding")
+        .expect("note exists after rejected provision funding")
+        .ecc_balance(2);
+    let root_model_after = backend
+        .client()
+        .get_account(&root_model)
+        .await
+        .expect("read RootModel after rejected provision funding")
+        .is_some_and(|account| account.is_active());
+    println!(
+        " provisioning state: ECC[2] before={shell} after={shell_after}; \
+         RootModel {} active before={root_model_before} after={root_model_after}",
+        root_model
+    );
+    assert_eq!(shell_after, shell, "rejected funding must not spend ECC[2]");
+    assert_eq!(
+        root_model_after, root_model_before,
+        "rejected funding must not advance RootModel provisioning state"
+    );
+    assert!(
+        !displayed.contains(owner_secret),
+        "operator diagnostic leaked the owner key"
+    );
+    for forbidden in [
+        "owner_secret_key_hex",
+        "seed",
+        "signed BOC",
+        "signature",
+        "api_key",
+    ] {
+        assert!(
+            !displayed
+                .to_ascii_lowercase()
+                .contains(&forbidden.to_ascii_lowercase()),
+            "operator diagnostic leaked forbidden secret material label {forbidden}"
+        );
+    }
+}
+
 /// A LIVE deal test, step 2: the seller(note0) **provisions a per-deal `TokenContract`** and
 /// **posts an offer into the on-chain book** `InferenceOrderBook`. Checks that the offer actually landed
 /// in the order book(`getStats.orderCount>=1`, `getBestBidAsk.hasAsk`). Deploys the TC at an address that

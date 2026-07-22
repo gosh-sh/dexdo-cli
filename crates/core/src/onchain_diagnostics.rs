@@ -1,4 +1,5 @@
 use serde_json::Value;
+use std::collections::HashSet;
 use std::fmt;
 
 const REDACTED: &str = "<redacted>";
@@ -30,8 +31,15 @@ struct ExitCode {
 }
 
 pub fn validate_onchain_submit_response(resp: Value) -> Result<Value, OnchainSubmitError> {
-    if let Some(err) = resp.get("error").filter(|v| !v.is_null()) {
-        return Err(submit_error(block_manager_error_message(err), &resp));
+    if resp.get("error").is_some_and(|v| !v.is_null()) {
+        let sanitized = sanitize_onchain_submit_payload(&resp);
+        let sanitized_err = sanitized
+            .get("error")
+            .expect("sanitizing a JSON object preserves its keys");
+        return Err(OnchainSubmitError {
+            message: block_manager_error_message(sanitized_err),
+            sanitized_payload: sanitized,
+        });
     }
 
     if let Some(exit) = first_nonzero_exit_code(&resp) {
@@ -53,7 +61,9 @@ pub fn validate_onchain_submit_response(resp: Value) -> Result<Value, OnchainSub
 }
 
 pub fn sanitize_onchain_submit_payload(value: &Value) -> Value {
-    sanitize_value(value, None)
+    let mut secrets = HashSet::new();
+    collect_echo_secrets(value, &mut secrets);
+    sanitize_value(value, &secrets)
 }
 
 pub fn contract_error_names(code: i64) -> &'static [&'static str] {
@@ -189,7 +199,15 @@ fn block_manager_error_message(err: &Value) -> String {
     if let Some(exit) = first_nonzero_exit_code(err).or_else(|| first_exit_code(err)) {
         parts.push(exit_code_fragment(&exit));
     }
+    if let Some(action) = first_nonzero_action_result_code(err).or_else(|| action_result_code(err))
+    {
+        parts.push(action_result_code_fragment(&action));
+    }
     parts.extend(bm_detail_fragments(err));
+    parts.push(format!(
+        "tvm_sdk_error={}",
+        sanitize_onchain_submit_payload(err)
+    ));
     parts.join("; ")
 }
 
@@ -223,13 +241,20 @@ fn exit_code_fragment(exit: &ExitCode) -> String {
 }
 
 fn action_result_code_fragment(action: &ExitCode) -> String {
-    let label = contract_error_label(action.code)
+    let label = action_result_code_label(action.code)
         .map(|l| format!(" ({l})"))
         .unwrap_or_default();
     format!(
         "action_result_code={}{} stage={}",
         action.code, label, action.stage
     )
+}
+
+fn action_result_code_label(code: i64) -> Option<String> {
+    if code == 38 {
+        return Some("insufficient extra currency / no_funds".to_string());
+    }
+    contract_error_label(code)
 }
 
 fn contract_error_label(code: i64) -> Option<String> {
@@ -410,53 +435,118 @@ fn value_i64(value: &Value) -> Option<i64> {
     }
 }
 
-fn sanitize_value(value: &Value, key: Option<&str>) -> Value {
-    if key.is_some_and(is_secret_key) {
-        return Value::String(REDACTED.to_string());
+fn collect_echo_secrets(value: &Value, secrets: &mut HashSet<String>) {
+    match value {
+        Value::Object(map) => map.iter().for_each(|(key, child)| {
+            if is_credential_key(key) && !is_ext_message_token_key(key) {
+                collect_strings(child, secrets);
+            } else {
+                collect_echo_secrets(child, secrets);
+            }
+        }),
+        Value::Array(items) => items
+            .iter()
+            .for_each(|child| collect_echo_secrets(child, secrets)),
+        _ => {}
     }
+}
+
+fn is_ext_message_token_key(key: &str) -> bool {
+    matches!(
+        key.to_ascii_lowercase().as_str(),
+        "extmessagetoken" | "ext_message_token"
+    )
+}
+
+fn collect_strings(value: &Value, secrets: &mut HashSet<String>) {
+    match value {
+        Value::String(secret) if !secret.is_empty() => {
+            secrets.insert(secret.clone());
+        }
+        Value::Object(map) => map
+            .values()
+            .for_each(|child| collect_strings(child, secrets)),
+        Value::Array(items) => items
+            .iter()
+            .for_each(|child| collect_strings(child, secrets)),
+        _ => {}
+    }
+}
+
+fn sanitize_value(value: &Value, secrets: &HashSet<String>) -> Value {
     match value {
         Value::Object(map) => Value::Object(
             map.iter()
-                .map(|(k, v)| {
-                    let v = if is_secret_key(k) {
+                .map(|(key, child)| {
+                    let child = if is_credential_key(key) {
                         Value::String(REDACTED.to_string())
                     } else {
-                        sanitize_value(v, Some(k))
+                        sanitize_value(child, secrets)
                     };
-                    (k.clone(), v)
+                    (key.clone(), child)
                 })
                 .collect(),
         ),
-        Value::Array(items) => Value::Array(items.iter().map(|v| sanitize_value(v, key)).collect()),
-        Value::String(s) if looks_like_raw_signed_body(s) => Value::String(REDACTED.to_string()),
+        Value::Array(items) => Value::Array(
+            items
+                .iter()
+                .map(|child| sanitize_value(child, secrets))
+                .collect(),
+        ),
+        Value::String(text) => Value::String(mask_exact_secrets(text, secrets)),
         _ => value.clone(),
     }
 }
 
-fn is_secret_key(key: &str) -> bool {
-    let k = key.to_ascii_lowercase().replace(['-', '_'], "");
-    k.contains("secret")
-        || k.contains("seed")
-        || k.contains("phrase")
-        || k.contains("mnemonic")
-        || k.contains("private")
-        || k.contains("apikey")
-        || k.contains("providertoken")
-        || k.contains("accesstoken")
-        || k.contains("refreshtoken")
-        || k.contains("authtoken")
-        || k.contains("authorization")
-        || k.contains("password")
-        || k.contains("signedmessage")
-        || k.contains("messageboc")
-        || matches!(k.as_str(), "key" | "boc" | "body" | "payload")
-        || (k.ends_with("key") && !k.contains("pub") && !k.contains("public"))
+fn is_credential_key(key: &str) -> bool {
+    matches!(
+        key.to_ascii_lowercase().as_str(),
+        "extmessagetoken"
+            | "ext_message_token"
+            | "authorization"
+            | "accesstoken"
+            | "access_token"
+            | "refreshtoken"
+            | "refresh_token"
+            | "api_key"
+            | "apikey"
+            | "provider_api_key"
+            | "providerapikey"
+            | "secret"
+            | "secretkey"
+            | "secret_key"
+            | "secret_hash"
+            | "seed"
+            | "seedphrase"
+            | "seed_phrase"
+            | "mnemonic"
+            | "password"
+            | "password_hash"
+            | "passwd"
+            | "privatekey"
+            | "private_key"
+            | "signature"
+            | "unsigned"
+            | "signedmessagebody"
+            | "signed_message_body"
+            | "messageboc"
+            | "message_boc"
+            | "signedboc"
+            | "signed_boc"
+    )
 }
 
-fn looks_like_raw_signed_body(s: &str) -> bool {
-    s.len() > 512
-        && s.bytes()
-            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'+' | b'/' | b'=' | b'-' | b'_'))
+fn mask_exact_secrets(text: &str, secrets: &HashSet<String>) -> String {
+    let mut masked = text.to_string();
+    let mut secrets = secrets
+        .iter()
+        .filter(|secret| secret.len() >= 8)
+        .collect::<Vec<_>>();
+    secrets.sort_unstable_by_key(|secret| std::cmp::Reverse(secret.len()));
+    for secret in secrets {
+        masked = masked.replace(secret, REDACTED);
+    }
+    masked
 }
 
 #[cfg(test)]
@@ -563,7 +653,47 @@ mod tests {
         .unwrap_err()
         .to_string();
         assert!(err.contains("action_result_code=38"), "{err}");
+        assert!(
+            err.contains("insufficient extra currency / no_funds"),
+            "{err}"
+        );
+        assert!(!err.contains("ECC[2]"), "{err}");
+        assert!(err.contains("no_funds"), "{err}");
         assert!(err.contains("stage=result.action"), "{err}");
+    }
+
+    #[test]
+    fn block_manager_action_no_funds_keeps_sanitized_diagnostics() {
+        let err = validate_onchain_submit_response(json!({
+            "error": {
+                "code": "TVM_ERROR",
+                "message": "transaction aborted",
+                "data": {
+                    "transaction": {
+                        "aborted": true,
+                        "compute": {"exit_code": 0},
+                        "action": {"success": false, "result_code": 38, "no_funds": true}
+                    },
+                    "transaction_hash": "tx-public-480",
+                    "signature": "secret-signature-480"
+                }
+            }
+        }))
+        .unwrap_err()
+        .to_string();
+
+        assert!(err.contains("action_result_code=38"), "{err}");
+        assert!(
+            err.contains("insufficient extra currency / no_funds"),
+            "{err}"
+        );
+        assert!(!err.contains("ECC[2]"), "{err}");
+        assert!(err.contains("no_funds"), "{err}");
+        assert!(err.contains("stage=data.transaction.action"), "{err}");
+        assert!(err.contains("transaction_hash"), "{err}");
+        assert!(err.contains("tx-public-480"), "{err}");
+        assert!(err.contains(REDACTED), "{err}");
+        assert!(!err.contains("secret-signature-480"), "{err}");
     }
 
     #[test]
@@ -624,6 +754,137 @@ mod tests {
     }
 
     #[test]
+    fn production_submit_tvm_error_is_diagnostic_and_credential_safe() {
+        for (exit_code, contract_label) in [
+            (137, "dex::ERR_INVALID_ZKPROOF"),
+            (403, "dex::ERR_INVALID_HISTORY_PROOF"),
+        ] {
+            let continuation = format!("continuation-token-{exit_code}-long");
+            let signature = format!("message-signature-{exit_code}-long");
+            let message = format!("submission rejected; prefix{continuation}suffix");
+            let submit_error = validate_onchain_submit_response(json!({
+                "result": null,
+                "error": {
+                    "code": "TVM_ERROR",
+                    "message": message,
+                    "data": {
+                        "exit_code": exit_code,
+                        "phase": "compute",
+                        "vm_error": "contract execution failed",
+                        "signature": signature,
+                        "message_hash": "msg-public-deadbeef",
+                        "current_time": "1752345678",
+                        "thread_id": "thread-public-cafebabe"
+                    }
+                },
+                "ext_message_token": {
+                    "unsigned": continuation,
+                    "signature": signature,
+                    "issuer": {"bm": "public-ish-issuer"}
+                }
+            }))
+            .unwrap_err();
+            let direct = submit_error.to_string();
+            let chained = format!("{:#}", anyhow::Error::new(submit_error));
+
+            for displayed in [&direct, &chained] {
+                for expected in [
+                    "code=TVM_ERROR",
+                    "phase=compute",
+                    "contract execution failed",
+                    "msg-public-deadbeef",
+                    "current_time",
+                    "1752345678",
+                    "thread-public-cafebabe",
+                    REDACTED,
+                    contract_label,
+                ] {
+                    assert!(
+                        displayed.contains(expected),
+                        "missing {expected}: {displayed}"
+                    );
+                }
+                assert!(
+                    displayed.contains(&format!("exit_code={exit_code}")),
+                    "{displayed}"
+                );
+                assert!(!displayed.contains(&continuation), "{displayed}");
+                assert!(!displayed.contains(&signature), "{displayed}");
+            }
+        }
+    }
+
+    #[test]
+    fn tvm_sdk_621_wrapper_remains_diagnostic_and_credential_safe() {
+        const GENERIC_MESSAGE: &str = "Message failed during the compute phase";
+        for (exit_code, contract_label) in [
+            (137, "dex::ERR_INVALID_ZKPROOF"),
+            (403, "dex::ERR_INVALID_HISTORY_PROOF"),
+        ] {
+            let continuation = format!("synthetic-continuation-{exit_code}");
+            let signature = format!("synthetic-signature-{exit_code}");
+            let unsigned = format!("synthetic-unsigned-{exit_code}");
+            let signed_boc = format!("synthetic-signed-boc-{exit_code}");
+            // Shape produced by pinned tvm-sdk's
+            // Error::try_extract_send_messages_error/send_message_server_error.
+            let submit_error = validate_onchain_submit_response(json!({
+                "error": {
+                    "code": 621,
+                    "message": GENERIC_MESSAGE,
+                    "data": {
+                        "node_error": {
+                            "extensions": {
+                                "code": "TVM_ERROR",
+                                "message": GENERIC_MESSAGE,
+                                "details": {
+                                    "phase": "compute",
+                                    "vm_error": "contract execution failed",
+                                    "exit_code": exit_code,
+                                    "transaction_hash": "tx-deadbeef",
+                                    "message_hash": "msg-cafebabe",
+                                    "signed_boc": signed_boc
+                                }
+                            }
+                        },
+                        "ext_message_token": {
+                            "unsigned": unsigned,
+                            "signature": signature,
+                            "issuer": {"bm": continuation}
+                        }
+                    }
+                }
+            }))
+            .unwrap_err();
+            let direct = submit_error.to_string();
+            let chained = format!("{:#}", anyhow::Error::new(submit_error));
+
+            for displayed in [&direct, &chained] {
+                assert!(
+                    displayed.contains(&format!("exit_code={exit_code}")),
+                    "{displayed}"
+                );
+                assert!(
+                    displayed.contains("stage=data.node_error.extensions.details"),
+                    "{displayed}"
+                );
+                assert!(displayed.contains(contract_label), "{displayed}");
+                assert!(displayed.contains(GENERIC_MESSAGE), "{displayed}");
+                assert!(
+                    displayed.contains("contract execution failed"),
+                    "{displayed}"
+                );
+                assert!(displayed.contains("phase=compute"), "{displayed}");
+                assert!(displayed.contains("tx-deadbeef"), "{displayed}");
+                assert!(displayed.contains("msg-cafebabe"), "{displayed}");
+                assert!(displayed.contains(REDACTED), "{displayed}");
+                for credential in [&continuation, &signature, &unsigned, &signed_boc] {
+                    assert!(!displayed.contains(credential), "{displayed}");
+                }
+            }
+        }
+    }
+
+    #[test]
     fn sanitized_payload_redacts_secret_fields() {
         let err = validate_onchain_submit_response(json!({
             "error": {
@@ -632,7 +893,14 @@ mod tests {
                 "data": {
                     "seed_phrase": "alpha beta gamma",
                     "provider_api_key": "sk-live",
-                    "signed_message_body": "te6ccgEBAQEAAAAA",
+                    "messageboc": "te6ccgEBAQEAAAAA",
+                    "ext_message_token": {
+                        "unsigned": "synthetic-unsigned",
+                        "signature": "synthetic-signature",
+                        "issuer": {"bm": "synthetic-continuation"}
+                    },
+                    "nested": [{"refresh_token": "synthetic-refresh"}],
+                    "signed_boc": "synthetic-signed-boc",
                     "public_key": "0xabc",
                     "phase": "compute"
                 }
@@ -642,8 +910,184 @@ mod tests {
         let sanitized = err.sanitized_payload();
         assert_eq!(sanitized["error"]["data"]["seed_phrase"], REDACTED);
         assert_eq!(sanitized["error"]["data"]["provider_api_key"], REDACTED);
-        assert_eq!(sanitized["error"]["data"]["signed_message_body"], REDACTED);
+        assert_eq!(sanitized["error"]["data"]["messageboc"], REDACTED);
+        assert_eq!(sanitized["error"]["data"]["ext_message_token"], REDACTED);
+        assert_eq!(
+            sanitized["error"]["data"]["nested"][0]["refresh_token"],
+            REDACTED
+        );
+        assert_eq!(sanitized["error"]["data"]["signed_boc"], REDACTED);
         assert_eq!(sanitized["error"]["data"]["public_key"], "0xabc");
         assert_eq!(sanitized["error"]["message"], "compute phase failed");
+    }
+
+    #[test]
+    fn structured_credential_echoed_in_upstream_message_is_not_displayed() {
+        let credential = "synthetic-reusable-signature";
+        let err = validate_onchain_submit_response(json!({
+            "error": {
+                "code": 621,
+                "message": format!("rejected signature {credential}"),
+                "data": {
+                    "node_error": {
+                        "extensions": {
+                            "code": "TVM_ERROR",
+                            "details": {
+                                "phase": "compute",
+                                "exit_code": 137,
+                                "signature": credential
+                            }
+                        }
+                    }
+                }
+            }
+        }))
+        .unwrap_err()
+        .to_string();
+
+        assert!(err.contains("signature"), "{err}");
+        assert!(err.contains(REDACTED), "{err}");
+        assert!(!err.contains(credential), "{err}");
+    }
+
+    #[test]
+    fn signed_message_body_is_redacted_but_plain_body_is_public() {
+        let sanitized = sanitize_onchain_submit_payload(&json!({
+            "signed_message_body": "synthetic-signed-message-boc",
+            "signedMessageBody": "synthetic-compact-signed-message-boc",
+            "body": "execution failed"
+        }));
+
+        assert_eq!(sanitized["signed_message_body"], REDACTED);
+        assert_eq!(sanitized["signedMessageBody"], REDACTED);
+        assert_eq!(sanitized["body"], "execution failed");
+    }
+
+    #[test]
+    fn echo_masking_ignores_short_values_and_masks_mid_word_occurrences() {
+        let short = sanitize_onchain_submit_payload(&json!({
+            "signature": "x",
+            "message": "execution failed for x"
+        }));
+        assert_eq!(short["message"], "execution failed for x");
+
+        let token = "reusable-token-505";
+        let long = sanitize_onchain_submit_payload(&json!({
+            "ext_message_token": {
+                "unsigned": token,
+                "signature": "reusable-signature-505",
+                "issuer": {"bm": "public-ish-issuer"}
+            },
+            "message": format!("execution failed for {token}; prefix{token}suffix")
+        }));
+        assert_eq!(
+            long["message"],
+            format!("execution failed for {REDACTED}; prefix{REDACTED}suffix")
+        );
+    }
+
+    #[test]
+    fn echoed_signed_boc_is_not_displayed() {
+        let signed_boc = "te6ccgEBAQEA-reusable-signed-boc";
+        let displayed = validate_onchain_submit_response(json!({
+            "error": {
+                "code": "TVM_ERROR",
+                "message": format!("submission rejected: prefix{signed_boc}suffix"),
+                "data": {
+                    "exit_code": 137,
+                    "signed_message_body": signed_boc
+                }
+            }
+        }))
+        .unwrap_err()
+        .to_string();
+
+        assert!(displayed.contains(REDACTED), "{displayed}");
+        assert!(!displayed.contains(signed_boc), "{displayed}");
+    }
+
+    #[test]
+    fn final_display_uses_structural_redaction_and_exact_value_masking() {
+        let credentials = [
+            "Bearer auth-X",
+            "camel-api-X",
+            "correct horse battery staple",
+            "object-ext-X",
+            "object-signature-X",
+            "object-unsigned-X",
+            "object-boc-X",
+            "password-hash-X",
+            "secret-hash-X",
+        ];
+        let message = format!(
+            "upstream echoed {}; providerApiKey={}; password rejected; signature verification failed",
+            credentials[0], credentials[1]
+        );
+
+        for (exit_code, contract_label) in [
+            (137, "dex::ERR_INVALID_ZKPROOF"),
+            (403, "dex::ERR_INVALID_HISTORY_PROOF"),
+        ] {
+            let displayed = validate_onchain_submit_response(json!({
+                "error": {
+                    "code": 621,
+                    "message": message,
+                    "data": {
+                        "node_error": {"extensions": {
+                            "code": "TVM_ERROR",
+                            "details": {
+                                "exit_code": exit_code,
+                                "authorization": credentials[0],
+                                "providerApiKey": credentials[1],
+                                "password": credentials[2],
+                                "ext_message_token": {
+                                    "unsigned": credentials[3],
+                                    "signature": credentials[4],
+                                    "issuer": {"bm": "public-ish-issuer"}
+                                },
+                                "signature": credentials[4],
+                                "unsigned": {"body": credentials[5]},
+                                "signed_boc": credentials[6],
+                                "password_hash": credentials[7],
+                                "secret_hash": credentials[8],
+                                "token_type": "NACKL",
+                                "token_contract": "0:public-contract",
+                                "token_amount": 42,
+                                "completion_tokens": 17,
+                                "signature_status": "checked",
+                                "signature_valid": false,
+                                "transaction_hash": "tx-public",
+                                "message_hash": "msg-public",
+                                "diagnostic": "signature verification failed"
+                            }
+                        }}
+                    }
+                }
+            }))
+            .unwrap_err()
+            .to_string();
+
+            for credential in credentials {
+                assert!(!displayed.contains(credential), "{displayed}");
+            }
+            for public in [
+                "token_type",
+                "token_contract",
+                "token_amount",
+                "completion_tokens",
+                "signature_status",
+                "signature_valid",
+                "tx-public",
+                "msg-public",
+                "signature verification failed",
+            ] {
+                assert!(displayed.contains(public), "missing {public}: {displayed}");
+            }
+            assert!(
+                displayed.contains(&format!("exit_code={exit_code}")),
+                "{displayed}"
+            );
+            assert!(displayed.contains(contract_label), "{displayed}");
+        }
     }
 }

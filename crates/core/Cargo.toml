@@ -52,5 +52,6 @@ shellnet = ["dep:gosh-ackinacki", "dep:anyhow", "dep:tvm_block", "dep:tvm_types"
 test-giver = ["shellnet"]
 
 [dev-dependencies]
+anyhow.workspace = true
 proptest.workspace = true
 http.workspace = true

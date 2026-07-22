@@ -1,3 +1,31 @@
+## v0.0.15
+
+- fix: model-only exact-row match uses authoritative on-chain row (unblocks live model-only buy)
+- fix: clock-skew preflight before signed writes
+- docs: record rejected epoch design and contract-owner requirements
+- fix: native Anthropic seller upstream (api.anthropic.com/v1/messages)
+- fix(-D2): surface ECC[2]-shortfall (no_funds/result_code=38) on note-funded provision
+- fix: live-harness leftovers -- 4.0.27 pin text, --test-threads=1, headroom bound
+- fix: surface verbatim tvm-sdk error + numeric exit code (diagnose 137 vs 403)
+- Directive: respond to reporter on now + repro note-deploy on ARM
+- fix: use accepted output as buyer continuity heartbeat
+- fix: preserve real order-book identity through buyer quote/journal/pre-submit
+- guard: gate UpdateCustodian funding wallet before artifacts
+- revert: the dapp_id 0->4 change is a proven no-op (Multisig discards dapp_id)
+- fix: route note-deploy generateVoucher to RootPN dapp 4 (was stale dapp 0)
+- fix: stamp workspace version to release tag
+- fix: persist on-demand ambiguous-submit recovery identity
+- fix( corrective): injectable note-deploy retry boundary + real production-loop regressions
+- mitigate: harden dexdo note-deploy Hermez SRS preflight
+- Directive: release under LIVE shellnet 4.0.27 (supersedes 362/4.0.21)
+- refactor(cli): move buyer command core to cli/buyer.rs (C15)
+- refactor(cli): move run_monitor to cli/monitor.rs (C14)
+- refactor(cli): move run_seller to cli/seller.rs (C13)
+- refactor(cli): move run_note_withdraw handler to cli/note_cmd.rs (C12)
+- refactor(cli): move markets list handlers to cli/markets.rs (C11)
+- refactor(cli): move provision/market-deploy/destroy admin handlers to cli/admin.rs (C10)
+- fix: restore read-only test coverage + correct C7/C8/C9/C-FIX/lint evidence (foreground recovery, supersedes PR465)
+
 ## v0.0.14
 
 - fix: stamp workspace version to release tag

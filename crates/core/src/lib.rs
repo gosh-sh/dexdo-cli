@@ -33,9 +33,14 @@ pub use gosh_ackinacki::{
 #[cfg(feature = "shellnet")]
 pub use shellnet::{
     endpoint_urls, keypair_ed_pubkey, normalize_endpoint, real_market_deal_view, resolve_endpoint,
-    DealContext, Deployed, MoneySubmitError, RealBuyerBackend, RealChainBackend, RealDealBackend,
-    RealNote, RealSellerBackend, ShellnetDoctorCheck, ShellnetDoctorReport, ShellnetDoctorStatus,
-    DEFAULT_SHELLNET_ENDPOINT, MODEL_TICK_SIZE,
+    shellnet_clock_skew_preflight, DealContext, Deployed, MoneySubmitError, RealBuyerBackend,
+    RealChainBackend, RealDealBackend, RealNote, RealSellerBackend, ShellnetDoctorCheck,
+    ShellnetDoctorReport, ShellnetDoctorStatus, DEFAULT_SHELLNET_ENDPOINT, MODEL_TICK_SIZE,
+};
+#[cfg(feature = "test-giver")]
+pub use shellnet::{
+    PlaceInferenceBuyReceipt, TokenContractSettlementEvent, TokenContractSettlementReceipt,
+    TokenContractSettlementReceipts,
 };
 
 pub use chain::{

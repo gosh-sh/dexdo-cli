@@ -3,6 +3,7 @@
 
 use crate::seller::auth::{challenge_bytes, AuthRegistry};
 use crate::seller::upstream::UpstreamConfig;
+use crate::seller::upstream::UpstreamEvent;
 use dexdo_core::note::Signature;
 use dexdo_proto::{
     CanonChunk, CanonRequest, Challenge, ChallengeRequest, Gateway, GatewayServer, StreamRequest,
@@ -140,25 +141,31 @@ impl Default for GatewayState {
 /// Multiple sequential streams on the same deal all add to the same `count`. Pairs with `drive_advance`'s
 /// Acquire reads, which translate delivered tokens to ticks.
 async fn relay_counting(
-    mut up_rx: mpsc::Receiver<Result<CanonChunk, Status>>,
+    mut up_rx: mpsc::Receiver<Result<UpstreamEvent, Status>>,
     tx: mpsc::Sender<Result<CanonChunk, Status>>,
     count: Arc<AtomicU64>,
 ) {
-    while let Some(chunk) = up_rx.recv().await {
-        let delivered_tokens = chunk.as_ref().ok().map(accounted_tokens);
-        if tx.send(chunk).await.is_err() {
-            break; // buyer disconnected -- the chunk was not delivered
-        }
-        if let Some(tokens) = delivered_tokens {
-            count.fetch_add(tokens, Ordering::Release);
+    while let Some(event) = up_rx.recv().await {
+        match event {
+            Ok(UpstreamEvent::Chunk {
+                chunk,
+                accounted_tokens,
+            }) => {
+                if tx.send(Ok(chunk)).await.is_err() {
+                    break;
+                }
+                count.fetch_add(accounted_tokens, Ordering::Release);
+            }
+            Ok(UpstreamEvent::Accounted(tokens)) => {
+                count.fetch_add(tokens, Ordering::Release);
+            }
+            Err(status) => {
+                if tx.send(Err(status)).await.is_err() {
+                    break;
+                }
+            }
         }
     }
-}
-
-fn accounted_tokens(chunk: &CanonChunk) -> u64 {
-    let token_ids = chunk.token_ids.len() as u64;
-    let logprobs = chunk.logprobs.len() as u64;
-    token_ids.max(logprobs).max(1)
 }
 
 /// gRPC implementation of the gateway service.
@@ -231,9 +238,9 @@ impl Gateway for GatewayService {
         let count =
             self.state
                 .stream_token_limit(&req.token_contract, request.as_ref(), mock_upstream);
-        // R1: the upstream adapts the CANONICAL request(OpenAI shape) that arrived in the opening
+        // R1: the upstream adapts the CANONICAL request that arrived in the opening
         // call alongside authorization. The mock model builds fake output from the prompt; the real
-        // OpenAI-compatible upstream(Groq) proxies the request and normalizes the SSE(R1/R5/R6).
+        // provider adapter proxies the request and normalizes the SSE(R1/R5/R6).
         let upstream = self.state.upstream.clone();
         // The per-deal delivery tracker is shared across all of this deal's streams (the gateway map returns
         // the same `DealDelivery`), so `count` accumulates over sequential requests. The relay is handed only
@@ -242,7 +249,7 @@ impl Gateway for GatewayService {
         // Incremental yielding(R6): without buffering. The upstream feeds an internal channel;
         // `relay_counting` forwards each chunk to the buyer AND adds the delivered token count to the deal's
         // cumulative count, so the seller's `drive_advance` can bill only real delivered ticks.
-        let (up_tx, up_rx) = mpsc::channel::<Result<CanonChunk, Status>>(16);
+        let (up_tx, up_rx) = mpsc::channel(16);
         tokio::spawn(async move {
             upstream.run(count, request, up_tx).await;
         });
@@ -262,15 +269,17 @@ mod tests {
     /// Drive one gRPC stream through `relay_counting`: emit `n_ok` `Ok` chunks (and optionally a trailing
     /// `Err`), forward to a sink, and return how many items reached the buyer. Adds delivered tokens to `count`.
     async fn run_one_stream(count: Arc<AtomicU64>, n_ok: usize, trailing_err: bool) -> usize {
-        let (up_tx, up_rx) = mpsc::channel::<Result<CanonChunk, Status>>(16);
+        let (up_tx, up_rx) = mpsc::channel(16);
         let (tx, mut rx) = mpsc::channel::<Result<CanonChunk, Status>>(16);
         tokio::spawn(async move {
             for _ in 0..n_ok {
                 up_tx
-                    .send(Ok(CanonChunk {
-                        token_ids: vec![42],
-                        ..CanonChunk::default()
-                    }))
+                    .send(Ok(
+                        crate::seller::upstream::chunk_with_structured_accounting(CanonChunk {
+                            token_ids: vec![42],
+                            ..CanonChunk::default()
+                        }),
+                    ))
                     .await
                     .unwrap();
             }
@@ -397,17 +406,24 @@ mod tests {
     #[tokio::test]
     async fn relay_counts_tokens_from_structured_signals_not_chunks() {
         let count = Arc::new(AtomicU64::new(0));
-        let (up_tx, up_rx) = mpsc::channel::<Result<CanonChunk, Status>>(16);
+        let (up_tx, up_rx) = mpsc::channel(16);
         let (tx, mut rx) = mpsc::channel::<Result<CanonChunk, Status>>(16);
         tokio::spawn(async move {
             up_tx
-                .send(Ok(CanonChunk {
-                    token_ids: vec![1, 2, 3],
-                    ..CanonChunk::default()
-                }))
+                .send(Ok(
+                    crate::seller::upstream::chunk_with_structured_accounting(CanonChunk {
+                        token_ids: vec![1, 2, 3],
+                        ..CanonChunk::default()
+                    }),
+                ))
                 .await
                 .unwrap();
-            up_tx.send(Ok(CanonChunk::default())).await.unwrap();
+            up_tx
+                .send(Ok(crate::seller::upstream::chunk_with_structured_accounting(
+                    CanonChunk::default(),
+                )))
+                .await
+                .unwrap();
         });
         relay_counting(up_rx, tx, count.clone()).await;
         while rx.recv().await.is_some() {}
@@ -416,5 +432,34 @@ mod tests {
             4,
             "one chunk may carry multiple canonical tokens; no signal falls back to one token"
         );
+    }
+
+    #[tokio::test]
+    async fn relay_uses_authoritative_usage_instead_of_anthropic_delta_count() {
+        let count = Arc::new(AtomicU64::new(0));
+        let (up_tx, up_rx) = mpsc::channel(16);
+        let (tx, mut rx) = mpsc::channel(16);
+        tokio::spawn(async move {
+            for text in ["Hello", " world"] {
+                up_tx
+                    .send(Ok(UpstreamEvent::Chunk {
+                        chunk: CanonChunk {
+                            text: text.into(),
+                            ..CanonChunk::default()
+                        },
+                        accounted_tokens: 0,
+                    }))
+                    .await
+                    .unwrap();
+            }
+            up_tx.send(Ok(UpstreamEvent::Accounted(5))).await.unwrap();
+        });
+        relay_counting(up_rx, tx, count.clone()).await;
+        let mut delivered_chunks = 0;
+        while rx.recv().await.is_some() {
+            delivered_chunks += 1;
+        }
+        assert_eq!(delivered_chunks, 2);
+        assert_eq!(count.load(Ordering::Acquire), 5);
     }
 }

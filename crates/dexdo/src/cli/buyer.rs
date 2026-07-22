@@ -955,10 +955,10 @@ fn money_submit_error_clears_journal(error: &anyhow::Error) -> bool {
 }
 
 #[cfg(feature = "shellnet")]
-fn journal_match(fill: &dexdo_core::MatchedFill, order_id: u128) -> BuyerJournalMatch {
+fn journal_match(fill: &dexdo_core::MatchedFill) -> BuyerJournalMatch {
     BuyerJournalMatch {
         token_contract: fill.token_contract.clone(),
-        order_id,
+        order_id: fill.order_id,
         ticks: fill.ticks,
         clearing_price: fill.price_per_tick,
     }
@@ -1644,7 +1644,7 @@ async fn complete_buyer_submit_with_journal(
     let token_contract =
         correlated_buy_token_contract(fill.clone(), expected.as_ref(), ticks, max_price_per_tick)
             .map_err(anyhow::Error::new)?;
-    let resolved = journal_match(&fill, quoted_order.map_or(0, |order| order.order_id));
+    let resolved = journal_match(&fill);
     persist_resolved_buyer_submits(journal_path, note_addr, &[resolved])?;
     let status = validate_reported_match_state(chain, &token_contract)
         .await
@@ -1669,6 +1669,7 @@ async fn reconcile_pending_buyer_submit(
             .resolved_matches
             .iter()
             .map(|matched| dexdo_core::MatchedFill {
+                order_id: matched.order_id,
                 token_contract: matched.token_contract.clone(),
                 ticks: matched.ticks,
                 price_per_tick: matched.clearing_price,
@@ -1721,10 +1722,7 @@ async fn reconcile_pending_buyer_submit(
         .cloned()
         .collect::<Vec<_>>();
     if !matching.is_empty() {
-        let resolved = matching
-            .iter()
-            .map(|fill| journal_match(fill, journal.quoted_order.order_id))
-            .collect::<Vec<_>>();
+        let resolved = matching.iter().map(journal_match).collect::<Vec<_>>();
         persist_resolved_buyer_submits(journal_path, note_addr, &resolved)?;
     }
     if matching.len() != 1 {
@@ -2603,9 +2601,10 @@ async fn buyer_quote_selection_once(
     escrow: Option<u128>,
 ) -> Result<BuyerQuoteSelection> {
     let mut explicit_submit_safe_order = None;
+    let mut model_submit_safe_order = None;
     if explicit_tc.is_none() {
-        chain
-            .assert_model_buy_matches_executable_quote(ticks, max_price_per_tick)
+        model_submit_safe_order = chain
+            .submit_safe_model_buy_quote_order(ticks, max_price_per_tick)
             .await
             .map_err(|e| anyhow::Error::new(e).context("buyer model-only quote preflight"))?;
     } else if let Some(tc) = explicit_tc {
@@ -2624,7 +2623,7 @@ async fn buyer_quote_selection_once(
         }
     }
     let explicit_submit_safe_selected = explicit_submit_safe_order.is_some();
-    let mut orders = if let Some(order) = explicit_submit_safe_order {
+    let mut orders = if let Some(order) = explicit_submit_safe_order.or(model_submit_safe_order) {
         vec![order]
     } else {
         mock_orders_from_offers(chain.discover_offers().await?)
@@ -3774,6 +3773,7 @@ fn buyer_monitor_current_facts(
     session_settled: bool,
     chain_state: Option<DealChainState>,
     now_secs: u64,
+    last_accepted_output_secs: u64,
 ) -> dexdo::buyer::continuity::DealFacts {
     use dexdo::buyer::continuity::DealFacts;
 
@@ -3787,10 +3787,11 @@ fn buyer_monitor_current_facts(
         return DealFacts::closed(token_contract);
     }
     if state.opened {
-        let idle_secs = if state.last_advance == 0 {
+        let latest_activity = state.last_advance.max(last_accepted_output_secs);
+        let idle_secs = if latest_activity == 0 {
             0
         } else {
-            now_secs.saturating_sub(state.last_advance)
+            now_secs.saturating_sub(latest_activity)
         };
         return DealFacts::opened_idle(token_contract, idle_secs);
     }
@@ -3812,6 +3813,7 @@ enum BuyerMonitorRecoveryKind {
 async fn execute_buyer_monitor_recovery(
     chain: &dyn ChainBackend,
     action: dexdo::buyer::continuity::BuyerAction,
+    heartbeat: Option<&dexdo_core::chain::HeartbeatGuard>,
 ) -> Option<(
     BuyerMonitorRecoveryKind,
     dexdo_core::TokenContract,
@@ -3829,12 +3831,27 @@ async fn execute_buyer_monitor_recovery(
             ))
         }
         BuyerAction::ReclaimOpened { token_contract } => {
-            let result = chain.seller_timeout(&token_contract).await;
-            Some((
-                BuyerMonitorRecoveryKind::ReclaimOpened,
-                token_contract,
-                result,
-            ))
+            let result = match heartbeat {
+                Some(heartbeat) => {
+                    chain
+                        .seller_timeout_if_heartbeat(&token_contract, heartbeat)
+                        .await
+                }
+                None => chain.seller_timeout(&token_contract).await.map(Some),
+            };
+            match result {
+                Ok(Some(settlement)) => Some((
+                    BuyerMonitorRecoveryKind::ReclaimOpened,
+                    token_contract,
+                    Ok(settlement),
+                )),
+                Ok(None) => None,
+                Err(error) => Some((
+                    BuyerMonitorRecoveryKind::ReclaimOpened,
+                    token_contract,
+                    Err(error),
+                )),
+            }
         }
         _ => None,
     }
@@ -3955,12 +3972,15 @@ fn spawn_buyer_service_renewal(
                 }
             };
             let now_secs = unix_now_secs();
+            let accepted_output_heartbeat = active.accepted_output_guard();
+            let current_opened = chain_state.as_ref().is_some_and(|state| state.opened);
             let current_facts = buyer_monitor_current_facts(
                 current_tc.clone(),
                 active.remaining_tokens(),
                 active.session.is_settled(),
                 chain_state,
                 now_secs,
+                active.last_accepted_output_unix_secs(),
             );
             let consumer_demand =
                 if active.has_active_or_recent_request(now_secs, CONSUMER_DEMAND_RECENT_SECS) {
@@ -3987,7 +4007,7 @@ fn spawn_buyer_service_renewal(
                             cfg,
                         );
                         if let Some((_kind, token_contract, result)) =
-                            execute_buyer_monitor_recovery(chain.as_ref(), recovery).await
+                            execute_buyer_monitor_recovery(chain.as_ref(), recovery, None).await
                         {
                             match result {
                                 Ok(settlement) => {
@@ -4022,10 +4042,27 @@ fn spawn_buyer_service_renewal(
                 continue;
             }
 
+            let mut current_cfg = cfg;
+            if current_opened {
+                current_cfg.stream_timeout_secs = match chain.deal_stream_timeout(&current_tc).await
+                {
+                    Ok(timeout) => timeout,
+                    Err(e) => {
+                        planner.keep_active(&current_tc);
+                        tracing::warn!(
+                            token_contract = %current_tc,
+                            error = %e,
+                            "buyer continuity: getConfig().streamTimeout unreadable; refusing inactivity reclaim"
+                        );
+                        continue;
+                    }
+                };
+            }
+
             let action = planner.tick_with_mode(
                 Some(current_facts),
                 ready_next,
-                cfg,
+                current_cfg,
                 continuity_mode,
                 consumer_demand,
             );
@@ -4045,8 +4082,12 @@ fn spawn_buyer_service_renewal(
                 }
                 action @ (BuyerAction::CleanupUnopened { .. }
                 | BuyerAction::ReclaimOpened { .. }) => {
-                    if let Some((kind, token_contract, result)) =
-                        execute_buyer_monitor_recovery(chain.as_ref(), action).await
+                    if let Some((kind, token_contract, result)) = execute_buyer_monitor_recovery(
+                        chain.as_ref(),
+                        action,
+                        Some(&accepted_output_heartbeat),
+                    )
+                    .await
                     {
                         match (kind, result) {
                             (BuyerMonitorRecoveryKind::CleanupUnopened, Ok(settlement)) => {
@@ -4081,6 +4122,8 @@ fn spawn_buyer_service_renewal(
                             }
                         }
                         pending = None;
+                    } else {
+                        planner.keep_active(&current_tc);
                     }
                 }
                 BuyerAction::PlaceNextDeal { reason } => {
@@ -4650,6 +4693,7 @@ async fn prepare_lazy_buyer_api_deal_once(
         .and_then(|outcome| outcome.submit_reconciliation.as_ref())
         .map(|reconciliation| reconciliation.submit_identity.clone());
     let mut service_renewal: Option<(u128, u128, u128)> = None;
+    let mut buyer_order_id = None;
     let (mut token_contract, buy_ticks) = if let Some(outcome) = raised_money {
         if args.resume {
             emit_shared_buyer_event(
@@ -4782,7 +4826,7 @@ async fn prepare_lazy_buyer_api_deal_once(
                     .map(|d| d.as_secs() as i64)
                     .unwrap_or(0)
                     - RESUME_LOOKBACK_SECS;
-                let tc = chain
+                let fill = chain
                     .wait_matched_token_contract(
                         since_unix,
                         std::time::Duration::from_secs(DEAL_WAIT_SECS),
@@ -4790,8 +4834,9 @@ async fn prepare_lazy_buyer_api_deal_once(
                     .await?
                     .ok_or_else(|| {
                         ChainError::Chain("buyer fill event returned no match".to_string())
-                    })?
-                    .token_contract;
+                    })?;
+                let tc = fill.token_contract;
+                buyer_order_id = Some(fill.order_id);
                 chain.assert_model_only_resume_target(&tc).await?;
                 emit_shared_buyer_event(
                     &events,
@@ -4799,6 +4844,7 @@ async fn prepare_lazy_buyer_api_deal_once(
                     machine::OP_BUYER_START,
                     json!({
                         "token_contract": tc.clone(),
+                        "order_id": machine::amount(fill.order_id),
                         "role": "buyer",
                         "source": "note_fill_event",
                         "deal_handle": deals::make_handle_id(&tc),
@@ -5003,6 +5049,7 @@ async fn prepare_lazy_buyer_api_deal_once(
             market_path: args.market.as_deref(),
             contracts: &args.contracts,
             endpoint,
+            created_order_ids: buyer_order_id.into_iter().collect(),
         };
         if args.mock.mock_chain {
             save_mock_runtime_deal_handle(input)?;
@@ -5572,6 +5619,7 @@ async fn run_buyer_inner(
         .and_then(|outcome| outcome.submit_reconciliation.as_ref())
         .map(|reconciliation| reconciliation.submit_identity.clone());
     let mut service_renewal: Option<(u128, u128, u128)> = None;
+    let mut buyer_order_id = None;
     let (mut token_contract, buy_ticks) = if let Some(outcome) = raised_money {
         machine_context.set_token_contract(&outcome.token_contract);
         if let Some(events) = machine_events.as_mut() {
@@ -5736,7 +5784,7 @@ async fn run_buyer_inner(
                      for a matched deal on {frame_model} -- no new buy"
                 );
                 }
-                let tc = chain
+                let fill = chain
                     .wait_matched_token_contract(
                         since_unix,
                         std::time::Duration::from_secs(DEAL_WAIT_SECS),
@@ -5744,8 +5792,9 @@ async fn run_buyer_inner(
                     .await?
                     .ok_or_else(|| {
                         ChainError::Chain("buyer fill event returned no match".to_string())
-                    })?
-                    .token_contract;
+                    })?;
+                let tc = fill.token_contract;
+                buyer_order_id = Some(fill.order_id);
                 chain.assert_model_only_resume_target(&tc).await?;
                 machine_context.order_book = Some("model_order_book".to_string());
                 machine_context.set_token_contract(&tc);
@@ -5755,6 +5804,7 @@ async fn run_buyer_inner(
                         machine::OP_BUYER_START,
                         json!({
                             "token_contract": tc.clone(),
+                            "order_id": machine::amount(fill.order_id),
                             "role": "buyer",
                             "source": "note_fill_event",
                             "deal_handle": deals::make_handle_id(&tc),
@@ -6018,6 +6068,7 @@ async fn run_buyer_inner(
             market_path: args.market.as_deref(),
             contracts: &args.contracts,
             endpoint,
+            created_order_ids: buyer_order_id.into_iter().collect(),
         };
         let saved = if args.mock.mock_chain {
             save_mock_runtime_deal_handle(input)?
@@ -6431,10 +6482,15 @@ mod tests {
     #[derive(Default)]
     struct QuotePreflightChain {
         offers: Vec<dexdo_core::OfferListing>,
+        discover_calls: std::sync::atomic::AtomicUsize,
         model_preflight_error: Option<String>,
         model_preflight_failure: Option<QuotePreflightFailure>,
         model_preflight_calls: std::sync::atomic::AtomicUsize,
         model_preflight_transport_failures: std::sync::atomic::AtomicUsize,
+        model_submit_safe_order: Option<dexdo_core::OrderBookOrder>,
+        model_pre_submit_order: Option<dexdo_core::OrderBookOrder>,
+        model_before_post_calls: std::sync::atomic::AtomicUsize,
+        model_money_submit_calls: std::sync::atomic::AtomicUsize,
         model_presubmit_preflight_calls: std::sync::atomic::AtomicUsize,
         model_submit_calls: std::sync::atomic::AtomicUsize,
         explicit_preflight_error: Option<String>,
@@ -6494,6 +6550,8 @@ mod tests {
         async fn discover_offers(
             &self,
         ) -> Result<Vec<dexdo_core::OfferListing>, dexdo_core::ChainError> {
+            self.discover_calls
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             Ok(self.offers.clone())
         }
 
@@ -6543,6 +6601,50 @@ mod tests {
                 Some(err) => Err(dexdo_core::ChainError::Chain(err.clone())),
                 None => Ok(()),
             }
+        }
+
+        async fn submit_safe_model_buy_quote_order(
+            &self,
+            ticks: u128,
+            max_price_per_tick: u128,
+        ) -> Result<Option<dexdo_core::OrderBookOrder>, dexdo_core::ChainError> {
+            self.assert_model_buy_matches_executable_quote(ticks, max_price_per_tick)
+                .await?;
+            Ok(self.model_submit_safe_order.clone())
+        }
+
+        fn model_buy_order_book_identity(&self) -> Option<String> {
+            Some(format!("0:{}", "2".repeat(64)))
+        }
+
+        async fn place_buy_by_model_with_submit_identity(
+            &self,
+            _note: &dyn dexdo_core::Note,
+            quoted_order: Option<&dexdo_core::OrderBookOrder>,
+            _ticks: u128,
+            _max_price_per_tick: u128,
+            _escrow: u128,
+            cursor: &mut dexdo_core::MatchWatchCursor,
+            before_post: &mut (dyn FnMut(
+                String,
+                dexdo_core::MatchWatchCursor,
+            ) -> Result<(), dexdo_core::ChainError>
+                      + Send),
+        ) -> Result<(), dexdo_core::ChainError> {
+            let selected = self.model_pre_submit_order.as_ref().ok_or_else(|| {
+                dexdo_core::ChainError::Chain(
+                    "buyer model-only preflight failed: no_executable_ask: rendered ask disappeared; no escrow was sent"
+                        .to_string(),
+                )
+            })?;
+            dexdo_core::chain::ensure_pre_submit_quote_unchanged(quoted_order, selected)?;
+            *cursor = dexdo_core::MatchWatchCursor::new(67);
+            self.model_before_post_calls
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            before_post(format!("boc-sha256:{}", "a".repeat(64)), cursor.clone())?;
+            self.model_money_submit_calls
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Ok(())
         }
 
         async fn assert_explicit_buy_matches_executable_quote(
@@ -6651,6 +6753,53 @@ mod tests {
         ) -> Option<dexdo_core::StreamSnapshot> {
             None
         }
+    }
+
+    /// the production real-shellnet seam returns one complete matcher row. Selection must retain
+    /// every field and must not reconstruct the durable identity through lossy offer discovery.
+    #[tokio::test]
+    async fn buyer_model_quote_preserves_full_submit_safe_order_without_offer_round_trip() {
+        use std::sync::atomic::Ordering;
+
+        let mut real_order =
+            QuotePreflightChain::order(154, &format!("0:{}", "3".repeat(64)), 1_000_000, 4);
+        real_order.owner_note = format!("0:{}", "4".repeat(64));
+        real_order.escrow = 9_999;
+        real_order.deadline = 1_234_567;
+        real_order.flags = 7;
+        real_order.timestamp = 1_234_000;
+        let chain = QuotePreflightChain {
+            offers: vec![QuotePreflightChain::offer(
+                real_order.token_contract.as_deref().unwrap(),
+                real_order.price_per_tick as u64,
+                real_order.ticks as u64,
+            )],
+            model_submit_safe_order: Some(real_order.clone()),
+            submit_safe_single_ask_quote: true,
+            ..Default::default()
+        };
+
+        let selection = super::buyer_quote_selection(&chain, None, 2, 1_000_000, None)
+            .await
+            .expect("canonical real order remains executable");
+
+        assert_eq!(selection.quoted_order.as_ref(), Some(&real_order));
+        assert_eq!(selection.quote.fills.len(), 1);
+        assert_eq!(selection.quote.fills[0].order_id, real_order.order_id);
+        assert_eq!(
+            selection.quote.fills[0].token_contract,
+            real_order.token_contract.clone().unwrap()
+        );
+        assert_eq!(
+            chain.discover_calls.load(Ordering::SeqCst),
+            0,
+            "real-shellnet model selection must never call mock_orders_from_offers"
+        );
+        assert_eq!(
+            chain.model_preflight_calls.load(Ordering::SeqCst),
+            1,
+            "the canonical assertion must perform exactly one row-returning real-shellnet quote read"
+        );
     }
 
     #[tokio::test]
@@ -6921,6 +7070,26 @@ mod tests {
         assert_eq!(selection.quote.fills.len(), 1);
         assert_eq!(selection.quote.fills[0].ticks, 1);
         assert_eq!(selection.quote.fills[0].token_contract, "0:big");
+    }
+
+    #[tokio::test]
+    async fn buyer_model_only_quote_selection_preserves_authoritative_on_chain_row() {
+        let mut authoritative = QuotePreflightChain::order(7, "0:best", 1000, 1);
+        authoritative.timestamp = 1_783_535_201;
+        let chain = QuotePreflightChain {
+            offers: vec![QuotePreflightChain::offer("0:best", 1000, 1)],
+            model_submit_safe_order: Some(authoritative.clone()),
+            submit_safe_single_ask_quote: true,
+            ..Default::default()
+        };
+
+        let selection = super::buyer_quote_selection(&chain, None, 1, 1000, None)
+            .await
+            .expect("model-only selection uses the authoritative submit-safe row");
+
+        assert_eq!(selection.quoted_order, Some(authoritative));
+        assert_eq!(selection.quote.fills[0].order_id, 7);
+        assert_eq!(selection.quoted_order.unwrap().timestamp, 1_783_535_201);
     }
 
     #[tokio::test]
@@ -7510,8 +7679,8 @@ mod tests {
             .expect("buyer quote helper present");
         let body = &source[quote..];
         let preflight = body
-            .find("assert_model_buy_matches_executable_quote")
-            .expect("model-only quote selection checks raw/executable submit safety");
+            .find("submit_safe_model_buy_quote_order")
+            .expect("model-only quote selection reads the authoritative submit-safe row");
         let discover = body
             .find("chain.discover_offers")
             .expect("buyer quote selection discovers offers");
@@ -8508,6 +8677,7 @@ mod tests {
         subscription_placement_calls: std::sync::atomic::AtomicUsize,
         subscription_placement_error: bool,
         subscription_order_active: bool,
+        heartbeat_during_reclaim_preflight: std::sync::Mutex<Option<dexdo::buyer::api::ApiDeal>>,
     }
 
     impl RecordingRecoveryChain {
@@ -8635,6 +8805,30 @@ mod tests {
             })
         }
 
+        async fn seller_timeout_if_heartbeat(
+            &self,
+            _token_contract: &dexdo_core::TokenContract,
+            heartbeat: &dexdo_core::chain::HeartbeatGuard,
+        ) -> Result<Option<dexdo_core::Settlement>, dexdo_core::ChainError> {
+            if let Some(deal) = self
+                .heartbeat_during_reclaim_preflight
+                .lock()
+                .expect("preflight heartbeat lock")
+                .take()
+            {
+                deal.record_accepted_output(super::unix_now_secs());
+            }
+            if !heartbeat.unchanged() {
+                return Ok(None);
+            }
+            self.reclaim_calls
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Ok(Some(dexdo_core::Settlement::SellerNoShow {
+                to_buyer_refund: 0,
+                seller_commission_returned: 0,
+            }))
+        }
+
         async fn cleanup_unopened(
             &self,
             _token_contract: &dexdo_core::TokenContract,
@@ -8675,6 +8869,7 @@ mod tests {
             self.wait_match_calls
                 .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             Ok(Some(dexdo_core::MatchedFill {
+                order_id: 1,
                 token_contract: self
                     .next_match
                     .clone()
@@ -8750,16 +8945,19 @@ mod tests {
         };
         for fill in [
             dexdo_core::MatchedFill {
+                order_id: 7,
                 token_contract: "tc-wrong".to_string(),
                 ticks: 2,
                 price_per_tick: 700,
             },
             dexdo_core::MatchedFill {
+                order_id: 7,
                 token_contract: "tc-intended".to_string(),
                 ticks: 3,
                 price_per_tick: 700,
             },
             dexdo_core::MatchedFill {
+                order_id: 7,
                 token_contract: "tc-intended".to_string(),
                 ticks: 2,
                 price_per_tick: 701,
@@ -9703,6 +9901,48 @@ mod tests {
         };
         let chain = RecordingRecoveryChain::default();
 
+        for heartbeat in [101, 400, 699] {
+            let active = super::buyer_monitor_current_facts(
+                "tc-active".to_string(),
+                100,
+                false,
+                Some(dexdo_core::DealChainState {
+                    funded: true,
+                    opened: true,
+                    disputed: false,
+                    probe_accepted: false,
+                    funded_time: Some(1),
+                    last_advance: 100,
+                }),
+                700,
+                heartbeat,
+            );
+            assert!(matches!(
+                BuyerContinuity::default().tick(Some(active), None, cfg),
+                BuyerAction::ServeCurrent { .. }
+            ));
+        }
+
+        let boundary = super::buyer_monitor_current_facts(
+            "tc-boundary".to_string(),
+            100,
+            false,
+            Some(dexdo_core::DealChainState {
+                funded: true,
+                opened: true,
+                disputed: false,
+                probe_accepted: false,
+                funded_time: Some(1),
+                last_advance: 100,
+            }),
+            700,
+            100,
+        );
+        assert!(matches!(
+            BuyerContinuity::default().tick(Some(boundary), None, cfg),
+            BuyerAction::ReclaimOpened { .. }
+        ));
+
         let opened_idle = super::buyer_monitor_current_facts(
             "tc-open".to_string(),
             100,
@@ -9716,6 +9956,7 @@ mod tests {
                 last_advance: 100,
             }),
             700,
+            0,
         );
         let mut planner = BuyerContinuity::default();
         let action = planner.tick(Some(opened_idle), None, cfg);
@@ -9725,7 +9966,42 @@ mod tests {
                 token_contract: "tc-open".to_string()
             }
         );
-        let (kind, tc, result) = super::execute_buyer_monitor_recovery(&chain, action)
+
+        let race_chain = std::sync::Arc::new(RecordingRecoveryChain::default());
+        let race_deal = dexdo::buyer::api::ApiDeal::new(
+            dexdo::buyer::api::Route {
+                handover: dexdo_core::Handover {
+                    endpoint: "https://127.0.0.1:1".to_string(),
+                    tls_fingerprint: "00".repeat(32),
+                },
+                token_contract: "tc-open".to_string(),
+                max_tokens: 100,
+            },
+            std::sync::Arc::new(dexdo::buyer::api::SessionSettle::new(
+                race_chain.clone(),
+                "tc-open".to_string(),
+                std::sync::Arc::new(dexdo_core::LocalNote::generate()),
+            )),
+            std::sync::Arc::new(dexdo::buyer::api::ContentGate::skip()),
+        );
+        *race_chain
+            .heartbeat_during_reclaim_preflight
+            .lock()
+            .expect("preflight heartbeat lock") = Some(race_deal.clone());
+        let race_heartbeat = race_deal.accepted_output_guard();
+        assert!(
+            super::execute_buyer_monitor_recovery(
+                race_chain.as_ref(),
+                action.clone(),
+                Some(&race_heartbeat),
+            )
+            .await
+            .is_none(),
+            "newly accepted output must cancel reclaim immediately before submission"
+        );
+        assert_eq!(race_chain.reclaim_calls.load(Ordering::SeqCst), 0);
+
+        let (kind, tc, result) = super::execute_buyer_monitor_recovery(&chain, action, None)
             .await
             .expect("reclaim action executes");
         assert_eq!(kind, super::BuyerMonitorRecoveryKind::ReclaimOpened);
@@ -9751,6 +10027,7 @@ mod tests {
                 last_advance: 0,
             }),
             700,
+            0,
         );
         let mut planner = BuyerContinuity::default();
         let action = planner.tick(Some(never_opened), None, cfg);
@@ -9760,7 +10037,7 @@ mod tests {
                 token_contract: "tc-clean".to_string()
             }
         );
-        let (kind, tc, result) = super::execute_buyer_monitor_recovery(&chain, action)
+        let (kind, tc, result) = super::execute_buyer_monitor_recovery(&chain, action, None)
             .await
             .expect("cleanup action executes");
         assert_eq!(kind, super::BuyerMonitorRecoveryKind::CleanupUnopened);
@@ -9776,6 +10053,49 @@ mod tests {
             BuyerAction::IgnoreStale { token_contract } if token_contract == "tc-clean"
         ));
         assert_eq!(chain.cleanup_calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn buyer_monitor_dynamic_stream_timeout_delays_reclaim_until_real_threshold() {
+        use dexdo::buyer::continuity::{BuyerAction, BuyerContinuity, ContinuityConfig};
+        use std::sync::atomic::Ordering;
+
+        let cfg = ContinuityConfig {
+            stream_timeout_secs: 1_200,
+            ..ContinuityConfig::default()
+        };
+        let facts_at = |now| {
+            super::buyer_monitor_current_facts(
+                "tc-dynamic-timeout".to_string(),
+                100,
+                false,
+                Some(dexdo_core::DealChainState {
+                    funded: true,
+                    opened: true,
+                    disputed: false,
+                    probe_accepted: false,
+                    funded_time: Some(1),
+                    last_advance: 100,
+                }),
+                now,
+                0,
+            )
+        };
+        let chain = RecordingRecoveryChain::default();
+
+        assert!(matches!(
+            BuyerContinuity::default().tick(Some(facts_at(700)), None, cfg),
+            BuyerAction::ServeCurrent { .. }
+        ));
+        assert_eq!(chain.reclaim_calls.load(Ordering::SeqCst), 0);
+
+        let action = BuyerContinuity::default().tick(Some(facts_at(1_300)), None, cfg);
+        assert!(matches!(action, BuyerAction::ReclaimOpened { .. }));
+        let (_, _, result) = super::execute_buyer_monitor_recovery(&chain, action, None)
+            .await
+            .expect("real dynamic threshold submits reclaim");
+        result.expect("dynamic threshold reclaim succeeds");
+        assert_eq!(chain.reclaim_calls.load(Ordering::SeqCst), 1);
     }
 
     #[test]
@@ -9925,6 +10245,184 @@ mod tests {
                 resolved_matches: journal.resolved_matches.clone(),
             }
         }
+    }
+
+    #[cfg(feature = "shellnet")]
+    fn issue67_real_like_order() -> dexdo_core::OrderBookOrder {
+        dexdo_core::OrderBookOrder {
+            order_id: 154,
+            owner_note: format!("0:{}", "4".repeat(64)),
+            token_contract: Some(format!("0:{}", "3".repeat(64))),
+            is_buy: false,
+            price_per_tick: 1_000_000,
+            ticks: 4,
+            escrow: 9_999,
+            deadline: 1_234_567,
+            flags: 7,
+            timestamp: 1_234_000,
+        }
+    }
+
+    #[cfg(feature = "shellnet")]
+    fn issue67_pipeline_chain(
+        quoted_order: &dexdo_core::OrderBookOrder,
+        fresh_order: Option<dexdo_core::OrderBookOrder>,
+    ) -> QuotePreflightChain {
+        QuotePreflightChain {
+            offers: vec![QuotePreflightChain::offer(
+                quoted_order.token_contract.as_deref().unwrap(),
+                quoted_order.price_per_tick as u64,
+                quoted_order.ticks as u64,
+            )],
+            model_submit_safe_order: Some(quoted_order.clone()),
+            model_pre_submit_order: fresh_order,
+            submit_safe_single_ask_quote: true,
+            ..Default::default()
+        }
+    }
+
+    #[cfg(feature = "shellnet")]
+    async fn issue67_select_and_submit(
+        chain: &QuotePreflightChain,
+        journal_path: &std::path::Path,
+    ) -> anyhow::Result<super::BuyerQuoteSelection> {
+        let ticks = 2;
+        let max_price_per_tick = chain
+            .model_submit_safe_order
+            .as_ref()
+            .unwrap()
+            .price_per_tick;
+        let escrow = dexdo_core::required_escrow_for_buy(ticks, max_price_per_tick);
+        let selection =
+            super::buyer_quote_selection(chain, None, ticks, max_price_per_tick, Some(escrow))
+                .await?;
+        let buyer = dexdo::buyer::Buyer::generate();
+        let mut cursor = dexdo_core::MatchWatchCursor::default();
+        super::place_quote_bound_buy_with_journal(
+            chain,
+            &buyer,
+            &super::BuyerSubmitIntent::foreground(),
+            None,
+            &selection,
+            ticks,
+            max_price_per_tick,
+            escrow,
+            &format!("0:{}", "1".repeat(64)),
+            &mut cursor,
+            journal_path,
+        )
+        .await?;
+        Ok(selection)
+    }
+
+    /// an unchanged real matcher row is rendered, persisted before POST, and submitted exactly once
+    /// without ever entering the mock offer-reconstruction path.
+    #[cfg(feature = "shellnet")]
+    #[tokio::test]
+    async fn buyer_real_quote_identity_reaches_journal_and_money_submit_once() {
+        use std::sync::atomic::Ordering;
+
+        let order = issue67_real_like_order();
+        let chain = issue67_pipeline_chain(&order, Some(order.clone()));
+        let (dir, _cleanup) = buyer_journal_test_dir("buyer-issue-67-unchanged");
+        let journal_path = dir.join("submit.json");
+
+        let selection = issue67_select_and_submit(&chain, &journal_path)
+            .await
+            .expect("unchanged real matcher row submits");
+        assert_eq!(selection.quoted_order.as_ref(), Some(&order));
+        assert_eq!(selection.quote.fills[0].order_id, order.order_id);
+        assert_eq!(
+            selection.quote.fills[0].token_contract,
+            order.token_contract.clone().unwrap()
+        );
+        let journal: super::BuyerSubmitJournal =
+            serde_json::from_slice(&std::fs::read(&journal_path).unwrap()).unwrap();
+        assert_eq!(journal.quoted_order, order);
+        assert_eq!(journal.quote, selection.quote);
+        assert_eq!(chain.discover_calls.load(Ordering::SeqCst), 0);
+        assert_eq!(chain.model_before_post_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(chain.model_money_submit_calls.load(Ordering::SeqCst), 1);
+    }
+
+    /// negative: every matcher-relevant quote-to-submit mutation fails before durable journal POST
+    /// and before the money submit.
+    #[cfg(feature = "shellnet")]
+    #[tokio::test]
+    async fn buyer_real_quote_identity_change_fails_before_journal_and_escrow() {
+        use std::sync::atomic::Ordering;
+
+        let quoted = issue67_real_like_order();
+        let mut mutations = Vec::new();
+        let mut changed = quoted.clone();
+        changed.order_id += 1;
+        mutations.push(("order-id", changed));
+        let mut changed = quoted.clone();
+        changed.token_contract = Some(format!("0:{}", "5".repeat(64)));
+        mutations.push(("token-contract", changed));
+        let mut changed = quoted.clone();
+        changed.price_per_tick += 1;
+        mutations.push(("price", changed));
+        let mut changed = quoted.clone();
+        changed.ticks -= 1;
+        mutations.push(("ticks", changed));
+
+        for (label, changed) in mutations {
+            let chain = issue67_pipeline_chain(&quoted, Some(changed));
+            let (dir, _cleanup) =
+                buyer_journal_test_dir(&format!("buyer-issue-67-changed-{label}"));
+            let journal_path = dir.join("submit.json");
+            let error = issue67_select_and_submit(&chain, &journal_path)
+                .await
+                .expect_err("changed matcher head must fail before escrow");
+            assert!(
+                error.to_string().contains(
+                    "buyer pre-submit matcher head differs from the rendered quote; no escrow was sent"
+                ),
+                "{label}: {error:#}"
+            );
+            assert!(
+                !journal_path.exists(),
+                "{label}: no journal may claim a POST"
+            );
+            assert_eq!(chain.discover_calls.load(Ordering::SeqCst), 0, "{label}");
+            assert_eq!(
+                chain.model_before_post_calls.load(Ordering::SeqCst),
+                0,
+                "{label}"
+            );
+            assert_eq!(
+                chain.model_money_submit_calls.load(Ordering::SeqCst),
+                0,
+                "{label}"
+            );
+        }
+    }
+
+    /// negative: a quote that disappears or becomes non-executable on the fresh pre-submit read
+    /// cannot create a journal or attempt escrow.
+    #[cfg(feature = "shellnet")]
+    #[tokio::test]
+    async fn buyer_disappeared_real_quote_fails_before_journal_and_escrow() {
+        use std::sync::atomic::Ordering;
+
+        let quoted = issue67_real_like_order();
+        let chain = issue67_pipeline_chain(&quoted, None);
+        let (dir, _cleanup) = buyer_journal_test_dir("buyer-issue-67-disappeared");
+        let journal_path = dir.join("submit.json");
+        let error = issue67_select_and_submit(&chain, &journal_path)
+            .await
+            .expect_err("disappeared ask must fail before escrow");
+
+        assert!(error.to_string().contains("no_executable_ask"), "{error:#}");
+        assert!(
+            error.to_string().contains("no escrow was sent"),
+            "{error:#}"
+        );
+        assert!(!journal_path.exists());
+        assert_eq!(chain.discover_calls.load(Ordering::SeqCst), 0);
+        assert_eq!(chain.model_before_post_calls.load(Ordering::SeqCst), 0);
+        assert_eq!(chain.model_money_submit_calls.load(Ordering::SeqCst), 0);
     }
 
     #[cfg(feature = "shellnet")]
@@ -10618,6 +11116,7 @@ mod tests {
         );
 
         let fill = dexdo_core::MatchedFill {
+            order_id: fixture.quoted_order.order_id,
             token_contract: fixture.quoted_order.token_contract.clone().unwrap(),
             ticks: fixture.ticks,
             price_per_tick: fixture.quoted_order.price_per_tick,
@@ -11008,6 +11507,7 @@ mod tests {
         .unwrap();
         let _env = EnvVarGuard::set("DEXDO_PN_POOL", pool_path.as_os_str());
         let fill = dexdo_core::MatchedFill {
+            order_id: fixture.quoted_order.order_id,
             token_contract: fixture.quoted_order.token_contract.clone().unwrap(),
             ticks: fixture.ticks,
             price_per_tick: fixture.quoted_order.price_per_tick,
@@ -11063,6 +11563,7 @@ mod tests {
         let _ = std::fs::remove_file(&money_lock.journal_path);
         super::write_buyer_submit_journal(&money_lock.journal_path, &fixture).unwrap();
         let fill = dexdo_core::MatchedFill {
+            order_id: fixture.quoted_order.order_id,
             token_contract: fixture.quoted_order.token_contract.clone().unwrap(),
             ticks: fixture.ticks,
             price_per_tick: fixture.quoted_order.price_per_tick,
@@ -11285,6 +11786,7 @@ mod tests {
             let _ = std::fs::remove_file(&money_lock.journal_path);
             super::write_buyer_submit_journal(&money_lock.journal_path, &fixture).unwrap();
             let fill = dexdo_core::MatchedFill {
+                order_id: fixture.quoted_order.order_id,
                 token_contract: fixture.quoted_order.token_contract.clone().unwrap(),
                 ticks: fixture.ticks,
                 price_per_tick: fixture.quoted_order.price_per_tick,
@@ -11365,6 +11867,7 @@ mod tests {
         let _ = std::fs::remove_file(&money_lock.journal_path);
         super::write_buyer_submit_journal(&money_lock.journal_path, &fixture).unwrap();
         let fill = dexdo_core::MatchedFill {
+            order_id: fixture.quoted_order.order_id,
             token_contract: fixture.quoted_order.token_contract.clone().unwrap(),
             ticks: fixture.ticks,
             price_per_tick: fixture.quoted_order.price_per_tick,
@@ -11481,6 +11984,7 @@ mod tests {
         .unwrap();
         let _env = EnvVarGuard::set("DEXDO_PN_POOL", pool_path.as_os_str());
         let fill = dexdo_core::MatchedFill {
+            order_id: fixture.quoted_order.order_id,
             token_contract: fixture.quoted_order.token_contract.clone().unwrap(),
             ticks: fixture.ticks,
             price_per_tick: fixture.quoted_order.price_per_tick,
@@ -11498,7 +12002,7 @@ mod tests {
             escrow: fixture.escrow,
             submit_identity: fixture.submit_identity.clone(),
             created_at_unix: fixture.created_at_unix,
-            resolved_match: Some(super::journal_match(&fill, fixture.quoted_order.order_id)),
+            resolved_match: Some(super::journal_match(&fill)),
         };
         let bytes = serde_json::to_vec_pretty(&legacy).unwrap();
         super::with_pool_write_lock(&journal_path, |path| {

@@ -181,9 +181,7 @@ fn sse_response(
                 CanonStreamNext::Bailed | CanonStreamNext::End => break,
             };
             if !chunk.text.is_empty() {
-                yield Ok(Event::default().data(render::openai_delta_chunk(
-                    &id, &model, created, &chunk.text, first,
-                )));
+                yield Ok(openai_content_event(&deal, &id, &model, created, &chunk.text, first));
                 first = false;
             }
             let before = driver.received();
@@ -219,6 +217,25 @@ fn sse_response(
         yield Ok(Event::default().data("[DONE]"));
     };
     Sse::new(sse)
+}
+
+fn openai_content_event(
+    deal: &ApiDeal,
+    id: &str,
+    model: &str,
+    created: u64,
+    text: &str,
+    first: bool,
+) -> Event {
+    deal.record_accepted_output(now_secs());
+    Event::default().data(render::openai_delta_chunk(id, model, created, text, first))
+}
+
+#[cfg(test)]
+pub(super) fn heartbeat_poll_test_stream(deal: ApiDeal) -> impl Stream<Item = Event> {
+    async_stream::stream! {
+        yield openai_content_event(&deal, "id", "model", 1, "content", true);
+    }
 }
 
 /// Non-streaming(B19): collect the entire canonical stream into a single `chat.completion`.

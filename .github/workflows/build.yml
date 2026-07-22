@@ -30,9 +30,13 @@ jobs:
       - uses: actions/checkout@v4
       - name: No AI-authorship markers in the published tree
         run: |
-          # The character classes keep the literal marker words out of this file
-          # while still matching them at run time.
-          pat='c[l]aude|c[o]dex|g[e]mini|copil[o]t|co-?authored-by|generated (by|with) (c[l]aude|c[o]dex)'
+          # Flag AUTHORSHIP phrasing only (mirrors release/scan-clean.sh's AI_RE),
+          # NOT bare product/model vocabulary. Names like the Anthropic/OpenAI model
+          # families are legitimate traded-model names (the seller sells them), not
+          # authorship traces.
+          # The character classes keep the literal marker words out of this file (which
+          # scan-clean.sh itself scans as *.yml) while still matching them at run time.
+          pat='co-?authored-by|((written|generated|created|authored|assisted)[[:space:]]+(by|with)[[:space:]]+|generated[[:space:]]+this[[:space:]]+|ai-generated[[:space:]]+)(\[[^]]*\][[:space:]]*\([^)]*\)|c[l]aude([[:space:]]+code)?|c[o]dex|g[e]mini|copil[o]t|an?[[:space:]]*ai|implementation)|\b(c[l]aude([[:space:]]+code)?|c[o]dex|g[e]mini|copil[o]t|an?[[:space:]]*ai)[[:space:]]+(generated|wrote|created|authored|assisted)\b|\bas[[:space:]]+an?[[:space:]]+ai\b|\bi[[:space:]]+am[[:space:]]+an?[[:space:]]+ai\b'
           if grep -rniE "$pat" \
                --include='*.rs' --include='*.toml' --include='*.md' --include='*.sol' . ; then
             echo "authorship markers found in the published tree" >&2

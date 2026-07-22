@@ -7,6 +7,10 @@
 use crate::machine::Settlement;
 use crate::note::{Note, NotePubkey};
 use async_trait::async_trait;
+use std::sync::{
+    atomic::{AtomicU64, Ordering},
+    Arc,
+};
 
 mod accounting;
 mod mock;
@@ -14,6 +18,26 @@ mod types;
 pub use accounting::*;
 pub use mock::*;
 pub use types::*;
+
+#[derive(Clone)]
+pub struct HeartbeatGuard {
+    generation: Arc<AtomicU64>,
+    expected: u64,
+}
+
+impl HeartbeatGuard {
+    pub fn new(generation: Arc<AtomicU64>) -> Self {
+        let expected = generation.load(Ordering::SeqCst);
+        Self {
+            generation,
+            expected,
+        }
+    }
+
+    pub fn unchanged(&self) -> bool {
+        self.generation.load(Ordering::SeqCst) == self.expected
+    }
+}
 
 /// On-chain abstraction. In -- `MockChainBackend`; in -- the shellnet adapter.
 /// Brings up the minimum for e2e: discovery/book/oracle and subscriptions are the horizon.
@@ -158,16 +182,29 @@ pub trait ChainBackend: Send + Sync {
             "buyer order activity reconciliation is not supported by this backend".to_string(),
         ))
     }
-    /// Read-only guard for automated model-only buyer selection. Real shellnet `placeInferenceBuy(modelHash,...)`
-    /// cannot name an order id or `TokenContract`, so an executable quote is submit-safe only when the raw
-    /// on-chain price/time matcher would reach the same ask. Default `Ok(())` keeps mock backends simple; the
-    /// real buyer backend fails closed on stale raw heads before emitting a machine `quote_selected` event.
+    /// Read-only guard for automated model-only buyer selection. Real shellnet
+    /// `placeInferenceBuy(modelHash,...)` cannot name an order id or `TokenContract`, so an
+    /// executable quote is submit-safe only when the raw on-chain price/time matcher reaches the
+    /// same ask.
     async fn assert_model_buy_matches_executable_quote(
         &self,
         _ticks: u128,
         _max_price_per_tick: u128,
     ) -> Result<(), ChainError> {
         Ok(())
+    }
+    /// Return the authoritative submit-safe row for a model-only buyer selection. Real shellnet
+    /// returns the full on-chain row so rendering, durable journaling, and the immediate
+    /// pre-submit guard preserve one identity without a lossy listing round trip. Backends that
+    /// cannot expose the on-chain row retain the legacy preflight + discovery path.
+    async fn submit_safe_model_buy_quote_order(
+        &self,
+        ticks: u128,
+        max_price_per_tick: u128,
+    ) -> Result<Option<OrderBookOrder>, ChainError> {
+        self.assert_model_buy_matches_executable_quote(ticks, max_price_per_tick)
+            .await?;
+        Ok(None)
     }
     /// Read-only guard for explicit `--token-contract` buyer selection. A displayed quote is submit-safe only
     /// if the model-wide `placeInferenceBuy(modelHash,...)` matcher would actually fund this TokenContract,
@@ -297,6 +334,19 @@ pub trait ChainBackend: Send + Sync {
         &self,
         token_contract: &TokenContract,
     ) -> Result<Settlement, ChainError>;
+    /// Submit inactivity reclaim only if accepted output has not advanced since the caller planned it.
+    /// Real backends override this to place the comparison after transaction preflight and immediately
+    /// before the reclaim send.
+    async fn seller_timeout_if_heartbeat(
+        &self,
+        token_contract: &TokenContract,
+        heartbeat: &HeartbeatGuard,
+    ) -> Result<Option<Settlement>, ChainError> {
+        if !heartbeat.unchanged() {
+            return Ok(None);
+        }
+        self.seller_timeout(token_contract).await.map(Some)
+    }
     /// The seller never opened a funded match: after MATCH_OPEN_TIMEOUT the buyer can clean up the unopened
     /// deal(`streamCleanup` -> `TC.cleanupUnopened`) and recover escrow. Default unsupported; real buyer
     /// backends override it.
@@ -316,6 +366,12 @@ pub trait ChainBackend: Send + Sync {
         _token_contract: &TokenContract,
     ) -> Result<Option<DealChainState>, ChainError> {
         Ok(None)
+    }
+    /// Authoritative per-deal `getConfig().streamTimeout`. Unsupported/unreadable backends fail closed.
+    async fn deal_stream_timeout(&self, token_contract: &TokenContract) -> Result<u64, ChainError> {
+        Err(ChainError::Chain(format!(
+            "getConfig().streamTimeout unavailable for {token_contract}"
+        )))
     }
     /// Snapshot of locks and burned SHELL for the contract -- for e2e checks.
     async fn snapshot(&self, token_contract: &TokenContract) -> Option<StreamSnapshot>;
@@ -460,6 +516,45 @@ mod tests {
             flags: 0,
             timestamp: 0,
         }
+    }
+
+    /// the immediate money boundary accepts only the exact row rendered to the buyer. Every
+    /// matcher-relevant identity mutation remains an actionable pre-submit failure.
+    #[test]
+    fn pre_submit_quote_identity_rejects_real_matcher_head_changes() {
+        let quoted = ask(154, "0:quoted", 1_000_000, 4);
+        ensure_pre_submit_quote_unchanged(Some(&quoted), &quoted)
+            .expect("an unchanged matcher head is submit-safe");
+
+        let mut mutations = Vec::new();
+        let mut changed = quoted.clone();
+        changed.order_id += 1;
+        mutations.push(changed);
+        let mut changed = quoted.clone();
+        changed.token_contract = Some("0:changed".to_string());
+        mutations.push(changed);
+        let mut changed = quoted.clone();
+        changed.price_per_tick += 1;
+        mutations.push(changed);
+        let mut changed = quoted.clone();
+        changed.ticks -= 1;
+        mutations.push(changed);
+
+        for changed in mutations {
+            let error = ensure_pre_submit_quote_unchanged(Some(&quoted), &changed)
+                .expect_err("a changed matcher head must fail before escrow")
+                .to_string();
+            assert!(
+                error.contains(
+                    "buyer pre-submit matcher head differs from the rendered quote; no escrow was sent"
+                ),
+                "{error}"
+            );
+        }
+        assert!(ensure_pre_submit_quote_unchanged(None, &quoted)
+            .expect_err("a missing durable quote must fail before escrow")
+            .to_string()
+            .contains("no escrow was sent"));
     }
 
     /// quote consumes the book in price/time order and includes the 2.5% book fee in totals.

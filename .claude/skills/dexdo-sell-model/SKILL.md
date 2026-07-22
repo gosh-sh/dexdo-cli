@@ -113,6 +113,33 @@ changes nothing on-chain.
 
 Export the upstream key (not written to logs): `export GROQ_API_KEY=<your-key>`
 
+### Selling Claude through the native Anthropic upstream
+
+Dexdo selects `seller/upstream/anthropic.rs` when the model entry points to `api.anthropic.com`. The seller
+calls the Anthropic Messages API directly; do not put a LiteLLM/OpenAI-compatible proxy between them. Keep the
+real key in the environment named by `api_key_env`, never in `models.json`. Anthropic does not return token ids
+or OpenAI logprobs, so keep `logprobs` off and omit `top_logprobs`:
+
+```json
+{
+  "models": {
+    "claude-sonnet": {
+      "frame_model": "anthropic--claude-sonnet--4",
+      "served_model": "claude-sonnet-4-20250514",
+      "base_url": "https://api.anthropic.com",
+      "api_key_env": "ANTHROPIC_API_KEY",
+      "tokenizer_family": "claude",
+      "price_per_tick": 1000,
+      "capabilities": { "logprobs": false }
+    }
+  }
+}
+```
+
+Set `ANTHROPIC_API_KEY`, then run the seller with `--model claude-sonnet --models models.json`. The adapter
+streams text immediately and reconciles billing to Anthropic's cumulative `usage.output_tokens`, not SSE
+content-delta count.
+
 ## Phase 4. Read the price, then provision the deal
 
 First look at the model's shared order book (read-only, writes nothing) so you can price your offer

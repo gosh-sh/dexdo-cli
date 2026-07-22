@@ -9,9 +9,11 @@ use crate::chain::{
     InferenceSubscriptionPlacement, MatchWatchCursor, MatchedFill, OrderBookSubscription,
 };
 use crate::manifest::{model_hash_for, MarketManifest};
-use crate::onchain_diagnostics::validate_onchain_submit_response;
+use crate::onchain_diagnostics::{validate_onchain_submit_response, OnchainSubmitError};
 use crate::oracle_manifest::OracleMarketManifest;
 use anyhow::{anyhow, Context, Result};
+#[cfg(feature = "test-giver")]
+use base64::Engine as _;
 use gosh_ackinacki::airegistry::calls::encode_external_call;
 use gosh_ackinacki::airegistry::deploy::{build_deploy, local_context};
 use gosh_ackinacki::config::AiRegistryConfig;
@@ -21,12 +23,23 @@ use serde::Deserialize;
 use serde_json::{json, Value};
 use std::collections::BTreeSet;
 use std::path::Path;
+#[cfg(feature = "test-giver")]
+use tvm_block::Deserializable;
 
 const FIXED_SUPERROOT_ACCOUNT_ID: &str =
     "0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c";
 const MIN_PMP_INITIAL_STAKE: u128 = 10_000_000;
 /// `PrivateNote.sol::STREAM_LOCK_MAX`; the owner escape hatch is accepted strictly after this delay.
 pub const PRIVATE_NOTE_STREAM_LOCK_MAX_SECS: u64 = 7 * 24 * 60 * 60;
+/// Pinned `tvm_client` default signed-message lifetime(`message_expiration_timeout`).
+const SDK_MESSAGE_EXPIRY_SECS: u64 = 40;
+/// Strict contract window: `block.timestamp < expireAt < block.timestamp + 300`.
+const CONTRACT_MESSAGE_WINDOW_SECS: u64 = 300;
+/// Keep ten seconds away from either strict boundary for observation/submit latency.
+const CLOCK_SKEW_SAFETY_MARGIN_SECS: u64 = 10;
+const MAX_CLOCK_BEHIND_SECS: u64 = SDK_MESSAGE_EXPIRY_SECS - CLOCK_SKEW_SAFETY_MARGIN_SECS;
+const MAX_CLOCK_AHEAD_SECS: u64 =
+    CONTRACT_MESSAGE_WINDOW_SECS - SDK_MESSAGE_EXPIRY_SECS - CLOCK_SKEW_SAFETY_MARGIN_SECS;
 
 fn money_submit_identity(signed_boc: &str) -> String {
     use sha2::{Digest, Sha256};
@@ -112,7 +125,11 @@ fn correlate_fill_batch(
     let Some(expected) = expected else {
         return Ok(fills.last().cloned());
     };
-    if let Some(fill) = fills.iter().find(|fill| *fill == expected) {
+    if let Some(fill) = fills.iter().find(|fill| {
+        fill.token_contract == expected.token_contract
+            && fill.ticks == expected.ticks
+            && fill.price_per_tick == expected.price_per_tick
+    }) {
         return Ok(Some(fill.clone()));
     }
     let Some(fill) = fills.first() else {
@@ -512,6 +529,90 @@ fn skipped_check(name: &str, message: &str) -> ShellnetDoctorCheck {
         actual: None,
         message: message.to_string(),
     }
+}
+
+fn clock_skew_check(local_unix: u64, chain_unix: u64) -> ShellnetDoctorCheck {
+    let (skew_secs, direction, permitted_secs) = if local_unix >= chain_unix {
+        (local_unix - chain_unix, "ahead of", MAX_CLOCK_AHEAD_SECS)
+    } else {
+        (chain_unix - local_unix, "behind", MAX_CLOCK_BEHIND_SECS)
+    };
+    let status = if skew_secs <= permitted_secs {
+        ShellnetDoctorStatus::Pass
+    } else {
+        ShellnetDoctorStatus::Fail
+    };
+    let message = if status == ShellnetDoctorStatus::Pass {
+        format!(
+            "local clock is within the signed-message safety threshold (skew={skew_secs}s, \
+             local_unix={local_unix}, chain_unix={chain_unix})"
+        )
+    } else {
+        format!(
+            "CLOCK_SKEW: local clock is {skew_secs}s {direction} chain time \
+             (local_unix={local_unix}, chain_unix={chain_unix}); refusing signed writes before \
+             submit: the pinned SDK gives signed messages {SDK_MESSAGE_EXPIRY_SECS}s to expire and \
+             contracts strictly require block.timestamp < expireAt < block.timestamp + \
+             {CONTRACT_MESSAGE_WINDOW_SECS}. Fix system time / NTP and retry."
+        )
+    };
+    ShellnetDoctorCheck {
+        name: "local clock vs chain time".to_string(),
+        status,
+        address: None,
+        expected: Some(format!(
+            "behind<={MAX_CLOCK_BEHIND_SECS}s, ahead<={MAX_CLOCK_AHEAD_SECS}s"
+        )),
+        actual: Some(format!(
+            "skew={skew_secs}s local_unix={local_unix} chain_unix={chain_unix}"
+        )),
+        message,
+    }
+}
+
+fn local_unix_secs() -> Result<u64> {
+    Ok(std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .context("local system clock is before the Unix epoch")?
+        .as_secs())
+}
+
+async fn fetch_chain_time_secs(http: &reqwest::Client, endpoint: &str) -> Result<u64> {
+    let (graphql_url, _) = endpoint_urls(endpoint)?;
+    let body = json!({
+        "query": "{ blockchain { blocks(last:1){ edges { node { gen_utime } } } } }"
+    });
+    let response: Value = http
+        .post(&graphql_url)
+        .json(&body)
+        .send()
+        .await
+        .with_context(|| format!("POST {graphql_url} for chain time"))?
+        .error_for_status()?
+        .json()
+        .await
+        .context("parse GraphQL chain-time response")?;
+    if let Some(errors) = response.get("errors").filter(|errors| !errors.is_null()) {
+        return Err(anyhow!("GraphQL chain-time errors: {errors}"));
+    }
+    response
+        .pointer("/data/blockchain/blocks/edges/0/node/gen_utime")
+        .and_then(Value::as_u64)
+        .ok_or_else(|| anyhow!("chain time: latest block is missing gen_utime"))
+}
+
+/// Fail closed before a signed SDK write when the operator clock is unsafe for the contracts'
+/// five-minute `expireAt` window.
+pub async fn shellnet_clock_skew_preflight(endpoint: &str) -> Result<()> {
+    let http = reqwest::Client::builder().user_agent(BROWSER_UA).build()?;
+    let check = clock_skew_check(
+        local_unix_secs()?,
+        fetch_chain_time_secs(&http, endpoint).await?,
+    );
+    if check.status == ShellnetDoctorStatus::Fail {
+        return Err(anyhow!(check.message));
+    }
+    Ok(())
 }
 
 fn dense_string_map(labels: &[String]) -> Value {
@@ -957,14 +1058,145 @@ fn submit_message_id() -> String {
     format!("dexdo-{}-{nanos}", std::process::id())
 }
 
+fn submit_failure_is_clock_related(payload: &Value) -> bool {
+    const GIVER_ADDRESS: &str =
+        "0:1111111111111111111111111111111111111111111111111111111111111111";
+
+    fn contains_string(value: &Value, wanted: &str) -> bool {
+        match value {
+            Value::String(value) => value == wanted,
+            Value::Array(items) => items.iter().any(|item| contains_string(item, wanted)),
+            Value::Object(fields) => fields.values().any(|value| contains_string(value, wanted)),
+            _ => false,
+        }
+    }
+
+    fn contains_exit_code(value: &Value, wanted: impl Fn(u64) -> bool + Copy) -> bool {
+        match value {
+            Value::Array(items) => items.iter().any(|item| contains_exit_code(item, wanted)),
+            Value::Object(fields) => fields.iter().any(|(key, value)| {
+                (matches!(
+                    key.as_str(),
+                    "exit_code" | "exitCode" | "vm_exit_code" | "vmExitCode"
+                ) && value.as_u64().is_some_and(wanted))
+                    || contains_exit_code(value, wanted)
+            }),
+            _ => false,
+        }
+    }
+
+    contains_exit_code(payload, |code| matches!(code, 401 | 402))
+        || (contains_string(payload, GIVER_ADDRESS)
+            && contains_exit_code(payload, |code| matches!(code, 102 | 103)))
+}
+
 fn checked_submit_response(resp: Value) -> Result<Value> {
     validate_onchain_submit_response(resp).map_err(|e| {
         tracing::debug!(
             payload = %e.sanitized_payload(),
             "shellnet submit failure payload"
         );
-        anyhow!(e)
+        let clock_related = submit_failure_is_clock_related(e.sanitized_payload());
+        let error = anyhow!(e);
+        if clock_related {
+            error.context(
+                "signed-write expiry/replay rejection: verify the operator clock/NTP; a preflight observation may have raced or gone stale",
+            )
+        } else {
+            error
+        }
     })
+}
+
+fn external_message_hash(boc_base64: &str) -> Result<String> {
+    use base64::Engine;
+
+    let bytes = base64::engine::general_purpose::STANDARD
+        .decode(boc_base64)
+        .context("decode signed external-message BOC")?;
+    let cell = tvm_types::read_single_root_boc(&bytes)
+        .map_err(|error| anyhow!("decode signed external-message cell: {error}"))?;
+    Ok(cell.repr_hash().to_hex_string())
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct CorrelatedActionReceipt {
+    message_hash: String,
+    transaction_hash: Option<String>,
+    aborted: Option<bool>,
+    action_success: Option<bool>,
+    result_code: Option<i64>,
+    no_funds: Option<bool>,
+}
+
+const EXACT_MESSAGE_RECEIPT_QUERY: &str = r#"
+    query($hash: String!, $accountId: String!, $dappId: String!) {
+      blockchain {
+        message(hash: $hash) {
+          id dst
+          dst_transaction {
+            id status aborted account_addr
+            action { result_code success no_funds }
+          }
+        }
+        account(account_id: $accountId, dapp_id: $dappId) {
+          info { id dapp_id }
+        }
+      }
+    }
+"#;
+
+fn fund_deploy_shell_receipt_error(
+    submit_error: anyhow::Error,
+    expected_message_hash: &str,
+    receipt: Option<&CorrelatedActionReceipt>,
+) -> anyhow::Error {
+    match receipt {
+        Some(receipt)
+            if bare_hex(&receipt.message_hash) == bare_hex(expected_message_hash)
+                && receipt.transaction_hash.is_some()
+                && receipt.aborted == Some(true)
+                && receipt.action_success == Some(false)
+                && receipt.result_code == Some(38)
+                && receipt.no_funds == Some(true) =>
+        {
+            submit_error.context(format!(
+                "fundDeployShell failed: insufficient ECC[2]/SHELL for note_fund_deploy_shell; \
+                 correlated finalized receipt message_hash={} transaction_hash={} \
+                 aborted=true action_success=false action_result_code=38 no_funds=true",
+                expected_message_hash,
+                receipt
+                    .transaction_hash
+                    .as_deref()
+                    .expect("guard requires a transaction hash"),
+            ))
+        }
+        Some(receipt) => submit_error.context(format!(
+            "fundDeployShell aborted; correlated receipt message_hash={} transaction_hash={} \
+             aborted={} action_success={} action_result_code={} no_funds={}; ECC[2] cause not proven",
+            expected_message_hash,
+            receipt
+                .transaction_hash
+                .as_deref()
+                .unwrap_or("<unavailable>"),
+            receipt
+                .aborted
+                .map_or_else(|| "<unavailable>".to_string(), |value| value.to_string()),
+            receipt
+                .action_success
+                .map_or_else(|| "<unavailable>".to_string(), |value| value.to_string()),
+            receipt
+                .result_code
+                .map_or_else(|| "<unavailable>".to_string(), |value| value.to_string()),
+            receipt
+                .no_funds
+                .map_or_else(|| "<unavailable>".to_string(), |value| value.to_string()),
+        )),
+        None => submit_error.context(format!(
+            "fundDeployShell aborted; no finalized destination receipt matched external \
+             message_hash={expected_message_hash}; ECC[2] cause not proven"
+        )),
+    }
 }
 
 fn build_money_post_http_client() -> reqwest::Result<reqwest::Client> {
@@ -1079,6 +1311,185 @@ async fn send_message_routed_money_once(
         .map_err(|source| anyhow::Error::new(MoneySubmitError::Rejected { source }))
 }
 
+async fn prepare_reclaim_money_post_if<P, F, Fut>(
+    prepare: P,
+    before_post: &mut (dyn FnMut() -> bool + Send),
+    send: F,
+) -> Result<Option<Value>>
+where
+    P: std::future::Future<Output = Result<(String, String, String, String)>>,
+    F: FnOnce((String, String, String, String)) -> Fut,
+    Fut: std::future::Future<Output = Result<Value>>,
+{
+    let prepared = prepare.await?;
+    if !before_post() {
+        return Ok(None);
+    }
+    send(prepared).await.map(Some)
+}
+
+async fn query_exact_destination_receipt(
+    http: &reqwest::Client,
+    endpoint: &str,
+    account_id: &str,
+    dapp_id: &str,
+    expected_message_hash: &str,
+) -> Result<Value> {
+    let gql = format!("{}/graphql", endpoint.trim_end_matches('/'));
+    let response: Value = http
+        .post(&gql)
+        .json(&json!({
+            "query": EXACT_MESSAGE_RECEIPT_QUERY,
+            "variables": {
+                "hash": bare_hex(expected_message_hash),
+                "accountId": bare_hex(account_id),
+                "dappId": bare_hex(dapp_id),
+            },
+        }))
+        .send()
+        .await?
+        .error_for_status()?
+        .json()
+        .await?;
+    Ok(response)
+}
+
+fn parse_exact_destination_receipt(
+    response: &Value,
+    expected_account_id: &str,
+    expected_dapp_id: &str,
+    expected_message_hash: &str,
+) -> Result<Option<CorrelatedActionReceipt>> {
+    let node = response
+        .pointer("/data/blockchain/message")
+        .ok_or_else(|| anyhow!("fundDeployShell receipt GraphQL response shape changed"))?;
+    if node.is_null() {
+        return Ok(None);
+    }
+    let message_hash = node["id"]
+        .as_str()
+        .ok_or_else(|| anyhow!("fundDeployShell exact-hash receipt has no message id"))?;
+    if bare_hex(message_hash) != bare_hex(expected_message_hash) {
+        return Err(anyhow!(
+            "fundDeployShell exact-hash lookup returned mismatched message id"
+        ));
+    }
+    let transaction = &node["dst_transaction"];
+    if transaction.is_null() {
+        return Ok(None);
+    }
+    let finalized = transaction["status"].as_i64() == Some(3)
+        || transaction["status"].as_str() == Some("Finalized");
+    if !finalized {
+        return Ok(None);
+    }
+
+    let expected_account = bare_hex(expected_account_id);
+    let destination = node["dst"]
+        .as_str()
+        .ok_or_else(|| anyhow!("fundDeployShell exact-hash receipt has no destination"))?;
+    let transaction_account = transaction["account_addr"]
+        .as_str()
+        .ok_or_else(|| anyhow!("fundDeployShell destination transaction has no account"))?;
+    let account = response
+        .pointer("/data/blockchain/account/info")
+        .ok_or_else(|| anyhow!("fundDeployShell receipt has no target account/dapp proof"))?;
+    let account_id = account["id"]
+        .as_str()
+        .ok_or_else(|| anyhow!("fundDeployShell receipt target account has no id"))?;
+    let account_dapp = account["dapp_id"]
+        .as_str()
+        .ok_or_else(|| anyhow!("fundDeployShell receipt target account has no dapp_id"))?;
+    if bare_hex(destination) != expected_account
+        || bare_hex(transaction_account) != expected_account
+        || bare_hex(account_id) != expected_account
+        || bare_hex(account_dapp) != bare_hex(expected_dapp_id)
+    {
+        return Err(anyhow!(
+            "fundDeployShell exact-hash receipt destination/account/dapp mismatch"
+        ));
+    }
+    let transaction_hash = transaction["id"]
+        .as_str()
+        .ok_or_else(|| anyhow!("fundDeployShell finalized destination transaction has no id"))?;
+    let aborted = transaction["aborted"].as_bool().ok_or_else(|| {
+        anyhow!("fundDeployShell finalized destination transaction has no aborted fact")
+    })?;
+    let action_success = transaction["action"]["success"].as_bool().ok_or_else(|| {
+        anyhow!("fundDeployShell finalized destination transaction has no action success fact")
+    })?;
+    let result_code = transaction["action"]["result_code"]
+        .as_i64()
+        .ok_or_else(|| {
+            anyhow!("fundDeployShell finalized destination transaction has no action result code")
+        })?;
+    let no_funds = transaction["action"]["no_funds"].as_bool().ok_or_else(|| {
+        anyhow!("fundDeployShell finalized destination transaction has no no_funds fact")
+    })?;
+    Ok(Some(CorrelatedActionReceipt {
+        message_hash: message_hash.to_string(),
+        transaction_hash: Some(transaction_hash.to_string()),
+        aborted: Some(aborted),
+        action_success: Some(action_success),
+        result_code: Some(result_code),
+        no_funds: Some(no_funds),
+    }))
+}
+
+async fn poll_finalized_destination_receipt(
+    http: &reqwest::Client,
+    endpoint: &str,
+    account_id: &str,
+    dapp_id: &str,
+    expected_message_hash: &str,
+) -> Result<Option<CorrelatedActionReceipt>> {
+    poll_finalized_destination_receipt_with(
+        account_id,
+        dapp_id,
+        expected_message_hash,
+        || {
+            query_exact_destination_receipt(
+                http,
+                endpoint,
+                account_id,
+                dapp_id,
+                expected_message_hash,
+            )
+        },
+        std::time::Duration::from_secs(2),
+    )
+    .await
+}
+
+async fn poll_finalized_destination_receipt_with<F, Fut>(
+    account_id: &str,
+    dapp_id: &str,
+    expected_message_hash: &str,
+    mut query: F,
+    retry_delay: std::time::Duration,
+) -> Result<Option<CorrelatedActionReceipt>>
+where
+    F: FnMut() -> Fut,
+    Fut: std::future::Future<Output = Result<Value>>,
+{
+    const ATTEMPTS: u32 = 12;
+    for attempt in 0..ATTEMPTS {
+        let response = query().await?;
+        if let Some(errors) = response.get("errors") {
+            return Err(anyhow!("fundDeployShell receipt GraphQL errors: {errors}"));
+        }
+        if let Some(receipt) =
+            parse_exact_destination_receipt(&response, account_id, dapp_id, expected_message_hash)?
+        {
+            return Ok(Some(receipt));
+        }
+        if attempt + 1 < ATTEMPTS {
+            tokio::time::sleep(retry_delay).await;
+        }
+    }
+    Ok(None)
+}
+
 pub(super) fn previous_page_cursor(
     context: &str,
     page: &Value,
@@ -1118,6 +1529,60 @@ pub(super) struct SellerOfferEvents {
     pub placed_order_id: Option<u128>,
     pub matched: bool,
     pub placement_value_returned: bool,
+}
+
+/// One successful owner-signed `PrivateNote.placeInferenceBuy` transaction, decoded from the note's
+/// external-in message and backed by a non-aborted destination transaction.
+#[cfg(feature = "test-giver")]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PlaceInferenceBuyReceipt {
+    pub message_id: String,
+    pub created_at: u64,
+    pub max_price_per_tick: u128,
+    pub ticks: u128,
+    pub escrow: u128,
+}
+
+/// One ordered lifecycle/settlement event emitted by a `TokenContract`.
+#[cfg(feature = "test-giver")]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TokenContractSettlementReceipt {
+    pub message_id: String,
+    pub created_at: u64,
+    pub event: TokenContractSettlementEvent,
+}
+
+/// Exact ABI payload of a lifecycle/settlement event used by the live money-path proof.
+#[cfg(feature = "test-giver")]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TokenContractSettlementEvent {
+    ProbeAccepted {
+        buyer: String,
+        to_seller: u128,
+        commission_returned: u128,
+    },
+    ProbeBurned {
+        buyer: String,
+        burned_probe: u128,
+        burned_commission: u128,
+        refund_to_buyer: u128,
+    },
+    TickFinalized {
+        finalized_owed: u128,
+        deposit: u128,
+    },
+    StreamStopped {
+        buyer: String,
+        to_seller: u128,
+        refund_to_buyer: u128,
+    },
+}
+
+/// Ordered lifecycle and settlement receipts emitted by one `TokenContract`.
+#[cfg(feature = "test-giver")]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct TokenContractSettlementReceipts {
+    pub events: Vec<TokenContractSettlementReceipt>,
 }
 
 pub(super) async fn fetch_ext_out_page(
@@ -1240,6 +1705,134 @@ async fn fetch_all_ext_out_messages(
     Ok(messages)
 }
 
+#[cfg(feature = "test-giver")]
+fn decode_token_contract_settlement_receipts(
+    mut messages: Vec<ExtOutMessage>,
+) -> Result<TokenContractSettlementReceipts> {
+    messages.sort_by(|left, right| {
+        (left.created_at, &left.cursor).cmp(&(right.created_at, &right.cursor))
+    });
+    let mut receipts = TokenContractSettlementReceipts::default();
+    for message in messages {
+        let Some(decoded) = decode_external_abi_message(&message.body, TOKENCONTRACT_ABI, false)
+        else {
+            continue;
+        };
+        let required_u128 = |name| {
+            decoded_u128(&decoded.tokens, name).ok_or_else(|| {
+                anyhow!(
+                    "{} event {} has no {name}",
+                    decoded.function_name,
+                    message.id
+                )
+            })
+        };
+        let required_address = |name| {
+            decoded_address(&decoded.tokens, name).ok_or_else(|| {
+                anyhow!(
+                    "{} event {} has no {name}",
+                    decoded.function_name,
+                    message.id
+                )
+            })
+        };
+        let event = match decoded.function_name.as_str() {
+            "ProbeAccepted" => TokenContractSettlementEvent::ProbeAccepted {
+                buyer: required_address("buyer")?,
+                to_seller: required_u128("toSeller")?,
+                commission_returned: required_u128("commissionReturned")?,
+            },
+            "ProbeBurned" => TokenContractSettlementEvent::ProbeBurned {
+                buyer: required_address("buyer")?,
+                burned_probe: required_u128("burnedProbe")?,
+                burned_commission: required_u128("burnedCommission")?,
+                refund_to_buyer: required_u128("refundToBuyer")?,
+            },
+            "TickFinalized" => TokenContractSettlementEvent::TickFinalized {
+                finalized_owed: required_u128("finalizedOwed")?,
+                deposit: required_u128("deposit")?,
+            },
+            "StreamStopped" => TokenContractSettlementEvent::StreamStopped {
+                buyer: required_address("buyer")?,
+                to_seller: required_u128("toSeller")?,
+                refund_to_buyer: required_u128("refundToBuyer")?,
+            },
+            _ => continue,
+        };
+        receipts.events.push(TokenContractSettlementReceipt {
+            message_id: message.id,
+            created_at: message.created_at,
+            event,
+        });
+    }
+    Ok(receipts)
+}
+
+#[cfg(feature = "test-giver")]
+fn decode_external_abi_message(
+    body_b64: &str,
+    abi: &str,
+    input: bool,
+) -> Option<tvm_abi::contract::DecodedMessage> {
+    let bytes = base64::engine::general_purpose::STANDARD
+        .decode(body_b64.trim())
+        .ok()?;
+    let cell = tvm_types::read_single_root_boc(&bytes).ok()?;
+    let slice = tvm_types::SliceData::load_cell(cell).ok()?;
+    let contract = tvm_abi::Contract::load(abi.as_bytes()).ok()?;
+    if input {
+        contract.decode_input(slice, false, true).ok()
+    } else {
+        contract.decode_output(slice, false, true).ok()
+    }
+}
+
+#[cfg(feature = "test-giver")]
+fn decode_external_abi_message_boc(
+    message_b64: &str,
+    abi: &str,
+    input: bool,
+) -> Option<tvm_abi::contract::DecodedMessage> {
+    let bytes = base64::engine::general_purpose::STANDARD
+        .decode(message_b64.trim())
+        .ok()?;
+    let cell = tvm_types::read_single_root_boc(&bytes).ok()?;
+    let message = tvm_block::Message::construct_from_cell(cell).ok()?;
+    let body = message.body()?;
+    let contract = tvm_abi::Contract::load(abi.as_bytes()).ok()?;
+    if input {
+        contract.decode_input(body, false, true).ok()
+    } else {
+        contract.decode_output(body, false, true).ok()
+    }
+}
+
+#[cfg(feature = "test-giver")]
+fn decoded_u128(tokens: &[tvm_abi::Token], name: &str) -> Option<u128> {
+    tokens.iter().find_map(|token| {
+        if token.name != name {
+            return None;
+        }
+        match &token.value {
+            tvm_abi::token::TokenValue::Uint(value) => value.number.to_string().parse().ok(),
+            _ => None,
+        }
+    })
+}
+
+#[cfg(feature = "test-giver")]
+fn decoded_address(tokens: &[tvm_abi::Token], name: &str) -> Option<String> {
+    tokens.iter().find_map(|token| {
+        if token.name != name {
+            return None;
+        }
+        match &token.value {
+            tvm_abi::token::TokenValue::Address(value) => Some(format!("{value}")),
+            _ => None,
+        }
+    })
+}
+
 impl RealChainBackend {
     /// Connect using an optional manifest endpoint, falling back to the canonical shellnet endpoint.
     pub fn connect(manifest_path: impl AsRef<Path>) -> anyhow::Result<Self> {
@@ -1288,6 +1881,17 @@ impl RealChainBackend {
     /// Chain liveness check -- confirms a working connection to shellnet.
     pub async fn liveness(&self) -> Result<ChainLiveness> {
         self.client.chain_liveness().await
+    }
+
+    async fn clock_skew_preflight(&self) -> Result<()> {
+        let check = clock_skew_check(
+            local_unix_secs()?,
+            fetch_chain_time_secs(&self.http, self.client.endpoint()).await?,
+        );
+        if check.status == ShellnetDoctorStatus::Fail {
+            return Err(anyhow!(check.message));
+        }
+        Ok(())
     }
 
     async fn account_active_code_hash(&self, addr: &Address) -> Result<(bool, Option<String>)> {
@@ -1365,6 +1969,10 @@ impl RealChainBackend {
         let mut checks = Vec::new();
         self.liveness().await?;
         checks.push(pass_check("shellnet endpoint", "reachable"));
+        checks.push(clock_skew_check(
+            local_unix_secs()?,
+            fetch_chain_time_secs(&self.http, self.client.endpoint()).await?,
+        ));
 
         if account_id_eq(&self.superroot, FIXED_SUPERROOT_ACCOUNT_ID) {
             checks.push(skipped_check(
@@ -1887,6 +2495,9 @@ impl RealChainBackend {
         args: Value,
         keys: &KeyPair,
     ) -> Result<(String, String, String, String)> {
+        self.clock_skew_preflight()
+            .await
+            .map_err(|source| anyhow::Error::new(MoneySubmitError::Preparation { source }))?;
         let boc = Self::encode_signed_call_boc(addr, abi_json, method, args, keys)
             .await
             .map_err(|source| anyhow::Error::new(MoneySubmitError::Preparation { source }))?;
@@ -1939,6 +2550,7 @@ impl RealChainBackend {
     /// not a test crutch. Other(logical) errors propagate immediately. `deploy` is threaded to
     /// [`submit_once`] so only deploy-message sends get the funded-uninit `/v2/account` 404 tolerance.
     async fn retry_submit(&self, boc: &str, deploy: bool) -> Result<Value> {
+        self.clock_skew_preflight().await?;
         // Transient marker: the queue is full OR a temporary gateway failure(5xx) that clears on its own.
         fn is_transient(msg: &str) -> bool {
             msg.contains("QUEUE_OVERFLOW")
@@ -2097,6 +2709,7 @@ impl RealChainBackend {
                     matches.push((
                         created_at,
                         MatchedFill {
+                            order_id: fill.order_id,
                             token_contract: tc,
                             ticks: fill.ticks,
                             price_per_tick: fill.price_per_tick,
@@ -2236,6 +2849,7 @@ impl RealChainBackend {
                         created_at,
                         fill.order_id,
                         MatchedFill {
+                            order_id: fill.order_id,
                             token_contract: tc,
                             ticks: fill.ticks,
                             price_per_tick: fill.price_per_tick,
@@ -2958,6 +3572,151 @@ impl RealChainBackend {
             .await
     }
 
+    /// Read every successful owner-signed `placeInferenceBuy` receipt for one note. This is intended
+    /// for live by-fact verification: it counts destination transactions, not CLI log events. The
+    /// shellnet indexer can omit `body` for external-in messages, so decode the authoritative full
+    /// message BOC when that projection is absent.
+    #[cfg(feature = "test-giver")]
+    pub async fn successful_place_inference_buy_receipts(
+        &self,
+        note: &Address,
+    ) -> Result<Vec<PlaceInferenceBuyReceipt>> {
+        const PAGE_SIZE: u32 = 1_000;
+        let account_id = note.bare().to_string();
+        let endpoint = self.client.endpoint().trim_end_matches('/');
+        let dapp_id = fetch_dapp_id(&self.http, endpoint, &account_id).await?;
+        let gql = format!("{endpoint}/graphql");
+        let query = r#"
+            query($accountId: String!, $dappId: String!, $last: Int!, $before: String) {
+              blockchain {
+                account(account_id: $accountId, dapp_id: $dappId) {
+                  messages(msg_type: [ExtIn], last: $last, before: $before) {
+                    pageInfo { startCursor hasPreviousPage }
+                    edges {
+                      cursor
+                      node {
+                        id boc body created_at
+                        dst_transaction {
+                          aborted
+                          compute { exit_code success }
+                          action { result_code success }
+                        }
+                      }
+                    }
+                  }
+                }
+              }
+            }
+        "#;
+        let mut before: Option<String> = None;
+        let mut seen = BTreeSet::new();
+        let mut receipts = Vec::new();
+        loop {
+            let response: Value = self
+                .http
+                .post(&gql)
+                .json(&json!({
+                    "query": query,
+                    "variables": {
+                        "accountId": account_id.as_str(),
+                        "dappId": dapp_id.as_str(),
+                        "last": PAGE_SIZE,
+                        "before": before.as_deref(),
+                    },
+                }))
+                .send()
+                .await?
+                .error_for_status()?
+                .json()
+                .await?;
+            if let Some(errors) = response.get("errors") {
+                return Err(anyhow!(
+                    "PrivateNote {note} owner-call GraphQL errors: {errors}"
+                ));
+            }
+            let messages = response
+                .pointer("/data/blockchain/account/messages")
+                .ok_or_else(|| {
+                    anyhow!("PrivateNote {note} owner-call GraphQL shape changed: {response}")
+                })?;
+            let edges = messages["edges"].as_array().ok_or_else(|| {
+                anyhow!("PrivateNote {note} owner-call GraphQL edges missing: {response}")
+            })?;
+            for edge in edges {
+                let cursor = edge["cursor"]
+                    .as_str()
+                    .ok_or_else(|| anyhow!("PrivateNote {note} owner call has no cursor"))?;
+                let node = &edge["node"];
+                let message_id = node["id"].as_str().unwrap_or(cursor);
+                if !seen.insert(message_id.to_string()) || !successful_inbound_call(node) {
+                    continue;
+                }
+                let decoded = node["body"]
+                    .as_str()
+                    .and_then(|body| decode_external_abi_message(body, PRIVATENOTE_ABI, true))
+                    .or_else(|| {
+                        node["boc"].as_str().and_then(|boc| {
+                            decode_external_abi_message_boc(boc, PRIVATENOTE_ABI, true)
+                        })
+                    });
+                let Some(decoded) = decoded else {
+                    continue;
+                };
+                if decoded.function_name != "placeInferenceBuy" {
+                    continue;
+                }
+                let created_at = node["created_at"]
+                    .as_u64()
+                    .or_else(|| {
+                        node["created_at"]
+                            .as_str()
+                            .and_then(|value| value.parse().ok())
+                    })
+                    .ok_or_else(|| {
+                        anyhow!("successful PrivateNote placeInferenceBuy has no created_at")
+                    })?;
+                receipts.push(PlaceInferenceBuyReceipt {
+                    message_id: message_id.to_string(),
+                    created_at,
+                    max_price_per_tick: decoded_u128(&decoded.tokens, "maxPricePerTick")
+                        .ok_or_else(|| {
+                            anyhow!("placeInferenceBuy receipt has no maxPricePerTick")
+                        })?,
+                    ticks: decoded_u128(&decoded.tokens, "ticks")
+                        .ok_or_else(|| anyhow!("placeInferenceBuy receipt has no ticks"))?,
+                    escrow: decoded_u128(&decoded.tokens, "escrow")
+                        .ok_or_else(|| anyhow!("placeInferenceBuy receipt has no escrow"))?,
+                });
+            }
+            let Some(next) = previous_page_cursor(
+                &format!("PrivateNote {note} owner-call"),
+                messages,
+                before.as_deref(),
+            )?
+            else {
+                break;
+            };
+            before = Some(next);
+        }
+        receipts.sort_by(|left, right| {
+            (left.created_at, &left.message_id).cmp(&(right.created_at, &right.message_id))
+        });
+        Ok(receipts)
+    }
+
+    /// Read ordered lifecycle receipts for one deal. `StreamStopped` proves the clean
+    /// post-probe-accept split; `ProbeBurned` proves the mutually exclusive BurnBoth path.
+    #[cfg(feature = "test-giver")]
+    pub async fn token_contract_settlement_receipts(
+        &self,
+        token_contract: &Address,
+    ) -> Result<TokenContractSettlementReceipts> {
+        let account_id = token_contract.bare().to_string();
+        let messages =
+            fetch_all_ext_out_messages(&self.http, self.client.endpoint(), &account_id).await?;
+        decode_token_contract_settlement_receipts(messages)
+    }
+
     /// Read-only buyer preflight for the final-withdrawal latch. A withdrawn PrivateNote cannot call
     /// `placeInferenceBuy`; detect that state before any money write and return the actionable chain
     /// refusal instead of the raw exit code. Read errors are retried because a transient getter failure
@@ -3032,7 +3791,7 @@ impl RealChainBackend {
         root_model_shell: u128,
         tc_shell: u128,
     ) -> Result<Value> {
-        self.submit(
+        let boc = Self::encode_signed_call_boc(
             note,
             PRIVATENOTE_ABI,
             "fundDeployShell",
@@ -3043,7 +3802,46 @@ impl RealChainBackend {
             }),
             owner_keys,
         )
-        .await
+        .await?;
+        let message_hash = external_message_hash(&boc)?;
+        let endpoint = self.client.endpoint();
+        let account_id = dest_account_id_hex(&boc)?;
+        let dapp_id = fetch_dapp_id(&self.http, endpoint, &account_id).await?;
+        match self.send_with_retry(&boc).await {
+            Ok(value) => Ok(value),
+            Err(error) => {
+                let aborted = error
+                    .downcast_ref::<OnchainSubmitError>()
+                    .and_then(|submit| submit.sanitized_payload().pointer("/result/aborted"))
+                    .and_then(Value::as_bool)
+                    == Some(true);
+                if !aborted {
+                    return Err(error);
+                }
+                let receipt = match poll_finalized_destination_receipt(
+                    &self.http,
+                    endpoint,
+                    &account_id,
+                    &dapp_id,
+                    &message_hash,
+                )
+                .await
+                {
+                    Ok(receipt) => receipt,
+                    Err(receipt_error) => {
+                        return Err(error.context(format!(
+                            "fundDeployShell aborted; failed to resolve finalized destination receipt \
+                             for message_hash={message_hash}: {receipt_error}; ECC[2] cause not proven"
+                        )));
+                    }
+                };
+                Err(fund_deploy_shell_receipt_error(
+                    error,
+                    &message_hash,
+                    receipt.as_ref(),
+                ))
+            }
+        }
     }
 
     pub(super) async fn active_native_balance(&self, addr: &Address) -> Result<u128> {
@@ -3364,6 +4162,39 @@ impl RealChainBackend {
         .await
     }
 
+    /// Prepare the signed reclaim and its route before synchronously checking whether accepted
+    /// output changed. A changed heartbeat cancels before the single money POST.
+    pub async fn reclaim_on_timeout_if(
+        &self,
+        buyer_note: &Address,
+        buyer_keys: &KeyPair,
+        tc: &Address,
+        before_post: &mut (dyn FnMut() -> bool + Send),
+    ) -> Result<Option<Value>> {
+        prepare_reclaim_money_post_if(
+            self.prepare_money_post(
+                buyer_note,
+                PRIVATENOTE_ABI,
+                "streamReclaim",
+                json!({ "tokenContract": tc.with_workchain() }),
+                buyer_keys,
+            ),
+            before_post,
+            |prepared| async move {
+                let (endpoint, boc, account_id, dapp_id) = prepared;
+                send_message_routed_money_once(
+                    &self.money_post_http,
+                    &endpoint,
+                    &boc,
+                    &account_id,
+                    &dapp_id,
+                )
+                .await
+            },
+        )
+        .await
+    }
+
     /// The buyer cleans up a funded-but-never-opened deal via their note:
     /// `streamCleanup(tokenContract)` -> `TC.cleanupUnopened()`. Requires
     /// `block.timestamp >= _fundedTime + MATCH_OPEN_TIMEOUT` and `!_opened`.
@@ -3570,7 +4401,8 @@ impl RealChainBackend {
                 .await;
             let prefund = self
                 .note_fund_deploy_shell(note, seed_keys, nonce, gas, gas)
-                .await?;
+                .await
+                .context("note-funded provision: fundDeployShell ECC[2]/SHELL funding failed")?;
             eprintln!(
                 "deploy-prefund submit: RootModel {gas} + TokenContract {gas} via fundDeployShell(nonce={nonce}) -> {prefund}"
             );
@@ -3607,7 +4439,10 @@ impl RealChainBackend {
                     .await;
                 let prefund = self
                     .note_fund_deploy_shell(note, seed_keys, nonce, 0, gas)
-                    .await?;
+                    .await
+                    .context(
+                        "note-funded provision: fundDeployShell ECC[2]/SHELL funding failed",
+                    )?;
                 eprintln!(
                     "deploy-prefund submit: TokenContract {gas} via fundDeployShell(nonce={nonce}) -> {prefund}"
                 );
@@ -4212,8 +5047,586 @@ fn withdraw_note_tokens_payload(dest_wallet: &Address, dapp_id: &str) -> Value {
 mod tests {
     use super::*;
     use std::collections::VecDeque;
-    use std::sync::Mutex;
+    use std::sync::{
+        atomic::{AtomicUsize, Ordering},
+        Arc, Mutex,
+    };
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    #[test]
+    fn clock_skew_within_threshold_passes() {
+        for local in [999_990, 1_000_030] {
+            assert_eq!(
+                clock_skew_check(local, 1_000_000).status,
+                ShellnetDoctorStatus::Pass
+            );
+        }
+    }
+
+    #[test]
+    fn clock_skew_real_boundaries_fail_closed_with_actionable_message() {
+        for behind in [41, 60] {
+            let check = clock_skew_check(1_000_000 - behind, 1_000_000);
+            assert_eq!(check.status, ShellnetDoctorStatus::Fail);
+            assert!(check.message.contains("CLOCK_SKEW"));
+            assert!(check
+                .message
+                .contains(&format!("{behind}s behind chain time")));
+        }
+        let check = clock_skew_check(1_000_000 + MAX_CLOCK_AHEAD_SECS + 1, 1_000_000);
+        assert_eq!(check.status, ShellnetDoctorStatus::Fail);
+        assert!(check.message.contains("CLOCK_SKEW"));
+        assert!(check.message.contains("251s ahead of chain time"));
+        assert!(check.message.contains("Fix system time / NTP and retry"));
+
+        let report = ShellnetDoctorReport {
+            network: "shellnet".to_string(),
+            versions: Vec::new(),
+            checks: vec![check],
+        };
+        assert!(!report.is_ok(), "write preflight must fail closed");
+        assert!(report.fail_summary().contains("CLOCK_SKEW"));
+    }
+
+    #[test]
+    fn signed_write_expiry_codes_get_clock_hint_without_hiding_dex_errors() {
+        let error = checked_submit_response(json!({
+            "error": {
+                "code": "TVM_ERROR",
+                "message": "Failed to execute the message. Error occurred during the compute phase.",
+                "exit_code": 103,
+                "address": "0:1111111111111111111111111111111111111111111111111111111111111111"
+            }
+        }))
+        .expect_err("nested giver replay rejection");
+        assert!(format!("{error:#}").contains("verify the operator clock/NTP"));
+
+        for (code, diagnosis) in [
+            (102, "dex::ERR_LOW_VALUE"),
+            (103, "dex::ERR_ALREADY_RESOLVED"),
+        ] {
+            let error = checked_submit_response(json!({
+                "result": {
+                    "exit_code": code,
+                    "address": "0:2222222222222222222222222222222222222222222222222222222222222222"
+                }
+            }))
+            .expect_err("ordinary dex rejection");
+            let displayed = format!("{error:#}");
+            assert!(displayed.contains(diagnosis), "{displayed}");
+            assert!(!displayed.contains("operator clock"), "{displayed}");
+        }
+
+        for code in [401, 402] {
+            let error = checked_submit_response(json!({"result": {"exit_code": code}}))
+                .expect_err("dex expiry/replay rejection");
+            assert!(format!("{error:#}").contains("verify the operator clock/NTP"));
+        }
+        let error = checked_submit_response(json!({"result": {"exit_code": 151}}))
+            .expect_err("other rejection");
+        assert!(!format!("{error:#}").contains("operator clock"));
+    }
+
+    async fn skew_fixture_backend(
+        chain_offset: i64,
+    ) -> (
+        RealChainBackend,
+        Arc<AtomicUsize>,
+        tokio::task::JoinHandle<()>,
+    ) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let endpoint = format!("http://{}", listener.local_addr().unwrap());
+        let posts = Arc::new(AtomicUsize::new(0));
+        let server_posts = Arc::clone(&posts);
+        let task = tokio::spawn(async move {
+            loop {
+                let (mut socket, _) = listener.accept().await.unwrap();
+                let mut request = [0_u8; 8192];
+                let read = socket.read(&mut request).await.unwrap();
+                let request = String::from_utf8_lossy(&request[..read]);
+                if request.starts_with("POST /v2/messages ") {
+                    server_posts.fetch_add(1, Ordering::SeqCst);
+                }
+                let local = local_unix_secs().unwrap() as i64;
+                let chain = (local + chain_offset) as u64;
+                let body = json!({"data":{"blockchain":{"blocks":{"edges":[{"node":{"gen_utime":chain}}]}}}}).to_string();
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    body.len(), body
+                );
+                socket.write_all(response.as_bytes()).await.unwrap();
+            }
+        });
+        let deployed = deployed("");
+        let backend = RealChainBackend {
+            client: ChainClient::connect(&endpoint).unwrap(),
+            http: reqwest::Client::new(),
+            money_post_http: build_money_post_http_client().unwrap(),
+            superroot: Address::parse(&deployed.superroot).unwrap(),
+            deployed,
+        };
+        (backend, posts, task)
+    }
+
+    #[tokio::test]
+    async fn unsafe_clock_produces_zero_posts_in_regular_and_money_paths() {
+        for chain_offset in [60, -300] {
+            let (backend, posts, task) = skew_fixture_backend(chain_offset).await;
+            let regular = backend.retry_submit("not-posted", false).await.unwrap_err();
+            assert!(format!("{regular:#}").contains("CLOCK_SKEW"));
+
+            let address = Address::parse(&format!("0:{}", "1".repeat(64))).unwrap();
+            let keys = KeyPair::from_secret_hex(&"3a".repeat(32)).unwrap();
+            let money = backend
+                .prepare_money_post(&address, "{}", "unused", json!({}), &keys)
+                .await
+                .unwrap_err();
+            assert!(format!("{money:#}").contains("CLOCK_SKEW"));
+            assert_eq!(
+                posts.load(Ordering::SeqCst),
+                0,
+                "no message POST is permitted"
+            );
+            task.abort();
+        }
+    }
+
+    fn aborted_submit_error() -> anyhow::Error {
+        checked_submit_response(json!({
+            "result": {
+                "exit_code": 0,
+                "aborted": true
+            }
+        }))
+        .expect_err("aborted submit must fail")
+    }
+
+    #[test]
+    fn fund_deploy_shell_correlated_no_funds_receipt_adds_ecc2_context() {
+        let contextual = fund_deploy_shell_receipt_error(
+            aborted_submit_error(),
+            "abcd",
+            Some(&CorrelatedActionReceipt {
+                message_hash: "abcd".to_string(),
+                transaction_hash: Some("tx38".to_string()),
+                aborted: Some(true),
+                action_success: Some(false),
+                result_code: Some(38),
+                no_funds: Some(true),
+            }),
+        );
+        let displayed = format!("{contextual:#}");
+        assert!(
+            displayed.contains("insufficient ECC[2]/SHELL"),
+            "{displayed}"
+        );
+        assert!(displayed.contains("note_fund_deploy_shell"), "{displayed}");
+        assert!(displayed.contains("aborted=true"), "{displayed}");
+        assert!(displayed.contains("action_success=false"), "{displayed}");
+        assert!(displayed.contains("action_result_code=38"), "{displayed}");
+        assert!(displayed.contains("no_funds=true"), "{displayed}");
+    }
+
+    #[test]
+    fn fund_deploy_shell_non_38_receipt_is_factual_without_ecc2_claim() {
+        let contextual = fund_deploy_shell_receipt_error(
+            aborted_submit_error(),
+            "abcd",
+            Some(&CorrelatedActionReceipt {
+                message_hash: "abcd".to_string(),
+                transaction_hash: Some("tx401".to_string()),
+                aborted: Some(true),
+                action_success: Some(false),
+                result_code: Some(401),
+                no_funds: Some(false),
+            }),
+        );
+        let displayed = format!("{contextual:#}");
+        assert!(!displayed.contains("insufficient ECC[2]"), "{displayed}");
+        assert!(displayed.contains("action_result_code=401"), "{displayed}");
+        assert!(displayed.contains("aborted=true"), "{displayed}");
+        assert!(displayed.contains("ECC[2] cause not proven"), "{displayed}");
+    }
+
+    #[test]
+    fn fund_deploy_shell_missing_or_mismatched_receipt_fails_closed() {
+        let missing = fund_deploy_shell_receipt_error(aborted_submit_error(), "abcd", None);
+        let missing = format!("{missing:#}");
+        assert!(!missing.contains("insufficient ECC[2]"), "{missing}");
+        assert!(
+            missing.contains("no finalized destination receipt matched"),
+            "{missing}"
+        );
+
+        let mismatched = fund_deploy_shell_receipt_error(
+            aborted_submit_error(),
+            "abcd",
+            Some(&CorrelatedActionReceipt {
+                message_hash: "ffff".to_string(),
+                transaction_hash: Some("tx38".to_string()),
+                aborted: Some(true),
+                action_success: Some(false),
+                result_code: Some(38),
+                no_funds: Some(true),
+            }),
+        );
+        let mismatched = format!("{mismatched:#}");
+        assert!(!mismatched.contains("insufficient ECC[2]"), "{mismatched}");
+        assert!(
+            mismatched.contains("ECC[2] cause not proven"),
+            "{mismatched}"
+        );
+    }
+
+    #[test]
+    fn fund_deploy_shell_incomplete_or_inconsistent_38_receipt_fails_closed() {
+        for (case, receipt) in [
+            (
+                "action success",
+                CorrelatedActionReceipt {
+                    message_hash: "abcd".to_string(),
+                    transaction_hash: Some("tx38".to_string()),
+                    aborted: Some(true),
+                    action_success: Some(true),
+                    result_code: Some(38),
+                    no_funds: Some(true),
+                },
+            ),
+            (
+                "missing no_funds",
+                CorrelatedActionReceipt {
+                    message_hash: "abcd".to_string(),
+                    transaction_hash: Some("tx38".to_string()),
+                    aborted: Some(true),
+                    action_success: Some(false),
+                    result_code: Some(38),
+                    no_funds: None,
+                },
+            ),
+            (
+                "missing aborted",
+                CorrelatedActionReceipt {
+                    message_hash: "abcd".to_string(),
+                    transaction_hash: Some("tx38".to_string()),
+                    aborted: None,
+                    action_success: Some(false),
+                    result_code: Some(38),
+                    no_funds: Some(true),
+                },
+            ),
+            (
+                "missing transaction id",
+                CorrelatedActionReceipt {
+                    message_hash: "abcd".to_string(),
+                    transaction_hash: None,
+                    aborted: Some(true),
+                    action_success: Some(false),
+                    result_code: Some(38),
+                    no_funds: Some(true),
+                },
+            ),
+        ] {
+            let contextual =
+                fund_deploy_shell_receipt_error(aborted_submit_error(), "abcd", Some(&receipt));
+            let displayed = format!("{contextual:#}");
+            assert!(
+                !displayed.contains("insufficient ECC[2]"),
+                "{case}: {displayed}"
+            );
+            assert!(
+                displayed.contains("ECC[2] cause not proven"),
+                "{case}: {displayed}"
+            );
+            assert!(
+                displayed.contains("action_result_code=38"),
+                "{case}: {displayed}"
+            );
+        }
+    }
+
+    #[test]
+    fn exact_message_receipt_keeps_polling_without_destination_transaction() {
+        let raw = json!({
+            "data": {"blockchain": {
+                "message": {
+                    "id": "abcd",
+                    "dst": "11",
+                    "dst_transaction": null
+                },
+                "account": {"info": null}
+            }}
+        });
+
+        assert_eq!(
+            parse_exact_destination_receipt(&raw, "11", "04", "abcd")
+                .expect("pending exact message must not fail"),
+            None
+        );
+    }
+
+    #[test]
+    fn exact_message_receipt_keeps_polling_non_finalized_destination_transaction() {
+        let raw = json!({
+            "data": {"blockchain": {
+                "message": {
+                    "id": "abcd",
+                    "dst": "11",
+                    "dst_transaction": {"status": 1}
+                },
+                "account": {"info": null}
+            }}
+        });
+
+        assert_eq!(
+            parse_exact_destination_receipt(&raw, "11", "04", "abcd")
+                .expect("non-finalized destination transaction must not fail"),
+            None
+        );
+    }
+
+    #[test]
+    fn exact_message_receipt_rejects_malformed_finalized_destination_transaction() {
+        let raw = json!({
+            "data": {"blockchain": {
+                "message": {
+                    "id": "abcd",
+                    "dst": "11",
+                    "dst_transaction": {"status": 3}
+                },
+                "account": {"info": {"id": "11", "dapp_id": "04"}}
+            }}
+        });
+
+        let error = parse_exact_destination_receipt(&raw, "11", "04", "abcd")
+            .expect_err("malformed finalized receipt must fail closed");
+        assert!(
+            error.to_string().contains("has no account"),
+            "unexpected error: {error:#}"
+        );
+    }
+
+    #[test]
+    fn exact_message_receipt_query_and_raw_shape_ignore_unrelated_newer_messages() {
+        const TARGET: &str = "1111111111111111111111111111111111111111111111111111111111111111";
+        const DAPP: &str = "04";
+        const HASH: &str = "abcd";
+        assert!(
+            EXACT_MESSAGE_RECEIPT_QUERY.contains("message(hash: $hash)"),
+            "receipt lookup must address the submitted message directly"
+        );
+        assert!(
+            !EXACT_MESSAGE_RECEIPT_QUERY.contains("messages("),
+            "receipt lookup must not scan a bounded account-message window"
+        );
+
+        let raw = json!({
+            "data": {"blockchain": {
+                "message": {
+                    "id": HASH,
+                    "dst": format!("0:{TARGET}"),
+                    "dst_transaction": {
+                        "id": "tx38",
+                        "status": 3,
+                        "aborted": true,
+                        "account_addr": TARGET,
+                        "action": {"result_code": 38, "success": false, "no_funds": true}
+                    }
+                },
+                "account": {"info": {"id": TARGET, "dapp_id": DAPP}},
+                "messages": {"edges": [{"node": {
+                    "id": "unrelated-newer-message",
+                    "dst": format!("0:{TARGET}")
+                }}]}
+            }}
+        });
+        let receipt = parse_exact_destination_receipt(&raw, TARGET, DAPP, HASH)
+            .expect("raw exact-hash GraphQL shape")
+            .expect("finalized destination receipt");
+        assert_eq!(receipt.message_hash, HASH);
+        assert_eq!(receipt.transaction_hash.as_deref(), Some("tx38"));
+        assert_eq!(receipt.result_code, Some(38));
+        assert_eq!(receipt.no_funds, Some(true));
+    }
+
+    #[test]
+    fn exact_message_receipt_rejects_wrong_destination_account_or_dapp() {
+        const TARGET: &str = "1111111111111111111111111111111111111111111111111111111111111111";
+        let base = json!({
+            "data": {"blockchain": {
+                "message": {
+                    "id": "abcd",
+                    "dst": TARGET,
+                    "dst_transaction": {
+                        "id": "tx38", "status": 3, "aborted": true,
+                        "account_addr": TARGET,
+                        "action": {"result_code": 38, "success": false, "no_funds": true}
+                    }
+                },
+                "account": {"info": {"id": TARGET, "dapp_id": "04"}}
+            }}
+        });
+        for (case, mut raw) in [
+            ("destination", base.clone()),
+            ("transaction account", base.clone()),
+            ("account", base.clone()),
+            ("dapp", base),
+        ] {
+            let replacement = Value::String("22".repeat(32));
+            match case {
+                "destination" => raw["data"]["blockchain"]["message"]["dst"] = replacement,
+                "transaction account" => {
+                    raw["data"]["blockchain"]["message"]["dst_transaction"]["account_addr"] =
+                        replacement
+                }
+                "account" => raw["data"]["blockchain"]["account"]["info"]["id"] = replacement,
+                "dapp" => {
+                    raw["data"]["blockchain"]["account"]["info"]["dapp_id"] =
+                        Value::String("05".to_string())
+                }
+                _ => unreachable!(),
+            }
+            let error = parse_exact_destination_receipt(&raw, TARGET, "04", "abcd")
+                .expect_err("mismatched receipt must fail closed");
+            assert!(error.to_string().contains("mismatch"), "{case}: {error:#}");
+        }
+    }
+
+    #[tokio::test]
+    async fn exact_message_receipt_poller_crosses_pending_states_to_one_final_receipt() {
+        use std::collections::VecDeque;
+        use std::sync::{Arc, Mutex};
+
+        const TARGET: &str = "1111111111111111111111111111111111111111111111111111111111111111";
+        const DAPP: &str = "04";
+        const HASH: &str = "abcd";
+        let responses = Arc::new(Mutex::new(VecDeque::from([
+            json!({"data": {"blockchain": {
+                "message": {"id": HASH, "dst": TARGET, "dst_transaction": null},
+                "account": {"info": null}
+            }}}),
+            json!({"data": {"blockchain": {
+                "message": {
+                    "id": HASH, "dst": TARGET,
+                    "dst_transaction": {"status": 1}
+                },
+                "account": {"info": null}
+            }}}),
+            json!({"data": {"blockchain": {
+                "message": {
+                    "id": HASH,
+                    "dst": TARGET,
+                    "dst_transaction": {
+                        "id": "tx38", "status": 3, "aborted": true,
+                        "account_addr": TARGET,
+                        "action": {"result_code": 38, "success": false, "no_funds": true}
+                    }
+                },
+                "account": {"info": {"id": TARGET, "dapp_id": DAPP}}
+            }}}),
+        ])));
+        let reads = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let query = {
+            let responses = Arc::clone(&responses);
+            let reads = Arc::clone(&reads);
+            move || {
+                let responses = Arc::clone(&responses);
+                let reads = Arc::clone(&reads);
+                async move {
+                    reads.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    Ok(responses
+                        .lock()
+                        .expect("scripted response lock")
+                        .pop_front()
+                        .expect("poller must not exceed the three scripted reads"))
+                }
+            }
+        };
+
+        let receipt = poll_finalized_destination_receipt_with(
+            TARGET,
+            DAPP,
+            HASH,
+            query,
+            std::time::Duration::ZERO,
+        )
+        .await
+        .expect("pending reads must not abort the poller")
+        .expect("third read must return the finalized correlated receipt");
+
+        assert_eq!(reads.load(std::sync::atomic::Ordering::SeqCst), 3);
+        assert!(responses.lock().expect("scripted response lock").is_empty());
+        assert_eq!(
+            receipt,
+            CorrelatedActionReceipt {
+                message_hash: HASH.to_string(),
+                transaction_hash: Some("tx38".to_string()),
+                aborted: Some(true),
+                action_success: Some(false),
+                result_code: Some(38),
+                no_funds: Some(true),
+            }
+        );
+    }
+
+    #[tokio::test]
+    async fn exact_message_receipt_poller_does_not_retry_malformed_finalized_receipt() {
+        use std::sync::{
+            atomic::{AtomicUsize, Ordering},
+            Arc,
+        };
+
+        let reads = Arc::new(AtomicUsize::new(0));
+        let query = {
+            let reads = Arc::clone(&reads);
+            move || {
+                let reads = Arc::clone(&reads);
+                async move {
+                    reads.fetch_add(1, Ordering::SeqCst);
+                    Ok(json!({"data": {"blockchain": {
+                        "message": {
+                            "id": "abcd", "dst": "11",
+                            "dst_transaction": {"status": 3}
+                        },
+                        "account": {"info": {"id": "11", "dapp_id": "04"}}
+                    }}}))
+                }
+            }
+        };
+
+        let error = poll_finalized_destination_receipt_with(
+            "11",
+            "04",
+            "abcd",
+            query,
+            std::time::Duration::ZERO,
+        )
+        .await
+        .expect_err("malformed finalized receipt must terminate fail-closed");
+
+        assert_eq!(reads.load(Ordering::SeqCst), 1);
+        assert!(error.to_string().contains("has no account"), "{error:#}");
+    }
+
+    #[cfg(feature = "test-giver")]
+    fn encode_token_contract_event(name: &str, fields: Value) -> String {
+        use tvm_abi::token::Tokenizer;
+        use tvm_abi::{Contract, TokenValue};
+        use tvm_types::{BuilderData, IBitstring as _};
+
+        let contract =
+            Contract::load(TOKENCONTRACT_ABI.as_bytes()).expect("load TokenContract ABI");
+        let event = contract.event(name).expect("TokenContract event by name");
+        let tokens =
+            Tokenizer::tokenize_all_params(&event.inputs, &fields).expect("tokenize event");
+        let mut prefix = BuilderData::new();
+        prefix.append_u32(event.get_id()).expect("event selector");
+        let builder =
+            TokenValue::pack_values_into_chain(&tokens, vec![prefix.into()], &event.abi_version)
+                .expect("encode event body");
+        let cell = builder.into_cell().expect("event cell");
+        base64::engine::general_purpose::STANDARD
+            .encode(tvm_types::write_boc(&cell).expect("event BOC"))
+    }
 
     fn deployed(endpoint_field: &str) -> Deployed {
         serde_json::from_str(&format!(
@@ -4240,6 +5653,125 @@ mod tests {
                 "https://shellnet.ackinacki.org/graphql".into(),
                 "https://shellnet.ackinacki.org/v2/account".into(),
             )
+        );
+    }
+
+    #[cfg(feature = "test-giver")]
+    #[tokio::test]
+    async fn full_ext_in_boc_decodes_place_inference_buy_when_body_projection_is_absent() {
+        let note =
+            Address::parse("0:1111111111111111111111111111111111111111111111111111111111111111")
+                .expect("note");
+        let keys = KeyPair::from_secret_hex(&"22".repeat(32)).expect("owner key");
+        let boc = RealChainBackend::encode_signed_call_boc(
+            &note,
+            PRIVATENOTE_ABI,
+            "placeInferenceBuy",
+            json!({
+                "modelHash": format!("0x{}", "33".repeat(32)),
+                "maxPricePerTick": "7",
+                "ticks": "2",
+                "escrow": "14",
+                "flags": 0,
+                "deadline": "0",
+            }),
+            &keys,
+        )
+        .await
+        .expect("encode owner-signed placeInferenceBuy");
+
+        let decoded = decode_external_abi_message_boc(&boc, PRIVATENOTE_ABI, true)
+            .expect("decode placeInferenceBuy from the full indexed message BOC");
+        assert_eq!(decoded.function_name, "placeInferenceBuy");
+        assert_eq!(decoded_u128(&decoded.tokens, "maxPricePerTick"), Some(7));
+        assert_eq!(decoded_u128(&decoded.tokens, "ticks"), Some(2));
+        assert_eq!(decoded_u128(&decoded.tokens, "escrow"), Some(14));
+    }
+
+    #[cfg(feature = "test-giver")]
+    #[test]
+    fn settlement_receipts_decode_exact_payloads_in_chain_order() {
+        let buyer = format!("0:{}", "44".repeat(32));
+        let message = |id: &str, created_at: u64, event: &str, fields: Value| ExtOutMessage {
+            id: id.to_string(),
+            created_at,
+            cursor: format!("{created_at:04}-{id}"),
+            body: encode_token_contract_event(event, fields),
+        };
+        let receipts = decode_token_contract_settlement_receipts(vec![
+            message(
+                "stop",
+                40,
+                "StreamStopped",
+                json!({
+                    "buyer": buyer,
+                    "toSeller": "0",
+                    "refundToBuyer": "0",
+                }),
+            ),
+            message(
+                "tick-3",
+                30,
+                "TickFinalized",
+                json!({"finalizedOwed": "3", "deposit": "0"}),
+            ),
+            message(
+                "accepted",
+                10,
+                "ProbeAccepted",
+                json!({
+                    "buyer": buyer,
+                    "toSeller": "1",
+                    "commissionReturned": "0",
+                }),
+            ),
+            message(
+                "tick-2",
+                20,
+                "TickFinalized",
+                json!({"finalizedOwed": "2", "deposit": "0"}),
+            ),
+        ])
+        .expect("decode exact settlement lifecycle");
+
+        assert_eq!(
+            receipts.events,
+            vec![
+                TokenContractSettlementReceipt {
+                    message_id: "accepted".to_string(),
+                    created_at: 10,
+                    event: TokenContractSettlementEvent::ProbeAccepted {
+                        buyer: buyer.clone(),
+                        to_seller: 1,
+                        commission_returned: 0,
+                    },
+                },
+                TokenContractSettlementReceipt {
+                    message_id: "tick-2".to_string(),
+                    created_at: 20,
+                    event: TokenContractSettlementEvent::TickFinalized {
+                        finalized_owed: 2,
+                        deposit: 0,
+                    },
+                },
+                TokenContractSettlementReceipt {
+                    message_id: "tick-3".to_string(),
+                    created_at: 30,
+                    event: TokenContractSettlementEvent::TickFinalized {
+                        finalized_owed: 3,
+                        deposit: 0,
+                    },
+                },
+                TokenContractSettlementReceipt {
+                    message_id: "stop".to_string(),
+                    created_at: 40,
+                    event: TokenContractSettlementEvent::StreamStopped {
+                        buyer,
+                        to_seller: 0,
+                        refund_to_buyer: 0,
+                    },
+                },
+            ]
         );
     }
 
@@ -4281,6 +5813,7 @@ mod tests {
 
     fn fill(token_contract: &str, ticks: u128, price_per_tick: u128) -> MatchedFill {
         MatchedFill {
+            order_id: 1,
             token_contract: token_contract.to_string(),
             ticks,
             price_per_tick,
@@ -4445,6 +5978,43 @@ mod tests {
             MoneySubmitError::Preparation { .. }
         ));
         assert!(money_submit_stage(&error).clears_journal());
+    }
+
+    #[tokio::test]
+    async fn reclaim_heartbeat_change_after_prepare_skips_money_post() {
+        use std::sync::{
+            atomic::{AtomicU64, AtomicUsize, Ordering},
+            Arc,
+        };
+
+        let generation = Arc::new(AtomicU64::new(7));
+        let heartbeat = crate::chain::HeartbeatGuard::new(Arc::clone(&generation));
+        let sends = Arc::new(AtomicUsize::new(0));
+        let prepare_generation = Arc::clone(&generation);
+        let send_counter = Arc::clone(&sends);
+        let mut before_post = || heartbeat.unchanged();
+
+        let result = prepare_reclaim_money_post_if(
+            async move {
+                prepare_generation.fetch_add(1, Ordering::SeqCst);
+                Ok((
+                    "endpoint".to_string(),
+                    "signed-boc".to_string(),
+                    "account".to_string(),
+                    "dapp".to_string(),
+                ))
+            },
+            &mut before_post,
+            move |_| async move {
+                send_counter.fetch_add(1, Ordering::SeqCst);
+                Ok(json!({"ok": true}))
+            },
+        )
+        .await
+        .expect("changed heartbeat must cancel without a send");
+
+        assert!(result.is_none());
+        assert_eq!(sends.load(Ordering::SeqCst), 0);
     }
 
     #[tokio::test]

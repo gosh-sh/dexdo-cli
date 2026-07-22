@@ -181,7 +181,11 @@ pub(crate) async fn run_seller(args: SellerArgs) -> Result<()> {
         let models = dexdo::seller::ModelsConfig::load(&args.models)?;
         let mc = models.get(name)?;
         mc.require_api_key_present()?;
-        dexdo::seller::UpstreamConfig::OpenAi(dexdo::seller::OpenAiConfig::from_model(mc))
+        if dexdo::seller::AnthropicConfig::supports(mc) {
+            dexdo::seller::UpstreamConfig::Anthropic(dexdo::seller::AnthropicConfig::from_model(mc))
+        } else {
+            dexdo::seller::UpstreamConfig::OpenAi(dexdo::seller::OpenAiConfig::from_model(mc))
+        }
     };
     let seller_frame_model_for_handle = if args.mock.mock_chain {
         None
@@ -325,6 +329,7 @@ pub(crate) async fn run_seller(args: SellerArgs) -> Result<()> {
                     kind: "gateway".to_string(),
                     value: gateway_advertise.clone(),
                 }),
+                created_order_ids: Vec::new(),
             },
             true,
         )?;

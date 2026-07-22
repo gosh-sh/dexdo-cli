@@ -213,6 +213,8 @@ pub struct ApiDeal {
     pub session: Arc<SessionSettle>,
     pub content_gate: Arc<ContentGate>,
     delivered_tokens: Arc<AtomicU64>,
+    last_accepted_output_unix_secs: Arc<AtomicU64>,
+    accepted_output_generation: Arc<AtomicU64>,
     active_requests: Arc<AtomicU64>,
     last_request_started_unix_secs: Arc<AtomicU64>,
 }
@@ -224,6 +226,8 @@ impl ApiDeal {
             session,
             content_gate,
             delivered_tokens: Arc::new(AtomicU64::new(0)),
+            last_accepted_output_unix_secs: Arc::new(AtomicU64::new(0)),
+            accepted_output_generation: Arc::new(AtomicU64::new(0)),
             active_requests: Arc::new(AtomicU64::new(0)),
             last_request_started_unix_secs: Arc::new(AtomicU64::new(0)),
         }
@@ -241,6 +245,26 @@ impl ApiDeal {
 
     pub fn record_delivered(&self, n: u64) {
         self.delivered_tokens.fetch_add(n, Ordering::SeqCst);
+    }
+
+    /// Record output immediately before a streaming adapter yields it to its consumer.
+    pub fn record_accepted_output(&self, now_secs: u64) {
+        self.last_accepted_output_unix_secs
+            .fetch_max(now_secs, Ordering::SeqCst);
+        self.accepted_output_generation
+            .fetch_add(1, Ordering::SeqCst);
+    }
+
+    pub fn last_accepted_output_unix_secs(&self) -> u64 {
+        self.last_accepted_output_unix_secs.load(Ordering::SeqCst)
+    }
+
+    pub fn accepted_output_generation(&self) -> u64 {
+        self.accepted_output_generation.load(Ordering::SeqCst)
+    }
+
+    pub fn accepted_output_guard(&self) -> dexdo_core::chain::HeartbeatGuard {
+        dexdo_core::chain::HeartbeatGuard::new(self.accepted_output_generation.clone())
     }
 
     pub(crate) fn begin_request(&self, now_secs: u64) -> ConsumerRequestGuard {
@@ -1537,6 +1561,70 @@ mod tests {
                 "SSE path must not wait until stream end to publish delivered tokens"
             );
         }
+    }
+
+    fn heartbeat_test_deal() -> ApiDeal {
+        ApiDeal::new(
+            Route {
+                handover: Handover {
+                    endpoint: "https://127.0.0.1:1".to_string(),
+                    tls_fingerprint: "00".repeat(32),
+                },
+                token_contract: "tc-heartbeat-poll".to_string(),
+                max_tokens: 100,
+            },
+            Arc::new(SessionSettle::new(
+                Arc::new(RecordingSettleChain::default()),
+                "tc-heartbeat-poll".to_string(),
+                Arc::new(dexdo_core::LocalNote::generate()),
+            )),
+            Arc::new(ContentGate::skip()),
+        )
+    }
+
+    #[tokio::test]
+    async fn openai_content_poll_records_heartbeat_before_returning_event() {
+        use futures::StreamExt;
+        let deal = heartbeat_test_deal();
+        let stream = super::openai::heartbeat_poll_test_stream(deal.clone());
+        futures::pin_mut!(stream);
+        assert_eq!(deal.accepted_output_generation(), 0);
+        assert!(stream.next().await.is_some());
+        assert_eq!(deal.accepted_output_generation(), 1);
+    }
+
+    #[tokio::test]
+    async fn anthropic_content_poll_records_heartbeat_before_returning_event() {
+        use futures::StreamExt;
+        let deal = heartbeat_test_deal();
+        let stream = super::anthropic::heartbeat_poll_test_stream(deal.clone());
+        futures::pin_mut!(stream);
+        assert_eq!(deal.accepted_output_generation(), 0);
+        assert!(stream.next().await.is_some());
+        assert_eq!(deal.accepted_output_generation(), 1);
+    }
+
+    #[test]
+    fn accepted_output_heartbeat_is_monotonic() {
+        let deal = ApiDeal::new(
+            Route {
+                handover: Handover {
+                    endpoint: "https://127.0.0.1:1".to_string(),
+                    tls_fingerprint: "00".repeat(32),
+                },
+                token_contract: "tc-heartbeat".to_string(),
+                max_tokens: 100,
+            },
+            Arc::new(SessionSettle::new(
+                Arc::new(RecordingSettleChain::default()),
+                "tc-heartbeat".to_string(),
+                Arc::new(dexdo_core::LocalNote::generate()),
+            )),
+            Arc::new(ContentGate::skip()),
+        );
+        deal.record_accepted_output(200);
+        deal.record_accepted_output(199);
+        assert_eq!(deal.last_accepted_output_unix_secs(), 200);
     }
 
     #[derive(Default)]

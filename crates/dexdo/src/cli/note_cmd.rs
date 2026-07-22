@@ -358,8 +358,21 @@ fn note_deploy_multisig_keys(args: &NoteDeployArgs) -> Result<dexdo_core::KeyPai
 }
 
 #[cfg(feature = "shellnet")]
+trait NoteDeployFundingKeyLoader {
+    fn load_funding_wallet_keys(&self) -> Result<dexdo_core::KeyPair>;
+}
+
+#[cfg(feature = "shellnet")]
+impl NoteDeployFundingKeyLoader for NoteDeployArgs {
+    fn load_funding_wallet_keys(&self) -> Result<dexdo_core::KeyPair> {
+        note_deploy_multisig_keys(self)
+    }
+}
+
+#[cfg(feature = "shellnet")]
 #[derive(Debug, Clone, Copy, Default)]
 struct NoteDeployVoucherFailpoints {
+    before_voucher_event_wait: bool,
     after_deposit_submit: bool,
     after_deposit_event: bool,
     after_shell_submit: bool,
@@ -388,160 +401,230 @@ const NOTE_DEPLOY_SUBMIT_NATIVE_VALUE: u128 = 2_000_000_000;
 #[cfg(feature = "shellnet")]
 const NOTE_DEPLOY_VOUCHER_EVENT_TIMEOUT_SECS: u64 = 480;
 #[cfg(feature = "shellnet")]
-const NOTE_DEPLOY_ROOT_PN_DAPP_ID: &str = "0";
-#[cfg(feature = "shellnet")]
-const NOTE_DEPLOY_GENERIC_MULTISIG_CODE_HASH: &str =
-    "3a7a53248ff39fde936a4274eab143b5fac94feac0d8e2e2748aac5e74538d5f";
-#[cfg(feature = "shellnet")]
 const NOTE_DEPLOY_UPDATE_CUSTODIAN_MULTISIG_CODE_HASH: &str =
     "8470e1da28a2b4c742b5f7edefdd97db81c79e726f8a8b0be78d921adaf32414";
 
 #[cfg(feature = "shellnet")]
-const NOTE_DEPLOY_GENERIC_MULTISIG_ABI_JSON: &str = r#"{
-  "ABI version": 2,
-  "version": "2.4",
-  "header": ["pubkey", "time", "expire"],
-  "functions": [
-    {
-      "name": "sendTransaction",
-      "inputs": [
-        { "name": "dest", "type": "address" },
-        { "name": "value", "type": "uint128" },
-        { "name": "cc", "type": "map(uint32,varuint32)" },
-        { "name": "bounce", "type": "bool" },
-        { "name": "flags", "type": "uint8" },
-        { "name": "payload", "type": "cell" },
-        { "name": "dapp_id", "type": "uint256" }
-      ],
-      "outputs": [{ "name": "value0", "type": "address" }]
+fn ensure_note_deploy_update_custodian_code_hash(code_hash: &str) -> Result<()> {
+    let code_hash = code_hash.trim();
+    let code_hash = code_hash
+        .strip_prefix("0x")
+        .or_else(|| code_hash.strip_prefix("0X"))
+        .unwrap_or(code_hash)
+        .to_ascii_lowercase();
+    if code_hash == NOTE_DEPLOY_UPDATE_CUSTODIAN_MULTISIG_CODE_HASH {
+        return Ok(());
     }
-  ],
-  "events": [],
-  "data": []
-}"#;
-
-#[cfg(feature = "shellnet")]
-const NOTE_DEPLOY_UPDATE_CUSTODIAN_MULTISIG_ABI_JSON: &str = r#"{
-  "ABI version": 2,
-  "version": "2.4",
-  "header": ["pubkey", "time", "expire"],
-  "functions": [
-    {
-      "name": "sendTransaction",
-      "inputs": [
-        { "name": "dest", "type": "address" },
-        { "name": "value", "type": "uint128" },
-        { "name": "cc", "type": "map(uint32,varuint32)" },
-        { "name": "bounce", "type": "bool" },
-        { "name": "flags", "type": "uint8" },
-        { "name": "payload", "type": "cell" }
-      ],
-      "outputs": [{ "name": "value0", "type": "address" }]
-    }
-  ],
-  "events": [],
-  "data": []
-}"#;
-
-#[cfg(feature = "shellnet")]
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum NoteDeployMultisigForwardKind {
-    Generic,
-    UpdateCustodian,
+    bail!(
+        "unsupported funding wallet code_hash {code_hash}; dexdo note deploy supports only \
+         UpdateCustodianMultisigWallet {NOTE_DEPLOY_UPDATE_CUSTODIAN_MULTISIG_CODE_HASH}"
+    )
 }
 
 #[cfg(feature = "shellnet")]
-impl NoteDeployMultisigForwardKind {
-    fn from_code_hash(code_hash: &str) -> Result<Self> {
-        let code_hash = code_hash
-            .trim()
-            .trim_start_matches("0x")
-            .to_ascii_lowercase();
-        match code_hash.as_str() {
-            NOTE_DEPLOY_GENERIC_MULTISIG_CODE_HASH => Ok(Self::Generic),
-            NOTE_DEPLOY_UPDATE_CUSTODIAN_MULTISIG_CODE_HASH => Ok(Self::UpdateCustodian),
-            other => Err(anyhow::anyhow!(
-                "unsupported funding wallet code_hash {other}; supported generic Multisig \
-                 {NOTE_DEPLOY_GENERIC_MULTISIG_CODE_HASH} and UpdateCustodianMultisigWallet \
-                 {NOTE_DEPLOY_UPDATE_CUSTODIAN_MULTISIG_CODE_HASH}"
-            )),
-        }
-    }
-
-    fn abi_json(self) -> &'static str {
-        match self {
-            Self::Generic => NOTE_DEPLOY_GENERIC_MULTISIG_ABI_JSON,
-            Self::UpdateCustodian => NOTE_DEPLOY_UPDATE_CUSTODIAN_MULTISIG_ABI_JSON,
-        }
-    }
-
-    fn send_transaction_params(
-        self,
-        root_pn: &dexdo_core::Address,
-        cc: serde_json::Map<String, serde_json::Value>,
-        voucher_body: String,
-    ) -> serde_json::Value {
-        let mut params = serde_json::json!({
-            "dest": root_pn.with_workchain(),
-            "value": NOTE_DEPLOY_SUBMIT_NATIVE_VALUE.to_string(),
-            "cc": serde_json::Value::Object(cc),
-            "bounce": true,
-            "flags": 1,
-            "payload": voucher_body,
-        });
-        if self == Self::Generic {
-            params["dapp_id"] = serde_json::Value::String(NOTE_DEPLOY_ROOT_PN_DAPP_ID.to_string());
-        }
-        params
-    }
+fn note_deploy_update_custodian_send_transaction_params(
+    root_pn: &dexdo_core::Address,
+    cc: serde_json::Map<String, serde_json::Value>,
+    voucher_body: String,
+) -> serde_json::Value {
+    serde_json::json!({
+        "dest": root_pn.with_workchain(),
+        "value": NOTE_DEPLOY_SUBMIT_NATIVE_VALUE.to_string(),
+        "cc": serde_json::Value::Object(cc),
+        "bounce": true,
+        "flags": 1,
+        "payload": voucher_body,
+    })
 }
 
 #[cfg(feature = "shellnet")]
-async fn note_deploy_fetch_wallet_code_hash(
-    http: &reqwest::Client,
-    endpoint: &str,
-    wallet: &dexdo_core::Address,
-) -> Result<String> {
-    let bare = wallet.bare();
-    let query = format!(
-        "{{ blockchain {{ account(account_id: \"{bare}\", dapp_id: \"{bare}\") {{ info {{ acc_type_name code_hash }} }} }} }}"
-    );
-    let resp: serde_json::Value = http
-        .post(format!("{}/graphql", endpoint.trim_end_matches('/')))
-        .json(&serde_json::json!({ "query": query }))
-        .send()
-        .await
-        .map_err(|e| anyhow::anyhow!("read funding wallet code_hash: {e}"))?
-        .error_for_status()
-        .map_err(|e| anyhow::anyhow!("read funding wallet code_hash: {e}"))?
-        .json()
-        .await
-        .map_err(|e| anyhow::anyhow!("decode funding wallet code_hash response: {e}"))?;
-    if let Some(errors) = resp.get("errors") {
-        bail!("read funding wallet code_hash GraphQL errors: {errors}");
+fn normalize_multisig_pubkey(pubkey: &str) -> Option<String> {
+    let pubkey = pubkey
+        .trim()
+        .strip_prefix("0x")
+        .or_else(|| pubkey.trim().strip_prefix("0X"))
+        .unwrap_or_else(|| pubkey.trim());
+    if pubkey.is_empty()
+        || pubkey.len() > 64
+        || !pubkey.bytes().all(|byte| byte.is_ascii_hexdigit())
+    {
+        return None;
     }
-    let info = resp
-        .pointer("/data/blockchain/account/info")
-        .ok_or_else(|| anyhow::anyhow!("funding wallet {} not found", wallet.with_workchain()))?;
-    let acc_type = info
-        .get("acc_type_name")
-        .and_then(serde_json::Value::as_str)
-        .unwrap_or("unknown");
-    if acc_type != "Active" {
-        bail!(
-            "funding wallet {} is not Active (acc_type={acc_type})",
-            wallet.with_workchain()
-        );
+    Some(format!("{pubkey:0>64}").to_ascii_lowercase())
+}
+
+#[cfg(feature = "shellnet")]
+fn multisig_custodian_pubkeys(custodians: &serde_json::Value) -> Vec<String> {
+    custodians
+        .get("custodians")
+        .and_then(serde_json::Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(|custodian| custodian.get("owner_pubkey"))
+        .filter_map(serde_json::Value::as_str)
+        .filter_map(normalize_multisig_pubkey)
+        .collect()
+}
+
+#[cfg(feature = "shellnet")]
+fn multisig_key_is_sole_custodian(derived_pubkey: &str, custodians: &serde_json::Value) -> bool {
+    let Some(custodian_entries) = custodians
+        .get("custodians")
+        .and_then(serde_json::Value::as_array)
+    else {
+        return false;
+    };
+    if custodian_entries.len() != 1 {
+        return false;
     }
-    info.get("code_hash")
-        .and_then(serde_json::Value::as_str)
-        .map(ToOwned::to_owned)
+    let pubkeys = multisig_custodian_pubkeys(custodians);
+    normalize_multisig_pubkey(derived_pubkey).is_some_and(|derived| pubkeys.as_slice() == [derived])
+}
+
+#[cfg(feature = "shellnet")]
+fn ensure_multisig_key_is_sole_custodian(
+    funding_wallet: &str,
+    derived_pubkey: &str,
+    custodians: &serde_json::Value,
+) -> Result<()> {
+    let custodian_entries = custodians
+        .get("custodians")
+        .and_then(serde_json::Value::as_array)
         .ok_or_else(|| {
             anyhow::anyhow!(
-                "funding wallet {} has no code_hash",
-                wallet.with_workchain()
+                "funding wallet {funding_wallet} is Active, but getCustodians returned no \
+                 `custodians` array (ABI/getter output mismatch)"
             )
-        })
+        })?;
+    if custodian_entries.len() != 1 {
+        bail!(
+            "funding wallet {funding_wallet} has {} custodians; direct \
+             UpdateCustodianMultisigWallet.sendTransaction \
+             requires exactly one pubkey custodian, and --multisig-key must match it",
+            custodian_entries.len()
+        );
+    }
+
+    let derived = normalize_multisig_pubkey(derived_pubkey)
+        .unwrap_or_else(|| derived_pubkey.trim().to_ascii_lowercase());
+    let pubkeys = multisig_custodian_pubkeys(custodians);
+    let [sole_custodian] = pubkeys.as_slice() else {
+        bail!(
+            "funding wallet {funding_wallet} has zero pubkey custodians in getCustodians output; \
+             direct UpdateCustodianMultisigWallet.sendTransaction requires exactly one pubkey custodian"
+        );
+    };
+    if multisig_key_is_sole_custodian(derived_pubkey, custodians) {
+        return Ok(());
+    }
+    bail!(
+        "--multisig-key derives pubkey 0x{derived}, but funding wallet {funding_wallet}'s sole \
+         custodian is 0x{sole_custodian}. Provide the sole custodian's key \
+         (--multisig-key / --multisig-seed-file); no wallet message was submitted."
+    )
+}
+
+#[cfg(feature = "shellnet")]
+fn require_get_custodians_output(
+    funding_wallet: &str,
+    output: Option<serde_json::Value>,
+) -> Result<serde_json::Value> {
+    match output {
+        Some(output)
+            if output
+                .get("custodians")
+                .and_then(serde_json::Value::as_array)
+                .is_some() =>
+        {
+            Ok(output)
+        }
+        _ => bail!(
+            "funding wallet {funding_wallet} is Active, but getCustodians returned no custodians \
+             output (ABI/getter output mismatch)"
+        ),
+    }
+}
+
+#[cfg(feature = "shellnet")]
+#[async_trait::async_trait(?Send)]
+trait NoteDeployFundingWalletReader {
+    async fn funding_wallet_code_hash(
+        &self,
+        multisig_address: &dexdo_core::Address,
+    ) -> Result<String>;
+
+    async fn funding_wallet_custodians(
+        &self,
+        multisig_address: &dexdo_core::Address,
+    ) -> Result<serde_json::Value>;
+}
+
+#[cfg(feature = "shellnet")]
+#[async_trait::async_trait(?Send)]
+impl NoteDeployFundingWalletReader for dexdo_core::ChainClient {
+    async fn funding_wallet_code_hash(
+        &self,
+        multisig_address: &dexdo_core::Address,
+    ) -> Result<String> {
+        let funding_multisig_address = multisig_address.with_workchain();
+        let funding_wallet = self
+            .get_account(multisig_address)
+            .await
+            .map_err(|e| anyhow::anyhow!("read funding wallet {funding_multisig_address}: {e}"))?
+            .ok_or_else(|| {
+                anyhow::anyhow!("funding wallet {funding_multisig_address} not found")
+            })?;
+        if !funding_wallet.is_active() {
+            bail!(
+                "funding wallet {funding_multisig_address} is not Active (acc_type={})",
+                funding_wallet.status
+            );
+        }
+        let wallet_code_hash = funding_wallet.code_hash.as_deref().ok_or_else(|| {
+            anyhow::anyhow!("funding wallet {funding_multisig_address} has no code_hash")
+        })?;
+        Ok(wallet_code_hash.to_string())
+    }
+
+    async fn funding_wallet_custodians(
+        &self,
+        multisig_address: &dexdo_core::Address,
+    ) -> Result<serde_json::Value> {
+        let funding_multisig_address = multisig_address.with_workchain();
+        let output = self
+            .run_getter(
+                multisig_address,
+                dexdo_core::ackinacki_wallet::contracts::MULTISIG_ABI_JSON,
+                "getCustodians",
+                serde_json::json!({}),
+            )
+            .await
+            .map_err(|e| {
+                anyhow::anyhow!("read custodians of funding wallet {funding_multisig_address}: {e}")
+            })?;
+        require_get_custodians_output(&funding_multisig_address, output)
+    }
+}
+
+#[cfg(feature = "shellnet")]
+async fn note_deploy_preflight_key_owns_wallet(
+    wallet_reader: &dyn NoteDeployFundingWalletReader,
+    multisig_address: &dexdo_core::Address,
+    multisig_keys: &dexdo_core::KeyPair,
+) -> Result<()> {
+    let funding_multisig_address = multisig_address.with_workchain();
+    let code_hash = wallet_reader
+        .funding_wallet_code_hash(multisig_address)
+        .await?;
+    ensure_note_deploy_update_custodian_code_hash(&code_hash)?;
+    let custodians = wallet_reader
+        .funding_wallet_custodians(multisig_address)
+        .await?;
+    ensure_multisig_key_is_sole_custodian(
+        &funding_multisig_address,
+        multisig_keys.public_hex(),
+        &custodians,
+    )
 }
 
 #[cfg(feature = "shellnet")]
@@ -556,14 +639,11 @@ fn note_deploy_persist_voucher_checkpoint(
 }
 
 #[cfg(feature = "shellnet")]
-#[allow(clippy::too_many_arguments)]
 async fn note_deploy_build_voucher_submit_boc(
-    endpoint: &str,
     multisig_address: &dexdo_core::Address,
     multisig_keys: &dexdo_core::KeyPair,
     root_pn: &dexdo_core::Address,
     checkpoint: &crate::cli::note::NoteDeployVoucherCheckpoint,
-    http: &reqwest::Client,
 ) -> Result<String> {
     use dexdo_core::{
         airegistry::{
@@ -591,23 +671,49 @@ async fn note_deploy_build_voucher_submit_boc(
         checkpoint.token_type.to_string(),
         serde_json::Value::String(checkpoint.raw_value.to_string()),
     );
-    let wallet_code_hash =
-        note_deploy_fetch_wallet_code_hash(http, endpoint, multisig_address).await?;
-    let forward_kind = NoteDeployMultisigForwardKind::from_code_hash(&wallet_code_hash)?;
     let boc = encode_external_call(
         &ctx,
-        forward_kind.abi_json(),
+        dexdo_core::ackinacki_wallet::contracts::MULTISIG_ABI_JSON,
         &multisig_address.with_workchain(),
         "sendTransaction",
-        forward_kind.send_transaction_params(root_pn, cc, voucher_body),
+        note_deploy_update_custodian_send_transaction_params(root_pn, cc, voucher_body),
         multisig_keys.public_hex(),
         multisig_keys.secret_hex(),
     )
     .await
     .map_err(|e| {
-        anyhow::anyhow!("encode Multisig.sendTransaction -> RootPN.generateVoucher: {e}")
+        anyhow::anyhow!(
+            "encode UpdateCustodianMultisigWallet.sendTransaction -> RootPN.generateVoucher: {e}"
+        )
     })?;
     Ok(boc)
+}
+
+#[cfg(feature = "shellnet")]
+#[async_trait::async_trait(?Send)]
+trait NoteDeployVoucherBocBuilder {
+    async fn build_voucher_submit_boc(
+        &self,
+        multisig_address: &dexdo_core::Address,
+        multisig_keys: &dexdo_core::KeyPair,
+        root_pn: &dexdo_core::Address,
+        checkpoint: &crate::cli::note::NoteDeployVoucherCheckpoint,
+    ) -> Result<String>;
+}
+
+#[cfg(feature = "shellnet")]
+#[async_trait::async_trait(?Send)]
+impl NoteDeployVoucherBocBuilder for dexdo_core::ChainClient {
+    async fn build_voucher_submit_boc(
+        &self,
+        multisig_address: &dexdo_core::Address,
+        multisig_keys: &dexdo_core::KeyPair,
+        root_pn: &dexdo_core::Address,
+        checkpoint: &crate::cli::note::NoteDeployVoucherCheckpoint,
+    ) -> Result<String> {
+        note_deploy_build_voucher_submit_boc(multisig_address, multisig_keys, root_pn, checkpoint)
+            .await
+    }
 }
 
 #[cfg(feature = "shellnet")]
@@ -618,6 +724,7 @@ async fn note_deploy_submit_voucher_boc(
     http: &reqwest::Client,
 ) -> Result<()> {
     use dexdo_core::ackinacki_wallet::query::send_message_routed;
+    dexdo_core::shellnet_clock_skew_preflight(endpoint).await?;
     send_message_routed(
         http,
         endpoint,
@@ -628,16 +735,44 @@ async fn note_deploy_submit_voucher_boc(
     )
     .await
     .map_err(|e| {
-        anyhow::anyhow!("submit Multisig.sendTransaction -> RootPN.generateVoucher: {e}")
+        anyhow::anyhow!(
+            "submit UpdateCustodianMultisigWallet.sendTransaction -> RootPN.generateVoucher: {e}"
+        )
     })?;
     Ok(())
+}
+
+#[cfg(feature = "shellnet")]
+#[async_trait::async_trait(?Send)]
+trait NoteDeployVoucherSubmitter {
+    async fn submit_voucher_boc(
+        &self,
+        endpoint: &str,
+        multisig_address: &dexdo_core::Address,
+        boc: &str,
+        http: &reqwest::Client,
+    ) -> Result<()>;
+}
+
+#[cfg(feature = "shellnet")]
+#[async_trait::async_trait(?Send)]
+impl NoteDeployVoucherSubmitter for dexdo_core::ChainClient {
+    async fn submit_voucher_boc(
+        &self,
+        endpoint: &str,
+        multisig_address: &dexdo_core::Address,
+        boc: &str,
+        http: &reqwest::Client,
+    ) -> Result<()> {
+        note_deploy_submit_voucher_boc(endpoint, multisig_address, boc, http).await
+    }
 }
 
 #[cfg(feature = "shellnet")]
 fn is_note_deploy_wallet_submit_busy_error(error: &anyhow::Error) -> bool {
     error
         .to_string()
-        .contains("submit Multisig.sendTransaction -> RootPN.generateVoucher:")
+        .contains("submit UpdateCustodianMultisigWallet.sendTransaction -> RootPN.generateVoucher:")
         && is_note_deploy_wallet_busy_error(error)
 }
 
@@ -690,7 +825,10 @@ async fn note_deploy_mint_voucher_recoverable(
     recovery: &mut crate::cli::note::NoteDeployRecoveryState,
     kind: crate::cli::note::NoteDeployVoucherKind,
     multisig_address: &dexdo_core::Address,
-    multisig_keys: &dexdo_core::KeyPair,
+    funding_key_loader: &dyn NoteDeployFundingKeyLoader,
+    wallet_reader: &dyn NoteDeployFundingWalletReader,
+    voucher_boc_builder: &dyn NoteDeployVoucherBocBuilder,
+    voucher_submitter: &dyn NoteDeployVoucherSubmitter,
     recipient_ephemeral_pubkey_hex: &str,
     voucher_token_type: u32,
     voucher_value: u64,
@@ -711,6 +849,7 @@ async fn note_deploy_mint_voucher_recoverable(
     let endpoint = client.endpoint();
     let root_pn = dexdo_core::Address::parse(ROOT_PN_ADDRESS)?;
     let recipient_ephemeral_pubkey_hex = proof::strip_0x(recipient_ephemeral_pubkey_hex);
+    let mut guarded_funding_keys = None;
     let mut checkpoint = match recovery.voucher_checkpoint(kind).cloned() {
         Some(checkpoint) => {
             checkpoint.ensure_matches(
@@ -723,6 +862,12 @@ async fn note_deploy_mint_voucher_recoverable(
             checkpoint
         }
         None => {
+            let funding_keys = funding_key_loader.load_funding_wallet_keys()?;
+            note_deploy_preflight_key_owns_wallet(wallet_reader, multisig_address, &funding_keys)
+                .await?;
+            guarded_funding_keys = Some(funding_keys);
+
+            let recovery_was_persisted = recovery_path.exists();
             let sk_u_hex = proof::random_secret_key();
             let sk_u_commit_hex = compute_sk_u_commit_hex(&sk_u_hex)
                 .map_err(|e| anyhow::anyhow!("compute {} voucher skUCommit: {e}", kind.label()))?;
@@ -740,6 +885,12 @@ async fn note_deploy_mint_voucher_recoverable(
                 kind,
                 checkpoint.clone(),
             )?;
+            if !recovery_was_persisted {
+                eprintln!(
+                    "{}",
+                    crate::cli::note::recovery_owner_key_written_message(recovery_path)
+                );
+            }
             eprintln!(
                 "note deploy recovery: recorded {} voucher checkpoint in {} before wallet spend.",
                 kind.label(),
@@ -761,15 +912,22 @@ async fn note_deploy_mint_voucher_recoverable(
     let http = reqwest::Client::new();
     if checkpoint.event.is_none() {
         if !checkpoint.submit_maybe_sent {
-            let boc = note_deploy_build_voucher_submit_boc(
-                endpoint,
-                multisig_address,
-                multisig_keys,
-                &root_pn,
-                &checkpoint,
-                &http,
-            )
-            .await?;
+            if guarded_funding_keys.is_none() {
+                let funding_keys = funding_key_loader.load_funding_wallet_keys()?;
+                note_deploy_preflight_key_owns_wallet(
+                    wallet_reader,
+                    multisig_address,
+                    &funding_keys,
+                )
+                .await?;
+                guarded_funding_keys = Some(funding_keys);
+            }
+            let funding_keys = guarded_funding_keys.as_ref().ok_or_else(|| {
+                anyhow::anyhow!("fresh voucher submit is missing its guarded funding key")
+            })?;
+            let boc = voucher_boc_builder
+                .build_voucher_submit_boc(multisig_address, funding_keys, &root_pn, &checkpoint)
+                .await?;
             checkpoint.submit_maybe_sent = true;
             note_deploy_persist_voucher_checkpoint(
                 recovery_path,
@@ -782,7 +940,9 @@ async fn note_deploy_mint_voucher_recoverable(
                 kind.label(),
                 recovery_path.display()
             );
-            note_deploy_submit_voucher_boc(endpoint, multisig_address, &boc, &http).await?;
+            voucher_submitter
+                .submit_voucher_boc(endpoint, multisig_address, &boc, &http)
+                .await?;
             if failpoints.after_submit(kind) {
                 bail!(
                     "simulated interruption after {} voucher wallet submit. Recovery state is at {}; rerun `dexdo note deploy --recovery <this-file> --pool <pool>` to resume without a second wallet spend.",
@@ -798,6 +958,9 @@ async fn note_deploy_mint_voucher_recoverable(
             );
         }
 
+        if failpoints.before_voucher_event_wait {
+            bail!("simulated interruption before voucher event wait");
+        }
         let event = voucher_event::wait_for_voucher_event_by_sk_u_commit(
             &http,
             endpoint,
@@ -884,6 +1047,7 @@ async fn note_deploy_submit_private_note(
         proof::{hex_u256_to_dec, pubkey_to_dec},
     };
 
+    dexdo_core::shellnet_clock_skew_preflight(client.endpoint()).await?;
     client
         .call(
             root_pn,
@@ -914,7 +1078,7 @@ async fn deploy_private_note_from_multisig_recoverable(
     recovery_path: &std::path::Path,
     recovery: &mut crate::cli::note::NoteDeployRecoveryState,
     multisig_address: &dexdo_core::Address,
-    multisig_keys: &dexdo_core::KeyPair,
+    funding_key_loader: &dyn NoteDeployFundingKeyLoader,
     pn_keys: &dexdo_core::KeyPair,
     halo2_paths: &dexdo_core::private_note::Halo2Paths,
     failpoints: NoteDeployVoucherFailpoints,
@@ -965,7 +1129,10 @@ async fn deploy_private_note_from_multisig_recoverable(
                 recovery,
                 crate::cli::note::NoteDeployVoucherKind::Deposit,
                 multisig_address,
-                multisig_keys,
+                funding_key_loader,
+                client,
+                client,
+                client,
                 pn_keys.public_hex(),
                 deposit_token_type,
                 deposit_raw_value,
@@ -1105,7 +1272,10 @@ async fn deploy_private_note_from_multisig_recoverable(
                 recovery,
                 crate::cli::note::NoteDeployVoucherKind::ShellGas,
                 multisig_address,
-                multisig_keys,
+                funding_key_loader,
+                client,
+                client,
+                client,
                 pn_keys.public_hex(),
                 CURRENCY_ID_SHELL,
                 ECC_SHELL_DEPOSIT_RAW,
@@ -1116,6 +1286,7 @@ async fn deploy_private_note_from_multisig_recoverable(
             .await
             .map_err(|e| anyhow::anyhow!("halo2 SHELL gas voucher: {e}"))?;
 
+            dexdo_core::shellnet_clock_skew_preflight(client.endpoint()).await?;
             client
                 .call(
                     &root_pn,
@@ -1683,18 +1854,17 @@ struct NoteDeployProductionOps<'a> {
 impl NoteDeployResolvedOps for NoteDeployProductionOps<'_> {
     async fn load_recovery(&mut self) -> Result<crate::cli::note::NoteDeployRecoveryState> {
         use crate::cli::note::{
-            load_note_deploy_recovery, recovery_owner_key_written_message,
-            write_note_deploy_recovery, NoteDeployRecoveryState,
+            load_note_deploy_recovery, recovery_owner_key_written_message, NoteDeployRecoveryState,
         };
 
-        let recovery = match load_note_deploy_recovery(self.recovery_path)? {
+        let (recovery, already_persisted) = match load_note_deploy_recovery(self.recovery_path)? {
             Some(state) => {
                 state.ensure_matches_request(self.recovery_request)?;
                 eprintln!(
                     "note deploy recovery: using existing state file {}.",
                     self.recovery_path.display()
                 );
-                state
+                (state, true)
             }
             None => {
                 let pn_keys = dexdo_core::KeyPair::generate();
@@ -1703,11 +1873,15 @@ impl NoteDeployResolvedOps for NoteDeployProductionOps<'_> {
                     pn_keys.public_hex(),
                     pn_keys.secret_hex(),
                 )?;
-                write_note_deploy_recovery(self.recovery_path, &state)?;
-                state
+                // Keep a brand-new recovery in memory until the funding wallet passes the exact
+                // UpdateCustodian/sole-custodian guard. The first voucher checkpoint persists the owner
+                // key and checkpoint together before any signed BOC or wallet submit.
+                (state, false)
             }
         };
-        eprintln!("{}", recovery_owner_key_written_message(self.recovery_path));
+        if already_persisted {
+            eprintln!("{}", recovery_owner_key_written_message(self.recovery_path));
+        }
         self.pn_keys = Some(
             dexdo_core::KeyPair::from_secret_hex(&recovery.owner_secret_key_hex)
                 .map_err(|e| anyhow::anyhow!("note deploy recovery owner key: {e:?}"))?,
@@ -1737,13 +1911,12 @@ impl NoteDeployResolvedOps for NoteDeployProductionOps<'_> {
             async |_attempt| {
                 let multisig_address = dexdo_core::Address::parse(self.funding_multisig_address)
                     .map_err(|e| anyhow::anyhow!("--multisig-address: {e}"))?;
-                let multisig_keys = note_deploy_multisig_keys(self.args)?;
                 deploy_private_note_from_multisig_recoverable(
                     self.client,
                     self.recovery_path,
                     recovery,
                     &multisig_address,
-                    &multisig_keys,
+                    self.args,
                     pn_keys,
                     self.halo2_paths,
                     self.voucher_failpoints,
@@ -1841,20 +2014,19 @@ pub(crate) async fn run_note_deploy(args: NoteDeployArgs) -> Result<()> {
     };
     use dexdo_core::{
         private_note::{proof::ECC_SHELL_DEPOSIT_RAW, Halo2Paths, Nominal, TokenType},
-        Address, ChainClient,
+        ChainClient,
     };
 
     let pool_path = resolve_private_file_path(&args.pool, "--pool")?;
     note_deploy_same_file_pool_guard(std::env::var_os("DEXDO_PN_POOL").as_deref(), &pool_path)?;
     let funding_multisig_address = dexdo_core::normalize_wallet_address(&args.multisig_address)
         .map_err(|e| anyhow::anyhow!("--multisig-address: {e}"))?;
-    Address::parse(&funding_multisig_address)
-        .map_err(|e| anyhow::anyhow!("--multisig-address: {e}"))?;
     let nominal = Nominal::parse(&args.nominal)?;
     let token_type = TokenType::parse(&args.token_type)?;
     let nominal_label = nominal.label().to_string();
     let token_type_label = token_type.label().to_string();
     let endpoint = note_endpoint_url(&args.endpoint)?;
+    dexdo_core::shellnet_clock_skew_preflight(&endpoint).await?;
     let client = ChainClient::connect(&endpoint)?;
     let _wallet_lock = acquire_note_deploy_wallet_lock(&funding_multisig_address)?;
     let recovery_path = args
@@ -1878,6 +2050,7 @@ pub(crate) async fn run_note_deploy(args: NoteDeployArgs) -> Result<()> {
         funding_multisig_address, nominal_label, token_type_label, endpoint
     );
     let voucher_failpoints = NoteDeployVoucherFailpoints {
+        before_voucher_event_wait: false,
         after_deposit_submit: args.simulate_interrupt_after_deposit_voucher_submit,
         after_deposit_event: args.simulate_interrupt_after_deposit_voucher_event,
         after_shell_submit: args.simulate_interrupt_after_shell_voucher_submit,
@@ -2000,10 +2173,922 @@ pub(crate) async fn run_note_withdraw(_args: NoteWithdrawArgs) -> Result<()> {
 #[cfg(test)]
 mod tests {
     #[cfg(feature = "shellnet")]
+    #[tokio::test]
+    async fn unsafe_clock_produces_zero_posts_in_note_deploy_direct_send() {
+        use std::sync::{
+            atomic::{AtomicUsize, Ordering},
+            Arc,
+        };
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        for chain_offset in [60_i64, -300] {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let endpoint = format!("http://{}", listener.local_addr().unwrap());
+            let posts = Arc::new(AtomicUsize::new(0));
+            let server_posts = Arc::clone(&posts);
+            let task = tokio::spawn(async move {
+                loop {
+                    let (mut socket, _) = listener.accept().await.unwrap();
+                    let mut request = [0_u8; 8192];
+                    let read = socket.read(&mut request).await.unwrap();
+                    let request = String::from_utf8_lossy(&request[..read]);
+                    if request.starts_with("POST /v2/messages ") {
+                        server_posts.fetch_add(1, Ordering::SeqCst);
+                    }
+                    let local = std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .unwrap()
+                        .as_secs() as i64;
+                    let chain = (local + chain_offset) as u64;
+                    let body = serde_json::json!({"data":{"blockchain":{"blocks":{"edges":[{"node":{"gen_utime":chain}}]}}}}).to_string();
+                    let response = format!(
+                        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                        body.len(), body
+                    );
+                    socket.write_all(response.as_bytes()).await.unwrap();
+                }
+            });
+            let wallet = dexdo_core::Address::parse(&format!("0:{}", "a".repeat(64))).unwrap();
+            let error = super::note_deploy_submit_voucher_boc(
+                &endpoint,
+                &wallet,
+                "not-posted",
+                &reqwest::Client::new(),
+            )
+            .await
+            .unwrap_err();
+            assert!(format!("{error:#}").contains("CLOCK_SKEW"));
+            assert_eq!(
+                posts.load(Ordering::SeqCst),
+                0,
+                "no message POST is permitted"
+            );
+            task.abort();
+        }
+    }
+
+    #[cfg(feature = "shellnet")]
+    struct FixedFundingKeyLoader {
+        secret_hex: Option<String>,
+        failure: Option<&'static str>,
+        calls: std::cell::Cell<usize>,
+    }
+
+    #[cfg(feature = "shellnet")]
+    impl FixedFundingKeyLoader {
+        fn returning(keys: &dexdo_core::KeyPair) -> Self {
+            Self {
+                secret_hex: Some(keys.secret_hex().to_string()),
+                failure: None,
+                calls: std::cell::Cell::new(0),
+            }
+        }
+
+        fn failing(message: &'static str) -> Self {
+            Self {
+                secret_hex: None,
+                failure: Some(message),
+                calls: std::cell::Cell::new(0),
+            }
+        }
+    }
+
+    #[cfg(feature = "shellnet")]
+    impl super::NoteDeployFundingKeyLoader for FixedFundingKeyLoader {
+        fn load_funding_wallet_keys(&self) -> anyhow::Result<dexdo_core::KeyPair> {
+            self.calls.set(self.calls.get() + 1);
+            if let Some(message) = self.failure {
+                anyhow::bail!("{message}");
+            }
+            dexdo_core::KeyPair::from_secret_hex(
+                self.secret_hex
+                    .as_deref()
+                    .ok_or_else(|| anyhow::anyhow!("fixed key loader has no secret"))?,
+            )
+            .map_err(|error| anyhow::anyhow!("fixed funding key: {error:?}"))
+        }
+    }
+
+    #[cfg(feature = "shellnet")]
+    struct FixedFundingWalletReader {
+        code_hash: Option<String>,
+        custodians: Option<serde_json::Value>,
+        failure: Option<&'static str>,
+        code_hash_calls: std::cell::Cell<usize>,
+        custodian_calls: std::cell::Cell<usize>,
+    }
+
+    #[cfg(feature = "shellnet")]
+    impl FixedFundingWalletReader {
+        fn returning(custodians: serde_json::Value) -> Self {
+            Self::with_code_hash(
+                super::NOTE_DEPLOY_UPDATE_CUSTODIAN_MULTISIG_CODE_HASH,
+                custodians,
+            )
+        }
+
+        fn with_code_hash(code_hash: &str, custodians: serde_json::Value) -> Self {
+            Self {
+                code_hash: Some(code_hash.to_string()),
+                custodians: Some(custodians),
+                failure: None,
+                code_hash_calls: std::cell::Cell::new(0),
+                custodian_calls: std::cell::Cell::new(0),
+            }
+        }
+
+        fn failing(message: &'static str) -> Self {
+            Self {
+                code_hash: None,
+                custodians: None,
+                failure: Some(message),
+                code_hash_calls: std::cell::Cell::new(0),
+                custodian_calls: std::cell::Cell::new(0),
+            }
+        }
+    }
+
+    #[cfg(feature = "shellnet")]
+    #[async_trait::async_trait(?Send)]
+    impl super::NoteDeployFundingWalletReader for FixedFundingWalletReader {
+        async fn funding_wallet_code_hash(
+            &self,
+            _multisig_address: &dexdo_core::Address,
+        ) -> anyhow::Result<String> {
+            self.code_hash_calls.set(self.code_hash_calls.get() + 1);
+            if let Some(message) = self.failure {
+                anyhow::bail!("{message}");
+            }
+            self.code_hash
+                .clone()
+                .ok_or_else(|| anyhow::anyhow!("fixed wallet reader has no code hash"))
+        }
+
+        async fn funding_wallet_custodians(
+            &self,
+            _multisig_address: &dexdo_core::Address,
+        ) -> anyhow::Result<serde_json::Value> {
+            self.custodian_calls.set(self.custodian_calls.get() + 1);
+            if let Some(message) = self.failure {
+                anyhow::bail!("{message}");
+            }
+            self.custodians
+                .clone()
+                .ok_or_else(|| anyhow::anyhow!("fixed wallet reader has no custodians"))
+        }
+    }
+
+    #[cfg(feature = "shellnet")]
+    #[derive(Default)]
+    struct CountingVoucherBocBuilder {
+        calls: std::cell::Cell<usize>,
+        saw_nonempty_boc: std::cell::Cell<bool>,
+    }
+
+    #[cfg(feature = "shellnet")]
+    #[async_trait::async_trait(?Send)]
+    impl super::NoteDeployVoucherBocBuilder for CountingVoucherBocBuilder {
+        async fn build_voucher_submit_boc(
+            &self,
+            multisig_address: &dexdo_core::Address,
+            multisig_keys: &dexdo_core::KeyPair,
+            root_pn: &dexdo_core::Address,
+            checkpoint: &crate::cli::note::NoteDeployVoucherCheckpoint,
+        ) -> anyhow::Result<String> {
+            self.calls.set(self.calls.get() + 1);
+            let boc = super::note_deploy_build_voucher_submit_boc(
+                multisig_address,
+                multisig_keys,
+                root_pn,
+                checkpoint,
+            )
+            .await?;
+            self.saw_nonempty_boc.set(!boc.is_empty());
+            Ok(boc)
+        }
+    }
+
+    #[cfg(feature = "shellnet")]
+    #[derive(Default)]
+    struct CountingVoucherSubmitter {
+        calls: std::cell::Cell<usize>,
+        saw_nonempty_boc: std::cell::Cell<bool>,
+    }
+
+    #[cfg(feature = "shellnet")]
+    #[async_trait::async_trait(?Send)]
+    impl super::NoteDeployVoucherSubmitter for CountingVoucherSubmitter {
+        async fn submit_voucher_boc(
+            &self,
+            _endpoint: &str,
+            _multisig_address: &dexdo_core::Address,
+            boc: &str,
+            _http: &reqwest::Client,
+        ) -> anyhow::Result<()> {
+            self.calls.set(self.calls.get() + 1);
+            self.saw_nonempty_boc.set(!boc.is_empty());
+            Ok(())
+        }
+    }
+
+    #[cfg(feature = "shellnet")]
+    fn preflight_fixture_keys() -> dexdo_core::KeyPair {
+        dexdo_core::KeyPair::from_secret_hex(&"3a".repeat(32)).expect("fixture funding key")
+    }
+
+    #[cfg(feature = "shellnet")]
+    async fn run_preflight_with_fixed_custodians(
+        custodians: serde_json::Value,
+    ) -> anyhow::Result<()> {
+        let wallet = dexdo_core::Address::parse(&format!("0:{}", "a".repeat(64)))
+            .expect("parse fixture wallet");
+        let keys = preflight_fixture_keys();
+        let reader = FixedFundingWalletReader::returning(custodians);
+        let result = super::note_deploy_preflight_key_owns_wallet(&reader, &wallet, &keys).await;
+        assert_eq!(
+            reader.code_hash_calls.get(),
+            1,
+            "pre-flight must read the funding-wallet code hash exactly once"
+        );
+        assert_eq!(
+            reader.custodian_calls.get(),
+            1,
+            "pre-flight must read getCustodians exactly once"
+        );
+        result
+    }
+
+    #[cfg(feature = "shellnet")]
+    #[tokio::test]
+    async fn note_deploy_preflight_rejects_zero_pubkey_custodians() {
+        let error = run_preflight_with_fixed_custodians(serde_json::json!({
+            "custodians": [{
+                "index": "0",
+                "owner_pubkey": null,
+                "owner_address": format!("0:{}", "b".repeat(64)),
+            }]
+        }))
+        .await
+        .expect_err("an address-only custodian cannot authorize a pubkey-signed direct send")
+        .to_string();
+        assert!(error.contains("zero pubkey custodians"), "{error}");
+        assert!(error.contains("exactly one pubkey custodian"), "{error}");
+    }
+
+    #[cfg(feature = "shellnet")]
+    #[tokio::test]
+    async fn note_deploy_preflight_rejects_multiple_custodians() {
+        let keys = preflight_fixture_keys();
+        let error = run_preflight_with_fixed_custodians(serde_json::json!({
+            "custodians": [
+                {
+                    "index": "0",
+                    "owner_pubkey": format!("0x{}", keys.public_hex()),
+                },
+                {
+                    "index": "1",
+                    "owner_pubkey": format!("0x{}", "11".repeat(32)),
+                }
+            ]
+        }))
+        .await
+        .expect_err("membership is insufficient when direct sendTransaction would exit 108")
+        .to_string();
+        assert!(error.contains("has 2 custodians"), "{error}");
+        assert!(error.contains("exactly one pubkey custodian"), "{error}");
+    }
+
+    #[cfg(feature = "shellnet")]
+    #[tokio::test]
+    async fn note_deploy_preflight_rejects_mismatched_sole_custodian() {
+        let error = run_preflight_with_fixed_custodians(serde_json::json!({
+            "custodians": [{
+                "index": "0",
+                "owner_pubkey": format!("0x{}", "11".repeat(32)),
+            }]
+        }))
+        .await
+        .expect_err("a mismatched sole funding key must fail closed")
+        .to_string();
+        assert!(error.contains("sole custodian is"), "{error}");
+        assert!(error.contains("no wallet message was submitted"), "{error}");
+    }
+
+    #[cfg(feature = "shellnet")]
+    #[tokio::test]
+    async fn note_deploy_preflight_accepts_matching_sole_custodian() {
+        let keys = preflight_fixture_keys();
+        run_preflight_with_fixed_custodians(serde_json::json!({
+            "custodians": [{
+                "index": "0",
+                "owner_pubkey": format!("0X{}", keys.public_hex().to_ascii_uppercase()),
+            }]
+        }))
+        .await
+        .expect("the matching sole pubkey custodian must pass");
+    }
+
+    #[cfg(feature = "shellnet")]
+    #[test]
+    fn note_deploy_get_custodians_none_or_empty_reports_abi_output_error() {
+        let wallet = format!("0:{}", "a".repeat(64));
+        for output in [None, Some(serde_json::json!({}))] {
+            let error = super::require_get_custodians_output(&wallet, output)
+                .expect_err("None/empty getter output must fail as an ABI/getter diagnostic")
+                .to_string();
+            assert!(error.contains("is Active"), "{error}");
+            assert!(error.contains("getCustodians"), "{error}");
+            assert!(error.contains("no custodians output"), "{error}");
+            assert!(!error.contains("is not Active"), "{error}");
+        }
+    }
+
+    #[cfg(feature = "shellnet")]
+    #[test]
+    fn note_deploy_update_custodian_is_the_only_wallet_canon() {
+        let abi: serde_json::Value =
+            serde_json::from_str(dexdo_core::ackinacki_wallet::contracts::MULTISIG_ABI_JSON)
+                .expect("parse SDK canonical UpdateCustodian ABI");
+        let functions = abi["functions"].as_array().expect("ABI functions");
+        let send_transaction = functions
+            .iter()
+            .find(|function| function["name"] == "sendTransaction")
+            .expect("canonical sendTransaction function");
+        assert_eq!(
+            send_transaction["inputs"],
+            serde_json::json!([
+                { "name": "dest", "type": "address" },
+                { "name": "value", "type": "uint128" },
+                { "name": "cc", "type": "map(uint32,varuint32)" },
+                { "name": "bounce", "type": "bool" },
+                { "name": "flags", "type": "uint8" },
+                { "name": "payload", "type": "cell" }
+            ]),
+            "SDK canonical UpdateCustodian sendTransaction shape"
+        );
+        let get_custodians = functions
+            .iter()
+            .find(|function| function["name"] == "getCustodians")
+            .expect("canonical getCustodians function");
+        assert_eq!(get_custodians["inputs"], serde_json::json!([]));
+        assert_eq!(
+            get_custodians["outputs"],
+            serde_json::json!([{
+                "name": "custodians",
+                "type": "tuple[]",
+                "components": [
+                    { "name": "owner_pubkey", "type": "optional(uint256)" },
+                    { "name": "owner_address", "type": "optional(address)" },
+                    { "name": "index", "type": "uint8" }
+                ]
+            }]),
+            "SDK canonical getCustodians getter shape"
+        );
+        let root_pn = dexdo_core::Address::parse(&format!("0:{}", "b".repeat(64)))
+            .expect("parse RootPN fixture");
+        let params = super::note_deploy_update_custodian_send_transaction_params(
+            &root_pn,
+            serde_json::Map::new(),
+            "fixture-body".to_string(),
+        );
+        let fields = params.as_object().expect("wallet-forward params object");
+        assert_eq!(
+            fields.len(),
+            6,
+            "UpdateCustodian sendTransaction has six inputs"
+        );
+        assert!(
+            !fields.contains_key("dapp_id"),
+            "trailing dapp_id is forbidden"
+        );
+        assert!(
+            !dexdo_core::ackinacki_wallet::contracts::MULTISIG_ABI_JSON.contains("dapp_id"),
+            "UpdateCustodian ABI must not grow a Generic-wallet dapp_id"
+        );
+        super::ensure_note_deploy_update_custodian_code_hash(&format!(
+            "0X{}",
+            super::NOTE_DEPLOY_UPDATE_CUSTODIAN_MULTISIG_CODE_HASH.to_ascii_uppercase()
+        ))
+        .expect("canonical UpdateCustodian hash");
+        let error = super::ensure_note_deploy_update_custodian_code_hash(
+            "3a7a53248ff39fde936a4274eab143b5fac94feac0d8e2e2748aac5e74538d5f",
+        )
+        .expect_err("Generic Multisig must be unsupported")
+        .to_string();
+        assert!(error.contains("supports only UpdateCustodian"), "{error}");
+    }
+
+    #[cfg(feature = "shellnet")]
+    #[tokio::test]
+    async fn note_deploy_missing_recovery_remains_in_memory_before_wallet_preflight() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let recovery_path = temp.path().join("fresh.recovery.json");
+        let pool_path = temp.path().join("fresh.pool.json");
+        let key_path = temp.path().join("funding.secret.hex");
+        let funding_wallet = format!("0:{}", "a".repeat(64));
+        let client = dexdo_core::ChainClient::connect("http://127.0.0.1:9")
+            .expect("connect offline fixture endpoint");
+        let halo2_paths = dexdo_core::private_note::Halo2Paths::from_env();
+        let args = super::NoteDeployArgs {
+            multisig_address: funding_wallet.clone(),
+            multisig_key: Some(key_path),
+            multisig_seed_file: None,
+            nominal: "N100".to_string(),
+            token_type: "nackl".to_string(),
+            endpoint: "http://127.0.0.1:9".to_string(),
+            pool: pool_path.clone(),
+            recovery: Some(recovery_path.clone()),
+            simulate_interrupt_after_spend_before_pool: false,
+            simulate_interrupt_after_deposit_voucher_submit: false,
+            simulate_interrupt_after_deposit_voucher_event: false,
+            simulate_interrupt_after_shell_voucher_submit: false,
+            simulate_interrupt_after_deploy_before_note_record: false,
+        };
+        let recovery_request = crate::cli::note::NoteDeployRecoveryRequest {
+            endpoint: "http://127.0.0.1:9",
+            nominal: "N100",
+            token_type: 1,
+            raw_value: 100_000_000_000,
+            ecc_shell_deposit: 100_000_000_000,
+            funding_multisig_address: &funding_wallet,
+        };
+        let mut ops = super::NoteDeployProductionOps {
+            args: &args,
+            client: &client,
+            recovery_path: &recovery_path,
+            pool_path: &pool_path,
+            funding_multisig_address: &funding_wallet,
+            recovery_request,
+            pn_keys: None,
+            halo2_paths: &halo2_paths,
+            voucher_failpoints: Default::default(),
+        };
+
+        let recovery = super::NoteDeployResolvedOps::load_recovery(&mut ops)
+            .await
+            .expect("create fresh recovery in memory");
+        assert!(
+            ops.pn_keys.is_some(),
+            "fresh owner key must remain available in memory"
+        );
+        assert!(recovery.deposit_voucher.is_none());
+        assert!(recovery.shell_voucher.is_none());
+        assert!(
+            !recovery_path.exists(),
+            "fresh journal must wait for wallet preflight"
+        );
+        assert!(!pool_path.exists(), "fresh pool must not exist");
+    }
+
+    #[cfg(feature = "shellnet")]
+    #[tokio::test]
+    async fn note_deploy_fresh_path_rejects_non_custodian_before_all_artifacts_and_submit() {
+        use crate::cli::note::NoteDeployVoucherKind;
+
+        let temp = tempfile::tempdir().expect("temp dir");
+        let client = dexdo_core::ChainClient::connect("http://127.0.0.1:9")
+            .expect("connect offline fixture endpoint");
+        let multisig_address = dexdo_core::Address::parse(&format!("0:{}", "a".repeat(64)))
+            .expect("parse fixture wallet");
+        let multisig_keys =
+            dexdo_core::KeyPair::from_secret_hex(&"3a".repeat(32)).expect("fixture funding key");
+        let halo2_paths = dexdo_core::private_note::Halo2Paths::from_env();
+        let cases = [
+            (
+                "wrong-sole-key",
+                serde_json::json!({
+                    "custodians": [{
+                        "index": "0",
+                        "owner_pubkey": format!("0x{}", "11".repeat(32)),
+                    }]
+                }),
+                "sole custodian is",
+            ),
+            (
+                "non-sole-key",
+                serde_json::json!({
+                    "custodians": [
+                        {
+                            "index": "0",
+                            "owner_pubkey": format!("0x{}", multisig_keys.public_hex()),
+                        },
+                        {
+                            "index": "1",
+                            "owner_pubkey": format!("0x{}", "11".repeat(32)),
+                        }
+                    ]
+                }),
+                "has 2 custodians",
+            ),
+        ];
+
+        for (case, custodians, expected_error) in cases {
+            let key_loader = FixedFundingKeyLoader::returning(&multisig_keys);
+            let wallet_reader = FixedFundingWalletReader::returning(custodians);
+            let boc_builder = CountingVoucherBocBuilder::default();
+            let submitter = CountingVoucherSubmitter::default();
+            let mut recovery = test_recovery_state();
+            let owner = recovery.owner_public_key_hex.clone();
+            let token_type = recovery.token_type;
+            let raw_value = recovery.raw_value;
+            let recovery_path = temp.path().join(format!("{case}.recovery.json"));
+
+            let error = super::note_deploy_mint_voucher_recoverable(
+                &client,
+                &recovery_path,
+                &mut recovery,
+                NoteDeployVoucherKind::Deposit,
+                &multisig_address,
+                &key_loader,
+                &wallet_reader,
+                &boc_builder,
+                &submitter,
+                &owner,
+                token_type,
+                raw_value,
+                false,
+                &halo2_paths,
+                Default::default(),
+            )
+            .await
+            .expect_err("the real fresh path must reject a wrong/non-sole custodian")
+            .to_string();
+
+            assert!(error.contains(expected_error), "{case}: {error}");
+            assert_eq!(key_loader.calls.get(), 1, "{case}");
+            assert_eq!(wallet_reader.code_hash_calls.get(), 1, "{case}");
+            assert_eq!(wallet_reader.custodian_calls.get(), 1, "{case}");
+            assert_eq!(
+                boc_builder.calls.get(),
+                0,
+                "{case}: rejected wallet must not create a signed wallet BOC"
+            );
+            assert_eq!(
+                submitter.calls.get(),
+                0,
+                "{case}: rejected wallet must create zero wallet transactions"
+            );
+            assert!(
+                recovery
+                    .voucher_checkpoint(NoteDeployVoucherKind::Deposit)
+                    .is_none(),
+                "{case}: rejection must precede checkpoint creation"
+            );
+            assert!(
+                !recovery_path.exists(),
+                "{case}: rejection must precede journal creation"
+            );
+        }
+    }
+
+    #[cfg(feature = "shellnet")]
+    #[tokio::test]
+    async fn note_deploy_fresh_path_rejects_generic_wallet_before_all_artifacts_and_submit() {
+        use crate::cli::note::NoteDeployVoucherKind;
+
+        let temp = tempfile::tempdir().expect("temp dir");
+        let client = dexdo_core::ChainClient::connect("http://127.0.0.1:9")
+            .expect("connect offline fixture endpoint");
+        let multisig_address = dexdo_core::Address::parse(&format!("0:{}", "a".repeat(64)))
+            .expect("parse fixture wallet");
+        let multisig_keys =
+            dexdo_core::KeyPair::from_secret_hex(&"3a".repeat(32)).expect("fixture funding key");
+        let wallet_reader = FixedFundingWalletReader::with_code_hash(
+            "3a7a53248ff39fde936a4274eab143b5fac94feac0d8e2e2748aac5e74538d5f",
+            serde_json::json!({
+                "custodians": [{
+                    "index": "0",
+                    "owner_pubkey": format!("0x{}", multisig_keys.public_hex()),
+                }]
+            }),
+        );
+        let key_loader = FixedFundingKeyLoader::returning(&multisig_keys);
+        let boc_builder = CountingVoucherBocBuilder::default();
+        let submitter = CountingVoucherSubmitter::default();
+        let halo2_paths = dexdo_core::private_note::Halo2Paths::from_env();
+        let mut recovery = test_recovery_state();
+        let owner = recovery.owner_public_key_hex.clone();
+        let token_type = recovery.token_type;
+        let raw_value = recovery.raw_value;
+        let recovery_path = temp.path().join("custodian-recovery.json");
+
+        let error = super::note_deploy_mint_voucher_recoverable(
+            &client,
+            &recovery_path,
+            &mut recovery,
+            NoteDeployVoucherKind::Deposit,
+            &multisig_address,
+            &key_loader,
+            &wallet_reader,
+            &boc_builder,
+            &submitter,
+            &owner,
+            token_type,
+            raw_value,
+            false,
+            &halo2_paths,
+            Default::default(),
+        )
+        .await
+        .expect_err("Generic funding wallet must fail closed")
+        .to_string();
+
+        assert!(error.contains("supports only UpdateCustodian"), "{error}");
+        assert_eq!(key_loader.calls.get(), 1);
+        assert_eq!(wallet_reader.code_hash_calls.get(), 1);
+        assert_eq!(
+            wallet_reader.custodian_calls.get(),
+            0,
+            "unsupported code must stop before getter"
+        );
+        assert_eq!(boc_builder.calls.get(), 0);
+        assert_eq!(submitter.calls.get(), 0);
+        assert!(recovery
+            .voucher_checkpoint(NoteDeployVoucherKind::Deposit)
+            .is_none());
+        assert!(!recovery_path.exists());
+    }
+
+    #[cfg(feature = "shellnet")]
+    #[tokio::test]
+    async fn note_deploy_fresh_path_matching_custodian_reaches_signed_boc_and_submit_seam() {
+        use crate::cli::note::NoteDeployVoucherKind;
+
+        let temp = tempfile::tempdir().expect("temp dir");
+        let client = dexdo_core::ChainClient::connect("http://127.0.0.1:9")
+            .expect("connect offline fixture endpoint");
+        let multisig_address = dexdo_core::Address::parse(&format!("0:{}", "a".repeat(64)))
+            .expect("parse fixture wallet");
+        let multisig_keys = preflight_fixture_keys();
+        let wallet_reader = FixedFundingWalletReader::returning(serde_json::json!({
+            "custodians": [{
+                "index": "0",
+                "owner_pubkey": format!("0x{}", multisig_keys.public_hex()),
+            }]
+        }));
+        let key_loader = FixedFundingKeyLoader::returning(&multisig_keys);
+        let boc_builder = CountingVoucherBocBuilder::default();
+        let submitter = CountingVoucherSubmitter::default();
+        let halo2_paths = dexdo_core::private_note::Halo2Paths::from_env();
+        let failpoints = super::NoteDeployVoucherFailpoints {
+            after_deposit_submit: true,
+            ..Default::default()
+        };
+        let mut recovery = test_recovery_state();
+        let owner = recovery.owner_public_key_hex.clone();
+        let token_type = recovery.token_type;
+        let raw_value = recovery.raw_value;
+        let recovery_path = temp.path().join("matching-custodian-recovery.json");
+
+        let error = super::note_deploy_mint_voucher_recoverable(
+            &client,
+            &recovery_path,
+            &mut recovery,
+            NoteDeployVoucherKind::Deposit,
+            &multisig_address,
+            &key_loader,
+            &wallet_reader,
+            &boc_builder,
+            &submitter,
+            &owner,
+            token_type,
+            raw_value,
+            false,
+            &halo2_paths,
+            failpoints,
+        )
+        .await
+        .expect_err("fixture stops after the injected wallet-submit seam")
+        .to_string();
+
+        assert!(
+            error.contains("simulated interruption after deposit voucher wallet submit"),
+            "{error}"
+        );
+        assert_eq!(key_loader.calls.get(), 1);
+        assert_eq!(wallet_reader.code_hash_calls.get(), 1);
+        assert_eq!(wallet_reader.custodian_calls.get(), 1);
+        assert_eq!(boc_builder.calls.get(), 1);
+        assert!(
+            boc_builder.saw_nonempty_boc.get(),
+            "matching sole key must produce a signed BOC"
+        );
+        assert_eq!(
+            submitter.calls.get(),
+            1,
+            "matching sole key must reach wallet submit"
+        );
+        assert!(
+            submitter.saw_nonempty_boc.get(),
+            "submit seam must receive a signed BOC"
+        );
+        assert!(
+            recovery_path.exists(),
+            "guarded checkpoint must be durable before submit"
+        );
+        assert!(
+            recovery
+                .voucher_checkpoint(NoteDeployVoucherKind::Deposit)
+                .expect("guarded checkpoint")
+                .submit_maybe_sent,
+            "submit intent must be durable before transport"
+        );
+    }
+
+    #[cfg(feature = "shellnet")]
+    #[tokio::test]
+    async fn note_deploy_submit_maybe_sent_resume_skips_funding_key_and_wallet_preflight() {
+        use crate::cli::note::{NoteDeployVoucherCheckpoint, NoteDeployVoucherKind};
+
+        let temp = tempfile::tempdir().expect("temp dir");
+        let client = dexdo_core::ChainClient::connect("http://127.0.0.1:9")
+            .expect("connect offline fixture endpoint");
+        let multisig_address = dexdo_core::Address::parse(&format!("0:{}", "a".repeat(64)))
+            .expect("parse fixture wallet");
+        let key_loader =
+            FixedFundingKeyLoader::failing("submitted recovery must not load funding key");
+        let wallet_reader =
+            FixedFundingWalletReader::failing("submitted recovery must not read funding wallet");
+        let boc_builder = CountingVoucherBocBuilder::default();
+        let submitter = CountingVoucherSubmitter::default();
+        let halo2_paths = dexdo_core::private_note::Halo2Paths::from_env();
+        let failpoints = super::NoteDeployVoucherFailpoints {
+            before_voucher_event_wait: true,
+            ..Default::default()
+        };
+
+        let mut resumed_recovery = test_recovery_state();
+        let resumed_owner = resumed_recovery.owner_public_key_hex.clone();
+        let resumed_token_type = resumed_recovery.token_type;
+        let resumed_raw_value = resumed_recovery.raw_value;
+        let mut checkpoint = NoteDeployVoucherCheckpoint::new(
+            &resumed_owner,
+            resumed_token_type,
+            resumed_raw_value,
+            false,
+            "b".repeat(64),
+            "c".repeat(64),
+        )
+        .expect("fixture voucher checkpoint");
+        checkpoint.submit_maybe_sent = true;
+        resumed_recovery
+            .set_voucher_checkpoint(NoteDeployVoucherKind::Deposit, checkpoint)
+            .expect("persist resumed checkpoint");
+        let resumed_recovery_path = temp.path().join("resumed-recovery.json");
+        crate::cli::note::write_note_deploy_recovery(&resumed_recovery_path, &resumed_recovery)
+            .expect("write resumed recovery");
+        let before = std::fs::read(&resumed_recovery_path).expect("read recovery before resume");
+        let mut resumed_recovery =
+            crate::cli::note::load_note_deploy_recovery(&resumed_recovery_path)
+                .expect("load submitted recovery")
+                .expect("submitted recovery exists");
+
+        let resumed_error = super::note_deploy_mint_voucher_recoverable(
+            &client,
+            &resumed_recovery_path,
+            &mut resumed_recovery,
+            NoteDeployVoucherKind::Deposit,
+            &multisig_address,
+            &key_loader,
+            &wallet_reader,
+            &boc_builder,
+            &submitter,
+            &resumed_owner,
+            resumed_token_type,
+            resumed_raw_value,
+            false,
+            &halo2_paths,
+            failpoints,
+        )
+        .await
+        .expect_err("fixture must stop before the live event wait")
+        .to_string();
+        assert!(
+            resumed_error.contains("simulated interruption before voucher event wait"),
+            "{resumed_error}"
+        );
+        assert!(
+            !resumed_error.contains("submitted recovery must not read funding wallet"),
+            "{resumed_error}"
+        );
+        assert!(
+            !resumed_error.contains("submitted recovery must not load funding key"),
+            "{resumed_error}"
+        );
+        assert_eq!(key_loader.calls.get(), 0);
+        assert_eq!(wallet_reader.code_hash_calls.get(), 0);
+        assert_eq!(wallet_reader.custodian_calls.get(), 0);
+        assert_eq!(
+            boc_builder.calls.get(),
+            0,
+            "reconciliation must not build another signed wallet BOC"
+        );
+        assert_eq!(
+            submitter.calls.get(),
+            0,
+            "reconciliation must not submit another wallet BOC"
+        );
+        assert_eq!(
+            std::fs::read(&resumed_recovery_path).expect("read recovery after resume seam"),
+            before,
+            "read-only reconciliation seam must not rewrite the journal without new chain facts"
+        );
+    }
+
+    #[cfg(feature = "shellnet")]
+    #[tokio::test]
+    async fn note_deploy_later_fresh_shell_voucher_is_gated_after_submitted_deposit() {
+        use crate::cli::note::{NoteDeployVoucherCheckpoint, NoteDeployVoucherKind};
+        use dexdo_core::private_note::proof::{CURRENCY_ID_SHELL, ECC_SHELL_DEPOSIT_RAW};
+
+        let temp = tempfile::tempdir().expect("temp dir");
+        let client = dexdo_core::ChainClient::connect("http://127.0.0.1:9")
+            .expect("connect offline fixture endpoint");
+        let multisig_address = dexdo_core::Address::parse(&format!("0:{}", "a".repeat(64)))
+            .expect("parse fixture wallet");
+        let multisig_keys = preflight_fixture_keys();
+        let key_loader = FixedFundingKeyLoader::returning(&multisig_keys);
+        let wallet_reader = FixedFundingWalletReader::returning(serde_json::json!({
+            "custodians": [{
+                "index": "0",
+                "owner_pubkey": format!("0x{}", "11".repeat(32)),
+            }]
+        }));
+        let boc_builder = CountingVoucherBocBuilder::default();
+        let submitter = CountingVoucherSubmitter::default();
+        let halo2_paths = dexdo_core::private_note::Halo2Paths::from_env();
+
+        let mut recovery = test_recovery_state();
+        let owner = recovery.owner_public_key_hex.clone();
+        let mut deposit = NoteDeployVoucherCheckpoint::new(
+            &owner,
+            recovery.token_type,
+            recovery.raw_value,
+            false,
+            "b".repeat(64),
+            "c".repeat(64),
+        )
+        .expect("fixture deposit checkpoint");
+        deposit.submit_maybe_sent = true;
+        recovery
+            .set_voucher_checkpoint(NoteDeployVoucherKind::Deposit, deposit)
+            .expect("persist prior deposit checkpoint");
+        let recovery_path = temp.path().join("later-shell-recovery.json");
+        crate::cli::note::write_note_deploy_recovery(&recovery_path, &recovery)
+            .expect("write recovery with submitted deposit");
+        let before = std::fs::read(&recovery_path).expect("read recovery before SHELL leg");
+
+        let error = super::note_deploy_mint_voucher_recoverable(
+            &client,
+            &recovery_path,
+            &mut recovery,
+            NoteDeployVoucherKind::ShellGas,
+            &multisig_address,
+            &key_loader,
+            &wallet_reader,
+            &boc_builder,
+            &submitter,
+            &owner,
+            CURRENCY_ID_SHELL,
+            ECC_SHELL_DEPOSIT_RAW,
+            true,
+            &halo2_paths,
+            Default::default(),
+        )
+        .await
+        .expect_err("a later fresh voucher leg must run the wallet guard")
+        .to_string();
+
+        assert!(error.contains("sole custodian is"), "{error}");
+        assert_eq!(key_loader.calls.get(), 1);
+        assert_eq!(wallet_reader.code_hash_calls.get(), 1);
+        assert_eq!(wallet_reader.custodian_calls.get(), 1);
+        assert_eq!(boc_builder.calls.get(), 0);
+        assert_eq!(submitter.calls.get(), 0);
+        assert!(
+            recovery
+                .voucher_checkpoint(NoteDeployVoucherKind::ShellGas)
+                .is_none(),
+            "rejection must precede the fresh SHELL checkpoint"
+        );
+        assert!(
+            recovery
+                .voucher_checkpoint(NoteDeployVoucherKind::Deposit)
+                .is_some(),
+            "the prior submitted deposit checkpoint must remain intact"
+        );
+        assert_eq!(
+            std::fs::read(&recovery_path).expect("read recovery after rejected SHELL leg"),
+            before,
+            "rejected later leg must not rewrite the existing journal"
+        );
+    }
+
+    #[cfg(feature = "shellnet")]
     #[test]
     fn note_deploy_wallet_replay_conflict_is_busy_retryable_and_actionable() {
         let raw = anyhow::anyhow!(
-            "submit Multisig.sendTransaction -> RootPN.generateVoucher: block manager rejected \
+            "submit UpdateCustodianMultisigWallet.sendTransaction -> RootPN.generateVoucher: block manager rejected \
              message code=TVM_ERROR; exit-code:52 nonce desynchronized"
         );
 
@@ -2072,7 +3157,7 @@ mod tests {
                 attempts.push(attempt);
                 if attempt < 3 {
                     Err(anyhow::anyhow!(
-                        "submit Multisig.sendTransaction -> RootPN.generateVoucher: \
+                        "submit UpdateCustodianMultisigWallet.sendTransaction -> RootPN.generateVoucher: \
                          tvm_error exit-code:52 nonce desynchronized"
                     ))
                 } else {
@@ -2106,7 +3191,7 @@ mod tests {
             async |attempt| {
                 attempts.push(attempt);
                 Err(anyhow::anyhow!(
-                    "submit Multisig.sendTransaction -> RootPN.generateVoucher: \
+                    "submit UpdateCustodianMultisigWallet.sendTransaction -> RootPN.generateVoucher: \
                      tvm_error exit-code:52 nonce desynchronized"
                 ))
             },

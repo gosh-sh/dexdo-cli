@@ -1,7 +1,5 @@
 //! Seller model config layer: model-agnosticism is achieved through
-//! **OpenAI compatibility + config + a local proxy**, without vendor branches in dexdo.
-//! Any model reachable over an OpenAI-compatible API (a real provider OR a local
-//! proxy in front of dexdo) is described by a **config entry** and selected **by name**.
+//! provider adapters + config. Models are described by a **config entry** and selected **by name**.
 //! The format is **JSON**(not yaml/toml): `serde_json` is already in the build graph, we don't
 //! introduce a new dependency, and it is consistent with the rest of the repo's configs
 //! (`deployed.shellnet.json`, `endpoints.json`). Loading/selection is **fail-loud**: a corrupt file,
@@ -48,7 +46,7 @@ pub struct FingerprintCfg {
 pub struct ModelConfig {
     /// The canonical market id(R1): the seller **forces** it; the buyer's `model` is not trusted.
     pub frame_model: String,
-    /// OpenAI-compatible base URL(a real provider **or** a local proxy), without a trailing path.
+    /// Provider API base URL, without the operation path.
     pub base_url: String,
     /// The model id at the upstream -- what to send in the request's `model` field.
     pub served_model: String,

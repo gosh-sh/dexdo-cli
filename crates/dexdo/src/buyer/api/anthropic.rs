@@ -148,7 +148,7 @@ fn sse_response(
                 CanonStreamNext::Bailed | CanonStreamNext::End => break,
             };
             if !chunk.text.is_empty() {
-                yield Ok(event(render::anthropic_content_block_delta(&chunk.text)));
+                yield Ok(anthropic_content_event(&deal, &chunk.text));
             }
             let before = driver.received();
             if driver.account_rendered(&chunk) {
@@ -183,6 +183,18 @@ fn sse_response(
         yield Ok(event(render::anthropic_message_stop()));
     };
     Sse::new(sse)
+}
+
+fn anthropic_content_event(deal: &ApiDeal, text: &str) -> Event {
+    deal.record_accepted_output(message_started_secs());
+    event(render::anthropic_content_block_delta(text))
+}
+
+#[cfg(test)]
+pub(super) fn heartbeat_poll_test_stream(deal: ApiDeal) -> impl Stream<Item = Event> {
+    async_stream::stream! {
+        yield anthropic_content_event(&deal, "content");
+    }
 }
 
 /// Build an axum SSE `Event` from `(name, JSON data)`(B20). A single source of truth for the

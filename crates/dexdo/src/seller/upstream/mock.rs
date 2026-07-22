@@ -2,6 +2,7 @@
 //! . A standard debug mode in production code, not a
 //! `#[cfg(test)]` crutch. Retained even after the real upstream appears.
 
+use super::{chunk_with_structured_accounting, UpstreamEvent};
 use dexdo_proto::{CanonChunk, CanonRequest, SignalManifest, TokenLogprobs};
 use tokio::sync::mpsc;
 use tonic::Status;
@@ -13,7 +14,7 @@ use tonic::Status;
 pub async fn run(
     count: u64,
     req: Option<&CanonRequest>,
-    tx: mpsc::Sender<Result<CanonChunk, Status>>,
+    tx: mpsc::Sender<Result<UpstreamEvent, Status>>,
     scammer: bool,
 ) {
     // claims a DIFFERENT(real) model than the market's frame model -> the buyer's verification(B7) rejects it.
@@ -90,7 +91,11 @@ pub async fn run(
                 }
             }),
         };
-        if tx.send(Ok(chunk)).await.is_err() {
+        if tx
+            .send(Ok(chunk_with_structured_accounting(chunk)))
+            .await
+            .is_err()
+        {
             break; // buyer disconnected(STOP)
         }
     }
@@ -110,18 +115,19 @@ fn last_user_message(req: &CanonRequest) -> &str {
 /// user message, one delta token per word, truncated to `count`(mock model).
 fn derive_tokens(req: &CanonRequest, count: u64) -> Vec<String> {
     let prompt = last_user_message(req);
-    let mut out: Vec<String> = Vec::new();
+    let mut seed: Vec<String> = Vec::new();
     // Mock marker + echo of the prompt token-by-token(R6: incrementality is preserved).
-    out.push("mock-reply: ".to_string());
+    seed.push("mock-reply: ".to_string());
     for word in prompt.split_whitespace() {
-        out.push(format!("{word} "));
+        seed.push(format!("{word} "));
     }
-    if out.len() == 1 {
+    if seed.len() == 1 {
         // Empty prompt -- still yield something deterministic.
-        out.push("(empty) ".to_string());
+        seed.push("(empty) ".to_string());
     }
-    out.truncate(count as usize);
-    out
+    (0..count)
+        .map(|index| seed[(index % seed.len() as u64) as usize].clone())
+        .collect()
 }
 
 #[cfg(test)]
@@ -142,12 +148,26 @@ mod tests {
         run(8, Some(&req), tx, false).await;
         let mut chunks = Vec::new();
         while let Some(item) = rx.recv().await {
-            chunks.push(item.unwrap());
+            if let UpstreamEvent::Chunk { chunk, .. } = item.unwrap() {
+                chunks.push(chunk);
+            }
         }
         // seq monotonic from 0; marker + echo of the prompt words.
         assert_eq!(chunks[0].seq, 0);
         let text: String = chunks.iter().map(|c| c.text.as_str()).collect();
         assert!(text.contains("mock-reply"));
         assert!(text.contains("ping") && text.contains("pong"));
+    }
+
+    #[test]
+    fn mock_token_count_is_exact_even_when_prompt_is_short() {
+        let req = CanonRequest {
+            messages: vec![ChatMessage {
+                role: "user".into(),
+                content: "ping".into(),
+            }],
+            params: None,
+        };
+        assert_eq!(derive_tokens(&req, 5).len(), 5);
     }
 }

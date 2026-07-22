@@ -1545,6 +1545,39 @@ mod deposit_tests {
         )
         .is_ok());
     }
+
+    #[test]
+    fn provision_script_serializes_every_full_live_suite_command() {
+        let sources = [
+            (
+                "provision-shellnet-actor.sh",
+                include_str!("../../../provision-shellnet-actor.sh"),
+            ),
+            ("README.md", include_str!("../../../README.md")),
+            ("live_cli.rs", include_str!("../tests/live_cli.rs")),
+        ];
+        let commands: Vec<_> = sources
+            .iter()
+            .flat_map(|(source, text)| {
+                text.lines().filter_map(move |line| {
+                    let is_full_ignored_suite = line.contains("cargo test")
+                        && line.contains("-- --ignored")
+                        && (line.contains("--test live_cli") || line.contains("-p dexdo-core"));
+                    is_full_ignored_suite.then_some((*source, line))
+                })
+            })
+            .collect();
+        assert!(
+            !commands.is_empty(),
+            "full live-suite command must remain documented"
+        );
+        for (source, command) in commands {
+            assert!(
+                command.contains("--test-threads=1"),
+                "unserialized full ignored shellnet-suite command in {source}: {command}"
+            );
+        }
+    }
 }
 
 #[cfg(test)]

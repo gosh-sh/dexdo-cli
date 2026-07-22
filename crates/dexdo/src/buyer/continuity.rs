@@ -202,6 +202,10 @@ impl BuyerContinuity {
         self.pending_after.remove(current);
     }
 
+    pub fn keep_active(&mut self, current: &TokenContract) {
+        self.stale.remove(current);
+    }
+
     pub fn tick(
         &mut self,
         current: Option<DealFacts>,

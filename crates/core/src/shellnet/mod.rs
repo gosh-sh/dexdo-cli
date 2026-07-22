@@ -28,9 +28,15 @@ pub use book_events::{
     fold_book_event_pages, BookEventFold, BookEventMessage, BookEventPage, LiveBookOrder,
 };
 pub use client::{
-    endpoint_urls, normalize_endpoint, resolve_endpoint, Deployed, MoneySubmitError,
-    NoteStreamLockStatus, RealChainBackend, ShellnetDoctorCheck, ShellnetDoctorReport,
-    ShellnetDoctorStatus, DEFAULT_SHELLNET_ENDPOINT, PRIVATE_NOTE_STREAM_LOCK_MAX_SECS,
+    endpoint_urls, normalize_endpoint, resolve_endpoint, shellnet_clock_skew_preflight, Deployed,
+    MoneySubmitError, NoteStreamLockStatus, RealChainBackend, ShellnetDoctorCheck,
+    ShellnetDoctorReport, ShellnetDoctorStatus, DEFAULT_SHELLNET_ENDPOINT,
+    PRIVATE_NOTE_STREAM_LOCK_MAX_SECS,
+};
+#[cfg(feature = "test-giver")]
+pub use client::{
+    PlaceInferenceBuyReceipt, TokenContractSettlementEvent, TokenContractSettlementReceipt,
+    TokenContractSettlementReceipts,
 };
 pub use contracts_provision::keypair_ed_pubkey;
 pub use stream_locks::{NoteStreamLockEntry, NoteStreamLockKind, NoteStreamLockSnapshot};

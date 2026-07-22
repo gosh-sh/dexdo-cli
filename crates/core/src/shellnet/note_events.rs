@@ -89,6 +89,8 @@ pub(super) struct InferenceFilled {
     pub order_book: String,
     /// The matched per-deal `TokenContract`(`0:<hex>`) -- what the buyer/seller then reads.
     pub token_contract: String,
+    /// This note owner's authoritative order-book id.
+    pub order_id: u128,
     /// Number of ticks filled by this match.
     pub ticks: u128,
     /// Clearing price paid per tick.
@@ -141,6 +143,7 @@ pub(super) fn decode_inference_filled(body_b64: &str) -> Result<Option<Inference
 
     let mut order_book = None;
     let mut token_contract = None;
+    let mut order_id = None;
     let mut ticks = None;
     let mut price_per_tick = None;
     let mut is_buy = None;
@@ -148,6 +151,7 @@ pub(super) fn decode_inference_filled(body_b64: &str) -> Result<Option<Inference
         match (t.name.as_str(), &t.value) {
             ("orderBook", TokenValue::Address(a)) => order_book = Some(format!("{a}")),
             ("tokenContract", TokenValue::Address(a)) => token_contract = Some(format!("{a}")),
+            ("orderId", TokenValue::Uint(v)) => order_id = v.number.to_string().parse().ok(),
             ("ticks", TokenValue::Uint(v)) => ticks = v.number.to_string().parse().ok(),
             ("clearingPrice", TokenValue::Uint(v)) => {
                 price_per_tick = v.number.to_string().parse().ok()
@@ -156,22 +160,31 @@ pub(super) fn decode_inference_filled(body_b64: &str) -> Result<Option<Inference
             _ => {}
         }
     }
-    match (order_book, token_contract, ticks, price_per_tick, is_buy) {
+    match (
+        order_book,
+        token_contract,
+        order_id,
+        ticks,
+        price_per_tick,
+        is_buy,
+    ) {
         (
             Some(order_book),
             Some(token_contract),
+            Some(order_id),
             Some(ticks),
             Some(price_per_tick),
             Some(is_buy),
         ) => Ok(Some(InferenceFilled {
             order_book,
             token_contract,
+            order_id,
             ticks,
             price_per_tick,
             is_buy,
         })),
         _ => Err(anyhow!(
-            "InferenceFilledConfirmed body missing orderBook/tokenContract/ticks/clearingPrice/isBuy -- ABI drift"
+            "InferenceFilledConfirmed body missing orderBook/tokenContract/orderId/ticks/clearingPrice/isBuy -- ABI drift"
         )),
     }
 }

@@ -10,7 +10,7 @@ pub mod upstream;
 
 pub use advance::{drive_advance, AdvanceWindows};
 pub use models::{Capabilities, ModelConfig, ModelsConfig};
-pub use upstream::{openai::OpenAiConfig, UpstreamConfig};
+pub use upstream::{anthropic::AnthropicConfig, openai::OpenAiConfig, UpstreamConfig};
 
 use anyhow::{bail, Result};
 use dexdo_core::{

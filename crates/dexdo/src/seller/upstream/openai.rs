@@ -7,6 +7,7 @@
 //! . Without a key the adapter does not start -- the stream
 //! closes with `Status::failed_precondition`, which yields a clean skip in e2e.
 
+use super::{chunk_with_structured_accounting, UpstreamEvent};
 use crate::seller::models::{Capabilities, ModelConfig};
 use dexdo_proto::{CanonChunk, CanonRequest, SignalManifest, TokenLogprobs, TopLogprob};
 use serde::{Deserialize, Serialize};
@@ -255,7 +256,7 @@ pub async fn run(
     cfg: &OpenAiConfig,
     count: u64,
     req: Option<CanonRequest>,
-    tx: mpsc::Sender<Result<CanonChunk, Status>>,
+    tx: mpsc::Sender<Result<UpstreamEvent, Status>>,
 ) {
     let Some(key) = api_key(&cfg.api_key_env) else {
         let _ = tx
@@ -288,7 +289,7 @@ async fn stream_upstream(
     key: &str,
     count: u64,
     req: &CanonRequest,
-    tx: &mpsc::Sender<Result<CanonChunk, Status>>,
+    tx: &mpsc::Sender<Result<UpstreamEvent, Status>>,
 ) -> Result<(), Status> {
     use futures::StreamExt;
 
@@ -356,7 +357,11 @@ async fn stream_upstream(
                         }),
                     };
                     seq += 1;
-                    if tx.send(Ok(chunk)).await.is_err() {
+                    if tx
+                        .send(Ok(chunk_with_structured_accounting(chunk)))
+                        .await
+                        .is_err()
+                    {
                         return Ok(()); // buyer disconnected(STOP)
                     }
                     sent_tokens = sent_tokens.saturating_add(delivered_tokens);

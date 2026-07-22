@@ -54,6 +54,22 @@ impl OrderBookOrder {
     }
 }
 
+/// Fail closed unless the fresh matcher head is the exact full row rendered to the buyer.
+/// This guard intentionally compares the complete order identity. A caller must not reconstruct a
+/// shellnet row from a lossy market listing before invoking it.
+pub fn ensure_pre_submit_quote_unchanged(
+    quoted_order: Option<&OrderBookOrder>,
+    selected: &OrderBookOrder,
+) -> Result<(), ChainError> {
+    if quoted_order == Some(selected) {
+        return Ok(());
+    }
+    Err(ChainError::Chain(
+        "buyer pre-submit matcher head differs from the rendered quote; no escrow was sent"
+            .to_string(),
+    ))
+}
+
 /// Parsed `InferenceOrderBook.getStats()`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct OrderBookStats {
@@ -114,6 +130,8 @@ pub struct QuoteFill {
 /// Buyer-visible fill details returned after a model-only buy.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct MatchedFill {
+    /// The buyer's authoritative order-book id from `InferenceFilledConfirmed`.
+    pub order_id: u128,
     pub token_contract: TokenContract,
     pub ticks: u128,
     pub price_per_tick: u128,

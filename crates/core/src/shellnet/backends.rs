@@ -3874,6 +3874,16 @@ impl ChainBackend for RealBuyerBackend {
             .map(|_| ())
     }
 
+    async fn submit_safe_model_buy_quote_order(
+        &self,
+        ticks: u128,
+        max_price_per_tick: u128,
+    ) -> Result<Option<OrderBookOrder>, ChainError> {
+        self.model_buy_preflight_selection_once(ticks, max_price_per_tick)
+            .await
+            .map(|(_, selected)| Some(selected))
+    }
+
     async fn assert_explicit_buy_matches_executable_quote(
         &self,
         token_contract: &TokenContract,
@@ -3989,6 +3999,7 @@ impl ChainBackend for RealBuyerBackend {
         self.assert_selected_tc_unused(selected_tc, &order_book)
             .await?;
         let expected = MatchedFill {
+            order_id: selected.order_id,
             token_contract: parse_tc(&selected_tc.to_string())?.with_workchain(),
             ticks,
             price_per_tick: selected.price_per_tick,
@@ -4051,12 +4062,7 @@ impl ChainBackend for RealBuyerBackend {
         let (order_book, selected) = self
             .model_buy_preflight_selection_once(ticks, max_price_per_tick)
             .await?;
-        if quoted_order != Some(&selected) {
-            return Err(ChainError::Chain(
-                "buyer pre-submit matcher head differs from the rendered quote; no escrow was sent"
-                    .to_string(),
-            ));
-        }
+        crate::chain::ensure_pre_submit_quote_unchanged(quoted_order, &selected)?;
         let selected_tc = selected.token_contract.as_deref().ok_or_else(|| {
             ChainError::Chain(format!(
                 "buyer model-only preflight failed for InferenceOrderBook {order_book}: selected order #{} has no TokenContract",
@@ -4066,6 +4072,7 @@ impl ChainBackend for RealBuyerBackend {
         self.assert_selected_tc_unused(selected_tc, &order_book)
             .await?;
         let expected = MatchedFill {
+            order_id: selected.order_id,
             token_contract: parse_tc(&selected_tc.to_string())?.with_workchain(),
             ticks,
             price_per_tick: selected.price_per_tick,
@@ -4380,6 +4387,31 @@ impl ChainBackend for RealBuyerBackend {
         })
     }
 
+    async fn seller_timeout_if_heartbeat(
+        &self,
+        token_contract: &TokenContract,
+        heartbeat: &crate::chain::HeartbeatGuard,
+    ) -> Result<Option<Settlement>, ChainError> {
+        let tc = parse_tc(token_contract)?;
+        let (_opened, _accepted, _prepaid, frozen, deposit, commission) =
+            tc_settle_state(&self.chain, &tc).await.map_err(map_err)?;
+        self.require_tc_gas(&tc).await?;
+        let mut heartbeat_unchanged = || heartbeat.unchanged();
+        let submitted = self
+            .chain
+            .reclaim_on_timeout_if(&self.note, &self.keys, &tc, &mut heartbeat_unchanged)
+            .await
+            .map_err(map_err)?;
+        if submitted.is_none() {
+            return Ok(None);
+        }
+        wait_tc_bool(&self.chain, &tc, "opened", false).await?;
+        Ok(Some(Settlement::SellerNoShow {
+            to_buyer_refund: (frozen + deposit) as Shell,
+            seller_commission_returned: commission as Shell,
+        }))
+    }
+
     async fn cleanup_unopened(
         &self,
         token_contract: &TokenContract,
@@ -4431,6 +4463,25 @@ impl ChainBackend for RealBuyerBackend {
             .map_err(map_err)?
             .as_ref()
             .map(deal_chain_state_from_json))
+    }
+
+    async fn deal_stream_timeout(&self, token_contract: &TokenContract) -> Result<u64, ChainError> {
+        let tc = parse_tc(token_contract)?;
+        let cfg = self
+            .chain
+            .token_contract_config(&tc)
+            .await
+            .map_err(map_err)?
+            .ok_or_else(|| map_err(anyhow!("getConfig() empty for {token_contract}")))?;
+        cfg["streamTimeout"]
+            .as_str()
+            .and_then(|value| value.parse::<u64>().ok())
+            .filter(|timeout| *timeout > 0)
+            .ok_or_else(|| {
+                map_err(anyhow!(
+                    "getConfig().streamTimeout missing for {token_contract}"
+                ))
+            })
     }
 
     async fn snapshot(&self, token_contract: &TokenContract) -> Option<StreamSnapshot> {

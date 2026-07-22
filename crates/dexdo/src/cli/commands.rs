@@ -101,6 +101,7 @@ pub(crate) struct RuntimeDealHandleInput<'a> {
     pub(crate) market_path: Option<&'a std::path::Path>,
     pub(crate) contracts: &'a std::path::Path,
     pub(crate) endpoint: Option<deals::DealEndpointInfo>,
+    pub(crate) created_order_ids: Vec<u128>,
 }
 
 #[cfg(feature = "shellnet")]
@@ -158,7 +159,7 @@ fn persist_runtime_deal_handle(
         market,
         contracts: input.contracts.display().to_string(),
         endpoint: input.endpoint,
-        created_order_ids: Vec::new(),
+        created_order_ids: input.created_order_ids,
         created_at_unix: deals::now_unix()?,
     };
     deals::validate_deal_handle(&h)?;
