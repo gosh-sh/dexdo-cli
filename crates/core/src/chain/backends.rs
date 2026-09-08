@@ -169,15 +169,57 @@ fn duplicate_sell_from_offer_latch(tc: &Address, latch: Option<DealOfferLatch>) 
     }
 }
 
+/// Prove that `TokenContract.postFromNote` will not silently discard the next SELL.
+///
+/// The exact-TC raw-book and match reads happen immediately before this in seller startup.  The
+/// contract's latch is the final independent precondition: `postFromNote` accepts and charges the
+/// message, then returns without calling the book while `_offerPosted` is set.  An unreadable latch
+/// is therefore not permission to write.
+fn require_clear_offer_latch_before_post(
+    tc: &Address,
+    latch: Option<DealOfferLatch>,
+) -> Result<(), ChainError> {
+    let tc = display_token_contract(tc);
+    match latch {
+        Some(latch) if !latch.offer_posted => Ok(()),
+        Some(_) => Err(ChainError::DuplicateSell(format!(
+            "refusing seller postSellOffer for TokenContract {tc}: exact raw SELL and match reads were vacant, but getOffer().offerPosted=true; the contract would silently discard a second post"
+        ))),
+        None => Err(ChainError::Chain(format!(
+            "refusing seller postSellOffer for TokenContract {tc}: getOffer().offerPosted is unreadable; whether the contract would silently discard this post is unknown"
+        ))),
+    }
+}
+
 fn classify_seller_offer_outcome(
-    events: SellerOfferEvents,
+    events: &SellerOfferEvents,
     matched_state: bool,
+    raw_orders: &[OrderBookOrder],
 ) -> Result<Option<SellOfferOutcome>, ChainError> {
-    if events.matched || matched_state {
+    // Current contract/book state is authority. Events are deliberately not enough to report a
+    // resting or matched offer: the one-second/time-skew window and bounded event page can miss the
+    // submit, while an old placement event can outlive its order.
+    if matched_state {
         return Ok(Some(SellOfferOutcome::Matched));
     }
-    if let Some(order_id) = events.placed_order_id {
-        return Ok(Some(SellOfferOutcome::Rested { order_id }));
+    match raw_orders {
+        [order] => {
+            return Ok(Some(SellOfferOutcome::Rested {
+                order_id: order.order_id,
+            }))
+        }
+        [] => {}
+        orders => {
+            let ids = orders
+                .iter()
+                .map(|order| order.order_id.to_string())
+                .collect::<Vec<_>>()
+                .join(",");
+            return Err(ChainError::Chain(format!(
+                "seller postSellOffer outcome is ambiguous: exact TokenContract has {} current raw SELL rows (order ids {ids})",
+                orders.len()
+            )));
+        }
     }
     if events.placement_value_returned {
         return Err(ChainError::DuplicateSell(
@@ -8536,6 +8578,14 @@ impl ChainBackend for RealSellerBackend {
                 max_ticks
             );
         }
+        let latch = retry_seller_read("seller pre-submit TokenContract offer latch", || async {
+            self.chain
+                .token_contract_offer(&tc)
+                .await
+                .map_err(map_err)
+        })
+        .await?;
+        require_clear_offer_latch_before_post(&tc, latch)?;
         *self.offer_post_started_at.lock().map_err(|_| {
             ChainError::Chain("seller offer submission marker lock poisoned".to_string())
         })? = Some(now_secs()?.saturating_sub(crate::params::SELLER_OFFER_EVENT_LOOKBACK_SECS));
@@ -8597,7 +8647,37 @@ impl ChainBackend for RealSellerBackend {
                 ChainError::Chain("seller offer submission marker is missing".to_string())
             })?;
         let started = std::time::Instant::now();
+        let mut last_evidence = "authoritative state not read yet".to_string();
         while started.elapsed() < OFFER_ACCEPTANCE_TIMEOUT {
+            let matched_state = retry_seller_read("seller immediate-match state", || async {
+                self.read_openable_match_once(tc).await
+            })
+            .await?
+            .is_some();
+            if matched_state {
+                return Ok(Some(SellOfferOutcome::Matched));
+            }
+            let raw_orders = retry_seller_read("seller outcome raw exact-TC SELL rows", || async {
+                self.chain
+                    .raw_resting_sell_orders_for_tc(&ob, &tc_addr)
+                    .await
+                    .map_err(map_err)
+            })
+            .await?;
+            if let Some(outcome) = classify_seller_offer_outcome(
+                &SellerOfferEvents::default(),
+                false,
+                &raw_orders,
+            )? {
+                return Ok(Some(outcome));
+            }
+            let latch = retry_seller_read("seller outcome TokenContract offer latch", || async {
+                self.chain
+                    .token_contract_offer(&tc_addr)
+                    .await
+                    .map_err(map_err)
+            })
+            .await?;
             let events = retry_seller_read("seller offer outcome events", || async {
                 self.chain
                     .seller_offer_events_since(&self.note, &ob, &tc_addr, since)
@@ -8605,12 +8685,7 @@ impl ChainBackend for RealSellerBackend {
                     .map_err(map_err)
             })
             .await?;
-            let matched_state = retry_seller_read("seller immediate-match state", || async {
-                self.read_openable_match_once(tc).await
-            })
-            .await?
-            .is_some();
-            match classify_seller_offer_outcome(events, matched_state) {
+            match classify_seller_offer_outcome(&events, false, &[]) {
                 Ok(Some(outcome)) => return Ok(Some(outcome)),
                 Ok(None) => {}
                 Err(ChainError::DuplicateSell(_)) => {
@@ -8627,11 +8702,19 @@ impl ChainBackend for RealSellerBackend {
                 }
                 Err(other) => return Err(other),
             }
+            let latch_evidence = match latch {
+                Some(latch) => format!("offerPosted={}", latch.offer_posted),
+                None => "offerPosted=unreadable".to_string(),
+            };
+            last_evidence = format!(
+                "match_current={matched_state}; raw_exact_tc_sell_count={}; {latch_evidence}; events_matched={}; event_placed_order_id={:?}; placement_value_returned={}",
+                raw_orders.len(), events.matched, events.placed_order_id, events.placement_value_returned
+            );
             tokio::time::sleep(crate::params::SELLER_OFFER_OUTCOME_POLL_INTERVAL).await;
         }
         Err(ChainError::Chain(format!(
-            "seller postSellOffer outcome is not yet confirmed for TokenContract {}; no placement, match, or returned placement value was observed",
-            display_token_contract(tc)
+            "seller postSellOffer outcome is not yet confirmed for TokenContract {}; refusing automatic repost; {last_evidence}",
+            display_token_contract(tc),
         )))
     }
 
@@ -10781,31 +10864,82 @@ mod codecell_tests {
     }
 
     #[test]
-    fn outcome_confirmation_distinguishes_rested_matched_and_duplicate() {
+    fn outcome_confirmation_requires_current_state_and_uses_events_only_as_evidence() {
+        let current_sell = OrderBookOrder {
+            order_id: 835,
+            owner_note: "0:1111111111111111111111111111111111111111111111111111111111111111"
+                .to_string(),
+            token_contract: None,
+            is_buy: false,
+            price_per_tick: 1,
+            ticks: 1,
+            escrow: 0,
+            deadline: u64::MAX,
+            flags: 0,
+            timestamp: 1,
+        };
         let rested = classify_seller_offer_outcome(
-            SellerOfferEvents {
+            &SellerOfferEvents::default(),
+            false,
+            std::slice::from_ref(&current_sell),
+        )
+        .expect("current raw SELL proves rested outcome");
+        assert_eq!(rested, Some(SellOfferOutcome::Rested { order_id: 835 }));
+
+        let matched = classify_seller_offer_outcome(&SellerOfferEvents::default(), true, &[])
+            .expect("current match proves matched outcome");
+        assert_eq!(matched, Some(SellOfferOutcome::Matched));
+
+        let historical_placement = classify_seller_offer_outcome(
+            &SellerOfferEvents {
                 placed_order_id: Some(835),
+                matched: true,
                 ..Default::default()
             },
             false,
+            &[],
         )
-        .expect("rested outcome");
-        assert_eq!(rested, Some(SellOfferOutcome::Rested { order_id: 835 }));
-
-        let matched = classify_seller_offer_outcome(SellerOfferEvents::default(), true)
-            .expect("matched outcome");
-        assert_eq!(matched, Some(SellOfferOutcome::Matched));
+        .expect("an event without current state is only supplementary evidence");
+        assert_eq!(historical_placement, None);
 
         let duplicate = classify_seller_offer_outcome(
-            SellerOfferEvents {
+            &SellerOfferEvents {
                 placement_value_returned: true,
                 ..Default::default()
             },
             false,
+            &[],
         )
         .expect_err("returned placement value is a duplicate");
         assert_eq!(duplicate.to_string(), DUPLICATE_SELL_MESSAGE);
         assert!(!duplicate.to_string().contains("CHAIN_TRANSPORT"));
+    }
+
+    #[test]
+    fn pre_submit_latch_must_be_readable_and_clear() {
+        let tc =
+            Address::parse("0:9aff5b8520caf32dbb91390134a946fc9c2896830d96b86cb0f1fbd2262dbe36")
+                .expect("tc");
+
+        require_clear_offer_latch_before_post(
+            &tc,
+            Some(DealOfferLatch {
+                offer_posted: false,
+            }),
+        )
+        .expect("only a readable clear latch permits the post");
+
+        let stale = require_clear_offer_latch_before_post(
+            &tc,
+            Some(DealOfferLatch { offer_posted: true }),
+        )
+        .expect_err("a stale latch must block before postSellOffer");
+        assert!(matches!(stale, ChainError::DuplicateSell(_)));
+        assert!(stale.to_string().contains("silently discard"));
+
+        let unreadable = require_clear_offer_latch_before_post(&tc, None)
+            .expect_err("an unreadable latch must fail closed");
+        assert!(unreadable.to_string().contains("unreadable"));
     }
 
     /// the duplicate-SELL verdict is a claim about the deal's offer latch, so it may only be
@@ -10892,10 +11026,11 @@ mod codecell_tests {
             }
         })
         .await
-        .and_then(|events| classify_seller_offer_outcome(events, false));
+        .and_then(|events| classify_seller_offer_outcome(&events, false, &[]));
         assert_eq!(
             result.unwrap(),
-            Some(SellOfferOutcome::Rested { order_id: 1 })
+            None,
+            "a delayed or historical placement event cannot prove a current resting ask"
         );
     }
 
@@ -11434,6 +11569,9 @@ mod codecell_tests {
         let terms = body
             .find("sell_offer_terms(&offer.token_contract)")
             .expect("post_offer reads on-chain deal terms");
+        let latch = body
+            .find("require_clear_offer_latch_before_post")
+            .expect("post_offer proves the TokenContract offer latch is clear");
         let submit = body
             .find(".post_sell_offer(")
             .expect("post_offer submits to the chain");
@@ -11444,6 +11582,10 @@ mod codecell_tests {
         assert!(
             terms < submit,
             "TokenContract.getDeal terms must be read before postSellOffer"
+        );
+        assert!(
+            latch < submit,
+            "TokenContract.getOffer().offerPosted must be proven false before postSellOffer"
         );
         assert!(
             body.contains("seller offer terms are bound to TokenContract.getDeal"),
