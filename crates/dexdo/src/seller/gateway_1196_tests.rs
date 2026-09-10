@@ -2,8 +2,8 @@ use super::*;
 use crate::seller::{drive_advance_with_observer, AdvanceWindows, ClaimStateObserver};
 use dexdo_core::{
     order_flags, ChainBackend, ChainError, DealChainState, DealSubscription, LocalNote, Match,
-    Note, OfferListing, SellOffer, Settlement, StreamSnapshot,
-    CHAIN_READ_EXHAUSTED_MESSAGE_PREFIX, TICK_SIZE,
+    Note, OfferListing, SellOffer, Settlement, StreamSnapshot, CHAIN_READ_EXHAUSTED_MESSAGE_PREFIX,
+    TICK_SIZE,
 };
 use dexdo_proto::SamplingParams;
 use std::sync::Arc;
@@ -118,14 +118,12 @@ async fn fail_required_read(state: Arc<GatewayState>, failure: ReadFailure) {
     );
 }
 
-fn chunk(text: &str) -> UpstreamEvent {
-    UpstreamEvent::Chunk {
-        chunk: CanonChunk {
-            text: text.to_string(),
-            ..CanonChunk::default()
-        },
-        accounted_tokens: 1,
-    }
+fn chunk(text: &str, seq: u64) -> UpstreamEvent {
+    UpstreamEvent::Chunk(CanonChunk {
+        text: text.to_string(),
+        seq,
+        ..CanonChunk::default()
+    })
 }
 
 async fn controlled_relay(
@@ -146,6 +144,9 @@ async fn controlled_relay(
         delivery,
         None,
         Some(unavailable),
+        u64::MAX,
+        u64::MAX,
+        false,
     ));
     (up_tx, buyer_rx, relay)
 }
@@ -156,8 +157,8 @@ async fn exhausted_read_budget_stop_terminates_inflight_stream_as_buyer_error() 
     let (up_tx, mut buyer_rx, relay) = controlled_relay(&state, TC).await;
     let (other_up_tx, mut other_buyer_rx, other_relay) =
         controlled_relay(&state, "0:other-open-deal").await;
-    up_tx.send(Ok(chunk("first"))).await.unwrap();
-    other_up_tx.send(Ok(chunk("other"))).await.unwrap();
+    up_tx.send(Ok(chunk("first", 0))).await.unwrap();
+    other_up_tx.send(Ok(chunk("other", 0))).await.unwrap();
     assert_eq!(buyer_rx.recv().await.unwrap().unwrap().text, "first");
     assert_eq!(other_buyer_rx.recv().await.unwrap().unwrap().text, "other");
 
@@ -196,18 +197,25 @@ async fn exhausted_read_budget_stop_terminates_inflight_stream_as_buyer_error() 
 async fn one_failed_attempt_inside_the_budget_does_not_stop_serving() {
     let state = Arc::new(GatewayState::new());
     let (up_tx, mut buyer_rx, relay) = controlled_relay(&state, TC).await;
-    up_tx.send(Ok(chunk("first"))).await.unwrap();
+    up_tx.send(Ok(chunk("first", 0))).await.unwrap();
     assert_eq!(buyer_rx.recv().await.unwrap().unwrap().text, "first");
 
     fail_required_read(state, ReadFailure::OneAttempt).await;
-    up_tx.send(Ok(chunk("second"))).await.unwrap();
+    up_tx.send(Ok(chunk("second", 1))).await.unwrap();
+    up_tx
+        .send(Ok(UpstreamEvent::Usage(
+            BillingUsage::new(0, 2, None).unwrap(),
+        )))
+        .await
+        .unwrap();
     drop(up_tx);
 
     assert_eq!(buyer_rx.recv().await.unwrap().unwrap().text, "second");
-    assert!(
-        buyer_rx.recv().await.is_none(),
-        "one failed attempt does not install a terminal status"
+    assert_eq!(
+        buyer_rx.recv().await.unwrap().unwrap().usage,
+        Some(BillingUsage::new(0, 2, None).unwrap())
     );
+    assert!(buyer_rx.recv().await.is_none());
     relay.await.unwrap();
 }
 
@@ -216,18 +224,25 @@ async fn keep_serving_preserves_the_existing_clean_relay_behavior() {
     let state = Arc::new(GatewayState::new());
     state.set_chain_unavailable_action(ChainUnavailableAction::KeepServing);
     let (up_tx, mut buyer_rx, relay) = controlled_relay(&state, TC).await;
-    up_tx.send(Ok(chunk("first"))).await.unwrap();
+    up_tx.send(Ok(chunk("first", 0))).await.unwrap();
     assert_eq!(buyer_rx.recv().await.unwrap().unwrap().text, "first");
 
     fail_required_read(state, ReadFailure::ExhaustedBudget).await;
-    up_tx.send(Ok(chunk("second"))).await.unwrap();
+    up_tx.send(Ok(chunk("second", 1))).await.unwrap();
+    up_tx
+        .send(Ok(UpstreamEvent::Usage(
+            BillingUsage::new(0, 2, None).unwrap(),
+        )))
+        .await
+        .unwrap();
     drop(up_tx);
 
     assert_eq!(buyer_rx.recv().await.unwrap().unwrap().text, "second");
-    assert!(
-        buyer_rx.recv().await.is_none(),
-        "keep_serving retains today's clean upstream EOF"
+    assert_eq!(
+        buyer_rx.recv().await.unwrap().unwrap().usage,
+        Some(BillingUsage::new(0, 2, None).unwrap())
     );
+    assert!(buyer_rx.recv().await.is_none());
     relay.await.unwrap();
 }
 
@@ -250,6 +265,7 @@ fn authorized_request(
                 ..SamplingParams::default()
             }),
         }),
+        billing_grant_tokens: 8,
     })
 }
 

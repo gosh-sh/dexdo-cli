@@ -56,7 +56,13 @@ mod multisig_pubkey_tests {
     #[test]
     fn one_key_normalizes_to_one_form() {
         let expected = format!("{}cafe", "0".repeat(60));
-        for rendering in ["0xcafe", "0XCAFE", "cafe", "  cafe  ", &expected.to_uppercase()] {
+        for rendering in [
+            "0xcafe",
+            "0XCAFE",
+            "cafe",
+            "  cafe  ",
+            &expected.to_uppercase(),
+        ] {
             assert_eq!(
                 normalize_multisig_pubkey(rendering).as_deref(),
                 Some(expected.as_str()),

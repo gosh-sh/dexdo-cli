@@ -330,7 +330,10 @@ async fn generation_one(dir: &Path, vault: &FakeVault) {
 /// id EXECUTED. Nothing here says the Hot has been credited.
 fn the_vault_transfer_executes(vault: &FakeVault) {
     vault.queue.borrow_mut().clear();
-    vault.history.borrow_mut().push(sent_event(7, QUEUED_AT + 60));
+    vault
+        .history
+        .borrow_mut()
+        .push(sent_event(7, QUEUED_AT + 60));
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -430,7 +433,10 @@ async fn a_pre_receipt_balance_cannot_open_a_duplicate_remainder() {
         "the stale pre-receipt shortfall must not create a second Vault transfer"
     );
     assert_eq!(
-        funded.expect("the post-receipt balance is sufficient").observed.get(SHELL),
+        funded
+            .expect("the post-receipt balance is sufficient")
+            .observed
+            .get(SHELL),
         SECOND_REQUIREMENT,
     );
     let record = record_of(dir.path()).expect("record");
@@ -487,7 +493,11 @@ async fn a_late_post_receipt_read_cannot_outlive_the_funding_wait() {
         started.elapsed() < Duration::from_secs(2),
         "the post-receipt read escaped the funding deadline"
     );
-    assert_eq!(hot.reads.get(), 3, "the third read is the post-receipt read");
+    assert_eq!(
+        hot.reads.get(),
+        3,
+        "the third read is the post-receipt read"
+    );
     assert_eq!(vault.submits.get(), 1, "a timed-out read submits nothing");
     let record = record_of(dir.path()).expect("record");
     assert_eq!(record.state, FundingState::Executed);

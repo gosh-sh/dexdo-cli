@@ -409,6 +409,7 @@ struct PolicyProblem {
 /// Read from the same table the validator reads, so a question set built against this cannot ask
 /// for a field the file does not need, or miss one it does. That is the whole guarantee: an
 /// operator who answers every question ends up with a file that loads.
+#[cfg(test)]
 pub(crate) fn required_paths(role: RuntimeRole) -> Vec<&'static str> {
     role_fields(role).iter().map(|field| field.path).collect()
 }
@@ -417,6 +418,7 @@ pub(crate) fn required_paths(role: RuntimeRole) -> Vec<&'static str> {
 
 /// For the questions that offer choices: an answer whose wording an operator reads has to carry a
 /// value the file accepts, and nothing but this table decides which those are.
+#[cfg(test)]
 pub(crate) fn accepts(path: &str, value: &str) -> bool {
     let optional = seller_chain_unavailable_field();
     let Some(field) = [RuntimeRole::Seller, RuntimeRole::Buyer]
@@ -441,9 +443,7 @@ fn role_fields(role: RuntimeRole) -> &'static [PolicyField] {
 fn seller_chain_unavailable_field() -> PolicyField {
     PolicyField {
         path: "seller.on.chain_unavailable",
-        kind: FieldKind::Choice(
-            dexdo::seller::gateway::ChainUnavailableAction::supported_values(),
-        ),
+        kind: FieldKind::Choice(dexdo::seller::gateway::ChainUnavailableAction::supported_values()),
     }
 }
 
@@ -632,7 +632,10 @@ fn validate_value(value: &Value, role: RuntimeRole) -> Vec<PolicyProblem> {
     }
     for field in role_fields(role) {
         if !field_valid(get_path(value, field.path), field.kind) {
-            problems.push(problem(field.path, allowed_for_operator(field.path, field.kind)));
+            problems.push(problem(
+                field.path,
+                allowed_for_operator(field.path, field.kind),
+            ));
         }
     }
     let chain_unavailable = seller_chain_unavailable_field();
@@ -683,10 +686,13 @@ fn ask_the_rules(role: RuntimeRole, base: &Value) -> Result<Value> {
         RuntimeRole::Seller => (SELLER_QUESTIONS, SELLER_COUNTS),
     };
     let mut value = base.clone();
-    scaffold_roles(&mut value, match role {
-        RuntimeRole::Buyer => PolicyRoleArg::Buyer,
-        RuntimeRole::Seller => PolicyRoleArg::Seller,
-    });
+    scaffold_roles(
+        &mut value,
+        match role {
+            RuntimeRole::Buyer => PolicyRoleArg::Buyer,
+            RuntimeRole::Seller => PolicyRoleArg::Seller,
+        },
+    );
     eprintln!(
         "{}",
         crate::cli::choose::title(&format!(
@@ -729,7 +735,13 @@ fn ask_the_rules(role: RuntimeRole, base: &Value) -> Result<Value> {
         eprintln!("{}", crate::cli::choose::heading(question.situation));
         eprintln!("{}", crate::cli::choose::aside(question.because));
         if offered.len() == 1 {
-            eprintln!("{}", crate::cli::choose::answered(&format!("{} -- the only thing this client can do today", first.says)));
+            eprintln!(
+                "{}",
+                crate::cli::choose::answered(&format!(
+                    "{} -- the only thing this client can do today",
+                    first.says
+                ))
+            );
             set_path(&mut value, question.path, Value::from(first.value));
             continue;
         }
@@ -1241,9 +1253,7 @@ pub(crate) struct DoctorPolicyAssessment {
     pub(crate) problems: Vec<String>,
 }
 
-pub(crate) fn doctor_policy_assessment(
-    explicit: Option<&Path>,
-) -> Result<DoctorPolicyAssessment> {
+pub(crate) fn doctor_policy_assessment(explicit: Option<&Path>) -> Result<DoctorPolicyAssessment> {
     let path = resolve_policy_path(explicit)?;
     if !path.exists() {
         return Ok(DoctorPolicyAssessment {
@@ -1277,10 +1287,7 @@ pub(crate) fn doctor_policy_line(assessment: &DoctorPolicyAssessment) -> String 
     match assessment.status {
         DoctorPolicyStatus::Ready => "ready".to_string(),
         DoctorPolicyStatus::Missing => "not configured (optional for doctor)".to_string(),
-        DoctorPolicyStatus::Incomplete => format!(
-            "incomplete: {}",
-            assessment.problems.join(", ")
-        ),
+        DoctorPolicyStatus::Incomplete => format!("incomplete: {}", assessment.problems.join(", ")),
     }
 }
 
@@ -1614,10 +1621,19 @@ fn validate_accepts_both_roles_and_uses_each_role_own_loader() {
     // and the check has to be the role's own loader rather than a shared "looks like JSON".
     let mut scaffold = serde_json::json!({});
     scaffold_roles(&mut scaffold, PolicyRoleArg::Seller);
-    std::fs::write(&path, serde_json::to_vec_pretty(&scaffold).expect("serialize"))
-        .expect("write the scaffold");
-    assert!(load_seller_runtime_policy(Some(&path)).is_err(), "a scaffold is UNSET until filled in");
-    assert!(load_buyer_runtime_policy(Some(&path)).is_err(), "a seller file has no buyer rules");
+    std::fs::write(
+        &path,
+        serde_json::to_vec_pretty(&scaffold).expect("serialize"),
+    )
+    .expect("write the scaffold");
+    assert!(
+        load_seller_runtime_policy(Some(&path)).is_err(),
+        "a scaffold is UNSET until filled in"
+    );
+    assert!(
+        load_buyer_runtime_policy(Some(&path)).is_err(),
+        "a seller file has no buyer rules"
+    );
 }
 
 #[cfg(test)]

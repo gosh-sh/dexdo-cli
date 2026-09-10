@@ -73,9 +73,7 @@ fn placed() -> dexdo_core::BuyerOrderFact {
 }
 
 fn swept() -> dexdo_core::BuyerOrderFact {
-    fact(dexdo_core::BuyerOrderFactKind::Expired {
-        order_id: ORDER_ID,
-    })
+    fact(dexdo_core::BuyerOrderFactKind::Expired { order_id: ORDER_ID })
 }
 
 fn refunded() -> dexdo_core::BuyerOrderFact {

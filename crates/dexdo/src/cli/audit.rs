@@ -212,7 +212,6 @@ pub(crate) fn build_deal_audit(input: DealAuditBuild) -> Result<DealAuditExport>
         input.active,
         input.summary.as_ref(),
         handle.is_some(),
-        &input.contracts,
     );
 
     Ok(DealAuditExport {
@@ -311,7 +310,6 @@ fn build_actions(
     active: bool,
     summary: Option<&DealStateSummary>,
     has_handle: bool,
-    contracts: &str,
 ) -> AuditActions {
     let token_contract = dexdo_core::address::display_self_dapp(token_contract);
     // none of these next actions can be a command line. Every one of them signs, so its
@@ -320,9 +318,8 @@ fn build_actions(
     // all: a shell reads `<buyer-key>` as a redirection and never hands the token to `dexdo`. So
     // each action names its command and states the inputs the operator supplies. With no stored
     // handle the deal reference is a raw TokenContract, which carries neither the role nor the
-    // note the close handler requires below clap, so those are stated too; and the manifest this
-    // export was built against is carried, or the follow-up would settle a different deployment.
-    let contracts = std::path::Path::new(contracts);
+    // note the close handler requires below clap, so those are stated too. The manifest comes from
+    // `DEXDO_MANIFEST`; no follow-up may invent the removed `--contracts` flag.
     let raw_buyer = (!has_handle).then_some("buyer");
     let raw_seller = (!has_handle).then_some("seller");
     let public_deal_ref = if has_handle {
@@ -330,18 +327,10 @@ fn build_actions(
     } else {
         token_contract.clone()
     };
-    let close_as_buyer = crate::cli::commands::close_guidance(
-        &public_deal_ref,
-        raw_buyer,
-        "buyer",
-        None
-    );
-    let close_as_seller = crate::cli::commands::close_guidance(
-        &public_deal_ref,
-        raw_seller,
-        "seller",
-        None
-    );
+    let close_as_buyer =
+        crate::cli::commands::close_guidance(&public_deal_ref, raw_buyer, "buyer", None);
+    let close_as_seller =
+        crate::cli::commands::close_guidance(&public_deal_ref, raw_seller, "seller", None);
     let settlement = |command: &str, actor: &str, what: &str| {
         format!(
             "{what}: run `dexdo {command}` with --token-contract {}, the {actor} --note-addr and \
@@ -961,7 +950,6 @@ mod tests {
                         true,
                         Some(&summary),
                         has_handle,
-                        "/tmp/my deploy/deployed.json",
                     );
                     for action in actions.available_next_commands {
                         if !action.contains("`dexdo ") {
@@ -970,9 +958,7 @@ mod tests {
                         let context =
                             format!("audit next action (has_handle={has_handle}, {role:?})");
                         // What an action must state depends on the command it names. The ones that
-                        // move money sign, so the key has to be named, and the manifest this
-                        // export was built against has to survive into the follow-up or the
-                        // operator settles against the default deployment. A raw TokenContract
+                        // move money sign, so the key has to be named. A raw TokenContract
                         // carries neither role nor note, so a `close` rendered without a stored
                         // handle states those too; a stored handle already carries them. The
                         // read-only lines (`dexdo status`) and the "keep it running" lines
@@ -1045,7 +1031,6 @@ mod tests {
             true,
             Some(&summary),
             true,
-            "manifest/deployed.manifest.json",
         )
         .available_next_commands
         .join("\n");
@@ -1062,7 +1047,6 @@ mod tests {
             true,
             Some(&summary),
             true,
-            "manifest/deployed.manifest.json",
         )
         .available_next_commands
         .join("\n");

@@ -87,22 +87,6 @@ pub fn ordinary_buy_reserve(
     subscription_buy_reserve(ticks, max_price_per_tick)
 }
 
-#[cfg(test)]
-mod ordinary_buy_reserve_tests {
-    use super::{ordinary_buy_reserve, subscription_buy_reserve};
-
-    #[test]
-    fn ordinary_and_subscription_buy_reserves_match_at_the_same_inputs() {
-        let ticks = 3;
-        let price_per_tick = 1_000_000;
-
-        assert_eq!(
-            ordinary_buy_reserve(ticks, price_per_tick),
-            subscription_buy_reserve(ticks, price_per_tick)
-        );
-    }
-}
-
 /// Require the exact subscription reserve before a money submit.
 
 /// Both underfunding and overfunding are rejected: a subscription message carries precisely the
@@ -835,4 +819,20 @@ pub fn check_withdrawable_shell(
         ));
     }
     Ok(amount)
+}
+
+#[cfg(test)]
+mod ordinary_buy_reserve_tests {
+    use super::{ordinary_buy_reserve, subscription_buy_reserve};
+
+    #[test]
+    fn ordinary_and_subscription_buy_reserves_match_at_the_same_inputs() {
+        let ticks = 3;
+        let price_per_tick = 1_000_000;
+
+        assert_eq!(
+            ordinary_buy_reserve(ticks, price_per_tick),
+            subscription_buy_reserve(ticks, price_per_tick)
+        );
+    }
 }

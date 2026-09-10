@@ -54,8 +54,9 @@ fn a_queue_entry_that_is_our_transfer_matches() {
 /// different transfer, which must not be adopted as ours.
 #[test]
 fn every_fingerprint_field_is_part_of_the_match() {
+    type QueueMutation = (&'static str, Box<dyn Fn(&mut QueuedTransfer)>);
     let expected = fingerprint();
-    let mutations: Vec<(&str, Box<dyn Fn(&mut QueuedTransfer)>)> = vec![
+    let mutations: Vec<QueueMutation> = vec![
         (
             "creator",
             Box::new(|entry: &mut QueuedTransfer| entry.creator_pubkey = Some(hex64(0xee))),

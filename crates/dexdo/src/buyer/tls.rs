@@ -375,7 +375,9 @@ mod tests {
             connect_pinned(&format!("https://{host}:{port}"), &seller.tls_fingerprint)
                 .await
                 .unwrap_or_else(|error| {
-                    panic!("the endpoint spelling `{host}` must complete the pinned dial: {error:?}")
+                    panic!(
+                        "the endpoint spelling `{host}` must complete the pinned dial: {error:?}"
+                    )
                 });
         }
 

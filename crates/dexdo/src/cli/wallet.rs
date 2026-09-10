@@ -457,7 +457,7 @@ async fn run_show(args: crate::cli::args::WalletShowArgs) -> Result<()> {
     let mut found = Vec::new();
     let mut unreadable = Vec::new();
     for network in &networks {
-        match store.peek_active(&network) {
+        match store.peek_active(network) {
             Ok(Some(binding)) => found.push((network, binding)),
             Ok(None) => {}
             Err(error) => unreadable.push((network, format!("{error:#}"))),
@@ -498,7 +498,7 @@ async fn run_show(args: crate::cli::args::WalletShowArgs) -> Result<()> {
                     "binding_id": binding.id,
                     "hot_key_file": binding.hot_key_file.as_ref().map(|path| path.display().to_string()),
                     "hot_seed_file": binding.hot_seed_file.as_ref().map(|path| path.display().to_string()),
-                    "binding_file": store.binding_path(&network).display().to_string(),
+                    "binding_file": store.binding_path(network).display().to_string(),
                     "shell_raw": shell,
                     "native_raw": native,
                     "balance_unread": unread,
@@ -615,7 +615,9 @@ async fn run_show(args: crate::cli::args::WalletShowArgs) -> Result<()> {
                     "SHELL",
                     &format!(
                         "{} SHELL (raw {})",
-                        dexdo_core::shell_amount(balances.get(dexdo_core::params::SHELL_CURRENCY_ID)),
+                        dexdo_core::shell_amount(
+                            balances.get(dexdo_core::params::SHELL_CURRENCY_ID)
+                        ),
                         balances.get(dexdo_core::params::SHELL_CURRENCY_ID)
                     ),
                     Role::Text,
@@ -661,7 +663,12 @@ async fn run_show(args: crate::cli::args::WalletShowArgs) -> Result<()> {
             &format!("Binding on {network} cannot be read"),
         ));
         out.push('\n');
-        out.push_str(&style::field(palette, "file", &store.binding_path(&network).display().to_string(), Role::Meta));
+        out.push_str(&style::field(
+            palette,
+            "file",
+            &store.binding_path(network).display().to_string(),
+            Role::Meta,
+        ));
         out.push('\n');
         out.push_str(&style::field(palette, "why", error, Role::Err));
         out.push('\n');
@@ -720,10 +727,10 @@ async fn run_remove_archived(args: WalletRemoveArchivedArgs) -> Result<()> {
         refuse_a_manifest_for_another_network(&deployed.network, &target.binding.network)?;
     }
     let endpoint = wallet_read_endpoint(Some(manifest.as_path()), target.binding.network.clone())?;
-    let client = dexdo_core::ChainClient::connect(&endpoint)
-        .map_err(|error| anyhow::anyhow!("connect read-only balance endpoint {endpoint}: {error}"))?;
-    let removed =
-        remove_archived_binding_after_balance_check(&store, &target, &client).await?;
+    let client = dexdo_core::ChainClient::connect(&endpoint).map_err(|error| {
+        anyhow::anyhow!("connect read-only balance endpoint {endpoint}: {error}")
+    })?;
+    let removed = remove_archived_binding_after_balance_check(&store, &target, &client).await?;
     println!(
         "removed archived wallet binding {} and its secrets directory after Hot {} on {} was \
          proven to hold zero native and zero ECC balances",
@@ -731,7 +738,6 @@ async fn run_remove_archived(args: WalletRemoveArchivedArgs) -> Result<()> {
     );
     Ok(())
 }
-
 
 /// The money-safety boundary: no local removal is reachable before a successful all-zero read.
 async fn remove_archived_binding_after_balance_check<R>(
@@ -742,13 +748,14 @@ async fn remove_archived_binding_after_balance_check<R>(
 where
     R: crate::cli::wallet_funding::HotBalanceReader,
 {
-    let hot = dexdo_core::CanonicalAddress::parse(&target.binding.hot_address).map_err(|error| {
-        anyhow::anyhow!(
+    let hot =
+        dexdo_core::CanonicalAddress::parse(&target.binding.hot_address).map_err(|error| {
+            anyhow::anyhow!(
             "archived binding {} records unusable Hot address {:?}: {error}; nothing was removed",
             target.binding.id,
             target.binding.hot_address
         )
-    })?;
+        })?;
     let balances = reader.hot_balances(&hot).await.map_err(|error| {
         anyhow::anyhow!(
             "read every balance of archived binding {} Hot {}: {error}; nothing was removed",
@@ -815,7 +822,6 @@ fn refuse_removal_while_funding_may_still_arrive(binding: &WalletBinding) -> Res
     // and the canonical round-trip of its Hot. A different rendering here would read a file that
     // does not exist and report "nothing pending" about a request that is.
     let hot_address = hot.to_string();
-    let network = binding.network.as_str();
     let data_dir = crate::cli::data_dir::effective()?;
     refuse_removal_while_funding_may_still_arrive_at(
         binding,
@@ -837,9 +843,7 @@ fn refuse_removal_while_funding_may_still_arrive_at(
     let Some(record) = load_funding_journal_records(data_dir, network, hot_address)?
         .unwrap_or_default()
         .into_iter()
-        .find(|record| {
-            record.generation_may_still_execute() && !record.is_expired_at(now)
-        })
+        .find(|record| record.generation_may_still_execute() && !record.is_expired_at(now))
     else {
         return Ok(());
     };
@@ -1008,7 +1012,7 @@ pub(crate) fn resolve_funding_wallet(
             seed_file: explicit_seed_file.clone(),
         });
     }
-    let binding = store.require_active(&network)?;
+    let binding = store.require_active(network)?;
     if binding.hot_key_file.is_none() && binding.hot_seed_file.is_none() {
         bail!(
             "wallet binding {} (provider `{}`, Hot {}) records no local Hot key or seed file, so \
@@ -1088,9 +1092,11 @@ pub(crate) async fn resolve_funding_wallet_or_onboard(
 /// Compiled under every test build, not only the chain build: it calls nothing from the chain half, and
 /// the tests that pin which refusals may start an onboarding run in both configurations.
 fn is_wallet_not_configured(error: &anyhow::Error) -> bool {
-    error.downcast_ref::<dexdo_core::DexdoError>().is_some_and(|coded| {
-        coded.code() == dexdo_core::error_codes::E_WALLET_NOT_CONFIGURED.code()
-    })
+    error
+        .downcast_ref::<dexdo_core::DexdoError>()
+        .is_some_and(|coded| {
+            coded.code() == dexdo_core::error_codes::E_WALLET_NOT_CONFIGURED.code()
+        })
 }
 
 /// Onboarding shows a code to scan and then waits for a phone, so it needs a real operator on the
@@ -1348,7 +1354,10 @@ fn resumable_binding_id(
     if action != WalletAction::Onboard || provider != WalletProvider::GoshAi {
         return None;
     }
-    crate::cli::wallet_goshai::files::find_resumable(store.root(), &selected_network(explicit).ok()?)
+    crate::cli::wallet_goshai::files::find_resumable(
+        store.root(),
+        &selected_network(explicit).ok()?,
+    )
 }
 
 /// Retire the finished attempt's resume marker. See [`resumable_binding_id`] for who writes one.
@@ -1485,7 +1494,9 @@ fn ackinacki_onboard_args(
             agent_name: dexdo_core::params::WALLET_ONBOARD_DEFAULT_AGENT_NAME.to_string(),
             // The menu carries no command line, so the manifest is the one the client finds.
             state: Some(binding_dir.join(dexdo_core::params::DEFAULT_WALLET_ONBOARD_STATE_PATH)),
-            hot_key: Some(binding_dir.join(dexdo_core::params::DEFAULT_WALLET_ONBOARD_HOT_KEY_PATH)),
+            hot_key: Some(
+                binding_dir.join(dexdo_core::params::DEFAULT_WALLET_ONBOARD_HOT_KEY_PATH),
+            ),
             vault_key: None,
             qr_file: None,
             terminal_qr: false,
@@ -1496,7 +1507,6 @@ fn ackinacki_onboard_args(
 /// follow-up item 6: the owner-only defaults, and the menu path they unblock.
 #[cfg(test)]
 mod ackinacki_defaults_tests;
-
 
 /// The manual provider: an existing Hot, connected by address plus a local secret file.
 
@@ -1532,11 +1542,9 @@ async fn manual_flow(
     crate::cli::wallet_manual::run_wallet_onboard_manual(args, draft.id()).await
 }
 
-
 /// The Gosh.ai flow proves the Hot on chain before it binds, so it exists only where there is a
 /// chain backend. In a default build the provider is still selectable -- that is argument parsing --
 /// and refuses here for the same reason every other money path does.
-
 async fn goshai_flow(
     draft: &BindingDraft,
     explicit: Option<&WalletProviderCommand>,

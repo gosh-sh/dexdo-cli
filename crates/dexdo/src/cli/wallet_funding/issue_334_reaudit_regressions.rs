@@ -357,7 +357,9 @@ async fn a_hot_that_can_pay_for_one_voucher_submit_is_short_by_exactly_the_other
          and the funding step must ask the Vault for the difference rather than report it funded"
     );
     let submitted = vault.submitted.borrow();
-    let on_wire = submitted.first().expect("the provider submitted a fingerprint");
+    let on_wire = submitted
+        .first()
+        .expect("the provider submitted a fingerprint");
     assert_eq!(
         on_wire.value,
         one_voucher_submit_costs(),

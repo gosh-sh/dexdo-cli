@@ -27,7 +27,7 @@ mod endpoint_and_resume_tests {
     /// secrets must never enter the repository.
 
     /// The clock is read through `std` rather than the onboarding crate's own helper: naming that
-    /// crate outside `wallet_onboarding.rs` is what `ci/check-single-sdk.sh` exists to forbid, and
+    /// crate outside `wallet_onboarding.rs` is what `ci/check_single_sdk.sh` exists to forbid, and
     /// this file is a separate path even though it compiles into that module.
     fn scheme_less_request_prepared_state(hot_pubkey: &str, endpoint: &str) -> String {
         let now = std::time::SystemTime::now()
@@ -105,10 +105,7 @@ mod endpoint_and_resume_tests {
         // is no table of defaults to check one network's against another's. What still has to hold
         // -- and is the whole reason this boundary was lifted out -- is that whatever comes back is
         // ABSOLUTE, because a scheme-less host posts the AuthProfile write over plain http.
-        let args = WalletOnboardArgs {
-            ..args_in(dir.path())
-        };
-        let resolved = onboarding_endpoint(&args).expect("an endpoint");
+        let resolved = onboarding_endpoint().expect("an endpoint");
         assert!(
             resolved.starts_with("https://") || resolved.starts_with("http://"),
             "the endpoint must be absolute before anything downstream sees it: {resolved}"
@@ -127,7 +124,7 @@ mod endpoint_and_resume_tests {
         // path accepts.
         let args = args_in(dir.path());
         let state = resolve_private_file_path(args.state.as_deref().unwrap(), "state").unwrap();
-        let endpoint = onboarding_endpoint(&args).unwrap();
+        let endpoint = onboarding_endpoint().unwrap();
         let (session, _keys, created) =
             load_or_create_session(&args, &endpoint, &state, limits()).unwrap();
 
@@ -147,8 +144,8 @@ mod endpoint_and_resume_tests {
     /// A literal used to stand here. With `--endpoint` gone the run takes its endpoint from the
     /// manifest, so a literal is a session for some OTHER endpoint -- which resume refuses, and
     /// that refusal is the next test's subject, not this one's.
-    fn scheme_less_endpoint_of_this_run(dir: &Path) -> String {
-        let absolute = onboarding_endpoint(&args_in(dir)).expect("this run resolves an endpoint");
+    fn scheme_less_endpoint_of_this_run() -> String {
+        let absolute = onboarding_endpoint().expect("this run resolves an endpoint");
         absolute
             .split_once("://")
             .map(|(_, host)| host.to_string())
@@ -158,9 +155,9 @@ mod endpoint_and_resume_tests {
     #[test]
     fn a_session_holding_a_scheme_less_endpoint_still_resumes() {
         let dir = tempfile::tempdir().unwrap();
-        let args = resumable_state(dir.path(), &scheme_less_endpoint_of_this_run(dir.path()));
+        let args = resumable_state(dir.path(), &scheme_less_endpoint_of_this_run());
         let state = resolve_private_file_path(args.state.as_deref().unwrap(), "state").unwrap();
-        let endpoint = onboarding_endpoint(&args).unwrap();
+        let endpoint = onboarding_endpoint().unwrap();
 
         let (session, _keys, created) = load_or_create_session(&args, &endpoint, &state, limits())
             .expect("a session written before the endpoint was normalised must still resume");
@@ -176,7 +173,7 @@ mod endpoint_and_resume_tests {
     #[test]
     fn resume_still_refuses_a_genuinely_different_endpoint() {
         let dir = tempfile::tempdir().unwrap();
-        let args = resumable_state(dir.path(), &scheme_less_endpoint_of_this_run(dir.path()));
+        let args = resumable_state(dir.path(), &scheme_less_endpoint_of_this_run());
         let state = resolve_private_file_path(args.state.as_deref().unwrap(), "state").unwrap();
 
         // Accepting a scheme difference must not become accepting a host or a downgrade.

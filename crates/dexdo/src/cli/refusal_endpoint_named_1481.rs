@@ -48,7 +48,10 @@ const BALANCE_READ_AGAINST_A_REFUSED_HOST: &str =
 
 #[test]
 fn an_unreachable_chain_is_named_by_the_address_the_run_dialled() {
-    for raw in [DOCTOR_AGAINST_A_DEAD_PORT, BALANCE_READ_AGAINST_A_REFUSED_HOST] {
+    for raw in [
+        DOCTOR_AGAINST_A_DEAD_PORT,
+        BALANCE_READ_AGAINST_A_REFUSED_HOST,
+    ] {
         let refusal = for_operator(&anyhow::anyhow!("{raw}"))
             .unwrap_or_else(|| panic!("a transport failure has to be recognised: {raw}"));
         let shown = refusal.render();
@@ -82,7 +85,10 @@ fn an_unreachable_chain_is_named_by_the_address_the_run_dialled() {
             .join(" ")
             .trim()
             .to_string();
-        assert!(!news.starts_with(' '), "the news is not the first row: {shown}");
+        assert!(
+            !news.starts_with(' '),
+            "the news is not the first row: {shown}"
+        );
         assert!(news.contains("could not reach the chain"), "{shown}");
         assert_eq!(
             printed_instruction,
@@ -119,11 +125,19 @@ fn a_transport_failure_that_names_no_address_does_not_acquire_one() {
         shown.contains("The client could not reach the chain, and nothing was sent."),
         "{shown}"
     );
-    assert!(!shown.contains("://"), "nothing was invented to fill the gap: {shown}");
+    assert!(
+        !shown.contains("://"),
+        "nothing was invented to fill the gap: {shown}"
+    );
     // One statement of news, one instruction under it, and nothing else -- wrapped rows are still
     // that instruction, and a row that starts its own sentence is not.
-    let unindented: Vec<&str> =
-        shown.lines().filter(|row| !row.starts_with("            ")).collect();
+    let unindented: Vec<&str> = shown
+        .lines()
+        .filter(|row| !row.starts_with("            "))
+        .collect();
     assert_eq!(unindented.len(), 1, "{shown}");
-    assert!(unindented[0].contains("could not reach the chain"), "{shown}");
+    assert!(
+        unindented[0].contains("could not reach the chain"),
+        "{shown}"
+    );
 }

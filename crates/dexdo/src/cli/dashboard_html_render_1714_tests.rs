@@ -13,9 +13,7 @@
 //! on a whole cell value. A substring search for the account id would match both spellings at once,
 //! which is precisely the distinction under test.
 
-use super::{
-    render_html, DashboardAccounting, DashboardDeal, DashboardSnapshot, DashboardSource,
-};
+use super::{render_html, DashboardAccounting, DashboardDeal, DashboardSnapshot, DashboardSource};
 
 const TC: &str = "b7e4a91c0d5f6382a4b5c6d7e8f90a1b2c3d4e5f60718293a4b5c6d7e8f90a1b";
 
@@ -101,7 +99,10 @@ fn the_row_names_the_token_contract_in_its_self_dapp_form() {
         "the row printed the legacy spelling the renderer is supposed to rewrite: {html}"
     );
     // The row is still a row, so this cannot pass by rendering an empty page.
-    assert!(tokens.iter().any(|token| token == "buyer-tc-open"), "{html}");
+    assert!(
+        tokens.iter().any(|token| token == "buyer-tc-open"),
+        "{html}"
+    );
 }
 
 /// The DApp half is the ACCOUNT's own, not the shared dexdo DApp. A renderer that used

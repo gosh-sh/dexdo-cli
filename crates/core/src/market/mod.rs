@@ -279,7 +279,8 @@ pub trait ChainBackend: Send + Sync {
         _deadline: u64,
     ) -> Result<(), ChainError> {
         Err(ChainError::Chain(
-            "place_buy_by_model: model-only buy is only supported on the real chain buyer backend".into(),
+            "place_buy_by_model: model-only buy is only supported on the real chain buyer backend"
+                .into(),
         ))
     }
     /// Stable identity of the model-scoped order book used for durable recovery.

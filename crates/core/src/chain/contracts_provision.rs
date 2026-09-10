@@ -55,7 +55,8 @@ pub(super) const PRIVATENOTE_ABI: &str =
     include_str!("../../../../contracts/compiled/dex/PrivateNote.abi.json");
 /// `PrivateNote` StateInit (`.tvc`). The CLI never deploys `PrivateNote` -- RootPN does, from the code
 /// installed by `setPrivateNoteCode` -- so **no path may treat this vendored image as evidence about
-/// the live chain**; that job belongs to [`PRIVATENOTE_PINNED_CODE_HASH`], which is read from RootPN.
+/// the live chain**; that job belongs to the matching `private_note` value in [`GENERATION_PINS`],
+/// which is read from RootPN.
 /// It is listed in [`COMPILED_CONTRACT_IMAGES`] for the one statement a vendored image *can* make,
 /// which is about this tree and not about the chain: the deployment manifest's `PrivateNote` pin
 /// names the artifact committed beside it.
@@ -164,7 +165,9 @@ pub(super) const GENERATION_PINS: &[GenerationPins] = &[
         // `Skip` as passing, so the honest-looking answer was a hole: the right value was in the
         // tree and nothing read it. Held to the artifact by
         // `the_book_and_deal_pins_are_the_images_this_tree_ships`.
-        inference_orderbook: Some("e97227c5d1a8fff171e0c5a1f6aa3e063f663bfcb5c86757392aef82a8775954"),
+        inference_orderbook: Some(
+            "e97227c5d1a8fff171e0c5a1f6aa3e063f663bfcb5c86757392aef82a8775954",
+        ),
         private_note: "acf19e140b58469a50165bcbda88cca952b2036678f1f5823b6a6bebd3fc32b1",
         token_contract_code: Some(
             "ee4105b4800d852dde1a86cec4e270ecfa2ae0e199f05a46823aed792933e711",
@@ -191,24 +194,10 @@ pub(super) fn generation_pins(version: &str) -> Option<&'static GenerationPins> 
     GENERATION_PINS.iter().find(|row| row.version == version)
 }
 
-/// `SuperRoot` at `0:0c0c...`.
-pub(super) const PINNED_SUPERROOT_CODE_HASH: &str =
-    "295b0f05b571273d7b01e3ea9566bfee4340ed2a7cdd59b21242c555925e10d0";
-/// `RootPN` at `0:1010...`. Compiled with `sold_old` (v1 ext-out), which preserves the
-/// `VoucherGenerated` format consumed by the voucher prover. Several images answer the same
-/// `getVersion()`, so this hash rather than the version getter identifies the generation. Like
-/// `PRIVATENOTE_PINNED_CODE_HASH` it is a statement about the chain and NOT a property of any
-/// vendored image -- the CLI never deploys RootPN and this tree carries no RootPN `.tvc`, so it
-/// moves on its own.
-pub(super) const PINNED_ROOTPN_V1_CODE_HASH: &str =
-    "2d577219df058ec0f6ea09dad204b13398342ef7cd5c66e843049ae2380aa928";
-/// `RootOracle` at `0:1515...`.
-pub(super) const PINNED_ROOTORACLE_CODE_HASH: &str =
-    "227d5b86dd309a757e0ff5977ebffc3065d269d80acb830336a7a3d21213d489";
-/// The per-model `InferenceOrderBook`, which RootPN deploys from the code installed by
-/// `setInferenceOrderBookCode`.
-pub(super) const PINNED_INFERENCE_ORDERBOOK_CODE_HASH: &str =
-    "e97227c5d1a8fff171e0c5a1f6aa3e063f663bfcb5c86757392aef82a8775954";
+// Test code names the active table row without repeating its hash literal.
+#[cfg(test)]
+pub(super) const PRIVATENOTE_PINNED_CODE_HASH: &str = GENERATION_PINS[0].private_note;
+
 /// `TokenContract` StateInit (`.tvc`) -- deployed via `build_deploy` (step 2: the seller provisions
 /// the per-deal TC). Its code-hash == the `RootModel.TOKEN_CONTRACT_CODE_HASH` pin (offline guard), so
 /// the derived address matches `RootModel.getTokenContractAddress` and registration is accepted.
@@ -243,23 +232,6 @@ pub(super) const ROOTMODEL_PINNED_TC_CODE_HASH: &str =
 /// SuperRoot took over the deploy.
 pub(super) const SUPERROOT_PINNED_RM_CODE_HASH: &str =
     "e92a14cb9c5ac757e16be2f453d5c3a25e7bec90044a1389b97414d1b785cac8";
-/// The code-hash of the `PrivateNote` that `RootPN` mints for the 4.0.34 generation. The
-/// orphaned-note guard (`assert_seller_note_current`) requires the seller note's on-chain
-/// `code_hash` to equal this, so a value that lags the chain makes the binary refuse every NEWLY
-/// minted note.
-
-/// What this constant is about is the chain, NOT a property of the `PRIVATENOTE_TVC` vendored here:
-/// the CLI never deploys `PrivateNote` (RootPN does, from the code installed by
-/// `setPrivateNoteCode`), so the embedded image may legitimately lag. Tying this constant to that
-/// image is what let 4.0.33 go live unnoticed -- a test that hashed the vendored `.tvc` and compared
-/// it to the constant beside it stayed green while both drifted away from the chain together.
-/// `doctor_compares_every_generation_pin_and_never_a_vendored_image` pins the real relationship
-/// instead: `doctor` compares this constant against RootPN's on-chain pin, and nothing in production
-/// hashes an image.
-/// Update on every PrivateNote redeploy.
-pub(super) const PRIVATENOTE_PINNED_CODE_HASH: &str =
-    "acf19e140b58469a50165bcbda88cca952b2036678f1f5823b6a6bebd3fc32b1";
-
 pub(super) fn normalize_code_hash(raw: &str) -> Option<String> {
     let h = raw.trim().strip_prefix("0x").unwrap_or(raw.trim());
     if h.is_empty() || h.len() > 64 || !h.bytes().all(|b| b.is_ascii_hexdigit()) {
@@ -348,9 +320,9 @@ pub(super) fn note_balance_private_note_account(
 }
 
 /// Fund-safety guard for `note withdraw`: pure code-hash generation check.
-/// A note whose on-chain `code_hash` is not the current `PRIVATENOTE_PINNED_CODE_HASH` was deployed
-/// by a previous contract generation; the current-generation `withdrawTokens` zeroes it without
-/// crediting the destination, so the SHELL is lost. Refuse before any on-chain write.
+/// A note whose on-chain `code_hash` is not the current generation's `private_note` pin was
+/// deployed by a previous contract generation; the current-generation `withdrawTokens` zeroes it
+/// without crediting the destination, so the SHELL is lost. Refuse before any on-chain write.
 pub(super) fn note_withdraw_generation_ok(
     expected: &str,
     note: &Address,

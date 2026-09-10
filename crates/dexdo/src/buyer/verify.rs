@@ -11,7 +11,7 @@
 //! we do not fabricate (R4), we degrade (R3) to the next layers.
 
 use crate::registry::model_id_alias;
-use crate::seller::{ModelConfig, ModelsConfig};
+use crate::seller::{ModelConfig, ModelsConfig, SampleAlgorithm};
 pub use dexdo_core::params::DEFAULT_SPOTCHECK_THRESHOLD;
 use dexdo_proto::{CanonChunk, SignalManifest};
 use std::sync::Arc;
@@ -211,13 +211,17 @@ fn fingerprints_for(model_id: &str, models: &ModelsConfig) -> Vec<Fingerprint> {
 /// (`base_url` + `served_model` + `api_key_env`). Resolves ONLY by config key / `frame_model` /
 /// exact `served_model` -- NOT `identity_aliases`: a provider-neutral registry name (e.g. `Qwen/Qwen3-32B`,
 /// which may be served elsewhere) has no reference here, so we do not compare it against the configured
-/// provider's greedy output. `None` -- no reference -> **degradation** (R3): reliance on the cheap B7 + B5/B6.
+/// provider's greedy output. A profile using `sample_algorithm: NONE` has no comparable reference and
+/// therefore also returns `None` -- **degradation** (R3): reliance on B5 and behavioral probes.
 pub fn reference_endpoint_for(model_id: &str, models: &ModelsConfig) -> Option<ReferenceEndpoint> {
     let id = model_id.trim();
     let cfg = models
         .get(id)
         .ok()
         .or_else(|| models.models.values().find(|m| m.served_model == id))?;
+    if cfg.capabilities.sample_algorithm == SampleAlgorithm::None {
+        return None;
+    }
     Some(cfg.reference_endpoint())
 }
 
@@ -308,6 +312,8 @@ pub struct ReferenceEndpoint {
     pub base_url: String,
     pub model: String,
     pub api_key_env: String,
+    /// The same provider-declared greedy control used by the seller leg of B7.
+    pub sample_algorithm: SampleAlgorithm,
 }
 
 /// Coarse tokenizer family by model id (`qwen`/`llama`/`gpt`/...). This is for diagnostics/tokenizer profiles only;
@@ -349,9 +355,9 @@ fn normalize_words(s: &str) -> Vec<String> {
 }
 
 /// Agreement fraction over the **leading word prefix** (B7 spot-check), normalized by the full
-/// reference length so a seller cannot raise its score by answering less. Greedy (temp=0) of the
-/// same model gives an identical prefix (-> 1.0); a different model diverges early (-> low). `0.0`,
-/// if there is nothing to compare (empty response on either side).
+/// reference length so a seller cannot raise its score by answering less. With matching declared
+/// greedy controls, the same model is expected to keep a long prefix; a different model should
+/// diverge early. Returns `0.0` if there is nothing to compare (empty response on either side).
 pub fn prefix_agreement(seller: &str, reference: &str) -> f64 {
     let a = normalize_words(seller);
     let b = normalize_words(reference);
@@ -393,6 +399,7 @@ mod tests {
             token_ids,
             seq,
             manifest,
+            usage: None,
         }
     }
 
@@ -519,7 +526,8 @@ mod tests {
                 "price_per_tick": 1000,
                 "identity_aliases": ["Qwen/Qwen3-32B"],
                 "vocab_size": 152064,
-                "fingerprints": [ { "probe_prompt": "What is 17*23? Think step by step.", "expected_contains": "<think>", "accepts_reasoning_side_channel": true } ]
+                "fingerprints": [ { "probe_prompt": "What is 17*23? Think step by step.", "expected_contains": "<think>", "accepts_reasoning_side_channel": true } ],
+                "capabilities": { "sample_algorithm": "SEED" }
             } } }"#,
         )
         .expect("qwen config")
@@ -540,7 +548,8 @@ mod tests {
                 "price_per_tick": 1000,
                 "identity_aliases": ["Qwen/Qwen3-32B"],
                 "vocab_size": 152064,
-                "fingerprints": [ { "probe_prompt": "What is 17*23? Think step by step.", "expected_contains": "<think>", "accepts_reasoning_side_channel": true } ]
+                "fingerprints": [ { "probe_prompt": "What is 17*23? Think step by step.", "expected_contains": "<think>", "accepts_reasoning_side_channel": true } ],
+                "capabilities": { "sample_algorithm": "SEED" }
               },
               "gpt-oss-20b": {
                 "frame_model": "openai--gpt-oss--20b",
@@ -551,7 +560,8 @@ mod tests {
                 "price_per_tick": 500,
                 "identity_aliases": ["openai/gpt-oss-20b"],
                 "vocab_size": 100352,
-                "fingerprints": [ { "probe_prompt": "Reply with exactly: OSSMARK", "expected_contains": "OSSMARK" } ]
+                "fingerprints": [ { "probe_prompt": "Reply with exactly: OSSMARK", "expected_contains": "OSSMARK" } ],
+                "capabilities": { "sample_algorithm": "SEED" }
               }
             } }"#,
         )
@@ -819,6 +829,22 @@ mod tests {
     }
 
     #[test]
+    fn issue_1951_none_sample_algorithm_degrades_b7_before_network() {
+        let cfg = ModelsConfig::from_json(
+            r#"{"models":{"m":{"frame_model":"vendor--model--v1",
+              "base_url":"https://provider.example/v1","served_model":"provider/model",
+              "api_key_env":"PROVIDER_KEY","tokenizer_family":"vendor","price_per_tick":1,
+              "capabilities":{"max_output_tokens":256,"sample_algorithm":"NONE"}}}}"#,
+        )
+        .expect("NONE profile parses");
+
+        assert!(
+            reference_endpoint_for("m", &cfg).is_none(),
+            "NONE has no comparable B7 reference and must degrade before any request"
+        );
+    }
+
+    #[test]
     fn prefix_agreement_identical_and_subset() {
         // greedy of one model: identical output -> 1.0.
         assert_eq!(
@@ -871,6 +897,9 @@ mod tests {
     /// legs) floors at 0.41 (`qwen/qwen3-32b` branches at word 21 of 51), a substituting seller
     /// (6 different models) tops out at 0.02 (branch at word 0/1). Both populations must stay on
     /// their own side of the threshold, or the gate refuses honest sellers again.
+    const _: () =
+        assert!(DEFAULT_SPOTCHECK_THRESHOLD > 0.02 && DEFAULT_SPOTCHECK_THRESHOLD <= 0.41);
+
     #[test]
     fn spotcheck_threshold_separates_measured_populations() {
         // Honest floor measured live -- must PASS.
@@ -883,10 +912,6 @@ mod tests {
             spotcheck_verdict(0.02, DEFAULT_SPOTCHECK_THRESHOLD),
             Verdict::Bail(_)
         ));
-        assert!(
-            DEFAULT_SPOTCHECK_THRESHOLD > 0.02 && DEFAULT_SPOTCHECK_THRESHOLD <= 0.41,
-            "threshold {DEFAULT_SPOTCHECK_THRESHOLD} left the measured separation band"
-        );
     }
 
     #[test]

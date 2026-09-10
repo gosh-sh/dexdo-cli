@@ -326,8 +326,7 @@ fn an_older_live_request_blocks_removal_even_when_the_newest_generation_is_satis
     live.pending_transaction_id = Some("7".to_string());
     store_funding_journal(fixture._temp.path(), &live).expect("store older live request");
     let satisfied = funding_record(&fixture.old, 2, now, 200, FundingState::Satisfied);
-    store_funding_journal(fixture._temp.path(), &satisfied)
-        .expect("store newer satisfied request");
+    store_funding_journal(fixture._temp.path(), &satisfied).expect("store newer satisfied request");
 
     let error = refuse_removal_while_funding_may_still_arrive_at(
         &fixture.old,
@@ -345,13 +344,7 @@ fn an_older_live_request_blocks_removal_even_when_the_newest_generation_is_satis
 fn a_submitted_request_blocks_through_its_deadline_and_not_one_second_later() {
     let fixture = Fixture::new();
     let created_at = 1_800_000_000;
-    let submitted = funding_record(
-        &fixture.old,
-        1,
-        created_at,
-        100,
-        FundingState::Submitted,
-    );
+    let submitted = funding_record(&fixture.old, 1, created_at, 100, FundingState::Submitted);
     store_funding_journal(fixture._temp.path(), &submitted).expect("store submitted request");
 
     let at_deadline = refuse_removal_while_funding_may_still_arrive_at(

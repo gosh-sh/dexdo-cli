@@ -6,15 +6,14 @@ use crate::cli::commands::{
     book_target_for, fold_snapshot_from_orders, read_book_target, registry_requested_model,
     resolve_order_book_target, retry_executable_read, target_from_market, BookTarget,
 };
-use crate::cli::support::read_secret_hex;
 use anyhow::{bail, Result};
 use std::future::Future;
 // `render_order_line` and `render_escrow` are built in a default-features test build too, so
 // `one_unit_everywhere` can drive the order row in the gate that runs on every push.
 use dexdo_core::address as addr;
 use dexdo_core::chain::BookEventFold;
-use dexdo_core::OrderBookSnapshot;
 use dexdo_core::OrderBookOrder;
+use dexdo_core::OrderBookSnapshot;
 
 /// An `orders` snapshot together with its provenance: which read path produced the rows and
 /// the freshness marker that came with them.
@@ -202,18 +201,16 @@ where
         // can see" arrive here identically; only the book's own storage separates them.
         Ok(mut view) => {
             let fold_rows = std::mem::take(&mut view.snapshot.orders);
-            let (rows, source) = crate::cli::fold_completeness::rows_or_storage_when_empty(
-                fold_rows,
-                || async {
+            let (rows, source) =
+                crate::cli::fold_completeness::rows_or_storage_when_empty(fold_rows, || async {
                     let snapshot = retry_executable_read(
                         "storage confirmation of an empty order-book fold",
                         &mut fallback_read,
                     )
                     .await?;
                     Ok(snapshot.orders)
-                },
-            )
-            .await?;
+                })
+                .await?;
             view.snapshot.orders = rows;
             view.rows = source.provenance();
             if source == crate::cli::fold_completeness::RowSource::Storage {
@@ -415,38 +412,15 @@ fn expire_too_early(order_id: u128, deadline: u64, as_of: u64) -> String {
     )
 }
 
-/// Has the book said this order left it?
-
-/// ONE question for both removals, because two predicates that must agree are two predicates that
-/// can drift. The book announces the two removals differently and the fold treats them
-/// differently, and this is the single place that knows it:
-
-/// * `InferenceOrderCancelled` is TERMINAL -- the fold drops the row
-/// (`crates/core/src/chain/book_events.rs`), so absence IS the announcement.
-/// * `InferenceOrderExpired` is deliberately NOT terminal -- it sets `expired_by_event` and the
-/// row STAYS, because `dexdo orders list` must keep showing an owner a row that may still be
-/// sitting in the book holding escrow.
-
-/// So absence alone is right for one and waits forever for the other, over money that is already
-/// back in the note. Both shapes together are the honest answer for either.
-fn order_has_left_the_book<'a>(
-    orders: impl IntoIterator<Item = &'a dexdo_core::chain::LiveBookOrder>,
-    order_id: u128,
-) -> bool {
-    orders
-        .into_iter()
-        .find(|order| order.order_id == order_id)
-        .is_none_or(|order| order.expired_by_event)
-}
-
 /// Confirm one removal the way `subscription cancel` confirms its own: poll the authoritative book,
 /// bounded by the read timeout, and read the note's spendable balance on either side of it.
 /// Shared by `cancel` and `expire` -- the two differ in who may ask and in what a replay means, not
 /// in what "the book removed it and the money came back" looks like.
 
-/// The signal is the book's OWN announcement, via [`order_has_left_the_book`]. Absence from the
-/// owner's row list is deliberately not asked directly: for an expiry that list keeps the row on
-/// purpose, and waiting for it to disappear waits forever.
+/// The fold's explicit `expired_by_event` is sufficient. A row absent from the bounded fold is not:
+/// direct order-book storage must independently confirm the absence before removal is reported.
+/// That distinction lets an expiry remain visible in the owner's folded history without turning a
+/// truncated history into a false cancellation.
 
 /// The credit reported is one this client OBSERVED. It is never derived from the row's `escrow`
 /// field, which the event-fold read path does not carry at all (`escrow=-`) -- computing a refund
@@ -672,10 +646,11 @@ pub(crate) async fn run_orders(args: OrdersArgs) -> Result<()> {
             .ok_or_else(|| anyhow::anyhow!("DEXDO_MANIFEST: non-printable path"))?,
     )?;
     if matches!(&args.command, OrdersCommand::Journal) {
-        return budget.read(
-            crate::cli::buyer::run_buyer_submit_journal(&chain, note_addr),
-        )
-        .await;
+        return budget
+            .read(crate::cli::buyer::run_buyer_submit_journal(
+                &chain, note_addr,
+            ))
+            .await;
     }
     let target = if let Some(model_hash) = args.model_hash.as_deref() {
         // the note-and-key route. No file is read and no name is resolved, because an owner
@@ -717,31 +692,33 @@ pub(crate) async fn run_orders(args: OrdersArgs) -> Result<()> {
     // event, and folding the resting projection first would pay a full history walk to produce
     // rows this command never reads.
     if matches!(&args.command, OrdersCommand::Fills) {
-        return budget.read(async {
-            let order_book = resolve_order_book_target(&chain, &target).await?;
-            let book = dexdo_core::Address::parse(&order_book)
-                .map_err(|error| anyhow::anyhow!("order_book {order_book}: {error}"))?;
-            let note = dexdo_core::Address::parse(note_addr)
-                .map_err(|error| anyhow::anyhow!("--note-addr {note_addr}: {error}"))?;
-            let report = chain.verified_book_fill_candidates(&book, &note).await?;
-            print!(
-                "{}",
-                render_orders_fills(
-                    model_label(&target.frame_model, &target.model_hash),
-                    &order_book,
-                    note_addr,
-                    &report,
-                )
-            );
-            Ok(())
-        })
-        .await;
+        return budget
+            .read(async {
+                let order_book = resolve_order_book_target(&chain, &target).await?;
+                let book = dexdo_core::Address::parse(&order_book)
+                    .map_err(|error| anyhow::anyhow!("order_book {order_book}: {error}"))?;
+                let note = dexdo_core::Address::parse(note_addr)
+                    .map_err(|error| anyhow::anyhow!("--note-addr {note_addr}: {error}"))?;
+                let report = chain.verified_book_fill_candidates(&book, &note).await?;
+                print!(
+                    "{}",
+                    render_orders_fills(
+                        model_label(&target.frame_model, &target.model_hash),
+                        &order_book,
+                        note_addr,
+                        &report,
+                    )
+                );
+                Ok(())
+            })
+            .await;
     }
-    let view = budget.read(async {
-        let order_book = resolve_order_book_target(&chain, &target).await?;
-        read_live_order_snapshot(&chain, &target, &order_book).await
-    })
-    .await?;
+    let view = budget
+        .read(async {
+            let order_book = resolve_order_book_target(&chain, &target).await?;
+            read_live_order_snapshot(&chain, &target, &order_book).await
+        })
+        .await?;
     let as_of = crate::cli::provenance::now_unix()?;
     let snapshot = &view.snapshot;
     let own = own_orders(snapshot, note_addr);
@@ -809,15 +786,11 @@ pub(crate) async fn run_orders(args: OrdersArgs) -> Result<()> {
             let note = dexdo_core::Address::parse(note_addr)
                 .map_err(|e| anyhow::anyhow!("--note-addr {note_addr}: {e}"))?;
             let keys = dexdo_core::KeyPair::from_secret_hex(secret.trim())
-            .map_err(|e| anyhow::anyhow!("--note-key (SDK secret hex): {e:?}"))?;
-            budget.read(
-                chain.assert_note_owner_matches("orders cancel", &note, &keys),
-            )
-            .await?;
-            let balance_before = budget.read(
-                chain.private_note_shell_balance(&note),
-            )
-            .await?;
+                .map_err(|e| anyhow::anyhow!("--note-key (SDK secret hex): {e:?}"))?;
+            budget
+                .read(chain.assert_note_owner_matches("orders cancel", &note, &keys))
+                .await?;
+            let balance_before = budget.read(chain.private_note_shell_balance(&note)).await?;
             chain
                 .cancel_inference_order(&note, &keys, &target.model_hash, order.order_id)
                 .await?;
@@ -904,12 +877,11 @@ pub(crate) async fn run_orders(args: OrdersArgs) -> Result<()> {
                         .map_err(|e| anyhow::anyhow!("--note-addr {note_addr}: {e}"))?;
                     let book = dexdo_core::Address::parse(&snapshot.order_book)
                         .map_err(|e| anyhow::anyhow!("order book {}: {e}", snapshot.order_book))?;
-                    let frame_model = model_label(&snapshot.frame_model, &snapshot.model_hash).to_string();
+                    let frame_model =
+                        model_label(&snapshot.frame_model, &snapshot.model_hash).to_string();
                     let order_book = snapshot.order_book.clone();
-                    let balance_before = budget.read(
-                        chain.private_note_shell_balance(&note),
-                    )
-                    .await?;
+                    let balance_before =
+                        budget.read(chain.private_note_shell_balance(&note)).await?;
                     chain.expire_inference_order(&book, order_id).await?;
                     println!(
                         "expire submitted model={frame_model} order_book={} order_id={order_id} owner={}",
@@ -978,11 +950,10 @@ pub(crate) async fn run_orders(args: OrdersArgs) -> Result<()> {
             let note = dexdo_core::Address::parse(note_addr)
                 .map_err(|e| anyhow::anyhow!("--note-addr {note_addr}: {e}"))?;
             let keys = dexdo_core::KeyPair::from_secret_hex(secret.trim())
-            .map_err(|e| anyhow::anyhow!("--note-key (SDK secret hex): {e:?}"))?;
-            budget.read(
-                chain.assert_note_owner_matches("orders cancel-all", &note, &keys),
-            )
-            .await?;
+                .map_err(|e| anyhow::anyhow!("--note-key (SDK secret hex): {e:?}"))?;
+            budget
+                .read(chain.assert_note_owner_matches("orders cancel-all", &note, &keys))
+                .await?;
             chain
                 .cancel_all_inference_orders(&note, &keys, &target.model_hash)
                 .await?;
@@ -997,7 +968,6 @@ pub(crate) async fn run_orders(args: OrdersArgs) -> Result<()> {
     }
     Ok(())
 }
-
 
 /// Where the production text ends, for every scanner in this FILE.
 
@@ -1044,9 +1014,9 @@ mod tests {
             let body = production.split_once(arm).expect("the arm").1;
             let end = body.find("\n        OrdersCommand::").unwrap_or(body.len());
             let body = &body[..end];
-            let confirms_at = body.find("reconcile_order_removal(").unwrap_or_else(|| {
-                panic!("{label}: the arm must confirm the removal on chain")
-            });
+            let confirms_at = body
+                .find("reconcile_order_removal(")
+                .unwrap_or_else(|| panic!("{label}: the arm must confirm the removal on chain"));
             let corrects_at = body
                 .find("mark_cancelled_subscription_order_terminal(")
                 .unwrap_or_else(|| {
@@ -1124,7 +1094,12 @@ mod tests {
         /// A mistyped id is refused BEFORE any chain read and long before anything is signed.
         #[test]
         fn a_malformed_model_id_is_refused_at_the_input() {
-            for bad in ["0xabc", "", "0xzz00000000000000000000000000000000000000000000000000000000000a", "not-a-hash"] {
+            for bad in [
+                "0xabc",
+                "",
+                "0xzz00000000000000000000000000000000000000000000000000000000000a",
+                "not-a-hash",
+            ] {
                 let message = match super::super::book_target_from_model_hash(bad, NOTE) {
                     Ok(_) => panic!("a malformed model id must not reach the chain: {bad:?}"),
                     Err(error) => error.to_string(),
@@ -1177,7 +1152,10 @@ mod tests {
         #[test]
         fn the_only_reader_of_the_name_is_given_the_id_instead_of_a_blank() {
             assert_eq!(super::super::model_label("", HASH), HASH);
-            assert_eq!(super::super::model_label("qwen--qwen3--32b", HASH), "qwen--qwen3--32b");
+            assert_eq!(
+                super::super::model_label("qwen--qwen3--32b", HASH),
+                "qwen--qwen3--32b"
+            );
 
             let production = include_str!("orders.rs")
                 .split_once(super::PRODUCTION_ENDS_AT)
@@ -1215,9 +1193,9 @@ mod tests {
             // bare occurrences would count those too -- `model_label(&snapshot.frame_model,` ends in
             // the very substring a naive check looks for -- so the reads are matched by what
             // precedes them.
-            let bare = production.match_indices("snapshot.frame_model").filter(|(at, _)| {
-                !production[..*at].ends_with("model_label(&")
-            });
+            let bare = production
+                .match_indices("snapshot.frame_model")
+                .filter(|(at, _)| !production[..*at].ends_with("model_label(&"));
             assert_eq!(
                 bare.count(),
                 0,
@@ -1457,7 +1435,11 @@ mod tests {
             .map(|order| render_order_line(order, AS_OF, view.escrow_read(order)))
             .collect::<Vec<_>>();
 
-        assert_eq!(rows.len(), 2, "the swept row stays visible (): {rows:?}");
+        assert_eq!(
+            rows.len(),
+            2,
+            "the swept row stays visible (): {rows:?}"
+        );
         let by_id = |want: &str| {
             rows.iter()
                 .map(|row| fields(row))
@@ -1597,56 +1579,6 @@ mod tests {
             ExpireAction::StillLive {
                 deadline: PAST_DEADLINE
             }
-        );
-    }
-
-    /// The live defect this pins, by fact: on 2026-08-05 the shipped sweep removed order 2 and
-    /// refunded its escrow -- book tx `now=1785963432` `exit_code:0` with four out-messages, two
-    /// buyer-note transactions in the same second, and a replay that emitted nothing because
-    /// `_doExpire` took its "already gone" branch -- and `dexdo orders expire` still reported the
-    /// removal unconfirmed, because it waited for the row to vanish from the owner's list.
-
-    /// That row is designed never to vanish. `InferenceOrderExpired` sets `expired_by_event` and
-    /// leaves it in place, so absence alone is the wrong question: the right one
-    /// is whether the BOOK said the order left it, which is true of an announced-expired row that
-    /// is still listed.
-
-    /// `cancel` and `expire` share this one oracle precisely because the answer is asymmetric and
-    /// two predicates that must agree are two predicates that can drift. `InferenceOrderCancelled`
-    /// IS terminal -- the fold drops the row -- so for a cancel absence is the announcement; for an
-    /// expiry it never comes. Both arms are asserted below against the same function.
-    #[test]
-    fn a_removal_is_confirmed_by_the_books_announcement_not_by_the_row_disappearing() {
-        let announced = dexdo_core::chain::LiveBookOrder {
-            expired_by_event: true,
-            ..folded_order(2, true, PAST_DEADLINE)
-        };
-        let merely_past_its_deadline = folded_order(2, true, PAST_DEADLINE);
-
-        // The cancel arm: `InferenceOrderCancelled` is terminal, so the fold no longer holds it.
-        assert!(
-            order_has_left_the_book(std::iter::empty(), 2),
-            "an order the fold no longer holds has left the book"
-        );
-        // The expiry arm: still listed, and still gone from the book.
-        assert!(
-            order_has_left_the_book(std::iter::once(&announced), 2),
-            "the book announced this order expired; still being listed does not un-say it"
-        );
-        assert!(
-            !order_has_left_the_book(std::iter::once(&merely_past_its_deadline), 2),
-            "a row past its deadline that nobody swept is still in the book holding escrow"
-        );
-        // The verdict is about ONE order id: a book still holding an unrelated live row says
-        // nothing about ours, and ours is gone.
-        let unrelated = folded_order(3, true, PAST_DEADLINE);
-        assert!(
-            order_has_left_the_book(std::iter::once(&unrelated), 2),
-            "another owner's row must not keep our swept order alive"
-        );
-        assert!(
-            !order_has_left_the_book([&merely_past_its_deadline, &unrelated], 2),
-            "our unswept row must still be found among others"
         );
     }
 
@@ -1864,7 +1796,7 @@ mod tests {
             );
         }
         assert!(
-            !rows[1..].iter().any(|row| *row == want),
+            !rows[1..].contains(&want),
             "exactly one row carries this tuple: {}",
             lines.join("\n")
         );

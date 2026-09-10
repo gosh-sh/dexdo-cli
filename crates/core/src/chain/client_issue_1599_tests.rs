@@ -2,7 +2,7 @@
 
 //! An earlier version of this header claimed a measured peak of SIX requests a second. That number
 //! double-counted: it summed h2 stream-opens with HTTP/1.1 pool acquisitions, which are the same
-//! requests seen twice (docs/measurements/1614-batch1-ext-out-pager.txt). It is withdrawn, and no
+//! requests seen twice. It is withdrawn, and no
 //! corrected peak replaces it, because none was measured on that command. What stands from the run
 //! is that mainnet answered it with `pool timed out`.
 
@@ -93,8 +93,7 @@ fn the_owners_ceiling_is_the_figure_the_committed_manifests_carry() {
         if !name.ends_with(".manifest.json") {
             continue;
         }
-        let deployed =
-            Deployed::load(&path).unwrap_or_else(|error| panic!("load {name}: {error}"));
+        let deployed = Deployed::load(&path).unwrap_or_else(|error| panic!("load {name}: {error}"));
         if let Some(per_second) = deployed.requests_per_second {
             declared.push((name.to_string(), per_second));
         }

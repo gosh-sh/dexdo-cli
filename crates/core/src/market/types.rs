@@ -1476,10 +1476,9 @@ impl fmt::Display for SettlementActionReceipt {
 mod tests {
     use super::{
         flags, order_deadline_is_live, DealBuyerBond, DealChainSnapshot, DealChainState,
-        DealOfferLatch,
-        DealSellerBond, DealSubscription, OrderBookOrder, OrderBookSnapshot, SettlementAction,
-        SettlementActionBondState, SettlementActionEvent, SettlementActionPostState,
-        SettlementActionReceipt, SUBSCRIPTION_WEEKS,
+        DealOfferLatch, DealSellerBond, DealSubscription, OrderBookOrder, OrderBookSnapshot,
+        SettlementAction, SettlementActionBondState, SettlementActionEvent,
+        SettlementActionPostState, SettlementActionReceipt, SUBSCRIPTION_WEEKS,
     };
     use crate::TICK_SIZE;
     use proptest::prelude::*;
@@ -1653,8 +1652,16 @@ mod tests {
     /// block.timestamp >= deadline`. The deadline second itself is already expired.
     #[test]
     fn the_deadline_predicate_matches_the_contract_boundary() {
-        assert!(order_deadline_is_live(false, LAPSED_DEADLINE, LAPSED_DEADLINE - 1));
-        assert!(!order_deadline_is_live(false, LAPSED_DEADLINE, LAPSED_DEADLINE));
+        assert!(order_deadline_is_live(
+            false,
+            LAPSED_DEADLINE,
+            LAPSED_DEADLINE - 1
+        ));
+        assert!(!order_deadline_is_live(
+            false,
+            LAPSED_DEADLINE,
+            LAPSED_DEADLINE
+        ));
         assert!(!order_deadline_is_live(false, LAPSED_DEADLINE, OBSERVED_AT));
     }
 
@@ -1843,7 +1850,10 @@ mod tests {
     fn recorded_week_expiry_marks_when_to_book_not_that_it_was_booked() {
         let week = super::SUB_WEEK_LEN.as_secs();
         assert_eq!(weekly_deal(0, 0).recorded_week_expires_at(), week);
-        assert_eq!(weekly_deal(2, 2 * WEEK).recorded_week_expires_at(), 3 * week);
+        assert_eq!(
+            weekly_deal(2, 2 * WEEK).recorded_week_expires_at(),
+            3 * week
+        );
         // Past the final booked boundary nothing further is due: the term is over, not pending.
         let finished = weekly_deal(SUBSCRIPTION_WEEKS, FUNDED);
         assert!(finished.term_is_over());
@@ -1859,12 +1869,10 @@ mod tests {
             ..weekly_deal(0, 0)
         };
         assert!(!ordinary.is_subscription());
-        let error =
-            super::subscription_claim_cap_at(&claimed(TICK_SIZE), &ordinary).unwrap_err();
+        let error = super::subscription_claim_cap_at(&claimed(TICK_SIZE), &ordinary).unwrap_err();
         assert!(error.contains("not a subscription"), "{error}");
         let error =
-            super::subscription_current_week_headroom(&claimed(TICK_SIZE), &ordinary)
-                .unwrap_err();
+            super::subscription_current_week_headroom(&claimed(TICK_SIZE), &ordinary).unwrap_err();
         assert!(error.contains("not a subscription"), "{error}");
     }
 
@@ -2095,7 +2103,10 @@ mod tests {
             include_str!("../../../../contracts/airegistry/TokenContract.sol");
         const PRIVATE_NOTE_SOL: &str = include_str!("../../../../contracts/dex/PrivateNote.sol");
 
-        let squashed: String = TOKEN_CONTRACT_SOL.split_whitespace().collect::<Vec<_>>().join(" ");
+        let squashed: String = TOKEN_CONTRACT_SOL
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            .join(" ");
         assert!(
             squashed.contains("function _bondAmount() private view returns (uint128) { return 2 * _pricePerTick; }"),
             "the deal's bond is twice the tick price, on both sides and unscaled by ticks"
@@ -2132,7 +2143,10 @@ mod tests {
 
         // And the corrected check admits the shape that broke six live proofs.
         let ordinary_with_a_bond = snapshot_for_bonds(false, 2_000_000_000, 2_000_000_000, 0);
-        assert_eq!(ordinary_with_a_bond.validate_cross_getter_invariants(), Ok(()));
+        assert_eq!(
+            ordinary_with_a_bond.validate_cross_getter_invariants(),
+            Ok(())
+        );
         // A bond larger than the deal could ever have taken is still refused.
         let oversized = snapshot_for_bonds(false, 2_000_000_000, 2_000_000_001, 0);
         assert!(oversized.validate_cross_getter_invariants().is_err());
@@ -2288,12 +2302,7 @@ mod tests {
                 "uint128 overflow in {field} must fail closed"
             );
         }
-        for field in [
-            "probeTime",
-            "lastClaimTime",
-            "disputeTime",
-            "fundedTime",
-        ] {
+        for field in ["probeTime", "lastClaimTime", "disputeTime", "fundedTime"] {
             let mut state = exact_state();
             set_field(&mut state, field, json!("18446744073709551616"));
             assert!(
@@ -2690,10 +2699,7 @@ mod tests {
                 "core the chain backend",
                 include_str!("../chain/backends.rs"),
             ),
-            (
-                "core chain client",
-                include_str!("../chain/client.rs"),
-            ),
+            ("core chain client", include_str!("../chain/client.rs")),
             ("CLI deals", include_str!("../../../dexdo/src/cli/deals.rs")),
             ("CLI audit", include_str!("../../../dexdo/src/cli/audit.rs")),
             (

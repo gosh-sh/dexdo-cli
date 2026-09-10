@@ -168,7 +168,6 @@ async fn issue_1054_default_proactive_model_only_refusal_is_framed_before_money_
     let policy = dir.path().join("policy.json");
     write_buyer_policy(&policy);
     let models = dir.path().join("models.json");
-    let contracts = dir.path().join("contracts.json");
     let args = BuyerArgs {
         mock: MockFlags {
             mock_model: false,

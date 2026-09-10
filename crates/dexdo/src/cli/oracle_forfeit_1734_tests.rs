@@ -124,6 +124,6 @@ fn the_result_explains_the_balance_that_did_not_move() {
 #[test]
 fn a_moved_balance_is_reported_instead_of_reassured_about() {
     let out = render_forfeit_epilogue(7, 9);
-    assert!(out.contains("did NOT move") == false, "{out}");
+    assert!(!out.contains("did NOT move"), "{out}");
     assert!(out.contains("read it again before acting"), "{out}");
 }

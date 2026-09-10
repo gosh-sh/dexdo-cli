@@ -3,8 +3,10 @@
 //! sends the buyer's canonical request (R1), reads the **streaming SSE** and normalizes each
 //! delta into a `CanonChunk` incrementally (R6).
 
-//! **Billing authority:** exactly one number authorizes money -- the provider's own
-//! terminal `usage.completion_tokens`. SSE event boundaries and delta text length are never a token count.
+//! **Billing authority:** money is authorized only by the provider's
+//! terminal `usage.prompt_tokens + usage.completion_tokens`. Provider `total_tokens` is optional,
+//! but when present must match; the normalized [`BillingUsage`] always carries the checked sum.
+//! SSE event boundaries and delta text length are never a token count.
 
 //! The key is taken **from the environment at runtime** ([`api_key`]) and is never stored/logged
 //! . Without a key the adapter does not start -- the stream
@@ -16,10 +18,11 @@ use super::{
 };
 use crate::seller::models::{Capabilities, ModelConfig};
 use dexdo_core::params::{
-    SellerLivenessParams, UPSTREAM_ERROR_BODY_MAX_BYTES, UPSTREAM_ERROR_DETAIL_MAX_BYTES,
+    SampleAlgorithm, SellerLivenessParams, REFERENCE_SAMPLE_SEED, REFERENCE_TOP_K,
+    UPSTREAM_ERROR_BODY_MAX_BYTES, UPSTREAM_ERROR_DETAIL_MAX_BYTES,
     UPSTREAM_ERROR_ECHO_PREFIX_CHARS, UPSTREAM_SSE_FRAME_MAX_BYTES,
 };
-use dexdo_proto::{CanonChunk, CanonRequest, SignalManifest};
+use dexdo_proto::{BillingUsage, CanonChunk, CanonRequest, SignalManifest};
 use serde::{Deserialize, Serialize};
 use std::time::{Duration, SystemTime};
 use tokio::sync::mpsc;
@@ -88,6 +91,8 @@ impl Default for OpenAiConfig {
             tokenizer_family: "qwen".to_string(),
             capabilities: Capabilities {
                 max_output_tokens: Some(DEFAULT_MAX_OUTPUT_TOKENS),
+                // The built-in demo is a known Groq profile, not an unfamiliar config entry.
+                sample_algorithm: SampleAlgorithm::Seed,
             },
             identity_aliases: Vec::new(),
         }
@@ -139,6 +144,13 @@ struct ChatRequest<'a> {
     stop: Vec<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     seed: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    random_seed: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    top_k: Option<u32>,
+    /// Internal annotation context; the provider never sees this field.
+    #[serde(skip)]
+    sample_algorithm: Option<SampleAlgorithm>,
     #[serde(skip_serializing_if = "Option::is_none")]
     reasoning: Option<ReasoningRequest>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
@@ -265,7 +277,7 @@ fn build_request_with_startup_capabilities<'a>(
             content: m.content.clone(),
         })
         .collect();
-    let (temperature, requested_max_tokens, stop, seed) = match &req.params {
+    let (temperature, requested_max_tokens, stop, sample_algorithm) = match &req.params {
         Some(p) => (
             // `greedy` (B7 spot-check) forcibly sets temp=0 (distinct from 0="not set").
             if p.greedy {
@@ -275,9 +287,11 @@ fn build_request_with_startup_capabilities<'a>(
             },
             (p.max_tokens != 0).then_some(p.max_tokens),
             p.stop.clone(),
-            // Groq exposes a random seed even at temperature=0 for some models (notably gpt-oss). Pin the
-            // sampled B7 greedy probe so the seller stream and the reference endpoint compare the same run.
-            p.greedy.then_some(0),
+            // B7 needs a provider-declared greedy control on both legs. A readiness request is not greedy,
+            // and NONE deliberately adds nothing so the reference layer degrades before making the call.
+            p.greedy
+                .then_some(cfg.capabilities.sample_algorithm)
+                .filter(|algorithm| *algorithm != SampleAlgorithm::None),
         ),
         None => (None, None, Vec::new(), None),
     };
@@ -302,27 +316,31 @@ fn build_request_with_startup_capabilities<'a>(
         temperature,
         max_tokens,
         stop,
-        seed,
+        seed: (sample_algorithm == Some(SampleAlgorithm::Seed)).then_some(REFERENCE_SAMPLE_SEED),
+        random_seed: (sample_algorithm == Some(SampleAlgorithm::RandomSeed))
+            .then_some(REFERENCE_SAMPLE_SEED),
+        top_k: (sample_algorithm == Some(SampleAlgorithm::TopK)).then_some(REFERENCE_TOP_K),
+        sample_algorithm,
         reasoning: (probe_thinking || openrouter_qwen_reasoning(cfg)).then_some(ReasoningRequest {
             enabled: true,
             exclude: false,
         }),
-        tools: probe_tools
-            .then(|| {
-                vec![CapabilityToolDefinition {
-                    kind: "function",
-                    function: CapabilityToolFunction {
-                        name: CAPABILITY_TOOL_NAME,
-                        description: "Return an empty object to prove tool-call support.",
-                        parameters: CapabilityToolParameters {
-                            kind: "object",
-                            properties: serde_json::json!({}),
-                            additional_properties: false,
-                        },
+        tools: if probe_tools {
+            vec![CapabilityToolDefinition {
+                kind: "function",
+                function: CapabilityToolFunction {
+                    name: CAPABILITY_TOOL_NAME,
+                    description: "Return an empty object to prove tool-call support.",
+                    parameters: CapabilityToolParameters {
+                        kind: "object",
+                        properties: serde_json::json!({}),
+                        additional_properties: false,
                     },
-                }]
-            })
-            .unwrap_or_default(),
+                },
+            }]
+        } else {
+            Vec::new()
+        },
         tool_choice: probe_tools.then_some(CapabilityToolChoice {
             kind: "function",
             function: CapabilityToolChoiceFunction {
@@ -412,19 +430,21 @@ async fn run_with_startup_capabilities(
     };
 
     if let Err(status) = stream_upstream_with_startup_capabilities(
-        cfg,
-        market,
-        requirements,
+        OpenAiStreamContext {
+            cfg,
+            market,
+            requirements,
+            count,
+            tx: &tx,
+        },
         &key,
-        count,
         &req,
-        &tx,
         model_output_cap,
     )
     .await
     {
         // Send the error into the channel (if the buyer is still listening) -- without leaking the key into the text.
-        let _ = tx.send(Err(status)).await;
+        let _ = tx.send(Err(*status)).await;
     }
 }
 
@@ -477,6 +497,15 @@ enum RetryStep {
     BuyerGone,
 }
 
+#[derive(Clone, Copy)]
+struct OpenAiStreamContext<'a> {
+    cfg: &'a OpenAiConfig,
+    market: Option<&'a str>,
+    requirements: Option<StartupCapabilityRequirements>,
+    count: u64,
+    tx: &'a mpsc::Sender<Result<UpstreamEvent, Status>>,
+}
+
 /// Wait exactly as long as the provider requested, or use the already-canonical seller health
 /// cadence when it gave no usable instruction. The whole pre-output retry phase is bounded by the
 /// existing seller supervision cycle; the buyer closing its stream is an earlier domain bound.
@@ -485,13 +514,13 @@ async fn wait_for_retry(
     retry_after: Option<Duration>,
     retry_deadline: tokio::time::Instant,
     tx: &mpsc::Sender<Result<UpstreamEvent, Status>>,
-) -> Result<RetryStep, Status> {
+) -> Result<RetryStep, Box<Status>> {
     let timing = SellerLivenessParams::canonical();
     let delay = retry_after.unwrap_or(timing.health_interval);
     let remaining = retry_deadline.saturating_duration_since(tokio::time::Instant::now());
     if remaining.is_zero() || delay >= remaining {
         // Never retry before `Retry-After`, and never sleep past the domain's supervision cycle.
-        return Err(failure);
+        return Err(Box::new(failure));
     }
     tracing::warn!(
         error = %failure,
@@ -515,30 +544,35 @@ async fn stream_upstream(
     req: &CanonRequest,
     tx: &mpsc::Sender<Result<UpstreamEvent, Status>>,
     model_output_cap: u32,
-) -> Result<(), Status> {
+) -> Result<(), Box<Status>> {
     stream_upstream_with_startup_capabilities(
-        cfg,
-        market,
-        None,
+        OpenAiStreamContext {
+            cfg,
+            market,
+            requirements: None,
+            count,
+            tx,
+        },
         key,
-        count,
         req,
-        tx,
         model_output_cap,
     )
     .await
 }
 
 async fn stream_upstream_with_startup_capabilities(
-    cfg: &OpenAiConfig,
-    market: Option<&str>,
-    requirements: Option<StartupCapabilityRequirements>,
+    context: OpenAiStreamContext<'_>,
     key: &str,
-    count: u64,
     req: &CanonRequest,
-    tx: &mpsc::Sender<Result<UpstreamEvent, Status>>,
     model_output_cap: u32,
-) -> Result<(), Status> {
+) -> Result<(), Box<Status>> {
+    let OpenAiStreamContext {
+        cfg,
+        requirements,
+        count,
+        tx,
+        ..
+    } = context;
     let url = format!("{}/chat/completions", cfg.base_url.trim_end_matches('/'));
     let body =
         build_request_with_startup_capabilities(cfg, req, count, model_output_cap, requirements);
@@ -566,14 +600,14 @@ async fn stream_upstream_with_startup_capabilities(
                 }
             }
             Ok(Err(error)) => {
-                return Err(Status::unavailable(format!(
+                return Err(Box::new(Status::unavailable(format!(
                     "upstream connect failed: {error}"
-                )))
+                ))))
             }
             Err(_) => {
-                return Err(Status::deadline_exceeded(
+                return Err(Box::new(Status::deadline_exceeded(
                     "upstream produced no output before the seller supervision cycle ended",
-                ))
+                )))
             }
         };
 
@@ -591,35 +625,26 @@ async fn stream_upstream_with_startup_capabilities(
             // and exact generation limit instead of relaying an opaque provider line to the buyer.
             let http_status = resp.status().as_u16();
             let sent_max_tokens = body.max_tokens;
-            return Err(annotate_seller_config_fault(
+            return Err(Box::new(annotate_seller_config_fault(
                 upstream_http_error(resp, key, req).await,
                 http_status,
                 &cfg.model,
                 sent_max_tokens,
                 model_output_cap,
-            ));
+                body.sample_algorithm,
+            )));
         }
 
         let mut ending = StreamEnding::default();
-        let result = stream_response(
-            resp,
-            cfg,
-            market,
-            requirements,
-            count,
-            tx,
-            retry_deadline,
-            &mut ending,
-        )
-        .await;
+        let result = stream_response(resp, context, retry_deadline, &mut ending).await;
         match result {
             Err(failure) if ending.retryable_pre_output_non_answer => {
-                match wait_for_retry(failure, None, retry_deadline, tx).await? {
+                match wait_for_retry(*failure, None, retry_deadline, tx).await? {
                     RetryStep::Retry => continue 'attempt,
                     RetryStep::BuyerGone => return Ok(()),
                 }
             }
-            Err(failure) => return Err(ending.explain(failure, key, req)),
+            Err(failure) => return Err(Box::new(ending.explain(*failure, key, req))),
             Ok(()) => return Ok(()),
         }
     }
@@ -896,15 +921,19 @@ fn frame_reasoning_usage(value: &serde_json::Value) -> Result<Option<u64>, Statu
 /// reorder buyer-visible content.
 async fn stream_response(
     resp: reqwest::Response,
-    cfg: &OpenAiConfig,
-    market: Option<&str>,
-    requirements: Option<StartupCapabilityRequirements>,
-    count: u64,
-    tx: &mpsc::Sender<Result<UpstreamEvent, Status>>,
+    context: OpenAiStreamContext<'_>,
     retry_deadline: tokio::time::Instant,
     ending: &mut StreamEnding,
-) -> Result<(), Status> {
+) -> Result<(), Box<Status>> {
     use futures::StreamExt;
+
+    let OpenAiStreamContext {
+        cfg,
+        market,
+        requirements,
+        count,
+        tx,
+    } = context;
 
     // Incremental SSE parsing over the body's byte stream (R6): accumulate a buffer, split on
     // `\n\n` boundaries, parse `data:` lines. `data: [DONE]` ends the stream.
@@ -914,9 +943,10 @@ async fn stream_response(
     // buyer text the provider never wrote. Bytes are decoded only at a complete `\n\n` frame boundary.
     let mut buf: Vec<u8> = Vec::new();
     let mut seq: u64 = 0;
-    // the provider's own terminal output total, held locally until the stream terminates consistently
-    // so a second, contradictory or post-terminal record cannot leave a partially advanced bill.
-    let mut native_usage: Option<u64> = None;
+    // the provider's terminal input-plus-output usage, held locally until the stream
+    // terminates consistently so a second, contradictory or post-terminal record cannot leave a
+    // partially advanced bill.
+    let mut native_usage: Option<BillingUsage> = None;
     // the spellings that may name the model that answers, normalized once for the whole stream.
     // WHICH spellings depends on the question this call is asking -- see `offered_model_aliases`.
     let offered = offered_model_aliases(cfg, market);
@@ -932,9 +962,11 @@ async fn stream_response(
                 _ = tx.closed() => return Ok(()),
                 item = tokio::time::timeout_at(retry_deadline, byte_stream.next()) => match item {
                     Ok(item) => item,
-                    Err(_) => return Err(Status::deadline_exceeded(
-                        "upstream produced no output before the seller supervision cycle ended",
-                    )),
+                    Err(_) => {
+                        return Err(Box::new(Status::deadline_exceeded(
+                            "upstream produced no output before the seller supervision cycle ended",
+                        )))
+                    }
                 },
             }
         } else {
@@ -952,9 +984,9 @@ async fn stream_response(
                 if seq == 0 && retryable_transport_error(&error) {
                     ending.transport_non_answer();
                 }
-                return Err(Status::unavailable(format!(
+                return Err(Box::new(Status::unavailable(format!(
                     "upstream read failed: {error}"
-                )));
+                ))));
             }
         };
         buf.extend_from_slice(&bytes);
@@ -1049,7 +1081,7 @@ async fn stream_response(
                                     ),
                                 };
                                 if seq == 0 {
-                                    return Err(Status::failed_precondition(mismatch));
+                                    return Err(Box::new(Status::failed_precondition(mismatch)));
                                 }
                                 tracing::error!(
                                     "{mismatch}; output was already delivered, so the stream is carried to \
@@ -1063,14 +1095,14 @@ async fn stream_response(
                     if let Some(reported) = usage {
                         // UPS-29: transport position alone does not make a content-carrying frame terminal.
                         if has_output {
-                            return Err(Status::data_loss(
+                            return Err(Box::new(Status::data_loss(
                                 "OpenAI-compatible usage is attached to an output delta, not a terminal record",
-                            ));
+                            )));
                         }
-                        if reported > count {
-                            return Err(Status::data_loss(
-                                "OpenAI-compatible usage exceeds the requested token limit",
-                            ));
+                        if reported.output_tokens > count {
+                            return Err(Box::new(Status::data_loss(
+                                "OpenAI-compatible completion_tokens exceeds the requested output limit",
+                            )));
                         }
                         // UPS-24: one request carries exactly one authoritative aggregate, and it is billed
                         // exactly once. Real OpenAI-compatible endpoints RESTATE that one aggregate rather
@@ -1083,9 +1115,9 @@ async fn stream_response(
                         // inventing the amount.
                         if let Some(recorded) = native_usage {
                             if recorded != reported {
-                                return Err(Status::data_loss(
+                                return Err(Box::new(Status::data_loss(
                                     "OpenAI-compatible stream reported contradictory terminal usage totals",
-                                ));
+                                )));
                             }
                             continue;
                         }
@@ -1097,9 +1129,9 @@ async fn stream_response(
                     }
                     // UPS-30: post-terminal output cannot be ignored while the earlier bill is kept.
                     if native_usage.is_some() {
-                        return Err(Status::data_loss(
+                        return Err(Box::new(Status::data_loss(
                             "OpenAI-compatible output continued after the terminal usage record",
-                        ));
+                        )));
                     }
                     if !has_canon_output {
                         continue;
@@ -1122,16 +1154,10 @@ async fn stream_response(
                                 .clone()
                                 .unwrap_or_else(|| cfg.frame_model.clone()),
                         }),
+                        usage: None,
                     };
                     seq += 1;
-                    if tx
-                        .send(Ok(UpstreamEvent::Chunk {
-                            chunk,
-                            accounted_tokens: 0,
-                        }))
-                        .await
-                        .is_err()
-                    {
+                    if tx.send(Ok(UpstreamEvent::Chunk(chunk))).await.is_err() {
                         return Ok(()); // buyer disconnected (STOP)
                     }
                 }
@@ -1152,29 +1178,39 @@ async fn stream_response(
     };
     if saw_done {
         if let (Some(requirements), Some(observation)) = (requirements, &capability_observation) {
-            observation.validate(requirements, native_usage)?;
+            observation.validate(
+                requirements,
+                native_usage.as_ref().map(|usage| usage.output_tokens),
+            )?;
         }
         if seq == 0
             && !capability_observation
                 .as_ref()
                 .is_some_and(|observation| observation.saw_tool_call)
         {
+            let Some(usage) = native_usage else {
+                return Err(Box::new(Status::data_loss(
+                    "OpenAI-compatible response ended without terminal billing usage",
+                )));
+            };
             // UPS-28: a positive number alone is not proof of delivered service.
-            if native_usage.unwrap_or(0) != 0 {
-                return Err(Status::data_loss(
-                    "OpenAI-compatible usage reports output tokens without delivered output",
-                ));
+            if usage.total_tokens != 0 {
+                return Err(Box::new(Status::data_loss(
+                    "OpenAI-compatible usage reports billable tokens without delivered output",
+                )));
             }
             return Ok(());
         }
         // UPS-02/UPS-07/UPS-20: delivered output bills exactly the provider's terminal total, and only when
         // that total exists and is positive. Zero or absent is a contradiction, never a fallback to lengths.
-        let output_tokens = native_usage.filter(|tokens| *tokens > 0).ok_or_else(|| {
-            Status::data_loss(
+        let usage = native_usage
+            .filter(|usage| usage.output_tokens > 0)
+            .ok_or_else(|| {
+                Status::data_loss(
                 "OpenAI-compatible output ended without positive terminal usage.completion_tokens",
             )
-        })?;
-        let _ = tx.send(Ok(UpstreamEvent::Accounted(output_tokens))).await;
+            })?;
+        let _ = tx.send(Ok(UpstreamEvent::Usage(usage))).await;
         return Ok(());
     }
     if seq == 0 {
@@ -1196,7 +1232,7 @@ async fn stream_response(
     } else {
         Status::data_loss("OpenAI-compatible SSE ended without [DONE]")
     };
-    Err(failure)
+    Err(Box::new(failure))
 }
 
 /// Provider errors are untrusted and may echo credentials or request fields. Read only a small
@@ -1490,13 +1526,13 @@ fn drain_complete_events(buf: &mut Vec<u8>) -> Result<Vec<String>, Status> {
 enum ParsedEvent {
     /// Terminal `data: [DONE]`.
     Done,
-    /// `data: {...}`: content/reasoning deltas (possibly empty), the provider's own native output total
-    /// when this frame carries one and the model the provider says actually answered (`model`,
+    /// `data: {...}`: content/reasoning deltas (possibly empty), the provider's own native input/output
+    /// usage when this frame carries one, and the model the provider says actually answered (`model`,
     /// ) when the frame states one.
     Frame {
         text: String,
         reasoning: String,
-        usage: Option<u64>,
+        usage: Option<BillingUsage>,
         /// Top-level `model` of an OpenAI-compatible chunk -- the provider's own name for what served
         /// this frame. `None` = the frame stated nothing (see [`stream_upstream`]).
         model: Option<String>,
@@ -1509,14 +1545,16 @@ enum ParsedEvent {
     Other,
 }
 
-/// Read one native output total out of a `usage`-shaped container.
+/// Read one complete native input/output usage record out of a `usage`-shaped container.
 
-/// Untrusted input: a container that is not an object, and a `completion_tokens` that is not a
-/// non-negative integer that fits `u64` (string, float, negative, overflowing), are rejected outright
-/// (E2E-UPS-18/22). An absent field is "this frame carries no total", which is not an error here -- the
-/// stream then simply never reaches an authoritative amount (E2E-UPS-07).
+/// Untrusted input: a container that is not an object, and a required prompt/completion count that is
+/// not a non-negative integer fitting `u64` (string, float, negative, overflowing), are rejected
+/// outright (E2E-UPS-18/22). An object declaring none of the billing fields carries no record; the
+/// stream then fails at its terminal boundary if no complete record ever arrives (E2E-UPS-07).
 #[allow(clippy::result_large_err)]
-fn native_output_total(container: Option<&serde_json::Value>) -> Result<Option<u64>, Status> {
+fn native_billing_usage(
+    container: Option<&serde_json::Value>,
+) -> Result<Option<BillingUsage>, Status> {
     let Some(container) = container else {
         return Ok(None);
     };
@@ -1528,22 +1566,40 @@ fn native_output_total(container: Option<&serde_json::Value>) -> Result<Option<u
             "OpenAI-compatible usage is not an object",
         ));
     };
-    match object.get("completion_tokens") {
-        None => Ok(None),
-        Some(serde_json::Value::Null) => Ok(None),
-        Some(value) => value.as_u64().map(Some).ok_or_else(|| {
-            Status::data_loss("OpenAI-compatible usage.completion_tokens is not a token count")
-        }),
+    let declares_billing = ["prompt_tokens", "completion_tokens", "total_tokens"]
+        .iter()
+        .any(|field| object.contains_key(*field));
+    if !declares_billing {
+        return Ok(None);
     }
+    let token = |field: &'static str| {
+        object
+            .get(field)
+            .and_then(serde_json::Value::as_u64)
+            .ok_or_else(|| {
+                Status::data_loss(format!(
+                    "OpenAI-compatible usage.{field} is missing or is not a token count"
+                ))
+            })
+    };
+    let input_tokens = token("prompt_tokens")?;
+    let output_tokens = token("completion_tokens")?;
+    let declared_total = object
+        .get("total_tokens")
+        .map(|_| token("total_tokens"))
+        .transpose()?;
+    BillingUsage::new(input_tokens, output_tokens, declared_total)
+        .map(Some)
+        .map_err(Status::data_loss)
 }
 
 /// The frame's terminal native total: the standard `usage` and the Groq mirror `x_groq.usage` are BOTH
 /// read, and a disagreement between them is rejected instead of resolved (E2E-UPS-19) -- choosing the
 /// first, last, smaller or larger value would monetize contradictory provider metadata.
 #[allow(clippy::result_large_err)]
-fn frame_native_usage(value: &serde_json::Value) -> Result<Option<u64>, Status> {
-    let standard = native_output_total(value.get("usage"))?;
-    let groq = native_output_total(value.get("x_groq").and_then(|groq| groq.get("usage")))?;
+fn frame_native_usage(value: &serde_json::Value) -> Result<Option<BillingUsage>, Status> {
+    let standard = native_billing_usage(value.get("usage"))?;
+    let groq = native_billing_usage(value.get("x_groq").and_then(|groq| groq.get("usage")))?;
     match (standard, groq) {
         (Some(standard), Some(groq)) if standard != groq => Err(Status::data_loss(
             "OpenAI-compatible native usage totals disagree",
@@ -1555,8 +1611,8 @@ fn frame_native_usage(value: &serde_json::Value) -> Result<Option<u64>, Status> 
 
 /// Parse a single SSE event: join the `data:` lines, recognize `[DONE]` and the provider's own
 /// in-band `event: error` frame, otherwise extract `choices[0].delta.content`,
-/// provider-separated reasoning and the frame's native output total. A frame without `data:`
-/// is `Other`; malformed JSON fails closed.
+/// provider-separated reasoning and the frame's native input/output usage. A frame
+/// without `data:` is `Other`; malformed JSON fails closed.
 #[allow(clippy::result_large_err)]
 fn parse_event(event: &str) -> Result<ParsedEvent, Status> {
     let mut data = String::new();
@@ -1732,7 +1788,7 @@ fn collect_reasoning(
 /// `finish_reason` chunk (mirrored in `usage` and `x_groq.usage`) and once on the dedicated
 /// `stream_options.include_usage` chunk that carries `choices: []`. It also shows the two facts
 /// depends on for this provider: content frames carry log probabilities and carry no token ids, so
-/// `usage.completion_tokens` is the only authoritative count there is.
+/// the terminal input/output/total usage record is the only authoritative bill there is.
 #[cfg(test)]
 /// the starvation capture: the SAME model answering the SAME readiness prompt at the OLD
 /// one-token budget (live, 2026-08-12). Four frames, `content` present once and empty, `reasoning`
@@ -1752,6 +1808,7 @@ data: [DONE]
 /// The EXACT bytes a live Groq `openai/gpt-oss-20b` returned for the readiness probe request
 /// seventeen frames, `content` present once and EMPTY, thirteen
 /// frames carrying the whole answer in `reasoning`, terminal `completion_tokens` = 16.
+#[cfg(test)]
 pub(crate) const LIVE_GROQ_GPT_OSS_READINESS_CAPTURE: &str = r#"data: {"id":"chatcmpl-107bf530-0688-4a0e-b2a3-b21025c15124","object":"chat.completion.chunk","created":1786530113,"model":"openai/gpt-oss-20b","system_fingerprint":"fp_ef00694abe","choices":[{"index":0,"delta":{"role":"assistant","content":""},"logprobs":null,"finish_reason":null}],"x_groq":{"id":"req_01kztqwa7ke0s9kzg8qqda4hs5","seed":917241710}}
 
 data: {"id":"chatcmpl-107bf530-0688-4a0e-b2a3-b21025c15124","object":"chat.completion.chunk","created":1786530113,"model":"openai/gpt-oss-20b","system_fingerprint":"fp_ef00694abe","choices":[{"index":0,"delta":{"reasoning":"The","channel":"analysis"},"logprobs":null,"finish_reason":null}]}
@@ -1788,6 +1845,7 @@ data: [DONE]
 
 "#;
 
+#[cfg(test)]
 pub(crate) const LIVE_GROQ_READINESS_CAPTURE: &str = r#"data: {"id":"chatcmpl-eda3591e-f053-41b8-b720-f6f6a9b3fed2","object":"chat.completion.chunk","created":1785879521,"model":"qwen/qwen3-32b","system_fingerprint":"fp_d58dbe76cd","choices":[{"index":0,"delta":{"role":"assistant","content":""},"logprobs":null,"finish_reason":null}],"x_groq":{"id":"req_01kz7bdsx2ewjbpzjmx50syk52","seed":1312675382}}
 
 data: {"id":"chatcmpl-eda3591e-f053-41b8-b720-f6f6a9b3fed2","object":"chat.completion.chunk","created":1785879521,"model":"qwen/qwen3-32b","system_fingerprint":"fp_d58dbe76cd","choices":[{"index":0,"delta":{"content":"\u003cthink\u003e"},"logprobs":{"content":[{"token":"\u003cthink\u003e","logprob":0,"bytes":[60,116,104,105,110,107,62],"top_logprobs":[{"token":"\u003cthink\u003e","logprob":0,"bytes":[60,116,104,105,110,107,62]},{"token":"\u003c/think\u003e","logprob":-14.689622,"bytes":[60,47,116,104,105,110,107,62]},{"token":"Okay","logprob":-15.249238,"bytes":[79,107,97,121]},{"token":"okay","logprob":-15.942385,"bytes":[111,107,97,121]},{"token":"","logprob":-16.635532,"bytes":null}]}]},"finish_reason":null}]}
@@ -1902,7 +1960,7 @@ mod tests {
         body: Vec<u8>,
         split: usize,
         count: u64,
-    ) -> (Result<(), Status>, Vec<UpstreamEvent>) {
+    ) -> (Result<(), Box<Status>>, Vec<UpstreamEvent>) {
         let (base_url, server) = start_split_test_server(body, split).await;
         let cfg = OpenAiConfig {
             base_url,
@@ -1933,7 +1991,7 @@ mod tests {
         body: String,
         count: u64,
         capabilities: Capabilities,
-    ) -> (Result<(), Status>, Vec<UpstreamEvent>, String) {
+    ) -> (Result<(), Box<Status>>, Vec<UpstreamEvent>, String) {
         let (base_url, server) = start_test_server(body).await;
         let cfg = OpenAiConfig {
             base_url,
@@ -1970,7 +2028,7 @@ mod tests {
         body: String,
         count: u64,
         model: &str,
-    ) -> (Result<(), Status>, Vec<UpstreamEvent>) {
+    ) -> (Result<(), Box<Status>>, Vec<UpstreamEvent>) {
         let (base_url, server) = start_test_server(body).await;
         let cfg = OpenAiConfig {
             base_url,
@@ -2002,7 +2060,10 @@ mod tests {
         (result, events)
     }
 
-    async fn run_test_stream(body: String, count: u64) -> (Result<(), Status>, Vec<UpstreamEvent>) {
+    async fn run_test_stream(
+        body: String,
+        count: u64,
+    ) -> (Result<(), Box<Status>>, Vec<UpstreamEvent>) {
         let (result, events, _) =
             run_test_stream_with_capabilities(body, count, OpenAiConfig::default().capabilities)
                 .await;
@@ -2012,6 +2073,7 @@ mod tests {
     fn no_logprobs() -> Capabilities {
         Capabilities {
             max_output_tokens: Some(DEFAULT_MAX_OUTPUT_TOKENS),
+            ..Capabilities::default()
         }
     }
 
@@ -2035,13 +2097,20 @@ mod tests {
 
     fn both_usage_frame(tokens: u64) -> String {
         format!(
-            "data: {{\"choices\":[{{\"delta\":{{}},\"finish_reason\":\"stop\"}}],\"usage\":{{\"completion_tokens\":{tokens}}},\"x_groq\":{{\"usage\":{{\"completion_tokens\":{tokens}}}}}}}\n\n"
+            "data: {{\"choices\":[{{\"delta\":{{}},\"finish_reason\":\"stop\"}}],\"usage\":{{\"prompt_tokens\":0,\"completion_tokens\":{tokens},\"total_tokens\":{tokens}}},\"x_groq\":{{\"usage\":{{\"prompt_tokens\":0,\"completion_tokens\":{tokens},\"total_tokens\":{tokens}}}}}}}\n\n"
         )
     }
 
-    /// The OpenAI-compatible terminal record: no content shape, one native output total.
+    /// The OpenAI-compatible terminal record: no content shape, one native billing record.
     fn usage_frame(tokens: u64) -> String {
-        format!("data: {{\"choices\":[],\"usage\":{{\"completion_tokens\":{tokens}}}}}\n\n")
+        usage_frame_parts(0, tokens)
+    }
+
+    fn usage_frame_parts(input_tokens: u64, output_tokens: u64) -> String {
+        let total_tokens = input_tokens.checked_add(output_tokens).unwrap();
+        format!(
+            "data: {{\"choices\":[],\"usage\":{{\"prompt_tokens\":{input_tokens},\"completion_tokens\":{output_tokens},\"total_tokens\":{total_tokens}}}}}\n\n"
+        )
     }
 
     /// A terminal record whose `usage` container is spelled by the caller (malformed grids, UPS-18).
@@ -2053,10 +2122,8 @@ mod tests {
         events
             .into_iter()
             .map(|event| match event {
-                UpstreamEvent::Chunk {
-                    accounted_tokens, ..
-                }
-                | UpstreamEvent::Accounted(accounted_tokens) => accounted_tokens,
+                UpstreamEvent::Chunk(_) => 0,
+                UpstreamEvent::Usage(usage) => usage.total_tokens,
             })
             .sum()
     }
@@ -2211,20 +2278,13 @@ mod tests {
 
     /// E2E-ROW: E2E-UPS-43/L0
 
-    /// A provider that answers nothing, states no total and terminates properly is not a failure.
-    /// The end-of-stream branch reads `seq == 0` with `native_usage.unwrap_or(0) == 0` and returns
-    /// `Ok(())` before the positive-total requirement is ever reached.
-
-    /// Both halves of that matter. If it returned an error, every legitimately empty completion --
-    /// a model given a budget too small to say anything, a prompt it declines -- would be reported
-    /// as a broken seller and would fail readiness. If it emitted `Accounted(0)`, a zero would be
-    /// recorded as a delivery, and a zero delivery is not the same fact as no delivery for anything
-    /// downstream that counts events rather than tokens.
+    /// `[DONE]` is a transport terminator, not an input-usage record. Even with no visible
+    /// output, a request that omitted its provider-native input total fails closed explicitly.
     #[tokio::test]
-    async fn an_empty_but_properly_terminated_stream_succeeds_and_bills_nothing() {
+    async fn an_empty_done_only_stream_without_usage_fails_closed() {
         let (result, events, _) =
             run_test_stream_with_capabilities(DONE.to_string(), 8, no_logprobs()).await;
-        assert!(result.is_ok(), "{:?}", result.unwrap_err());
+        assert_status(result, "without terminal billing usage");
         assert!(
             forwarded_text(&events).is_empty(),
             "an empty completion delivers no chunk"
@@ -2314,7 +2374,10 @@ mod tests {
             "a mismatch found after delivery must not strand the buyer's paid capacity: {:?}",
             result.unwrap_err()
         );
-        assert_eq!(forwarded_text(&events), vec!["already delivered", "and more"]);
+        assert_eq!(
+            forwarded_text(&events),
+            vec!["already delivered", "and more"]
+        );
         assert_eq!(
             accounted_total(events),
             4,
@@ -2439,7 +2502,7 @@ mod tests {
     /// Left `#[ignore]`d rather than adjusted to today's behaviour: an error answer must be asked
     /// exactly once, and asserting the retry instead would pin the defect as the contract. The
     /// reason string deliberately avoids `EXPECTED TO FAIL`, which is the marker
-    /// `ci/run-red-by-design-tests.sh` holds in strict bijection with its own registry; adding an
+    /// `ci/run_red_by_design_tests.sh` holds in strict bijection with its own registry; adding an
     /// entry there is the lead's call, together with whether to fix this at all.
     #[tokio::test]
     async fn a_two_hundred_response_whose_body_is_a_bare_error_object_is_asked_exactly_once() {
@@ -2527,7 +2590,7 @@ mod tests {
     async fn a_total_stated_only_in_the_groq_usage_mirror_is_authoritative() {
         let mut body = unstructured_sse_frame("delivered");
         body.push_str(
-            "data: {\"choices\":[],\"x_groq\":{\"usage\":{\"completion_tokens\":4}}}\n\n",
+            "data: {\"choices\":[],\"x_groq\":{\"usage\":{\"prompt_tokens\":0,\"completion_tokens\":4,\"total_tokens\":4}}}\n\n",
         );
         body.push_str(DONE);
         let (result, events, _) = run_test_stream_with_capabilities(body, 8, no_logprobs()).await;
@@ -2679,7 +2742,7 @@ mod tests {
         );
     }
 
-    /// Only the provider's terminal native output-usage total authorizes what the seller bills for
+    /// Only the provider's terminal native input + output total authorizes what the seller bills for
     /// one OpenAI-compatible response.
 
     /// E2E-UPS-02, `tests/e2e/test-specification.md`.
@@ -2707,7 +2770,7 @@ mod tests {
         assert_eq!(
             accounted_total(events),
             3,
-            "the accounted total is exactly the provider's reported completion_tokens"
+            "the accounted total is exactly the provider's reported prompt + completion sum"
         );
     }
 
@@ -2723,11 +2786,11 @@ mod tests {
         assert_eq!(accounted_total(events), 1);
     }
 
-    // ---: the provider's own terminal output total is the sole billing authority ---
+    // ---: provider-native terminal input-plus-output usage is the sole billing authority ---
 
     /// A negative row fails on its OWN reason: assert the exact refusal, never merely "some `DataLoss`".
     #[track_caller]
-    fn assert_status(result: Result<(), Status>, expected: &str) {
+    fn assert_status(result: Result<(), Box<Status>>, expected: &str) {
         let status = result.expect_err("this stream must be refused");
         assert_eq!(status.code(), tonic::Code::DataLoss, "{}", status.message());
         assert!(
@@ -2742,8 +2805,8 @@ mod tests {
         events
             .iter()
             .filter_map(|event| match event {
-                UpstreamEvent::Accounted(tokens) => Some(*tokens),
-                UpstreamEvent::Chunk { .. } => None,
+                UpstreamEvent::Usage(usage) => Some(usage.total_tokens),
+                UpstreamEvent::Chunk(_) => None,
             })
             .collect()
     }
@@ -2753,8 +2816,8 @@ mod tests {
         events
             .iter()
             .filter_map(|event| match event {
-                UpstreamEvent::Chunk { chunk, .. } => Some(chunk.text.clone()),
-                UpstreamEvent::Accounted(_) => None,
+                UpstreamEvent::Chunk(chunk) => Some(chunk.text.clone()),
+                UpstreamEvent::Usage(_) => None,
             })
             .collect()
     }
@@ -2778,13 +2841,44 @@ mod tests {
             "the provider's terminal completion total is the whole bill"
         );
         // Chunks never carry their own money on this path: the terminal record does.
-        assert!(events.iter().all(|event| matches!(
-            event,
-            UpstreamEvent::Chunk {
-                accounted_tokens: 0,
-                ..
-            } | UpstreamEvent::Accounted(_)
-        )));
+        assert!(events
+            .iter()
+            .all(|event| matches!(event, UpstreamEvent::Chunk(_) | UpstreamEvent::Usage(_))));
+    }
+
+    #[tokio::test]
+    async fn nonempty_input_is_billed_without_becoming_part_of_the_output_cap() {
+        let mut body = unstructured_sse_frame("one output");
+        body.push_str(
+            "data: {\"choices\":[],\"usage\":{\"prompt_tokens\":100,\"completion_tokens\":1,\"total_tokens\":101}}\n\n",
+        );
+        body.push_str(DONE);
+        let (result, events, _) = run_test_stream_with_capabilities(body, 1, no_logprobs()).await;
+        result.expect("input usage is bounded by the billing grant, not the output cap");
+        assert_eq!(forwarded_text(&events), vec!["one output"]);
+        assert_eq!(accounted_amounts(&events), vec![101]);
+    }
+
+    #[test]
+    fn declared_total_and_full_groq_mirror_must_match() {
+        let bad_total = serde_json::json!({
+            "prompt_tokens": 2,
+            "completion_tokens": 3,
+            "total_tokens": 6
+        });
+        assert!(native_billing_usage(Some(&bad_total))
+            .unwrap_err()
+            .message()
+            .contains("does not equal"));
+
+        let conflicting_mirror = serde_json::json!({
+            "usage": {"prompt_tokens": 2, "completion_tokens": 3, "total_tokens": 5},
+            "x_groq": {"usage": {"prompt_tokens": 1, "completion_tokens": 4, "total_tokens": 5}}
+        });
+        assert!(frame_native_usage(&conflicting_mirror)
+            .unwrap_err()
+            .message()
+            .contains("disagree"));
     }
 
     /// UPS-01: the seller must reach the provider. A model configured without log probabilities is served,
@@ -2861,7 +2955,7 @@ mod tests {
     async fn disagreeing_native_totals_authorize_nothing() {
         let mut body = unstructured_sse_frame("output");
         body.push_str(
-            "data: {\"choices\":[],\"usage\":{\"completion_tokens\":3},\"x_groq\":{\"usage\":{\"completion_tokens\":4}}}\n\n",
+            "data: {\"choices\":[],\"usage\":{\"prompt_tokens\":0,\"completion_tokens\":3,\"total_tokens\":3},\"x_groq\":{\"usage\":{\"prompt_tokens\":0,\"completion_tokens\":4,\"total_tokens\":4}}}\n\n",
         );
         body.push_str("data: [DONE]\n\n");
         let (result, events, _) = run_test_stream_with_capabilities(body, 8, no_logprobs()).await;
@@ -2914,8 +3008,8 @@ mod tests {
         result.expect("the live provider stream must be consumable by the production adapter");
         assert_eq!(
             accounted_amounts(&events),
-            vec![1],
-            "the bill is the provider's own terminal usage.completion_tokens"
+            vec![13],
+            "the bill is the provider's own terminal input + output total"
         );
     }
 
@@ -2932,11 +3026,13 @@ mod tests {
             "openai/gpt-oss-20b",
         )
         .await;
-        result.expect("a reasoning-only provider stream must be consumable by the production adapter");
+        result.expect(
+            "a reasoning-only provider stream must be consumable by the production adapter",
+        );
         assert_eq!(
             accounted_amounts(&events),
-            vec![16],
-            "the bill is the provider's own terminal usage.completion_tokens"
+            vec![89],
+            "the bill is the provider's own terminal input + output total"
         );
     }
 
@@ -2994,7 +3090,7 @@ mod tests {
     #[tokio::test]
     async fn usage_attached_to_an_output_delta_is_not_terminal() {
         let body = concat!(
-            "data: {\"choices\":[{\"delta\":{\"content\":\"paid and printed\"}}],\"usage\":{\"completion_tokens\":2}}\n\n",
+            "data: {\"choices\":[{\"delta\":{\"content\":\"paid and printed\"}}],\"usage\":{\"prompt_tokens\":0,\"completion_tokens\":2,\"total_tokens\":2}}\n\n",
             "data: [DONE]\n\n"
         )
         .to_string();
@@ -3008,18 +3104,27 @@ mod tests {
     #[tokio::test]
     async fn malformed_native_totals_authorize_nothing() {
         for (usage, expected) in [
-            ("{\"completion_tokens\":\"3\"}", "is not a token count"),
-            ("{\"completion_tokens\":-3}", "is not a token count"),
-            ("{\"completion_tokens\":3.5}", "is not a token count"),
             (
-                "{\"completion_tokens\":18446744073709551616}",
+                "{\"prompt_tokens\":0,\"completion_tokens\":\"3\"}",
+                "is not a token count",
+            ),
+            (
+                "{\"prompt_tokens\":0,\"completion_tokens\":-3}",
+                "is not a token count",
+            ),
+            (
+                "{\"prompt_tokens\":0,\"completion_tokens\":3.5}",
+                "is not a token count",
+            ),
+            (
+                "{\"prompt_tokens\":0,\"completion_tokens\":18446744073709551616}",
                 "is not a token count",
             ),
             // A usage container that carries no total at all is not a terminal record: the request ends
             // with no authoritative amount, which is UPS-07, not a silent chunk-length fallback.
             (
-                "{\"completion_tokens\":null}",
-                "without positive terminal usage.completion_tokens",
+                "{\"prompt_tokens\":0,\"completion_tokens\":null}",
+                "is not a token count",
             ),
             ("{}", "without positive terminal usage.completion_tokens"),
             ("3", "usage is not an object"),
@@ -3041,7 +3146,7 @@ mod tests {
         body.push_str(&usage_frame(9));
         body.push_str("data: [DONE]\n\n");
         let (result, events, _) = run_test_stream_with_capabilities(body, 8, no_logprobs()).await;
-        assert_status(result, "exceeds the requested token limit");
+        assert_status(result, "exceeds the requested output limit");
         assert_eq!(accounted_total(events), 0);
     }
 
@@ -3500,7 +3605,7 @@ mod tests {
             api_key_env: "PATH".to_string(),
             capabilities: Capabilities {
                 max_output_tokens: None,
-                ..OpenAiConfig::default().capabilities
+                ..Capabilities::default()
             },
             ..OpenAiConfig::default()
         };
@@ -3543,7 +3648,7 @@ mod tests {
         let known_cap = OpenAiConfig {
             capabilities: Capabilities {
                 max_output_tokens: Some(16),
-                ..unknown_cap.capabilities.clone()
+                ..Capabilities::default()
             },
             ..unknown_cap
         };
@@ -3664,7 +3769,13 @@ mod tests {
 
     #[test]
     fn build_request_pins_seed_only_for_greedy_spotcheck() {
-        let cfg = OpenAiConfig::default();
+        let cfg = OpenAiConfig {
+            capabilities: Capabilities {
+                max_output_tokens: Some(DEFAULT_MAX_OUTPUT_TOKENS),
+                sample_algorithm: SampleAlgorithm::Seed,
+            },
+            ..OpenAiConfig::default()
+        };
         let greedy = CanonRequest {
             messages: vec![],
             params: Some(dexdo_proto::SamplingParams {
@@ -3676,7 +3787,7 @@ mod tests {
         };
         let body = build_request(&cfg, &greedy, 8, DEFAULT_MAX_OUTPUT_TOKENS);
         assert_eq!(body.temperature, Some(0.0));
-        assert_eq!(body.seed, Some(0));
+        assert_eq!(body.seed, Some(REFERENCE_SAMPLE_SEED));
         let json = serde_json::to_string(&body).unwrap();
         assert!(json.contains("\"seed\":0"), "{json}");
 
@@ -3692,6 +3803,128 @@ mod tests {
         let body = build_request(&cfg, &regular, 32, DEFAULT_MAX_OUTPUT_TOKENS);
         assert_eq!(body.temperature, Some(0.9));
         assert_eq!(body.seed, None);
+    }
+
+    #[test]
+    fn issue_1951_sample_algorithm_selects_exactly_one_greedy_wire_shape() {
+        let expected = [
+            ("SEED", "seed", serde_json::json!(0)),
+            ("RANDOM_SEED", "random_seed", serde_json::json!(0)),
+            ("TOP_K", "top_k", serde_json::json!(1)),
+        ];
+        let control_fields = ["seed", "random_seed", "top_k"];
+
+        for (algorithm, expected_field, expected_value) in expected {
+            let models = crate::seller::models::ModelsConfig::from_json(&format!(
+                r#"{{"models":{{"m":{{"frame_model":"vendor--model--v1",
+                  "base_url":"https://provider.example/v1","served_model":"provider/model",
+                  "api_key_env":"PROVIDER_KEY","tokenizer_family":"vendor","price_per_tick":1,
+                  "capabilities":{{"max_output_tokens":256,"sample_algorithm":"{algorithm}"}}}}}}}}"#,
+            ))
+            .expect("declared sample algorithm parses");
+            let cfg = OpenAiConfig::from_model(models.get("m").expect("profile"), None);
+            let greedy = CanonRequest {
+                messages: vec![],
+                params: Some(dexdo_proto::SamplingParams {
+                    temperature: 0.9,
+                    max_tokens: 16,
+                    stop: vec![],
+                    greedy: true,
+                }),
+            };
+            let body = serde_json::to_value(build_request(&cfg, &greedy, 8, 256)).unwrap();
+
+            assert_eq!(body["temperature"], 0.0, "algorithm {algorithm}");
+            assert_eq!(
+                body[expected_field], expected_value,
+                "algorithm {algorithm}"
+            );
+            assert_eq!(
+                control_fields
+                    .iter()
+                    .filter(|field| body.get(**field).is_some())
+                    .count(),
+                1,
+                "algorithm {algorithm} must add exactly one greedy control: {body}"
+            );
+        }
+
+        let models = crate::seller::models::ModelsConfig::from_json(
+            r#"{"models":{"m":{"frame_model":"vendor--model--v1",
+              "base_url":"https://provider.example/v1","served_model":"provider/model",
+              "api_key_env":"PROVIDER_KEY","tokenizer_family":"vendor","price_per_tick":1,
+              "capabilities":{"max_output_tokens":256}}}}"#,
+        )
+        .expect("omitted sample algorithm parses");
+        let cfg = OpenAiConfig::from_model(models.get("m").expect("profile"), None);
+        let greedy = CanonRequest {
+            messages: vec![],
+            params: Some(dexdo_proto::SamplingParams {
+                temperature: 0.9,
+                max_tokens: 16,
+                stop: vec![],
+                greedy: true,
+            }),
+        };
+        let body = serde_json::to_value(build_request(&cfg, &greedy, 8, 256)).unwrap();
+        assert!(
+            control_fields
+                .iter()
+                .all(|field| body.get(*field).is_none()),
+            "the conservative NONE default must add no optional field: {body}"
+        );
+    }
+
+    #[tokio::test]
+    async fn issue_1951_declared_field_rejection_names_the_profile_switch() {
+        let (base_url, server) = start_test_server_with_response(
+            r#"{"error":{"message":"unsupported field: seed"}}"#.to_string(),
+            "400 Bad Request",
+            "application/json",
+        )
+        .await;
+        let cfg = OpenAiConfig {
+            base_url,
+            capabilities: Capabilities {
+                max_output_tokens: Some(DEFAULT_MAX_OUTPUT_TOKENS),
+                sample_algorithm: SampleAlgorithm::Seed,
+            },
+            ..OpenAiConfig::default()
+        };
+        let greedy = CanonRequest {
+            messages: vec![],
+            params: Some(dexdo_proto::SamplingParams {
+                temperature: 0.0,
+                max_tokens: 16,
+                stop: vec![],
+                greedy: true,
+            }),
+        };
+        let (tx, _rx) = mpsc::channel(4);
+
+        let status = stream_upstream(
+            &cfg,
+            None,
+            "secret",
+            16,
+            &greedy,
+            &tx,
+            DEFAULT_MAX_OUTPUT_TOKENS,
+        )
+        .await
+        .expect_err("the provider refuses a request carrying seed");
+        let _ = server.await;
+
+        let message = status.message();
+        assert!(message.contains("unsupported field: seed"), "{message}");
+        assert!(
+            message.contains("optional field \"seed\""),
+            "the refusal must name the exact request field: {message}"
+        );
+        assert!(
+            message.contains("capabilities.sample_algorithm=SEED"),
+            "the refusal must name the exact profile switch: {message}"
+        );
     }
 
     #[test]
@@ -3757,11 +3990,13 @@ mod tests {
     /// transform that drops or mangles the provider's text fails here rather than passing quietly.
     const GPT_OSS_REASONING_FRAGMENTS: [&str; 5] = ["The", " user", " says", ":", " \""];
 
-    /// The provider's own terminal `usage.completion_tokens` for that capture.
-    const GPT_OSS_REASONING_ONLY_TOTAL: u64 = 8;
+    /// The provider's own terminal output and billable totals for that capture.
+    const GPT_OSS_REASONING_ONLY_OUTPUT: u64 = 8;
+    const GPT_OSS_REASONING_ONLY_BILLABLE: u64 = 83;
 
-    /// The provider's own terminal `usage.completion_tokens` for [`TOOL_CALL_CAPTURE`].
-    const TOOL_CALL_TOTAL: u64 = 5;
+    /// The provider's own terminal output and billable totals for [`TOOL_CALL_CAPTURE`].
+    const TOOL_CALL_OUTPUT: u64 = 5;
+    const TOOL_CALL_BILLABLE: u64 = 250;
 
     /// The terminal total [`LIVE_GROQ_READINESS_CAPTURE`] itself reports.
 
@@ -3771,7 +4006,7 @@ mod tests {
     /// meant. then moved that constant to 64 and the row failed for a reason that had nothing
     /// to do with what it tests. What a provider bills is what the provider reported; a test that has
     /// to be edited when an unrelated constant moves was not testing what it claimed.
-    const LIVE_GROQ_READINESS_CAPTURE_TOTAL: u64 = 1;
+    const LIVE_GROQ_READINESS_CAPTURE_BILLABLE: u64 = 13;
 
     /// A live `openai/gpt-oss-20b` answering the readiness prompt at `max_tokens: 8`. Nine events:
     /// `content` appears exactly ONCE, empty, on the role delta and never again; five deltas carry
@@ -3887,7 +4122,7 @@ data: {"error":{"message":"Tool choice is required, but model did not call a too
         model: &str,
         market: Option<&str>,
         requirements: Option<StartupCapabilityRequirements>,
-    ) -> (Result<(), Status>, Vec<UpstreamEvent>) {
+    ) -> (Result<(), Box<Status>>, Vec<UpstreamEvent>) {
         let (base_url, server) = start_test_server(body).await;
         let cfg = OpenAiConfig {
             base_url,
@@ -3901,13 +4136,15 @@ data: {"error":{"message":"Tool choice is required, but model did not call a too
             resolve_model_output_cap(cfg.capabilities.max_output_tokens, "frame", &cfg.model)
                 .expect("test capabilities declare an output cap");
         let result = stream_upstream_with_startup_capabilities(
-            &cfg,
-            market,
-            requirements,
+            OpenAiStreamContext {
+                cfg: &cfg,
+                market,
+                requirements,
+                count,
+                tx: &tx,
+            },
             "secret",
-            count,
             &request(),
-            &tx,
             model_output_cap,
         )
         .await;
@@ -3923,7 +4160,7 @@ data: {"error":{"message":"Tool choice is required, but model did not call a too
     /// A refusal is asserted by its OWN code and reason: `is_err` alone would pass for any of the
     /// dozen other ways this adapter can fail, and would keep passing after the behaviour moved.
     #[track_caller]
-    fn assert_refusal(result: Result<(), Status>, code: tonic::Code, expected: &[&str]) {
+    fn assert_refusal(result: Result<(), Box<Status>>, code: tonic::Code, expected: &[&str]) {
         let status = result.expect_err("this stream must be refused");
         assert_eq!(status.code(), code, "{}", status.message());
         for part in expected {
@@ -3940,8 +4177,8 @@ data: {"error":{"message":"Tool choice is required, but model did not call a too
         events
             .iter()
             .filter_map(|event| match event {
-                UpstreamEvent::Chunk { chunk, .. } => Some(chunk.reasoning.clone()),
-                UpstreamEvent::Accounted(_) => None,
+                UpstreamEvent::Chunk(chunk) => Some(chunk.reasoning.clone()),
+                UpstreamEvent::Usage(_) => None,
             })
             .collect()
     }
@@ -3951,8 +4188,8 @@ data: {"error":{"message":"Tool choice is required, but model did not call a too
         events
             .iter()
             .filter_map(|event| match event {
-                UpstreamEvent::Chunk { chunk, .. } => Some(chunk.seq),
-                UpstreamEvent::Accounted(_) => None,
+                UpstreamEvent::Chunk(chunk) => Some(chunk.seq),
+                UpstreamEvent::Usage(_) => None,
             })
             .collect()
     }
@@ -3962,11 +4199,11 @@ data: {"error":{"message":"Tool choice is required, but model did not call a too
         events
             .iter()
             .filter_map(|event| match event {
-                UpstreamEvent::Chunk { chunk, .. } => chunk
+                UpstreamEvent::Chunk(chunk) => chunk
                     .manifest
                     .as_ref()
                     .map(|manifest| (chunk.seq, manifest.claimed_model.clone())),
-                UpstreamEvent::Accounted(_) => None,
+                UpstreamEvent::Usage(_) => None,
             })
             .collect()
     }
@@ -3981,7 +4218,10 @@ data: {"error":{"message":"Tool choice is required, but model did not call a too
 
     /// The JSON of the first captured frame `pick` accepts -- the provider's own bytes, so a derived
     /// shape differs from the live stream in exactly the one edit its row names.
-    fn capture_frame(capture: &str, pick: impl Fn(&serde_json::Value) -> bool) -> serde_json::Value {
+    fn capture_frame(
+        capture: &str,
+        pick: impl Fn(&serde_json::Value) -> bool,
+    ) -> serde_json::Value {
         capture_events(capture)
             .into_iter()
             .filter_map(|event| event.strip_prefix("data: "))
@@ -4046,9 +4286,14 @@ data: {"error":{"message":"Tool choice is required, but model did not call a too
     #[tokio::test]
     async fn the_whole_answer_in_reasoning_content_is_delivered_and_billed() {
         let body = respell_reasoning("reasoning_content", |text| serde_json::json!(text));
-        let (result, events) =
-            run_provider_capture(body, GPT_OSS_REASONING_ONLY_TOTAL, GPT_OSS_MODEL, None, None)
-                .await;
+        let (result, events) = run_provider_capture(
+            body,
+            GPT_OSS_REASONING_ONLY_OUTPUT,
+            GPT_OSS_MODEL,
+            None,
+            None,
+        )
+        .await;
         result.expect("a reasoning_content-only stream is delivered output, not an empty response");
         assert_eq!(forwarded_reasoning(&events), GPT_OSS_REASONING_FRAGMENTS);
         assert_eq!(
@@ -4058,8 +4303,8 @@ data: {"error":{"message":"Tool choice is required, but model did not call a too
         );
         assert_eq!(
             accounted_amounts(&events),
-            vec![GPT_OSS_REASONING_ONLY_TOTAL],
-            "the bill is the provider's own terminal usage.completion_tokens"
+            vec![GPT_OSS_REASONING_ONLY_BILLABLE],
+            "the bill is the provider's own terminal input + output total"
         );
     }
 
@@ -4067,19 +4312,27 @@ data: {"error":{"message":"Tool choice is required, but model did not call a too
     /// carry text (`.text` and `.summary`). Same verdict as UPS-B3: it is delivered output.
     #[tokio::test]
     async fn the_whole_answer_in_reasoning_details_is_delivered_and_billed() {
-        let shapes: [(&str, fn(&str) -> serde_json::Value); 2] = [
-            ("reasoning_details[].text", |text| {
-                serde_json::json!([{"type": "reasoning.text", "text": text}])
-            }),
-            ("reasoning_details[].summary", |text| {
-                serde_json::json!([{"type": "reasoning.summary", "summary": text}])
-            }),
+        type ReasoningDetailsShape = (&'static str, fn(&str) -> serde_json::Value);
+        let shapes: [ReasoningDetailsShape; 2] = [
+            (
+                "reasoning_details[].text",
+                |text| serde_json::json!([{"type": "reasoning.text", "text": text}]),
+            ),
+            (
+                "reasoning_details[].summary",
+                |text| serde_json::json!([{"type": "reasoning.summary", "summary": text}]),
+            ),
         ];
         for (shape, wrap) in shapes {
             let body = respell_reasoning("reasoning_details", wrap);
-            let (result, events) =
-                run_provider_capture(body, GPT_OSS_REASONING_ONLY_TOTAL, GPT_OSS_MODEL, None, None)
-                    .await;
+            let (result, events) = run_provider_capture(
+                body,
+                GPT_OSS_REASONING_ONLY_OUTPUT,
+                GPT_OSS_MODEL,
+                None,
+                None,
+            )
+            .await;
             result.unwrap_or_else(|status| {
                 panic!("{shape} is delivered output, not an empty response: {status}")
             });
@@ -4090,7 +4343,7 @@ data: {"error":{"message":"Tool choice is required, but model did not call a too
             );
             assert_eq!(
                 accounted_amounts(&events),
-                vec![GPT_OSS_REASONING_ONLY_TOTAL],
+                vec![GPT_OSS_REASONING_ONLY_BILLABLE],
                 "{shape}"
             );
         }
@@ -4112,7 +4365,7 @@ data: {"error":{"message":"Tool choice is required, but model did not call a too
         );
         let (result, events) = run_provider_capture(
             GPT_OSS_REASONING_ONLY_CAPTURE.to_string(),
-            GPT_OSS_REASONING_ONLY_TOTAL,
+            GPT_OSS_REASONING_ONLY_OUTPUT,
             GPT_OSS_MODEL,
             None,
             None,
@@ -4136,7 +4389,7 @@ data: {"error":{"message":"Tool choice is required, but model did not call a too
         );
         assert_eq!(
             accounted_amounts(&events),
-            vec![GPT_OSS_REASONING_ONLY_TOTAL]
+            vec![GPT_OSS_REASONING_ONLY_BILLABLE]
         );
     }
 
@@ -4147,15 +4400,23 @@ data: {"error":{"message":"Tool choice is required, but model did not call a too
     async fn a_third_identical_restatement_of_the_live_total_is_billed_once() {
         let body = GPT_OSS_REASONING_ONLY_CAPTURE.replace(
             "data: [DONE]",
-            &format!("{}data: [DONE]", usage_frame(GPT_OSS_REASONING_ONLY_TOTAL)),
+            &format!(
+                "{}data: [DONE]",
+                usage_frame_parts(75, GPT_OSS_REASONING_ONLY_OUTPUT)
+            ),
         );
-        let (result, events) =
-            run_provider_capture(body, GPT_OSS_REASONING_ONLY_TOTAL, GPT_OSS_MODEL, None, None)
-                .await;
+        let (result, events) = run_provider_capture(
+            body,
+            GPT_OSS_REASONING_ONLY_OUTPUT,
+            GPT_OSS_MODEL,
+            None,
+            None,
+        )
+        .await;
         result.expect("an unchanged restatement of the same total is not a contradiction");
         assert_eq!(
             accounted_amounts(&events),
-            vec![GPT_OSS_REASONING_ONLY_TOTAL],
+            vec![GPT_OSS_REASONING_ONLY_BILLABLE],
             "three statements of one total are one bill"
         );
     }
@@ -4169,12 +4430,17 @@ data: {"error":{"message":"Tool choice is required, but model did not call a too
             "data: [DONE]",
             &format!(
                 "{}data: [DONE]",
-                usage_frame(GPT_OSS_REASONING_ONLY_TOTAL - 1)
+                usage_frame_parts(75, GPT_OSS_REASONING_ONLY_OUTPUT - 1)
             ),
         );
-        let (result, events) =
-            run_provider_capture(body, GPT_OSS_REASONING_ONLY_TOTAL, GPT_OSS_MODEL, None, None)
-                .await;
+        let (result, events) = run_provider_capture(
+            body,
+            GPT_OSS_REASONING_ONLY_OUTPUT,
+            GPT_OSS_MODEL,
+            None,
+            None,
+        )
+        .await;
         assert_refusal(
             result,
             tonic::Code::DataLoss,
@@ -4190,11 +4456,20 @@ data: {"error":{"message":"Tool choice is required, but model did not call a too
     #[tokio::test]
     async fn usage_attached_to_a_reasoning_delta_is_not_terminal() {
         let mut frame = capture_frame(GPT_OSS_REASONING_ONLY_CAPTURE, is_reasoning_delta);
-        frame["usage"] = serde_json::json!({ "completion_tokens": GPT_OSS_REASONING_ONLY_TOTAL });
+        frame["usage"] = serde_json::json!({
+            "prompt_tokens": 75,
+            "completion_tokens": GPT_OSS_REASONING_ONLY_OUTPUT,
+            "total_tokens": GPT_OSS_REASONING_ONLY_BILLABLE,
+        });
         let body = format!("{}data: [DONE]\n\n", data_frame(&frame));
-        let (result, events) =
-            run_provider_capture(body, GPT_OSS_REASONING_ONLY_TOTAL, GPT_OSS_MODEL, None, None)
-                .await;
+        let (result, events) = run_provider_capture(
+            body,
+            GPT_OSS_REASONING_ONLY_OUTPUT,
+            GPT_OSS_MODEL,
+            None,
+            None,
+        )
+        .await;
         assert_refusal(
             result,
             tonic::Code::DataLoss,
@@ -4212,7 +4487,11 @@ data: {"error":{"message":"Tool choice is required, but model did not call a too
     #[tokio::test]
     async fn usage_attached_to_a_tool_call_delta_is_not_terminal() {
         let mut frame = capture_frame(TOOL_CALL_CAPTURE, is_tool_call_delta);
-        frame["usage"] = serde_json::json!({ "completion_tokens": TOOL_CALL_TOTAL });
+        frame["usage"] = serde_json::json!({
+            "prompt_tokens": 245,
+            "completion_tokens": TOOL_CALL_OUTPUT,
+            "total_tokens": TOOL_CALL_BILLABLE,
+        });
         let body = format!("{}data: [DONE]\n\n", data_frame(&frame));
         let (result, events) = run_provider_capture(
             body.clone(),
@@ -4230,7 +4509,8 @@ data: {"error":{"message":"Tool choice is required, but model did not call a too
         assert_eq!(accounted_total(events), 0);
 
         let (result, events) =
-            run_provider_capture(body, capability_probe_budget(), TOOL_CALL_MODEL, None, None).await;
+            run_provider_capture(body, capability_probe_budget(), TOOL_CALL_MODEL, None, None)
+                .await;
         assert_refusal(result, tonic::Code::DataLoss, &["without delivered output"]);
         assert_eq!(accounted_total(events), 0);
     }
@@ -4246,9 +4526,14 @@ data: {"error":{"message":"Tool choice is required, but model did not call a too
             "data: [DONE]",
             &format!("{}data: [DONE]", data_frame(&replayed)),
         );
-        let (result, events) =
-            run_provider_capture(body, GPT_OSS_REASONING_ONLY_TOTAL, GPT_OSS_MODEL, None, None)
-                .await;
+        let (result, events) = run_provider_capture(
+            body,
+            GPT_OSS_REASONING_ONLY_OUTPUT,
+            GPT_OSS_MODEL,
+            None,
+            None,
+        )
+        .await;
         assert_refusal(
             result,
             tonic::Code::DataLoss,
@@ -4304,7 +4589,7 @@ data: {"error":{"message":"Tool choice is required, but model did not call a too
         honest.expect("the market's own model answering it is not a substitution");
         assert_eq!(
             accounted_amounts(&events),
-            vec![LIVE_GROQ_READINESS_CAPTURE_TOTAL],
+            vec![LIVE_GROQ_READINESS_CAPTURE_BILLABLE],
             "the bill is the CAPTURE's own terminal total, not the budget the request asked for"
         );
 
@@ -4424,8 +4709,8 @@ data: {"error":{"message":"Tool choice is required, but model did not call a too
         );
         assert_eq!(
             accounted_amounts(&events),
-            vec![TOOL_CALL_TOTAL],
-            "the bill is the provider's own terminal usage.completion_tokens"
+            vec![TOOL_CALL_BILLABLE],
+            "the bill is the provider's own terminal input + output total"
         );
     }
 
@@ -4436,7 +4721,7 @@ data: {"error":{"message":"Tool choice is required, but model did not call a too
     async fn a_tools_probe_answered_without_a_tool_call_is_refused_with_the_provider_numbers() {
         let (result, events) = run_provider_capture(
             GPT_OSS_REASONING_ONLY_CAPTURE.to_string(),
-            GPT_OSS_REASONING_ONLY_TOTAL,
+            GPT_OSS_REASONING_ONLY_OUTPUT,
             GPT_OSS_MODEL,
             None,
             Some(tools_probe()),
@@ -4513,7 +4798,7 @@ data: {"error":{"message":"Failed to call a function. Please adjust your prompt.
     async fn run_counted_stream(
         body: String,
         count: u64,
-    ) -> (Result<(), Status>, Vec<UpstreamEvent>, usize) {
+    ) -> (Result<(), Box<Status>>, Vec<UpstreamEvent>, usize) {
         let (base_url, requests) = start_counting_test_server(body).await;
         let cfg = OpenAiConfig {
             base_url,
@@ -4547,7 +4832,7 @@ data: {"error":{"message":"Failed to call a function. Please adjust your prompt.
     /// for a dozen other endings, and asserting only our half cannot see the provider's half appear
     /// or disappear.
     #[track_caller]
-    fn assert_provider_refusal(result: Result<(), Status>, expected: &[&str]) {
+    fn assert_provider_refusal(result: Result<(), Box<Status>>, expected: &[&str]) {
         let status = result.expect_err("this stream must be refused");
         assert_eq!(status.code(), tonic::Code::DataLoss, "{}", status.message());
         for part in expected {
@@ -4609,7 +4894,10 @@ data: {"error":{"message":"Failed to call a function. Please adjust your prompt.
         let mut body = unstructured_sse_frame("delivered");
         body.push_str(LIVE_GROQ_INBAND_ERROR_CAPTURE);
         let (result, events) = run_test_stream(body, 8).await;
-        assert_provider_refusal(result, &[UNTERMINATED_CLASS, LIVE_GROQ_INBAND_ERROR_MESSAGE]);
+        assert_provider_refusal(
+            result,
+            &[UNTERMINATED_CLASS, LIVE_GROQ_INBAND_ERROR_MESSAGE],
+        );
         assert_eq!(forwarded_text(&events), vec!["delivered"]);
         assert_eq!(accounted_total(events), 0);
     }
@@ -4620,8 +4908,7 @@ data: {"error":{"message":"Failed to call a function. Please adjust your prompt.
     #[tokio::test]
     async fn an_oversized_provider_error_is_bounded_not_pasted_whole() {
         let oversized = "z".repeat(UPSTREAM_ERROR_DETAIL_MAX_BYTES * 4);
-        let body =
-            format!("event: error\ndata: {{\"error\":{{\"message\":\"{oversized}\"}}}}\n\n");
+        let body = format!("event: error\ndata: {{\"error\":{{\"message\":\"{oversized}\"}}}}\n\n");
         let (result, _) = run_test_stream(body, 8).await;
         let status = result.expect_err("an unterminated stream is refused");
         assert!(
@@ -4631,7 +4918,8 @@ data: {"error":{"message":"Failed to call a function. Please adjust your prompt.
         );
         assert!(
             status.message().len()
-                <= UNTERMINATED_CLASS.len() + ": provider reported: ".len()
+                <= UNTERMINATED_CLASS.len()
+                    + ": provider reported: ".len()
                     + UPSTREAM_ERROR_DETAIL_MAX_BYTES,
             "the provider's half must stay inside the one bound, got {} bytes",
             status.message().len()
@@ -4652,11 +4940,14 @@ data: {"error":{"message":"Failed to call a function. Please adjust your prompt.
                 "Authorization",
             ),
         ] {
-            let body = format!("event: error\ndata: {{\"error\":{{\"message\":\"{message}\"}}}}\n\n");
+            let body =
+                format!("event: error\ndata: {{\"error\":{{\"message\":\"{message}\"}}}}\n\n");
             let (result, _) = run_test_stream(body, 8).await;
             let status = result.expect_err("an unterminated stream is refused");
             assert!(
-                status.message().contains("sensitive provider error detail redacted"),
+                status
+                    .message()
+                    .contains("sensitive provider error detail redacted"),
                 "{case}: {}",
                 status.message()
             );
@@ -4705,15 +4996,15 @@ data: {"error":{"message":"Failed to call a function. Please adjust your prompt.
     async fn an_error_frame_that_states_the_total_is_still_the_terminal_record() {
         let mut body = unstructured_sse_frame("delivered");
         body.push_str(
-            "event: error\ndata: {\"error\":{\"message\":\"late failure\"},\"choices\":[],\"usage\":{\"completion_tokens\":3}}\n\n",
+            "event: error\ndata: {\"error\":{\"message\":\"late failure\"},\"choices\":[],\"usage\":{\"prompt_tokens\":2,\"completion_tokens\":3,\"total_tokens\":5}}\n\n",
         );
         body.push_str("data: [DONE]\n\n");
         let (result, events) = run_test_stream(body, 8).await;
         result.expect("a frame carrying the provider's own total is the terminal record");
         assert_eq!(
             accounted_amounts(&events),
-            vec![3],
-            "the bill is the provider's own terminal usage.completion_tokens"
+            vec![5],
+            "the bill is the provider's own terminal input + output total"
         );
     }
 
@@ -4767,7 +5058,8 @@ data: {"error":{"message":"Failed to call a function. Please adjust your prompt.
         /// error. This is the half the issue calls the real cost: a diagnosis the operator cannot
         /// tell apart from an outage is worth little.
         #[tokio::test]
-        async fn a_bare_json_error_body_under_two_hundred_is_asked_once_and_reported_as_an_answer() {
+        async fn a_bare_json_error_body_under_two_hundred_is_asked_once_and_reported_as_an_answer()
+        {
             let (base_url, requests) =
                 start_repeating_test_server(BARE_ERROR_BODY.to_string()).await;
             let cfg = OpenAiConfig {

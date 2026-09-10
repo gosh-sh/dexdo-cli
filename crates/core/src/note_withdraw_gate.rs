@@ -323,8 +323,8 @@ fn locked_in_orders(fields: &Value) -> Result<Vec<(u32, u128)>, String> {
                 let id = parse_u(&Value::String(key.clone()))
                     .and_then(|id| u32::try_from(id).ok())
                     .ok_or_else(|| format!("{name} key {key} is not a token type"))?;
-                let locked = parse_u(value)
-                    .ok_or_else(|| format!("{name}[{key}] is not an amount"))?;
+                let locked =
+                    parse_u(value).ok_or_else(|| format!("{name}[{key}] is not an amount"))?;
                 Ok((id, locked))
             })
             .collect(),
@@ -431,10 +431,7 @@ pub fn note_withdraw_gate_from_storage(fields: &Value) -> NoteWithdrawGate {
     // 5. `_lockedInOrders` -- the contract iterates and requires EVERY entry to be zero, so a
     // present-but-zero entry closes the gate and only a non-zero one holds.
     let locked = read!("_lockedInOrders", locked_in_orders(fields));
-    if let Some((token_type, locked)) = locked
-        .into_iter()
-        .find(|(_, locked)| *locked != 0)
-    {
+    if let Some((token_type, locked)) = locked.into_iter().find(|(_, locked)| *locked != 0) {
         return NoteWithdrawGate::Held(WithdrawGate::LockedInOrders { token_type, locked });
     }
 

@@ -29,7 +29,10 @@ fn the_refusal_names_every_watcher_that_did_not_report_back() {
 
     assert!(refusal.contains("0:aaa"), "{refusal}");
     assert!(refusal.contains("0:bbb"), "{refusal}");
-    assert!(refusal.contains("2 watcher(s)"), "the count is stated: {refusal}");
+    assert!(
+        refusal.contains("2 watcher(s)"),
+        "the count is stated: {refusal}"
+    );
 }
 
 /// The bound is named in the text, and by its own name rather than by a bare number, so an operator

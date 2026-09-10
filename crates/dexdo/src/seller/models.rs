@@ -7,6 +7,7 @@
 //! an empty config, an unknown model -> an explicit error, not a silent degradation.
 
 use anyhow::{bail, Context, Result};
+pub use dexdo_core::params::SampleAlgorithm;
 use serde::Deserialize;
 use std::collections::BTreeMap;
 use std::path::Path;
@@ -16,7 +17,7 @@ use std::path::Path;
 /// Unlike the rest of the config this struct does NOT deny unknown fields: the retired `logprobs` /
 /// `top_logprobs` keys are still present in already-deployed `models.json` files, and rejecting them
 /// would take every such seller off the market on upgrade. They are ignored, not honoured.
-#[derive(Clone, Debug, Default, Deserialize, PartialEq)]
+#[derive(Clone, Debug, Deserialize, PartialEq)]
 pub struct Capabilities {
     /// The model's **own** maximum output length (completion tokens) at this endpoint. The outbound
     /// generation limit is clamped to it in addition to the deal budget: a deal budget is
@@ -26,6 +27,21 @@ pub struct Capabilities {
     /// error BEFORE the provider is contacted, rather than sending an unbounded value.
     #[serde(default)]
     pub max_output_tokens: Option<u32>,
+    /// Which one provider-specific field controls B7 reproducibility. A non-`NONE` declaration
+    /// asserts that the exact endpoint was found reproducible with that wire shape. `NONE` is the
+    /// conservative default: send no optional field and degrade B7 rather than compare stochastic
+    /// generations.
+    #[serde(default)]
+    pub sample_algorithm: SampleAlgorithm,
+}
+
+impl Default for Capabilities {
+    fn default() -> Self {
+        Self {
+            max_output_tokens: None,
+            sample_algorithm: dexdo_core::params::OPENAI_COMPATIBLE_SAMPLE_ALGORITHM_DEFAULT,
+        }
+    }
 }
 
 /// One behavioral-probe fingerprint declared for a model in config: a deterministic
@@ -89,6 +105,7 @@ impl ModelConfig {
             base_url: self.base_url.clone(),
             model: self.served_model.clone(),
             api_key_env: self.api_key_env.clone(),
+            sample_algorithm: self.capabilities.sample_algorithm,
         }
     }
 }
@@ -247,6 +264,46 @@ mod tests {
         let m = cfg.get("m").unwrap();
         // an undeclared output cap is UNKNOWN, never "unbounded" -- the seller fails closed.
         assert_eq!(m.capabilities.max_output_tokens, None);
+        assert!(
+            m.capabilities.sample_algorithm == SampleAlgorithm::None,
+            "an omitted sample_algorithm uses the conservative NONE default"
+        );
+    }
+
+    #[test]
+    fn sample_algorithm_enum_is_loaded_and_reaches_the_reference_binding() {
+        for (value, expected) in [
+            ("SEED", SampleAlgorithm::Seed),
+            ("RANDOM_SEED", SampleAlgorithm::RandomSeed),
+            ("TOP_K", SampleAlgorithm::TopK),
+            ("NONE", SampleAlgorithm::None),
+        ] {
+            let json = format!(
+                r#"{{"models":{{"m":{{"frame_model":"f","base_url":"http://x","served_model":"s",
+                  "api_key_env":"K","tokenizer_family":"fam","price_per_tick":1,
+                  "capabilities":{{"max_output_tokens":16,"sample_algorithm":"{value}"}}}}}}}}"#,
+            );
+            let cfg = ModelsConfig::from_json(&json).unwrap();
+            let model = cfg.get("m").unwrap();
+            assert_eq!(model.capabilities.sample_algorithm, expected);
+            assert_eq!(model.reference_endpoint().sample_algorithm, expected);
+        }
+
+        let invalid = r#"{"models":{"m":{"frame_model":"f","base_url":"http://x","served_model":"s",
+          "api_key_env":"K","tokenizer_family":"fam","price_per_tick":1,
+          "capabilities":{"max_output_tokens":16,"sample_algorithm":"BOTH"}}}}"#;
+        assert!(
+            ModelsConfig::from_json(invalid).is_err(),
+            "a profile must select exactly one known sampling algorithm"
+        );
+
+        let retired_do_sample = r#"{"models":{"m":{"frame_model":"f","base_url":"http://x","served_model":"s",
+          "api_key_env":"K","tokenizer_family":"fam","price_per_tick":1,
+          "capabilities":{"max_output_tokens":16,"sample_algorithm":"DO_SAMPLE"}}}}"#;
+        assert!(
+            ModelsConfig::from_json(retired_do_sample).is_err(),
+            "DO_SAMPLE is not a supported B7 reproducibility declaration; GLM profiles use NONE"
+        );
     }
 
     #[test]
@@ -260,7 +317,10 @@ mod tests {
         // artifact. `models.json` stopped being one -- it is our own working config now, and what the
         // user's archive carries is the example. An example teaching a config with no output cap
         // teaches a seller a model that never serves a token, which is exactly what this guards.
-        let path = Path::new(concat!(env!("CARGO_MANIFEST_DIR"), "/../../models.example.json"));
+        let path = Path::new(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../models.example.json"
+        ));
         let cfg = ModelsConfig::load(path).expect("the repo's models.example.json loads");
         for (name, model) in &cfg.models {
             assert!(

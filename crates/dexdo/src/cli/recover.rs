@@ -13,7 +13,7 @@ use crate::cli::commands::{
     resolve_pool_recovery_inputs_for_deal, resolve_pool_recovery_plan, AmbiguousRecoveryDeals,
     PoolRecoveryPlan, PoolRecoveryTarget,
 };
-use crate::cli::support::{load_market, read_secret_hex, resolve_market_fields};
+use crate::cli::support::{load_market, resolve_market_fields};
 use serde_json::Value;
 
 fn display_token_contract(value: &dyn std::fmt::Display) -> String {
@@ -413,7 +413,10 @@ async fn run_recover_with_chain_and_marker(
                         note_addr,
                         tc_str,
                         state,
-                        buyer_note.as_ref().map(|note| note.with_workchain()).as_deref(),
+                        buyer_note
+                            .as_ref()
+                            .map(|note| note.with_workchain())
+                            .as_deref(),
                     ));
                 }
                 let deal = select_recorded_deal("recover", &ambiguous, verdicts)?;
@@ -511,7 +514,6 @@ pub(crate) async fn run_recover(args: RecoverArgs) -> Result<()> {
     run_recover_with_chain(args, &chain).await
 }
 
-
 /// The chain surface `dispute` uses, mirroring [`RecoverChain`] so the buyer-side dispute has the same
 /// offline seam its sibling recovery already has.
 #[async_trait::async_trait]
@@ -597,7 +599,10 @@ async fn run_dispute_with_chain(args: DisputeArgs, chain: &dyn DisputeChain) -> 
                         note_addr,
                         tc_str,
                         state,
-                        buyer_note.as_ref().map(|note| note.with_workchain()).as_deref(),
+                        buyer_note
+                            .as_ref()
+                            .map(|note| note.with_workchain())
+                            .as_deref(),
                     ));
                 }
                 let deal = select_recorded_deal("dispute", &ambiguous, verdicts)?;
@@ -655,7 +660,6 @@ async fn run_dispute_with_chain(args: DisputeArgs, chain: &dyn DisputeChain) -> 
     );
     Ok(())
 }
-
 
 pub(crate) fn check_reclaimable_state(
     state: dexdo_core::DealChainState,
@@ -1046,7 +1050,6 @@ async fn drive_reclaim_plan(
     Ok(())
 }
 
-
 pub(crate) async fn run_release_dispute(args: ReleaseDisputeArgs) -> Result<()> {
     use dexdo_core::{
         check_release_disputable, check_seller_pubkey, Address, KeyPair, RealChainBackend,
@@ -1110,7 +1113,6 @@ pub(crate) async fn run_release_dispute(args: ReleaseDisputeArgs) -> Result<()> 
     Ok(())
 }
 
-
 fn required_u64(value: &Value, field: &str, context: &str) -> Result<u64> {
     value[field]
         .as_u64()
@@ -1136,7 +1138,9 @@ pub(crate) struct DealIsNotDisputed {
 
 impl DealIsNotDisputed {
     pub(crate) fn new(message: impl Into<String>) -> Self {
-        Self { message: message.into() }
+        Self {
+            message: message.into(),
+        }
     }
 }
 
@@ -1259,7 +1263,6 @@ pub(crate) async fn run_resolve_dispute_timeout(args: ResolveDisputeTimeoutArgs)
     Ok(())
 }
 
-
 const WITHDRAW_SHELL_GUIDANCE: &str =
     "This withdraws finalized seller proceeds. If this drains the last finalized proceeds from a funded, closed, undisputed deal with no live offer, the TC also selfdestructs; otherwise it remains active.";
 
@@ -1331,7 +1334,6 @@ pub(crate) async fn run_withdraw_shell(args: WithdrawShellArgs) -> Result<()> {
     );
     Ok(())
 }
-
 
 #[cfg(test)]
 mod tests {
@@ -3802,7 +3804,13 @@ mod tests {
     }
 
     impl RecordedDealsChain {
-        fn with_deal(mut self, tc: &str, opened: bool, buyer_note: &str, buyer_secret: &str) -> Self {
+        fn with_deal(
+            mut self,
+            tc: &str,
+            opened: bool,
+            buyer_note: &str,
+            buyer_secret: &str,
+        ) -> Self {
             let keys = dexdo_core::KeyPair::from_secret_hex(buyer_secret).unwrap();
             self.deals.insert(
                 dexdo_core::Address::parse(tc).unwrap().with_workchain(),
@@ -3930,7 +3938,9 @@ mod tests {
             _keys: &dexdo_core::KeyPair,
             tc: &dexdo_core::Address,
         ) -> anyhow::Result<dexdo_core::SettlementActionReceipt> {
-            let deal = self.deal(tc)?.expect("dispute on an inactive TokenContract");
+            let deal = self
+                .deal(tc)?
+                .expect("dispute on an inactive TokenContract");
             assert_eq!(
                 note.with_workchain(),
                 deal.buyer_note,
@@ -3987,9 +3997,7 @@ mod tests {
             .as_array()
             .unwrap()
             .iter()
-            .find(|note| {
-                note["token_contract"].as_str().map(account_of) == Some(account.clone())
-            })
+            .find(|note| note["token_contract"].as_str().map(account_of) == Some(account.clone()))
             .unwrap_or_else(|| panic!("pool must still record {token_contract}"))
             ["token_contract_updated_at_unix"]
             .as_u64()

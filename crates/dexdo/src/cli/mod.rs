@@ -54,10 +54,10 @@ pub(crate) mod markets;
 pub(crate) mod model_registry;
 pub(crate) mod monitor;
 // One snapshot of chain figures through every renderer a person reads, checked for the unit.
-#[cfg(test)]
-mod one_unit_everywhere;
 pub(crate) mod note;
 pub(crate) mod note_cmd;
+#[cfg(test)]
+mod one_unit_everywhere;
 // Which note a command spends from, when the operator did not say: the rows, and the refusal for a
 // run that cannot ask.
 pub(crate) mod note_pick;
@@ -111,8 +111,8 @@ pub(crate) mod qr_compact;
 pub(crate) mod qr_display;
 // What a refusal says to the operator, above what it says to a machine.
 
-pub(crate) mod refusal;
 pub(crate) mod recover;
+pub(crate) mod refusal;
 pub(crate) mod reports;
 // Where a key lives: the operating system's store where the machine has one that keeps a secret
 // until it is deleted, and an owner-only file where it does not. Both branches are ordinary -- a

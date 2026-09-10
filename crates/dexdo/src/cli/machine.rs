@@ -109,23 +109,6 @@ pub(crate) enum MachineFundingNotice {
     ManualTopUpRequested,
 }
 
-impl MachineFundingNotice {
-    /// The same stable name `serde` writes into the `event` field, for the human-facing rendering.
-
-    /// Kept beside the enum so the two spellings live in one file, and pinned to the serialized
-    /// form by a regression rather than by convention.
-    pub(crate) fn event(self) -> &'static str {
-        match self {
-            Self::AlreadyFunded => "already_funded",
-            Self::RequestSubmitted => "request_submitted",
-            Self::RequestAlreadyPending => "request_already_pending",
-            Self::RequestExecuted => "request_executed",
-            Self::RequestIndeterminate => "request_indeterminate",
-            Self::ManualTopUpRequested => "manual_top_up_requested",
-        }
-    }
-}
-
 /// The funding state a money command had already reached when it failed.
 
 /// A `note deploy` that creates a Vault -> Hot request and then times out waiting for the balance
@@ -208,7 +191,9 @@ mod funding_context_1432_tests {
         let wrapped = FundingContext::wrap(MachineFundingNotice::RequestSubmitted, inner);
 
         assert!(
-            wrapped.chain().any(|cause| cause.downcast_ref::<Deeper>().is_some()),
+            wrapped
+                .chain()
+                .any(|cause| cause.downcast_ref::<Deeper>().is_some()),
             "the typed cause fell out of the chain"
         );
         assert!(format!("{wrapped:#}").contains("the transport gave up"));
@@ -306,7 +291,6 @@ impl std::error::Error for SubscriptionStatusOrderNotFound {}
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum ErrorCode {
     InvalidArgument,
-    FeatureUnavailable,
     StaleClient,
     DealRecordSchemaTooNew,
     NoLiquidity,
@@ -368,7 +352,6 @@ impl ErrorCode {
     pub(crate) fn as_str(self) -> &'static str {
         match self {
             Self::InvalidArgument => "INVALID_ARGUMENT",
-            Self::FeatureUnavailable => "FEATURE_UNAVAILABLE",
             Self::StaleClient => "STALE_CLIENT",
             Self::DealRecordSchemaTooNew => "DEAL_RECORD_SCHEMA_TOO_NEW",
             Self::NoLiquidity => "NO_LIQUIDITY",
@@ -414,7 +397,6 @@ impl ErrorCode {
     pub(crate) fn safe_message(self) -> &'static str {
         match self {
             Self::InvalidArgument => "invalid or missing command input",
-            Self::FeatureUnavailable => "requested feature is unavailable in this binary",
             Self::StaleClient => NOTE_DEPLOY_GENERATION_MISMATCH_MESSAGE,
             Self::DealRecordSchemaTooNew => "durable deal record schema is newer than this runtime",
             Self::NoLiquidity => "no executable liquidity is available",
@@ -427,7 +409,9 @@ impl ErrorCode {
             Self::GatewayConnectFailed => "seller gateway connection failed",
             Self::GatewayAuthFailed => "seller gateway authentication failed",
             Self::ChainTransport => "chain transport failed before a by-fact result",
-            Self::AccountUnreadable => "the account could not be read, and retrying will not change that",
+            Self::AccountUnreadable => {
+                "the account could not be read, and retrying will not change that"
+            }
             Self::ChainRevert => "chain returned a non-success contract result",
             Self::AmbiguousSubmit => "money submit outcome is unknown and must not be retried",
             Self::SettlementFailed => "settlement submission failed",
@@ -1483,11 +1467,10 @@ mod tests {
 
     #[test]
     fn classifier_does_not_map_our_own_chain_prefixed_errors_to_chain_transport() {
-        let err =
-            anyhow::anyhow!(format!(
-                "{}: seller offer did not rest after accepted postSellOffer",
-                dexdo_core::params::current_network()
-            ));
+        let err = anyhow::anyhow!(format!(
+            "{}: seller offer did not rest after accepted postSellOffer",
+            dexdo_core::params::current_network()
+        ));
         assert_eq!(classify_error(OP_BUYER_START, &err), ErrorCode::Internal);
     }
 

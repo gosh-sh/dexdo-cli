@@ -70,8 +70,10 @@ fn as_u128(value: &Value, field: &str) -> Result<u128> {
     value
         .as_u64()
         .map(u128::from)
-        .or_else(|| value.as_str().and_then(|text| parse_uint(text)))
-        .ok_or_else(|| anyhow!("multisig getter field `{field}` is not an unsigned integer: {value}"))
+        .or_else(|| value.as_str().and_then(parse_uint))
+        .ok_or_else(|| {
+            anyhow!("multisig getter field `{field}` is not an unsigned integer: {value}")
+        })
 }
 
 fn as_u64(value: &Value, field: &str) -> Result<u64> {
@@ -164,9 +166,8 @@ fn vault_to_hot_submit_transaction_params(fingerprint: &FundingFingerprint) -> R
         send_flag_argument()?,
         fingerprint.payload_for_wire()?.to_string(),
     );
-    params["dapp_id"] = serde_json::json!(dexdo_core::address::to_dapp_id_param(
-        &fingerprint.dapp_id
-    ));
+    params["dapp_id"] =
+        serde_json::json!(dexdo_core::address::to_dapp_id_param(&fingerprint.dapp_id));
     Ok(params)
 }
 
@@ -256,8 +257,9 @@ impl VaultChain for RealVaultChain<'_> {
     ) -> Result<Option<String>> {
         // The frozen fingerprint's own destination, parsed by the one address parser this client
         // has. A destination that does not parse is not a destination a receipt can be proven at.
-        let destination = CanonicalAddress::parse(destination)
-            .map_err(|e| anyhow!("funding destination {destination} is not a chain address: {e}"))?;
+        let destination = CanonicalAddress::parse(destination).map_err(|e| {
+            anyhow!("funding destination {destination} is not a chain address: {e}")
+        })?;
         let http = dexdo_core::chain_http_client()?;
         dexdo_core::chain::prove_multisig_delivery_message(
             &http,
@@ -332,7 +334,9 @@ impl VaultChain for RealVaultChain<'_> {
             Ok(receipt) => receipt,
             Err(error) => {
                 return Ok(SubmitOutcome::Indeterminate {
-                    reason: format!("the Vault submitTransaction receipt could not be read: {error}"),
+                    reason: format!(
+                        "the Vault submitTransaction receipt could not be read: {error}"
+                    ),
                 })
             }
         };

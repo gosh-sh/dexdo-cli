@@ -68,7 +68,6 @@ fn a_url_in_the_manifest_is_kept_as_given() {
     assert_eq!(resolved, "https://net-a.example");
 }
 
-
 // What stood here described the opposite contract: "an unreadable manifest is not a refusal here,
 // the network's own default answers instead". That default was removed by and the sentence
 // outlived it, attached to no test -- so an auditor reading this directory found two files stating

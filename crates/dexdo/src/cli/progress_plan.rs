@@ -10,28 +10,10 @@
 //! that says `preparing` while nothing happens for two minutes reads as a hung command rather than
 //! as a request. Measured on a a live chain deploy: 147 seconds under one unchanging label.
 
-//! Pure. The escape sequences that put this on a terminal live in `progress_draw`; here a plan is a
-//! list of strings and a cursor, and rendering it is a list of strings out.
+//! Pure. The escape sequences that put this on a terminal live in `progress_draw`; here a plan
+//! advances a cursor and returns only the completed lines that the caller leaves in the log.
 
-/// Where a step stands.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(super) enum StepState {
-    Done,
-    Current,
-    Pending,
-}
-
-/// Marks chosen so the three states stay apart in a screenshot, in a pipe, and for a reader who
-/// cannot see colour: the tick is the only filled glyph, the arrow points at exactly one line.
-impl StepState {
-    fn mark(self) -> &'static str {
-        match self {
-            StepState::Done => "\u{2714}",
-            StepState::Current => "\u{25b8}",
-            StepState::Pending => "\u{2610}",
-        }
-    }
-}
+const DONE_MARK: &str = "\u{2714}";
 
 /// One declared step, in the two tenses it is read in.
 
@@ -103,7 +85,7 @@ impl Plan {
             .map(|step| {
                 format!(
                     "{} [{}/{total}] {}",
-                    StepState::Done.mark(),
+                    DONE_MARK,
                     step + 1,
                     self.steps[step].done
                 )
@@ -124,38 +106,6 @@ impl Plan {
     pub(super) fn position(&self) -> Option<(usize, usize)> {
         (self.at < self.steps.len()).then(|| (self.at + 1, self.steps.len()))
     }
-
-    fn state_of(&self, index: usize) -> StepState {
-        match index.cmp(&self.at) {
-            std::cmp::Ordering::Less => StepState::Done,
-            std::cmp::Ordering::Equal => StepState::Current,
-            std::cmp::Ordering::Greater => StepState::Pending,
-        }
-    }
-
-    /// The checklist as lines, top to bottom.
-
-    /// `current` replaces the current step's text when the running code has said something more
-    /// specific than the declared step -- the wallet confirmation being the case that matters. The
-    /// declared step is what a finished line keeps, so the checklist reads the same afterwards no
-    /// matter what was happening while it ran.
-    pub(super) fn lines(&self, current: Option<&str>) -> Vec<(StepState, String)> {
-        self.steps
-            .iter()
-            .enumerate()
-            .map(|(index, step)| {
-                let state = self.state_of(index);
-                let text = match (state, current) {
-                    (StepState::Current, Some(detail)) if detail != step.doing => {
-                        detail.to_string()
-                    }
-                    (StepState::Done, _) => step.done.clone(),
-                    _ => step.doing.clone(),
-                };
-                (state, format!("{} {text}", state.mark()))
-            })
-            .collect()
-    }
 }
 
 #[cfg(test)]
@@ -171,27 +121,17 @@ mod tests {
     }
 
     #[test]
-    fn a_fresh_plan_has_one_current_step_and_the_rest_ahead() {
-        let states: Vec<StepState> = plan().lines(None).into_iter().map(|(s, _)| s).collect();
-        assert_eq!(
-            states,
-            vec![StepState::Current, StepState::Pending, StepState::Pending]
-        );
-    }
-
-    #[test]
     fn advancing_ticks_everything_behind_the_new_step() {
         let mut plan = plan();
         assert_eq!(
             plan.advance_to("proving the note"),
-            vec!["\u{2714} [1/3] network checked", "\u{2714} [2/3] Hot funded"],
+            vec![
+                "\u{2714} [1/3] network checked",
+                "\u{2714} [2/3] Hot funded"
+            ],
             "the steps a move leaves behind are what gets ticked into the log"
         );
-        let states: Vec<StepState> = plan.lines(None).into_iter().map(|(s, _)| s).collect();
-        assert_eq!(
-            states,
-            vec![StepState::Done, StepState::Done, StepState::Current]
-        );
+        assert_eq!(plan.position(), Some((3, 3)));
     }
 
     /// The case this exists for: the client is not working, it is waiting on the operator, and the
@@ -203,13 +143,12 @@ mod tests {
             plan.advance_to("funding Hot: confirm the transfer in the wallet"),
             vec!["\u{2714} [1/3] network checked"]
         );
-        let lines = plan.lines(Some("funding Hot: confirm the transfer in the wallet"));
-        assert_eq!(lines[0].0, StepState::Done);
-        assert_eq!(lines[1].1, "\u{25b8} funding Hot: confirm the transfer in the wallet");
-        // The declared text is what the finished line keeps.
-        let mut plan = plan;
-        plan.finish();
-        assert_eq!(plan.lines(None)[1].1, "\u{2714} Hot funded");
+        assert_eq!(plan.position(), Some((2, 3)));
+        assert_eq!(
+            plan.finish(),
+            vec!["\u{2714} [2/3] Hot funded", "\u{2714} [3/3] note proved"],
+            "the declared past-tense labels are what completed lines keep"
+        );
     }
 
     /// A label the plan never declared -- a prover phase, say -- must not move the checklist, and
@@ -217,10 +156,8 @@ mod tests {
     #[test]
     fn an_undeclared_label_leaves_the_checklist_alone() {
         let mut plan = plan();
-        assert!(plan
-            .advance_to("proving: generate_proof (warm)")
-            .is_empty());
-        assert_eq!(plan.lines(None)[0].0, StepState::Current);
+        assert!(plan.advance_to("proving: generate_proof (warm)").is_empty());
+        assert_eq!(plan.position(), Some((1, 3)));
     }
 
     /// A line left behind reports what happened; a line still running says what is happening. The
@@ -228,10 +165,11 @@ mod tests {
     #[test]
     fn a_passed_step_is_reported_in_the_past_tense() {
         let mut plan = plan();
-        assert_eq!(plan.advance_to("funding Hot"), vec!["\u{2714} [1/3] network checked"]);
-        let lines = plan.lines(None);
-        assert_eq!(lines[0].1, "\u{2714} network checked");
-        assert_eq!(lines[1].1, "\u{25b8} funding Hot");
+        assert_eq!(
+            plan.advance_to("funding Hot"),
+            vec!["\u{2714} [1/3] network checked"]
+        );
+        assert_eq!(plan.position(), Some((2, 3)));
     }
 
     /// A resumed run re-reads the chain after it has proved. Un-ticking would claim work was
@@ -240,8 +178,8 @@ mod tests {
     fn the_checklist_never_goes_backwards() {
         let mut plan = plan();
         plan.advance_to("proving the note");
-        plan.advance_to("checking the network");
-        assert_eq!(plan.lines(None)[2].0, StepState::Current);
+        assert!(plan.advance_to("checking the network").is_empty());
+        assert_eq!(plan.position(), Some((3, 3)));
     }
 
     /// The counter is what replaced the block that could never fill in: it has to name the step the
@@ -255,13 +193,5 @@ mod tests {
         plan.finish();
         assert_eq!(plan.position(), None);
         assert_eq!(Plan::default().position(), None);
-    }
-
-    #[test]
-    fn a_finished_plan_has_no_current_step() {
-        let mut plan = plan();
-        plan.finish();
-        let states: Vec<StepState> = plan.lines(None).into_iter().map(|(s, _)| s).collect();
-        assert!(states.iter().all(|state| *state == StepState::Done));
     }
 }

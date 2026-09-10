@@ -1,3 +1,17 @@
+## v0.3.0
+
+### New / Improvements
+
+- The client now ships its user guides in `docs/`: a glossary of the market's terms, the registered-model page that shows how to export the on-chain name list and check one name against it, and a walkthrough of wallets, private notes and how funds move between them. They were not part of the published tree before.
+
+### Fixes
+
+- Fixed billing on provider-native streams, which counted only output tokens and so undercharged every request by the length of its prompt, leaving buyer and seller totals disagreeing about the same deal. Input and output usage are now accounted together against a separate billing grant, while the cap you set on model output stays output-only: an explicit output limit above the billing grant is refused rather than silently clamped. Sellers proxying Anthropic should expect a stricter stream: exactly one initial usage record is required before any content, a repeated or missing one ends the stream, and a malformed provider stream is no longer billable.
+- Fixed a buy that could end after its money had already been posted. One connection reset while polling for the fill was turned into `ambiguous submit ... no resubmit is safe`, ending a purchase that was in fact still in flight. Those reads now go through the same retry policy as every other read on the money path; the surrounding wait bounds are unchanged, so an exhausted read still gives up as before.
+- Fixed `dexdo doctor` running a label into its value when the label filled its column, which printed lines such as `generationmanifest 4.0.36, chain 4.0.36`. The separator is now part of the layout, so it is present at every label length, including the contract rows whose labels come from the manifest.
+- Fixed OpenAI-compatible B7 sampling controls: readiness no longer sends reproducibility fields, and model profiles can set `capabilities.sample_algorithm` to `SEED`, `RANDOM_SEED`, `TOP_K`, or `NONE`. Omitted values default to `NONE` and degrade the reference comparison instead of rejecting honest sellers whose endpoint generates independently. The ineffective `DO_SAMPLE` value is no longer accepted; GLM profiles use `NONE`, and other non-`NONE` values require measured reproducibility on that exact endpoint.
+- Fixed `dexdo market-data list` and `dexdo market-data show` output to use JSON fields `modelRefName` and `contractVersion` and table fields `model_ref` and `contract_version`; no flag or configuration changes are required.
+
 ## v0.2.1
 
 ### Breaking Changes

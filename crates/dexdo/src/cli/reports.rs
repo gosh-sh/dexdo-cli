@@ -4,7 +4,7 @@
 use crate::cli::args::ExportFormatArg;
 use crate::cli::args::{DashboardArgs, DealsArgs, ExportArgs, HistoryArgs, StatusArgs};
 use crate::cli::commands::{
-    close_hint, deal_contracts_path, load_deal_target, chain_doctor_preflight_market,
+    chain_doctor_preflight_market, close_hint, deal_contracts_path, load_deal_target,
 };
 use crate::cli::commands::{mock_chain_for_machine, resolve_mock_deal_target, role_arg_str};
 use crate::cli::{audit, dashboard, deals, machine};
@@ -468,17 +468,9 @@ pub(crate) async fn run_status(args: StatusArgs) -> Result<()> {
             .map(|v| v.to_string())
             .unwrap_or_else(|| "-".to_string())
     );
-    println!(
-        "{}",
-        close_hint(
-            &target,
-            &s,
-            args.deals_dir.as_deref()
-        )
-    );
+    println!("{}", close_hint(&target, &s, args.deals_dir.as_deref()));
     Ok(())
 }
-
 
 pub(crate) async fn run_export(args: ExportArgs) -> Result<()> {
     use dexdo_core::RealChainBackend;
@@ -537,7 +529,6 @@ pub(crate) async fn run_export(args: ExportArgs) -> Result<()> {
     }
     Ok(())
 }
-
 
 #[cfg(test)]
 mod tests {
@@ -631,16 +622,16 @@ mod tests {
     #[test]
     fn status_reports_a_destroyed_token_contract_as_closed_instead_of_failing_its_preflight() {
         let source = include_str!("reports.rs");
-        let body =
-            crate::cli::source_probe::code_of(source, "pub(crate) async fn run_status(args: StatusArgs)");
+        let body = crate::cli::source_probe::code_of(
+            source,
+            "pub(crate) async fn run_status(args: StatusArgs)",
+        );
 
         let snapshot_read = body
             .find("let deal_snapshot = chain.token_contract_deal_snapshot(&tc).await?;")
             .expect("status must read the deal snapshot itself");
         let preflight = body
-            .find(
-                "chain_doctor_preflight_market(&contracts_path, target.market.as_ref()).await?",
-            )
+            .find("chain_doctor_preflight_market(&contracts_path, target.market.as_ref()).await?")
             .expect("status must still run the market preflight");
         assert!(
             snapshot_read < preflight,
@@ -666,8 +657,10 @@ mod tests {
 
         // The relaxation is scoped to `status`. Every other command keeps the preflight ahead of
         // everything it does, because there an inactive TokenContract IS a failure.
-        let export_body =
-            crate::cli::source_probe::code_of(source, "pub(crate) async fn run_export(args: ExportArgs)");
+        let export_body = crate::cli::source_probe::code_of(
+            source,
+            "pub(crate) async fn run_export(args: ExportArgs)",
+        );
         let export_preflight = export_body
             .find("chain_doctor_preflight_market(")
             .expect("export keeps its market preflight");

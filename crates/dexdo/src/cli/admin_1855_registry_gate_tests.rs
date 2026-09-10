@@ -76,8 +76,9 @@ fn the_seller_refuses_a_spelling_the_registry_holds_differently() {
 #[test]
 fn the_live_520_seller_spelling_is_refused_before_the_offer_is_posted() {
     let listed = "qwen--qwen3.6--27b";
-    ensure_model_flags_are_canonical(ModelResolutionCaller::Seller, listed, false)
-        .expect("no flag tail here: this is a base-name spelling, and the flag gate must not claim it");
+    ensure_model_flags_are_canonical(ModelResolutionCaller::Seller, listed, false).expect(
+        "no flag tail here: this is a base-name spelling, and the flag gate must not claim it",
+    );
     let error = model_resolution_result(
         ModelResolutionCaller::Seller,
         listed,
@@ -177,9 +178,12 @@ fn a_name_the_registry_confirms_byte_for_byte_lists() {
 /// catalog miss would produce.
 #[test]
 fn a_flag_token_that_is_not_a_flag_token_is_refused() {
-    let error =
-        ensure_model_flags_are_canonical(ModelResolutionCaller::Seller, "qwen--qwen3--32b--toolz", false)
-            .unwrap_err();
+    let error = ensure_model_flags_are_canonical(
+        ModelResolutionCaller::Seller,
+        "qwen--qwen3--32b--toolz",
+        false,
+    )
+    .unwrap_err();
     let message = error.to_string();
     assert!(
         message.contains("toolz"),
@@ -195,7 +199,11 @@ fn a_flag_token_that_is_not_a_flag_token_is_refused() {
 /// [--think][--<precision>]`. `tools` is slot 3 and a window is slot 1, so this pair is backwards.
 #[test]
 fn flags_written_out_of_canonical_order_are_refused() {
-    let error = ensure_model_flags_are_canonical(ModelResolutionCaller::Seller, "qwen--qwen3--32b--tools--w8k", false)
+    let error = ensure_model_flags_are_canonical(
+        ModelResolutionCaller::Seller,
+        "qwen--qwen3--32b--tools--w8k",
+        false,
+    )
     .unwrap_err();
     assert!(
         error.to_string().contains("w8k"),
@@ -206,7 +214,11 @@ fn flags_written_out_of_canonical_order_are_refused() {
 /// One slot, one occurrence. Two windows are two answers to the same question.
 #[test]
 fn a_slot_written_twice_is_refused() {
-    let error = ensure_model_flags_are_canonical(ModelResolutionCaller::Seller, "qwen--qwen3--32b--w8k--w16k", false)
+    let error = ensure_model_flags_are_canonical(
+        ModelResolutionCaller::Seller,
+        "qwen--qwen3--32b--w8k--w16k",
+        false,
+    )
     .unwrap_err();
     assert!(
         error.to_string().contains("w16k"),
@@ -218,9 +230,12 @@ fn a_slot_written_twice_is_refused() {
 /// falling through to "unknown token".
 #[test]
 fn a_packing_spelling_is_refused_as_a_flag() {
-    let error =
-        ensure_model_flags_are_canonical(ModelResolutionCaller::Seller, "qwen--qwen3--32b--awq", false)
-            .unwrap_err();
+    let error = ensure_model_flags_are_canonical(
+        ModelResolutionCaller::Seller,
+        "qwen--qwen3--32b--awq",
+        false,
+    )
+    .unwrap_err();
     assert!(error.to_string().contains("awq"), "{error}");
 }
 
@@ -288,9 +303,13 @@ fn well_formed_flags_pass_the_flag_gate_and_the_registry_is_what_refuses_them() 
     let flagged = "qwen--qwen3--32b--w8k--tools";
     ensure_model_flags_are_canonical(ModelResolutionCaller::Seller, flagged, false)
         .expect("`w8k` then `tools` is slot 1 then slot 3: canonical, and the grammar says so");
-    let error =
-        model_resolution_result(ModelResolutionCaller::Seller, flagged, false, Ok("Qwen3-32B".to_string()))
-            .unwrap_err();
+    let error = model_resolution_result(
+        ModelResolutionCaller::Seller,
+        flagged,
+        false,
+        Ok("Qwen3-32B".to_string()),
+    )
+    .unwrap_err();
     let message = error.to_string();
     assert!(
         message.contains("w8k") && message.contains("tools"),

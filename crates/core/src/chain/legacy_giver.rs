@@ -805,9 +805,11 @@ async fn live_chain_connect_and_read() {
 #[tokio::test]
 #[ignore = "live: mints testnet SHELL from the Giver (a real write submit)"]
 async fn live_giver_funds_fresh_wallet() {
+    use super::client::test_giver::{
+        giver_from_env, GIVER_ADDRESS_VAR, GIVER_PUBKEY_VAR, GIVER_SECRET_VAR,
+    };
     use gosh_ackinacki::airegistry::deploy::{build_deploy, local_context};
     use gosh_ackinacki::wallet::giver::GiverClient;
-    use super::client::test_giver::{giver_from_env, GIVER_ADDRESS_VAR, GIVER_PUBKEY_VAR, GIVER_SECRET_VAR};
 
     // The faucet comes from the environment, not from an SDK preset: a preset carries its private
     // key into every build that links it.
@@ -825,7 +827,7 @@ async fn live_giver_funds_fresh_wallet() {
         &giver_from_env(GIVER_ADDRESS_VAR).expect("giver address"),
         &giver_from_env(GIVER_PUBKEY_VAR).expect("giver pubkey"),
         &giver_from_env(GIVER_SECRET_VAR).expect("giver secret"),
-        &endpoint,
+        endpoint,
         http.clone(),
     );
 
@@ -857,16 +859,16 @@ async fn live_giver_funds_fresh_wallet() {
     // Giver diagnostics: whether it exists, whether it is funded, and whether the keys in the SDK config are stale
     // (after an an emergency chain restart the genesis contracts were re-keyed -- comment on 82dbe51).
     {
-        let be0 = RealChainBackend::connect(live_manifest())
-        .expect("connect");
-        let gaddr = Address::parse(&giver_from_env(GIVER_ADDRESS_VAR).expect("giver address")).unwrap();
+        let be0 = RealChainBackend::connect(live_manifest()).expect("connect");
+        let gaddr =
+            Address::parse(&giver_from_env(GIVER_ADDRESS_VAR).expect("giver address")).unwrap();
         match be0.client().get_account(&gaddr).await.expect("get giver") {
             Some(a) => println!(
                 "=== Giver {gaddr}: active={} shell={} ecc2={} (SDK giver_pubkey={}) ===",
                 a.is_active(),
                 a.shell(),
                 a.ecc_balance(2),
-                &giver_from_env(GIVER_PUBKEY_VAR).unwrap_or_else(|_| "?".to_string())
+                giver_from_env(GIVER_PUBKEY_VAR).unwrap_or_else(|_| "?".to_string())
             ),
             None => println!("=== Giver {gaddr}: NOT FOUND on chain ==="),
         }
@@ -918,7 +920,6 @@ async fn live_giver_funds_fresh_wallet() {
 #[tokio::test]
 #[ignore = "live: refill operational wallet stock from the chain's test giver"]
 async fn live_refill_wallet_stock_from_giver() -> Result<()> {
-    use gosh_ackinacki::config::AiRegistryConfig;
     use gosh_ackinacki::wallet::query::fetch_dapp_id;
 
     let plan_path = std::env::var("DEXDO_WALLET_REFILL_PLAN")
@@ -995,7 +996,8 @@ async fn live_refill_wallet_stock_from_giver() -> Result<()> {
         .checked_add(deploy_reserve)
         .ok_or_else(|| anyhow!("wallet refill planned giver mint overflow"))?;
 
-    let giver_text = super::client::test_giver::giver_from_env(super::client::test_giver::GIVER_ADDRESS_VAR)?;
+    let giver_text =
+        super::client::test_giver::giver_from_env(super::client::test_giver::GIVER_ADDRESS_VAR)?;
     let giver = Address::parse(&giver_text)?;
     let giver_dapp_id = fetch_dapp_id(&be.http, be.client().endpoint(), giver.bare()).await?;
     let giver_dapp = Address::parse(&format!("0:{giver_dapp_id}"))?;
@@ -1003,10 +1005,12 @@ async fn live_refill_wallet_stock_from_giver() -> Result<()> {
         .client()
         .get_account_in_dapp(&giver, &giver_dapp)
         .await
-        .map_err(|e| anyhow!(
+        .map_err(|e| {
+            anyhow!(
                 "cannot query the configured {} Giver {giver}: {e}",
                 crate::params::current_network()
-            ))?;
+            )
+        })?;
     let giver_observation = giver_account
         .as_ref()
         .map(|account| GiverMintFaucetObservation {
@@ -2898,8 +2902,8 @@ async fn live_stream_open_and_probe_burn() {
 #[tokio::test]
 #[ignore = "live: drive a deal through the RealDealBackend ChainBackend trait on the chain (~6min)"]
 async fn live_real_deal_backend_trait() {
-    use crate::market::{ChainBackend, SellOffer};
     use crate::machine::Settlement;
+    use crate::market::{ChainBackend, SellOffer};
     use crate::note::Note;
 
     let Ok(pool_path) = std::env::var("DEXDO_PN_POOL") else {

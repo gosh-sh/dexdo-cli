@@ -3,9 +3,8 @@ use anyhow::Result;
 
 use anyhow::Context;
 use dexdo_core::{
-    buyer_net_result, buyer_total_debit, implied_write_off, Deployed, RealChainBackend,
-    TokenContractCurrentFacts, TokenContractReceiptChainData, TokenContractSettlementEvent,
-    TokenContractSettlementReceipt,
+    buyer_net_result, buyer_total_debit, Deployed, RealChainBackend, TokenContractCurrentFacts,
+    TokenContractReceiptChainData, TokenContractSettlementEvent, TokenContractSettlementReceipt,
 };
 use serde::Serialize;
 use serde_json::{json, Value};
@@ -1361,7 +1360,7 @@ fn build_receipt(
         missing,
     };
     let conservation = conservation_receipt(
-        &events,
+        events,
         terminal_events.first().map(|receipt| &receipt.event),
         chain,
         buyer_address.as_deref(),
@@ -1470,10 +1469,7 @@ fn conservation_detail(conservation: &ConservationReceipt) -> String {
     parts.push(if conservation.unexplained.is_empty() {
         "unexplained: not established".to_string()
     } else {
-        format!(
-            "unexplained {} raw ECC[2] SHELL",
-            conservation.unexplained
-        )
+        format!("unexplained {} raw ECC[2] SHELL", conservation.unexplained)
     });
     parts.extend(conservation.missing.iter().cloned());
     parts.join("; ")
@@ -1575,11 +1571,9 @@ fn receipt_exit_status(receipt: &SettlementReceiptV1, require_conserved: bool) -
     let Some(refusal) = conservation_refusal(receipt) else {
         return Ok(());
     };
-    let envelope = super::machine::MachineError::new(
-        super::machine::OP_SETTLEMENT_RECEIPT,
-        refusal.code,
-    )
-    .with_cause(refusal.cause);
+    let envelope =
+        super::machine::MachineError::new(super::machine::OP_SETTLEMENT_RECEIPT, refusal.code)
+            .with_cause(refusal.cause);
     match super::machine::print_json(&envelope) {
         Ok(()) => Err(super::machine::printed_error()),
         Err(error) => Err(error),
@@ -1592,8 +1586,8 @@ pub(crate) async fn run_settlement_receipt(args: SettlementReceiptArgs) -> Resul
         .map_err(|error| anyhow::anyhow!("TOKEN_CONTRACT {}: {error}", args.token_contract))?;
     let token_contract_text = token_contract.with_workchain();
     let manifest = crate::cli::commands::manifest_path()?;
-    let deployed = Deployed::load(&manifest)
-        .with_context(|| format!("load {}", manifest.display()))?;
+    let deployed =
+        Deployed::load(&manifest).with_context(|| format!("load {}", manifest.display()))?;
     let endpoint = dexdo_core::resolve_endpoint(None, &deployed)?;
     let expected_code_hash = dexdo_core::chain::compiled_contract_hash("TokenContract")
         .ok()
@@ -1625,7 +1619,6 @@ pub(crate) async fn run_settlement_receipt(args: SettlementReceiptArgs) -> Resul
     // caller that asked for the gate still gets the data it came for..
     receipt_exit_status(&receipt, args.require_conserved)
 }
-
 
 #[cfg(test)]
 mod tests {
@@ -2131,7 +2124,13 @@ mod tests {
                                 deposit: 2_050_000_000,
                             },
                         ),
-                        event("bond", 2, BuyerBondFunded { amount: 2_000_000_000 }),
+                        event(
+                            "bond",
+                            2,
+                            BuyerBondFunded {
+                                amount: 2_000_000_000,
+                            },
+                        ),
                         event(
                             "destroyed",
                             3,
@@ -2155,7 +2154,10 @@ mod tests {
             assert!(receipt.outcome.deal_amount.is_none());
             assert!(receipt.outcome.missing.is_empty());
             let value = as_value(&receipt);
-            assert_eq!(value["outcome"]["note_credits"][0]["message_id"], "credit-4");
+            assert_eq!(
+                value["outcome"]["note_credits"][0]["message_id"],
+                "credit-4"
+            );
             assert_eq!(value["outcome"]["notes_read"][0], buyer);
             // The buyer bond is now in the sequence: without it a reader sees a 4.05 return against
             // a 2.05 deposit and cannot account for the difference.

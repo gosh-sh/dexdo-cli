@@ -19,7 +19,7 @@ pub use advance::{
 pub use keeper::{
     drive_subscription_keeper, drive_subscription_keeper_with_observer, SubscriptionKeeperObserver,
 };
-pub use models::{Capabilities, ModelConfig, ModelsConfig};
+pub use models::{Capabilities, ModelConfig, ModelsConfig, SampleAlgorithm};
 pub use upstream::{anthropic::AnthropicConfig, openai::OpenAiConfig, UpstreamConfig};
 
 use anyhow::{anyhow, bail, Result};
@@ -1062,7 +1062,14 @@ mod tests {
                 .0
                 .to_vec(),
             nonce: challenge.nonce,
-            request: Some(CanonRequest::default()),
+            request: Some(CanonRequest {
+                params: Some(dexdo_proto::SamplingParams {
+                    max_tokens: 1,
+                    ..Default::default()
+                }),
+                ..Default::default()
+            }),
+            billing_grant_tokens: 1,
         }
     }
 

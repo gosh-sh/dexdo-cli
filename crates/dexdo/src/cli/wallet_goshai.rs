@@ -79,7 +79,13 @@ fn display_label(network: &str) -> String {
     network
         .trim()
         .chars()
-        .map(|c| if c.is_ascii_graphic() || c == ' ' { c } else { '?' })
+        .map(|c| {
+            if c.is_ascii_graphic() || c == ' ' {
+                c
+            } else {
+                '?'
+            }
+        })
         .take(64)
         .collect()
 }
@@ -247,32 +253,12 @@ impl PasteFault {
             }
         }
     }
-
-    /// Which half a re-prompt should ask for, or `None` when the whole string must be re-entered.
-    const fn missing_half(self) -> Option<WalletPart> {
-        match self {
-            Self::Empty | Self::Separator | Self::Shape => None,
-            Self::AddressMissing
-            | Self::AddressAmbiguous
-            | Self::AddressMalformed
-            | Self::AddressNotSelfDapp => Some(WalletPart::Address),
-            Self::PhraseMissing | Self::PhraseAmbiguous | Self::PhraseInvalid => {
-                Some(WalletPart::Phrase)
-            }
-        }
-    }
 }
 
 impl std::fmt::Display for PasteFault {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(f, "{}: {}", self.class(), self.advice())
     }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum WalletPart {
-    Address,
-    Phrase,
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -563,20 +549,6 @@ pub(crate) fn collect_wallet_string(
     }
 }
 
-/// Which half [`collect_wallet_string`] will ask for next, given what it holds. Exposed so the
-/// re-prompt behaviour can be asserted directly rather than inferred from prompt text.
-pub(crate) const fn next_prompt_for(
-    has_address: bool,
-    has_phrase: bool,
-) -> Option<(&'static str, Option<WalletPart>)> {
-    match (has_address, has_phrase) {
-        (true, true) => None,
-        (true, false) => Some((PROMPT_PHRASE_ONLY, Some(WalletPart::Phrase))),
-        (false, true) => Some((PROMPT_ADDRESS_ONLY, Some(WalletPart::Address))),
-        (false, false) => Some((PROMPT_WHOLE_STRING, None)),
-    }
-}
-
 // ---------------------------------------------------------------------------------------------
 // Waiting for an asynchronous deploy
 // ---------------------------------------------------------------------------------------------
@@ -599,9 +571,6 @@ pub(crate) enum PollVerdict {
     /// The Hot is `Active`; the refusal list may now be applied.
     Active,
 }
-
-/// The three account states of an asynchronous deploy, named by the spec.
-pub(crate) const EXPECTED_DEPLOY_STATES: [&str; 3] = ["NotFound", "NonExist", "Uninit"];
 
 /// Decide what one read means.
 
@@ -1111,7 +1080,10 @@ pub(crate) mod files {
     /// choice is never silent.
     pub(crate) fn find_resumable(wallet_root: &Path, network: &WalletNetwork) -> Option<String> {
         let mut best: Option<(std::time::SystemTime, String)> = None;
-        for entry in std::fs::read_dir(wallet_root.join("bindings")).ok()?.flatten() {
+        for entry in std::fs::read_dir(wallet_root.join("bindings"))
+            .ok()?
+            .flatten()
+        {
             let Some(dir_name) = entry.file_name().to_str().map(str::to_string) else {
                 continue;
             };
@@ -1299,12 +1271,6 @@ pub(crate) fn resume_onboarding(
     }))
 }
 
-/// A binding id, generated before any key material exists.
-pub(crate) fn new_binding_id() -> String {
-    let bytes: [u8; 16] = rand::random();
-    hex::encode(bytes)
-}
-
 // ---------------------------------------------------------------------------------------------
 // Production wiring
 // ---------------------------------------------------------------------------------------------
@@ -1325,8 +1291,8 @@ mod live {
     use std::time::{Duration, Instant};
 
     use anyhow::{bail, Context as _, Result};
-    use dexdo_core::params::{GOSHAI_HOT_ACTIVATION_POLL_INTERVAL, GOSHAI_HOT_ACTIVATION_TIMEOUT};
     use dexdo_core::chain::RetryingReads as _;
+    use dexdo_core::params::{GOSHAI_HOT_ACTIVATION_POLL_INTERVAL, GOSHAI_HOT_ACTIVATION_TIMEOUT};
     use dexdo_core::{Address, CanonicalAddress};
     use zeroize::Zeroizing;
 
@@ -1620,8 +1586,9 @@ mod live {
             }
         };
 
-        let chain = dexdo_core::ChainClient::connect(&endpoint)
-            .map_err(|error| anyhow::anyhow!("connect verification endpoint {endpoint}: {error}"))?;
+        let chain = dexdo_core::ChainClient::connect(&endpoint).map_err(|error| {
+            anyhow::anyhow!("connect verification endpoint {endpoint}: {error}")
+        })?;
         let address = chain_address(&prepared.hot_address)?;
         await_active_hot(&chain, &address, options.activation_timeout).await?;
 
@@ -1947,33 +1914,6 @@ mod tests {
         );
     }
 
-    #[test]
-    fn the_next_prompt_follows_only_from_which_half_is_held() {
-        assert_eq!(
-            next_prompt_for(false, false).map(|(p, _)| p),
-            Some(PROMPT_WHOLE_STRING)
-        );
-        assert_eq!(
-            next_prompt_for(true, false),
-            Some((PROMPT_PHRASE_ONLY, Some(WalletPart::Phrase)))
-        );
-        assert_eq!(
-            next_prompt_for(false, true),
-            Some((PROMPT_ADDRESS_ONLY, Some(WalletPart::Address)))
-        );
-        assert_eq!(next_prompt_for(true, true), None);
-        // And every fault knows which half it is about, so the loop cannot ask for the wrong one.
-        assert_eq!(
-            PasteFault::AddressAmbiguous.missing_half(),
-            Some(WalletPart::Address)
-        );
-        assert_eq!(
-            PasteFault::PhraseInvalid.missing_half(),
-            Some(WalletPart::Phrase)
-        );
-        assert_eq!(PasteFault::Shape.missing_half(), None);
-    }
-
     // -----------------------------------------------------------------------------------------
     // A wrong paste never appears in any output
     // -----------------------------------------------------------------------------------------
@@ -2201,22 +2141,23 @@ mod tests {
     #[test]
     fn each_binding_id_gets_its_own_directory_so_a_rebind_cannot_overwrite_old_secrets() {
         let root = tempfile::tempdir().expect("tempdir");
-        let first = files::GoshAiPaths::new(root.path(), crate::cli::wallet::test_network_a(), "binding-one");
-        let second = files::GoshAiPaths::new(root.path(), crate::cli::wallet::test_network_a(), "binding-two");
+        let first = files::GoshAiPaths::new(
+            root.path(),
+            crate::cli::wallet::test_network_a(),
+            "binding-one",
+        );
+        let second = files::GoshAiPaths::new(
+            root.path(),
+            crate::cli::wallet::test_network_a(),
+            "binding-two",
+        );
         assert_ne!(first.seed_file, second.seed_file);
         assert_ne!(first.draft_file, second.draft_file);
         // One active binding, whichever directory it points at.
         assert_eq!(first.active_binding_file, second.active_binding_file);
-        assert!(first.active_binding_file.ends_with("wallet/active/net-a.json"));
-    }
-
-    #[test]
-    fn a_binding_id_is_unique_per_run() {
-        let a = new_binding_id();
-        let b = new_binding_id();
-        assert_ne!(a, b);
-        assert_eq!(a.len(), 32);
-        assert!(a.bytes().all(|byte| byte.is_ascii_hexdigit()));
+        assert!(first
+            .active_binding_file
+            .ends_with("wallet/active/net-a.json"));
     }
 
     // -----------------------------------------------------------------------------------------
@@ -2225,13 +2166,13 @@ mod tests {
 
     #[test]
     fn not_found_non_exist_and_uninit_are_waiting_states() {
-        assert_eq!(EXPECTED_DEPLOY_STATES, ["NotFound", "NonExist", "Uninit"]);
+        let expected_deploy_states = ["NotFound", "NonExist", "Uninit"];
         // An account the chain does not have at all is `NotFound` expressed as absence.
         assert!(matches!(
             classify_hot_poll(&HotPoll::Absent),
             PollVerdict::KeepWaiting(_)
         ));
-        for state in EXPECTED_DEPLOY_STATES {
+        for state in expected_deploy_states {
             assert!(
                 matches!(
                     classify_hot_poll(&HotPoll::Status(state.to_string())),
@@ -2448,8 +2389,11 @@ mod tests {
         .expect("a supported Hot holding our custodian");
         // The flow BUILDS the binding; the store is the single writer and archives what it
         // replaces. Committing here is what the production path does in `run_selected`.
-        let binding =
-            files::active_binding(&prepared.paths, crate::cli::wallet::test_network_a(), &prepared.hot_address);
+        let binding = files::active_binding(
+            &prepared.paths,
+            crate::cli::wallet::test_network_a(),
+            &prepared.hot_address,
+        );
         let store = crate::cli::wallet::WalletStore::at(&prepared.paths.wallet_root);
         assert_eq!(
             store.binding_path(&crate::cli::wallet::test_network_a()),
@@ -2462,7 +2406,10 @@ mod tests {
 
         assert_eq!(binding.provider, WalletProvider::GoshAi);
         assert_eq!(binding.hot_address, hot_address());
-        assert_eq!(binding.hot_seed_file, Some(prepared.paths.seed_file.clone()));
+        assert_eq!(
+            binding.hot_seed_file,
+            Some(prepared.paths.seed_file.clone())
+        );
         let written: serde_json::Value = serde_json::from_str(
             &std::fs::read_to_string(&prepared.paths.active_binding_file).expect("binding file"),
         )
@@ -2546,8 +2493,11 @@ mod tests {
         let draft: GoshAiOnboardingDraft =
             serde_json::from_slice(&std::fs::read(&prepared.paths.draft_file).expect("draft"))
                 .expect("typed draft");
-        let binding =
-            files::active_binding(&prepared.paths, crate::cli::wallet::test_network_b(), &prepared.hot_address);
+        let binding = files::active_binding(
+            &prepared.paths,
+            crate::cli::wallet::test_network_b(),
+            &prepared.hot_address,
+        );
 
         assert_eq!(draft.provider, binding.provider);
         assert_eq!(draft.network, binding.network);
@@ -2565,7 +2515,11 @@ mod tests {
 
         let reserved_first = store.open_draft().expect("reserve the first binding's id");
         let first = files::active_binding(
-            &files::GoshAiPaths::new(root.path(), crate::cli::wallet::test_network_a(), reserved_first.id()),
+            &files::GoshAiPaths::new(
+                root.path(),
+                crate::cli::wallet::test_network_a(),
+                reserved_first.id(),
+            ),
             crate::cli::wallet::test_network_a(),
             &dexdo_core::CanonicalAddress::parse(&hot_address()).expect("hot"),
         );
@@ -2576,7 +2530,11 @@ mod tests {
 
         let reserved_second = store.open_draft().expect("reserve the second binding's id");
         let second = files::active_binding(
-            &files::GoshAiPaths::new(root.path(), crate::cli::wallet::test_network_a(), reserved_second.id()),
+            &files::GoshAiPaths::new(
+                root.path(),
+                crate::cli::wallet::test_network_a(),
+                reserved_second.id(),
+            ),
             crate::cli::wallet::test_network_a(),
             &dexdo_core::CanonicalAddress::parse(&hot_address()).expect("hot"),
         );
@@ -2593,7 +2551,11 @@ mod tests {
             "funds can still sit in the old Hot, so its address must remain recoverable"
         );
         assert_eq!(
-            store.load_active(&crate::cli::wallet::test_network_a()).expect("load").expect("active").id,
+            store
+                .load_active(&crate::cli::wallet::test_network_a())
+                .expect("load")
+                .expect("active")
+                .id,
             second.id
         );
     }

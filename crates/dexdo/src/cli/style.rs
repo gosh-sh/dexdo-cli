@@ -60,14 +60,6 @@ pub(crate) const ERR: &str = "\u{2716}";
 pub(crate) const WARN: &str = "\u{26a0}";
 pub(crate) const INFO: &str = "\u{25c6}";
 pub(crate) const BUY: &str = "\u{25b2}";
-pub(crate) const SELL: &str = "\u{25bc}";
-pub(crate) const STOPPED: &str = "\u{25fc}";
-
-/// The braille spinner, 80 ms a frame, drawn in the `Wait` role.
-pub(crate) const SPINNER: [&str; 10] = [
-    "\u{280b}", "\u{2819}", "\u{2839}", "\u{2838}", "\u{283c}", "\u{2834}", "\u{2826}", "\u{2827}",
-    "\u{2807}", "\u{280f}",
-];
 
 /// Where a value starts: labels are indented two, values line up in column twelve.
 const VALUE_COLUMN: usize = 12;
@@ -229,7 +221,12 @@ pub(crate) fn window_columns() -> usize {
 
 /// A sentence longer than the window is folded by the terminal at column zero, which puts half of it
 /// under the label and breaks the grid this module exists to keep. Words are never split.
-pub(crate) fn field_wrapped(palette: Palette, label: &str, value: &str, value_role: Role) -> String {
+pub(crate) fn field_wrapped(
+    palette: Palette,
+    label: &str,
+    value: &str,
+    value_role: Role,
+) -> String {
     let room = window_columns().saturating_sub(VALUE_COLUMN).max(20);
     let mut lines: Vec<String> = Vec::new();
     let mut current = String::new();
@@ -273,7 +270,12 @@ pub(crate) fn raw_requested() -> bool {
 /// The raw line a block adds under itself when `--raw` is on: quiet, and never in anybody's way
 /// otherwise.
 pub(crate) fn raw_line(palette: Palette, text: &str) -> String {
-    field(palette, "raw", &paint(palette, Role::Meta, text), Role::Meta)
+    field(
+        palette,
+        "raw",
+        &paint(palette, Role::Meta, text),
+        Role::Meta,
+    )
 }
 
 /// An amount as a person says it: SHELL to two decimals.
@@ -310,7 +312,9 @@ pub(crate) fn short_id(address: &str) -> String {
     let chars: Vec<char> = account.chars().collect();
     format!(
         "\u{2026}{}",
-        chars[chars.len().saturating_sub(6)..].iter().collect::<String>()
+        chars[chars.len().saturating_sub(6)..]
+            .iter()
+            .collect::<String>()
     )
 }
 

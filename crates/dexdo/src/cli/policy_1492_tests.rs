@@ -94,7 +94,11 @@ fn the_policy_written_from_the_interview_loads_with_the_cap_in_raw_units() {
     let mut value = serde_json::json!({ "version": 1 });
     scaffold_roles(&mut value, PolicyRoleArg::Buyer);
     for question in crate::cli::policy_questions::BUYER_QUESTIONS {
-        set_path(&mut value, question.path, Value::from(question.suggestion().value));
+        set_path(
+            &mut value,
+            question.path,
+            Value::from(question.suggestion().value),
+        );
     }
     for count in BUYER_COUNTS {
         record_count(&mut value, count, count.suggested).expect("the answer is recorded");
@@ -154,7 +158,10 @@ fn every_prompt_that_asks_for_shell_is_a_prompt_that_is_converted() {
         );
         money += usize::from(count_is_stated_in_shell(count.path));
     }
-    assert_eq!(money, 1, "the interview asks for exactly one money figure today");
+    assert_eq!(
+        money, 1,
+        "the interview asks for exactly one money figure today"
+    );
 }
 
 /// Rules files written before this change hold raw figures, and nothing here re-reads them.
@@ -169,9 +176,17 @@ fn a_file_written_before_this_change_keeps_its_raw_figures() {
     let mut value = serde_json::json!({ "version": 1 });
     scaffold_roles(&mut value, PolicyRoleArg::Buyer);
     for question in crate::cli::policy_questions::BUYER_QUESTIONS {
-        set_path(&mut value, question.path, Value::from(question.suggestion().value));
+        set_path(
+            &mut value,
+            question.path,
+            Value::from(question.suggestion().value),
+        );
     }
-    set_path(&mut value, "buyer.failover.max_sellers_to_try", Value::from(3));
+    set_path(
+        &mut value,
+        "buyer.failover.max_sellers_to_try",
+        Value::from(3),
+    );
     // What an operator following the published buyer document wrote by hand: raw ECC[2].
     set_path(
         &mut value,

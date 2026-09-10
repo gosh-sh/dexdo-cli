@@ -141,7 +141,7 @@ mod agreed_wallet_shape_tests {
     }
 
     /// Built through the wire shape rather than through the crate's parser: naming
-    /// `dexdo_wallet_onboarding` outside `wallet_onboarding.rs` is what `ci/check-single-sdk.sh`
+    /// `dexdo_wallet_onboarding` outside `wallet_onboarding.rs` is what `ci/check_single_sdk.sh`
     /// exists to forbid, and this file is included beside it rather than being it.
     fn response() -> AgentWalletsResponse {
         serde_json::from_value(serde_json::json!({

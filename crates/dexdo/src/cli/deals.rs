@@ -469,7 +469,7 @@ pub(crate) fn list_deal_handles(dir: &Path) -> Result<Vec<(PathBuf, DealHandle)>
             return Err(error);
         }
     }
-    out.sort_by(|a, b| a.1.created_at_unix.cmp(&b.1.created_at_unix));
+    out.sort_by_key(|entry| entry.1.created_at_unix);
     Ok(out)
 }
 
@@ -510,7 +510,7 @@ pub(crate) fn list_deal_handles_strict(
         }
         out.push((p.clone(), load_deal_handle(&p)?));
     }
-    out.sort_by(|a, b| a.1.created_at_unix.cmp(&b.1.created_at_unix));
+    out.sort_by_key(|entry| entry.1.created_at_unix);
     Ok(out)
 }
 
@@ -1026,10 +1026,7 @@ mod tests {
         );
 
         let mut incomplete = state(true, true, true, false, 10, 0);
-        incomplete
-            .as_object_mut()
-            .unwrap()
-            .remove("tokensPending");
+        incomplete.as_object_mut().unwrap().remove("tokensPending");
         assert!(
             classify_deal_state(&incomplete, ordinary_bond)
                 .unwrap_err()

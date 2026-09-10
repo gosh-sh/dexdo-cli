@@ -90,4 +90,3 @@ pub(crate) async fn run_monitor_real(args: &MonitorArgs) -> Result<()> {
     });
     Ok(())
 }
-

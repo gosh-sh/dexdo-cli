@@ -121,9 +121,8 @@ fn pmp_account_fixture_is_rebuilt_from_this_tree() {
     let _carried_over = tvm_client::boc::get_code_salt(
         context.clone(),
         tvm_client::boc::ParamsOfGetCodeSalt {
-            code: base64::engine::general_purpose::STANDARD.encode(
-                tvm_types::write_boc(&current_code).expect("serialise the fixture's code"),
-            ),
+            code: base64::engine::general_purpose::STANDARD
+                .encode(tvm_types::write_boc(&current_code).expect("serialise the fixture's code")),
             ..Default::default()
         },
     )
@@ -131,10 +130,9 @@ fn pmp_account_fixture_is_rebuilt_from_this_tree() {
     .salt
     .expect("the fixture's code is salted");
 
-    let private_note = super::contracts_provision::code_cell(
-        super::contracts_provision::PRIVATENOTE_TVC,
-    )
-    .expect("vendored PrivateNote is a code cell");
+    let private_note =
+        super::contracts_provision::code_cell(super::contracts_provision::PRIVATENOTE_TVC)
+            .expect("vendored PrivateNote is a code cell");
     let salt_cell = tvm_abi::TokenValue::pack_values_into_chain(
         &[tvm_abi::Token::new(
             "privateNoteCode",
@@ -203,7 +201,8 @@ fn pmp_account_fixture_is_rebuilt_from_this_tree() {
     );
 
     let compiled = std::fs::read(&compiled_path).expect("compiled PMP reads");
-    let base = super::contracts_provision::code_cell(&compiled).expect("compiled PMP is a code cell");
+    let base =
+        super::contracts_provision::code_cell(&compiled).expect("compiled PMP is a code cell");
 
     let salted = tvm_client::boc::set_code_salt(
         context,
@@ -218,7 +217,7 @@ fn pmp_account_fixture_is_rebuilt_from_this_tree() {
     .code;
 
     let salted_cell = tvm_types::read_single_root_boc(
-        &base64::engine::general_purpose::STANDARD
+        base64::engine::general_purpose::STANDARD
             .decode(salted)
             .expect("salted code decodes"),
     )

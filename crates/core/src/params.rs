@@ -97,14 +97,13 @@ pub const fn price_raw_from_shell(shell: u128) -> Option<u128> {
 pub mod serde_price_shell {
     use serde::{Deserialize, Deserializer, Serializer};
 
-
     /// Emit whole SHELL per tick, refusing a price that is not whole.
 
     /// Refusing rather than dividing: `1000` raw is not a price the book can hold, and a dividing
     /// serializer would write it as `0` -- a market that gives its model away, recorded in the file
     /// the seller and the buyer both load.
     pub fn serialize<S: Serializer>(raw: &u128, serializer: S) -> Result<S::Ok, S::Error> {
-        if raw % super::PRICE_STEP != 0 {
+        if !raw.is_multiple_of(super::PRICE_STEP) {
             return Err(serde::ser::Error::custom(format!(
                 "price_per_tick {raw} raw is not a whole number of SHELL, so it is not a price the \
                  order book can hold"
@@ -223,7 +222,11 @@ pub fn shell_amount_raw(text: &str) -> Result<u128, String> {
     let scale = 10u128.pow(9 - decimals_text.len() as u32);
     whole
         .checked_mul(SHELL_UNIT)
-        .and_then(|raw| decimals.checked_mul(scale).and_then(|part| raw.checked_add(part)))
+        .and_then(|raw| {
+            decimals
+                .checked_mul(scale)
+                .and_then(|part| raw.checked_add(part))
+        })
         .ok_or_else(|| format!("amount {text} SHELL is beyond the range of an amount"))
 }
 
@@ -236,6 +239,11 @@ pub const SHELL_ECC_ID: u32 = 2;
 /// Canonical tick: the billing quantum, in tokens. Consumption is claimed and disputed in raw tokens;
 /// only value is computed per tick (`TICK_SIZE = 1_000_000`).
 pub const TICK_SIZE: u128 = 1_000_000;
+
+/// Maximum durable billable usage the seller may have accepted beyond its last reconciled
+/// `tokensPending` anchor before admitting another request. The current accepted request completes;
+/// the gate only bounds risk for the next admission.
+pub const SELLER_UNCLAIMED_BILLABLE_RISK_LIMIT: u128 = TICK_SIZE;
 
 /// Cumulative consumption an accepted probe credits, in tokens: exactly one canonical tick.
 
@@ -637,6 +645,62 @@ pub const DEFAULT_SPOTCHECK_PROBE: &str = "What is 17 times 23? Show your step-b
 /// Prompt used to prove that a configured seller upstream is ready.
 pub const UPSTREAM_HEALTH_PROBE_PROMPT: &str = "Reply with OK.";
 
+/// Provider-declared spelling for the one optional B7 reproducibility control. These are
+/// alternatives, not a set: one profile selects exactly one wire shape and thereby asserts that
+/// its exact endpoint was found reproducible with that shape.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Deserialize)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+pub enum SampleAlgorithm {
+    /// OpenAI/Groq-style `"seed": 0`.
+    Seed,
+    /// Mistral-style `"random_seed": 0`.
+    RandomSeed,
+
+    TopK,
+    /// No provider-specific determinism field. B7 degrades instead of comparing stochastic runs.
+    None,
+}
+
+/// Conservative default for an undeclared OpenAI-compatible sampling algorithm.
+
+/// An unfamiliar endpoint receives no optional field and therefore cannot fail on one. Operators
+/// opt into a deterministic B7 reference only by declaring the provider's supported spelling.
+pub const OPENAI_COMPATIBLE_SAMPLE_ALGORITHM_DEFAULT: SampleAlgorithm = SampleAlgorithm::None;
+
+/// Fixed RNG seed carried by both supported seed spellings.
+pub const REFERENCE_SAMPLE_SEED: u32 = 0;
+
+/// `top_k` value that restricts each decode step to its single most probable token.
+pub const REFERENCE_TOP_K: u32 = 1;
+
+impl Default for SampleAlgorithm {
+    fn default() -> Self {
+        OPENAI_COMPATIBLE_SAMPLE_ALGORITHM_DEFAULT
+    }
+}
+
+impl SampleAlgorithm {
+    /// Exact profile spelling used in diagnostics and documentation.
+    pub const fn profile_value(self) -> &'static str {
+        match self {
+            Self::Seed => "SEED",
+            Self::RandomSeed => "RANDOM_SEED",
+            Self::TopK => "TOP_K",
+            Self::None => "NONE",
+        }
+    }
+
+    /// Optional JSON request field selected by this profile value.
+    pub const fn wire_field(self) -> Option<&'static str> {
+        match self {
+            Self::Seed => Some("seed"),
+            Self::RandomSeed => Some("random_seed"),
+            Self::TopK => Some("top_k"),
+            Self::None => None,
+        }
+    }
+}
+
 /// Token budget for one seller upstream readiness probe.
 
 /// - why this is NOT 1. A reasoning model spends its budget inside the reasoning channel
@@ -710,7 +774,8 @@ pub const UPSTREAM_HEALTH_PROBE_MAX_TOKENS: u32 = CONTENT_PROBE_MAX_TOKENS as u3
 /// **The wording is an existence proof, not a tuned choice.** It is the first coherent prompt that
 /// worked; no prompt search was run, and a shorter or clearer one may serve as well. What must be
 /// preserved is the coherence, not the sentence.
-pub const CAPABILITY_PROBE_PROMPT: &str = "Call the dexdo_capability_probe tool with an empty object.";
+pub const CAPABILITY_PROBE_PROMPT: &str =
+    "Call the dexdo_capability_probe tool with an empty object.";
 
 /// Buffered event capacity used by a seller upstream readiness probe.
 pub const UPSTREAM_HEALTH_CHANNEL_CAPACITY: usize = 4;
@@ -963,7 +1028,7 @@ pub const MANIFEST_PATH_VAR: &str = "DEXDO_MANIFEST";
 /// because there was nowhere to look at the copy. This is a PATH to the file the release installs:
 /// it is on disk, it is visible, it can be replaced, and it states its own network in its own
 /// `network` field. The bundle also carries exactly one manifest now, and it is mainnet's
-/// (`release/build-public-tree.sh`), so the default is what the user wants rather than a detour.
+/// (`ci/release/common/build_public_tree.sh`), so the default is what the user wants rather than a detour.
 
 /// **This value is the sole allowed hardcoded manifest location and MUST NOT BE CHANGED.** It is
 /// anchored below `$HOME` on Unix and `%USERPROFILE%` on Windows: one absolute per-user location,
@@ -1376,8 +1441,8 @@ pub const WALLET_SUBMIT_NATIVE_FEE_BOUND_RAW: u128 = 153_501_000;
 /// This is a statement of what messages COST, taken from constants and live receipts. It is
 /// deliberately NOT a policy about how much of their own money an operator ought to keep back: the
 /// client states the floor, and the operator decides.
-pub const FUNDING_WALLET_NATIVE_FLOOR_RAW: u128 =
-    NOTE_DEPLOY_WALLET_SUBMITS * (NOTE_DEPLOY_SUBMIT_NATIVE_VALUE + WALLET_SUBMIT_NATIVE_FEE_BOUND_RAW);
+pub const FUNDING_WALLET_NATIVE_FLOOR_RAW: u128 = NOTE_DEPLOY_WALLET_SUBMITS
+    * (NOTE_DEPLOY_SUBMIT_NATIVE_VALUE + WALLET_SUBMIT_NATIVE_FEE_BOUND_RAW);
 
 /// How far a funding wallet's NATIVE balance falls below [`FUNDING_WALLET_NATIVE_FLOOR_RAW`], or
 /// `None` when it is at or above it.
@@ -1999,22 +2064,21 @@ impl Default for WalletOnboardingParams {
         Self::canonical()
     }
 }
-/// No network table, and that absence is load-bearing.
+// No network table, and that absence is load-bearing.
 
-/// There used to be a compiled-in table of known chains here, with their default
-/// endpoints, their extra hosts and their indexers, plus the lookups that read it and the check
-/// that compared a manifest's label against the host being dialled.
+// There used to be a compiled-in table of known chains here, with their default
+// endpoints, their extra hosts and their indexers, plus the lookups that read it and the check
+// that compared a manifest's label against the host being dialled.
 
-/// All of it is gone, and what replaces it is that there is nothing to replace: the
-/// manifest `DEXDO_MANIFEST` names carries the label, the endpoint and the indexer, so the client
-/// has no second opinion to hold against the file. A list of chains IS an opinion about which
-/// chains exist -- a wallet bound on one nobody added to the table could not be resolved at all,
-/// not because anything was wrong with it but because the binary predated it.
+// All of it is gone, and what replaces it is that there is nothing to replace: the
+// manifest `DEXDO_MANIFEST` names carries the label, the endpoint and the indexer, so the client
+// has no second opinion to hold against the file. A list of chains IS an opinion about which
+// chains exist -- a wallet bound on one nobody added to the table could not be resolved at all,
+// not because anything was wrong with it but because the binary predated it.
 
-/// The endpoint check went with the table for a separate reason: both of its inputs came out of
-/// one file, so it compared the manifest with itself. It was written for `--endpoint`, a
-/// flag that could name another chain's host, and that flag is gone.
-
+// The endpoint check went with the table for a separate reason: both of its inputs came out of
+// one file, so it compared the manifest with itself. It was written for `--endpoint`, a
+// flag that could name another chain's host, and that flag is gone.
 
 /// The agent name `dexdo wallet onboard ackinacki-wallet` sends when `--agent-name` is not given
 /// .
@@ -2169,7 +2233,9 @@ pub const fn claim_delta_limit(elapsed: Duration, min_seconds_per_tick: Duration
     let rate_limit = if floor == 0 {
         MAX_CLAIM_DELTA
     } else {
-        (elapsed.as_secs() as u128) * TICK_SIZE / floor
+        ((elapsed.as_secs() as u128) * TICK_SIZE)
+            .checked_div(floor)
+            .expect("the non-zero floor permits division")
     };
     if rate_limit < MAX_CLAIM_DELTA {
         rate_limit
@@ -2313,8 +2379,10 @@ impl Default for DobParams {
 
 #[cfg(test)]
 mod shell_unit_tests {
-    use super::{price_raw_from_shell, shell_amount, shell_amount_of_text, shell_amount_raw,
-                PRICE_STEP, SHELL_UNIT};
+    use super::{
+        price_raw_from_shell, shell_amount, shell_amount_of_text, shell_amount_raw, PRICE_STEP,
+        SHELL_UNIT,
+    };
 
     /// What a person reads is what a person can type back. Every figure the client prints goes
     /// through `shell_amount`, and every amount argument through `shell_amount_raw`: if the two
@@ -2363,7 +2431,16 @@ mod shell_unit_tests {
     #[test]
     fn refused_amounts_are_named() {
         for bad in [
-            "", " ", "x", "1.2.3", "1.0000000001", "-1", "+1", "+6.15", "6.+15", "1e9",
+            "",
+            " ",
+            "x",
+            "1.2.3",
+            "1.0000000001",
+            "-1",
+            "+1",
+            "+6.15",
+            "6.+15",
+            "1e9",
         ] {
             assert!(shell_amount_raw(bad).is_err(), "accepted {bad:?}");
         }
@@ -2386,15 +2463,14 @@ mod shell_unit_tests {
 #[cfg(test)]
 mod tests {
     use super::{
-        cli_buy_deadline_is_valid, default_buy_deadline, probe_seed_owed, ClaimConfirmationParams,
-        DobParams, ProtocolConsts, SellerLivenessParams, DEAL_SNAPSHOT_MAX_ATTEMPTS,
+        cli_buy_deadline_is_valid, deal_gas_health_floor_raw, deal_gas_health_target_raw,
+        deal_gas_requirement_raw, default_buy_deadline, default_deposit_shells, min_deploy_shells,
+        probe_seed_owed, ClaimConfirmationParams, DobParams, ProtocolConsts, SellerLivenessParams,
+        WalletOnboardingParams, BUYER_HANDOVER_WAIT_SECS, BUYER_ON_DEMAND_PURCHASE_SECS,
+        DEAL_GAS_CLAIM_RAW, DEAL_GAS_FIRST_CLAIM_RAW, DEAL_SNAPSHOT_MAX_ATTEMPTS, DEAL_WAIT_SECS,
         DEFAULT_BUY_TTL, EXPLICIT_STOP_CONFIRM_MAX_ATTEMPTS, EXPLICIT_STOP_CONFIRM_POLL,
-        deal_gas_health_floor_raw, deal_gas_health_target_raw, deal_gas_requirement_raw,
-        default_deposit_shells, min_deploy_shells, WalletOnboardingParams, DEAL_GAS_CLAIM_RAW,
-        DEAL_GAS_FIRST_CLAIM_RAW, HERMEZ_SRS_MAX_ATTEMPTS,
-        HERMEZ_SRS_RETRY_INITIAL_BACKOFF, HERMEZ_SRS_SIZE_BYTES, MATCH_OPEN_TIMEOUT,
-        MATCH_OPEN_TIMEOUT_SECS, MAX_CLAIM_DELTA, MIN_STREAM_BUY_TICKS,
-        BUYER_HANDOVER_WAIT_SECS, BUYER_ON_DEMAND_PURCHASE_SECS, DEAL_WAIT_SECS,
+        HERMEZ_SRS_MAX_ATTEMPTS, HERMEZ_SRS_RETRY_INITIAL_BACKOFF, HERMEZ_SRS_SIZE_BYTES,
+        MATCH_OPEN_TIMEOUT, MATCH_OPEN_TIMEOUT_SECS, MAX_CLAIM_DELTA, MIN_STREAM_BUY_TICKS,
         NOTE_DEPLOY_SUBMIT_NATIVE_VALUE, PLATFORM_FEE_BPS, PRICE_STEP, PROBE_SEED_TOKENS,
         SELLER_TERMINAL_RECEIPT_POLL_INTERVAL, SELLER_TERMINAL_RECEIPT_TIMEOUT, SHELL_UNIT,
         STOP_SUBMIT_MARGIN, SUBSCRIPTION_MAX_TICKS, SUBSCRIPTION_WEEKS, SUB_TICKS_PER_WEEK,
@@ -2440,7 +2516,11 @@ mod tests {
     /// without an error and without inventing a surplus.
     #[test]
     fn no_network_is_refused_because_a_burn_is_the_same_number_everywhere() {
-        for label in ["net-a", "net-b", "some-network-this-tree-has-never-heard-of"] {
+        for label in [
+            "net-a",
+            "net-b",
+            "some-network-this-tree-has-never-heard-of",
+        ] {
             assert_eq!(
                 super::resolve_deal_gas_overhead_raw(label, None),
                 Ok(0),
@@ -2884,7 +2964,10 @@ mod tests {
     #[test]
     fn one_requirement_governs_the_deposit_the_default_and_the_top_up() {
         for max_ticks in [2_u128, 8, 53, 1_000] {
-            assert_eq!(default_deposit_shells(max_ticks), min_deploy_shells(max_ticks));
+            assert_eq!(
+                default_deposit_shells(max_ticks),
+                min_deploy_shells(max_ticks)
+            );
             assert_eq!(
                 deal_gas_health_floor_raw(max_ticks),
                 deal_gas_requirement_raw(max_ticks),
@@ -2984,18 +3067,20 @@ mod tests {
         // `MATCH_OPEN_TIMEOUT` abandons and settles deals that are still openable, and the shorter
         // it is the more of them: measured on the chain, a handover wait carved out of the match's
         // budget was left 7 seconds of its nominal 300.
-        assert!(
-            BUYER_HANDOVER_WAIT_SECS >= MATCH_OPEN_TIMEOUT_SECS,
-            "handover wait {BUYER_HANDOVER_WAIT_SECS}s is shorter than the contract's \
-             {MATCH_OPEN_TIMEOUT_SECS}s cleanup window"
-        );
+        const {
+            assert!(
+                BUYER_HANDOVER_WAIT_SECS >= MATCH_OPEN_TIMEOUT_SECS,
+                "handover wait is shorter than the contract cleanup window"
+            );
+        }
         // The purchase is the match and then the handover, so its budget is theirs together. Any
         // less and the outer wait cuts an inner one short.
-        assert!(
-            BUYER_ON_DEMAND_PURCHASE_SECS >= DEAL_WAIT_SECS + BUYER_HANDOVER_WAIT_SECS,
-            "on-demand purchase budget {BUYER_ON_DEMAND_PURCHASE_SECS}s cannot hold a \
-             {DEAL_WAIT_SECS}s match followed by a {BUYER_HANDOVER_WAIT_SECS}s handover"
-        );
+        const {
+            assert!(
+                BUYER_ON_DEMAND_PURCHASE_SECS >= DEAL_WAIT_SECS + BUYER_HANDOVER_WAIT_SECS,
+                "on-demand purchase budget cannot hold both match and handover"
+            );
+        }
     }
 
     #[test]
@@ -3217,15 +3302,24 @@ mod tests {
                 super::EMPTY_MODEL_BOOK_CLASS,
             ),
             (
-                format!("{} 1785678525: nearest ask is gone", super::EXPIRED_COUNTERPARTY_ASK_REASON),
+                format!(
+                    "{} 1785678525: nearest ask is gone",
+                    super::EXPIRED_COUNTERPARTY_ASK_REASON
+                ),
                 super::EXPIRED_COUNTERPARTY_ASK_CLASS,
             ),
             (
-                format!("{} for max_price_per_tick 10", super::LAPSED_MODEL_BOOK_REASON),
+                format!(
+                    "{} for max_price_per_tick 10",
+                    super::LAPSED_MODEL_BOOK_REASON
+                ),
                 super::EXPIRED_COUNTERPARTY_ASK_CLASS,
             ),
             (
-                format!("{} order  has only 1 ticks", super::INSUFFICIENT_HEAD_ASK_REASON),
+                format!(
+                    "{} order  has only 1 ticks",
+                    super::INSUFFICIENT_HEAD_ASK_REASON
+                ),
                 super::INSUFFICIENT_HEAD_ASK_CLASS,
             ),
             (
@@ -3247,13 +3341,20 @@ mod tests {
                 super::NO_EXECUTABLE_ASK_CLASS,
             ),
         ] {
-            assert_eq!(super::book_refusal_class(&reason), Some(expected), "{reason}");
+            assert_eq!(
+                super::book_refusal_class(&reason),
+                Some(expected),
+                "{reason}"
+            );
             assert_eq!(super::buy_refusal_class(&reason), expected, "{reason}");
         }
 
         // A failure to READ the book is not a state OF the book, and must stay an error.
         for reason in [
-            &format!("{}: GraphQL request failed: 502 Bad Gateway", crate::params::current_network()),
+            &format!(
+                "{}: GraphQL request failed: 502 Bad Gateway",
+                crate::params::current_network()
+            ),
             "InferenceOrderBook 0:book is not active",
         ] {
             assert_eq!(super::book_refusal_class(reason), None, "{reason}");

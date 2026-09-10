@@ -5,10 +5,10 @@ use crate::cli::args::{
     NoteWithdrawArgs,
 };
 use crate::cli::commands::{
-    is_note_deploy_wallet_busy_error, note_deploy_error, note_deploy_fold_state_into_pool,
-    note_deploy_multisig_secret_hex, note_deploy_now_unix, note_deploy_recovery_pool_guard,
-    note_deploy_same_file_pool_guard, note_endpoint_url, chain_doctor_preflight,
-    chain_doctor_preflight_with_endpoint, unix_now_secs, validate_existing_pool_if_present,
+    chain_doctor_preflight, chain_doctor_preflight_with_endpoint, is_note_deploy_wallet_busy_error,
+    note_deploy_error, note_deploy_fold_state_into_pool, note_deploy_multisig_secret_hex,
+    note_deploy_now_unix, note_deploy_recovery_pool_guard, note_deploy_same_file_pool_guard,
+    note_endpoint_url, unix_now_secs, validate_existing_pool_if_present,
 };
 use crate::cli::support::read_secret_hex;
 use anyhow::bail;
@@ -23,14 +23,12 @@ use dexdo_core::normalize_multisig_pubkey;
 use dexdo_core::params::{
     HERMEZ_SRS_HASH_BUFFER_BYTES, HERMEZ_SRS_HTTP_TIMEOUT, HERMEZ_SRS_MAX_ATTEMPTS,
     HERMEZ_SRS_PROGRESS_STEP_PERCENT, HERMEZ_SRS_RETRY_INITIAL_BACKOFF, HERMEZ_SRS_SIZE_BYTES,
-    NOTE_DEPLOY_ACTIVE_POLL_INTERVAL, NOTE_DEPLOY_ACTIVE_TIMEOUT,
-    NOTE_DEPLOY_LOCK_TIMEOUT_SECS,
+    NOTE_DEPLOY_ACTIVE_POLL_INTERVAL, NOTE_DEPLOY_ACTIVE_TIMEOUT, NOTE_DEPLOY_LOCK_TIMEOUT_SECS,
     NOTE_DEPLOY_PROVER_LOCK_POLL_INTERVAL, NOTE_DEPLOY_SHELL_FUNDING_POLL_INTERVAL,
     NOTE_DEPLOY_SHELL_FUNDING_TIMEOUT, NOTE_DEPLOY_SUBMIT_NATIVE_VALUE,
     NOTE_DEPLOY_VOUCHER_EVENT_TIMEOUT, NOTE_DEPLOY_WALLET_BUSY_BACKOFF_STEP_SECS,
     NOTE_DEPLOY_WALLET_BUSY_MAX_ATTEMPTS, NOTE_DEPLOY_WALLET_LOCK_POLL_INTERVAL, SHELL_CURRENCY_ID,
-    TRANSIENT_READ_ATTEMPT_TIMEOUT,
-    TRANSIENT_READ_INITIAL_BACKOFF, TRANSIENT_READ_MAX_BACKOFF,
+    TRANSIENT_READ_ATTEMPT_TIMEOUT, TRANSIENT_READ_INITIAL_BACKOFF, TRANSIENT_READ_MAX_BACKOFF,
 };
 // Not behind the chain build: the bounded-proof policy and its operator verdict are plain time and text,
 // so they compile -- and their regressions run -- in the default build too.
@@ -107,7 +105,11 @@ fn render_operator_wallet_funding(
     let ecc_display = grouped_whole_shells(ecc_shells);
     let source_total_display = grouped_whole_shells(native_shells + ecc_shells);
     let mut out = String::new();
-    writeln!(&mut out, "wallet is waiting for {native_display} SHELL at {address}").unwrap();
+    writeln!(
+        &mut out,
+        "wallet is waiting for {native_display} SHELL at {address}"
+    )
+    .unwrap();
     writeln!(
         &mut out,
         "Before deploy, send {native_display} SHELL to {address} with the non-bounceable ECC[2] flag-16 \
@@ -328,7 +330,8 @@ pub(crate) async fn run_note_wallet(args: NoteWalletArgs) -> Result<()> {
             )
         })?;
     if deployed != address {
-        let deployed_canonical = operator_wallet_canonical_address(chain.client(), &deployed).await?;
+        let deployed_canonical =
+            operator_wallet_canonical_address(chain.client(), &deployed).await?;
         bail!(
             "canonical wallet deploy returned {}, expected derived address {}",
             deployed_canonical,
@@ -339,7 +342,6 @@ pub(crate) async fn run_note_wallet(args: NoteWalletArgs) -> Result<()> {
     print_operator_wallet_preconditions(&chain, &address, &keys).await
 }
 
-
 pub(crate) async fn run_note_recover(args: NoteRecoverArgs) -> Result<()> {
     use crate::cli::note::{
         ensure_recovery_owner_matches_target_note, load_note_deploy_recovery,
@@ -348,9 +350,9 @@ pub(crate) async fn run_note_recover(args: NoteRecoverArgs) -> Result<()> {
     use dexdo_core::{private_note::artifacts::PRIVATE_NOTE_ABI_JSON, ChainClient};
 
     let pool_path = resolve_private_file_path(
-        args.pool
-            .as_deref()
-            .ok_or_else(|| anyhow::anyhow!("internal: note recover pool default was not applied"))?,
+        args.pool.as_deref().ok_or_else(|| {
+            anyhow::anyhow!("internal: note recover pool default was not applied")
+        })?,
         "--pool",
     )?;
     let recovery_path = resolve_private_file_path(&args.recovery, "--recovery")?;
@@ -381,7 +383,9 @@ pub(crate) async fn run_note_recover(args: NoteRecoverArgs) -> Result<()> {
             serde_json::json!({}),
         )
         .await
-        .map_err(|e| anyhow::anyhow!("verify recovered PrivateNote {note_display} owner key: {e}"))?;
+        .map_err(|e| {
+            anyhow::anyhow!("verify recovered PrivateNote {note_display} owner key: {e}")
+        })?;
     ensure_recovery_owner_matches_target_note(
         &recovery_path,
         &recovery,
@@ -404,7 +408,6 @@ pub(crate) async fn run_note_recover(args: NoteRecoverArgs) -> Result<()> {
     );
     Ok(())
 }
-
 
 const HERMEZ_SRS_NAME: &str = "hermez_kzg_srs_k19.bin";
 const HERMEZ_SRS_URL: &str = "https://binaries.gosh.sh/dexdo/hermez_kzg_bn254_19.srs";
@@ -468,9 +471,7 @@ pub(crate) fn funding_wallet_lock_path(
         );
     }
     let wallet = dexdo_core::CanonicalAddress::parse(funding_multisig_address.trim())
-        .map_err(|error| {
-            anyhow::anyhow!("--multisig-address {funding_multisig_address}: {error}")
-        })?
+        .map_err(|error| anyhow::anyhow!("--multisig-address {funding_multisig_address}: {error}"))?
         .legacy();
     let mut digest = Sha256::new();
     digest.update(network.as_bytes());
@@ -1822,8 +1823,13 @@ impl NoteDeployVoucherBocBuilder for dexdo_core::ChainClient {
         root_pn: &dexdo_core::Address,
         checkpoint: &crate::cli::note::NoteDeployVoucherCheckpoint,
     ) -> Result<String> {
-        note_deploy_build_voucher_submit_boc(multisig_address, multisig_private_keys, root_pn, checkpoint)
-            .await
+        note_deploy_build_voucher_submit_boc(
+            multisig_address,
+            multisig_private_keys,
+            root_pn,
+            checkpoint,
+        )
+        .await
     }
 }
 
@@ -2024,8 +2030,7 @@ where
     Op: AsyncFnMut(u64) -> Result<T>,
     Sleep: AsyncFnMut(std::time::Duration),
 {
-    let funding_multisig_display =
-        dexdo_core::address::display_self_dapp(funding_multisig_address);
+    let funding_multisig_display = dexdo_core::address::display_self_dapp(funding_multisig_address);
     let mut attempt = 1u64;
     loop {
         match op(attempt).await {
@@ -3522,7 +3527,7 @@ pub(crate) async fn prepare_prover_reference_string() -> Result<()> {
     // Whether it downloaded or was already there is the one thing an operator watching this step
     // wants afterwards, and the step said nothing either way.
     if outcome.is_ok() {
-        crate::cli::progress::tick(&format!(
+        crate::cli::progress::tick(format!(
             "proving material ready in {}",
             paths.prover_cache_dir.display()
         ));
@@ -3777,7 +3782,12 @@ fn note_deploy_summary(
         // `Library/Application Support/ai.gosh.dexdo`, so an 80-column window broke the path
         // between `Application` and `Support` and inserted twelve spaces -- printing, as two
         // unusable fragments, the one path the operator is being told to go and protect.
-        style::field(palette, "secret", &pool_path.display().to_string(), Role::Meta),
+        style::field(
+            palette,
+            "secret",
+            &pool_path.display().to_string(),
+            Role::Meta,
+        ),
         style::field_wrapped(
             palette,
             "",
@@ -3790,7 +3800,10 @@ fn note_deploy_summary(
         style::field(
             palette,
             "next",
-            &style::action(palette, "see every note this instance has, and what each one holds"),
+            &style::action(
+                palette,
+                "see every note this instance has, and what each one holds",
+            ),
             Role::Text,
         ),
         style::field_continued(&style::action(
@@ -4122,9 +4135,9 @@ pub(crate) async fn run_note_deploy(args: NoteDeployArgs) -> Result<()> {
     // The endpoint the manifest itself names, unless the operator overrode it. Reading it here,
     // once, is what stopped the old mandatory default from deciding the chain: it was substituted
     // on every run and always won over this field.
-    let manifest_for_endpoint = dexdo_core::Deployed::load(&crate::cli::commands::manifest_path()?)?;
-    let endpoint =
-        dexdo_core::chain::resolve_endpoint(None, &manifest_for_endpoint)?;
+    let manifest_for_endpoint =
+        dexdo_core::Deployed::load(&crate::cli::commands::manifest_path()?)?;
+    let endpoint = dexdo_core::chain::resolve_endpoint(None, &manifest_for_endpoint)?;
     // Both halves are the same manifest's, so there is nothing left to compare.
     let wallet_store = crate::cli::wallet::WalletStore::open()?;
     let funding_wallet_network =
@@ -4151,10 +4164,9 @@ pub(crate) async fn run_note_deploy(args: NoteDeployArgs) -> Result<()> {
     let funding_multisig_identity =
         crate::cli::note::normalize_funding_multisig_identity(&funding_wallet.address)
             .map_err(|e| anyhow::anyhow!("--multisig-address: {e}"))?;
-    let funding_multisig_address =
-        dexdo_core::CanonicalAddress::parse(&funding_multisig_identity)
-            .map_err(|e| anyhow::anyhow!("--multisig-address: {e}"))?
-            .legacy();
+    let funding_multisig_address = dexdo_core::CanonicalAddress::parse(&funding_multisig_identity)
+        .map_err(|e| anyhow::anyhow!("--multisig-address: {e}"))?
+        .legacy();
     let nominal = NoteNominal::parse(&args.nominal)?;
     let token_type = TokenType::parse(&args.token_type)?;
     let nominal_label = nominal.label().to_string();
@@ -4194,17 +4206,19 @@ pub(crate) async fn run_note_deploy(args: NoteDeployArgs) -> Result<()> {
     // that tells the next reader a money check does not exist is worse than no comment: it invites
     // them to add the check that is already there, or to trust a gap that is closed.
     let funding_notice = crate::cli::wallet_funding::fund_hot_for_money_command(
-        &client,
-        &endpoint,
-        funding_binding.as_ref(),
-        &funding_wallet.address,
-        &funding_network,
-        crate::cli::wallet_funding::FundingRequirements::new([(
-            SHELL_CURRENCY_ID,
-            crate::cli::note::operator_wallet_funding_raw(nominal),
-        )]),
-        "note deploy",
-        args.funding_timeout,
+        crate::cli::wallet_funding::MoneyCommandFunding {
+            client: &client,
+            endpoint: &endpoint,
+            binding: funding_binding.as_ref(),
+            resolved_hot_address: &funding_wallet.address,
+            network: &funding_network,
+            requirements: crate::cli::wallet_funding::FundingRequirements::new([(
+                SHELL_CURRENCY_ID,
+                crate::cli::note::operator_wallet_funding_raw(nominal),
+            )]),
+            operation: "note deploy",
+            funding_timeout: args.funding_timeout,
+        },
     )
     .await?
     .machine_notice();
@@ -4227,7 +4241,10 @@ pub(crate) async fn run_note_deploy(args: NoteDeployArgs) -> Result<()> {
     // for a reconstruction afterwards without being a paragraph in front of the operator.
     tracing::info!(
         "note deploy: in-process gosh.ackinacki -- wallet {} funds a {} {} PrivateNote on {} ...",
-        funding_multisig_identity, nominal_label, token_type_label, endpoint
+        funding_multisig_identity,
+        nominal_label,
+        token_type_label,
+        endpoint
     );
     let voucher_failpoints = NoteDeployVoucherFailpoints {
         before_voucher_event_wait: false,
@@ -4255,7 +4272,6 @@ pub(crate) async fn run_note_deploy(args: NoteDeployArgs) -> Result<()> {
     }
     outcome
 }
-
 
 /// `dexdo note balance`: address-only, read-only PrivateNote balance diagnostics.
 /// One row of `note list`: what it holds, then the address in FULL.
@@ -4304,7 +4320,10 @@ pub(crate) async fn run_note_list(args: crate::cli::args::NoteListArgs) -> Resul
     let bytes = std::fs::read(&pool_path)
         .map_err(|error| anyhow::anyhow!("read the pool {}: {error}", pool_path.display()))?;
     let pool: serde_json::Value = serde_json::from_slice(&bytes).map_err(|error| {
-        anyhow::anyhow!("the pool {} is not valid JSON: {error}", pool_path.display())
+        anyhow::anyhow!(
+            "the pool {} is not valid JSON: {error}",
+            pool_path.display()
+        )
     })?;
     let mut rows = crate::cli::note_pick::rows_of(&pool);
     if rows.is_empty() {
@@ -4426,7 +4445,6 @@ pub(crate) async fn run_note_list(args: crate::cli::args::NoteListArgs) -> Resul
     );
     Ok(())
 }
-
 
 pub(crate) async fn run_note_balance(args: NoteBalanceArgs) -> Result<()> {
     use crate::cli::note::{
@@ -4573,7 +4591,6 @@ pub(crate) async fn run_note_balance(args: NoteBalanceArgs) -> Result<()> {
     Ok(())
 }
 
-
 /// Render the resting-order half: what was recovered, what was not, and how much history was read.
 
 /// This used to be a count and a sentence saying the count was all there is. It was true of
@@ -4604,7 +4621,11 @@ fn render_note_outstanding_orders(
                 "Recovered resting order: modelHash={} orderId={} book={} -- proved by finding \
                  its tvm.hash(abi.encode(book, orderId)) in getOutstanding.\n  \
                  cancel it with: dexdo orders --note-addr {note} --model-hash {} cancel {}\n",
-                order.model_hash, order.order_id, order.order_book, order.model_hash, order.order_id
+                order.model_hash,
+                order.order_id,
+                order.order_book,
+                order.model_hash,
+                order.order_id
             ));
         }
     }
@@ -4713,7 +4734,6 @@ pub(crate) async fn run_note_outstanding(args: NoteOutstandingArgs) -> Result<()
     Ok(())
 }
 
-
 /// every note address this command prints is one an operator can act on.
 
 /// The renderer takes the address as an argument, so the choice of spelling is the CALLER'S and the
@@ -4792,7 +4812,10 @@ fn parse_note_withdraw_destination(
 pub(crate) async fn run_note_withdraw(args: NoteWithdrawArgs) -> Result<()> {
     use dexdo_core::{Address, KeyPair, RealChainBackend};
     let note_addr = args.identity.note_addr.clone().ok_or_else(|| {
-        anyhow::anyhow!(format!("real {}: --note-addr (the note to withdraw from) is required", dexdo_core::params::current_network()))
+        anyhow::anyhow!(format!(
+            "real {}: --note-addr (the note to withdraw from) is required",
+            dexdo_core::params::current_network()
+        ))
     })?;
     // The manifest path comes from the environment now. The flag it used to
     // come from is gone, and with it the case where an operator typed something
@@ -4844,7 +4867,6 @@ pub(crate) async fn run_note_withdraw(args: NoteWithdrawArgs) -> Result<()> {
     Ok(())
 }
 
-
 /// `dexdo note sweep`: submit owner-signed `PrivateNote.sweepShell(destWalletAddr, dapp_id)`.
 
 /// The money this collects is the note's PHYSICAL ECC[2] pocket, not its trading record, and it
@@ -4859,19 +4881,10 @@ pub(crate) async fn run_note_sweep(args: crate::cli::args::NoteSweepArgs) -> Res
     use dexdo_core::{Address, KeyPair, RealChainBackend};
 
     let note_addr = args.identity.note_addr.clone().ok_or_else(|| {
-        anyhow::anyhow!(format!("real {}: --note-addr (the note to sweep) is required", dexdo_core::params::current_network()))
-    })?;
-    // The manifest path comes from the environment now. The flag it used to
-    // come from is gone, and with it the case where an operator typed something
-    // unprintable -- what is left is a path this process was handed, which still has
-    // to be text before it can be passed on as one.
-    let manifest_path = crate::cli::commands::manifest_path()?;
-    let manifest = manifest_path.to_str().ok_or_else(|| {
-        anyhow::anyhow!(
-            "{} holds a path that is not printable text: {}",
-            dexdo_core::params::MANIFEST_PATH_VAR,
-            manifest_path.display()
-        )
+        anyhow::anyhow!(format!(
+            "real {}: --note-addr (the note to sweep) is required",
+            dexdo_core::params::current_network()
+        ))
     })?;
     let dest = parse_note_withdraw_destination(&args.to, "the transfer's `dest_dapp_id`")?;
     let dest_chain_address = dest.legacy();
@@ -4960,8 +4973,6 @@ pub(crate) fn render_note_sweep(
     );
     out
 }
-
-
 
 /// What `note topup` must still send to reach `to_raw`, or `None` when the note is already there.
 
@@ -5055,14 +5066,16 @@ pub(crate) async fn run_note_topup(args: crate::cli::args::NoteTopupArgs) -> Res
     // unprintable -- what is left is a path this process was handed, which still has
     // to be text before it can be passed on as one.
     let manifest_path = crate::cli::commands::manifest_path()?;
-    let manifest = manifest_path.to_str().ok_or_else(|| {
-        anyhow::anyhow!(
-            "{} holds a path that is not printable text: {}",
-            dexdo_core::params::MANIFEST_PATH_VAR,
-            manifest_path.display()
-        )
-    })?
-    .to_string();
+    let manifest = manifest_path
+        .to_str()
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "{} holds a path that is not printable text: {}",
+                dexdo_core::params::MANIFEST_PATH_VAR,
+                manifest_path.display()
+            )
+        })?
+        .to_string();
     // the value comes from a person, so it goes through the wider parser. `Address::parse`
     // is the SDK's, and it reads the `<dapp_id>` half of a canonical address as a workchain and
     // refuses it -- while the very next line PRINTS canonically, so the client's own output could
@@ -5197,8 +5210,10 @@ pub(crate) async fn run_note_topup(args: crate::cli::args::NoteTopupArgs) -> Res
         }
     };
 
-    let (source, secret_hex) =
-        crate::cli::commands::multisig_secret_hex(&args.multisig_private_key, &args.multisig_seed_file)?;
+    let (source, secret_hex) = crate::cli::commands::multisig_secret_hex(
+        &args.multisig_private_key,
+        &args.multisig_seed_file,
+    )?;
     let keys = KeyPair::from_secret_hex(secret_hex.trim())
         .map_err(|e| anyhow::anyhow!("{source} (SDK secret hex): {e:?}"))?;
     // the funding flow compares a chain clock with local time, so this client's own clock is
@@ -5211,14 +5226,19 @@ pub(crate) async fn run_note_topup(args: crate::cli::args::NoteTopupArgs) -> Res
     // which stays exactly as it was: it is step 7 of the specification, the re-read immediately
     // before the spend, and it still refuses on its own terms when nothing topped the Hot up.
     crate::cli::wallet_funding::fund_hot_for_money_command(
-        chain.client(),
-        chain.client().endpoint(),
-        funding_binding.as_ref(),
-        &funding_wallet.address,
-        &funding_network,
-        crate::cli::wallet_funding::FundingRequirements::new([(SHELL_CURRENCY_ID, missing_raw)]),
-        "note topup",
-        args.funding_timeout,
+        crate::cli::wallet_funding::MoneyCommandFunding {
+            client: chain.client(),
+            endpoint: chain.client().endpoint(),
+            binding: funding_binding.as_ref(),
+            resolved_hot_address: &funding_wallet.address,
+            network: &funding_network,
+            requirements: crate::cli::wallet_funding::FundingRequirements::new([(
+                SHELL_CURRENCY_ID,
+                missing_raw,
+            )]),
+            operation: "note topup",
+            funding_timeout: args.funding_timeout,
+        },
     )
     .await?;
     note_topup_preflight_wallet_ecc(&chain, &multisig, missing_raw).await?;
@@ -5293,8 +5313,7 @@ async fn note_topup_preflight_wallet_ecc(
         );
     }
     let native = account.as_ref().map(|acc| acc.balance).unwrap_or_default();
-    if let Some(notice) =
-        dexdo_core::params::funding_wallet_native_floor_notice(native, available)
+    if let Some(notice) = dexdo_core::params::funding_wallet_native_floor_notice(native, available)
     {
         bail!(
             "funding wallet {wallet} cannot pay for this top-up: {notice}. \
@@ -5396,7 +5415,6 @@ async fn note_topup_submit(
     }
     Ok(())
 }
-
 
 /// `dexdo note transfer`: move part of one `PrivateNote`'s spendable trading record into
 /// another's, bringing the DESTINATION up to exactly `--to`.
@@ -5641,9 +5659,10 @@ async fn note_transfer_read_record(
     flag: &str,
 ) -> Result<u128> {
     let display = dexdo_core::address::display(&note.with_workchain());
-    chain.private_note_shell_balance(note).await.map_err(|e| {
-        anyhow::anyhow!("{flag} {display}: read spendable SHELL trading record: {e}")
-    })
+    chain
+        .private_note_shell_balance(note)
+        .await
+        .map_err(|e| anyhow::anyhow!("{flag} {display}: read spendable SHELL trading record: {e}"))
 }
 
 /// The same read as a confirmation: an unreadable note is `None`, which
@@ -5675,11 +5694,9 @@ async fn note_transfer_wait_record(
     }
 }
 
-
 #[cfg(test)]
 #[path = "note_topup_wallet_lock_1291.rs"]
 mod note_topup_wallet_lock_1291;
-
 
 /// the turn of a holder that was KILLED is free, proven across a real process boundary.
 /// Unix only: the proof is death by SIGKILL, and a signal is what makes it a proof.
@@ -5730,7 +5747,10 @@ mod note_list_row_tests {
             !line.ends_with(&address) && line.contains("::"),
             "the legacy `0:<hex>` is storage; what is shown is the canonical form: {line}"
         );
-        assert!(!line.contains('\u{2026}'), "a result never shortens an address: {line}");
+        assert!(
+            !line.contains('\u{2026}'),
+            "a result never shortens an address: {line}"
+        );
         assert!(line.contains("100 SHELL"), "{line}");
 
         // The widest thing the column can hold must still be separated from the address: the first
@@ -5890,7 +5910,10 @@ mod tests {
             "{rendered}"
         );
         assert!(rendered.contains("getParties/getState"), "{rendered}");
-        assert!(rendered.contains("leads, not recovered deals"), "{rendered}");
+        assert!(
+            rendered.contains("leads, not recovered deals"),
+            "{rendered}"
+        );
     }
 
     #[test]
@@ -6450,9 +6473,7 @@ mod tests {
 
         const PROOF_BUDGET: std::time::Duration = std::time::Duration::from_secs(600);
 
-        fn wait_cost(
-            target_block_delta: u64,
-        ) -> super::super::NoteDeployProofWaitCost {
+        fn wait_cost(target_block_delta: u64) -> super::super::NoteDeployProofWaitCost {
             super::super::NoteDeployProofWaitCost {
                 target_layer: 1,
                 target_block_delta,
@@ -6558,14 +6579,10 @@ mod tests {
         /// gives. Asserted against the function the production path calls, not against prose.
         #[test]
         fn an_unobserved_boundary_is_answered_by_the_refusal_that_keeps_the_voucher() {
-            let refusal = super::super::note_deploy_escalated_proof_budget(
-                PROOF_BUDGET,
-                1,
-                None,
-                recovery(),
-            )
-            .expect_err("a boundary that could not be observed is refused, never narrated")
-            .to_string();
+            let refusal =
+                super::super::note_deploy_escalated_proof_budget(PROOF_BUDGET, 1, None, recovery())
+                    .expect_err("a boundary that could not be observed is refused, never narrated")
+                    .to_string();
             for expected in [
                 "could not be observed",
                 "refusing to raise the paid voucher to history layer 1",
@@ -6862,11 +6879,10 @@ mod tests {
                 recovery_path.exists(),
                 "a file the client cannot read may hold the only key to a funded voucher: {message}"
             );
-            assert_eq!(
+            assert!(
                 std::fs::read_to_string(&recovery_path)
                     .expect("the preserved file is readable as bytes")
                     .contains(&sk_u_hex),
-                true,
                 "preserving the file means preserving what is inside it"
             );
             for expected in [
@@ -6998,7 +7014,9 @@ mod tests {
              it in half: {summary:?}"
         );
         assert!(
-            summary.iter().any(|line| line.contains("0000...0004::867d76b4")),
+            summary
+                .iter()
+                .any(|line| line.contains("0000...0004::867d76b4")),
             "the deployed address is the other half of the result: {summary:?}"
         );
 
@@ -7171,12 +7189,14 @@ mod tests {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
             .await
             .expect("bind network trap");
-        let endpoint = format!("http://{}", listener.local_addr().unwrap());
 
         for (case, pool) in invalid_existing_pool_cases() {
             let pool_path = temp.path().join(format!("{case}.pool.json"));
             let original = serde_json::to_vec_pretty(&pool).unwrap();
-            crate::cli::support::write_owner_only_key_fixture(&pool_path, std::str::from_utf8(&original).unwrap());
+            crate::cli::support::write_owner_only_key_fixture(
+                &pool_path,
+                std::str::from_utf8(&original).unwrap(),
+            );
             let recovery_path = temp.path().join(format!("{case}.recovery.json"));
             let args = super::NoteDeployArgs {
                 json: false,
@@ -7191,7 +7211,7 @@ mod tests {
                 simulate_interrupt_after_deposit_voucher_submit: false,
                 simulate_interrupt_after_deposit_voucher_event: false,
                 simulate_interrupt_after_deploy_before_note_record: false,
-            funding_timeout: None,
+                funding_timeout: None,
             };
 
             let error = tokio::time::timeout(
@@ -7250,7 +7270,10 @@ mod tests {
         for (case, pool) in invalid_existing_pool_cases() {
             let pool_path = temp.path().join(format!("{case}.recover.pool.json"));
             let original_pool = serde_json::to_vec_pretty(&pool).unwrap();
-            crate::cli::support::write_owner_only_key_fixture(&pool_path, std::str::from_utf8(&original_pool).unwrap());
+            crate::cli::support::write_owner_only_key_fixture(
+                &pool_path,
+                std::str::from_utf8(&original_pool).unwrap(),
+            );
 
             let error = tokio::time::timeout(
                 std::time::Duration::from_secs(1),
@@ -7525,8 +7548,7 @@ mod tests {
     /// under test.
     fn issue_678_required_deposit_ecc() -> u128 {
         let recovery = test_recovery_state();
-        u128::from(recovery.raw_value)
-            + u128::from(crate::cli::note::contract_gas_deposit_raw())
+        u128::from(recovery.raw_value) + u128::from(crate::cli::note::contract_gas_deposit_raw())
     }
 
     fn issue_678_wallet_reader(ecc_balances: Vec<(u32, u128)>) -> FixedFundingWalletReader {
@@ -7808,7 +7830,7 @@ mod tests {
                     nominal: nominal.label(),
                     token_type: SHELL_CURRENCY_ID,
                     raw_value,
-                                funding_multisig_address: &wallet_id,
+                    funding_multisig_address: &wallet_id,
                 },
                 owner.public_hex(),
                 owner.secret_hex(),
@@ -7910,7 +7932,10 @@ mod tests {
             native, 1,
             "stage one is the flat deploy-gas figure, no longer nominal + GAS_DEPOSIT"
         );
-        assert_eq!(ecc, 10_250, "stage two is the nominal and GAS_DEPOSIT, nothing else");
+        assert_eq!(
+            ecc, 10_250,
+            "stage two is the nominal and GAS_DEPOSIT, nothing else"
+        );
         assert_eq!(
             lines[1],
             format!(
@@ -8770,7 +8795,10 @@ mod tests {
             ),
             "{error}"
         );
-        assert!(!error.contains(multisig_private_keys.secret_hex()), "{error}");
+        assert!(
+            !error.contains(multisig_private_keys.secret_hex()),
+            "{error}"
+        );
         assert!(
             !error.contains(recovery.owner_secret_key_hex.as_str()),
             "{error}"
@@ -9566,7 +9594,7 @@ mod tests {
                 nominal: "N100",
                 token_type: dexdo_core::params::SHELL_CURRENCY_ID,
                 raw_value: 100_000_000_000,
-                    funding_multisig_address: &format!("0:{}", "a".repeat(64)),
+                funding_multisig_address: &format!("0:{}", "a".repeat(64)),
             },
             owner.public_hex(),
             owner.secret_hex(),
@@ -10086,9 +10114,7 @@ mod tests {
                 return recovery.to_onboard_state();
             }
 
-            let both_proofs_persisted = [NoteDeployVoucherKind::Deposit]
-            .into_iter()
-            .all(|kind| {
+            let both_proofs_persisted = [NoteDeployVoucherKind::Deposit].into_iter().all(|kind| {
                 recovery
                     .voucher_checkpoint(kind)
                     .and_then(|checkpoint| checkpoint.proof.as_ref())
@@ -10977,7 +11003,10 @@ mod tests {
             .find("withdraw_note_tokens")
             .expect("withdraw submit present");
         assert!(input_guard < doctor, "input refusal must precede doctor");
-        assert!(input_guard < owner, "input refusal must precede owner reads");
+        assert!(
+            input_guard < owner,
+            "input refusal must precede owner reads"
+        );
         assert!(input_guard < submit, "input refusal must precede submit");
     }
 
@@ -11114,7 +11143,8 @@ mod tests {
             1,
             "run_note_balance is defined more than once; this test reads a single body"
         );
-        let body = crate::cli::source_probe::code_of(source, "pub(crate) async fn run_note_balance");
+        let body =
+            crate::cli::source_probe::code_of(source, "pub(crate) async fn run_note_balance");
         assert!(body.contains(".get_account_retrying("), "{body}");
         assert!(
             body.contains(".assert_note_balance_private_note_account("),
@@ -11334,11 +11364,7 @@ mod tests {
             AlreadyAtTarget
         );
         assert_eq!(
-            super::note_topup_no_op_verdict(
-                350_000_000_000,
-                Some(40_000_000_000),
-                350_000_000_000
-            ),
+            super::note_topup_no_op_verdict(350_000_000_000, Some(40_000_000_000), 350_000_000_000),
             ReadsDisagree
         );
         // An unreadable destination is a disagreement, not a level of zero -- treating it as zero
@@ -11545,8 +11571,7 @@ mod tests {
              funding key or submits: {body}"
         );
 
-        let submit_body =
-            crate::cli::source_probe::code_of(source, "async fn note_topup_submit");
+        let submit_body = crate::cli::source_probe::code_of(source, "async fn note_topup_submit");
         let marker = "submit_transaction_params(";
         let params = submit_body
             .find(marker)
@@ -11636,9 +11661,8 @@ mod tests {
                 _root_pn: &dexdo_core::Address,
                 _sk_u_commit_hex: &str,
                 timeout: Duration,
-            ) -> anyhow::Result<
-                dexdo_core::private_note::voucher_event::VoucherExtoutMessage,
-            > {
+            ) -> anyhow::Result<dexdo_core::private_note::voucher_event::VoucherExtoutMessage>
+            {
                 self.wait_calls.set(self.wait_calls.get() + 1);
                 self.wait_timeouts.borrow_mut().push(timeout);
                 let step = self
@@ -11720,8 +11744,7 @@ mod tests {
             use crate::cli::note::NoteDeployVoucherKind;
 
             let client = dexdo_core::ChainClient::connect("http://127.0.0.1:9")?;
-            let multisig_address =
-                dexdo_core::Address::parse(&format!("0:{}", "a".repeat(64)))?;
+            let multisig_address = dexdo_core::Address::parse(&format!("0:{}", "a".repeat(64)))?;
             let funding_keys = super::preflight_fixture_keys();
             let key_loader = super::FixedFundingKeyLoader::returning(&funding_keys);
             let wallet_reader = super::issue_678_wallet_reader(vec![(
@@ -11752,9 +11775,7 @@ mod tests {
             .await
         }
 
-        fn assert_paid_recovery_is_persisted_without_event(
-            recovery_path: &std::path::Path,
-        ) {
+        fn assert_paid_recovery_is_persisted_without_event(recovery_path: &std::path::Path) {
             let persisted = crate::cli::note::load_note_deploy_recovery(recovery_path)
                 .expect("read persisted recovery")
                 .expect("wallet submit must leave recovery state on disk");
@@ -11897,7 +11918,9 @@ mod tests {
                 "every SDK wait must receive less of the same deadline: {timeouts:?}"
             );
             assert!(
-                timeouts.last().is_some_and(|timeout| *timeout <= TRANSIENT_READ_MAX_BACKOFF),
+                timeouts
+                    .last()
+                    .is_some_and(|timeout| *timeout <= TRANSIENT_READ_MAX_BACKOFF),
                 "the final wait must receive only the bounded remainder: {timeouts:?}"
             );
             assert_paid_recovery_is_persisted_without_event(&recovery_path);

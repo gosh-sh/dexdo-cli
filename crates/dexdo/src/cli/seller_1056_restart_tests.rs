@@ -136,7 +136,6 @@ fn issue_1056_seller_args(
     root: &std::path::Path,
     deals_dir: std::path::PathBuf,
     endpoints_file: std::path::PathBuf,
-    contracts: std::path::PathBuf,
 ) -> crate::cli::args::SellerArgs {
     crate::cli::args::SellerArgs {
         mock: crate::cli::args::MockFlags {
@@ -216,7 +215,6 @@ async fn issue_1056_restart_child() {
         root.path(),
         deals_dir.clone(),
         endpoints_file,
-        contracts,
     ));
     tokio::pin!(seller);
     // The observation ends on the EVENT it is about -- the successor reaching the book -- and runs to

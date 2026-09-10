@@ -3,6 +3,7 @@ use super::book_events::{
     read_book_event_fold, read_book_fill_candidates, BookEventFold, BookFillCandidate,
 };
 use super::contracts_provision::*;
+use crate::manifest::{model_hash_for, MarketManifest};
 use crate::market::{
     check_seller_pubkey, check_subscription_buy_reserve, flags, BuyerOrderFact,
     BuyerStopTerminalFact, BuyerStopTerminalReceipt, DealBuyerBond, DealChainSnapshot,
@@ -11,7 +12,6 @@ use crate::market::{
     SettlementActionBondState, SettlementActionEvent, SettlementActionPostState,
     SettlementActionReceipt,
 };
-use crate::manifest::{model_hash_for, MarketManifest};
 use crate::onchain_diagnostics::{validate_onchain_submit_response, OnchainSubmitError};
 use crate::oracle_manifest::OracleMarketManifest;
 use crate::params::TICK_SIZE;
@@ -26,12 +26,12 @@ use gosh_ackinacki::airegistry::calls::encode_external_call;
 // the note, and the address derivation that remains encodes a stateInit rather than a message.
 // It stays imported because the `operator_wallet` submodule below globs this scope and deploys
 // the operator multisig through it, which is an ordinary external deploy and unaffected.
-use gosh_ackinacki::airegistry::deploy::{build_deploy, local_context};
-use gosh_ackinacki::config::AiRegistryConfig;
+use super::note_withdraw_gate_boc::note_withdraw_gate_from_account_boc;
 use crate::note_withdraw_gate::{
     refusal_carries_a_withdraw_gate_code, withdraw_gate_line, NoteWithdrawGate,
 };
-use super::note_withdraw_gate_boc::note_withdraw_gate_from_account_boc;
+use gosh_ackinacki::airegistry::deploy::{build_deploy, local_context};
+use gosh_ackinacki::config::AiRegistryConfig;
 use gosh_ackinacki::sdk::{Account, Address, ChainClient, ChainLiveness, KeyPair};
 use gosh_ackinacki::wallet::query::{dest_account_id_hex, fetch_dapp_id};
 use serde::Deserialize;
@@ -52,11 +52,9 @@ mod client_https_refusal_tests;
 #[path = "client_issue_1348_tests.rs"]
 mod client_issue_1348_tests;
 
-
 #[cfg(test)]
 #[path = "client_issue_1528_tests.rs"]
 mod client_issue_1528_tests;
-
 
 #[cfg(test)]
 #[path = "client_issue_1597_tests.rs"]
@@ -73,6 +71,10 @@ mod client_issue_1599_tests;
 #[cfg(test)]
 #[path = "client_issue_1861_tests.rs"]
 mod client_issue_1861_tests;
+
+#[cfg(test)]
+#[path = "client_issue_1998_tests.rs"]
+mod client_issue_1998_tests;
 
 // the fall-through step of `resolve_endpoint`. Declared beside the pair because it
 // pins the other half of the same rule -- refuses a label the endpoint contradicts, this one
@@ -826,7 +828,12 @@ pub(super) fn superroot_generation_check(
     expected: &str,
     live_code_hash: Option<&str>,
 ) -> ChainDoctorCheck {
-    code_hash_check("SuperRoot code hash", Some(superroot), expected, live_code_hash)
+    code_hash_check(
+        "SuperRoot code hash",
+        Some(superroot),
+        expected,
+        live_code_hash,
+    )
 }
 
 /// The RootPN generation check.
@@ -844,7 +851,12 @@ pub(super) fn rootoracle_generation_check(
     expected: &str,
     live_code_hash: Option<&str>,
 ) -> ChainDoctorCheck {
-    code_hash_check("RootOracle code hash", Some(rootoracle), expected, live_code_hash)
+    code_hash_check(
+        "RootOracle code hash",
+        Some(rootoracle),
+        expected,
+        live_code_hash,
+    )
 }
 
 /// The per-model `InferenceOrderBook` generation check.
@@ -865,13 +877,10 @@ pub(super) fn inference_orderbook_generation_check(
 /// the `RootPN.getDetails()` getter result; the PrivateNote code RootPN currently mints is its
 /// `privateNoteCodeHash` field.
 
-/// The comparison is deliberately against `PRIVATENOTE_PINNED_CODE_HASH` -- the constant the money-path
-/// guards enforce -- and NOT against the embedded `PRIVATENOTE_TVC`, which this CLI never deploys and
-/// which is therefore no evidence about the chain.
-pub(super) fn private_note_pin_check(
-    expected: &str,
-    rootpn_details: &Value,
-) -> ChainDoctorCheck {
+/// The comparison is deliberately against the active [`GenerationPins::private_note`] value the
+/// money-path guards enforce -- and NOT against the embedded `PRIVATENOTE_TVC`, which this CLI never
+/// deploys and which is therefore no evidence about the chain.
+pub(super) fn private_note_pin_check(expected: &str, rootpn_details: &Value) -> ChainDoctorCheck {
     code_hash_check(
         "PrivateNote code hash (RootPN pin)",
         None,
@@ -1647,7 +1656,6 @@ fn validate_salted_pmp_identity(
     Ok(())
 }
 
-
 fn active_account_code_hash(
     contract: &str,
     address: &Address,
@@ -1688,9 +1696,9 @@ fn active_account_code(
         .with_context(|| format!("read {contract} {display_address} account BOC"))?;
     let decoded = tvm_block::Account::construct_from_cell(root)
         .with_context(|| format!("decode {contract} {display_address} account"))?;
-    let code = decoded
-        .get_code()
-        .ok_or_else(|| anyhow!("{contract} {display_address} active account BOC exposes no code"))?;
+    let code = decoded.get_code().ok_or_else(|| {
+        anyhow!("{contract} {display_address} active account BOC exposes no code")
+    })?;
     let boc_hash = code.repr_hash().to_hex_string();
     if advertised_hash != boc_hash {
         return Err(anyhow!(
@@ -2198,17 +2206,6 @@ pub struct Deployed {
     pub goshai_onboarding_url: Option<String>,
 }
 
-
-/// Is this filename a deployment manifest?
-
-/// Two spellings, because both already exist in the wild: `deployed.<network>.json`, which the
-/// release publishes and every checkout carries, and `dexdo.contracts.json`, the flat name the
-/// acceptance suite hands to each participant. Recognising only one of them would have made this
-/// search miss the file an operator had already put where it belongs.
-pub(crate) fn is_manifest_name(name: &str) -> bool {
-    name == "dexdo.contracts.json" || (name.starts_with("deployed.") && name.ends_with(".json"))
-}
-
 impl Deployed {
     /// Read the manifest at the path the caller was given. Exactly that path, always.
 
@@ -2239,10 +2236,8 @@ impl Deployed {
         }
         let bytes = std::fs::read(path).map_err(|error| {
             let missing = error.kind() == std::io::ErrorKind::NotFound;
-            let refusal = anyhow::Error::new(error).context(format!(
-                "read the deployment manifest {}",
-                path.display()
-            ));
+            let refusal = anyhow::Error::new(error)
+                .context(format!("read the deployment manifest {}", path.display()));
             if !missing {
                 return refusal;
             }
@@ -2607,9 +2602,7 @@ impl std::error::Error for ChainHttpResponseError {
     }
 }
 
-async fn chain_response_for_status(
-    response: reqwest::Response,
-) -> Result<reqwest::Response> {
+async fn chain_response_for_status(response: reqwest::Response) -> Result<reqwest::Response> {
     if response.status() != reqwest::StatusCode::FORBIDDEN {
         return Ok(response.error_for_status()?);
     }
@@ -2691,28 +2684,50 @@ pub fn is_transient_read_failure(error: &anyhow::Error) -> bool {
     if is_transient_transport_failure(error) {
         return true;
     }
+    if read_request_got_no_response(error) {
+        return true;
+    }
     error
         .chain()
         .find_map(|cause| cause.downcast_ref::<GraphQlBodyError>())
         .is_some_and(GraphQlBodyError::is_pool_exhaustion)
 }
 
+/// A request that ended before any response existed: the connection was reset, closed or broken
+/// while the request was going out.
+
+/// `reqwest` calls this `Kind::Request`, and none of the facts
+/// [`ReadFailureFacts::reqwest`] collects covers it. `is_connect` answers `true` only for
+/// `hyper_util`'s `ErrorKind::Connect`, and a connection reset in flight is `ErrorKind::SendRequest`
+/// -- so a reset read was permanent to every retry this client has, measured on the endpoint the
+/// buy path dials.
+
+/// For a READ this is the plainest transient failure there is: no answer came back, so repeating the
+/// request asks the same question again. It is deliberately NOT part of
+/// [`is_transient_transport_failure`], which feeds the money-submit retry: a submit reset in flight
+/// may already have reached the chain, and repeating it is a second spend, not a second read.
+fn read_request_got_no_response(error: &anyhow::Error) -> bool {
+    error.chain().any(|cause| {
+        cause
+            .downcast_ref::<reqwest::Error>()
+            .is_some_and(reqwest::Error::is_request)
+    })
+}
+
 /// What the server asked us to wait, when it asked. Honouring it is the difference between backing
 /// off and making the limit worse; ignoring a stated `Retry-After` and retrying on our own schedule
 /// is what turns one rate-limited read into five.
 fn retry_after_delay(error: &anyhow::Error) -> Option<std::time::Duration> {
-    let seconds: u64 = error
-        .chain()
-        .find_map(|cause| {
-            cause
-                .downcast_ref::<RetryAfter>()
-                .map(|retry_after| retry_after.seconds)
-                .or_else(|| {
-                    cause
-                        .downcast_ref::<ChainHttpResponseError>()
-                        .and_then(|response| response.retry_after_seconds)
-                })
-        })?;
+    let seconds: u64 = error.chain().find_map(|cause| {
+        cause
+            .downcast_ref::<RetryAfter>()
+            .map(|retry_after| retry_after.seconds)
+            .or_else(|| {
+                cause
+                    .downcast_ref::<ChainHttpResponseError>()
+                    .and_then(|response| response.retry_after_seconds)
+            })
+    })?;
     let asked = std::time::Duration::from_secs(seconds);
     (asked <= crate::params::TRANSIENT_READ_MAX_RETRY_AFTER).then_some(asked)
 }
@@ -2755,11 +2770,8 @@ where
     let mut delay = crate::params::TRANSIENT_READ_INITIAL_BACKOFF;
 
     for attempt in 1..=crate::params::TRANSIENT_READ_ATTEMPTS {
-        let attempt_result = tokio::time::timeout(
-            crate::params::TRANSIENT_READ_ATTEMPT_TIMEOUT,
-            call(),
-        )
-        .await;
+        let attempt_result =
+            tokio::time::timeout(crate::params::TRANSIENT_READ_ATTEMPT_TIMEOUT, call()).await;
         let error = match attempt_result {
             Ok(Ok(value)) => return Ok(value),
             Ok(Err(error)) => {
@@ -2836,6 +2848,7 @@ pub(super) struct RequestGate {
     /// rather than assert on timing (which an `Unlimited` gate cannot show) or on the reader's
     /// return value (which is identical whether or not the admit is there). Without it, deleting an
     /// `admit()` from the pager broke nothing, which is how review finding 4 was found.
+    #[cfg(test)]
     admissions: std::sync::atomic::AtomicUsize,
 }
 
@@ -2844,18 +2857,21 @@ impl RequestGate {
         Self {
             ceiling,
             granted: tokio::sync::Mutex::new(std::collections::VecDeque::new()),
+            #[cfg(test)]
             admissions: std::sync::atomic::AtomicUsize::new(0),
         }
     }
 
     /// How many admissions this gate granted. Counts grants, not HTTP requests: how many requests
     /// the SDK makes out of one admission is not ours and is not counted here.
+    #[cfg(test)]
     pub(super) fn admissions(&self) -> usize {
         self.admissions.load(std::sync::atomic::Ordering::Relaxed)
     }
 
     /// Wait until this request may go out. Returns immediately when the network has no ceiling.
     pub(super) async fn admit(&self) {
+        #[cfg(test)]
         self.admissions
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let ChainRequestCeiling::PerSecond(ceiling) = self.ceiling else {
@@ -2878,7 +2894,9 @@ impl RequestGate {
                     return;
                 }
                 // The oldest admission in the window decides when a slot frees.
-                let oldest = *granted.front().expect("the window is full, so it is not empty");
+                let oldest = *granted
+                    .front()
+                    .expect("the window is full, so it is not empty");
                 window.saturating_sub(now.saturating_duration_since(oldest))
             };
             tokio::time::sleep(wait.max(std::time::Duration::from_millis(1))).await;
@@ -2929,7 +2947,7 @@ impl LimitedChainClient {
     /// still hands the raw client to ~100 existing call sites, and changing that type cascades through
     /// the CLI without a fixed point -- measured at 69, then 50, then 11 compile errors, each round
     /// uncovering another layer. So the ceiling is added ALONGSIDE rather than in place of it, the
-    /// remaining unmetered sites are frozen by `ci/check-client-bypass-ratchet.sh`, and they are
+    /// remaining unmetered sites are frozen by `ci/check_client_bypass_ratchet.sh`, and they are
     /// converted in batches. Anything reached through here is NOT rate limited.
     pub fn unmetered(&self) -> &ChainClient {
         &self.inner
@@ -3077,7 +3095,12 @@ struct LiveDealSnapshotSource<'a> {
 #[async_trait::async_trait]
 impl DealSnapshotSource for LiveDealSnapshotSource<'_> {
     async fn account_identity(&mut self) -> Result<Option<DealAccountIdentity>> {
-        let Some(account) = self.chain.client.get_account_retrying(self.token_contract).await? else {
+        let Some(account) = self
+            .chain
+            .client
+            .get_account_retrying(self.token_contract)
+            .await?
+        else {
             return Ok(None);
         };
         if !account.is_active() {
@@ -3691,11 +3714,7 @@ const EXACT_MESSAGE_RECEIPT_QUERY: &str = r#"
 /// The charge is new: a sell offer always paid `GAS_POST_FROM_NOTE` through the deal, a buy rested
 /// for free. A buyer whose note has a full balance and no physical ECC now fails at a call that used
 /// to work, with an error that points at the escrow.
-fn buy_order_shortfall(
-    private_balance: u128,
-    account_ecc: u128,
-    escrow: u128,
-) -> Option<String> {
+fn buy_order_shortfall(private_balance: u128, account_ecc: u128, escrow: u128) -> Option<String> {
     let charge = crate::params::BUY_ORDER_GAS_RAW;
     if private_balance < escrow {
         return Some(format!(
@@ -3951,7 +3970,8 @@ async fn retry_buyer_money_submit(
 ) -> Result<Value> {
     let mut delay = crate::params::TRANSIENT_SUBMIT_INITIAL_BACKOFF;
     for attempt in 1..=crate::params::TRANSIENT_SUBMIT_RETRIES_BEFORE_FINAL {
-        match send_message_routed_money_once(http, endpoint, boc_base64, account_id, dapp_id).await {
+        match send_message_routed_money_once(http, endpoint, boc_base64, account_id, dapp_id).await
+        {
             Ok(value) => return Ok(value),
             Err(error) if is_decoded_transient_money_rejection(&error) => {
                 eprintln!(
@@ -4023,7 +4043,7 @@ where
 /// without an answer is not an unfinalized receipt.
 
 /// The request stays INSIDE this function rather than moving to a `..._once` helper of its own. A
-/// helper would take `http: &reqwest::Client`, and `ci/check-client-bypass-ratchet.sh` counts that
+/// helper would take `http: &reqwest::Client`, and `ci/check_client_bypass_ratchet.sh` counts that
 /// signature as one more unmetered read surface (its DIRECT ceiling is an equality, measured 28 vs
 /// 27). One more reader is exactly what this change does NOT add: it is the same single request,
 /// repeated when it comes back with nothing.
@@ -4048,10 +4068,7 @@ async fn query_exact_destination_receipt(
             }))
             .send()
             .await?;
-        let response: Value = chain_response_for_status(response)
-            .await?
-            .json()
-            .await?;
+        let response: Value = chain_response_for_status(response).await?.json().await?;
         Ok(response)
     })
     .await
@@ -4412,9 +4429,8 @@ fn resolve_resting_inference_orders(
         {
             continue;
         }
-        let order_book =
-            RealChainBackend::canonical_inference_orderbook_address(&call.model_hash)?
-                .with_workchain();
+        let order_book = RealChainBackend::canonical_inference_orderbook_address(&call.model_hash)?
+            .with_workchain();
         let key = super::note_events::resting_inference_order_key(&order_book, call.order_id)?;
         if !order_keys.iter().any(|stored| stored == &key) {
             continue;
@@ -4699,9 +4715,8 @@ pub struct TokenContractInboundCall {
 impl TokenContractInboundCall {
     pub(super) fn is_buyer_stop_from(&self, buyer_note: &Address) -> bool {
         self.function == "stop"
-            && normalize_addr(&self.source).is_ok_and(|source| {
-                source.eq_ignore_ascii_case(&buyer_note.with_workchain())
-            })
+            && normalize_addr(&self.source)
+                .is_ok_and(|source| source.eq_ignore_ascii_case(&buyer_note.with_workchain()))
     }
 }
 
@@ -4811,16 +4826,28 @@ pub struct TokenContractSettlementReceipt {
 /// Exact ABI payload of a known `TokenContract` lifecycle/settlement event.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum TokenContractSettlementEvent {
-    ContractDeployed { token_contract: String },
-    StreamFunded { buyer: String, deposit: u128 },
-    SellerBondFunded { amount: u128 },
+    ContractDeployed {
+        token_contract: String,
+    },
+    StreamFunded {
+        buyer: String,
+        deposit: u128,
+    },
+    SellerBondFunded {
+        amount: u128,
+    },
     /// the BUYER's bond, which the deal has always emitted (`TokenContract.sol` event
     /// `BuyerBondFunded(uint128 amount)`) and this decoder never read. It is not a detail: on the
     /// never-opened path the bond is folded back into the deposit and refunded WITH it
     /// (`_releaseBuyerBond`), so a reader that knows the deposit and not the bond sees a refund
     /// larger than anything it can account for and calls a correct settlement a divergence.
-    BuyerBondFunded { amount: u128 },
-    StreamOpened { buyer: String, price_per_tick: u128 },
+    BuyerBondFunded {
+        amount: u128,
+    },
+    StreamOpened {
+        buyer: String,
+        price_per_tick: u128,
+    },
     ProbeAccepted {
         buyer: String,
         to_seller: u128,
@@ -4854,9 +4881,17 @@ pub enum TokenContractSettlementEvent {
         refund_to_buyer: u128,
         released: bool,
     },
-    StreamReclaimed { buyer: String, refund_to_buyer: u128 },
-    ShellWithdrawn { recipient: String, amount: u128 },
-    ContractDestroyed { token_contract: String },
+    StreamReclaimed {
+        buyer: String,
+        refund_to_buyer: u128,
+    },
+    ShellWithdrawn {
+        recipient: String,
+        amount: u128,
+    },
+    ContractDestroyed {
+        token_contract: String,
+    },
 }
 
 /// Ordered lifecycle and settlement receipts emitted by one `TokenContract`.
@@ -4909,6 +4944,16 @@ pub struct NoteDealCreditReceipt {
     pub cursor: String,
 }
 
+/// Caller-selected terms for one `PrivateNote.deployDeal` signed call.
+#[derive(Debug, Clone, Copy)]
+pub struct NoteDeployDealRequest<'a> {
+    pub nonce: u64,
+    pub model_name: &'a str,
+    pub price_per_tick: u128,
+    pub max_ticks: u128,
+    pub gas_reserve: u128,
+}
+
 pub(super) async fn fetch_ext_out_page(
     gate: &RequestGate,
     http: &reqwest::Client,
@@ -4948,10 +4993,7 @@ pub(super) async fn fetch_ext_out_page(
         }))
         .send()
         .await?;
-    let response: Value = chain_response_for_status(response)
-        .await?
-        .json()
-        .await?;
+    let response: Value = chain_response_for_status(response).await?.json().await?;
     if let Some(errors) = response.get("errors") {
         // typed, so the READ predicate can recognise a pool timeout here too. This is the
         // reader that stopped the live mainnet run: mainnet answered HTTP 200 with
@@ -5497,15 +5539,20 @@ pub fn parse_source_transaction_out_messages(
     if transaction.is_null() {
         return Ok(None);
     }
-    let out_messages = transaction["out_msgs"].as_array().ok_or_else(|| {
-        anyhow!("multisig delivery anchor source transaction has no out_msgs")
-    })?;
+    let out_messages = transaction["out_msgs"]
+        .as_array()
+        .ok_or_else(|| anyhow!("multisig delivery anchor source transaction has no out_msgs"))?;
     out_messages
         .iter()
         .map(|id| {
-            let id = id.as_str().filter(|id| !id.trim().is_empty()).ok_or_else(|| {
-                anyhow!("multisig delivery anchor source transaction has a malformed out_msg id")
-            })?;
+            let id = id
+                .as_str()
+                .filter(|id| !id.trim().is_empty())
+                .ok_or_else(|| {
+                    anyhow!(
+                        "multisig delivery anchor source transaction has a malformed out_msg id"
+                    )
+                })?;
             Ok(id.to_string())
         })
         .collect::<Result<Vec<_>>>()
@@ -5596,8 +5643,7 @@ pub async fn prove_multisig_delivery_message(
         "multisig delivery anchor",
     )
     .await?;
-    let Some(out_messages) =
-        parse_source_transaction_out_messages(&anchor, sent_event_message_id)?
+    let Some(out_messages) = parse_source_transaction_out_messages(&anchor, sent_event_message_id)?
     else {
         return Ok(None);
     };
@@ -5619,11 +5665,9 @@ pub async fn prove_multisig_delivery_message(
         let destination = parse_message_destination(&response, &id)?;
         siblings.push((id, destination));
     }
-    let Some(delivery) = sole_delivery_sibling(
-        &siblings,
-        sent_event_message_id,
-        destination_account_id,
-    ) else {
+    let Some(delivery) =
+        sole_delivery_sibling(&siblings, sent_event_message_id, destination_account_id)
+    else {
         return Ok(None);
     };
 
@@ -5683,7 +5727,7 @@ pub async fn prove_multisig_delivery_message(
 /// this change is not the place to alter that -- it is a separate defect of a different shape.
 
 /// The request stays inside this function rather than moving to a `..._once` helper: that helper
-/// would take `http: &reqwest::Client` and `ci/check-client-bypass-ratchet.sh` counts the signature
+/// would take `http: &reqwest::Client` and `ci/check_client_bypass_ratchet.sh` counts the signature
 /// against a ceiling that is an equality. Same reason as the receipt read above.
 async fn post_message_query(
     http: &reqwest::Client,
@@ -5701,10 +5745,7 @@ async fn post_message_query(
             }))
             .send()
             .await?;
-        let response: Value = chain_response_for_status(response)
-            .await?
-            .json()
-            .await?;
+        let response: Value = chain_response_for_status(response).await?.json().await?;
         Ok(response)
     })
     .await?;
@@ -5757,7 +5798,7 @@ fn settlement_action_event_kind(event: &TokenContractSettlementEvent) -> Option<
         | TokenContractSettlementEvent::ContractDeployed { .. }
         | TokenContractSettlementEvent::StreamFunded { .. }
         | TokenContractSettlementEvent::SellerBondFunded { .. }
-            | TokenContractSettlementEvent::BuyerBondFunded { .. }
+        | TokenContractSettlementEvent::BuyerBondFunded { .. }
         | TokenContractSettlementEvent::StreamOpened { .. }
         | TokenContractSettlementEvent::StreamReclaimed { .. }
         | TokenContractSettlementEvent::ShellWithdrawn { .. }
@@ -5985,7 +6026,7 @@ fn reject_prior_settlement_action(
                 | TokenContractSettlementEvent::ContractDeployed { .. }
                 | TokenContractSettlementEvent::StreamFunded { .. }
                 | TokenContractSettlementEvent::SellerBondFunded { .. }
-            | TokenContractSettlementEvent::BuyerBondFunded { .. }
+                | TokenContractSettlementEvent::BuyerBondFunded { .. }
                 | TokenContractSettlementEvent::StreamOpened { .. }
                 | TokenContractSettlementEvent::StreamReclaimed { .. }
                 | TokenContractSettlementEvent::ShellWithdrawn { .. }
@@ -6819,14 +6860,13 @@ impl RealChainBackend {
         .await?;
         let mut report = BookFillCandidateReport::default();
         for candidate in candidates {
-            let token_contract = Address::parse(&candidate.seller_token_contract).with_context(
-                || {
+            let token_contract =
+                Address::parse(&candidate.seller_token_contract).with_context(|| {
                     format!(
                         "InferenceFilled sellerTC {}",
                         candidate.seller_token_contract
                     )
-                },
-            )?;
+                })?;
             let parties = self.token_contract_parties(&token_contract).await?;
             let state = self.token_contract_deal_state(&token_contract).await?;
             match book_fill_candidate_refusal_reason(
@@ -7014,7 +7054,7 @@ impl RealChainBackend {
         };
         let actual = fields["_tokenContractCode"]
             .as_str()
-            .and_then(|cell| cell_boc_repr_hash(cell));
+            .and_then(cell_boc_repr_hash);
         let mut check = code_hash_check(NAME, Some(rootpn), expected, actual.as_deref());
         if check.status == ChainDoctorStatus::Fail {
             // The generic "stale binary, rebuild" advice is wrong here and would send an operator
@@ -7188,11 +7228,7 @@ impl RealChainBackend {
     ) -> Result<ChainDoctorReport> {
         let mut checks = Vec::new();
         self.liveness().await?;
-        record_doctor_check(
-            &mut checks,
-            &mut observe,
-            self.endpoint_reachable_check(),
-        );
+        record_doctor_check(&mut checks, &mut observe, self.endpoint_reachable_check());
         let local_unix = local_unix_secs()?;
         let chain_unix =
             retry_transient_read(|| fetch_chain_time_secs(&self.http, self.client.endpoint()))
@@ -7696,12 +7732,12 @@ impl RealChainBackend {
         else {
             return Ok(None);
         };
-        let buyer = value["buyer"]
-            .as_str()
-            .ok_or_else(|| anyhow!("TokenContract {display_tc} getParties() has no buyer address"))?;
-        let seller_note = value["sellerNote"]
-            .as_str()
-            .ok_or_else(|| anyhow!("TokenContract {display_tc} getParties() has no sellerNote address"))?;
+        let buyer = value["buyer"].as_str().ok_or_else(|| {
+            anyhow!("TokenContract {display_tc} getParties() has no buyer address")
+        })?;
+        let seller_note = value["sellerNote"].as_str().ok_or_else(|| {
+            anyhow!("TokenContract {display_tc} getParties() has no sellerNote address")
+        })?;
         Ok(Some(TokenContractParties {
             buyer: normalize_addr(buyer).with_context(|| {
                 format!(
@@ -8019,9 +8055,6 @@ impl RealChainBackend {
             .unwrap_or_else(|_| order_book.with_workchain());
         let endpoint = self.client.endpoint();
         let gql = format!("{}/graphql", endpoint.trim_end_matches('/'));
-        // the dapp-id lookup is a request of its own, so it takes a slot of its own.
-        self.client.gate().admit().await;
-        let dapp_id = fetch_dapp_id(&self.http, endpoint, &account_id).await?;
         let query = r#"
             query($accountId: String!, $dappId: String!, $last: Int!) {
               blockchain {
@@ -8033,22 +8066,31 @@ impl RealChainBackend {
               }
             }
         "#;
-        // this reader queries the ext-out surface with its own inline GraphQL, so it never
-        // reached the pager's gate. One request, one admission.
-        self.client.gate().admit().await;
-        let response = self
-            .http
-            .post(&gql)
-            .json(&json!({
-                "query": query,
-                "variables": { "accountId": account_id, "dappId": dapp_id, "last": 200 },
-            }))
-            .send()
-            .await?;
-        let resp: Value = chain_response_for_status(response)
-            .await?
-            .json()
-            .await?;
+        // both requests go through the one read retry policy, like every other reader in
+        // this file. Without it this poll was the buyer's only account of money already POSTed and
+        // a single connection reset on the dapp-id lookup ended the purchase with `ambiguous
+        // submit` -- measured on live shellnet, ten seconds into a 300-second wait. The retry is
+        // bounded by the policy: an exhausted read still leaves the loop, it just is not
+        // one unanswered request any more.
+        let resp: Value = retry_transient_read(|| async {
+            // the dapp-id lookup is a request of its own, so it takes a slot of its own, and
+            // so does the ext-out query below -- this reader has its own inline GraphQL and never
+            // reached the pager's gate.
+            self.client.gate().admit().await;
+            let dapp_id = fetch_dapp_id(&self.http, endpoint, &account_id).await?;
+            self.client.gate().admit().await;
+            let response = self
+                .http
+                .post(&gql)
+                .json(&json!({
+                    "query": query,
+                    "variables": { "accountId": account_id, "dappId": dapp_id, "last": 200 },
+                }))
+                .send()
+                .await?;
+            Ok(chain_response_for_status(response).await?.json().await?)
+        })
+        .await?;
         let edges = resp["data"]["blockchain"]["account"]["messages"]["edges"]
             .as_array()
             .ok_or_else(|| anyhow!("note ext-out GraphQL shape changed: {resp}"))?;
@@ -8145,10 +8187,7 @@ impl RealChainBackend {
             }))
             .send()
             .await?;
-        let response: Value = chain_response_for_status(response)
-            .await?
-            .json()
-            .await?;
+        let response: Value = chain_response_for_status(response).await?.json().await?;
         let edges = response["data"]["blockchain"]["account"]["messages"]["edges"]
             .as_array()
             .ok_or_else(|| anyhow!("seller offer outcome GraphQL shape changed: {response}"))?;
@@ -8204,17 +8243,16 @@ impl RealChainBackend {
         let want_ob = Address::parse(&order_book.with_workchain())
             .map(|a| a.with_workchain())
             .unwrap_or_else(|_| order_book.with_workchain());
-        let messages =
-            retry_transient_read(|| {
-                fetch_all_ext_out_messages(
-                    self.client.gate(),
-                    &self.http,
-                    self.client.endpoint(),
-                    &account_id,
-                    |message| Ok(Some(message)),
-                )
-            })
-            .await?;
+        let messages = retry_transient_read(|| {
+            fetch_all_ext_out_messages(
+                self.client.gate(),
+                &self.http,
+                self.client.endpoint(),
+                &account_id,
+                |message| Ok(Some(message)),
+            )
+        })
+        .await?;
         let mut matches = Vec::<(i64, u128, MatchedFill)>::new();
         for message in messages {
             match super::note_events::decode_attributed_inference_filled(&message.body) {
@@ -8346,17 +8384,16 @@ impl RealChainBackend {
         ticks: u128,
     ) -> Result<Vec<InferenceSubscriptionPlacement>> {
         let account_id = ob.bare().to_string();
-        let messages =
-            retry_transient_read(|| {
-                fetch_all_ext_out_messages(
-                    self.client.gate(),
-                    &self.http,
-                    self.client.endpoint(),
-                    &account_id,
-                    |message| Ok(Some(message)),
-                )
-            })
-            .await?;
+        let messages = retry_transient_read(|| {
+            fetch_all_ext_out_messages(
+                self.client.gate(),
+                &self.http,
+                self.client.endpoint(),
+                &account_id,
+                |message| Ok(Some(message)),
+            )
+        })
+        .await?;
         let buyer_note = buyer_note.with_workchain();
         let mut placements = Vec::new();
         for message in messages {
@@ -8403,17 +8440,16 @@ impl RealChainBackend {
         buyer_note: &Address,
     ) -> Result<Vec<BuyerOrderFact>> {
         let account_id = ob.bare().to_string();
-        let messages =
-            retry_transient_read(|| {
-                fetch_all_ext_out_messages(
-                    self.client.gate(),
-                    &self.http,
-                    self.client.endpoint(),
-                    &account_id,
-                    |message| Ok(Some(message)),
-                )
-            })
-            .await?;
+        let messages = retry_transient_read(|| {
+            fetch_all_ext_out_messages(
+                self.client.gate(),
+                &self.http,
+                self.client.endpoint(),
+                &account_id,
+                |message| Ok(Some(message)),
+            )
+        })
+        .await?;
         let buyer_note = buyer_note.with_workchain();
         let mut facts = Vec::new();
         for message in messages {
@@ -8423,7 +8459,8 @@ impl RealChainBackend {
                     message.id
                 )
             })?;
-            let Some(fact) = super::book_events::decode_buyer_order_fact(&message.body, created_at)?
+            let Some(fact) =
+                super::book_events::decode_buyer_order_fact(&message.body, created_at)?
             else {
                 continue;
             };
@@ -8438,7 +8475,10 @@ impl RealChainBackend {
             if !owner.eq_ignore_ascii_case(&buyer_note) {
                 continue;
             }
-            facts.push(BuyerOrderFact { note: owner, ..fact });
+            facts.push(BuyerOrderFact {
+                note: owner,
+                ..fact
+            });
         }
         Ok(facts)
     }
@@ -8635,7 +8675,8 @@ impl RealChainBackend {
         flags: u8,
         deadline: u64,
     ) -> Result<Value> {
-        self.refuse_buy_order_the_note_cannot_place(note, escrow).await?;
+        self.refuse_buy_order_the_note_cannot_place(note, escrow)
+            .await?;
         self.submit(
             note,
             PRIVATENOTE_ABI,
@@ -8960,13 +9001,10 @@ impl RealChainBackend {
         &self,
         note: &Address,
         order_keys: &[String],
-    ) -> Result<(
-        Vec<RecoveredRestingOrder>,
-        Vec<String>,
-        NoteHistoryCoverage,
-    )> {
+    ) -> Result<(Vec<RecoveredRestingOrder>, Vec<String>, NoteHistoryCoverage)> {
         let (placed, removed, history) = self.note_inbound_inference_order_calls(note).await?;
-        let (resting, unexplained) = resolve_resting_inference_orders(&placed, &removed, order_keys)?;
+        let (resting, unexplained) =
+            resolve_resting_inference_orders(&placed, &removed, order_keys)?;
         Ok((resting, unexplained, history))
     }
 
@@ -9029,9 +9067,9 @@ impl RealChainBackend {
                 .await?;
             let response: Value = chain_response_for_status(response).await?.json().await?;
             let messages = &response["data"]["blockchain"]["account"]["messages"];
-            let edges = messages["edges"].as_array().ok_or_else(|| {
-                anyhow!("note inbound-history GraphQL shape changed: {response}")
-            })?;
+            let edges = messages["edges"]
+                .as_array()
+                .ok_or_else(|| anyhow!("note inbound-history GraphQL shape changed: {response}"))?;
             for edge in edges {
                 let Some(body) = edge["node"]["body"].as_str().filter(|b| !b.is_empty()) else {
                     continue;
@@ -9083,12 +9121,7 @@ impl RealChainBackend {
         let note_address = Address::parse(&note)?;
         let value = self
             .client
-            .run_getter_retrying(
-                &note_address,
-                PRIVATENOTE_ABI,
-                "getOutstanding",
-                json!({}),
-            )
+            .run_getter_retrying(&note_address, PRIVATENOTE_ABI, "getOutstanding", json!({}))
             .await?
             .ok_or_else(|| {
                 anyhow!(
@@ -9099,9 +9132,7 @@ impl RealChainBackend {
         let (resting_orders, unexplained_order_keys, history) = self
             .recover_resting_inference_orders(&note_address, &order_keys)
             .await
-            .with_context(|| {
-                format!("recover resting inference orders for PrivateNote {note}")
-            })?;
+            .with_context(|| format!("recover resting inference orders for PrivateNote {note}"))?;
         let mut report = PrivateNoteOutstandingReport {
             opaque_order_count: order_keys.len(),
             resting_orders,
@@ -9212,10 +9243,7 @@ impl RealChainBackend {
                 }))
                 .send()
                 .await?;
-            let response: Value = chain_response_for_status(response)
-                .await?
-                .json()
-                .await?;
+            let response: Value = chain_response_for_status(response).await?.json().await?;
             if let Some(errors) = response.get("errors") {
                 return Err(anyhow!(
                     "PrivateNote {note} owner-call GraphQL errors: {errors}"
@@ -9400,10 +9428,7 @@ impl RealChainBackend {
                 }))
                 .send()
                 .await?;
-            let response: Value = chain_response_for_status(response)
-                .await?
-                .json()
-                .await?;
+            let response: Value = chain_response_for_status(response).await?.json().await?;
             if let Some(errors) = response.get("errors") {
                 return Err(anyhow!(
                     "TokenContract {token_contract} inbound-call GraphQL errors: {errors}"
@@ -9507,21 +9532,30 @@ impl RealChainBackend {
         let account_id = token_contract.bare().to_string();
         // A TokenContract is its own dapp. Its immutable ext-out history remains queryable after
         // terminal withdrawal destroys the account and `/v2/account` starts returning 404.
-        // the dapp-id lookup is a request of its own, so it takes a slot of its own.
-        self.client.gate().admit().await;
-        let dapp_id = match fetch_dapp_id(&self.http, self.client.endpoint(), &account_id).await {
+        // and it goes through the read retry policy, because this is what the settlement
+        // confirmation loop polls after the money POST. A 404 is a real answer and is not retried
+        // by the policy, so the uninit branch below keeps seeing it.
+        let dapp_id = match retry_transient_read(|| async {
+            // the dapp-id lookup is a request of its own, so it takes a slot of its own.
+            self.client.gate().admit().await;
+            fetch_dapp_id(&self.http, self.client.endpoint(), &account_id).await
+        })
+        .await
+        {
             Ok(dapp_id) => dapp_id,
             Err(error) if is_uninit_account_404(&error.to_string()) => account_id.clone(),
             Err(error) => return Err(error),
         };
-        let messages = fetch_all_ext_out_messages_routed(
-            self.client.gate(),
-            &self.http,
-            self.client.endpoint(),
-            &account_id,
-            &dapp_id,
-            |message| Ok(Some(message)),
-        )
+        let messages = retry_transient_read(|| {
+            fetch_all_ext_out_messages_routed(
+                self.client.gate(),
+                &self.http,
+                self.client.endpoint(),
+                &account_id,
+                &dapp_id,
+                |message| Ok(Some(message)),
+            )
+        })
         .await?;
         decode_token_contract_settlement_receipts(messages)
     }
@@ -9560,7 +9594,9 @@ impl RealChainBackend {
         } else {
             None
         };
-        let receipts = self.token_contract_settlement_receipts(token_contract).await?;
+        let receipts = self
+            .token_contract_settlement_receipts(token_contract)
+            .await?;
         // read the side that reports the money. The deal's own ext-out is silent about the
         // never-opened refund by construction, so the notes party to it are asked what they were
         // credited. Which notes: the current getters when the deal still exists, and -- because the
@@ -10016,27 +10052,24 @@ impl RealChainBackend {
     /// still comes from [`token_contract_deploy_address`](Self::token_contract_deploy_address) and
     /// every other party derives it exactly as before. What moved is the DAPP: the deal lands in the
     /// note's, which is configured, which is why it can hold its own native floor at all.
+
     pub async fn note_deploy_deal(
         &self,
         note: &Address,
         owner_keys: &KeyPair,
-        nonce: u64,
-        model_name: &str,
-        price_per_tick: u128,
-        max_ticks: u128,
-        gas_reserve: u128,
+        request: NoteDeployDealRequest<'_>,
     ) -> Result<Value> {
         let boc = Self::encode_signed_call_boc(
             note,
             PRIVATENOTE_ABI,
             "deployDeal",
             note_deploy_deal_params(
-                nonce,
-                model_name,
-                &model_hash_for(model_name),
-                price_per_tick,
-                max_ticks,
-                gas_reserve,
+                request.nonce,
+                request.model_name,
+                &model_hash_for(request.model_name),
+                request.price_per_tick,
+                request.max_ticks,
+                request.gas_reserve,
             ),
             owner_keys,
         )
@@ -10071,19 +10104,6 @@ impl RealChainBackend {
             ));
         }
         Ok(account.balance)
-    }
-
-    async fn wait_native_balance_at_least(&self, addr: &Address, min: u128) -> Result<()> {
-        for _ in 0..crate::params::GAS_BALANCE_CONFIRM_MAX_READS {
-            if self.active_native_balance(addr).await? > min {
-                return Ok(());
-            }
-            tokio::time::sleep(crate::params::GAS_BALANCE_CONFIRM_POLL_INTERVAL).await;
-        }
-        let balance = self.active_native_balance(addr).await?;
-        Err(anyhow!(
-            "contract {addr} native balance {balance} did not rise above gas-health floor {min}"
-        ))
     }
 
     async fn account_snapshot(&self, addr: &Address) -> String {
@@ -10220,8 +10240,14 @@ impl RealChainBackend {
         // send nothing.
         let Some(short) = crate::chain::contracts_provision::gas_health_top_up_amount(
             have,
-            crate::params::deal_gas_health_floor_raw_with_overhead(max_ticks, deal_gas_overhead_raw),
-            crate::params::deal_gas_health_target_raw_with_overhead(max_ticks, deal_gas_overhead_raw),
+            crate::params::deal_gas_health_floor_raw_with_overhead(
+                max_ticks,
+                deal_gas_overhead_raw,
+            ),
+            crate::params::deal_gas_health_target_raw_with_overhead(
+                max_ticks,
+                deal_gas_overhead_raw,
+            ),
         ) else {
             return Ok(());
         };
@@ -10442,14 +10468,8 @@ impl RealChainBackend {
             seller_keys.public_hex(),
         )
         .map_err(anyhow::Error::msg)?;
-        self.submit(
-            tc,
-            TOKENCONTRACT_ABI,
-            "destroy",
-            json!({}),
-            seller_keys,
-        )
-        .await
+        self.submit(tc, TOKENCONTRACT_ABI, "destroy", json!({}), seller_keys)
+            .await
     }
 
     /// the seller winds down an **UNSOLD** deal -- one that never matched, so it was never
@@ -10598,10 +10618,7 @@ impl RealChainBackend {
                 note,
                 PRIVATENOTE_ABI,
                 "withdrawTokens",
-                self.withdraw_note_tokens_payload_for_destination(
-                    dest_wallet,
-                    destination_dapp_id,
-                ),
+                self.withdraw_note_tokens_payload_for_destination(dest_wallet, destination_dapp_id),
                 keys,
             )
             .await;
@@ -10915,14 +10932,15 @@ impl RealChainBackend {
             .await?;
         let client_message_id = external_message_hash(&prepared.1)
             .map_err(|source| anyhow::Error::new(MoneySubmitError::Preparation { source }))?;
-        let receipt = self.submit_settlement_action_once(
-            tc,
-            SettlementAction::BuyerStop,
-            ExpectedSettlementEvent::BuyerStop,
-            Some(buyer_note),
-            prepared,
-        )
-        .await?;
+        let receipt = self
+            .submit_settlement_action_once(
+                tc,
+                SettlementAction::BuyerStop,
+                ExpectedSettlementEvent::BuyerStop,
+                Some(buyer_note),
+                prepared,
+            )
+            .await?;
         Ok(SubmittedBuyerStopReceipt {
             receipt,
             client_message_id,
@@ -11021,7 +11039,6 @@ impl RealChainBackend {
         buyer_keys: &KeyPair,
         tc: &Address,
     ) -> Result<Value> {
-
         self.submit(
             buyer_note,
             PRIVATENOTE_ABI,
@@ -11295,11 +11312,13 @@ impl RealChainBackend {
             self.note_deploy_deal(
                 note,
                 seed_keys,
-                nonce,
-                frame_model,
-                price_per_tick,
-                max_ticks,
-                gas,
+                NoteDeployDealRequest {
+                    nonce,
+                    model_name: frame_model,
+                    price_per_tick,
+                    max_ticks,
+                    gas_reserve: gas,
+                },
             )
             .await
             .context("note-deployed provision: PrivateNote.deployDeal failed")?;
@@ -11534,15 +11553,12 @@ impl RealChainBackend {
     }
 
     pub async fn oracle_event_info(&self, oel: &Address, event_id: &str) -> Result<Option<Value>> {
-        let events = self
-            .oracle_event_list_events(oel)
-            .await?
-            .ok_or_else(|| {
-                anyhow!(
-                    "OracleEventList {} _events getter unavailable",
-                    display_dexdo_address(oel)
-                )
-            })?;
+        let events = self.oracle_event_list_events(oel).await?.ok_or_else(|| {
+            anyhow!(
+                "OracleEventList {} _events getter unavailable",
+                display_dexdo_address(oel)
+            )
+        })?;
         Ok(event_from_getter_output(&events, event_id).cloned())
     }
 
@@ -11940,12 +11956,10 @@ impl RealChainBackend {
                 "OracleEventList {display_oel} code hash does not match the deployed manifest"
             ));
         }
-        let oel_fields = oracle_event_list_storage_fields(
-            oel_account
-                .boc
-                .as_deref()
-                .ok_or_else(|| anyhow!("OracleEventList {display_oel} account BOC is unavailable"))?,
-        )?;
+        let oel_fields =
+            oracle_event_list_storage_fields(oel_account.boc.as_deref().ok_or_else(|| {
+                anyhow!("OracleEventList {display_oel} account BOC is unavailable")
+            })?)?;
         let index = validate_oracle_event_list_identity(&oel_fields, manifest, signer)?;
         let canonical_oel = self.oracle_event_list_address(&oracle, index).await?;
         if canonical_oel.with_workchain() != oel.with_workchain() {
@@ -12030,12 +12044,10 @@ impl RealChainBackend {
             .await?
             .filter(Account::is_active)
             .ok_or_else(|| anyhow!("OracleEventList {display_oel} is not Active"))?;
-        let fields = oracle_event_list_storage_fields(
-            account
-                .boc
-                .as_deref()
-                .ok_or_else(|| anyhow!("OracleEventList {display_oel} account BOC is unavailable"))?,
-        )?;
+        let fields =
+            oracle_event_list_storage_fields(account.boc.as_deref().ok_or_else(|| {
+                anyhow!("OracleEventList {display_oel} account BOC is unavailable")
+            })?)?;
         oracle_pmp_confirmation_is_active(&fields, pmp, event_id)
     }
 
@@ -12493,8 +12505,8 @@ impl RealChainBackend {
     }
 
     /// Fund-safety guard for `note withdraw`. A PrivateNote deployed by a
-    /// PREVIOUS contract generation -- its on-chain `code_hash` != the current
-    /// `PRIVATENOTE_PINNED_CODE_HASH` -- still accepts the current-generation `withdrawTokens`
+    /// PREVIOUS contract generation -- its on-chain `code_hash` differs from the current generation's
+    /// `private_note` pin -- still accepts the current-generation `withdrawTokens`
     /// message: it ZEROES the note's balance but does NOT credit the destination wallet, so the
     /// SHELL is lost. Refuse the withdraw BEFORE any on-chain write when the note is not the current
     /// generation. This does not recover funds already lost; it prevents zeroing a still-funded
@@ -12710,10 +12722,7 @@ pub fn note_transfer_sender_refusal(details: &Value) -> Option<NoteTransferRefus
         .into_iter()
         .find(|(_, locked)| *locked > 0)
         .map(
-            |(token_type, locked)| NoteTransferRefusal::SenderLockedInOrders {
-                token_type,
-                locked,
-            },
+            |(token_type, locked)| NoteTransferRefusal::SenderLockedInOrders { token_type, locked },
         )
 }
 
@@ -12840,9 +12849,7 @@ mod tests {
     /// right now. Both halves have to hold -- history alone says what happened, the getter alone
     /// says what is true but not under what name.
     mod issue_1522_resting_orders_are_named_and_proved {
-        use super::super::{
-            resolve_resting_inference_orders, RealChainBackend,
-        };
+        use super::super::{resolve_resting_inference_orders, RealChainBackend};
         use crate::chain::note_events::{resting_inference_order_key, InferenceOrderCall};
 
         const MODEL_HASH: &str =
@@ -12930,7 +12937,6 @@ mod tests {
         }
     }
 
-
     /// `Deployed::load` maps the file's fields onto the struct's, for every committed manifest.
 
     /// This used to name one manifest and assert that chain's host, DApp id and roots as literals.
@@ -12956,22 +12962,37 @@ mod tests {
                     .expect("a committed manifest is JSON");
             let manifest = Deployed::load(&path).unwrap_or_else(|error| panic!("{name}: {error}"));
 
-            assert_eq!(Some(manifest.network.as_str()), raw["network"].as_str(), "{name}: network");
-            assert_eq!(Some(manifest.dapp_id.as_str()), raw["dapp_id"].as_str(), "{name}: dapp_id");
+            assert_eq!(
+                Some(manifest.network.as_str()),
+                raw["network"].as_str(),
+                "{name}: network"
+            );
+            assert_eq!(
+                Some(manifest.dapp_id.as_str()),
+                raw["dapp_id"].as_str(),
+                "{name}: dapp_id"
+            );
             assert_eq!(
                 Some(manifest.superroot.as_str()),
                 raw["superroot"].as_str(),
                 "{name}: superroot"
             );
             assert_eq!(
-                resolve_endpoint(None, &manifest).unwrap_or_else(|error| panic!("{name}: {error:#}")),
-                raw["endpoint"].as_str().expect("a committed manifest declares its endpoint"),
+                resolve_endpoint(None, &manifest)
+                    .unwrap_or_else(|error| panic!("{name}: {error:#}")),
+                raw["endpoint"]
+                    .as_str()
+                    .expect("a committed manifest declares its endpoint"),
                 "{name}: endpoint"
             );
             checked += 1;
         }
 
-        assert!(checked >= 1, "no committed manifest was found in {}", dir.display());
+        assert!(
+            checked >= 1,
+            "no committed manifest was found in {}",
+            dir.display()
+        );
     }
 
     /// Every committed manifest is internally consistent, whichever chain it names.
@@ -13043,7 +13064,11 @@ mod tests {
             checked += 1;
         }
 
-        assert!(checked >= 1, "no committed manifest was found in {}", dir.display());
+        assert!(
+            checked >= 1,
+            "no committed manifest was found in {}",
+            dir.display()
+        );
     }
 
     #[test]
@@ -13104,7 +13129,10 @@ mod tests {
 
         // Two labels this binary has heard of, and one deployed after it was built.
         assert_eq!(profile("net-a"), profile("net-b"));
-        assert_eq!(profile("net-a"), profile("a-chain-that-did-not-exist-at-build-time"));
+        assert_eq!(
+            profile("net-a"),
+            profile("a-chain-that-did-not-exist-at-build-time")
+        );
     }
 
     #[test]
@@ -13255,7 +13283,10 @@ mod tests {
                 "a client-signature ban cannot clear on retry: {error:#}"
             );
             let message = format!("{error:#}");
-            assert!(message.contains("client's HTTP signature is banned"), "{message}");
+            assert!(
+                message.contains("client's HTTP signature is banned"),
+                "{message}"
+            );
             assert!(message.contains("Cloudflare edge"), "{message}");
             assert!(message.contains("different HTTP client"), "{message}");
             assert!(!message.contains("rate limit"), "{message}");
@@ -13336,7 +13367,9 @@ mod tests {
     /// a 5xx, and a body that died mid-transfer.
     #[test]
     fn no_answer_is_classified_by_shape_not_by_luck() {
-        assert!(super::is_retryable_status(reqwest::StatusCode::TOO_MANY_REQUESTS));
+        assert!(super::is_retryable_status(
+            reqwest::StatusCode::TOO_MANY_REQUESTS
+        ));
         assert!(super::is_retryable_status(reqwest::StatusCode::FORBIDDEN));
         assert!(super::is_retryable_status(reqwest::StatusCode::BAD_GATEWAY));
         assert!(super::is_retryable_status(
@@ -13347,7 +13380,9 @@ mod tests {
         ));
 
         assert!(!super::is_retryable_status(reqwest::StatusCode::NOT_FOUND));
-        assert!(!super::is_retryable_status(reqwest::StatusCode::BAD_REQUEST));
+        assert!(!super::is_retryable_status(
+            reqwest::StatusCode::BAD_REQUEST
+        ));
         assert!(!super::is_retryable_status(
             reqwest::StatusCode::UNAUTHORIZED
         ));
@@ -13568,10 +13603,7 @@ mod tests {
                 );
                 assert_eq!(
                     deal_fund,
-                    owned(&[
-                        ("amount", "uint128"),
-                        ("endpointCipher", "optional(bytes)"),
-                    ]),
+                    owned(&[("amount", "uint128"), ("endpointCipher", "optional(bytes)"),]),
                     "TokenContract.fundDeal takes the bond as a figure and the 4.0.35 optional \
                      endpoint leg; the ECC that arrives with it is the deal's gas, not the bond"
                 );
@@ -13630,6 +13662,7 @@ mod tests {
     /// * artifacts at 4.0.34 -- the client must send exactly the two arguments the ABI declares;
     /// * artifacts still at 4.0.33 -- the ABI declares three, and the client must NOT be sending the
     /// third. Putting `rootModelShell` back turns this red in either state, which is the regression.
+
     /// The same invariant for the call that REPLACED the external deploy (contracts 4.0.36): the
     /// client sends exactly the arguments `PrivateNote.deployDeal` declares, in that order.
 
@@ -13774,8 +13807,7 @@ mod tests {
                      from it and the code comes from SuperRoot's own pin, so a caller can neither \
                      aim the deploy nor choose what lands there"
                 );
-                let declared: Vec<String> =
-                    deploy.iter().map(|(name, _)| name.clone()).collect();
+                let declared: Vec<String> = deploy.iter().map(|(name, _)| name.clone()).collect();
                 assert_eq!(
                     sent, declared,
                     "the client must send exactly the arguments the compiled SuperRoot ABI declares"
@@ -14362,7 +14394,10 @@ mod tests {
         );
         assert_eq!(endpoint, "https://example.invalid:8443/rpc/graphql");
         for secret in ["operator", "secret", "access_token", "private", "trace"] {
-            assert!(!endpoint.contains(secret), "doctor endpoint leaked {secret}: {endpoint}");
+            assert!(
+                !endpoint.contains(secret),
+                "doctor endpoint leaked {secret}: {endpoint}"
+            );
         }
     }
 
@@ -15575,7 +15610,7 @@ mod tests {
             (PMP_ABI, "submitCancelEvent", None),
             (ORACLEEVENTLIST_ABI, "deleteEvent", Some(("eventId", 22))),
         ]) {
-            let decoded = decode_external_abi_message_boc(&boc, abi, true)
+            let decoded = decode_external_abi_message_boc(boc, abi, true)
                 .unwrap_or_else(|| panic!("decode {method}"));
             assert_eq!(decoded.function_name, method);
             if let Some((field, value)) = expected_field {
@@ -16181,10 +16216,9 @@ mod tests {
 
         let mut conflicting = candidate.clone();
         conflicting.body = "changed-fill".to_string();
-        let error = filter_map_ext_out_messages_in_order(
-            vec![candidate, conflicting],
-            |message| Ok(Some(message.id)),
-        )
+        let error = filter_map_ext_out_messages_in_order(vec![candidate, conflicting], |message| {
+            Ok(Some(message.id))
+        })
         .expect_err("a reused message id with changed content must fail closed");
         assert!(
             error
@@ -16272,13 +16306,9 @@ mod tests {
         };
         let state = test_deal_state(true, false, 0);
 
-        let lead = classify_outstanding_deal_lead(
-            &note,
-            &token_contract,
-            Some(&parties),
-            Some(&state),
-        )
-        .expect("matching getParties plus funded getState offers a lead");
+        let lead =
+            classify_outstanding_deal_lead(&note, &token_contract, Some(&parties), Some(&state))
+                .expect("matching getParties plus funded getState offers a lead");
 
         assert_eq!(lead.token_contract, token_contract);
         assert_eq!(lead.role, DealRole::Buyer);
@@ -16296,13 +16326,9 @@ mod tests {
         let mut state = test_deal_state(false, false, 0);
         state.funded = false;
 
-        let refusal = classify_outstanding_deal_lead(
-            &note,
-            &token_contract,
-            Some(&parties),
-            Some(&state),
-        )
-        .expect_err("getOutstanding cannot promote an unfunded address to a deal lead");
+        let refusal =
+            classify_outstanding_deal_lead(&note, &token_contract, Some(&parties), Some(&state))
+                .expect_err("getOutstanding cannot promote an unfunded address to a deal lead");
 
         assert_eq!(refusal.token_contract, token_contract);
         assert!(refusal.reason.contains("funded=false"), "{refusal:?}");
@@ -17223,9 +17249,10 @@ mod tests {
             .map(|offset| start + offset)
             .expect("method after explicit stream_stop");
         let body = &source[start..end];
+        let compact_body: String = body.chars().filter(|ch| !ch.is_whitespace()).collect();
 
         assert!(body.contains(".prepare_money_post("));
-        assert!(body.contains("self.submit_settlement_action_once("));
+        assert!(compact_body.contains("self.submit_settlement_action_once("));
         assert!(body.contains("SettlementAction::BuyerStop"));
         assert!(body.contains("ExpectedSettlementEvent::BuyerStop"));
         assert!(!body.contains("send_explicit_stop_money_once("));
@@ -17328,12 +17355,8 @@ mod tests {
         });
 
         assert_eq!(
-            parse_submitted_buyer_stop_out_message_ids(
-                &response,
-                "client-stream-stop",
-                &buyer,
-            )
-            .expect("exact submitted streamStop trace"),
+            parse_submitted_buyer_stop_out_message_ids(&response, "client-stream-stop", &buyer,)
+                .expect("exact submitted streamStop trace"),
             Some(vec![
                 "unrelated-ensure-balance".to_string(),
                 "our-internal-stop".to_string(),
@@ -18369,17 +18392,14 @@ mod tests {
             deployed: deployment,
         };
         let destination_account = "a".repeat(64);
-        let supplied_destination = crate::CanonicalAddress::parse(&format!(
-            "{destination_dapp}::{destination_account}"
-        ))
-        .expect("canonical --to destination");
+        let supplied_destination =
+            crate::CanonicalAddress::parse(&format!("{destination_dapp}::{destination_account}"))
+                .expect("canonical --to destination");
         let dest = Address::parse(&supplied_destination.legacy()).expect("destination account");
 
         assert_ne!(backend.deployed.dapp_id, supplied_destination.dapp_id());
-        let payload = backend.withdraw_note_tokens_payload_for_destination(
-            &dest,
-            supplied_destination.dapp_id(),
-        );
+        let payload = backend
+            .withdraw_note_tokens_payload_for_destination(&dest, supplied_destination.dapp_id());
         assert_eq!(
             payload,
             json!({
@@ -18471,7 +18491,8 @@ mod tests {
         );
 
         let mut busy = clean.clone();
-        busy["busyAddress"] = json!("0:2222222222222222222222222222222222222222222222222222222222222222");
+        busy["busyAddress"] =
+            json!("0:2222222222222222222222222222222222222222222222222222222222222222");
         assert_eq!(
             note_transfer_sender_refusal(&busy),
             Some(NoteTransferRefusal::SenderBusy {
@@ -18611,11 +18632,18 @@ mod tests {
             ),
             None
         );
-        assert_eq!(note_transfer_submit_hint("on-chain submit failed: exit_code=102 (dex::ERR_LOW_VALUE) stage=compute"), None);
+        assert_eq!(
+            note_transfer_submit_hint(
+                "on-chain submit failed: exit_code=102 (dex::ERR_LOW_VALUE) stage=compute"
+            ),
+            None
+        );
         // And the codes are the ones the vendored table already knows by these names, so the hint
         // and the label can never disagree about which constant a number is.
         assert!(crate::onchain_diagnostics::contract_error_names(167)
             .contains(&"dex::ERR_OPEN_ORDERS_EXIST"));
-        assert!(crate::onchain_diagnostics::contract_error_names(121).contains(&"dex::ERR_NOTE_BUSY"));
+        assert!(
+            crate::onchain_diagnostics::contract_error_names(121).contains(&"dex::ERR_NOTE_BUSY")
+        );
     }
 }

@@ -275,7 +275,9 @@ impl OnboardingSession {
         // already committed. The label is a key, not a permission: it must be there, and that is all
         // this crate can honestly check about it.
         if self.network.trim().is_empty() {
-            bail!("wallet onboarding state names no network, so nothing says which chain it is for");
+            bail!(
+                "wallet onboarding state names no network, so nothing says which chain it is for"
+            );
         }
         if self.endpoint.trim().is_empty() {
             bail!("wallet onboarding state has an empty endpoint");
@@ -1873,8 +1875,8 @@ mod tests {
             session_state: post_receive,
             ..clone_request(&request)
         };
-        let replay = consume_wallets_response("net-a", &replay_request, event, limits(), now)
-            .unwrap_err();
+        let replay =
+            consume_wallets_response("net-a", &replay_request, event, limits(), now).unwrap_err();
         assert!(replay.to_string().contains("replay"), "{replay}");
     }
 

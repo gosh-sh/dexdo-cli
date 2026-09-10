@@ -35,7 +35,8 @@ fn a_deal_that_is_not_disputed_is_no_longer_reported_as_a_disputed_deal() {
 /// the TYPE that decides and not the wording.
 #[test]
 fn the_same_sentence_without_the_type_still_lands_on_the_old_code() {
-    let plain = anyhow::anyhow!("resolve-dispute-timeout: deal is not DISPUTED - nothing to resolve");
+    let plain =
+        anyhow::anyhow!("resolve-dispute-timeout: deal is not DISPUTED - nothing to resolve");
     assert_eq!(classify_error(OP_CLOSE, &plain), ErrorCode::DisputedDeal);
 }
 
@@ -88,15 +89,40 @@ fn an_ordinary_invalid_argument_still_reports_invalid_argument() {
 #[test]
 fn the_codes_that_were_already_correct_do_not_move() {
     for (text, want) in [
-        ("buyer quote: no liquidity for the requested model", ErrorCode::NoLiquidity),
-        ("buyer quote: incomplete quote filled_ticks=1", ErrorCode::IncompleteQuote),
-        ("endpoint readiness /v1/models failed", ErrorCode::EndpointReadinessFailed),
-        ("gateway reachability check failed at host", ErrorCode::GatewayConnectFailed),
-        ("streamStop settlement submission failed", ErrorCode::SettlementFailed),
+        (
+            "buyer quote: no liquidity for the requested model",
+            ErrorCode::NoLiquidity,
+        ),
+        (
+            "buyer quote: incomplete quote filled_ticks=1",
+            ErrorCode::IncompleteQuote,
+        ),
+        (
+            "endpoint readiness /v1/models failed",
+            ErrorCode::EndpointReadinessFailed,
+        ),
+        (
+            "gateway reachability check failed at host",
+            ErrorCode::GatewayConnectFailed,
+        ),
+        (
+            "streamStop settlement submission failed",
+            ErrorCode::SettlementFailed,
+        ),
         ("chain returned exit_code=101", ErrorCode::ChainRevert),
-        ("insufficient balance for the selected action", ErrorCode::InsufficientBalance),
-        ("close sellerStop returned an authoritative receipt", ErrorCode::GatewayAuthFailed),
+        (
+            "insufficient balance for the selected action",
+            ErrorCode::InsufficientBalance,
+        ),
+        (
+            "close sellerStop returned an authoritative receipt",
+            ErrorCode::GatewayAuthFailed,
+        ),
     ] {
-        assert_eq!(classify_error(OP_CLOSE, &anyhow::anyhow!("{text}")), want, "moved: {text}");
+        assert_eq!(
+            classify_error(OP_CLOSE, &anyhow::anyhow!("{text}")),
+            want,
+            "moved: {text}"
+        );
     }
 }

@@ -34,15 +34,14 @@ use crate::cli::note::{
 use super::{note_deploy_classify_stale_proof_attempt, NoteDeployRecoveryOutcome};
 
 /// The exact ECC[2] figure the wallet transaction carried, as the report printed it in hex.
-const REPORTED_WIRE_RAW: u128 = 0x517d_a02c_00;
+const REPORTED_WIRE_RAW: u128 = 0x0051_7da0_2c00;
 
 /// What the deploy was FOR: an N100 note. This is what a recovery state stores, and the reported
 /// payment is this plus the collection RootPN takes out of every deposit.
 const NOMINAL_LABEL: &str = "N100";
 const NOMINAL_RAW: u64 = 100_000_000_000;
 
-const OWNER_SECRET_HEX: &str =
-    "5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b";
+const OWNER_SECRET_HEX: &str = "5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b";
 
 /// Where the reported figure comes from, asserted rather than described.
 
@@ -318,7 +317,9 @@ fn the_writer_replaces_the_recovery_file_rather_than_writing_into_it() {
     #[cfg(unix)]
     let before = {
         use std::os::unix::fs::MetadataExt as _;
-        std::fs::metadata(&path).expect("stat the first write").ino()
+        std::fs::metadata(&path)
+            .expect("stat the first write")
+            .ino()
     };
 
     // The same document again, through the same writer.
@@ -366,7 +367,10 @@ fn the_writer_replaces_the_recovery_file_rather_than_writing_into_it() {
         serde_json::from_str::<serde_json::Value>(&second).is_ok(),
         "what lands at the path parses as a whole document"
     );
-    assert_ne!(first, second, "the fixtures differ, so the rewrite is observable");
+    assert_ne!(
+        first, second,
+        "the fixtures differ, so the rewrite is observable"
+    );
 
     // And no temp file is left behind to be mistaken for a recovery state.
     let strays: Vec<_> = std::fs::read_dir(temp.path())
@@ -374,7 +378,10 @@ fn the_writer_replaces_the_recovery_file_rather_than_writing_into_it() {
         .filter_map(|entry| entry.ok().map(|entry| entry.file_name()))
         .filter(|name| name.to_string_lossy().contains(".tmp."))
         .collect();
-    assert!(strays.is_empty(), "a completed write leaves no temp file: {strays:?}");
+    assert!(
+        strays.is_empty(),
+        "a completed write leaves no temp file: {strays:?}"
+    );
 }
 
 /// Idempotence, run twice rather than argued once.

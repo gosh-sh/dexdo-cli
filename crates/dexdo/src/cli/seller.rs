@@ -2,9 +2,9 @@
 
 use crate::cli::args::SellerArgs;
 use crate::cli::commands::{
-    enforce_model_registry_policy, expected_order_book_for_note,
+    chain_doctor_preflight, enforce_model_registry_policy, expected_order_book_for_note,
     load_enabled_model_registry_policy, order_book_active_from_contracts,
-    resolve_model_registry_target, chain_doctor_preflight, BookTarget,
+    resolve_model_registry_target, BookTarget,
 };
 use crate::cli::commands::{
     preload_model_registry_policy, save_runtime_deal_handle_for_network, RuntimeDealHandleInput,
@@ -177,7 +177,7 @@ struct SubscriptionCapacityObserver {
 fn funded_tick_budget(token_contract: &str, funded_tokens: u128, tick_size: u64) -> Result<u128> {
     let token_contract = display_token_contract(token_contract);
     let tick_size = u128::from(tick_size);
-    if tick_size == 0 || funded_tokens == 0 || funded_tokens % tick_size != 0 {
+    if tick_size == 0 || funded_tokens == 0 || !funded_tokens.is_multiple_of(tick_size) {
         bail!(
             "--token-contract {token_contract}: strict getSubscription().fundedTokens \
              {funded_tokens} is not a positive multiple of canonical tick size {tick_size}"
@@ -644,12 +644,7 @@ fn load_or_create_gateway_tls(
     let name = crate::cli::secret_store::SecretName::at(pool_dir.join("gateway.pem"));
     if let Some(bundle) = store.read(&name)? {
         return dexdo::seller::tls::GatewayTls::from_pem_bundle(bundle.to_string()).map_err(
-            |error| {
-                anyhow::anyhow!(
-                    "load seller gateway TLS {}: {error}",
-                    name.file().display()
-                )
-            },
+            |error| anyhow::anyhow!("load seller gateway TLS {}: {error}", name.file().display()),
         );
     }
     let tls = dexdo::seller::tls::GatewayTls::generate()?;
@@ -758,6 +753,7 @@ enum AfterStop {
 impl AfterStop {
     /// The decision itself, without its payload -- `dexdo_core::Match` carries no `Eq`, and adding one
     /// to a chain type so an assertion could be written would be tailoring the domain to the test.
+    #[cfg(test)]
     fn kind(&self) -> &'static str {
         match self {
             Self::Retire => "retire",
@@ -796,10 +792,9 @@ fn should_rearm_watcher(
         AfterStop::Retire => false,
         // A match obliges service, and shutdown does not excuse it: the buyer already paid in.
         AfterStop::ServeMatch(_) => true,
-        AfterStop::Retain => !matches!(
-            reason,
-            dexdo::seller::liveness::RestingStopReason::Shutdown
-        ),
+        AfterStop::Retain => {
+            !matches!(reason, dexdo::seller::liveness::RestingStopReason::Shutdown)
+        }
     }
 }
 
@@ -925,35 +920,36 @@ async fn apply_drained_outcome(
     match outcome {
         // Already served inside `watch_pool_deal` before it returned; the ask is off the book.
         dexdo::seller::liveness::RestingSellerOutcome::Matched(_) => {}
-        dexdo::seller::liveness::RestingSellerOutcome::Stopped { reason, disposition } => {
-            match decide_after_stop(&disposition) {
-                AfterStop::Retire => {
-                    seller.state.unregister_stream(&token_contract);
-                }
-                AfterStop::ServeMatch(matched) => {
-                    if let Err(error) = dexdo::seller::serve_watched_match(
-                        seller,
-                        deal.chain.as_ref(),
-                        &deal.cfg,
-                        &deal.watch,
-                        matched,
-                    )
-                    .await
-                    {
-                        first_error.get_or_insert(error);
-                    }
-                }
-                AfterStop::Retain => {
-                    tracing::warn!(
-                        token_contract = %display_token_contract(&token_contract),
-                        ?reason,
-                        %disposition,
-                        "seller pool drained a stopped resting deal whose ask is not proven off the book"
-                    );
-                    reseat_resting_after_stop(&token_contract, current_identity, previous, resting);
+        dexdo::seller::liveness::RestingSellerOutcome::Stopped {
+            reason,
+            disposition,
+        } => match decide_after_stop(&disposition) {
+            AfterStop::Retire => {
+                seller.state.unregister_stream(&token_contract);
+            }
+            AfterStop::ServeMatch(matched) => {
+                if let Err(error) = dexdo::seller::serve_watched_match(
+                    seller,
+                    deal.chain.as_ref(),
+                    &deal.cfg,
+                    &deal.watch,
+                    matched,
+                )
+                .await
+                {
+                    first_error.get_or_insert(error);
                 }
             }
-        }
+            AfterStop::Retain => {
+                tracing::warn!(
+                    token_contract = %display_token_contract(&token_contract),
+                    ?reason,
+                    %disposition,
+                    "seller pool drained a stopped resting deal whose ask is not proven off the book"
+                );
+                reseat_resting_after_stop(&token_contract, current_identity, previous, resting);
+            }
+        },
     }
 }
 
@@ -970,12 +966,9 @@ async fn sweep_unconfirmed_resting_offers(
 ) -> Option<anyhow::Error> {
     let mut first: Option<anyhow::Error> = None;
     for (deal, identity) in entries {
-        let disposition = dexdo::seller::liveness::cancel_and_confirm(
-            deal.chain.as_ref(),
-            &deal.cfg,
-            &identity,
-        )
-        .await;
+        let disposition =
+            dexdo::seller::liveness::cancel_and_confirm(deal.chain.as_ref(), &deal.cfg, &identity)
+                .await;
         match decide_after_stop(&disposition) {
             AfterStop::Retire => {}
             AfterStop::Retain => {
@@ -2303,11 +2296,9 @@ where
                 });
             }
             return match reason {
-                dexdo::seller::liveness::RestingStopReason::Shutdown => {
-                    Err(anyhow::anyhow!(
-                        "seller pool startup interrupted by shutdown"
-                    ))
-                }
+                dexdo::seller::liveness::RestingStopReason::Shutdown => Err(anyhow::anyhow!(
+                    "seller pool startup interrupted by shutdown"
+                )),
                 reason => Err(anyhow::anyhow!(
                     "seller pool startup stopped for {}: reason={reason:?}; \
                      cancellation_disposition={disposition}",
@@ -2323,8 +2314,7 @@ where
         println!(
             "posting offer: {} ticks (= {} model tokens) at {} SHELL/tick",
             deal.cfg.max_ticks,
-            (deal.cfg.max_ticks as u128)
-                .saturating_mul(DobParams::canonical().tick_size as u128),
+            (deal.cfg.max_ticks as u128).saturating_mul(DobParams::canonical().tick_size as u128),
             dexdo_core::shell_amount(u128::from(deal.cfg.price_per_tick)),
         );
     }
@@ -2750,11 +2740,9 @@ where
                 {
                     continue;
                 }
-                if let Some(note) = unaccounted_owner_fill_note(
-                    owner_fill_chain.as_ref(),
-                    &fill.token_contract,
-                )
-                .await
+                if let Some(note) =
+                    unaccounted_owner_fill_note(owner_fill_chain.as_ref(), &fill.token_contract)
+                        .await
                 {
                     cascade_notes.push(note);
                     break;
@@ -3633,7 +3621,10 @@ fn no_model_named(args: &SellerArgs) -> anyhow::Error {
     if args.mock.mock_chain {
         anyhow::anyhow!("set --model <name from config> (or --mock-model for a mock upstream)")
     } else {
-        anyhow::anyhow!(format!("real {}: set --model <name from config> (needed for model_hash)", dexdo_core::params::current_network()))
+        anyhow::anyhow!(format!(
+            "real {}: set --model <name from config> (needed for model_hash)",
+            dexdo_core::params::current_network()
+        ))
     }
 }
 
@@ -3721,7 +3712,8 @@ pub(crate) async fn run_seller_with_deal_gas_overhead(
         args.identity.note_addr = Some(
             // The endpoint is the manifest's: it names the network this run is on, and a second
             // source for it here would be a second answer to the same question.
-            crate::cli::note_pick::ask_which_note(&crate::cli::commands::manifest_path()?, None).await?,
+            crate::cli::note_pick::ask_which_note(&crate::cli::commands::manifest_path()?, None)
+                .await?,
         );
     }
     // Issue: the deal token_contract comes from `--market` (a provision manifest) or `--token-contract`.
@@ -3765,7 +3757,10 @@ pub(crate) async fn run_seller_with_deal_gas_overhead(
     let _display = crate::cli::progress::Status::with_plan(
         "checking the network and contracts",
         [
-            ("checking the network and contracts", "network and contracts checked"),
+            (
+                "checking the network and contracts",
+                "network and contracts checked",
+            ),
             // In the order the seller actually does them: the gateway is listening before the offer
             // that advertises it is posted. Declared the other way round, the third step was never
             // reached and its tick never appeared -- a checklist that ends one short reads as a
@@ -3794,7 +3789,10 @@ pub(crate) async fn run_seller_with_deal_gas_overhead(
         (None, None)
     } else {
         let note_addr = args.identity.note_addr.as_deref().ok_or_else(|| {
-            anyhow::anyhow!(format!("real {}: --note-addr is required for seller pool locking", dexdo_core::params::current_network()))
+            anyhow::anyhow!(format!(
+                "real {}: --note-addr is required for seller pool locking",
+                dexdo_core::params::current_network()
+            ))
         })?;
         let pool_dir = seller_pool_dir(args.deals_dir.as_deref(), note_addr)?;
         (
@@ -3829,7 +3827,11 @@ pub(crate) async fn run_seller_with_deal_gas_overhead(
         })
     };
     let registry_policy = if !args.mock.mock_chain && !shutdown_requested {
-        load_enabled_model_registry_policy(RegistryRole::Seller, &args.registry, &crate::cli::commands::manifest_path()?)?
+        load_enabled_model_registry_policy(
+            RegistryRole::Seller,
+            &args.registry,
+            &crate::cli::commands::manifest_path()?,
+        )?
     } else {
         None
     };
@@ -4163,18 +4165,24 @@ pub(crate) async fn run_seller_with_deal_gas_overhead(
                     let expected_order_book = if let Some(order_book) = target.order_book {
                         order_book
                     } else {
-                        let note_addr =
-                            args.identity.note_addr.as_deref().ok_or_else(|| {
-                                anyhow::anyhow!(
-                                    format!("real {}: --note-addr is required to derive the seller order book", dexdo_core::params::current_network())
-                                )
-                            })?;
-                        expected_order_book_for_note(&crate::cli::commands::manifest_path()?, note_addr, &frame_model)
-                            .await?
+                        let note_addr = args.identity.note_addr.as_deref().ok_or_else(|| {
+                            anyhow::anyhow!(format!(
+                                "real {}: --note-addr is required to derive the seller order book",
+                                dexdo_core::params::current_network()
+                            ))
+                        })?;
+                        expected_order_book_for_note(
+                            &crate::cli::commands::manifest_path()?,
+                            note_addr,
+                            &frame_model,
+                        )
+                        .await?
                     };
-                    let order_book_active =
-                        order_book_active_from_contracts(&crate::cli::commands::manifest_path()?, &expected_order_book)
-                            .await?;
+                    let order_book_active = order_book_active_from_contracts(
+                        &crate::cli::commands::manifest_path()?,
+                        &expected_order_book,
+                    )
+                    .await?;
                     enforce_model_registry_policy(
                         RegistryRole::Seller,
                         policy,
@@ -4900,6 +4908,7 @@ mod tests {
                         ..dexdo_proto::SamplingParams::default()
                     }),
                 }),
+                billing_grant_tokens: 1,
             }),
         )
         .await
@@ -5663,7 +5672,10 @@ mod tests {
         let (chain, config, identity, root) =
             existing_resting_offer(case, note.clone(), "127.0.0.1:0".to_string()).await;
         let root = root.path();
-        crate::cli::support::write_owner_only_key_fixture(&root.join("note.key"), &hex::encode(RESTART_NOTE_SEED));
+        crate::cli::support::write_owner_only_key_fixture(
+            &root.join("note.key"),
+            &hex::encode(RESTART_NOTE_SEED),
+        );
         std::fs::write(
             root.join("models.json"),
             serde_json::to_vec(&serde_json::json!({
@@ -5921,7 +5933,8 @@ mod tests {
         fn resting_unexpired(self, confirms_cancel: bool) -> Self {
             self.rests.store(true, Ordering::Relaxed);
             self.never_expires.store(true, Ordering::Relaxed);
-            self.cancel_confirms.store(confirms_cancel, Ordering::Relaxed);
+            self.cancel_confirms
+                .store(confirms_cancel, Ordering::Relaxed);
             self
         }
 
@@ -6861,8 +6874,14 @@ mod tests {
                 run.unknown_token_contract
             );
         }
-        assert_eq!(run.open_calls, 1, "the live matched deal must be served once");
-        assert!(run.opened, "the live matched deal never reached open_stream");
+        assert_eq!(
+            run.open_calls, 1,
+            "the live matched deal must be served once"
+        );
+        assert!(
+            run.opened,
+            "the live matched deal never reached open_stream"
+        );
     }
 
     /// money-safety half: an owner fill whose TokenContract still reports a non-terminal
@@ -6871,7 +6890,10 @@ mod tests {
     #[tokio::test]
     async fn non_terminal_unknown_owner_fill_still_fails_with_exact_pool_error() {
         let run = run_pool_with_unknown_owner_fill(false).await;
-        assert_eq!(run.open_calls, 1, "the matched deal must reach the real pool entry");
+        assert_eq!(
+            run.open_calls, 1,
+            "the matched deal must reach the real pool entry"
+        );
         assert!(run.opened, "the matched deal never reached open_stream");
         let error = run
             .outcome
@@ -8136,7 +8158,10 @@ mod tests {
     async fn inherited_ephemeral_advertise_reaches_the_buyer_as_the_bound_port() {
         let root = tempfile::tempdir().unwrap();
         let seller_seed = [0x63; 32];
-        crate::cli::support::write_owner_only_key_fixture(&root.path().join("seller.key"), &hex::encode(seller_seed));
+        crate::cli::support::write_owner_only_key_fixture(
+            &root.path().join("seller.key"),
+            &hex::encode(seller_seed),
+        );
         let token_contract = format!("0:{}", "7".repeat(64));
         let chain = MockChainBackend::new(
             root.path().join("endpoints.json"),
@@ -8266,7 +8291,10 @@ mod tests {
     async fn a_spent_deal_handle_whose_token_contract_is_gone_does_not_stop_the_seller() {
         let root = tempfile::tempdir().unwrap();
         let seller_seed = [0x64; 32];
-        crate::cli::support::write_owner_only_key_fixture(&root.path().join("seller.key"), &hex::encode(seller_seed));
+        crate::cli::support::write_owner_only_key_fixture(
+            &root.path().join("seller.key"),
+            &hex::encode(seller_seed),
+        );
         let seller_note = dexdo_core::NoteTree::from_secret_hex(&hex::encode(seller_seed))
             .unwrap()
             .node(0)
@@ -8300,17 +8328,14 @@ mod tests {
             token_contract: spent_token_contract.clone(),
             seller_note: seller_owner.clone(),
             nonce: 4,
-            price_per_tick: dexdo_core::PRICE_STEP as u128,
+            price_per_tick: dexdo_core::PRICE_STEP,
             max_ticks: 4,
         };
         deals::save_deal_handle(
             &deals_dir,
             &deals::DealHandle {
                 version: deals::DEAL_HANDLE_VERSION,
-                handle: deals::make_handle_id(
-                    &spent_token_contract,
-                    deals::DealHandleRole::Seller,
-                ),
+                handle: deals::make_handle_id(&spent_token_contract, deals::DealHandleRole::Seller),
                 role: deals::DealHandleRole::Seller,
                 network: "net-a".to_string(),
                 token_contract: spent_token_contract.clone(),
@@ -8734,7 +8759,10 @@ mod tests {
     async fn run_seller_raw_mock_partial_fill_relists_and_serves_two_buyers() {
         let root = tempfile::tempdir().unwrap();
         let seller_seed = [0x61; 32];
-        crate::cli::support::write_owner_only_key_fixture(&root.path().join("seller.key"), &hex::encode(seller_seed));
+        crate::cli::support::write_owner_only_key_fixture(
+            &root.path().join("seller.key"),
+            &hex::encode(seller_seed),
+        );
         let seller_note = Arc::new(
             dexdo_core::NoteTree::from_secret_hex(&hex::encode(seller_seed))
                 .unwrap()
@@ -8862,7 +8890,10 @@ mod tests {
     async fn run_seller_terminal_raw_ancestor_resumes_linked_descendant() {
         let root = tempfile::tempdir().unwrap();
         let seller_seed = [0x62; 32];
-        crate::cli::support::write_owner_only_key_fixture(&root.path().join("seller.key"), &hex::encode(seller_seed));
+        crate::cli::support::write_owner_only_key_fixture(
+            &root.path().join("seller.key"),
+            &hex::encode(seller_seed),
+        );
         let seller_note = Arc::new(
             dexdo_core::NoteTree::from_secret_hex(&hex::encode(seller_seed))
                 .unwrap()
@@ -9104,7 +9135,9 @@ mod tests {
                 futures::future::ready(Err::<
                     (dexdo_core::MarketManifest, Arc<dyn ChainBackend>),
                     anyhow::Error,
-                >(anyhow::anyhow!("the pool select must stop before provisioning")))
+                >(anyhow::anyhow!(
+                    "the pool select must stop before provisioning"
+                )))
             }
         };
         let shutdown = Issue1057Shutdown::after_parent_open(pool.parent.clone(), 0);

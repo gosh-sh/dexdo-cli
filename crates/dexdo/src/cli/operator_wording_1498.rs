@@ -8,7 +8,7 @@
 
 /// The word this file exists to keep out of everything an operator reads, spelled by construction
 /// rather than written out: the acceptance for this work is that a search of `crates/dexdo/src`
-/// finds it nowhere, and a check that names what it forbids flags itself. `ci/check-no-cyrillic.sh`
+/// finds it nowhere, and a check that names what it forbids flags itself. `ci/check_no_cyrillic.sh`
 /// escapes the range it rejects for exactly this reason.
 const RETIRED_TERM: &str = concat!("gi", "ver");
 
@@ -140,7 +140,8 @@ fn an_occupied_address_does_not_send_the_operator_to_spend() {
 /// and here is who moves it and what to rerun afterwards.
 #[test]
 fn the_funding_block_names_who_moves_the_shell_and_what_to_rerun() {
-    let rendered = super::render_operator_wallet_funding(&address(), crate::cli::note::NoteNominal::N10000);
+    let rendered =
+        super::render_operator_wallet_funding(&address(), crate::cli::note::NoteNominal::N10000);
     assert!(
         rendered.contains("Dexdo sent nothing to it"),
         "what did not happen: {rendered}"

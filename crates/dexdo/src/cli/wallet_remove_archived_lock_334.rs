@@ -92,9 +92,8 @@ fn remove_archived_locks_on_the_hot_it_is_about_to_forget_334() {
 #[test]
 fn the_binding_spelling_and_the_spender_spelling_take_one_turn_334() {
     let account_id = "5".repeat(64);
-    let canonical = format!(
-        "0000000000000000000000000000000000000000000000000000000000000004::{account_id}"
-    );
+    let canonical =
+        format!("0000000000000000000000000000000000000000000000000000000000000004::{account_id}");
     let legacy = format!("0:{account_id}");
 
     let from_spender = crate::cli::note_cmd::funding_wallet_lock_path("net-a", &canonical)
@@ -113,10 +112,12 @@ fn the_binding_spelling_and_the_spender_spelling_take_one_turn_334() {
 /// whole client and would be its own defect.
 #[test]
 fn two_different_wallets_do_not_share_one_turn_334() {
-    let one = crate::cli::note_cmd::funding_wallet_lock_path("net-a", &format!("0:{}", "5".repeat(64)))
-        .expect("first wallet");
-    let two = crate::cli::note_cmd::funding_wallet_lock_path("net-a", &format!("0:{}", "6".repeat(64)))
-        .expect("second wallet");
+    let one =
+        crate::cli::note_cmd::funding_wallet_lock_path("net-a", &format!("0:{}", "5".repeat(64)))
+            .expect("first wallet");
+    let two =
+        crate::cli::note_cmd::funding_wallet_lock_path("net-a", &format!("0:{}", "6".repeat(64)))
+            .expect("second wallet");
     assert_ne!(
         one, two,
         "two different wallets share one lock file, which would serialise unrelated spends"

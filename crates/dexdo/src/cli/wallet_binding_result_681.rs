@@ -179,7 +179,12 @@ fn the_machine_contract_replaces_the_human_result_681() {
         "--json is styled; a JSON document with colour escapes in it is not parseable, and 203 \
          exists because runtimes cannot supervise dexdo by reading human output"
     );
-    for field in ["\"hot\"", "\"binding_id\"", "\"binding_file\"", "\"secrets_dir\""] {
+    for field in [
+        "\"hot\"",
+        "\"binding_id\"",
+        "\"binding_file\"",
+        "\"secrets_dir\"",
+    ] {
         assert!(
             block.contains(field),
             "the --json object omits {field}; the paths in particular are the reason it exists -- \

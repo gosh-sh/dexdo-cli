@@ -21,14 +21,13 @@
 
 use crate::cli::args::{
     AccumulatorArgs, AccumulatorBuyArgs, AccumulatorClaimArgs, AccumulatorCommand,
-    AccumulatorLotsArgs, AccumulatorSellArgs, AccumulatorStatusArgs,
+    AccumulatorLotsArgs, AccumulatorSellArgs,
 };
 use anyhow::Result;
 
-
 pub(crate) async fn run_accumulator(args: AccumulatorArgs) -> Result<()> {
     match args.command {
-        AccumulatorCommand::Status(args) => run_status(args).await,
+        AccumulatorCommand::Status(_) => run_status().await,
         AccumulatorCommand::Sell(args) => run_sell(args).await,
         AccumulatorCommand::Buy(args) => run_buy(args).await,
         AccumulatorCommand::Lots(args) => run_lots(args).await,
@@ -40,16 +39,16 @@ mod live {
     use super::*;
     use anyhow::{anyhow, bail};
     use dexdo_core::accumulator::{
-        whole_usdc_from_raw, LotDetails, LotId, QueueState, RootDetails,
-        ACCUMULATOR_LOT_ABI, ACCUMULATOR_ROOT_ABI,
+        whole_usdc_from_raw, LotDetails, LotId, QueueState, RootDetails, ACCUMULATOR_LOT_ABI,
+        ACCUMULATOR_ROOT_ABI,
     };
+    use dexdo_core::chain::RetryingReads;
     use dexdo_core::params::{
         ACCUMULATOR_DAPP_ID, ACCUMULATOR_DENOMS, ACCUMULATOR_LOT_VERSION, ACCUMULATOR_ROOT_ADDRESS,
         ACCUMULATOR_ROOT_VERSION, ACCUMULATOR_WALLET_MESSAGE_GAS_RAW,
-        GAS_BALANCE_CONFIRM_MAX_READS,
-        GAS_BALANCE_CONFIRM_POLL_INTERVAL, NOTE_DEPLOY_SUBMIT_NATIVE_VALUE,
+        GAS_BALANCE_CONFIRM_MAX_READS, GAS_BALANCE_CONFIRM_POLL_INTERVAL,
+        NOTE_DEPLOY_SUBMIT_NATIVE_VALUE,
     };
-    use dexdo_core::chain::RetryingReads;
     use dexdo_core::{Address, ChainClient, KeyPair, RealChainBackend};
 
     /// One resolved on-chain lot: its identity, its address, and whether it can be claimed now.
@@ -121,7 +120,9 @@ mod live {
                 )
                 .await
                 .map_err(|e| anyhow!("read accumulator queue D={denom}: {e}"))?
-                .ok_or_else(|| anyhow!("accumulator root did not answer getQueueState D={denom}"))?;
+                .ok_or_else(|| {
+                    anyhow!("accumulator root did not answer getQueueState D={denom}")
+                })?;
             QueueState::decode_getter(&raw)
                 .map_err(|e| anyhow!("decode getQueueState D={denom}: {e}"))
         }
@@ -287,10 +288,7 @@ mod live {
         Ok(now_raw >= target_raw)
     }
 
-    pub(super) fn scan_floor(
-        floors: &std::collections::BTreeMap<u16, u64>,
-        denom: u16,
-    ) -> u64 {
+    pub(super) fn scan_floor(floors: &std::collections::BTreeMap<u16, u64>, denom: u16) -> u64 {
         floors.get(&denom).copied().unwrap_or(1)
     }
 
@@ -392,8 +390,7 @@ mod live {
             let network = dexdo_core::Deployed::load(manifest)
                 .map_err(|e| anyhow!("manifest {}: {e}", manifest.display()))?
                 .network;
-            let wallet_network =
-                crate::cli::wallet::WalletNetwork::from_manifest_label(&network)?;
+            let wallet_network = crate::cli::wallet::WalletNetwork::from_manifest_label(&network)?;
             let wallet = crate::cli::wallet::resolve_funding_wallet(
                 &crate::cli::wallet::WalletStore::open()?,
                 &wallet_network,
@@ -406,12 +403,11 @@ mod live {
             let address = address.into_chain();
             let display = dexdo_core::address::display_self_dapp(&address.with_workchain());
 
-            let lock = crate::cli::note_cmd::acquire_funding_wallet_lock(&network, &wallet.address)?;
-            let pending_path = crate::cli::note_cmd::funding_wallet_lock_path(
-                &network,
-                &wallet.address,
-            )?
-            .with_extension("accumulator-pending.json");
+            let lock =
+                crate::cli::note_cmd::acquire_funding_wallet_lock(&network, &wallet.address)?;
+            let pending_path =
+                crate::cli::note_cmd::funding_wallet_lock_path(&network, &wallet.address)?
+                    .with_extension("accumulator-pending.json");
 
             let (source, secret_hex) =
                 crate::cli::commands::multisig_secret_hex(&wallet.key, &wallet.seed_file)?;
@@ -676,7 +672,9 @@ mod live {
                 expected_credit_landed(
                     before_raw,
                     expected_raw,
-                    spender.ecc_balance(dexdo_core::params::SHELL_CURRENCY_ID).await?,
+                    spender
+                        .ecc_balance(dexdo_core::params::SHELL_CURRENCY_ID)
+                        .await?,
                 )? && usdc_before
                     .checked_sub(usdc_spent)
                     .is_some_and(|target| usdc_after <= target)
@@ -732,104 +730,6 @@ mod live {
     pub(super) fn usdc_units(raw: u128) -> String {
         format!("{} eccUSDC ({raw} raw ECC[3])", whole_usdc_from_raw(raw))
     }
-
-}
-
-#[cfg(test)]
-mod review_regressions {
-    use super::live::{
-        confirmation_complete, expected_credit_landed, is_claim_candidate, load_operation,
-        persist_operation, require_native_gas, required_native_gas, scan_floor, PendingOperation,
-    };
-    use std::collections::BTreeMap;
-
-    #[test]
-    fn unrelated_partial_credit_does_not_confirm_the_expected_money_movement() {
-        assert!(!expected_credit_landed(1_000, 500, 1_001).expect("valid target"));
-        assert!(!expected_credit_landed(1_000, 500, 1_499).expect("valid target"));
-        assert!(expected_credit_landed(1_000, 500, 1_500).expect("valid target"));
-        assert!(expected_credit_landed(1_000, 500, 1_501).expect("valid target"));
-    }
-
-    #[test]
-    fn an_impossible_expected_balance_fails_closed() {
-        assert!(expected_credit_landed(u128::MAX, 1, u128::MAX).is_err());
-    }
-
-    #[test]
-    fn canonical_wallet_binding_address_reaches_the_chain_account_parser() {
-        let account = "ab".repeat(32);
-        let parsed = dexdo_core::address::parse_chain_address(&format!("{account}::{account}"))
-            .expect("canonical binding address")
-            .into_chain();
-        assert_eq!(parsed.bare(), account);
-    }
-
-    #[test]
-    fn sell_confirmation_keeps_each_denominations_own_scan_floor() {
-        let floors = BTreeMap::from([(1000, 2), (100, 30), (10, 400), (1, 5_000)]);
-        assert_eq!(scan_floor(&floors, 1000), 2);
-        assert_eq!(scan_floor(&floors, 1), 5_000);
-        assert_eq!(scan_floor(&BTreeMap::new(), 10), 1);
-    }
-
-    #[test]
-    fn sell_confirmation_waits_for_every_planned_lot() {
-        assert!(!confirmation_complete(0, 1));
-        assert!(!confirmation_complete(3, 4));
-        assert!(confirmation_complete(4, 4));
-    }
-
-    #[test]
-    fn a_claim_already_in_flight_is_never_submitted_again() {
-        assert!(is_claim_candidate(true, false));
-        assert!(!is_claim_candidate(true, true));
-        assert!(!is_claim_candidate(false, false));
-    }
-
-    #[test]
-    fn native_gas_preflight_prices_every_message_before_a_multi_send() {
-        let one = dexdo_core::params::ACCUMULATOR_WALLET_MESSAGE_GAS_RAW;
-        assert_eq!(required_native_gas(3).expect("three messages"), one * 3);
-        let refusal = require_native_gas(one * 3 - 1, 3)
-            .expect_err("one raw short must refuse the entire operation")
-            .to_string();
-        assert!(refusal.contains(&(one * 3 - 1).to_string()), "{refusal}");
-        assert!(refusal.contains(&(one * 3).to_string()), "{refusal}");
-        assert!(refusal.contains("nothing was submitted"), "{refusal}");
-    }
-
-    #[test]
-    fn pending_buy_intent_is_durable_and_carries_the_chain_reconciliation_baseline() {
-        let pending = PendingOperation::Buy {
-            shell_before_raw: "41".to_string(),
-            shell_expected_raw: "100".to_string(),
-            usdc_before_raw: "500".to_string(),
-            usdc_spent_raw: "10".to_string(),
-        };
-        let temp = tempfile::tempdir().expect("temporary operation directory");
-        let path = temp.path().join("pending.json");
-        persist_operation(&path, &pending).expect("persist before transport");
-        let recovered = load_operation(&path)
-            .expect("read after process restart")
-            .expect("durable intent exists");
-        assert_eq!(recovered, pending);
-        let PendingOperation::Buy {
-            shell_before_raw,
-            shell_expected_raw,
-            usdc_before_raw,
-            usdc_spent_raw,
-        } = recovered
-        else {
-            panic!("buy intent");
-        };
-        let before_raw = shell_before_raw.parse().unwrap();
-        let expected_raw = shell_expected_raw.parse().unwrap();
-        assert!(!expected_credit_landed(before_raw, expected_raw, 140).unwrap());
-        assert!(expected_credit_landed(before_raw, expected_raw, 141).unwrap());
-        assert_eq!(usdc_before_raw, "500");
-        assert_eq!(usdc_spent_raw, "10");
-    }
 }
 
 use dexdo_core::accumulator::{BuyPlan, SellPlan};
@@ -839,7 +739,7 @@ use dexdo_core::params::{
 };
 use live::*;
 
-async fn run_status(args: AccumulatorStatusArgs) -> Result<()> {
+async fn run_status() -> Result<()> {
     let reader = AccumulatorReader::connect(&crate::cli::commands::manifest_path()?, None)?;
     reader.assert_root_identity().await?;
     let details = reader.details().await?;
@@ -858,10 +758,7 @@ async fn run_status(args: AccumulatorStatusArgs) -> Result<()> {
         shell_units(details.seller_shell_pool_raw)
     );
     println!("  usdc balance    {}", usdc_units(details.usdc_balance_raw));
-    println!(
-        "  owed to sellers {}",
-        usdc_units(details.owed_total_raw)
-    );
+    println!("  owed to sellers {}", usdc_units(details.owed_total_raw));
     println!(
         "  free reserve    {}",
         usdc_units(details.free_reserve_raw())
@@ -987,7 +884,12 @@ async fn run_sell(args: AccumulatorSellArgs) -> Result<()> {
             lot.denom
         );
         spender
-            .send_ecc(reader.root(), SHELL_CURRENCY_ID, lot.shell_raw, ACCUMULATOR_DAPP_ID)
+            .send_ecc(
+                reader.root(),
+                SHELL_CURRENCY_ID,
+                lot.shell_raw,
+                ACCUMULATOR_DAPP_ID,
+            )
             .await?;
     }
 
@@ -1052,7 +954,8 @@ async fn run_buy(args: AccumulatorBuyArgs) -> Result<()> {
         return Ok(());
     }
 
-    let plan = BuyPlan::for_whole_usdc(u128::from(args.usdc)).map_err(|e| anyhow::anyhow!("{e}"))?;
+    let plan =
+        BuyPlan::for_whole_usdc(u128::from(args.usdc)).map_err(|e| anyhow::anyhow!("{e}"))?;
     let available_raw = spender.ecc_balance(USDC_CURRENCY_ID).await?;
     plan.require_funded(available_raw)
         .map_err(|e| anyhow::anyhow!("{e}"))?;
@@ -1077,7 +980,12 @@ async fn run_buy(args: AccumulatorBuyArgs) -> Result<()> {
         usdc_spent_raw: plan.usdc_raw.to_string(),
     })?;
     spender
-        .send_ecc(reader.root(), USDC_CURRENCY_ID, plan.usdc_raw, ACCUMULATOR_DAPP_ID)
+        .send_ecc(
+            reader.root(),
+            USDC_CURRENCY_ID,
+            plan.usdc_raw,
+            ACCUMULATOR_DAPP_ID,
+        )
         .await?;
 
     let Some(after_raw) = spender
@@ -1117,8 +1025,7 @@ async fn run_lots(args: AccumulatorLotsArgs) -> Result<()> {
             let network = dexdo_core::Deployed::load(&manifest)
                 .map_err(|e| anyhow::anyhow!("manifest {}: {e}", manifest.display()))?
                 .network;
-            let wallet_network =
-                crate::cli::wallet::WalletNetwork::from_manifest_label(&network)?;
+            let wallet_network = crate::cli::wallet::WalletNetwork::from_manifest_label(&network)?;
             let wallet = crate::cli::wallet::resolve_funding_wallet(
                 &crate::cli::wallet::WalletStore::open()?,
                 &wallet_network,
@@ -1274,4 +1181,101 @@ async fn run_claim(args: AccumulatorClaimArgs) -> Result<()> {
     );
     spender.clear_pending()?;
     Ok(())
+}
+
+#[cfg(test)]
+mod review_regressions {
+    use super::live::{
+        confirmation_complete, expected_credit_landed, is_claim_candidate, load_operation,
+        persist_operation, require_native_gas, required_native_gas, scan_floor, PendingOperation,
+    };
+    use std::collections::BTreeMap;
+
+    #[test]
+    fn unrelated_partial_credit_does_not_confirm_the_expected_money_movement() {
+        assert!(!expected_credit_landed(1_000, 500, 1_001).expect("valid target"));
+        assert!(!expected_credit_landed(1_000, 500, 1_499).expect("valid target"));
+        assert!(expected_credit_landed(1_000, 500, 1_500).expect("valid target"));
+        assert!(expected_credit_landed(1_000, 500, 1_501).expect("valid target"));
+    }
+
+    #[test]
+    fn an_impossible_expected_balance_fails_closed() {
+        assert!(expected_credit_landed(u128::MAX, 1, u128::MAX).is_err());
+    }
+
+    #[test]
+    fn canonical_wallet_binding_address_reaches_the_chain_account_parser() {
+        let account = "ab".repeat(32);
+        let parsed = dexdo_core::address::parse_chain_address(&format!("{account}::{account}"))
+            .expect("canonical binding address")
+            .into_chain();
+        assert_eq!(parsed.bare(), account);
+    }
+
+    #[test]
+    fn sell_confirmation_keeps_each_denominations_own_scan_floor() {
+        let floors = BTreeMap::from([(1000, 2), (100, 30), (10, 400), (1, 5_000)]);
+        assert_eq!(scan_floor(&floors, 1000), 2);
+        assert_eq!(scan_floor(&floors, 1), 5_000);
+        assert_eq!(scan_floor(&BTreeMap::new(), 10), 1);
+    }
+
+    #[test]
+    fn sell_confirmation_waits_for_every_planned_lot() {
+        assert!(!confirmation_complete(0, 1));
+        assert!(!confirmation_complete(3, 4));
+        assert!(confirmation_complete(4, 4));
+    }
+
+    #[test]
+    fn a_claim_already_in_flight_is_never_submitted_again() {
+        assert!(is_claim_candidate(true, false));
+        assert!(!is_claim_candidate(true, true));
+        assert!(!is_claim_candidate(false, false));
+    }
+
+    #[test]
+    fn native_gas_preflight_prices_every_message_before_a_multi_send() {
+        let one = dexdo_core::params::ACCUMULATOR_WALLET_MESSAGE_GAS_RAW;
+        assert_eq!(required_native_gas(3).expect("three messages"), one * 3);
+        let refusal = require_native_gas(one * 3 - 1, 3)
+            .expect_err("one raw short must refuse the entire operation")
+            .to_string();
+        assert!(refusal.contains(&(one * 3 - 1).to_string()), "{refusal}");
+        assert!(refusal.contains(&(one * 3).to_string()), "{refusal}");
+        assert!(refusal.contains("nothing was submitted"), "{refusal}");
+    }
+
+    #[test]
+    fn pending_buy_intent_is_durable_and_carries_the_chain_reconciliation_baseline() {
+        let pending = PendingOperation::Buy {
+            shell_before_raw: "41".to_string(),
+            shell_expected_raw: "100".to_string(),
+            usdc_before_raw: "500".to_string(),
+            usdc_spent_raw: "10".to_string(),
+        };
+        let temp = tempfile::tempdir().expect("temporary operation directory");
+        let path = temp.path().join("pending.json");
+        persist_operation(&path, &pending).expect("persist before transport");
+        let recovered = load_operation(&path)
+            .expect("read after process restart")
+            .expect("durable intent exists");
+        assert_eq!(recovered, pending);
+        let PendingOperation::Buy {
+            shell_before_raw,
+            shell_expected_raw,
+            usdc_before_raw,
+            usdc_spent_raw,
+        } = recovered
+        else {
+            panic!("buy intent");
+        };
+        let before_raw = shell_before_raw.parse().unwrap();
+        let expected_raw = shell_expected_raw.parse().unwrap();
+        assert!(!expected_credit_landed(before_raw, expected_raw, 140).unwrap());
+        assert!(expected_credit_landed(before_raw, expected_raw, 141).unwrap());
+        assert_eq!(usdc_before_raw, "500");
+        assert_eq!(usdc_spent_raw, "10");
+    }
 }

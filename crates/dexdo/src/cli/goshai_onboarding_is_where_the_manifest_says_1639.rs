@@ -26,7 +26,7 @@ use super::wallet_goshai::{goshai_invitation_url, render_goshai_invitation};
 /// Inline rather than `include_str!` of a shipped manifest, for two reasons that both bite. A
 /// network name in `crates/**/*.rs` is the thing removed; and this module compiles inside the
 /// PUBLISHED tree, which carries one manifest only -- a test that reads the other by name stops the
-/// public tree from compiling, which `release/check-public-tree-tests.sh` exists to catch.
+/// public tree from compiling, which `ci/release/common/check_public_tree_tests.sh` exists to catch.
 fn deployment(declared: Option<&str>) -> dexdo_core::Deployed {
     let hex = "0".repeat(64);
     let mut document = serde_json::json!({
@@ -123,7 +123,8 @@ fn no_refusal_shows_a_url_at_all() {
             );
         }
         assert!(
-            said.chars().all(|c| !c.is_control() && c != '\u{202e}' && c != '\u{200b}'),
+            said.chars()
+                .all(|c| !c.is_control() && c != '\u{202e}' && c != '\u{200b}'),
             "a refusal echoed a character it refused the link for: {said:?}"
         );
     }
@@ -201,7 +202,10 @@ fn a_link_that_cannot_be_shown_safely_is_refused() {
     }
 
     // And the ordinary one still passes, so the checks above are a boundary and not a wall.
-    assert!(goshai_invitation_url(&with_goshai("https://gosh.ai/subscription/login/?utm_source=dexdo")).is_ok());
+    assert!(goshai_invitation_url(&with_goshai(
+        "https://gosh.ai/subscription/login/?utm_source=dexdo"
+    ))
+    .is_ok());
 }
 
 /// What the eye reads and what the camera reads are the same string.
@@ -228,7 +232,9 @@ fn the_printed_url_and_the_encoded_url_are_one_string() {
     let mut again = Vec::new();
     crate::cli::qr_display::write_qr(&mut again, &expected).expect("draw the same code");
     assert!(
-        shown.windows(again.len()).any(|window| window == again.as_slice()),
+        shown
+            .windows(again.len())
+            .any(|window| window == again.as_slice()),
         "the code printed does not encode the URL printed beside it"
     );
 

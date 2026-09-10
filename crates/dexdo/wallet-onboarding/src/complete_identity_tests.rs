@@ -228,7 +228,10 @@ fn the_prepared_request_carries_the_wallet_address_across_a_restart() {
         "request": request_json(Some(wallet())),
     })));
     let SessionPhase::RequestPrepared { request } = &session.phase else {
-        panic!("the fixture is a prepared request, not `{}`", session.phase_name());
+        panic!(
+            "the fixture is a prepared request, not `{}`",
+            session.phase_name()
+        );
     };
     assert_eq!(request.wallet_address, wallet());
     session

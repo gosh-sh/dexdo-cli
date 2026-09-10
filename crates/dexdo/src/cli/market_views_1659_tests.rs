@@ -16,7 +16,8 @@ const BOOK: &str = "0:917d85f33c24d3ed930355bf98a488456256d27de3c022d2c785315fcf
 fn snapshot_with(orders: Vec<OrderBookOrder>) -> OrderBookSnapshot {
     OrderBookSnapshot {
         frame_model: "qwen--qwen3--32b".to_string(),
-        model_hash: "0x53c05e91aeb663699a720e7a7e211f2f9eb2aa4b8c68a7f87c80cc56b716d8a8".to_string(),
+        model_hash: "0x53c05e91aeb663699a720e7a7e211f2f9eb2aa4b8c68a7f87c80cc56b716d8a8"
+            .to_string(),
         order_book: BOOK.to_string(),
         stats: None,
         orders,
@@ -26,7 +27,8 @@ fn snapshot_with(orders: Vec<OrderBookOrder>) -> OrderBookSnapshot {
 fn row(order_id: u128) -> OrderBookOrder {
     OrderBookOrder {
         order_id,
-        owner_note: "0:3bc65e6ab529b648a74ab3da1707edc450e0c91dcc12ffea53f0850117572aa1".to_string(),
+        owner_note: "0:3bc65e6ab529b648a74ab3da1707edc450e0c91dcc12ffea53f0850117572aa1"
+            .to_string(),
         token_contract: Some(BOOK.to_string()),
         is_buy: false,
         price_per_tick: 1_000_000_000,
@@ -46,7 +48,11 @@ fn row(order_id: u128) -> OrderBookOrder {
 #[tokio::test]
 async fn an_empty_fold_does_not_become_an_empty_market() {
     let view = read_executable_market_view_with(
-        || async { Ok(IndexerMarketContext { last_update_id: "ix-1".to_string() }) },
+        || async {
+            Ok(IndexerMarketContext {
+                last_update_id: "ix-1".to_string(),
+            })
+        },
         || async { Ok((snapshot_with(Vec::new()), "fold-1".to_string())) },
         || async { Ok(snapshot_with(vec![row(3)])) },
     )
@@ -74,7 +80,11 @@ async fn an_empty_fold_does_not_become_an_empty_market() {
 async fn a_fold_that_saw_rows_keeps_its_own_provenance() {
     let storage_reads = std::cell::Cell::new(0u32);
     let view = read_executable_market_view_with(
-        || async { Ok(IndexerMarketContext { last_update_id: "ix-1".to_string() }) },
+        || async {
+            Ok(IndexerMarketContext {
+                last_update_id: "ix-1".to_string(),
+            })
+        },
         || async { Ok((snapshot_with(vec![row(3)]), "fold-1".to_string())) },
         || {
             storage_reads.set(storage_reads.get() + 1);

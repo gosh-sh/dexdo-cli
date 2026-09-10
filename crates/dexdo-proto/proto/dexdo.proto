@@ -34,6 +34,8 @@ message StreamRequest {
   // sampling parameters travel in the opening call alongside authorization. The gateway adapts
   // it to its upstream's format (R1). The `model` field is NOT trusted -- the model is forced by the market.
   CanonRequest request = 4;
+  // Maximum provider-native input + output tokens this request may bill.
+  uint64 billing_grant_tokens = 5;
 }
 
 // The buyer's canonical request -- OpenAI chat-completions form.
@@ -93,4 +95,13 @@ message CanonChunk {
   // Reasoning/thinking delta from providers that separate it from user-visible content (for verification only).
   // Consumer OpenAI/Anthropic renderers do not expose this as `content`.
   string reasoning = 6;
+  // Present exactly once as the final typed event. A usage event carries no content fields.
+  BillingUsage usage = 7;
+}
+
+// Provider-native terminal usage. `total_tokens` must be the checked sum of input + output.
+message BillingUsage {
+  uint64 input_tokens = 1;
+  uint64 output_tokens = 2;
+  uint64 total_tokens = 3;
 }

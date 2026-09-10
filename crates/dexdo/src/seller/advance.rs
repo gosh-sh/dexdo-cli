@@ -23,7 +23,9 @@
 //! Bounds are read per-deal from `TokenContract.getConfig()` so a redeployed contract cannot desync the
 //! driver from what the chain will accept; tests inject short bounds.
 
-use dexdo_core::params::{MAX_CLAIM_DELTA, SELLER_TERMINAL_RECEIPT_POLL_INTERVAL};
+use dexdo_core::params::{
+    MAX_CLAIM_DELTA, SELLER_TERMINAL_RECEIPT_POLL_INTERVAL, SELLER_TERMINAL_RECEIPT_TIMEOUT,
+};
 use dexdo_core::{
     ChainBackend, ChainError, ClaimBounds, DealChainState, Note, TokenContract,
     CHAIN_READ_EXHAUSTED_MESSAGE_PREFIX, TICK_SIZE,
@@ -477,11 +479,8 @@ pub async fn drive_advance_with_observer(
                 cumulative_tokens: Some(next),
             },
         );
-        match claim_result {
-            Ok(()) => {
-                claimed = next;
-                needs_finalize = true;
-            }
+        let submitted_claim = match claim_result {
+            Ok(()) => next,
             Err(ChainError::ClaimHighWaterResync {
                 attempted,
                 on_chain,
@@ -504,8 +503,7 @@ pub async fn drive_advance_with_observer(
                     on_chain_tokens = on_chain,
                     "a concurrent or lost-response claim advanced the chain; resynchronising explicitly"
                 );
-                claimed = on_chain;
-                needs_finalize = true;
+                on_chain
             }
             Err(ChainError::Limit(_)) => break, // deal ceiling -- expected exhaustion
             Err(e) => {
@@ -516,7 +514,33 @@ pub async fn drive_advance_with_observer(
                 }
                 return Err(e);
             }
+        };
+
+        // A successful backend call is confirmed by an authoritative tokensPending read, but that internal
+        // confirmation is not visible to the ordinary-capacity observer. Re-read through the shared state
+        // seam before accepting another request so the just-claimed delivery debt is released locally.
+        let post_claim_state = match required_claim_state(chain, token_contract, observer).await {
+            Ok(state) => state,
+            Err(error) => {
+                if deal_closed_observed(chain, token_contract, observer).await?
+                    || buyer_stop_receipt_observed(chain, token_contract, observer).await?
+                {
+                    return Ok(submitted_claim);
+                }
+                return Err(error);
+            }
+        };
+        let reconciled =
+            validated_claim_high_water(token_contract, post_claim_state, token_budget)?;
+        if reconciled < submitted_claim || reconciled > target {
+            return Err(ChainError::Chain(format!(
+                "TokenContract {token_contract_display}: invalid post-claim reconciliation \
+                 (submitted={submitted_claim}, onChain={reconciled}, \
+                 deliveryTarget={target}, budget={token_budget})"
+            )));
         }
+        claimed = reconciled;
+        needs_finalize = true;
     }
 
     // The newest claim is still contestable and nothing will supersede it, so without this the last batch
@@ -581,6 +605,32 @@ async fn deal_closed_observed(
         observer.observe_terminal(token_contract)?;
     }
     Ok(closed)
+}
+
+/// Observe the immutable buyer-owned `StreamStopped` receipt that survives a real TokenContract
+/// self-destruct. Account disappearance and receipt indexing are separate reads, so the canonical
+/// terminal-receipt policy retries empty and transient-error reads for its bounded deadline. This fallback
+/// is intentionally separate from getter-based close detection: a missing getter/snapshot without this
+/// exact receipt is not terminal proof and must remain fail-closed.
+async fn buyer_stop_receipt_observed(
+    chain: &dyn ChainBackend,
+    token_contract: &TokenContract,
+    observer: &dyn ClaimStateObserver,
+) -> Result<bool, ChainError> {
+    let stopped = tokio::time::timeout(SELLER_TERMINAL_RECEIPT_TIMEOUT, async {
+        loop {
+            if let Ok(Some(_)) = chain.buyer_stop_settlement(token_contract).await {
+                return true;
+            }
+            tokio::time::sleep(SELLER_TERMINAL_RECEIPT_POLL_INTERVAL).await;
+        }
+    })
+    .await
+    .unwrap_or(false);
+    if stopped {
+        observer.observe_terminal(token_contract)?;
+    }
+    Ok(stopped)
 }
 #[cfg(test)]
 mod tests {
@@ -765,6 +815,10 @@ mod tests {
         finalized: AtomicU64,
         fail_finalize: AtomicBool,
         close_before_finalize_error: AtomicBool,
+        close_after_claim: AtomicBool,
+        buyer_stop_receipt_after_reads: AtomicU64,
+        buyer_stop_receipt_reads: AtomicU64,
+        buyer_stop_receipt_errors_remaining: AtomicU64,
         accepts: AtomicU64,
         closed: AtomicBool,
         state: std::sync::Mutex<DealChainState>,
@@ -778,6 +832,10 @@ mod tests {
                 finalized: AtomicU64::new(0),
                 fail_finalize: AtomicBool::new(false),
                 close_before_finalize_error: AtomicBool::new(false),
+                close_after_claim: AtomicBool::new(false),
+                buyer_stop_receipt_after_reads: AtomicU64::new(u64::MAX),
+                buyer_stop_receipt_reads: AtomicU64::new(0),
+                buyer_stop_receipt_errors_remaining: AtomicU64::new(0),
                 accepts: AtomicU64::new(0),
                 closed: AtomicBool::new(false),
                 state: std::sync::Mutex::new(claim_state(false, 0, 0)),
@@ -791,6 +849,10 @@ mod tests {
                 finalized: AtomicU64::new(0),
                 fail_finalize: AtomicBool::new(false),
                 close_before_finalize_error: AtomicBool::new(false),
+                close_after_claim: AtomicBool::new(false),
+                buyer_stop_receipt_after_reads: AtomicU64::new(u64::MAX),
+                buyer_stop_receipt_reads: AtomicU64::new(0),
+                buyer_stop_receipt_errors_remaining: AtomicU64::new(0),
                 accepts: AtomicU64::new(0),
                 closed: AtomicBool::new(false),
                 state: std::sync::Mutex::new(claim_state(true, tokens_final, tokens_pending)),
@@ -805,6 +867,33 @@ mod tests {
         fn closed() -> Self {
             let backend = Self::new();
             backend.closed.store(true, Ordering::Relaxed);
+            backend
+        }
+        fn closing_after_claim() -> Self {
+            let backend = Self::new();
+            backend.close_after_claim.store(true, Ordering::Relaxed);
+            backend
+                .buyer_stop_receipt_after_reads
+                .store(1, Ordering::Relaxed);
+            backend
+        }
+        fn closing_after_claim_with_delayed_receipt() -> Self {
+            let backend = Self::closing_after_claim();
+            backend
+                .buyer_stop_receipt_after_reads
+                .store(2, Ordering::Relaxed);
+            backend
+        }
+        fn closing_after_claim_with_transient_receipt_error() -> Self {
+            let backend = Self::closing_after_claim_with_delayed_receipt();
+            backend
+                .buyer_stop_receipt_errors_remaining
+                .store(1, Ordering::Relaxed);
+            backend
+        }
+        fn disappearing_after_claim_without_receipt() -> Self {
+            let backend = Self::new();
+            backend.close_after_claim.store(true, Ordering::Relaxed);
             backend
         }
         fn failing_finalize() -> Self {
@@ -877,6 +966,9 @@ mod tests {
             }
             self.claims.lock().unwrap().push(cumulative);
             self.state.lock().unwrap().tokens_pending = cumulative;
+            if self.close_after_claim.load(Ordering::Relaxed) {
+                self.closed.store(true, Ordering::Release);
+            }
             Ok(())
         }
         async fn finalize(&self, _: &TokenContract) -> Result<(), ChainError> {
@@ -895,12 +987,39 @@ mod tests {
             &self,
             _: &TokenContract,
         ) -> Result<Option<DealChainState>, ChainError> {
+            if self.closed.load(Ordering::Acquire) {
+                return Ok(None);
+            }
             Ok(Some(*self.state.lock().unwrap()))
         }
         async fn stop(&self, _: &TokenContract, _: &dyn Note) -> Result<Settlement, ChainError> {
             unimplemented!()
         }
+        async fn buyer_stop_settlement(
+            &self,
+            _: &TokenContract,
+        ) -> Result<Option<(u128, u128)>, ChainError> {
+            let read = self.buyer_stop_receipt_reads.fetch_add(1, Ordering::AcqRel) + 1;
+            if self
+                .buyer_stop_receipt_errors_remaining
+                .load(Ordering::Acquire)
+                > 0
+            {
+                self.buyer_stop_receipt_errors_remaining
+                    .fetch_sub(1, Ordering::AcqRel);
+                return Err(ChainError::Chain(
+                    "transient receipt read failed".to_string(),
+                ));
+            }
+            Ok((self.closed.load(Ordering::Acquire)
+                && read >= self.buyer_stop_receipt_after_reads.load(Ordering::Acquire))
+            .then_some((0, 0)))
+        }
         async fn snapshot(&self, _: &TokenContract) -> Option<StreamSnapshot> {
+            if self.close_after_claim.load(Ordering::Acquire) && self.closed.load(Ordering::Acquire)
+            {
+                return None;
+            }
             self.closed
                 .load(Ordering::Relaxed)
                 .then_some(StreamSnapshot {
@@ -1146,6 +1265,224 @@ mod tests {
             states.iter().skip(1).any(|state| state.probe_accepted),
             "the post-accept state must reach capacity reconciliation"
         );
+    }
+
+    #[tokio::test]
+    async fn confirmed_claim_state_is_observed_before_ordinary_driver_continues() {
+        let backend = RecordingBackend::new();
+        let observer = RecordingStateObserver::default();
+        let claimed = drive_advance_with_observer(
+            &backend,
+            &"tc-observed-claim".to_string(),
+            &LocalNote::generate(),
+            instant(),
+            2,
+            TICK_SIZE as u64,
+            true,
+            Arc::new(AtomicU64::new((2 * TICK_SIZE) as u64)),
+            Arc::new(AtomicBool::new(true)),
+            &observer,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(claimed, 2 * TICK_SIZE);
+        assert!(
+            observer
+                .states
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|state| state.tokens_pending == 2 * TICK_SIZE),
+            "the confirmed post-claim state must release ordinary capacity before another request"
+        );
+    }
+
+    #[tokio::test]
+    async fn clean_buyer_stop_after_confirmed_claim_is_terminal_success() {
+        let backend = RecordingBackend::closing_after_claim();
+        let observer = RecordingStateObserver::default();
+        let token_contract = "tc-close-after-claim".to_string();
+        let claimed = drive_advance_with_observer(
+            &backend,
+            &token_contract,
+            &LocalNote::generate(),
+            instant(),
+            2,
+            TICK_SIZE as u64,
+            true,
+            Arc::new(AtomicU64::new((2 * TICK_SIZE) as u64)),
+            Arc::new(AtomicBool::new(true)),
+            &observer,
+        )
+        .await
+        .expect("a clean close after the confirmed claim is terminal success");
+
+        assert_eq!(claimed, 2 * TICK_SIZE);
+        assert_eq!(backend.claims(), vec![2 * TICK_SIZE]);
+        assert!(
+            backend.deal_state(&token_contract).await.unwrap().is_none(),
+            "the production-faithful self-destruct removes getState"
+        );
+        assert!(
+            backend.snapshot(&token_contract).await.is_none(),
+            "the production snapshot delegates to the same missing getter"
+        );
+        assert!(
+            backend
+                .buyer_stop_settlement(&token_contract)
+                .await
+                .unwrap()
+                .is_some(),
+            "the immutable buyer-owned StreamStopped receipt survives self-destruct"
+        );
+        assert_eq!(observer.terminals.load(Ordering::Relaxed), 1);
+        assert_eq!(
+            backend.finalized.load(Ordering::Relaxed),
+            0,
+            "the destroyed deal must not receive a redundant finalize submit"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn delayed_buyer_stop_receipt_after_confirmed_claim_is_terminal_success() {
+        let backend = Arc::new(RecordingBackend::closing_after_claim_with_delayed_receipt());
+        let observer = Arc::new(RecordingStateObserver::default());
+        let driver_backend = backend.clone();
+        let driver_observer = observer.clone();
+        let driver = tokio::spawn(async move {
+            drive_advance_with_observer(
+                driver_backend.as_ref(),
+                &"tc-delayed-receipt-after-claim".to_string(),
+                &LocalNote::generate(),
+                instant(),
+                2,
+                TICK_SIZE as u64,
+                true,
+                Arc::new(AtomicU64::new((2 * TICK_SIZE) as u64)),
+                Arc::new(AtomicBool::new(true)),
+                driver_observer.as_ref(),
+            )
+            .await
+        });
+
+        while backend.buyer_stop_receipt_reads.load(Ordering::Acquire) == 0 {
+            tokio::task::yield_now().await;
+        }
+        assert!(
+            !driver.is_finished(),
+            "one empty receipt read must remain inside the canonical bounded wait"
+        );
+        tokio::time::advance(SELLER_TERMINAL_RECEIPT_POLL_INTERVAL).await;
+        tokio::task::yield_now().await;
+
+        assert_eq!(driver.await.unwrap().unwrap(), 2 * TICK_SIZE);
+        assert_eq!(backend.buyer_stop_receipt_reads.load(Ordering::Acquire), 2);
+        assert_eq!(observer.terminals.load(Ordering::Relaxed), 1);
+        assert_eq!(backend.finalized.load(Ordering::Relaxed), 0);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn transient_buyer_stop_receipt_error_after_confirmed_claim_is_retried() {
+        let backend =
+            Arc::new(RecordingBackend::closing_after_claim_with_transient_receipt_error());
+        let observer = Arc::new(RecordingStateObserver::default());
+        let driver_backend = backend.clone();
+        let driver_observer = observer.clone();
+        let driver = tokio::spawn(async move {
+            drive_advance_with_observer(
+                driver_backend.as_ref(),
+                &"tc-transient-receipt-after-claim".to_string(),
+                &LocalNote::generate(),
+                instant(),
+                2,
+                TICK_SIZE as u64,
+                true,
+                Arc::new(AtomicU64::new((2 * TICK_SIZE) as u64)),
+                Arc::new(AtomicBool::new(true)),
+                driver_observer.as_ref(),
+            )
+            .await
+        });
+
+        while backend.buyer_stop_receipt_reads.load(Ordering::Acquire) == 0 {
+            tokio::task::yield_now().await;
+        }
+        assert!(
+            !driver.is_finished(),
+            "a transient receipt read error must remain inside the canonical bounded wait"
+        );
+        tokio::time::advance(SELLER_TERMINAL_RECEIPT_POLL_INTERVAL).await;
+        tokio::task::yield_now().await;
+
+        assert_eq!(driver.await.unwrap().unwrap(), 2 * TICK_SIZE);
+        assert_eq!(backend.buyer_stop_receipt_reads.load(Ordering::Acquire), 2);
+        assert_eq!(observer.terminals.load(Ordering::Relaxed), 1);
+        assert_eq!(backend.finalized.load(Ordering::Relaxed), 0);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn missing_post_claim_state_without_terminal_receipt_fails_closed() {
+        let backend = Arc::new(RecordingBackend::disappearing_after_claim_without_receipt());
+        let observer = Arc::new(RecordingStateObserver::default());
+        let token_contract = "tc-missing-after-claim".to_string();
+        let driver_backend = backend.clone();
+        let driver_observer = observer.clone();
+        let driver_token_contract = token_contract.clone();
+        let driver = tokio::spawn(async move {
+            drive_advance_with_observer(
+                driver_backend.as_ref(),
+                &driver_token_contract,
+                &LocalNote::generate(),
+                instant(),
+                2,
+                TICK_SIZE as u64,
+                true,
+                Arc::new(AtomicU64::new((2 * TICK_SIZE) as u64)),
+                Arc::new(AtomicBool::new(true)),
+                driver_observer.as_ref(),
+            )
+            .await
+        });
+
+        while backend.buyer_stop_receipt_reads.load(Ordering::Acquire) == 0 {
+            tokio::task::yield_now().await;
+        }
+        assert!(
+            !driver.is_finished(),
+            "a missing receipt must not fail before the canonical bounded wait"
+        );
+        tokio::time::advance(
+            SELLER_TERMINAL_RECEIPT_TIMEOUT - SELLER_TERMINAL_RECEIPT_POLL_INTERVAL,
+        )
+        .await;
+        tokio::task::yield_now().await;
+        assert!(
+            !driver.is_finished(),
+            "a missing receipt must keep polling before the canonical deadline"
+        );
+        tokio::time::advance(SELLER_TERMINAL_RECEIPT_POLL_INTERVAL).await;
+        tokio::task::yield_now().await;
+
+        let error = driver
+            .await
+            .unwrap()
+            .expect_err("missing state without an exact StreamStopped receipt must fail closed");
+
+        assert!(
+            error.to_string().contains("getState returned no data"),
+            "{error}"
+        );
+        assert_eq!(backend.claims(), vec![2 * TICK_SIZE]);
+        assert!(backend.deal_state(&token_contract).await.unwrap().is_none());
+        assert!(backend.snapshot(&token_contract).await.is_none());
+        assert!(backend
+            .buyer_stop_settlement(&token_contract)
+            .await
+            .unwrap()
+            .is_none());
+        assert_eq!(observer.terminals.load(Ordering::Relaxed), 0);
+        assert_eq!(backend.finalized.load(Ordering::Relaxed), 0);
     }
 
     struct RejectingStateObserver;

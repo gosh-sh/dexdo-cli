@@ -189,30 +189,6 @@ fn pick_note_from_pool(command: &str, what: &str) -> Result<String> {
     crate::cli::note_pick::ask_which(&crate::cli::note_pick::rows_of(&pool))
 }
 
-/// The owner key the same commands need below clap, for the same reason.
-pub(crate) fn require_note_key<'a>(
-    identity: &'a IdentityArgs,
-    command: &str,
-    what: &str,
-) -> Result<&'a std::path::Path> {
-    identity
-        .note_key
-        .as_deref()
-        .ok_or_else(|| anyhow::anyhow!("{command}: --note-key ({what}) is required"))
-}
-
-/// The note is settled once per command, and the key is fetched FOR that note.
-
-/// Both entry points below resolve an address when they are given none, and resolving it means
-/// offering the operator the pool. A command that resolves twice shows the menu twice and can end
-/// up signing with the key of one note under the address of another -- a signature that cannot
-/// verify, paid for in gas.
-
-/// So a command that already holds an address must pass it, which is [`note_owner_secret_for`]. The
-/// identity-based [`note_owner_secret`] is for the one caller that has no address yet, and it sets
-/// the address it resolved before using it. This is checked by reading the sources rather than by
-/// exercising every command, because the failure is structural: it is a call shape, and it can only
-/// be seen where the calls are.
 #[cfg(test)]
 mod printed_follow_up_tests {
     use super::command_here;
@@ -243,50 +219,6 @@ mod printed_follow_up_tests {
 #[path = "secret_read_guard_1877_tests.rs"]
 mod secret_read_guard_1877_tests;
 
-#[cfg(test)]
-mod one_note_per_command_tests {
-    /// Files allowed to call the identity-based entry point, and why.
-
-    /// `admin.rs` resolves the address itself, sets it on the identity it passes, and is the only
-    /// caller for which the two are provably the same note.
-    /// `support.rs` is where both entry points are defined, and where this test's own text names
-    /// the call it is looking for.
-    const MAY_RESOLVE_INSIDE: &[&str] = &["admin.rs", "support.rs"];
-
-    #[test]
-    fn no_command_resolves_the_note_twice() {
-        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/cli");
-        let mut offenders = Vec::new();
-        let mut checked = 0usize;
-        for entry in std::fs::read_dir(&dir).expect("read the cli directory") {
-            let path = entry.expect("directory entry").path();
-            if path.extension().and_then(|ext| ext.to_str()) != Some("rs") {
-                continue;
-            }
-            let name = path
-                .file_name()
-                .and_then(|name| name.to_str())
-                .unwrap_or_default()
-                .to_string();
-            let source = std::fs::read_to_string(&path).expect("read a cli source");
-            checked += 1;
-            // The identity-based call, and not the `_for` one that takes an address.
-            let uses_identity = source
-                .match_indices("note_owner_secret(")
-                .any(|(at, _)| !source[..at].ends_with("fn "));
-            if uses_identity && !MAY_RESOLVE_INSIDE.contains(&name.as_str()) {
-                offenders.push(name);
-            }
-        }
-        assert!(checked > 10, "the cli sources were not read: {checked}");
-        assert!(
-            offenders.is_empty(),
-            "these resolve the note a second time inside the key lookup; pass the address you \
-             already have to `note_owner_secret_for`: {offenders:?}"
-        );
-    }
-}
-
 /// The secret a command signs a note with: from `--note-key` when it was passed, and otherwise from
 /// the pool entry for the note it is already working on.
 
@@ -302,31 +234,6 @@ mod one_note_per_command_tests {
 /// secret: this reads the file the pool already is.
 
 /// Refuses rather than guesses when the note is in no pool: two named remedies, and no invented key.
-pub(crate) fn note_owner_secret(
-    identity: &IdentityArgs,
-    pool: Option<&std::path::Path>,
-    command: &str,
-    what: &str,
-) -> Result<zeroize::Zeroizing<String>> {
-    if identity.note_key.is_none() {
-        // Resolving the address may offer the pool's notes, so it happens before the key is looked
-        // for -- there is no key to look for until the note is settled.
-        let note_addr = require_note_addr(identity, command, what)?;
-        return note_owner_secret_for(None, &note_addr, pool, command, what);
-    }
-    note_owner_secret_for(
-        identity.note_key.as_deref(),
-        identity.note_addr.as_deref().unwrap_or_default(),
-        pool,
-        command,
-        what,
-    )
-}
-
-/// The same rule for a command whose note key and address are not carried in [`IdentityArgs`].
-
-/// `close` and `recover` take theirs as their own arguments; the rule -- the flag wins, the pool
-/// answers, and neither means a refusal that names both -- is one rule and lives here.
 pub(crate) fn note_owner_secret_for(
     note_key: Option<&std::path::Path>,
     note_addr: &str,
@@ -441,20 +348,6 @@ pub(crate) fn release_dispute_guidance(token_contract: &str) -> String {
     format!(
         "the seller resolves it by running `dexdo release-dispute` with --token-contract {}, the \
          seller --note-addr and the seller --note-key",
-        shell_arg(&token_contract)
-    )
-}
-
-/// The `dexdo destroy` follow-up, as guidance for the same reason: `run_destroy` demands the
-/// seller note and the seller owner key below clap, and neither is known where this is printed.
-
-/// The note is named the way `run_destroy` names it (4.0.33 Task O): it identifies the operator,
-/// it does not choose the payee -- the deal pays the `_sellerNote` it stored at construction.
-pub(crate) fn destroy_guidance(token_contract: &str) -> String {
-    let token_contract = dexdo_core::address::display_self_dapp(token_contract);
-    format!(
-        "the seller closes it by running `dexdo destroy` with --token-contract {}, the seller \
-         --note-addr (the seller note this deal belongs to) and the seller --note-key",
         shell_arg(&token_contract)
     )
 }
@@ -576,7 +469,7 @@ pub(crate) mod printed_commands {
         predicate
             .strip_prefix("all(")
             .and_then(|rest| rest.strip_suffix(')'))
-            .is_some_and(|inner| cfg_items(inner).iter().any(|item| *item == "test"))
+            .is_some_and(|inner| cfg_items(inner).contains(&"test"))
     }
 
     /// The `#[cfg(...)]` attribute starting at `index`, if there is one. Attributes in this tree
@@ -851,7 +744,7 @@ pub(crate) mod printed_commands {
                 .chars()
                 .take_while(|c| c.is_ascii_alphanumeric() || *c == '-')
                 .collect();
-            if first.is_empty() || !subcommands.iter().any(|name| *name == first) {
+            if first.is_empty() || !subcommands.contains(&first) {
                 index += 1;
                 continue;
             }
@@ -1250,7 +1143,7 @@ pub(crate) mod printed_commands {
     /// operator. Commands whose handlers were not read are checked at the parser level only --
     /// stated rather than silently assumed.
     fn assert_handler_requirements(argv: &[String], context: &str, raw_close_target: bool) {
-        use super::{require_note_addr, require_note_key};
+        use super::require_note_addr;
         // Fail-closed: a parse failure here is not "someone else's report", it is a printed line
         // that does not reach its handler at all.
         let parsed = crate::Cli::try_parse_from(argv)
@@ -1278,20 +1171,26 @@ pub(crate) mod printed_commands {
             crate::Command::ReleaseDispute(args) => {
                 require_note_addr(&args.identity, "release-dispute", "seller note")
                     .unwrap_or_else(|e| panic!("{context}: {e}: {argv:?}"));
-                require_note_key(&args.identity, "release-dispute", "seller owner key")
-                    .unwrap_or_else(|e| panic!("{context}: {e}: {argv:?}"));
+                assert!(
+                    args.identity.note_key.is_some(),
+                    "{context}: `release-dispute` requires the seller owner key: {argv:?}"
+                );
             }
             crate::Command::WithdrawShell(args) => {
                 require_note_addr(&args.identity, "withdraw-shell", "seller note")
                     .unwrap_or_else(|e| panic!("{context}: {e}: {argv:?}"));
-                require_note_key(&args.identity, "withdraw-shell", "seller owner key")
-                    .unwrap_or_else(|e| panic!("{context}: {e}: {argv:?}"));
+                assert!(
+                    args.identity.note_key.is_some(),
+                    "{context}: `withdraw-shell` requires the seller owner key: {argv:?}"
+                );
             }
             crate::Command::Destroy(args) => {
                 require_note_addr(&args.identity, "destroy", "seller note = payout")
                     .unwrap_or_else(|e| panic!("{context}: {e}: {argv:?}"));
-                require_note_key(&args.identity, "destroy", "seller owner key")
-                    .unwrap_or_else(|e| panic!("{context}: {e}: {argv:?}"));
+                assert!(
+                    args.identity.note_key.is_some(),
+                    "{context}: `destroy` requires the seller owner key: {argv:?}"
+                );
             }
             _ => {}
         }
@@ -1617,7 +1516,10 @@ pub(crate) fn seller_real_backend_with_deal_gas_overhead(
         .as_deref()
         .filter(|s| !s.is_empty())
         .ok_or_else(|| {
-            anyhow::anyhow!(format!("real {}: set --model <name from config> (needed for model_hash)", dexdo_core::params::current_network()))
+            anyhow::anyhow!(format!(
+                "real {}: set --model <name from config> (needed for model_hash)",
+                dexdo_core::params::current_network()
+            ))
         })?;
     let configured_frame_model = dexdo::seller::ModelsConfig::load(&args.models)?
         .get(name)?
@@ -1650,7 +1552,11 @@ pub(crate) fn seller_real_backend_with_deal_gas_overhead(
     };
     let frame_model = &require_model_name(frame_model, source, fix)?;
     check_market_model_match(market_frame_model, frame_model, name)?;
-    let note_addr = require_note_addr(&args.identity, "a real chain seller", "the note it sells from")?;
+    let note_addr = require_note_addr(
+        &args.identity,
+        "a real chain seller",
+        "the note it sells from",
+    )?;
     // From `--note-key` where it was passed, and otherwise from the pool entry for THIS note --
     // the one settled a line above. Re-resolving would offer the pool a second time, and a key from
     // one note under the address of another is a signature that cannot verify.
@@ -1679,10 +1585,11 @@ pub(crate) fn seller_real_backend_with_deal_gas_overhead(
     // rejects any offer whose `tokenContract` does not derive from `(sellerPubkey, nonce)`, so the
     // real seller MUST have it -- from `--market` (manifest) or the explicit `--nonce` flag.
     let nonce = market_nonce.ok_or_else(|| {
-        anyhow::anyhow!(
-            format!("real {}: pass --nonce <n> (or --market <manifest>) -- the deal nonce binds the \
-             offer to the canonical TokenContract (IOB rejects a mismatched tokenContract)", dexdo_core::params::current_network())
-        )
+        anyhow::anyhow!(format!(
+            "real {}: pass --nonce <n> (or --market <manifest>) -- the deal nonce binds the \
+             offer to the canonical TokenContract (IOB rejects a mismatched tokenContract)",
+            dexdo_core::params::current_network()
+        ))
     })?;
     let (backend, rn) = dexdo_core::RealSellerBackend::from_provisioned_with_deal_gas_overhead(
         manifest,
@@ -1707,8 +1614,11 @@ pub(crate) async fn provision_replacement_seller_with_deal_gas_overhead(
 ) -> Result<(dexdo_core::MarketManifest, Arc<dyn ChainBackend>)> {
     use dexdo_core::{KeyPair, RealChainBackend, RealSellerBackend, TICK_SIZE};
 
-    let note_addr =
-        require_note_addr(&args.identity, "a real chain residual provisioning", "the note")?;
+    let note_addr = require_note_addr(
+        &args.identity,
+        "a real chain residual provisioning",
+        "the note",
+    )?;
     let note_addr = note_addr.as_str();
     let secret = note_owner_secret_for(
         args.identity.note_key.as_deref(),
@@ -1811,14 +1721,16 @@ pub(crate) async fn provision_replacement_seller_with_deal_gas_overhead(
     Ok((market, backend))
 }
 
-
-
 /// Real buyer backend + the buyer's `RealNote`: from a provisioned note (`--note-key`/`--note-addr`)
 /// and `model_hash` from `--frame-model`. The price limit is `--max-price-per-tick` (>= ask); the escrow must
 /// cover `ticks x limit x (1 + 2.5 % book fee)` (issue -- otherwise the escrow is orphaned in the book;
 /// `from_provisioned` checks the invariant ahead of time via `check_buy_deposit_headroom`).
 pub(crate) fn buyer_real_backend(args: &BuyerArgs, frame_model: &str) -> Result<ChainAndNote> {
-    let note_addr = require_note_addr(&args.identity, "the real chain buyer", "the note it buys with")?;
+    let note_addr = require_note_addr(
+        &args.identity,
+        "the real chain buyer",
+        "the note it buys with",
+    )?;
     let note_secret = note_owner_secret_for(
         args.identity.note_key.as_deref(),
         &note_addr,
@@ -1856,7 +1768,6 @@ pub(crate) fn buyer_real_backend(args: &BuyerArgs, frame_model: &str) -> Result<
     let note: Arc<dyn Note> = Arc::new(rn);
     Ok((chain, note))
 }
-
 
 /// Default endpoints file under the selected instance root, or under the legacy platform data
 /// directory when `--data-dir` is absent.
@@ -2070,8 +1981,6 @@ pub(crate) fn oneshot_real_upstream_guard(
     Ok(())
 }
 
-/// 1 SHELL = 1e9 raw ECC[2] nano (the note-side unit; `--deposit-shells N` = N **SHELL**, not vmshell).
-pub(crate) use dexdo_core::params::SHELL_UNIT;
 /// the default note deposit is THIS deal's own requirement, not one figure for every deal. It
 /// has always been the floor itself and still is; what changed is that the floor follows the deal.
 pub(crate) use dexdo_core::params::default_deposit_shells;
@@ -2086,6 +1995,8 @@ pub(crate) use dexdo_core::params::default_deposit_shells;
 /// `GAS_*` charge is declared in vmshell and burnt as that many raw ECC[2] units.
 #[cfg(test)]
 pub(crate) use dexdo_core::params::min_deploy_shells;
+/// 1 SHELL = 1e9 raw ECC[2] nano (the note-side unit; `--deposit-shells N` = N **SHELL**, not vmshell).
+pub(crate) use dexdo_core::params::SHELL_UNIT;
 /// resolve the per-deploy ECC[2] funding (raw) from the user's note deposit (SHELL) -- **fail-closed** for a
 /// value that controls live on-chain spending. Errors on `u128` overflow and on a **below-floor** deposit (a known
 /// funded-uninit / fund-burn outcome on-chain), instead of silently clamping or proceeding into a live spend. For

@@ -411,7 +411,8 @@ mod terminal_consumption_tests {
         );
         assert!(
             fields.contains("unpromoted_tokens=2000000")
-                && fields.contains("unpromoted_reason=claims_that_did_not_serve_claim_promote_window"),
+                && fields
+                    .contains("unpromoted_reason=claims_that_did_not_serve_claim_promote_window"),
             "the gap must be named, with the reason it was not paid: {fields}"
         );
     }
@@ -420,7 +421,8 @@ mod terminal_consumption_tests {
     /// warning above cannot be a line that is always printed.
     #[test]
     fn a_fully_promoted_terminal_reports_no_unpromoted_tail() {
-        let fields = terminal_consumption_fields(3 * dexdo_core::TICK_SIZE, 3 * dexdo_core::TICK_SIZE);
+        let fields =
+            terminal_consumption_fields(3 * dexdo_core::TICK_SIZE, 3 * dexdo_core::TICK_SIZE);
 
         assert!(fields.contains("finalized_tokens=3000000"), "{fields}");
         assert!(fields.contains("claimed_tokens=3000000"), "{fields}");

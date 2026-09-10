@@ -70,8 +70,7 @@ pub(crate) fn refusing_endpoint() -> (tokio::net::UdpSocket, String) {
             .expect("the held socket is never read from");
         let addr = socket.local_addr().expect("bound address");
         if tcp_refuses(addr) {
-            let socket =
-                tokio::net::UdpSocket::from_std(socket).expect("adopt the held socket");
+            let socket = tokio::net::UdpSocket::from_std(socket).expect("adopt the held socket");
             return (socket, addr.to_string());
         }
         // The port is held by UDP but something answers TCP on it. Drop the hold and take another:

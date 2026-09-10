@@ -37,9 +37,7 @@ fn binding(provider: WalletProvider) -> WalletBinding {
         provider,
         network: "net-a".to_string(),
         hot_address: self_dapp_hot(),
-        vault_address: provider
-            .creates_vault_request()
-            .then(vault_address),
+        vault_address: provider.creates_vault_request().then(vault_address),
     }
 }
 
@@ -172,10 +170,14 @@ impl HotFundingProvider for FakeProvider {
     async fn create_request(&self, request: &FundingRequest) -> Result<SubmitOutcome> {
         self.submits.set(self.submits.get() + 1);
         self.seen.borrow_mut().push(request.clone());
-        Ok(self.submit.borrow_mut().pop().unwrap_or(SubmitOutcome::Accepted {
-            transaction_hash: Some("tx".to_string()),
-            pending_transaction_id: Some("pending".to_string()),
-        }))
+        Ok(self
+            .submit
+            .borrow_mut()
+            .pop()
+            .unwrap_or(SubmitOutcome::Accepted {
+                transaction_hash: Some("tx".to_string()),
+                pending_transaction_id: Some("pending".to_string()),
+            }))
     }
 
     fn manual_instruction(&self, request: &FundingRequest) -> String {
@@ -279,7 +281,11 @@ fn journal_path_is_one_file_per_hot_under_the_data_directory() {
         path.parent().expect("parent"),
         dir.path().join("wallet").join("funding-requests")
     );
-    let name = path.file_name().expect("name").to_string_lossy().to_string();
+    let name = path
+        .file_name()
+        .expect("name")
+        .to_string_lossy()
+        .to_string();
     assert_eq!(name.len(), 64 + ".json".len());
     assert!(name.ends_with(".json"));
 }
@@ -336,14 +342,21 @@ async fn the_journal_is_written_owner_only() {
     .await;
 
     let path = funding_journal_path(dir.path(), "net-a", &self_dapp_hot());
-    let mode = std::fs::metadata(&path).expect("journal metadata").permissions().mode() & 0o777;
+    let mode = std::fs::metadata(&path)
+        .expect("journal metadata")
+        .permissions()
+        .mode()
+        & 0o777;
     assert_eq!(mode, 0o600, "the funding journal must be owner-only");
     let dir_mode = std::fs::metadata(funding_requests_dir(dir.path()))
         .expect("dir metadata")
         .permissions()
         .mode()
         & 0o777;
-    assert_eq!(dir_mode, 0o700, "the funding journal directory must be owner-only");
+    assert_eq!(
+        dir_mode, 0o700,
+        "the funding journal directory must be owner-only"
+    );
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -393,7 +406,10 @@ async fn a_repeat_after_an_unobserved_successful_spend_does_not_spend_twice() {
         },
     ]);
     let first = run(dir.path(), &binding, &chain1, &provider1, tight_bounds()).await;
-    assert!(first.is_err(), "the balance never arrived, so the wait must fail");
+    assert!(
+        first.is_err(),
+        "the balance never arrived, so the wait must fail"
+    );
     assert_eq!(provider1.submits.get(), 1);
     let after_first = record(dir.path()).expect("run 1 left a record");
     assert_eq!(
@@ -417,11 +433,21 @@ async fn a_repeat_after_an_unobserved_successful_spend_does_not_spend_twice() {
         0,
         "a repeat must not create a second Vault request once the first is proven present"
     );
-    assert_eq!(provider2.probes.get(), 1, "the repeat must prove presence before deciding");
+    assert_eq!(
+        provider2.probes.get(),
+        1,
+        "the repeat must prove presence before deciding"
+    );
     let after_second = record(dir.path()).expect("run 2 kept the record");
     assert_eq!(after_second.state, FundingState::Submitted);
-    assert_eq!(after_second.transaction_hash.as_deref(), Some("tx-from-run-1"));
-    assert_eq!(after_second.pending_transaction_id.as_deref(), Some("pending-7"));
+    assert_eq!(
+        after_second.transaction_hash.as_deref(),
+        Some("tx-from-run-1")
+    );
+    assert_eq!(
+        after_second.pending_transaction_id.as_deref(),
+        Some("pending-7")
+    );
 }
 
 #[tokio::test]
@@ -514,18 +540,15 @@ async fn an_executed_record_followed_by_contradictory_absence_never_submits() {
     .await;
     assert_eq!(provider.submits.get(), 1);
 
-    provider
-        .probe
-        .borrow_mut()
-        .push(RequestPresence::Executed {
-            evidence: FundingEvidence {
-                verdict: "executed".to_string(),
-                source: "history fallback".to_string(),
-                observed_at_unix: Some(7),
-                detail: "a generation-invariant sent event".to_string(),
-                delivery_message_id: None,
-            },
-        });
+    provider.probe.borrow_mut().push(RequestPresence::Executed {
+        evidence: FundingEvidence {
+            verdict: "executed".to_string(),
+            source: "history fallback".to_string(),
+            observed_at_unix: Some(7),
+            detail: "a generation-invariant sent event".to_string(),
+            delivery_message_id: None,
+        },
+    });
     let _ = run(
         dir.path(),
         &binding(WalletProvider::AckinackiWallet),
@@ -534,7 +557,10 @@ async fn an_executed_record_followed_by_contradictory_absence_never_submits() {
         tight_bounds(),
     )
     .await;
-    assert_eq!(record(dir.path()).expect("record").state, FundingState::Executed);
+    assert_eq!(
+        record(dir.path()).expect("record").state,
+        FundingState::Executed
+    );
 
     provider.probe.borrow_mut().push(RequestPresence::Absent);
     let _ = run(
@@ -550,7 +576,10 @@ async fn an_executed_record_followed_by_contradictory_absence_never_submits() {
         1,
         "an erroneous Absent verdict must not overwrite an Executed generation and submit again"
     );
-    assert_eq!(record(dir.path()).expect("record").state, FundingState::Executed);
+    assert_eq!(
+        record(dir.path()).expect("record").state,
+        FundingState::Executed
+    );
 }
 
 #[tokio::test]
@@ -605,7 +634,10 @@ async fn a_funding_flow_from_a_provider_the_binding_does_not_name_is_refused() {
     )
     .await
     .expect_err("provider mismatch");
-    assert!(format!("{error:#}").contains("provider mismatch"), "{error}");
+    assert!(
+        format!("{error:#}").contains("provider mismatch"),
+        "{error}"
+    );
     assert!(
         record(dir.path()).is_none(),
         "a refused run must not open a record"
@@ -674,7 +706,10 @@ async fn a_timeout_leaves_a_state_that_a_rerun_re_checks() {
     let funded = run(dir.path(), &binding, &chain2, &provider2, patient_bounds())
         .await
         .expect("the rerun sees the funded Hot");
-    assert!(chain2.reads.get() >= 1, "the rerun must re-check the balance");
+    assert!(
+        chain2.reads.get() >= 1,
+        "the rerun must re-check the balance"
+    );
     assert_eq!(funded.observed.get(SHELL), 1_000);
     assert_eq!(provider2.submits.get(), 0);
 }
@@ -705,10 +740,14 @@ async fn a_timeout_writes_nothing_of_its_own_into_the_record() {
     let _ = run(dir2.path(), &binding, &chain2, &provider2, bounds)
         .await
         .expect_err("timeout");
-    let after_many_passes =
-        load_funding_journal(dir2.path(), "net-a", &self_dapp_hot()).expect("read").expect("record");
+    let after_many_passes = load_funding_journal(dir2.path(), "net-a", &self_dapp_hot())
+        .expect("read")
+        .expect("record");
 
-    assert!(chain2.reads.get() > 1, "the longer wait really did poll again");
+    assert!(
+        chain2.reads.get() > 1,
+        "the longer wait really did poll again"
+    );
     assert_eq!(after_one_pass.state, after_many_passes.state);
     assert_eq!(after_one_pass.required, after_many_passes.required);
     assert_eq!(after_one_pass.shortfall, after_many_passes.shortfall);
@@ -751,7 +790,10 @@ async fn the_journal_closes_only_on_an_observed_balance_that_meets_the_requireme
     let closed = record(dir.path()).expect("record");
     assert_eq!(closed.state, FundingState::Satisfied);
     assert_eq!(
-        closed.satisfied_balances.as_ref().and_then(|b| b.get(&SHELL)),
+        closed
+            .satisfied_balances
+            .as_ref()
+            .and_then(|b| b.get(&SHELL)),
         Some(&1_000u128),
         "the record must close with the balances that were actually read"
     );
@@ -818,7 +860,10 @@ async fn a_chain_read_error_neither_closes_the_record_nor_counts_as_a_balance() 
 async fn the_production_hot_reader_retries_one_transient_account_failure() {
     let body = account_response(vault_to_hot_native_value(), 1_000);
     let (endpoint, reads, server) = serve_account_responses(vec![
-        ("503 Service Unavailable", r#"{"error":"try again"}"#.to_string()),
+        (
+            "503 Service Unavailable",
+            r#"{"error":"try again"}"#.to_string(),
+        ),
         ("200 OK", body),
     ])
     .await;
@@ -842,11 +887,8 @@ async fn the_production_hot_reader_retries_one_transient_account_failure() {
 async fn an_ecc_funded_hot_requests_only_its_exact_native_shortfall() {
     let native_shortfall = 123;
     let observed_native = vault_to_hot_native_value() - native_shortfall;
-    let (endpoint, reads, server) = serve_account_responses(vec![(
-        "200 OK",
-        account_response(observed_native, 1_000),
-    )])
-    .await;
+    let (endpoint, reads, server) =
+        serve_account_responses(vec![("200 OK", account_response(observed_native, 1_000))]).await;
     let client = dexdo_core::ChainClient::connect(&endpoint).expect("connect fixture client");
     let dir = temp();
     let provider = FakeProvider::ackinacki(RequestPresence::Absent);
@@ -909,7 +951,12 @@ async fn a_provider_without_a_vault_creates_no_request_and_probes_nothing() {
         )
         .await
         .expect_err("nothing topped the Hot up");
-        assert!(error.chain().any(|cause| cause.to_string().contains("timed out")), "{error}");
+        assert!(
+            error
+                .chain()
+                .any(|cause| cause.to_string().contains("timed out")),
+            "{error}"
+        );
         assert_eq!(provider.submits.get(), 0, "{provider_kind:?}");
         assert_eq!(provider.probes.get(), 0, "{provider_kind:?}");
         let open = record(dir.path()).expect("the open need is still recorded");
@@ -961,8 +1008,16 @@ fn shortfall_is_per_currency_and_saturates() {
     let requirements = FundingRequirements::new([(SHELL, 1_000u128), (7, 5u128)]);
     let balances = HotBalances::new(vault_to_hot_native_value(), [(SHELL, 1_200u128)]);
     let shortfall = requirements.shortfall(&balances);
-    assert_eq!(shortfall.get(&SHELL), None, "an over-funded currency is not a shortfall");
-    assert_eq!(shortfall.get(&7), Some(&5), "an absent currency reads as zero, not as met");
+    assert_eq!(
+        shortfall.get(&SHELL),
+        None,
+        "an over-funded currency is not a shortfall"
+    );
+    assert_eq!(
+        shortfall.get(&7),
+        Some(&5),
+        "an absent currency reads as zero, not as met"
+    );
     assert!(!requirements.met_by(&balances));
     assert!(requirements.met_by(&HotBalances::new(
         vault_to_hot_native_value(),
@@ -1036,7 +1091,10 @@ fn concurrent_runs_against_the_same_hot_are_serialised_by_the_lock() {
     })
     .join()
     .expect("thread");
-    assert!(next.is_ok(), "the lock must be available once the holder releases it");
+    assert!(
+        next.is_ok(),
+        "the lock must be available once the holder releases it"
+    );
 }
 
 #[tokio::test]
@@ -1115,7 +1173,10 @@ fn a_journal_record_round_trips_and_carries_every_field_the_specification_names(
     assert_eq!(read, written);
     assert_eq!(read.provider, WalletProvider::AckinackiWallet);
     assert_eq!(read.network, "net-a");
-    assert_eq!(read.vault_address.as_deref(), Some(vault_address().as_str()));
+    assert_eq!(
+        read.vault_address.as_deref(),
+        Some(vault_address().as_str())
+    );
     assert_eq!(read.hot_address, self_dapp_hot());
     assert_eq!(read.creator_pubkey, "pubkey");
     assert_eq!(read.required.get(&SHELL), Some(&1_000));
@@ -1124,12 +1185,8 @@ fn a_journal_record_round_trips_and_carries_every_field_the_specification_names(
     assert_eq!(read.native_shortfall, 40);
     assert_eq!(read.created_at_unix, 1_700_000_000);
 
-    let raw = std::fs::read_to_string(funding_journal_path(
-        dir.path(),
-        "net-a",
-        &self_dapp_hot(),
-    ))
-    .expect("read raw");
+    let raw = std::fs::read_to_string(funding_journal_path(dir.path(), "net-a", &self_dapp_hot()))
+        .expect("read raw");
     assert!(raw.contains("\"ackinacki-wallet\""), "{raw}");
     assert!(raw.contains("\"submitted\""), "{raw}");
     assert!(
@@ -1164,5 +1221,5 @@ fn a_record_this_client_cannot_read_is_refused_rather_than_acted_on() {
     );
 }
 
-mod pr1332_retirement_regressions;
 mod issue_334_explicit_hot_regressions;
+mod pr1332_retirement_regressions;

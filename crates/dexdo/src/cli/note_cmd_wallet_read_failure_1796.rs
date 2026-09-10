@@ -46,10 +46,7 @@ fn permanent_read_failure() -> anyhow::Error {
 /// What the message alone would classify as, if nothing typed carried it. This is the trap the fix
 /// leaves in place rather than edits away.
 fn classified_from_the_words_alone(refusal: &anyhow::Error) -> ErrorCode {
-    classify_error(
-        OP_NOTE_DEPLOY,
-        &anyhow::anyhow!("{}", refusal.to_string()),
-    )
+    classify_error(OP_NOTE_DEPLOY, &anyhow::anyhow!("{refusal}"))
 }
 
 #[tokio::test]

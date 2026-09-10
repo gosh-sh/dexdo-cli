@@ -277,8 +277,7 @@ fn the_set_of_paths_that_reach_a_chain_without_a_declared_network_is_frozen() {
     expected.sort();
 
     assert_eq!(
-        found,
-        expected,
+        found, expected,
         "the set of production calls of `ChainClient::connect(` changed.\n\
          Adding one is a decision, not an accident: this call takes an endpoint and nothing else, \
          so whatever decides which chain it dials has to be supplied and compared deliberately. \

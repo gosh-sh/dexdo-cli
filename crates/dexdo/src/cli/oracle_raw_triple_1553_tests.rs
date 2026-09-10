@@ -22,12 +22,20 @@ const TOKEN_TYPE: u32 = 2;
 /// What the stake was holding, in raw ECC[2]. Named so the test says what it is about.
 const LOCKED_RAW: u128 = 93_905_000_000;
 const STAKE_RAW: u128 = 20_000_000;
+const _: () = assert!(LOCKED_RAW / STAKE_RAW > 4_000);
 
-fn args(manifest: Option<&str>, pmp: Option<&str>, event: Option<&str>, list: Option<&str>)
-    -> OraclePmpExitArgs
-{
+fn args(
+    manifest: Option<&str>,
+    pmp: Option<&str>,
+    event: Option<&str>,
+    list: Option<&str>,
+) -> OraclePmpExitArgs {
     OraclePmpExitArgs {
-        identity: IdentityArgs { note_key: None, note_index: 0, note_addr: None },
+        identity: IdentityArgs {
+            note_key: None,
+            note_index: 0,
+            note_addr: None,
+        },
         manifest: manifest.map(PathBuf::from),
         pmp: pmp.map(str::to_string),
         event_id: event.map(str::to_string),
@@ -43,7 +51,10 @@ fn raw() -> OraclePmpExitArgs {
 fn assert_incident(target: &PmpExitTarget) {
     assert_eq!(target.pmp, PMP, "the PMP the stake lives on");
     assert_eq!(target.event_id, EVENT_ID, "eventId of the stake");
-    assert_eq!(target.oracle_list_hash, ORACLE_LIST_HASH, "oracleListHash of the stake");
+    assert_eq!(
+        target.oracle_list_hash, ORACLE_LIST_HASH,
+        "oracleListHash of the stake"
+    );
     assert_eq!(target.token_type, TOKEN_TYPE, "SHELL");
 }
 
@@ -58,13 +69,6 @@ fn issue_1553_the_incident_stake_is_addressable_without_any_manifest() {
         "the target must say the triple is where its identity came from, so a mismatch later \
          names the right side: {}",
         target.source
-    );
-
-    // The proportion is the whole reason this matters, and it is asserted rather than narrated:
-    // the artefact the old path demanded was guarding an amount ~4695x its own size.
-    assert!(
-        LOCKED_RAW / STAKE_RAW > 4_000,
-        "the stake held {LOCKED_RAW} raw behind {STAKE_RAW} raw"
     );
 }
 
@@ -103,7 +107,11 @@ fn issue_1553_a_surviving_manifest_and_the_raw_triple_agree() {
     )
     .expect("the manifest route must keep working");
     assert_incident(&from_file);
-    assert!(from_file.source.contains("manifest"), "{}", from_file.source);
+    assert!(
+        from_file.source.contains("manifest"),
+        "{}",
+        from_file.source
+    );
 
     let from_triple = resolve_pmp_exit_target(&raw(), "oracle cancel-stake").expect("raw route");
     assert_eq!(from_file.pmp, from_triple.pmp);
@@ -125,8 +133,12 @@ fn issue_1553_the_two_routes_are_exclusive_and_neither_is_optional() {
     );
 
     let both = resolve_pmp_exit_target(
-        &args(Some("/nonexistent/oracle-market.json"), Some(PMP), Some(EVENT_ID),
-              Some(ORACLE_LIST_HASH)),
+        &args(
+            Some("/nonexistent/oracle-market.json"),
+            Some(PMP),
+            Some(EVENT_ID),
+            Some(ORACLE_LIST_HASH),
+        ),
         "oracle cancel-stake",
     )
     .expect_err("two sources that could disagree must refuse, not be silently ranked");
@@ -134,14 +146,17 @@ fn issue_1553_the_two_routes_are_exclusive_and_neither_is_optional() {
 
     // `--pmp` without the rest of the triple. clap's `requires_all` catches this at parse time;
     // the resolver refuses it too, because a struct built any other way must not slip past.
-    let half = resolve_pmp_exit_target(&args(None, Some(PMP), None, Some(ORACLE_LIST_HASH)),
-                                       "oracle cancel-stake")
-        .expect_err("a half triple must refuse");
+    let half = resolve_pmp_exit_target(
+        &args(None, Some(PMP), None, Some(ORACLE_LIST_HASH)),
+        "oracle cancel-stake",
+    )
+    .expect_err("a half triple must refuse");
     assert!(half.to_string().contains("--event-id"), "{half}");
 
     let mut wrong_currency = raw();
     wrong_currency.token_type = 0;
-    let refused = resolve_pmp_exit_target(&wrong_currency, "oracle cancel-stake")
-        .expect_err("a non-SHELL token type must refuse on the raw route as it does on the manifest");
+    let refused = resolve_pmp_exit_target(&wrong_currency, "oracle cancel-stake").expect_err(
+        "a non-SHELL token type must refuse on the raw route as it does on the manifest",
+    );
     assert!(refused.to_string().contains("SHELL"), "{refused}");
 }

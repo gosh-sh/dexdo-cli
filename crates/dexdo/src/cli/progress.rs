@@ -35,35 +35,37 @@ use super::progress_plan::Plan;
 /// behind a poisoned lock is as usable as the data behind a healthy one, and taking it is not a
 /// papered-over bug.
 pub(super) fn lock(shared: &Mutex<Shared>) -> std::sync::MutexGuard<'_, Shared> {
-    shared.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+    shared
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
 }
 
-/// The status display of the command running on THIS thread, for code too far from it to be handed
-/// one.
+// The status display of the command running on THIS thread, for code too far from it to be handed
+// one.
 
-/// `note deploy` reaches the wallet funding wait through several modules, and that wait is the step
-/// that most needs to name itself -- it is not work, it is the client stopped until a transfer is
-/// confirmed in a phone. Threading a handle through every layer in between would put a display
-/// parameter on functions that have nothing to do with displaying anything.
+// `note deploy` reaches the wallet funding wait through several modules, and that wait is the step
+// that most needs to name itself -- it is not work, it is the client stopped until a transfer is
+// confirmed in a phone. Threading a handle through every layer in between would put a display
+// parameter on functions that have nothing to do with displaying anything.
 
-/// Per THREAD, and that is the whole of it. A command and every layer it reaches are one thread:
-/// `#[tokio::main]` drives the command's own future with `block_on`, which polls it on the thread
-/// that called it and never hands it to a worker to steal. One slot per process instead says
-/// something that is only true of a process running one command, and this one is not always that:
-/// the suite runs 872 commands' worth of code in threads of a single process, and there each
-/// display answered for whichever command registered last. Measured on the slot this replaces: 200
-/// runs of the suite at `--test-threads=64` failed 47 times in this module -- a command reading a
-/// display it had not built -- and the same 200 runs fail none once the slot is per thread.
+// Per THREAD, and that is the whole of it. A command and every layer it reaches are one thread:
+// `#[tokio::main]` drives the command's own future with `block_on`, which polls it on the thread
+// that called it and never hands it to a worker to steal. One slot per process instead says
+// something that is only true of a process running one command, and this one is not always that:
+// the suite runs 872 commands' worth of code in threads of a single process, and there each
+// display answered for whichever command registered last. Measured on the slot this replaces: 200
+// runs of the suite at `--test-threads=64` failed 47 times in this module -- a command reading a
+// display it had not built -- and the same 200 runs fail none once the slot is per thread.
 
-/// A `tokio::spawn`ed task runs on another thread and so has no display -- the same silence a
-/// command that never built one gets, rather than a claim on someone else's line. Nothing draws
-/// progress from a spawned task today: the buyer's renewal task is the only one that reaches code
-/// which can, and it calls it with `human_model: None`, which is the condition the stepping block
-/// is inside.
+// A `tokio::spawn`ed task runs on another thread and so has no display -- the same silence a
+// command that never built one gets, rather than a claim on someone else's line. Nothing draws
+// progress from a spawned task today: the buyer's renewal task is the only one that reaches code
+// which can, and it calls it with `human_model: None`, which is the condition the stepping block
+// is inside.
 
-/// Weak on purpose: this must never be what keeps a status line alive past its command. A command
-/// with no display -- every other command in the client -- leaves this empty, and [`step`] is then
-/// a no-op rather than a reason for callers to know whether a display exists.
+// Weak on purpose: this must never be what keeps a status line alive past its command. A command
+// with no display -- every other command in the client -- leaves this empty, and `step` is then
+// a no-op rather than a reason for callers to know whether a display exists.
 thread_local! {
     static CURRENT: RefCell<Option<Weak<Mutex<Shared>>>> = const { RefCell::new(None) };
 }
@@ -303,18 +305,6 @@ impl Status {
         }
     }
 
-    /// Keep one line on the screen and carry on: for a fact worth remembering after the command
-    /// ends, unlike a step, which is only worth seeing while it runs.
-    pub(crate) fn keep(&self, line: impl AsRef<str>) {
-        let mut guard = lock(&self.shared);
-        let text = if guard.colour {
-            format!("\x1b[32m\u{2714}\x1b[0m {}", line.as_ref())
-        } else {
-            line.as_ref().to_string()
-        };
-        guard.line(&text);
-    }
-
     /// Keep a caller-rendered line above the live status line without adding another glyph.
     pub(crate) fn keep_exact(&self, line: impl AsRef<str>) {
         lock(&self.shared).line(line.as_ref());
@@ -485,12 +475,18 @@ mod tests {
                 panic!("poison the status line");
             })
         };
-        assert!(poisoner.join().is_err(), "the helper thread must have panicked");
-        assert!(shared.is_poisoned(), "the lock must be poisoned for this to test anything");
+        assert!(
+            poisoner.join().is_err(),
+            "the helper thread must have panicked"
+        );
+        assert!(
+            shared.is_poisoned(),
+            "the lock must be poisoned for this to test anything"
+        );
 
         // Every production entry point, on a poisoned lock.
         status.step("second");
-        status.keep("kept");
+        status.keep_exact("kept");
         step("third");
         assert_eq!(lock(&shared).label, "third");
         drop(status);
@@ -522,7 +518,10 @@ mod tests {
         );
         step("funding Hot: confirm the transfer in the wallet");
         let guard = lock(&status.shared);
-        assert_eq!(guard.label, "funding Hot: confirm the transfer in the wallet");
+        assert_eq!(
+            guard.label,
+            "funding Hot: confirm the transfer in the wallet"
+        );
         drop(guard);
         drop(status);
         // Dropped: nothing left registered, and a later step is a no-op rather than a panic.

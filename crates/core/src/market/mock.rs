@@ -2242,16 +2242,12 @@ impl ChainBackend for MockChainBackend {
         // the deal's constructor-bound terms come first, because they are the ones that survive
         // the ask leaving the book. Falling back to a resting or consumed ask keeps every caller that
         // predates `deal_terms` reading exactly what it read before.
-        Ok(st
-            .deal_terms
-            .get(token_contract)
-            .copied()
-            .or_else(|| {
-                st.offers
-                    .get(token_contract)
-                    .or_else(|| st.matched_offers.get(token_contract))
-                    .map(|offer| (offer.price_per_tick, offer.max_ticks))
-            }))
+        Ok(st.deal_terms.get(token_contract).copied().or_else(|| {
+            st.offers
+                .get(token_contract)
+                .or_else(|| st.matched_offers.get(token_contract))
+                .map(|offer| (offer.price_per_tick, offer.max_ticks))
+        }))
     }
 
     async fn poll_seller_fills(
@@ -3373,16 +3369,21 @@ mod tests {
         let first_id = resting[0].order_id;
         assert_eq!(
             chain.token_contract_offer_latch(&tc).await.unwrap(),
-            Some(DealOfferLatch {
-                offer_posted: true,
-                }),
+            Some(DealOfferLatch { offer_posted: true }),
             "posting an ask sets the deal's own latch"
         );
 
         // A live order is refused, silently: this is not a back-door cancel.
-        chain.expire_resting_sell_order(&tc, first_id).await.unwrap();
+        chain
+            .expire_resting_sell_order(&tc, first_id)
+            .await
+            .unwrap();
         assert_eq!(
-            chain.raw_resting_sell_orders_for_tc(&tc).await.unwrap().len(),
+            chain
+                .raw_resting_sell_orders_for_tc(&tc)
+                .await
+                .unwrap()
+                .len(),
             1,
             "an ask whose deadline has not passed is not expirable by anyone"
         );
@@ -3397,12 +3398,19 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(
-            chain.raw_resting_sell_orders_for_tc(&tc).await.unwrap().len(),
+            chain
+                .raw_resting_sell_orders_for_tc(&tc)
+                .await
+                .unwrap()
+                .len(),
             1,
             "an id that is not this deal's resting ask removes nothing"
         );
 
-        chain.expire_resting_sell_order(&tc, first_id).await.unwrap();
+        chain
+            .expire_resting_sell_order(&tc, first_id)
+            .await
+            .unwrap();
         assert!(
             chain
                 .raw_resting_sell_orders_for_tc(&tc)
@@ -3415,7 +3423,7 @@ mod tests {
             chain.token_contract_offer_latch(&tc).await.unwrap(),
             Some(DealOfferLatch {
                 offer_posted: false,
-                }),
+            }),
             "the removal freed the deal's latch, which is what makes it re-listable"
         );
         assert_eq!(
@@ -3424,7 +3432,10 @@ mod tests {
             "getDeal is constructor-bound: the deal's capacity outlives the ask posted against it"
         );
 
-        chain.expire_resting_sell_order(&tc, first_id).await.unwrap();
+        chain
+            .expire_resting_sell_order(&tc, first_id)
+            .await
+            .unwrap();
         assert!(
             chain
                 .raw_resting_sell_orders_for_tc(&tc)

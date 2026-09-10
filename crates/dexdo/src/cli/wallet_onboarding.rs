@@ -57,7 +57,7 @@ mod live {
     /// the wrong scheme and fails as a bare `Send message` -- observed live on mainnet, with the
     /// request already prepared and durably stored. `wallet_validation_endpoint` normalised too
     /// late: only for validating an already-received Vault/Hot pair, never for the publish.
-    fn onboarding_endpoint(args: &WalletOnboardArgs) -> Result<String> {
+    fn onboarding_endpoint() -> Result<String> {
         // The manifest names it, and nothing else does: `--endpoint` used to rank above it and the
         // network's own default below it, and removed both.
 
@@ -77,8 +77,7 @@ mod live {
         // the file. The flag is gone and so is the divergence it created.
         let manifest = crate::cli::commands::manifest_path()?;
         let network = crate::cli::wallet::network_from_manifest()?;
-        let endpoint =
-            crate::cli::wallet::wallet_read_endpoint(Some(manifest.as_path()), network)?;
+        let endpoint = crate::cli::wallet::wallet_read_endpoint(Some(manifest.as_path()), network)?;
         let endpoint = endpoint.trim().to_string();
         if endpoint.is_empty() {
             bail!("the network names no endpoint to publish the onboarding request to");
@@ -181,7 +180,7 @@ mod live {
     ) -> Result<crate::cli::wallet::WalletBinding> {
         let params = WalletOnboardingParams::canonical();
         let limits = session_limits(params);
-        let endpoint = onboarding_endpoint(&args)?;
+        let endpoint = onboarding_endpoint()?;
 
         let (state_arg, hot_key_arg) = owner_only_paths(&args)?;
         let state_path = resolve_private_file_path(&state_arg, "wallet onboarding state")?;
@@ -303,9 +302,7 @@ mod live {
                     // value completion used to discard, and reading it here is what proves it
                     // survived.
                     return Ok(binding_of(
-                        crate::cli::wallet::WalletNetwork::from_manifest_label(
-                            &validated.network,
-                        )?,
+                        crate::cli::wallet::WalletNetwork::from_manifest_label(&validated.network)?,
                         binding_id,
                         &validated,
                         &hot_key_arg,
@@ -507,7 +504,8 @@ mod live {
         // request that cannot be reproduced without scanning a new QR.
         let stored = dexdo_core::normalize_endpoint(&session.endpoint)
             .unwrap_or_else(|_| session.endpoint.clone());
-        let given = dexdo_core::normalize_endpoint(endpoint).unwrap_or_else(|_| endpoint.to_string());
+        let given =
+            dexdo_core::normalize_endpoint(endpoint).unwrap_or_else(|_| endpoint.to_string());
         if stored != given {
             bail!("--endpoint does not match durable onboarding state");
         }
@@ -616,7 +614,9 @@ mod live {
         crate::cli::qr_display::write_qr(output, &scannable)
             .context("render the bee connection QR code")?;
         writeln!(output, "waiting for the wallet's signed hello...")?;
-        output.flush().context("flush wallet onboarding invitation")?;
+        output
+            .flush()
+            .context("flush wallet onboarding invitation")?;
         Ok(())
     }
 
@@ -855,7 +855,9 @@ mod live {
             .with_context(|| format!("read {role} wallet {display} getParameters"))?
             .ok_or_else(|| anyhow!("{role} wallet {display} getParameters returned no output"))?;
         let txn_confirms = required_u8(&parameters, "requiredTxnConfirms").ok_or_else(|| {
-            anyhow!("{role} wallet {display} getParameters has invalid or missing requiredTxnConfirms")
+            anyhow!(
+                "{role} wallet {display} getParameters has invalid or missing requiredTxnConfirms"
+            )
         })?;
         if txn_confirms != shape.required_txn_confirms {
             bail!(
@@ -1114,10 +1116,7 @@ mod live {
             assert_eq!(validated.vault_scoped_address, response.vault.canonical);
             let command = note_deploy_handoff_command(&validated, Path::new("hot.key"));
             assert!(
-                command.contains(&format!(
-                    "--multisig-address {}",
-                    response.hot.canonical
-                )),
+                command.contains(&format!("--multisig-address {}", response.hot.canonical)),
                 "{command}"
             );
             assert!(
@@ -1322,11 +1321,16 @@ mod live {
             print_invitation(deep_link, None, false, true, &mut output).unwrap();
 
             let code = crate::cli::qr_compact::smallest_code(deep_link.as_bytes()).unwrap();
-            let (columns, rows) = crate::cli::qr_compact::size_in_cells(&code);
+            let quiet_zone = 2;
+            let columns = code.width() + 2 * quiet_zone;
+            let rows = columns.div_ceil(2);
             let output = String::from_utf8(output).unwrap();
             let drawn: Vec<&str> = output
                 .lines()
-                .filter(|line| line.chars().all(|c| c == ' ' || ('\u{2580}'..='\u{259F}').contains(&c)))
+                .filter(|line| {
+                    line.chars()
+                        .all(|c| c == ' ' || ('\u{2580}'..='\u{259F}').contains(&c))
+                })
                 .collect();
             assert_eq!(drawn.len(), rows, "{output}");
             for line in drawn {

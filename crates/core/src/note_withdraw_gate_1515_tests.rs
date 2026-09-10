@@ -125,7 +125,10 @@ fn each_of_the_eleven_gates_is_named_when_it_is_the_one_holding() {
 
         // The line the operator actually reads names the field, not just the enum.
         let line = withdraw_gate_line(&NoteWithdrawGate::Held(gate.clone()));
-        assert!(line.contains(field), "{field}: the line does not name it: {line}");
+        assert!(
+            line.contains(field),
+            "{field}: the line does not name it: {line}"
+        );
         assert!(
             line.contains(&gate.exit_code().to_string()),
             "{field}: the line does not carry the exit code the operator saw: {line}"
@@ -157,8 +160,14 @@ fn every_gate_reports_the_exit_code_its_require_raises() {
         .exit_code(),
         144
     );
-    assert_eq!(WithdrawGate::PendingPlaceBuyLock { raw: 1 }.exit_code(), 144);
-    assert_eq!(WithdrawGate::PendingBatchBuyLock { raw: 1 }.exit_code(), 144);
+    assert_eq!(
+        WithdrawGate::PendingPlaceBuyLock { raw: 1 }.exit_code(),
+        144
+    );
+    assert_eq!(
+        WithdrawGate::PendingBatchBuyLock { raw: 1 }.exit_code(),
+        144
+    );
     assert_eq!(WithdrawGate::OpenOrders { count: 1 }.exit_code(), 167);
     assert_eq!(WithdrawGate::RestingInference { count: 1 }.exit_code(), 167);
     assert_eq!(WithdrawGate::PendingInference { count: 1 }.exit_code(), 167);
@@ -177,7 +186,10 @@ fn the_note_that_read_not_busy_and_refused_121_is_named_as_stakes() {
         "0x7cefd55652469dd381746e792d7781fef69f5d8ea458c80bf6eaf782c2ff8fa9": { "tokenType": 2 }
     });
     let reading = note_withdraw_gate_from_storage(&fields);
-    assert_eq!(reading, NoteWithdrawGate::Held(WithdrawGate::Stakes { count: 1 }));
+    assert_eq!(
+        reading,
+        NoteWithdrawGate::Held(WithdrawGate::Stakes { count: 1 })
+    );
     let line = withdraw_gate_line(&reading);
     assert!(line.contains("_stakes"), "{line}");
     assert!(line.contains("121"), "{line}");
@@ -299,10 +311,15 @@ fn hex_rendered_integers_are_read_as_numbers() {
 fn every_gate_names_something_to_do_or_says_there_is_nothing() {
     let gates = [
         WithdrawGate::HasWithdrawn,
-        WithdrawGate::Busy { with: "0:1".to_string() },
+        WithdrawGate::Busy {
+            with: "0:1".to_string(),
+        },
         WithdrawGate::Stakes { count: 1 },
         WithdrawGate::Debt { raw: 1 },
-        WithdrawGate::LockedInOrders { token_type: 2, locked: 1 },
+        WithdrawGate::LockedInOrders {
+            token_type: 2,
+            locked: 1,
+        },
         WithdrawGate::PendingPlaceBuyLock { raw: 1 },
         WithdrawGate::PendingBatchBuyLock { raw: 1 },
         WithdrawGate::OpenOrders { count: 1 },
@@ -318,7 +335,11 @@ fn every_gate_names_something_to_do_or_says_there_is_nothing() {
             || step.contains("re-read before acting")
             || step.contains("resolve that counterparty")
             || step.contains("must be settled");
-        assert!(actionable, "{}: next step is not actionable: {step}", gate.field());
+        assert!(
+            actionable,
+            "{}: next step is not actionable: {step}",
+            gate.field()
+        );
     }
 }
 
@@ -354,10 +375,15 @@ fn the_line_points_at_the_require_in_the_contract() {
 fn the_gate_exit_code_set_matches_the_gates_in_both_directions() {
     let gates = [
         WithdrawGate::HasWithdrawn,
-        WithdrawGate::Busy { with: "0:1".to_string() },
+        WithdrawGate::Busy {
+            with: "0:1".to_string(),
+        },
         WithdrawGate::Stakes { count: 1 },
         WithdrawGate::Debt { raw: 1 },
-        WithdrawGate::LockedInOrders { token_type: 2, locked: 1 },
+        WithdrawGate::LockedInOrders {
+            token_type: 2,
+            locked: 1,
+        },
         WithdrawGate::PendingPlaceBuyLock { raw: 1 },
         WithdrawGate::PendingBatchBuyLock { raw: 1 },
         WithdrawGate::OpenOrders { count: 1 },
@@ -386,7 +412,8 @@ fn the_gate_exit_code_set_matches_the_gates_in_both_directions() {
 #[test]
 fn only_a_refusal_a_gate_can_explain_is_worth_reading_state_for() {
     for code in WITHDRAW_GATE_EXIT_CODES {
-        let text = format!("on-chain submit failed: exit_code={code} (dex::SOMETHING) stage=compute");
+        let text =
+            format!("on-chain submit failed: exit_code={code} (dex::SOMETHING) stage=compute");
         assert!(
             refusal_carries_a_withdraw_gate_code(&text),
             "{code} is a gate code and was not recognised"
@@ -423,7 +450,10 @@ fn a_clear_reading_does_not_promise_that_the_withdrawal_succeeds() {
     let line = withdraw_gate_line(&NoteWithdrawGate::Clear);
     // It says what it measured, and how many.
     assert!(line.contains("STATE gates"), "{line}");
-    assert!(line.contains(&WITHDRAW_GATE_FIELDS.len().to_string()), "{line}");
+    assert!(
+        line.contains(&WITHDRAW_GATE_FIELDS.len().to_string()),
+        "{line}"
+    );
     // It names what it did NOT measure, rather than leaving the reader to assume it was
     // everything -- and it names BOTH halves, because "gas" alone still leaves amounts unstated.
     assert!(line.contains("gas"), "{line}");

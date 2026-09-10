@@ -4,7 +4,7 @@
 
 use crate::buyer::api::stream::{CanonStreamDriver, CanonStreamNext};
 use crate::buyer::api::{
-    cap_canon_to_grant, handle_stream_error_policy, is_capacity_backpressure,
+    accounted_tokens, cap_canon_to_grant, handle_stream_error_policy, is_capacity_backpressure,
     report_request_delivery, ApiDeal, ApiState, ConsumerRequestGuard, DeadGatewayAction,
     DealInitError, DeliveryEvents, RequestDelivery, RouteBudget, StreamErrorPolicyAction,
 };
@@ -14,7 +14,7 @@ use axum::response::sse::{Event, Sse};
 use axum::response::{IntoResponse, Response};
 use axum::Json;
 use dexdo_core::params::BUYER_UPSTREAM_OPEN_RETRIES;
-use dexdo_proto::CanonChunk;
+use dexdo_proto::{BillingUsage, CanonChunk};
 use futures::Stream;
 use http::StatusCode;
 use std::convert::Infallible;
@@ -52,17 +52,21 @@ pub async fn chat_completions(
     if deal.session.is_closed() {
         return reject(StatusCode::GONE, "deal session closed; open a new session");
     }
-    if let Err(reason) = deal.session.ensure_open_for_serving().await {
-        return reject(StatusCode::BAD_GATEWAY, &reason);
-    }
+    let serving_state = match deal.session.ensure_open_for_serving().await {
+        Ok(state) => state,
+        Err(reason) => return reject(StatusCode::BAD_GATEWAY, &reason),
+    };
     let stream = req.stream;
     let requested_max_tokens = req.max_tokens;
-    // admission RESERVES this request's output cap out of the route's remaining tokens before
-    // the model is contacted, so two concurrent requests can never be handed the same remainder. For a
+    // admission reserves the route's entire free billable remainder before the model is
+    // contacted, so two concurrent requests can never share an unknown provider-native input bill. For a
     // subscription it first books any due week boundary through the permissionless path and recomputes
     // from the coherent state that comes back -- an under-used week is never carried across it, and a
     // finished term is never served from a stale positive remainder.
-    match deal.admit(requested_max_tokens).await {
+    match deal
+        .admit_with_probe_observation(requested_max_tokens, serving_state.probe_accepted)
+        .await
+    {
         RouteBudget::Admitted(reservation) => {
             request_guard.hold(reservation);
         }
@@ -73,9 +77,9 @@ pub async fn chat_completions(
     // NAME while serving a cheaper model is caught only here. On a bail the gate closes the deal and attempts
     // policy recovery; a transport error is not cached, so a later request retries.
 
-    // this runs AFTER admission and inside the reservation it granted. Verification is paid
-    // output on this deal - the seller serves it and claims it like any other - so a request with no
-    // quota must not reach it, and the tokens it does consume come out of the same grant as the
+    // this runs after admission and inside the reservation it granted. Verification is
+    // billable service on this deal - the seller serves it and claims its terminal input+output total
+    // like any other request - so a request with no quota must not reach it, and its total comes out of the same grant as the
     // answer. Anything else lets an exhausted week keep buying probes.
     let verdict = deal
         .content_gate
@@ -87,8 +91,8 @@ pub async fn chat_completions(
             &format!("model identity verification failed (content check): {reason}"),
         );
     }
-    let max_tokens = request_guard.remaining_grant();
-    if max_tokens == 0 {
+    let billing_grant_tokens = request_guard.remaining_grant();
+    if billing_grant_tokens == 0 {
         return reject(
             StatusCode::SERVICE_UNAVAILABLE,
             "the identity verification this deal owed consumed the whole admitted grant; the \
@@ -98,7 +102,7 @@ pub async fn chat_completions(
     let mut canon = render::openai_to_canon(req);
     // the grant may still hold what verification did not spend. The answer is bounded by what
     // was actually asked for, on the wire and on the way back alike.
-    let max_tokens = cap_canon_to_grant(&mut canon, max_tokens);
+    let max_tokens = cap_canon_to_grant(&mut canon, billing_grant_tokens);
     let id = completion_id();
     let model = state.frame_model.clone();
     let created = now_secs();
@@ -119,6 +123,7 @@ pub async fn chat_completions(
                 &deal.route.handover,
                 &deal.route.token_contract,
                 canon.clone(),
+                billing_grant_tokens,
             )
             .await
         {
@@ -144,8 +149,8 @@ pub async fn chat_completions(
                 return reject(
                     StatusCode::TOO_MANY_REQUESTS,
                     &format!(
-                        "the deal has no delivery capacity for this request yet; retry once the \
-                         trial tick has been accepted: {error}"
+                        "the deal has no delivery capacity for this request yet; retry after seller \
+                         capacity reconciliation: {error}"
                     ),
                 );
             }
@@ -182,6 +187,7 @@ pub async fn chat_completions(
     // request and is settled once at session end (graceful shutdown) or on a verification-bail. The handler
     // settles the shared session ONLY on a bail (the seller cheated -> end the session, bail off B3/B10).
     let delivery_events = state.delivery_events.clone();
+    let mock_model = state.mock_model;
     if stream {
         sse_response(
             upstream,
@@ -189,6 +195,8 @@ pub async fn chat_completions(
             model,
             created,
             max_tokens,
+            billing_grant_tokens,
+            mock_model,
             deal,
             request_guard,
             delivery_events,
@@ -201,6 +209,8 @@ pub async fn chat_completions(
             model,
             created,
             max_tokens,
+            billing_grant_tokens,
+            mock_model,
             deal,
             request_guard,
             delivery_events,
@@ -211,8 +221,9 @@ pub async fn chat_completions(
 }
 
 /// Re-render the canonical stream to OpenAI-SSE (B19, R6): `chat.completion.chunk` deltas ->
-/// terminal chunk with `finish_reason` -> `data: [DONE]`. Accounting/verification happen before
-/// re-rendering.
+/// terminal chunk with `finish_reason` -> `data: [DONE]`. Canonical verification and the visible
+/// output cap happen before re-rendering; monetary accounting waits for validated terminal usage
+/// and clean EOF.
 #[allow(clippy::too_many_arguments)]
 fn sse_response(
     upstream: tonic::Streaming<CanonChunk>,
@@ -220,6 +231,8 @@ fn sse_response(
     model: String,
     created: u64,
     max_tokens: u64,
+    billing_grant_tokens: u64,
+    mock_model: bool,
     deal: ApiDeal,
     mut request_guard: ConsumerRequestGuard,
     delivery_events: Option<DeliveryEvents>,
@@ -230,13 +243,20 @@ fn sse_response(
             deal.session.closed_receiver(),
             model.clone(),
             max_tokens,
+            billing_grant_tokens,
+            mock_model,
         );
         let mut first = true;
         let mut capped = false;
         let mut stream_error = None;
+        let mut billing_usage: Option<BillingUsage> = None;
         loop {
             let chunk = match driver.next().await {
                 CanonStreamNext::Chunk(c) => c,
+                CanonStreamNext::Usage(usage) => {
+                    billing_usage = Some(usage);
+                    continue;
+                }
                 // upstream transport error -- do NOT pass it off as a clean stop (see finish_reason below).
                 CanonStreamNext::Errored(e) => {
                     stream_error = Some(e);
@@ -244,31 +264,25 @@ fn sse_response(
                 }
                 CanonStreamNext::Bailed | CanonStreamNext::End => break,
             };
-            // the grant is a HARD cap. A chunk that does not fit inside what is left of it
-            // is never rendered - the consumer may not be shown tokens no reservation covers.
-            // Stopping here is the REQUEST hitting its own cap, not the seller failing.
+            // exact token IDs are capped before rendering. Provider text fragments
+            // are transport units, so their output-only cap is checked against terminal usage.
             if !driver.admits(&chunk) {
                 capped = true;
                 break;
             }
-            // account BEFORE the bytes leave. A consumer that disconnects immediately after
-            // an event drops this request's guard, and a reservation released after exposure hands
-            // back quota for output the seller has already served. Nothing is exposed before it is
-            // paid for - the same rule as the chunk cap above, on the abnormal path too.
-            let before = driver.received();
-            let reached_cap = driver.account_rendered(&chunk);
-            if let Err(error) =
-                request_guard.record_delivered(&deal, driver.received().saturating_sub(before))
-            {
+            // Track the visible output lower bound before its bytes leave so an immediate consumer
+            // disconnect cannot erase evidence of what was rendered. This is not a monetary update:
+            // the held billing reservation commits only after validated terminal usage and clean EOF.
+            if let Err(error) = deal.record_visible_output(accounted_tokens(&chunk)) {
                 stream_error = Some(error.into());
                 break;
             }
+            let before = driver.received();
+            driver.account_rendered(&chunk);
+            debug_assert!(driver.received() >= before);
             if !chunk.text.is_empty() {
                 yield Ok(openai_content_event(&deal, &id, &model, created, &chunk.text, first));
                 first = false;
-            }
-            if reached_cap {
-                break; // request/deal token budget reached
             }
         }
         // Session-scoped: completion / max_tokens / upstream-error do NOT STOP -- the deal lives for
@@ -276,7 +290,15 @@ fn sse_response(
         // (the seller cheated -> STOP this deal + bail off, B3/B10). `errored` still drives the finish_reason below.
         let bailed = driver.bailed();
         let received = driver.received();
+        let rendered_tokens = driver.legacy_received();
         drop(driver);
+        if !bailed && stream_error.is_none() {
+            if let Some(usage) = billing_usage.as_ref() {
+                if let Err(error) = request_guard.record_billing(&deal, usage.total_tokens) {
+                    stream_error = Some(error.into());
+                }
+            }
+        }
         if bailed {
             deal.session.settle_verification_bail("verify-bail").await;
         } else if let Some(e) = &stream_error {
@@ -294,6 +316,11 @@ fn sse_response(
         } else {
             request_guard.complete();
         }
+        let accepted_usage = if stream_error.is_none() && !bailed {
+            billing_usage.as_ref()
+        } else {
+            None
+        };
         // the terminal chunk does NOT pass off a bail or an upstream error as a clean
         // `stop` -- bail -> `content_filter`, capacity refusal -> `capacity`, other transport error ->
         // `error`, otherwise an honest `stop`.
@@ -320,12 +347,18 @@ fn sse_response(
                 token_contract: deal.route.token_contract.clone(),
                 protocol: "openai",
                 streamed: true,
-                grant_tokens: max_tokens,
-                rendered_tokens: received,
-                route_delivered_tokens: deal.session.route_delivered_tokens(),
+                billing_grant_tokens,
+                output_limit_tokens: max_tokens,
+                visible_output_tokens: received,
+                rendered_tokens,
+                route_delivered_tokens: Some(deal.route_visible_output_tokens()),
+                input_tokens: accepted_usage.map(|usage| usage.input_tokens),
+                output_tokens: accepted_usage.map(|usage| usage.output_tokens),
+                billable_tokens: accepted_usage.map(|usage| usage.total_tokens),
+                route_billable_tokens: deal.session.route_billable_tokens(),
                 finish_reason,
-                truncated_by_grant: capped,
-                ended_before_grant: received < max_tokens,
+                truncated_by_output_limit: capped,
+                ended_before_output_limit: received < max_tokens,
             },
         );
         yield Ok(Event::default().data(render::openai_final_chunk(&id, &model, created, finish_reason)));
@@ -361,6 +394,8 @@ async fn aggregate_response(
     model: String,
     created: u64,
     max_tokens: u64,
+    billing_grant_tokens: u64,
+    mock_model: bool,
     deal: ApiDeal,
     mut request_guard: ConsumerRequestGuard,
     delivery_events: Option<DeliveryEvents>,
@@ -372,46 +407,61 @@ async fn aggregate_response(
         deal.session.closed_receiver(),
         model.clone(),
         max_tokens,
+        billing_grant_tokens,
+        mock_model,
     );
     let mut stream_error = None;
+    let mut billing_usage: Option<BillingUsage> = None;
     loop {
         let chunk = match driver.next().await {
             CanonStreamNext::Chunk(c) => c,
+            CanonStreamNext::Usage(usage) => {
+                billing_usage = Some(usage);
+                continue;
+            }
             CanonStreamNext::Errored(e) => {
                 stream_error = Some(e);
                 break;
             }
             CanonStreamNext::Bailed | CanonStreamNext::End => break,
         };
-        // the grant is a HARD cap. A chunk that does not fit inside what is left of it
-        // is never rendered - the consumer may not be shown tokens no reservation covers.
+        // the output limit is a HARD cap. A chunk that does not fit inside what is
+        // left of it is never rendered, independently of the larger total billing grant.
         // Stopping here is the REQUEST hitting its own cap, not the seller failing: it must not be
         // mistaken for an empty stream, which is a settlement action against the counterparty.
         if !driver.admits(&chunk) {
             capped = true;
             break;
         }
-        // account BEFORE the text joins the answer. The seller has served these tokens
-        // whether or not this request ever returns them, so a dropped future must not release the
-        // reservation that covers them.
-        let before = driver.received();
-        let reached_cap = driver.account_rendered(&chunk);
-        if let Err(error) =
-            request_guard.record_delivered(&deal, driver.received().saturating_sub(before))
-        {
+        // Track the visible output lower bound before it joins the answer. Money still waits for a
+        // validated terminal input-plus-output record and clean EOF.
+        if let Err(error) = deal.record_visible_output(accounted_tokens(&chunk)) {
             stream_error = Some(error.into());
             break;
         }
+        let before = driver.received();
+        driver.account_rendered(&chunk);
+        debug_assert!(driver.received() >= before);
         content.push_str(&chunk.text);
-        if reached_cap {
-            break;
-        }
     }
     // Session-scoped: a clean completion / max_tokens does NOT STOP -- the deal lives for the next
     // request. ONLY a verification-bail ends the session early (STOP + bail off, B3/B10).
     let bailed = driver.bailed();
     let received = driver.received();
+    let rendered_tokens = driver.legacy_received();
     drop(driver);
+    if !bailed && stream_error.is_none() {
+        if let Some(usage) = billing_usage.as_ref() {
+            if let Err(error) = request_guard.record_billing(&deal, usage.total_tokens) {
+                stream_error = Some(error.into());
+            }
+        }
+    }
+    let accepted_usage = if stream_error.is_none() && !bailed {
+        billing_usage.as_ref()
+    } else {
+        None
+    };
     // every terminal below records the same three figures, including the two that answer 502.
     // A request that failed after paying for output is exactly the one worth being able to attribute.
     let report = |finish_reason: &'static str| {
@@ -421,12 +471,18 @@ async fn aggregate_response(
                 token_contract: deal.route.token_contract.clone(),
                 protocol: "openai",
                 streamed: false,
-                grant_tokens: max_tokens,
-                rendered_tokens: received,
-                route_delivered_tokens: deal.session.route_delivered_tokens(),
+                billing_grant_tokens,
+                output_limit_tokens: max_tokens,
+                visible_output_tokens: received,
+                rendered_tokens,
+                route_delivered_tokens: Some(deal.route_visible_output_tokens()),
+                input_tokens: accepted_usage.map(|usage| usage.input_tokens),
+                output_tokens: accepted_usage.map(|usage| usage.output_tokens),
+                billable_tokens: accepted_usage.map(|usage| usage.total_tokens),
+                route_billable_tokens: deal.session.route_billable_tokens(),
                 finish_reason,
-                truncated_by_grant: capped,
-                ended_before_grant: received < max_tokens,
+                truncated_by_output_limit: capped,
+                ended_before_output_limit: received < max_tokens,
             },
         );
     };

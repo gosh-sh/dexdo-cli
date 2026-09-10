@@ -2,17 +2,16 @@
 
 use crate::cli::args::{DestroyArgs, MarketDeployArgs, ProvisionArgs};
 use crate::cli::commands::{
-    enforce_model_registry_policy, enforce_model_registry_policy_with_endpoint,
-    load_enabled_model_registry_policy, order_book_active,
-    preload_default_model_registry_with_endpoint, preload_model_registry_policy,
+    chain_doctor_preflight, enforce_model_registry_policy,
+    enforce_model_registry_policy_with_endpoint, load_enabled_model_registry_policy,
+    order_book_active, preload_default_model_registry_with_endpoint, preload_model_registry_policy,
     preload_model_registry_policy_with_endpoint, resolve_model_registry_target,
-    resolve_model_registry_target_with_endpoint, resolve_registry_content_identity,
-    chain_doctor_preflight, BookTarget,
+    resolve_model_registry_target_with_endpoint, resolve_registry_content_identity, BookTarget,
 };
 use crate::cli::policy;
 use crate::cli::support::{
     default_deposit_shells, deposit_per_deploy, deposit_per_deploy_with_overhead,
-    ensure_provision_deposit_covered, prompt_deposit_shells, read_secret_hex, require_model_name,
+    ensure_provision_deposit_covered, prompt_deposit_shells, require_model_name,
     require_provision_nonce, resolve_market_fields, validate_price_step, SHELL_UNIT,
 };
 use anyhow::Result;
@@ -394,12 +393,7 @@ pub(crate) async fn run_provision_with_deal_gas_overhead(
         None,
     )
     .await?;
-    crate::cli::commands::chain_doctor_preflight_with_endpoint(
-        &manifest_path,
-        None,
-        None,
-    )
-    .await?;
+    crate::cli::commands::chain_doctor_preflight_with_endpoint(&manifest_path, None, None).await?;
     // ASK THE BUYER'S QUESTION, HERE, BEFORE ANYTHING IS SPENT.
 
     // Everything below this line costs money -- the order book, the RootModel and the per-deal
@@ -469,10 +463,12 @@ pub(crate) async fn run_provision_with_deal_gas_overhead(
             policy,
             &manifest_path,
             None,
-            &frame_model,
-            &expected_order_book,
-            order_book_active,
-            BuyerMissingBookPolicy::Reject,
+            crate::cli::commands::RegistryBookExpectation {
+                frame_model: &frame_model,
+                expected_order_book: &expected_order_book,
+                order_book_active,
+                buyer_missing_book_policy: BuyerMissingBookPolicy::Reject,
+            },
         )
         .await?;
     }
@@ -774,10 +770,7 @@ mod tests {
             Ok("Qwen3.8-27B".to_string()),
         )
         .expect_err("the opt-out is about an unconfirmed model, not about a misspelled one");
-        assert!(
-            format!("{error:#}").contains("Qwen3.8-27B"),
-            "{error:#}"
-        );
+        assert!(format!("{error:#}").contains("Qwen3.8-27B"), "{error:#}");
     }
 
     /// The exact registered spelling passes through untouched, and is what comes back.
@@ -1044,8 +1037,6 @@ mod tests {
     }
 }
 
-
-
 /// `dexdo deploy-market`: deploy the per-model `InferenceOrderBook` (the shared market for a model) if it is
 /// not yet on-chain -- note-funded, the explicit "list this model" step a seller runs before posting
 /// offers. The book address is deterministic from `model_hash`, so this is idempotent (already-deployed ->
@@ -1213,7 +1204,6 @@ pub(crate) async fn run_market_deploy(args: MarketDeployArgs) -> Result<()> {
     Ok(())
 }
 
-
 /// `deploy-market` names the note the way its own refusal says it does.
 
 /// What it reads is `include_str!` of this source, so it needs nothing from the build configuration beyond
@@ -1378,16 +1368,15 @@ mod deploy_market_note_identity_1784_tests {
         let gate = body
             .find("ensure_model_resolves(")
             .expect("deploy-market must resolve the model name the way a buyer would");
-        for spend in ["deploy_inference_orderbook("] {
-            let at = body
-                .find(spend)
-                .unwrap_or_else(|| panic!("run_market_deploy still calls {spend}"));
-            assert!(
-                gate < at,
-                "`{spend}` runs at {at} and the registry resolution only at {gate}: a book would be \
-                 paid for before anyone asked whether a buyer could resolve its name"
-            );
-        }
+        let spend = "deploy_inference_orderbook(";
+        let at = body
+            .find(spend)
+            .unwrap_or_else(|| panic!("run_market_deploy still calls {spend}"));
+        assert!(
+            gate < at,
+            "`{spend}` runs at {at} and the registry resolution only at {gate}: a book would be \
+             paid for before anyone asked whether a buyer could resolve its name"
+        );
     }
 
     /// One command's body: from its signature to the next top-level item.
@@ -1547,7 +1536,6 @@ async fn run_destroy_with_chain(args: DestroyArgs, chain: &dyn DestroyChain) -> 
     Ok(())
 }
 
-
 #[cfg(test)]
 mod destroy_tests {
     use super::{run_destroy_with_chain, DestroyChain};
@@ -1606,7 +1594,7 @@ mod destroy_tests {
             &self,
             _tc: &dexdo_core::Address,
         ) -> Result<Option<dexdo_core::DealChainState>> {
-            Ok(self.state.clone())
+            Ok(self.state)
         }
 
         async fn destroy(

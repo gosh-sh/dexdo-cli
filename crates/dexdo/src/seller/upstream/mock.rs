@@ -2,15 +2,15 @@
 //! . A standard debug mode in production code, not a
 //! `#[cfg(test)]` crutch. Retained even after the real upstream appears.
 
-use super::{chunk_with_structured_accounting, UpstreamEvent};
-use dexdo_proto::{CanonChunk, CanonRequest, SignalManifest};
+use super::UpstreamEvent;
+use dexdo_proto::{BillingUsage, CanonChunk, CanonRequest, SignalManifest};
 use tokio::sync::mpsc;
 use tonic::Status;
 
 /// Run the mock upstream: build up to `count` deterministic fake tokens **from the prompt**
-/// of the canonical request (R1) and send them incrementally into `tx` (R6, token-by-token). Each mock
-/// chunk carries one fake token id, so gateway accounting sees one delivered token. Both sides know the tokens are fake (`--mock-model` on
-/// both,). When there is no request -- neutral `mock-token-*`.
+/// of the canonical request (R1) and send them incrementally into `tx` (R6, token-by-token), followed
+/// by the same terminal input/output/total record used by real adapters. Both sides know the tokens
+/// are fake. When there is no request -- neutral `mock-token-*`.
 /// Token ids per chunk in the `DEXDO_FIXTURE_FATCHUNK` fixture.
 pub const FAT_CHUNK_TOKENS: u32 = 4;
 
@@ -68,6 +68,14 @@ pub async fn run(
             *first = format!("limit={count} ");
         }
     }
+    let input_tokens = match mock_input_tokens(req) {
+        Ok(tokens) => tokens,
+        Err(error) => {
+            let _ = tx.send(Err(Status::data_loss(error))).await;
+            return;
+        }
+    };
+    let mut output_tokens = 0u64;
     for (seq, text) in tokens.into_iter().enumerate() {
         let chunk = CanonChunk {
             text,
@@ -116,44 +124,54 @@ pub async fn run(
                     }
                 }
             }),
+            usage: None,
         };
-        if fat_chunk || straddle {
-            let accounted_tokens = match u64::try_from(chunk.token_ids.len()) {
-                Ok(tokens) => tokens,
-                Err(_) => {
-                    let _ = tx
-                        .send(Err(Status::data_loss("token-id count does not fit u64")))
-                        .await;
-                    break;
-                }
-            };
-            if tx
-                .send(Ok(UpstreamEvent::Chunk {
-                    chunk,
-                    accounted_tokens: 0,
-                }))
-                .await
-                .is_err()
-            {
-                break;
+        let chunk_tokens = match u64::try_from(chunk.token_ids.len()) {
+            Ok(tokens) => tokens,
+            Err(_) => {
+                let _ = tx
+                    .send(Err(Status::data_loss(
+                        "mock token-id count does not fit u64",
+                    )))
+                    .await;
+                return;
             }
-            if tx
-                .send(Ok(UpstreamEvent::Accounted(accounted_tokens)))
-                .await
-                .is_err()
-            {
-                break;
+        };
+        output_tokens = match output_tokens.checked_add(chunk_tokens) {
+            Some(tokens) => tokens,
+            None => {
+                let _ = tx
+                    .send(Err(Status::data_loss(
+                        "mock output-token total overflows u64",
+                    )))
+                    .await;
+                return;
             }
-            continue;
-        }
-        if tx
-            .send(chunk_with_structured_accounting(chunk))
-            .await
-            .is_err()
-        {
-            break; // buyer disconnected (STOP)
+        };
+        if tx.send(Ok(UpstreamEvent::Chunk(chunk))).await.is_err() {
+            return; // buyer disconnected before terminal usage
         }
     }
+    let usage = match BillingUsage::new(input_tokens, output_tokens, None) {
+        Ok(usage) => usage,
+        Err(error) => {
+            let _ = tx.send(Err(Status::data_loss(error))).await;
+            return;
+        }
+    };
+    let _ = tx.send(Ok(UpstreamEvent::Usage(usage))).await;
+}
+
+fn mock_input_tokens(req: Option<&CanonRequest>) -> Result<u64, &'static str> {
+    req.into_iter()
+        .flat_map(|request| &request.messages)
+        .try_fold(0u64, |total, message| {
+            let count = u64::try_from(message.content.split_whitespace().count())
+                .map_err(|_| "mock input-token count does not fit u64")?;
+            total
+                .checked_add(count)
+                .ok_or("mock input-token total overflows u64")
+        })
 }
 
 /// The last `user`-role message in the canonical request (the prompt the output is built from).
@@ -202,15 +220,11 @@ mod tests {
         let (tx, mut rx) = mpsc::channel(16);
         run(8, Some(&req), tx, false, None).await;
         let mut chunks = Vec::new();
-        let mut accounted = 0;
+        let mut usage = None;
         while let Some(item) = rx.recv().await {
-            if let UpstreamEvent::Chunk {
-                chunk,
-                accounted_tokens,
-            } = item.unwrap()
-            {
-                accounted += accounted_tokens;
-                chunks.push(chunk);
+            match item.unwrap() {
+                UpstreamEvent::Chunk(chunk) => chunks.push(chunk),
+                UpstreamEvent::Usage(record) => usage = Some(record),
             }
         }
         // seq monotonic from 0; marker + echo of the prompt words.
@@ -219,9 +233,43 @@ mod tests {
         assert!(text.contains("mock-reply"));
         assert!(text.contains("ping") && text.contains("pong"));
         assert_eq!(
-            accounted, 8,
-            "mock billing is exactly the emitted fake token-id count"
+            usage,
+            Some(BillingUsage::new(2, 8, None).unwrap()),
+            "mock bills all message input plus the exact emitted fake token-id count"
         );
+    }
+
+    #[tokio::test]
+    async fn mock_counts_all_message_content_and_keeps_output_cap_independent() {
+        let req = CanonRequest {
+            messages: vec![
+                ChatMessage {
+                    role: "system".into(),
+                    content: "one two three".into(),
+                },
+                ChatMessage {
+                    role: "assistant".into(),
+                    content: String::new(),
+                },
+                ChatMessage {
+                    role: "user".into(),
+                    content: "four five".into(),
+                },
+            ],
+            params: None,
+        };
+        let (tx, mut rx) = mpsc::channel(8);
+        run(2, Some(&req), tx, false, None).await;
+        let mut chunks = 0;
+        let mut usage = None;
+        while let Some(event) = rx.recv().await {
+            match event.unwrap() {
+                UpstreamEvent::Chunk(_) => chunks += 1,
+                UpstreamEvent::Usage(record) => usage = Some(record),
+            }
+        }
+        assert_eq!(chunks, 2, "output alone is capped");
+        assert_eq!(usage, Some(BillingUsage::new(5, 2, None).unwrap()));
     }
 
     #[test]

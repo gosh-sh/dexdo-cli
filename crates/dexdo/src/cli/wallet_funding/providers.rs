@@ -431,15 +431,14 @@ impl<C: VaultChain> HotFundingProvider for AckinackiVaultProvider<C> {
         let submitted = history
             .iter()
             .filter(|event| event.kind == VaultQueueEventKind::Submitted)
-            .filter(|event| match known_id {
+            .rfind(|event| match known_id {
                 Some(id) => event.transaction_id == id,
                 None => {
                     addresses_equal(&event.dest, &expected.dest)
                         && dapp_ids_equal(&event.dapp_id, &expected.dapp_id)
                         && event.value == expected.value
                 }
-            })
-            .next_back();
+            });
 
         let id = known_id.or_else(|| submitted.map(|event| event.transaction_id));
 

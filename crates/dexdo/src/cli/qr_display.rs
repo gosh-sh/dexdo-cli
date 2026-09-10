@@ -740,7 +740,7 @@ mod io {
     use std::io::IsTerminal as _;
 
     use anyhow::Result;
-        use qrcode::QrCode;
+    use qrcode::QrCode;
 
     use super::{
         choose_display, encode_iterm2, encode_kitty, encode_sixel, fit_module_scale, probe,
@@ -934,8 +934,6 @@ mod io {
 
 #[cfg(test)]
 mod tests {
-    use base64::Engine as _;
-
     use super::*;
 
     // -- parse_probe_reply -----------------------------------------------------------------

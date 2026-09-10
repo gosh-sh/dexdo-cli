@@ -17,7 +17,8 @@
         }
       ],
       "capabilities": {
-        "max_output_tokens": 4096
+        "max_output_tokens": 4096,
+        "sample_algorithm": "NONE"
       }
     }
   }

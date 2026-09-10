@@ -63,7 +63,9 @@ fn a_sell_must_say_how_much_and_cannot_default_to_converting_everything() {
     // balance would be an irreversible deposit nobody asked for: lots cannot be cancelled.
     assert!(Cli::try_parse_from(["dexdo", "accumulator", "sell"]).is_err());
     // And the two ways of saying it are mutually exclusive, so an amount can never be ambiguous.
-    assert!(Cli::try_parse_from(["dexdo", "accumulator", "sell", "--usdc", "10", "--all"]).is_err());
+    assert!(
+        Cli::try_parse_from(["dexdo", "accumulator", "sell", "--usdc", "10", "--all"]).is_err()
+    );
     assert!(Cli::try_parse_from(["dexdo", "accumulator", "sell", "--all"]).is_ok());
 }
 

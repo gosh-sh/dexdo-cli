@@ -17,8 +17,8 @@ use super::*;
 #[test]
 fn an_empty_deals_directory_is_an_empty_list_and_not_a_refusal() {
     let temp = tempfile::tempdir().expect("tempdir");
-    let listed = list_deal_handles(temp.path())
-        .expect("a directory that holds no handles is not a refusal");
+    let listed =
+        list_deal_handles(temp.path()).expect("a directory that holds no handles is not a refusal");
     assert!(listed.is_empty(), "{listed:?}");
 }
 
@@ -46,8 +46,11 @@ fn an_empty_result_refuses_only_when_something_was_skipped() {
     );
 
     let skipped = tempfile::tempdir().expect("tempdir");
-    std::fs::write(skipped.path().join("deal-0-broken-seller.json"), b"{ not json")
-        .expect("write the only handle, unreadable");
+    std::fs::write(
+        skipped.path().join("deal-0-broken-seller.json"),
+        b"{ not json",
+    )
+    .expect("write the only handle, unreadable");
     let error = list_deal_handles(skipped.path())
         .expect_err("the only handle was unreadable, so there is no empty list to return");
     let rendered = format!("{error:#}");

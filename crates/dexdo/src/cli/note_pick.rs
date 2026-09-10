@@ -112,14 +112,19 @@ pub(crate) async fn holdings_raw_of(
     currency: u32,
 ) -> Result<u128, String> {
     use crate::cli::note::{note_getter_balance_maps, NoteBalanceMap};
-    use dexdo_core::private_note::artifacts::PRIVATE_NOTE_ABI_JSON;
     use dexdo_core::chain::RetryingReads as _;
+    use dexdo_core::private_note::artifacts::PRIVATE_NOTE_ABI_JSON;
 
     let Ok(parsed) = dexdo_core::address::parse_chain_address(address) else {
         return Err("unreadable address".to_string());
     };
     let details: Result<Option<Value>, _> = client
-        .run_getter_retrying(&parsed, PRIVATE_NOTE_ABI_JSON, "getDetails", serde_json::json!({}))
+        .run_getter_retrying(
+            &parsed,
+            PRIVATE_NOTE_ABI_JSON,
+            "getDetails",
+            serde_json::json!({}),
+        )
         .await;
     let maps = match details {
         Ok(details) => note_getter_balance_maps(details.as_ref()),
@@ -203,7 +208,11 @@ pub(crate) fn ask_which(rows: &[NoteRow]) -> Result<String> {
                     // what this run will print anywhere else.
                     style::paint(palette, Role::Id, &style::short_id(&row.shown)),
                     style::paint(palette, Role::Label, "\u{b7}"),
-                    if row.holds.trim().starts_with(|first: char| first.is_ascii_digit()) {
+                    if row
+                        .holds
+                        .trim()
+                        .starts_with(|first: char| first.is_ascii_digit())
+                    {
                         "spendable "
                     } else {
                         ""
@@ -251,7 +260,10 @@ pub(crate) fn spendable_address(row: &NoteRow) -> Result<String> {
 /// with the balance named as unread -- because the operator can still tell their notes apart, and a
 /// command that refused to offer a choice over a missing balance would be worse than one that says
 /// it does not know.
-pub(crate) async fn ask_which_note(contracts: &std::path::Path, endpoint: Option<&str>) -> Result<String> {
+pub(crate) async fn ask_which_note(
+    contracts: &std::path::Path,
+    endpoint: Option<&str>,
+) -> Result<String> {
     let Some(pool_path) = crate::cli::commands::note_pool_path(None) else {
         anyhow::bail!(
             "no pool to choose a note from. Deploy one with `dexdo note deploy`, or pass \
@@ -261,8 +273,12 @@ pub(crate) async fn ask_which_note(contracts: &std::path::Path, endpoint: Option
     let pool_path = crate::cli::note::resolve_private_file_path(&pool_path, "DEXDO_PN_POOL")?;
     let bytes = std::fs::read(&pool_path)
         .map_err(|error| anyhow::anyhow!("read the pool {}: {error}", pool_path.display()))?;
-    let pool: Value = serde_json::from_slice(&bytes)
-        .map_err(|error| anyhow::anyhow!("the pool {} is not valid JSON: {error}", pool_path.display()))?;
+    let pool: Value = serde_json::from_slice(&bytes).map_err(|error| {
+        anyhow::anyhow!(
+            "the pool {} is not valid JSON: {error}",
+            pool_path.display()
+        )
+    })?;
     let mut rows = rows_of(&pool);
     if rows.is_empty() || !crate::cli::interaction::may_ask() {
         // Nothing to show, or nobody to show it to: `ask_which` says which of those it is.
@@ -444,7 +460,9 @@ mod tests {
     #[test]
     fn without_a_terminal_it_refuses_and_names_the_flag() {
         let rows = rows_of(&pool());
-        let refusal = ask_which(&rows).expect_err("nothing can be asked here").to_string();
+        let refusal = ask_which(&rows)
+            .expect_err("nothing can be asked here")
+            .to_string();
         assert!(refusal.contains("--note-addr"), "{refusal}");
 
         let empty = ask_which(&[]).expect_err("no notes at all").to_string();

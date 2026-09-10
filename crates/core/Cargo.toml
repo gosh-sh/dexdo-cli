@@ -35,7 +35,7 @@ tvm_types = { git = "https://github.com/tvmlabs/tvm-sdk.git", tag = "v3.0.4-rc.a
 # Decoding the note's ext-out event bodies: the buyer reads the matched
 # deal `tokenContract` from ITS OWN note's event - no shared-book index. The workspace patch unifies it
 # with the tvm-sdk source gosh.ackinacki pulls transitively, so the single-SDK
-# invariant (`ci/check-single-sdk.sh`) holds.
+# invariant (`ci/check_single_sdk.sh`) holds.
 tvm_abi = { git = "https://github.com/tvmlabs/tvm-sdk.git", tag = "v3.0.4-rc.an" }
 # Read-only salted-code identity checks use the SDK's canonical code-salt parser/rebuilder.
 # The workspace patch keeps this direct dependency on the same TVM SDK revision as the rest.

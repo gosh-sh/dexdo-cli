@@ -81,29 +81,29 @@ pub(crate) fn rebase_default(path: &mut PathBuf, canonical_default: &str) {
     }
 }
 
-/// Like [`rebase_default`], but for a file the operator BRINGS rather than one the client writes.
+// Like [`rebase_default`], but for a file the operator BRINGS rather than one the client writes.
 
-/// The instance directory owns what this run produces: its pool, its deals, its wallet binding.
-/// `models.json` is not that -- it is a configuration file the operator wrote once and points several
-/// instances at. Rebasing its default into the instance directory means a `--data-dir` run cannot
-/// find the file lying right beside it, and the operator is made to pass `--models models.json` to
-/// say "the one that is already here".
+// The instance directory owns what this run produces: its pool, its deals, its wallet binding.
+// `models.json` is not that -- it is a configuration file the operator wrote once and points several
+// instances at. Rebasing its default into the instance directory means a `--data-dir` run cannot
+// find the file lying right beside it, and the operator is made to pass `--models models.json` to
+// say "the one that is already here".
 
-/// So the instance copy wins where it exists, and the working directory answers where it does not.
-/// An explicit `--models` is untouched either way.
-/// Is this filename a deployment manifest? Same two spellings the loader accepts.
-/// What stood here, and why it is gone.
+// So the instance copy wins where it exists, and the working directory answers where it does not.
+// An explicit `--models` is untouched either way.
+// Is this filename a deployment manifest? Same two spellings the loader accepts.
+// What stood here, and why it is gone.
 
-/// `rebase_contracts_default` pointed an untouched `--contracts` at the manifest inside the
-/// instance directory, so a directory dedicated to mainnet would not read the repository's development
-/// manifest. That protection was real -- measured 2026-08-25, an operator with a live mainnet
-/// binding was told "no wallet is bound on this network yet" and sent into a 750-second wait for a QR
-/// nobody needed to scan.
+// `rebase_contracts_default` pointed an untouched `--contracts` at the manifest inside the
+// instance directory, so a directory dedicated to mainnet would not read the repository's development
+// manifest. That protection was real -- measured 2026-08-25, an operator with a live mainnet
+// binding was told "no wallet is bound on this network yet" and sent into a 750-second wait for a QR
+// nobody needed to scan.
 
-/// It is unnecessary now, and could not work anyway: there is no `--contracts` to leave untouched
-/// and no default to recognise. The same protection is what `DEXDO_MANIFEST` gives directly -- the
-/// operator names the file, one directory at a time -- and it gives it without guessing, which is
-/// what the discovery here amounted to.
+// It is unnecessary now, and could not work anyway: there is no `--contracts` to leave untouched
+// and no default to recognise. The same protection is what `DEXDO_MANIFEST` gives directly -- the
+// operator names the file, one directory at a time -- and it gives it without guessing, which is
+// what the discovery here amounted to.
 
 pub(crate) fn rebase_default_if_present(path: &mut PathBuf, canonical_default: &str) {
     let Some(root) = explicit() else { return };
@@ -137,7 +137,11 @@ mod brought_file_tests {
 
         let mut path = PathBuf::from("models.json");
         rebase_into_if_present(&mut path, "models.json", root);
-        assert_eq!(path, PathBuf::from("models.json"), "nothing in the instance");
+        assert_eq!(
+            path,
+            PathBuf::from("models.json"),
+            "nothing in the instance"
+        );
 
         std::fs::write(root.join("models.json"), b"{}").expect("instance copy");
         let mut path = PathBuf::from("models.json");

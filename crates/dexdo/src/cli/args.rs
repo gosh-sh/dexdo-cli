@@ -3,21 +3,18 @@
 
 use anyhow::{bail, Result};
 use clap::{Args, Subcommand, ValueEnum};
-use dexdo_core::{
-    params::{
-        CLI_POSITIVE_U64_MIN, DEFAULT_BUYER_MAX_TOKENS, DEFAULT_BUYER_TICKS,
-        DEFAULT_CHAIN_READ_TIMEOUT_SECS, DEFAULT_CONTINUITY_MODE,
-        DEFAULT_DASHBOARD_LISTEN, DEFAULT_EXECUTABLE_BOOK_TICKS,
-        DEFAULT_EXPORT_FORMAT, DEFAULT_MARKETS_FRAME_MODEL, DEFAULT_MARKET_DATA_OUTPUT,
-        DEFAULT_MARKET_DATA_TIMEOUT_MS, DEFAULT_MARKET_MANIFEST_OUTPUT_PATH, DEFAULT_MODELS_PATH,
-        DEFAULT_MONITOR_TREE_WIDTH, DEFAULT_NOTE_INDEX,
-        DEFAULT_ORACLE_EVENT_LIST_DESCRIPTION, DEFAULT_ORACLE_EVENT_LIST_INDEX, DEFAULT_ORACLE_FEE,
-        DEFAULT_ORACLE_MARKET_OUTPUT_PATH, DEFAULT_ORACLE_PMP_DESCRIPTION, DEFAULT_POLICY_ROLE,
-        DEFAULT_PROVISION_MAX_TICKS, DEFAULT_SELLER_GATEWAY_LISTEN,
-        DEFAULT_SELLER_MOCK_TOKEN_COUNT, MARKET_DATA_DEPTH_LIMIT_MAX, MARKET_DATA_DEPTH_LIMIT_MIN,
-        MARKET_DATA_LIST_LIMIT_MAX, MARKET_DATA_LIST_LIMIT_MIN, SHELL_CURRENCY_ID,
-        SHELL_CURRENCY_LABEL,
-    },
+use dexdo_core::params::{
+    CLI_POSITIVE_U64_MIN, DEFAULT_BUYER_MAX_TOKENS, DEFAULT_BUYER_TICKS,
+    DEFAULT_CHAIN_READ_TIMEOUT_SECS, DEFAULT_CONTINUITY_MODE, DEFAULT_DASHBOARD_LISTEN,
+    DEFAULT_EXECUTABLE_BOOK_TICKS, DEFAULT_EXPORT_FORMAT, DEFAULT_MARKETS_FRAME_MODEL,
+    DEFAULT_MARKET_DATA_OUTPUT, DEFAULT_MARKET_DATA_TIMEOUT_MS,
+    DEFAULT_MARKET_MANIFEST_OUTPUT_PATH, DEFAULT_MODELS_PATH, DEFAULT_MONITOR_TREE_WIDTH,
+    DEFAULT_NOTE_INDEX, DEFAULT_ORACLE_EVENT_LIST_DESCRIPTION, DEFAULT_ORACLE_EVENT_LIST_INDEX,
+    DEFAULT_ORACLE_FEE, DEFAULT_ORACLE_MARKET_OUTPUT_PATH, DEFAULT_ORACLE_PMP_DESCRIPTION,
+    DEFAULT_POLICY_ROLE, DEFAULT_PROVISION_MAX_TICKS, DEFAULT_SELLER_GATEWAY_LISTEN,
+    DEFAULT_SELLER_MOCK_TOKEN_COUNT, MARKET_DATA_DEPTH_LIMIT_MAX, MARKET_DATA_DEPTH_LIMIT_MIN,
+    MARKET_DATA_LIST_LIMIT_MAX, MARKET_DATA_LIST_LIMIT_MIN, SHELL_CURRENCY_ID,
+    SHELL_CURRENCY_LABEL,
 };
 use http::uri::Authority;
 use std::fmt;
@@ -1886,18 +1883,10 @@ pub(crate) struct NoteDeployArgs {
     pub(crate) multisig_address: Option<String>,
     /// File with the multisig wallet's 32-byte secret hex (the funding key). Env fallback:
     /// DEXDO_MULTISIG_PRIVATE_KEY. The secret is never logged.
-    #[arg(
-        long,
-        value_name = "PATH",
-        conflicts_with = "multisig_seed_file"
-    )]
+    #[arg(long, value_name = "PATH", conflicts_with = "multisig_seed_file")]
     pub(crate) multisig_private_key: Option<PathBuf>,
     /// File with the multisig wallet seed phrase. TVM-compatible derivation is used; the phrase is never logged.
-    #[arg(
-        long,
-        value_name = "PATH",
-        conflicts_with = "multisig_private_key"
-    )]
+    #[arg(long, value_name = "PATH", conflicts_with = "multisig_private_key")]
     pub(crate) multisig_seed_file: Option<PathBuf>,
     /// PN deposit nominal: `N100`, `N1000`, `N10000`, `N100000`, or `N1000000`. Required on purpose
     /// -- the deposit is a spend from the funding wallet, so the CLI never picks a
@@ -1985,9 +1974,9 @@ impl NoteDeployArgs {
                 "a BYO Hot address requires --multisig-private-key/--multisig-seed-file or \
                  {DEXDO_MULTISIG_PRIVATE_KEY_ENV}"
             ),
-            (false, true) => bail!(
-                "a BYO Hot key requires --multisig-address or {DEXDO_MULTISIG_ADDRESS_ENV}"
-            ),
+            (false, true) => {
+                bail!("a BYO Hot key requires --multisig-address or {DEXDO_MULTISIG_ADDRESS_ENV}")
+            }
             _ => Ok(()),
         }
     }
@@ -2309,8 +2298,7 @@ pub(crate) enum AccumulatorCommand {
 
 /// Args for `dexdo accumulator status`.
 #[derive(Args)]
-pub(crate) struct AccumulatorStatusArgs {
-}
+pub(crate) struct AccumulatorStatusArgs {}
 
 /// Args for `dexdo accumulator sell`: convert the wallet's SHELL into eccUSDC sell lots.
 

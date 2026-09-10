@@ -62,6 +62,7 @@ fn authorized_request(
                 ..SamplingParams::default()
             }),
         }),
+        billing_grant_tokens: u64::from(max_tokens).saturating_add(1),
     })
 }
 
@@ -169,30 +170,36 @@ async fn registered_deal_keeps_reservation_and_delivery_numbers() {
     assert_eq!(before.available().unwrap(), 5);
 
     let mut stream = GatewayService::new(state.clone())
-        .open_stream(authorized_request(&state, &buyer, token_contract, 100))
+        .open_stream(authorized_request(&state, &buyer, token_contract, 3))
         .await
         .unwrap()
         .into_inner();
     let mut delivered_chunks = 0;
+    let mut terminal_usage = None;
     while let Some(item) = stream.next().await {
         let chunk = item.unwrap();
-        assert_eq!(chunk.token_ids.len(), 1);
-        delivered_chunks += 1;
+        if let Some(usage) = chunk.usage {
+            terminal_usage = Some(usage);
+        } else {
+            assert_eq!(chunk.token_ids.len(), 1);
+            delivered_chunks += 1;
+        }
     }
 
     assert_eq!(delivered_chunks, 3);
+    assert_eq!(terminal_usage, Some(BillingUsage::new(1, 3, None).unwrap()));
     assert_eq!(
         state.delivery(token_contract).count.load(Ordering::Acquire),
-        3
+        4
     );
     let after = state.capacity_snapshot(token_contract).unwrap().unwrap();
-    assert_eq!(after.local_delivered_after_anchor, 3);
+    assert_eq!(after.local_delivered_after_anchor, 4);
     assert_eq!(after.outstanding_reservation, 0);
-    assert_eq!(after.available().unwrap(), 2);
+    assert_eq!(after.available().unwrap(), 1);
 }
 
 #[tokio::test]
-async fn registered_mock_no_show_still_opens_without_a_reservation() {
+async fn registered_mock_zero_output_limit_is_rejected_without_a_reservation() {
     let state = Arc::new(GatewayState::new());
     let buyer = LocalNote::generate();
     let token_contract = "0:1046-mock-no-show";
@@ -206,12 +213,18 @@ async fn registered_mock_no_show_still_opens_without_a_reservation() {
         )
         .unwrap();
 
-    let mut stream = GatewayService::new(state.clone())
-        .open_stream(authorized_request(&state, &buyer, token_contract, 100))
+    let status = match GatewayService::new(state.clone())
+        .open_stream(authorized_request(&state, &buyer, token_contract, 1))
         .await
-        .unwrap()
-        .into_inner();
-    assert!(stream.next().await.is_none());
+    {
+        Ok(_) => panic!("a registered zero-output model cannot open a request"),
+        Err(status) => status,
+    };
+    assert_eq!(status.code(), tonic::Code::InvalidArgument);
+    assert_eq!(
+        status.message(),
+        "canonical request output limit must be nonzero"
+    );
     assert_eq!(
         state.delivery(token_contract).count.load(Ordering::Acquire),
         0

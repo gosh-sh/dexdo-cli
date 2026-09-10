@@ -48,8 +48,8 @@ fn vault_to_hot_fingerprint() -> FundingFingerprint {
 #[tokio::test]
 async fn vault_to_hot_submit_transaction_params_encode_against_the_canonical_multisig_abi() {
     let fingerprint = vault_to_hot_fingerprint();
-    let params =
-        vault_to_hot_submit_transaction_params(&fingerprint).expect("build Vault -> Hot parameters");
+    let params = vault_to_hot_submit_transaction_params(&fingerprint)
+        .expect("build Vault -> Hot parameters");
     let context = local_context().expect("local SDK context");
     let keys = KeyPair::generate();
 

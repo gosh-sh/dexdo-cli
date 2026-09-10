@@ -79,6 +79,7 @@ mod accumulator_1323_tests;
 #[path = "cli/wallet_334_cli_tests.rs"]
 mod wallet_334_cli_tests;
 
+#[cfg(test)]
 mod wallet_onboard_cli_tests {
     use super::*;
 
@@ -144,7 +145,8 @@ mod wallet_onboard_cli_tests {
             vec!["dexdo", "note", "deploy", "--nominal", "10"],
         ] {
             let printed = argv.join(" ");
-            let cli = Cli::try_parse_from(argv).unwrap_or_else(|error| panic!("{printed}: {error}"));
+            let cli =
+                Cli::try_parse_from(argv).unwrap_or_else(|error| panic!("{printed}: {error}"));
             assert_eq!(
                 default_log_level(&cli.command),
                 "error",
@@ -156,8 +158,16 @@ mod wallet_onboard_cli_tests {
     #[test]
     fn records_go_to_stderr_whatever_the_command() {
         let onboarding = Cli::try_parse_from([
-            "dexdo", "wallet", "onboard", "ackinacki-wallet", "--agent-name", "agent",
-            "--state", "session.json", "--hot-key", "hot.key",
+            "dexdo",
+            "wallet",
+            "onboard",
+            "ackinacki-wallet",
+            "--agent-name",
+            "agent",
+            "--state",
+            "session.json",
+            "--hot-key",
+            "hot.key",
         ])
         .unwrap();
         assert!(records_go_to_stderr(&onboarding.command));
@@ -197,19 +207,13 @@ mod wallet_onboard_cli_tests {
         let cli::args::WalletCommand::Onboard(onboard) = &wallet.command else {
             panic!("expected `wallet onboard`");
         };
-        let Some(cli::args::WalletProviderCommand::AckinackiWallet(args)) = onboard.provider.as_ref()
+        let Some(cli::args::WalletProviderCommand::AckinackiWallet(args)) =
+            onboard.provider.as_ref()
         else {
             panic!("expected the ackinacki-wallet provider");
         };
-        assert_eq!(
-            args.state,
-            None
-        );
-        assert_eq!(
-            args.hot_key,
-            None
-        );
-
+        assert_eq!(args.state, None);
+        assert_eq!(args.hot_key, None);
     }
 
     /// `--agent-name` is still required on the subcommand. Kept from the predecessor test, because
@@ -448,17 +452,12 @@ impl Command {
                 NoteCommand::Deploy(args) => {
                     args.apply_multisig_env_fallbacks()?;
                     if args.pool.is_none() {
-                        args.pool = Some(cli::data_dir::automatic_private_file(
-                            DEFAULT_PN_POOL_PATH,
-                        )?);
+                        args.pool =
+                            Some(cli::data_dir::automatic_private_file(DEFAULT_PN_POOL_PATH)?);
                     }
                 }
-                NoteCommand::Recover(args) => {
-                    if args.pool.is_none() {
-                        args.pool = Some(cli::data_dir::automatic_private_file(
-                            DEFAULT_PN_POOL_PATH,
-                        )?);
-                    }
+                NoteCommand::Recover(args) if args.pool.is_none() => {
+                    args.pool = Some(cli::data_dir::automatic_private_file(DEFAULT_PN_POOL_PATH)?);
                 }
                 _ => {}
             },
@@ -479,8 +478,7 @@ impl Command {
         match self {
             Command::Seller(args) => Some((
                 cli::data_dir::InstanceRole::Seller,
-                args.deals_dir.is_none()
-                    || (args.mock.mock_chain && args.endpoints_file.is_none()),
+                args.deals_dir.is_none() || (args.mock.mock_chain && args.endpoints_file.is_none()),
             )),
             Command::Buyer(args) => Some((
                 cli::data_dir::InstanceRole::Buyer,
@@ -1108,29 +1106,28 @@ mod note_cli_tests {
         .expect("note recover must accept the per-instance pool default");
     }
 
-    /// A `--data-dir` uses the manifest lying inside it when there IS one, and never invents one.
+    // A `--data-dir` uses the manifest lying inside it when there IS one, and never invents one.
 
-    /// **This replaces audit item 5, and the reversal is deliberate.** That item said
-    /// "contracts are application resources, not instance state" and forbade the rebase outright,
-    /// by the same argument that keeps `models.json` out of the instance directory: a file the
-    /// operator brought once and points several instances at should not be captured by one of them.
+    // **This replaces audit item 5, and the reversal is deliberate.** That item said
+    // "contracts are application resources, not instance state" and forbade the rebase outright,
+    // by the same argument that keeps `models.json` out of the instance directory: a file the
+    // operator brought once and points several instances at should not be captured by one of them.
 
-    /// The argument holds for a configuration file. It does not hold for THIS file, because this
-    /// one decides which chain the command dials and which wallet it may spend. Measured on the
-    /// owner's mainnet run, 25 August 2026: `--data-dir./.dexdo-mainnet`, whose manifest says
-    /// `network = mainnet`, `endpoint = dd-mainnet`, was read past and the compiled default
-    /// a stale committed path used instead -- so `note deploy` announced "no chain
-    /// wallet is bound yet" against a live mainnet binding and opened a twelve-minute onboarding
-    /// nobody asked for, and `doctor` dialled one chain's host nine times while reporting a verdict
-    /// about the operator's own network. A directory devoted to one chain read another chain's
-    /// The manifest is not rebased onto `--data-dir`, because nothing rebases any more.
+    // The argument holds for a configuration file. It does not hold for THIS file, because this
+    // one decides which chain the command dials and which wallet it may spend. Measured on the
+    // owner's mainnet run, 25 August 2026: `--data-dir./.dexdo-mainnet`, whose manifest says
+    // `network = mainnet`, `endpoint = dd-mainnet`, was read past and the compiled default
+    // a stale committed path used instead -- so `note deploy` announced "no chain
+    // wallet is bound yet" against a live mainnet binding and opened a twelve-minute onboarding
+    // nobody asked for, and `doctor` dialled one chain's host nine times while reporting a verdict
+    // about the operator's own network. A directory devoted to one chain read another chain's
+    // The manifest is not rebased onto `--data-dir`, because nothing rebases any more.
 
-    /// What stood here asserted that an instance directory holding a manifest read that one rather
-    /// than the working directory's. The mechanism it exercised is gone with the flag and the
-    /// default it worked on: `DEXDO_MANIFEST` names the file outright, one directory at a time, and
-    /// there is no untouched default left to recognise. Kept as a note rather than deleted silently
-    /// -- the protection it bought was real, and is recorded in `cli/data_dir.rs` where it stood.
-
+    // What stood here asserted that an instance directory holding a manifest read that one rather
+    // than the working directory's. The mechanism it exercised is gone with the flag and the
+    // default it worked on: `DEXDO_MANIFEST` names the file outright, one directory at a time, and
+    // there is no untouched default left to recognise. Kept as a note rather than deleted silently
+    // -- the protection it bought was real, and is recorded in `cli/data_dir.rs` where it stood.
 
     /// The rest of audit item 5 that does NOT touch: handle-less deal commands still
     /// resolve contracts without the instance directory, and the pool default is not duplicated.
@@ -1240,14 +1237,8 @@ mod note_cli_tests {
     /// `dexdo note balance` is address-only and read-only at the parser surface.
     #[test]
     fn note_balance_subcommand_parses_and_requires_note_addr() {
-        let c = Cli::try_parse_from([
-            "dexdo",
-            "note",
-            "balance",
-            "--note-addr",
-            NOTE,
-        ])
-        .expect("note balance parses");
+        let c = Cli::try_parse_from(["dexdo", "note", "balance", "--note-addr", NOTE])
+            .expect("note balance parses");
         let Command::Note(n) = c.command else {
             panic!("expected Command::Note");
         };
@@ -1268,40 +1259,6 @@ mod note_cli_tests {
         .is_err());
     }
 
-    /// A manifest that loads and names an endpoint nothing is listening on.
-
-    /// Three requirements, and they have to be met at once.
-
-    /// It must EXIST: it used to be a relative path to a committed manifest, which does not
-    /// resolve from a test's working directory -- and the test passed anyway, because a missing
-    /// manifest at the default path was quietly replaced by a copy compiled into the binary.
-    /// removed that copy.
-
-    /// It must be DEAD: these tests assert which guard a run trips, and the guards under test all
-    /// sit in front of the chain. Pointing them at the repository's own manifest made them dial
-    /// a real host -- a read, and no money, but a live call out of a unit test all the
-    /// same. `--endpoint` is gone, so the only way to keep a run offline is a manifest that
-    /// names a port nothing answers on.
-
-    /// It must be WRITTEN PER TEST: a shared path is a shared file, and these run in parallel.
-    fn offline_manifest(dir: &std::path::Path) -> PathBuf {
-        let path = dir.join("deployed.offline.json");
-        std::fs::write(
-            &path,
-            serde_json::json!({
-                "network": "net-a",
-                "version": "offline-guard-fixture",
-                "superroot": "0:0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c",
-                "dapp_config": "",
-                "dapp_id": "0000000000000000000000000000000000000000000000000000000000000004",
-                "endpoint": "http://127.0.0.1:1",
-            })
-            .to_string(),
-        )
-        .expect("write the offline manifest");
-        path
-    }
-
     // dev reached the same finding from the other side and marked this `#[ignore]`: the
     // `--note-key` case it used to carry is refused only AFTER `chain_doctor_preflight` has
     // reached the chain, so on a runner with no route it failed after five read attempts, and where
@@ -1316,8 +1273,6 @@ mod note_cli_tests {
     // NAME claims. The name is unchanged, so that dispute is unchanged.
     #[tokio::test]
     async fn note_withdraw_runtime_guards_fail_before_chain() {
-        let dir = tempfile::tempdir().expect("create the fixture directory");
-        let manifest = offline_manifest(dir.path());
         let err = crate::cli::commands::run_note_withdraw(NoteWithdrawArgs {
             identity: IdentityArgs {
                 note_key: Some(PathBuf::from("note.key")),
@@ -1367,8 +1322,8 @@ mod doctor_cli_tests {
         let c = Cli::try_parse_from(["dexdo", "doctor"]).expect("doctor parses");
         assert!(matches!(c.command, Command::Doctor(_)));
         assert_eq!(c.command.machine_operation(), None);
-        let c = Cli::try_parse_from(["dexdo", "doctor", "--json"])
-            .expect("doctor machine mode parses");
+        let c =
+            Cli::try_parse_from(["dexdo", "doctor", "--json"]).expect("doctor machine mode parses");
         let Command::Doctor(ref args) = c.command else {
             panic!("expected doctor command");
         };
@@ -1443,7 +1398,7 @@ mod market_orders_cli_tests {
     fn place_04_every_price_argument_rejects_only_above_uint128() {
         let max = u128::MAX.to_string();
         let above = "340282366920938463463374607431768211456";
-        let command_lines = vec![
+        let command_lines = [
             vec!["dexdo", "seller", "--price-per-tick", "VALUE"],
             vec!["dexdo", "buyer", "--max-price-per-tick", "VALUE"],
             vec![
@@ -1684,13 +1639,9 @@ mod market_orders_cli_tests {
             MarketDataCommand::List { limit: Some(1), .. }
         ));
 
-        let c = Cli::try_parse_from([
-            "dexdo",
-            "market-data",
-            "list",
-        ])
-        .expect("market-data list parses without a manifest flag");
-        let Command::MarketData(args) = c.command else {
+        let c = Cli::try_parse_from(["dexdo", "market-data", "list"])
+            .expect("market-data list parses without a manifest flag");
+        let Command::MarketData(_) = c.command else {
             panic!("expected Command::MarketData");
         };
 
@@ -1981,7 +1932,14 @@ mod market_orders_cli_tests {
     #[test]
     fn subscription_json_is_accepted_and_names_one_operation_per_subcommand() {
         let place = |json_first: bool| {
-            let mut argv = vec!["dexdo", "subscription", "--note-addr", "0:note", "--market", "m.json"];
+            let mut argv = vec![
+                "dexdo",
+                "subscription",
+                "--note-addr",
+                "0:note",
+                "--market",
+                "m.json",
+            ];
             if json_first {
                 argv.push("--json");
             }
@@ -2007,15 +1965,29 @@ mod market_orders_cli_tests {
         for (argv, operation) in [
             (
                 vec![
-                    "dexdo", "subscription", "--note-addr", "0:note", "--model", "qwen", "status",
-                    "7", "--json",
+                    "dexdo",
+                    "subscription",
+                    "--note-addr",
+                    "0:note",
+                    "--model",
+                    "qwen",
+                    "status",
+                    "7",
+                    "--json",
                 ],
                 machine::OP_SUBSCRIPTION_STATUS,
             ),
             (
                 vec![
-                    "dexdo", "subscription", "--json", "--note-addr", "0:note", "--model", "qwen",
-                    "cancel", "7",
+                    "dexdo",
+                    "subscription",
+                    "--json",
+                    "--note-addr",
+                    "0:note",
+                    "--model",
+                    "qwen",
+                    "cancel",
+                    "7",
                 ],
                 machine::OP_SUBSCRIPTION_CANCEL,
             ),
@@ -2099,17 +2071,12 @@ mod deal_handle_cli_tests {
         assert_eq!(d.deals_dir, Some(PathBuf::from("deals")));
 
         let c = Cli::try_parse_from(["dexdo", "status", "deal-0-abc"]).expect("status parses");
-        let Command::Status(status) = c.command else {
+        let Command::Status(_) = c.command else {
             panic!("expected Command::Status");
         };
 
-        let c = Cli::try_parse_from([
-            "dexdo",
-            "status",
-            "deal-0-abc",
-        ])
-        .expect("status parses");
-        let Command::Status(status) = c.command else {
+        let c = Cli::try_parse_from(["dexdo", "status", "deal-0-abc"]).expect("status parses");
+        let Command::Status(_) = c.command else {
             panic!("expected Command::Status");
         };
 
@@ -2164,15 +2131,8 @@ mod deal_handle_cli_tests {
         assert_eq!(dashboard.listen.to_string(), "127.0.0.1:0");
         assert_eq!(dashboard.deals_dir, Some(PathBuf::from("deals")));
 
-        let c = Cli::try_parse_from([
-            "dexdo",
-            "export",
-            "--deal",
-            "deal-0-abc",
-            "--format",
-            "md",
-        ])
-        .expect("export parses");
+        let c = Cli::try_parse_from(["dexdo", "export", "--deal", "deal-0-abc", "--format", "md"])
+            .expect("export parses");
         let Command::Export(export) = c.command else {
             panic!("expected Command::Export");
         };
@@ -2803,7 +2763,6 @@ mod deposit_tests {
         )
         .is_ok());
     }
-
 }
 
 #[cfg(test)]
@@ -3031,7 +2990,7 @@ mod tests {
         assert_eq!(monitor.tree_width, p::DEFAULT_MONITOR_TREE_WIDTH);
 
         let doctor = Cli::try_parse_from(["dexdo", "doctor"]).expect("doctor defaults parse");
-        let Command::Doctor(doctor) = doctor.command else {
+        let Command::Doctor(_) = doctor.command else {
             panic!("doctor command")
         };
 
@@ -3124,7 +3083,7 @@ mod tests {
         let Command::Note(note) = note.command else {
             panic!("note command")
         };
-        let NoteCommand::Deploy(note) = note.command else {
+        let NoteCommand::Deploy(_) = note.command else {
             panic!("note deploy")
         };
         // the same guarantee from the defaults side -- an unpassed --endpoint parses to
@@ -3362,7 +3321,10 @@ mod tests {
             .expect("mock chain state was written by the roundtrip");
         let chain_state: serde_json::Value =
             serde_json::from_slice(&chain_state).expect("mock chain state is JSON");
-        assert_eq!(chain_state["subscription_orders"]["1"], serde_json::Value::Null);
+        assert_eq!(
+            chain_state["subscription_orders"]["1"],
+            serde_json::Value::Null
+        );
         assert_eq!(
             chain_state["subscription_terminal_orders"]["1"]["reason"],
             "cancelled"
@@ -3420,8 +3382,9 @@ mod tests {
             for good in ["1", "3", "1000000"] {
                 let mut argv = command.clone();
                 argv.push(good);
-                Cli::try_parse_from(argv)
-                    .unwrap_or_else(|error| panic!("{command:?} must accept {good} SHELL: {error}"));
+                Cli::try_parse_from(argv).unwrap_or_else(|error| {
+                    panic!("{command:?} must accept {good} SHELL: {error}")
+                });
             }
         }
     }
@@ -3649,7 +3612,7 @@ mod tests {
         assert!(!help.contains("[default: N100]"), "{help}");
     }
 
-    /// The onboarding docs published with the release binary. `release/build-public-tree.sh`
+    /// The onboarding docs published with the release binary. `ci/release/common/build_public_tree.sh`
     /// allow-lists exactly these skill directories, so they are what a new user reads.
 
     /// Six since, and the count is the point: each trade ships one document written to drive
@@ -3958,10 +3921,7 @@ mod tests {
                 "dexdo note deploy --nominal 1 2> /tmp/err.log",
                 vec!["dexdo", "note", "deploy", "--nominal", "1"],
             ),
-            (
-                "dexdo market qwen | jq .",
-                vec!["dexdo", "market", "qwen"],
-            ),
+            ("dexdo market qwen | jq .", vec!["dexdo", "market", "qwen"]),
             (
                 "dexdo market qwen && dexdo quote --ticks 1",
                 vec!["dexdo", "market", "qwen"],
@@ -4140,7 +4100,9 @@ mod tests {
     /// This checks a property of the printed text, not its wording: what a shell does with it.
     #[test]
     fn no_printed_command_line_carries_a_placeholder_a_shell_would_eat() {
-        use crate::cli::support::printed_commands::{top_level_subcommands, unshellable_command_literals};
+        use crate::cli::support::printed_commands::{
+            top_level_subcommands, unshellable_command_literals,
+        };
         let crate_root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
         let subcommands = top_level_subcommands();
         let mut files = 0;
@@ -4175,7 +4137,9 @@ mod tests {
     /// lint beside it was rebuilt twice to escape.
     #[test]
     fn the_placeholder_sweep_finds_the_shape_it_is_for_and_no_other() {
-        use crate::cli::support::printed_commands::{top_level_subcommands, unshellable_command_literals};
+        use crate::cli::support::printed_commands::{
+            top_level_subcommands, unshellable_command_literals,
+        };
         let subs = top_level_subcommands();
         let caught = |src: &str| !unshellable_command_literals(src, &subs).is_empty();
 

@@ -15,7 +15,8 @@
 //! differently -- otherwise it would be green for the wrong reason.
 
 use super::{
-    admit_oracle_withdraw_destination, OracleWithdrawDestinationKind, OracleWithdrawDestinationProof,
+    admit_oracle_withdraw_destination, OracleWithdrawDestinationKind,
+    OracleWithdrawDestinationProof,
 };
 
 /// A real 64-hex account id. `0:aaaa` -- four hex characters -- is not an address at all, and
@@ -93,7 +94,10 @@ fn a_manually_onboarded_hot_is_admitted_when_to_names_the_same_account() {
     )
     .expect("a destination the operator declared for this network is admitted");
     assert!(
-        matches!(proof, OracleWithdrawDestinationProof::Declared("hot_address")),
+        matches!(
+            proof,
+            OracleWithdrawDestinationProof::Declared("hot_address")
+        ),
         "admitted by the wrong route: {proof:?}"
     );
 }
@@ -127,7 +131,10 @@ fn either_advertised_spelling_on_either_side_names_one_destination() {
             panic!("typed {typed} against a binding written from {bound}: {error}")
         });
         assert!(
-            matches!(proof, OracleWithdrawDestinationProof::Declared("vault_address")),
+            matches!(
+                proof,
+                OracleWithdrawDestinationProof::Declared("vault_address")
+            ),
             "typed {typed} against a binding written from {bound}: {proof:?}"
         );
     }
@@ -172,5 +179,8 @@ fn an_unreadable_declaration_admits_nothing() {
     )
     .expect_err("a declaration that is not an address must not admit")
     .to_string();
-    assert!(refusal.contains("names no account on this network"), "{refusal}");
+    assert!(
+        refusal.contains("names no account on this network"),
+        "{refusal}"
+    );
 }

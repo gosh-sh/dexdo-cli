@@ -5,8 +5,8 @@
 //! suite happens to have bound.
 
 use super::{
-    resolve_funding_wallet, FundingWallet, WalletBinding, WalletNetwork, WalletProvider,
-    WalletStore, BINDING_VERSION,
+    resolve_funding_wallet, FundingWallet, WalletBinding, WalletProvider, WalletStore,
+    BINDING_VERSION,
 };
 use crate::Cli;
 use clap::Parser as _;
@@ -53,8 +53,14 @@ fn is_wallet_not_configured(error: &anyhow::Error) -> bool {
 fn no_flags_and_no_binding_is_e_wallet_not_configured() {
     let dir = tempfile::tempdir().unwrap();
     let store = WalletStore::at(dir.path().join("wallet"));
-    let error = resolve_funding_wallet(&store, &crate::cli::wallet::test_network_a(), None, &None, &None)
-        .expect_err("a command that spends the Hot cannot proceed without one");
+    let error = resolve_funding_wallet(
+        &store,
+        &crate::cli::wallet::test_network_a(),
+        None,
+        &None,
+        &None,
+    )
+    .expect_err("a command that spends the Hot cannot proceed without one");
     assert!(
         is_wallet_not_configured(&error),
         "the refusal must carry E_WALLET_NOT_CONFIGURED: {error:#}"
@@ -72,7 +78,14 @@ fn without_flags_the_active_binding_supplies_the_wallet() {
     let dir = tempfile::tempdir().unwrap();
     let store = WalletStore::at(dir.path().join("wallet"));
     bound(&store, |_| {});
-    let resolved = resolve_funding_wallet(&store, &crate::cli::wallet::test_network_a(), None, &None, &None).expect("the binding answers");
+    let resolved = resolve_funding_wallet(
+        &store,
+        &crate::cli::wallet::test_network_a(),
+        None,
+        &None,
+        &None,
+    )
+    .expect("the binding answers");
     assert_eq!(
         resolved,
         FundingWallet {
@@ -143,8 +156,14 @@ fn an_unparseable_binding_is_an_error_and_not_a_silent_no_wallet() {
     std::fs::create_dir_all(&root).unwrap();
     std::fs::write(root.join("binding.json"), b"{ this is not json").unwrap();
 
-    let error = resolve_funding_wallet(&store, &crate::cli::wallet::test_network_a(), None, &None, &None)
-        .expect_err("a binding that cannot be read must not be treated as absent");
+    let error = resolve_funding_wallet(
+        &store,
+        &crate::cli::wallet::test_network_a(),
+        None,
+        &None,
+        &None,
+    )
+    .expect_err("a binding that cannot be read must not be treated as absent");
     assert!(
         !is_wallet_not_configured(&error),
         "an unreadable binding is a different problem from an absent one: {error:#}"
@@ -168,8 +187,14 @@ fn a_future_version_binding_is_refused_rather_than_treated_as_absent() {
     value["version"] = serde_json::json!(BINDING_VERSION + 1);
     std::fs::write(&path, serde_json::to_vec_pretty(&value).unwrap()).unwrap();
 
-    let error = resolve_funding_wallet(&store, &crate::cli::wallet::test_network_a(), None, &None, &None)
-        .expect_err("a newer binding must not be read with fields this build ignores");
+    let error = resolve_funding_wallet(
+        &store,
+        &crate::cli::wallet::test_network_a(),
+        None,
+        &None,
+        &None,
+    )
+    .expect_err("a newer binding must not be read with fields this build ignores");
     assert!(!is_wallet_not_configured(&error), "{error:#}");
 }
 
@@ -183,8 +208,14 @@ fn a_binding_with_no_local_secret_is_refused_as_itself() {
         binding.hot_key_file = None;
         binding.hot_seed_file = None;
     });
-    let error = resolve_funding_wallet(&store, &crate::cli::wallet::test_network_a(), None, &None, &None)
-        .expect_err("a binding with no secret cannot fund a spend");
+    let error = resolve_funding_wallet(
+        &store,
+        &crate::cli::wallet::test_network_a(),
+        None,
+        &None,
+        &None,
+    )
+    .expect_err("a binding with no secret cannot fund a spend");
     assert!(!is_wallet_not_configured(&error), "{error:#}");
     assert!(
         format!("{error:#}").contains("cannot sign a spend"),
@@ -201,7 +232,14 @@ fn a_seed_file_binding_resolves_to_the_seed_input() {
         binding.hot_key_file = None;
         binding.hot_seed_file = Some(PathBuf::from("/secrets/hot.seed"));
     });
-    let resolved = resolve_funding_wallet(&store, &crate::cli::wallet::test_network_a(), None, &None, &None).unwrap();
+    let resolved = resolve_funding_wallet(
+        &store,
+        &crate::cli::wallet::test_network_a(),
+        None,
+        &None,
+        &None,
+    )
+    .unwrap();
     assert_eq!(resolved.key, None);
     assert_eq!(resolved.seed_file, Some(PathBuf::from("/secrets/hot.seed")));
 }
@@ -214,10 +252,22 @@ fn a_seed_file_binding_resolves_to_the_seed_input() {
 fn note_deploy_reaches_binding_or_env_fallback_while_topup_pairing_still_rejects() {
     for command in [
         vec![
-            "dexdo", "note", "deploy", "--nominal", "N100", "--pool", "p.json",
+            "dexdo",
+            "note",
+            "deploy",
+            "--nominal",
+            "N100",
+            "--pool",
+            "p.json",
         ],
         vec![
-            "dexdo", "note", "topup", "--note-addr", "0:note", "--to", "1",
+            "dexdo",
+            "note",
+            "topup",
+            "--note-addr",
+            "0:note",
+            "--to",
+            "1",
         ],
         vec![
             "dexdo",
@@ -242,9 +292,8 @@ fn note_deploy_reaches_binding_or_env_fallback_while_topup_pairing_still_rejects
             "p.json",
         ],
     ] {
-        Cli::try_parse_from(command.clone()).unwrap_or_else(|error| {
-            panic!("{command:?} must reach binding/env fallback: {error}")
-        });
+        Cli::try_parse_from(command.clone())
+            .unwrap_or_else(|error| panic!("{command:?} must reach binding/env fallback: {error}"));
     }
     for command in [
         vec![
@@ -291,8 +340,14 @@ mod onboarding_on_demand {
         let temp = tempfile::tempdir().expect("temp dir");
         let store = WalletStore::at(temp.path().join("wallet"));
 
-        let refusal = resolve_funding_wallet(&store, &crate::cli::wallet::test_network_a(), None, &None, &None)
-            .expect_err("nothing is bound");
+        let refusal = resolve_funding_wallet(
+            &store,
+            &crate::cli::wallet::test_network_a(),
+            None,
+            &None,
+            &None,
+        )
+        .expect_err("nothing is bound");
 
         assert!(is_wallet_not_configured(&refusal), "{refusal:#}");
     }
@@ -309,8 +364,14 @@ mod onboarding_on_demand {
             binding.hot_seed_file = None;
         });
 
-        let refusal = resolve_funding_wallet(&store, &crate::cli::wallet::test_network_a(), None, &None, &None)
-            .expect_err("a binding with no key cannot sign");
+        let refusal = resolve_funding_wallet(
+            &store,
+            &crate::cli::wallet::test_network_a(),
+            None,
+            &None,
+            &None,
+        )
+        .expect_err("a binding with no key cannot sign");
 
         assert!(
             !is_wallet_not_configured(&refusal),
@@ -328,8 +389,14 @@ mod onboarding_on_demand {
         std::fs::create_dir_all(path.parent().expect("parent")).expect("mkdir");
         std::fs::write(&path, b"{ not json").expect("write");
 
-        let refusal = resolve_funding_wallet(&store, &crate::cli::wallet::test_network_a(), None, &None, &None)
-            .expect_err("a corrupt binding cannot be read");
+        let refusal = resolve_funding_wallet(
+            &store,
+            &crate::cli::wallet::test_network_a(),
+            None,
+            &None,
+            &None,
+        )
+        .expect_err("a corrupt binding cannot be read");
 
         assert!(!is_wallet_not_configured(&refusal), "{refusal:#}");
     }

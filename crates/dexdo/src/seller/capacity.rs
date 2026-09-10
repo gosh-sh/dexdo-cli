@@ -7,8 +7,8 @@
 
 use anyhow::{anyhow, bail, Result};
 use dexdo_core::{
-    order_flags as flags, DealChainState, DealSubscription, TokenContract, PROBE_SEED_TOKENS,
-    TICK_SIZE,
+    order_flags as flags, params::SELLER_UNCLAIMED_BILLABLE_RISK_LIMIT, DealChainState,
+    DealSubscription, TokenContract, PROBE_SEED_TOKENS, TICK_SIZE,
 };
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -92,24 +92,16 @@ impl CapacitySnapshot {
 
 /// How many delivered tokens may sit in memory before the durable record is rewritten.
 
-/// `record_delivered` moves tokens from `outstanding_reservation` to `local_delivered_after_anchor`;
-/// their SUM -- `CapacitySnapshot::committed` -- is unchanged, and the whole request reservation was
-/// already made durable by `reserve` BEFORE the first token could be delivered. So the funded-capacity
-/// ceiling, the only invariant `validate_record` enforces against the chain, never depends on how often
-/// this split reaches disk. Rewriting the record per token bought no safety and cost two fsyncs, a file
-/// create and a rename per token, which floors delivery at roughly 13k tokens/min on a real disk.
-
-/// What a coalesced write does risk is losing the SPLIT on a crash: up to this many delivered tokens
-/// stay classified as outstanding reservation. That direction is conservative -- capacity is retained,
-/// never released (see [`CapacityReservation`]), so the seller can only under-claim its own revenue,
-/// and the buyer is never exposed to over-delivery. Every request terminal flushes, so the loss window
-/// exists only for a crash mid-request.
+/// This compatibility path remains for callers that account incrementally. The gateway path
+/// instead commits one complete terminal bill through `finish_with_delivery`, without using this
+/// coalesced split.
 const CAPACITY_PERSIST_TOKEN_INTERVAL: u128 = 1_000;
 
 struct CapacityEntryState {
     record: DurableCapacityRecord,
     terminal: bool,
-    /// Delivered tokens applied to `record` in memory but not yet written to disk.
+    /// Delivered tokens applied to `record` in memory but not yet written to disk by the compatibility
+    /// incremental-accounting path.
     unpersisted_delivered: u128,
 }
 
@@ -119,11 +111,8 @@ struct CapacityEntry {
 }
 
 impl CapacityEntry {
-    /// Apply any coalesced delivered tokens to the record and make it durable.
-
-    /// Until this runs the tokens stay classified as outstanding reservation, so `committed` -- and
-    /// therefore the funded ceiling -- reads the same either way; only the split moves. Returns how
-    /// many delivered tokens became durable, which is the amount the caller may now claim against.
+    /// Apply any coalesced delivered tokens to the record and make it durable for the compatibility
+    /// incremental-accounting path.
     fn flush_delivered(&self, locked: &mut CapacityEntryState) -> Result<u64> {
         let pending = locked.unpersisted_delivered;
         if pending == 0 {
@@ -346,6 +335,9 @@ impl CapacityManager {
             return Err(ReserveError::Terminal);
         }
         validate_record(&locked.record).map_err(ReserveError::InvalidState)?;
+        if locked.record.local_delivered_after_anchor >= SELLER_UNCLAIMED_BILLABLE_RISK_LIMIT {
+            return Err(ReserveError::Exhausted);
+        }
         let available = CapacitySnapshot::from(&locked.record)
             .available()
             .map_err(ReserveError::InvalidState)?;
@@ -470,25 +462,66 @@ impl CapacityReservation {
         u64::try_from(remaining).expect("reservation is bounded by requested u64")
     }
 
-    /// Authorize output whose authoritative token count can only arrive AFTER it.
+    /// Atomically turn this request's whole durable billing reservation into one validated terminal
+    /// provider-usage total and release the unused remainder. No partial delivery split is persisted.
+    pub fn finish_with_delivery(&self, tokens: u64) -> Result<u64> {
+        if tokens == 0 {
+            bail!("terminal billable token total must be positive");
+        }
+        let mut request = self
+            .request
+            .lock()
+            .map_err(|_| anyhow!("{POISONED_LOCK_MESSAGE}: {CAPACITY_REQUEST_LOCK}"))?;
+        if request.finished {
+            bail!("capacity reservation already finished");
+        }
+        let tokens = u128::from(tokens);
+        if tokens > request.remaining {
+            bail!(
+                "terminal billable total {tokens} exceeds request reservation {}",
+                request.remaining
+            );
+        }
+        let mut locked = self
+            .entry
+            .state
+            .lock()
+            .map_err(|_| anyhow!("{POISONED_LOCK_MESSAGE}: {CAPACITY_ENTRY_STATE_LOCK}"))?;
+        if locked.terminal {
+            bail!("deal capacity became terminal");
+        }
+        if locked.unpersisted_delivered != 0 {
+            bail!("terminal billing cannot follow partial per-chunk delivery accounting");
+        }
+        let mut candidate = locked.record.clone();
+        candidate.outstanding_reservation = candidate
+            .outstanding_reservation
+            .checked_sub(request.remaining)
+            .ok_or_else(|| anyhow!("aggregate reservation underflow"))?;
+        candidate.local_delivered_after_anchor = candidate
+            .local_delivered_after_anchor
+            .checked_add(tokens)
+            .ok_or_else(|| anyhow!("local billable counter overflows uint128"))?;
+        validate_record(&candidate)?;
+        persist_candidate(self.entry.path.as_deref(), &candidate)?;
+        locked.record = candidate;
+        request.remaining = 0;
+        request.finished = true;
+        u64::try_from(tokens).map_err(|_| anyhow!("terminal billable total does not fit u64"))
+    }
 
-    /// The separate-usage shape -- content deltas first, one usage figure at the end -- is what every
-    /// shipped adapter produces, so on that branch there is no number to record before the chunk
-    /// crosses to the buyer. What there always is, is this reservation: it was made durable before the
-    /// upstream could observe the request, and it is the exact ceiling of what the request may still
-    /// bill. Once it holds nothing, every further token is output the seller can never claim
-    /// ([`Self::record_delivered`] refuses it), so the exposure must stop at the last token that could
-    /// still be paid for rather than continue and be reconciled into a refusal afterwards.
+    /// Compatibility gate for callers that still expose output before authoritative usage arrives.
+
+    /// The gateway path does not call this method: it validates one typed terminal usage record
+    /// and commits it atomically through [`Self::finish_with_delivery`]. This method remains for API
+    /// compatibility with incremental-accounting consumers.
 
     /// `min_billable` is what this upstream has already charged for one run of unaccounted output on
     /// this stream, and zero before it has charged anything. Asking only whether the reservation is
     /// non-empty refuses at exactly zero and nowhere else, so a reservation that lands short of the
     /// next run rather than on top of it still exposes one run it cannot bill: the seller has to be
     /// able to pay what this upstream has already shown a run costs, not merely one token.
-    pub fn authorize_exposure(
-        &self,
-        min_billable: u64,
-    ) -> std::result::Result<(), ReserveError> {
+    pub fn authorize_exposure(&self, min_billable: u64) -> std::result::Result<(), ReserveError> {
         let request = self.request.lock().map_err(|_| {
             ReserveError::InvalidState(anyhow!("{POISONED_LOCK_MESSAGE}: {CAPACITY_REQUEST_LOCK}"))
         })?;
@@ -498,12 +531,10 @@ impl CapacityReservation {
         Ok(())
     }
 
-    /// Record delivered tokens and return how many became DURABLE in this call.
+    /// Compatibility API: record an incremental billable delta and return how much became durable.
 
-    /// The caller must not advance the claim-driving counter past the returned total: `reconcile_deal`
-    /// refuses a `tokensPending` that ran beyond durable local delivery, so claiming a token whose
-    /// delivery a crash could erase would strand the deal. Coalescing therefore delays the counter, it
-    /// never lets it lead -- every request terminal flushes and returns the remainder.
+    /// The gateway path commits only a complete provider-native terminal bill through
+    /// [`Self::finish_with_delivery`]; this per-delta path remains for API compatibility.
     pub fn record_delivered(&self, tokens: u64) -> Result<u64> {
         if tokens == 0 {
             bail!("authoritative delivered delta must be positive");
@@ -553,8 +584,8 @@ impl CapacityReservation {
         Ok(durable)
     }
 
-    /// Release a request's exact unused remainder. Used for both clean completion and an interrupted stream
-    /// whose every successfully forwarded output already had an authoritative token count.
+    /// Release a request's exact unused remainder. The gateway uses this only when a request
+    /// failed before any billable total could be accepted.
     /// Returns the delivered tokens that became durable in this call (see [`Self::record_delivered`]).
     pub fn finish_exact(&self) -> Result<u64> {
         let mut request = self
@@ -1064,9 +1095,9 @@ mod tests {
         assert_invariant(CapacitySnapshot::from(&durable));
     }
 
-    /// MEASUREMENT INSTRUMENT (not a CI gate): per-delivered-token cost of the durable capacity
-    /// record, reported by decade. `record_delivered(1)` is exactly what the gateway relay calls
-    /// once per forwarded chunk, and an OpenAI-compatible SSE stream is one token per chunk.
+    /// MEASUREMENT INSTRUMENT (not a CI gate): per-delta cost of the durable compatibility path,
+    /// reported by decade. The gateway does not call `record_delivered`; this instrument is
+    /// retained for callers of the public incremental-accounting API.
 
     /// PERF_N=200000 cargo test -p dexdo --release --lib \
     /// seller::capacity::tests::measure_delivery_persist_by_decade -- --ignored --nocapture
@@ -1139,6 +1170,75 @@ mod tests {
             manager.reserve(&tc, 1),
             Err(ReserveError::Exhausted)
         ));
+    }
+
+    /// E2E-ROW: E2E-UPS-40/L0
+    #[test]
+    fn next_request_is_gated_at_one_tick_and_reopens_after_claim_reconciliation() {
+        let manager = CapacityManager::in_memory();
+        let tc = "0:billable-risk-gate".to_string();
+        manager
+            .reconcile_deal(&tc, state(true, TICK_SIZE), ordinary(ORDINARY_FUNDED))
+            .unwrap();
+
+        let below_limit = (SELLER_UNCLAIMED_BILLABLE_RISK_LIMIT - 1) as u64;
+        let first = manager.reserve(&tc, below_limit).unwrap();
+        assert_eq!(
+            first.finish_with_delivery(below_limit).unwrap(),
+            below_limit
+        );
+        assert_eq!(
+            manager
+                .reserve(&tc, 1)
+                .unwrap()
+                .finish_with_delivery(1)
+                .unwrap(),
+            1,
+            "the already-admitted request completes across the risk boundary"
+        );
+
+        assert!(matches!(
+            manager.reserve(&tc, 1),
+            Err(ReserveError::Exhausted)
+        ));
+
+        let reconciled = manager
+            .reconcile_deal(
+                &tc,
+                state(true, TICK_SIZE + SELLER_UNCLAIMED_BILLABLE_RISK_LIMIT),
+                ordinary(ORDINARY_FUNDED),
+            )
+            .unwrap()
+            .unwrap();
+        assert_eq!(reconciled.local_delivered_after_anchor, 0);
+        assert_eq!(manager.reserve(&tc, 1).unwrap().amount(), 1);
+    }
+
+    proptest! {
+        #[test]
+        fn admission_risk_gate_matches_the_durable_one_tick_boundary(
+            backlog in 0_u32..=SELLER_UNCLAIMED_BILLABLE_RISK_LIMIT as u32,
+        ) {
+            let manager = CapacityManager::in_memory();
+            let tc = "0:billable-risk-property".to_string();
+            manager
+                .reconcile_deal(&tc, state(true, TICK_SIZE), ordinary(ORDINARY_FUNDED))
+                .unwrap();
+            if backlog > 0 {
+                let accepted = manager.reserve(&tc, u64::from(backlog)).unwrap();
+                accepted.finish_with_delivery(u64::from(backlog)).unwrap();
+            }
+
+            let admission = manager.reserve(&tc, 1);
+            if u128::from(backlog) < SELLER_UNCLAIMED_BILLABLE_RISK_LIMIT {
+                prop_assert!(admission.is_ok());
+            } else {
+                prop_assert!(matches!(
+                    admission,
+                    Err(ReserveError::Exhausted)
+                ));
+            }
+        }
     }
 
     #[test]
@@ -1977,10 +2077,9 @@ mod tests {
     }
 
     /// The gateway's own recorder (`seller::gateway::CapacityDeliveryRecorder`) is private to that module,
-    /// so this reproduces exactly its reservation contract and nothing else: a delivered delta advances the
-    /// reservation, and the terminal CLASSIFICATION decides whether the unused remainder comes back
-    /// (`finish_exact`) or stays committed forever (`finish_ambiguous`). The classification itself is
-    /// asserted separately, so neither half can drift unnoticed.
+    /// so this reproduces exactly its reservation contract and nothing else: clean terminal usage atomically
+    /// commits its total, while an unsuccessful terminal classification either releases the grant or keeps
+    /// the unresolved reservation committed.
     #[derive(Clone)]
     struct RelayRecorder {
         reservation: std::sync::Arc<CapacityReservation>,
@@ -1996,14 +2095,13 @@ mod tests {
         ) -> std::result::Result<(), tonic::Status> {
             use crate::seller::gateway::{AuthoritativeDeliveryEvent, AuthoritativeDeliveryFinish};
             match event {
-                AuthoritativeDeliveryEvent::Delivered(tokens) => {
-                    self.reservation.record_delivered(tokens.get()).unwrap();
+                AuthoritativeDeliveryEvent::Completed(tokens) => {
+                    self.reservation.finish_with_delivery(tokens.get()).unwrap();
                 }
                 AuthoritativeDeliveryEvent::Finished(finish) => {
                     *self.finish.lock().unwrap() = Some(finish);
                     match finish {
-                        AuthoritativeDeliveryFinish::Clean
-                        | AuthoritativeDeliveryFinish::Interrupted => {
+                        AuthoritativeDeliveryFinish::Interrupted => {
                             self.reservation.finish_exact().unwrap()
                         }
                         AuthoritativeDeliveryFinish::AmbiguousUsage => {
@@ -2109,7 +2207,7 @@ mod tests {
             qwen_upstream,
             "data: {\"model\":\"qwen/qwen3-32b\",\"choices\":[{\"delta\":{\"role\":\"assistant\",\"content\":\"first \"}}]}\n\n\
              data: {\"model\":\"meta-llama/llama-3.3-70b-versatile\",\"choices\":[{\"delta\":{\"content\":\"second\"}}]}\n\n\
-             data: {\"choices\":[],\"usage\":{\"completion_tokens\":2}}\n\n\
+             data: {\"choices\":[],\"usage\":{\"prompt_tokens\":1,\"completion_tokens\":2,\"total_tokens\":3}}\n\n\
              data: [DONE]\n\n"
                 .to_string(),
         )
@@ -2117,8 +2215,9 @@ mod tests {
 
         let delivered: Vec<String> = received
             .iter()
-            .map(|item| match item {
-                Ok(chunk) => chunk.text.clone(),
+            .filter_map(|item| match item {
+                Ok(chunk) if chunk.usage.is_none() => Some(chunk.text.clone()),
+                Ok(_) => None,
                 Err(status) => panic!(
                     ": a provider that renamed itself after the first delivered chunk tore the \
                      stream down: {status:?}"
@@ -2127,17 +2226,15 @@ mod tests {
             .collect();
         assert_eq!(delivered, vec!["first ".to_string(), "second".to_string()]);
         assert_eq!(
-            finish,
-            Some(crate::seller::gateway::AuthoritativeDeliveryFinish::Clean),
-            ": the classification that burns the reservation is AmbiguousUsage; a late identity \
-             divergence must never produce it"
+            finish, None,
+            ": successful completion uses the single atomic Completed transition"
         );
         assert_eq!(
             durable.outstanding_reservation, 0,
             ": the unused remainder of the buyer's grant came back"
         );
         assert_eq!(
-            durable.local_delivered_after_anchor, 2,
+            durable.local_delivered_after_anchor, 3,
             "the provider's own terminal total is what was delivered and is claimable"
         );
         assert_invariant(CapacitySnapshot::from(&durable));
@@ -2162,7 +2259,7 @@ mod tests {
                 ..crate::seller::OpenAiConfig::default()
             },
             "data: {\"model\":\"Qwen/Qwen3-32B\",\"choices\":[{\"delta\":{\"content\":\"served\"}}]}\n\n\
-             data: {\"choices\":[],\"usage\":{\"completion_tokens\":1}}\n\n\
+             data: {\"choices\":[],\"usage\":{\"prompt_tokens\":1,\"completion_tokens\":1,\"total_tokens\":2}}\n\n\
              data: [DONE]\n\n"
                 .to_string(),
         )
@@ -2170,8 +2267,9 @@ mod tests {
 
         let delivered: Vec<String> = received
             .iter()
-            .map(|item| match item {
-                Ok(chunk) => chunk.text.clone(),
+            .filter_map(|item| match item {
+                Ok(chunk) if chunk.usage.is_none() => Some(chunk.text.clone()),
+                Ok(_) => None,
                 Err(status) => panic!(
                     ": a model declared through identity_aliases was refused as a substitution: \
                      {status:?}"
@@ -2180,9 +2278,8 @@ mod tests {
             .collect();
         assert_eq!(delivered, vec!["served".to_string()]);
         assert_eq!(
-            finish,
-            Some(crate::seller::gateway::AuthoritativeDeliveryFinish::Clean),
-            ": the declared alias is the same model, so the request ends cleanly"
+            finish, None,
+            ": the declared alias completes through the single atomic transition"
         );
         assert_eq!(durable.outstanding_reservation, 0);
         assert_invariant(CapacitySnapshot::from(&durable));

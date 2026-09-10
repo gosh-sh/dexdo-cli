@@ -34,7 +34,9 @@ fn depth_provenance_preserves_level_rows_and_order() {
     let response = depth();
     let before = render_depth_table(&response, ENDPOINT);
     let after = render_depth_output(&response, ENDPOINT, AS_OF);
-    let (_, table) = after.split_once('\n').expect("provenance before depth table");
+    let (_, table) = after
+        .split_once('\n')
+        .expect("provenance before depth table");
 
     assert_eq!(table, before);
     assert_eq!(

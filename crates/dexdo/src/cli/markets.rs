@@ -8,13 +8,16 @@ use crate::cli::commands::{
 use crate::cli::commands::{
     direct_chain_read_with_timeout, enforce_model_registry_policy,
     load_enabled_model_registry_policy, preload_model_registry_policy, read_executable_book_target,
-    resolve_model_registry_target, resolve_registry_content_identity, target_from_market, BookTarget,
+    resolve_model_registry_target, resolve_registry_content_identity, target_from_market,
+    BookTarget,
 };
 use crate::cli::machine;
 use anyhow::bail;
 use anyhow::Context;
 use anyhow::Result;
-use dexdo::registry::{BuyerMissingBookPolicy, RegistryBookAction, RegistryRole, RegistrySuggestions};
+use dexdo::registry::{
+    BuyerMissingBookPolicy, RegistryBookAction, RegistryRole, RegistrySuggestions,
+};
 use dexdo_core::address as addr;
 use dexdo_core::OrderBookSnapshot;
 use dexdo_core::{model_hash_for, ChainBackend, DobParams, MockChainBackend};
@@ -295,24 +298,28 @@ pub(crate) async fn run_markets_address(args: MarketsAddressArgs) -> Result<()> 
     let manifest = crate::cli::commands::manifest_path()?;
     let network = dexdo_core::Deployed::load(&manifest)
         .with_context(|| {
-            format!("read the deployed-contracts manifest {}", manifest.display())
+            format!(
+                "read the deployed-contracts manifest {}",
+                manifest.display()
+            )
         })?
         .network;
     // step 6: a direct chain read ends inside the configured bound, never hangs.
-    let registry_model = direct_chain_read_with_timeout(args.read_timeout.read_timeout_secs, async {
-        // Compute: this command's whole output is the answer, so its refusal is read by someone
-        // who has been stopped -- and the warning paths now name THIS command as where the list
-        // comes from, which would be a lie if it did not produce one.
-        resolve_registry_content_identity(
-            RegistryRole::Buyer,
-            &manifest,
-            None,
-            &args.model,
-            RegistrySuggestions::Compute,
-        )
-        .await
-    })
-    .await?;
+    let registry_model =
+        direct_chain_read_with_timeout(args.read_timeout.read_timeout_secs, async {
+            // Compute: this command's whole output is the answer, so its refusal is read by someone
+            // who has been stopped -- and the warning paths now name THIS command as where the list
+            // comes from, which would be a lie if it did not produce one.
+            resolve_registry_content_identity(
+                RegistryRole::Buyer,
+                &manifest,
+                None,
+                &args.model,
+                RegistrySuggestions::Compute,
+            )
+            .await
+        })
+        .await?;
 
     let model_hash = model_hash_for(&registry_model);
     let order_book = addr::display(
@@ -357,7 +364,9 @@ mod tests {
         let production = source
             .split_once("#[cfg(test)]\nmod tests")
             .map_or(source, |(before, _)| before);
-        let calls = production.matches("direct_chain_read_with_timeout(").count();
+        let calls = production
+            .matches("direct_chain_read_with_timeout(")
+            .count();
         assert_eq!(
             calls, 2,
             "one per command and no more. Two commands live here; a third call means one of them \

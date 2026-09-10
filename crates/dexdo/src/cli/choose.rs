@@ -47,7 +47,11 @@ pub(crate) fn title(text: &str) -> String {
 /// interview that looks like it will be asked again at every command is one an operator dreads,
 /// and the shape says otherwise before the words do.
 pub(crate) fn note(lines: &[&str]) -> String {
-    let width = lines.iter().map(|line| line.chars().count()).max().unwrap_or(0);
+    let width = lines
+        .iter()
+        .map(|line| line.chars().count())
+        .max()
+        .unwrap_or(0);
     use crate::cli::style::{self, Role};
     let palette = palette();
     let rule = |left: &str, right: &str| {
@@ -87,7 +91,10 @@ pub(crate) fn aside(text: &str) -> String {
     if crate::cli::no_color_requested() {
         return format!("  {text}");
     }
-    format!("  {}", crate::cli::style::paint(palette(), crate::cli::style::Role::Meta, text))
+    format!(
+        "  {}",
+        crate::cli::style::paint(palette(), crate::cli::style::Role::Meta, text)
+    )
 }
 
 /// One field of a result: two spaces, the label, then the value at a fixed column.
@@ -101,7 +108,11 @@ pub(crate) fn aside(text: &str) -> String {
 /// compile. Dead by the compiler's reckoning is not dead across the branches that are in flight.
 #[allow(dead_code)]
 pub(crate) fn field(label: &str, value: &str) -> String {
-    format!("  {:<FIELD_WIDTH$}{value}", format!("{label}:"), FIELD_WIDTH = FIELD_WIDTH)
+    format!(
+        "  {:<FIELD_WIDTH$}{value}",
+        format!("{label}:"),
+        FIELD_WIDTH = FIELD_WIDTH
+    )
 }
 
 /// A continuation of the field above, aligned under its value rather than under its label.
@@ -651,12 +662,8 @@ mod tests {
         let painted = menu.painted(true);
         assert!(painted[0].contains("\u{276f} a"), "{:?}", painted[0]);
         let opener = |role| {
-            crate::cli::style::paint(
-                crate::cli::style::Palette::resolved(true, false),
-                role,
-                "",
-            )
-            .replace(RESET, "")
+            crate::cli::style::paint(crate::cli::style::Palette::resolved(true, false), role, "")
+                .replace(RESET, "")
         };
         assert!(
             painted[0].starts_with(&opener(crate::cli::style::Role::Id)),
@@ -669,7 +676,10 @@ mod tests {
             painted[1]
         );
         for line in painted {
-            assert!(line.ends_with(RESET), "every painted line closes its colour");
+            assert!(
+                line.ends_with(RESET),
+                "every painted line closes its colour"
+            );
         }
     }
 

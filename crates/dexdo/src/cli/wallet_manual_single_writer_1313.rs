@@ -72,7 +72,10 @@ fn without_whitespace(source: &str) -> String {
 /// and not in the thing counted. Every spelling below is the same call.
 #[test]
 fn the_count_is_blind_to_what_sits_between_a_name_and_its_arguments() {
-    assert_eq!(applications_of("write(a); write (a); write\n(a);", "write"), 3);
+    assert_eq!(
+        applications_of("write(a); write (a); write\n(a);", "write"),
+        3
+    );
     assert_eq!(applications_of("write\t(a);\r\n write  (a);", "write"), 2);
     assert_eq!(
         applications_of("rewrite(a); write_twice(a); writer(a);", "write"),

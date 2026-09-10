@@ -64,8 +64,14 @@ fn the_line_separates_no_market_from_an_empty_one() {
 /// pass against a hard-coded sentence, which is the failure mode these three assertions invite.
 #[test]
 fn the_line_is_built_from_its_arguments() {
-    let other = render_book_not_deployed("gpt-oss-20b", "0:1111111111111111111111111111111111111111111111111111111111111111");
-    assert!(other.contains("gpt-oss-20b") && other.contains("1111111111"), "{other}");
+    let other = render_book_not_deployed(
+        "gpt-oss-20b",
+        "0:1111111111111111111111111111111111111111111111111111111111111111",
+    );
+    assert!(
+        other.contains("gpt-oss-20b") && other.contains("1111111111"),
+        "{other}"
+    );
     assert!(
         !other.contains(MODEL) && !other.contains("05cfd1a8"),
         "the previous subject leaked into this one: {other}"

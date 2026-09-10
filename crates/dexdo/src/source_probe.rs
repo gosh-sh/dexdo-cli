@@ -63,7 +63,9 @@ pub(crate) fn body_of<'a>(source: &'a str, signature: &str) -> &'a str {
         // silently narrows to a fragment where its second call no longer appears.
         match bytes[index] {
             b'/' if bytes.get(index + 1) == Some(&b'/') => {
-                index += rest[index..].find('\n').map_or(bytes.len() - index, |n| n + 1);
+                index += rest[index..]
+                    .find('\n')
+                    .map_or(bytes.len() - index, |n| n + 1);
                 continue;
             }
             b'/' if bytes.get(index + 1) == Some(&b'*') => {
@@ -119,10 +121,11 @@ pub(crate) fn body_of<'a>(source: &'a str, signature: &str) -> &'a str {
             // that identifier start closes it -- `'a'` is a char, `'a,` and `'static` are not. A
             // multi-byte or escaped body (an accented letter, `'\n'`) falls through to the literal
             // branch, which is where it belongs.
-            b'\'' if bytes
-                .get(index + 1)
-                .is_some_and(|byte| byte.is_ascii_alphabetic() || *byte == b'_')
-                && bytes.get(index + 2) != Some(&b'\'') =>
+            b'\''
+                if bytes
+                    .get(index + 1)
+                    .is_some_and(|byte| byte.is_ascii_alphabetic() || *byte == b'_')
+                    && bytes.get(index + 2) != Some(&b'\'') =>
             {
                 index += 1;
                 continue;
@@ -181,7 +184,7 @@ pub(crate) fn code_of(source: &str, signature: &str) -> String {
             b'/' if bytes.get(index + 1) == Some(&b'/') => {
                 // Keep the newline: two statements must not fuse into one line, or an order guard
                 // reading line numbers would see them at the same place.
-                index += body[index..].find('\n').map_or(bytes.len() - index, |n| n);
+                index += body[index..].find('\n').unwrap_or(bytes.len() - index);
                 continue;
             }
             b'/' if bytes.get(index + 1) == Some(&b'*') => {
@@ -225,10 +228,11 @@ pub(crate) fn code_of(source: &str, signature: &str) -> String {
                 index += 1;
                 continue;
             }
-            b'\'' if bytes
-                .get(index + 1)
-                .is_some_and(|byte| byte.is_ascii_alphabetic() || *byte == b'_')
-                && bytes.get(index + 2) != Some(&b'\'') =>
+            b'\''
+                if bytes
+                    .get(index + 1)
+                    .is_some_and(|byte| byte.is_ascii_alphabetic() || *byte == b'_')
+                    && bytes.get(index + 2) != Some(&b'\'') =>
             {
                 code.push('\'');
                 index += 1;
@@ -422,7 +426,10 @@ fn only() {
     /// caller of this seam is an ORDER guard that compares where calls appear.
     #[test]
     fn removing_a_comment_does_not_join_two_statements() {
-        let code = code_of("fn only() {\n    first(); // why\n second();\n}\n", "fn only");
+        let code = code_of(
+            "fn only() {\n    first(); // why\n second();\n}\n",
+            "fn only",
+        );
         let first = code
             .lines()
             .position(|line| line.contains("first();"))

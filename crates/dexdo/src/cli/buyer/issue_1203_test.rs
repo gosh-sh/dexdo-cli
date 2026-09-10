@@ -308,9 +308,11 @@ mod issue_1203 {
             &current.to_string(),
             Some(note_addr),
             &intent,
-            TICKS,
-            MAX_PRICE,
-            dexdo_core::required_escrow_for_buy(TICKS, MAX_PRICE),
+            super::super::BuyerOrderTerms {
+                ticks: TICKS,
+                max_price: MAX_PRICE,
+                escrow: dexdo_core::required_escrow_for_buy(TICKS, MAX_PRICE),
+            },
         ))
     }
 

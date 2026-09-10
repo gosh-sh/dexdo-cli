@@ -92,7 +92,11 @@ fn child_test_filter() -> String {
 /// IS an unbounded wait, so an acquisition called directly would let a reintroduced wedge hang the
 /// suite forever instead of failing it -- and a test that hangs reports nothing at all. `None` means
 /// the call never came back within `ceiling`, which is the wedge itself.
-fn acquire_within(wallet: &str, timeout: Duration, ceiling: Duration) -> Option<Result<(), String>> {
+fn acquire_within(
+    wallet: &str,
+    timeout: Duration,
+    ceiling: Duration,
+) -> Option<Result<(), String>> {
     let (report, collect) = std::sync::mpsc::channel();
     let wallet = wallet.to_string();
     std::thread::spawn(move || {

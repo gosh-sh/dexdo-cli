@@ -4,8 +4,9 @@
 
 //! Request path (B19): receive -> build `CanonRequest` -> route to the (mock) seller ->
 //! authorized TLS gRPC stream -> receive `CanonChunk` -> re-render to SSE in the desired format.
-//! Tick accounting/verification happen on the canonical stream BEFORE re-rendering
-//! ([`crate::buyer::verify::StreamVerifier`]).
+//! Canonical verification and the visible-output cap are enforced BEFORE re-rendering
+//! ([`crate::buyer::verify::StreamVerifier`]); monetary accounting waits for validated terminal
+//! input-plus-output usage and clean EOF.
 
 //! The model is forced by the market/frame (B2, B19): the request's `model` field is NOT trusted;
 //! a request outside the configured model frame is rejected. Any API key is accepted: this is a
@@ -289,7 +290,7 @@ pub struct SubscriptionWeeklyBudget {
     /// One reconciliation at a time; the losers read the ceiling the winner published.
     refresh_lock: Mutex<()>,
     /// The cumulative claim this route's local counter measures FROM: `tokensPending` as it stood
-    /// when the route was built and `delivered_tokens` was zero. Fixed for the life of the deal.
+    /// when the route was built and `billable_tokens` was zero. Fixed for the life of the deal.
 
     /// Everything the contract bounds is CUMULATIVE, and the local counter is not - so the two are
     /// only comparable through this one baseline. `anchor + delivered` is what the deal has actually
@@ -320,8 +321,8 @@ pub struct SubscriptionWeeklyBudget {
 
 /// What the pre-request admission gate decided.
 enum RouteBudget {
-    /// Tokens this request has RESERVED against the route. Holding it is what keeps a concurrent
-    /// request from being handed the same remainder; dropping it returns whatever was not delivered.
+    /// Billable tokens this request has reserved against the route. Holding it serializes requests
+    /// on one deal; dropping it returns the part not accepted by terminal usage.
     Admitted(RouteReservation),
     /// Nothing is deliverable; the payload is the operator-facing reject text.
     Exhausted(String),
@@ -329,9 +330,9 @@ enum RouteBudget {
 
 /// An admitted request's claim on the route's remaining tokens.
 
-/// Reservation happens once, atomically, before the model is contacted - `granted` is the request's
-/// hard output cap. What the stream does not use comes back when this is dropped, so an over-asking
-/// request cannot strand the week's quota.
+/// Reservation happens once, atomically, before the model is contacted. `granted` is the total
+/// input+output billing grant, not the output cap; the consumer's `max_tokens` remains output-only.
+/// What terminal usage does not consume comes back when this is dropped.
 struct RouteReservation {
     reserved: Arc<AtomicU64>,
     granted: u64,
@@ -340,16 +341,16 @@ struct RouteReservation {
 
 impl RouteReservation {
     fn remaining(&self) -> u64 {
-        self.granted.checked_sub(self.used).unwrap_or(0)
+        self.granted.saturating_sub(self.used)
     }
 
-    fn checked_used_after(&self, delivered: u64) -> Result<u64, String> {
+    fn checked_used_after(&self, billable: u64) -> Result<u64, String> {
         self.used
-            .checked_add(delivered)
+            .checked_add(billable)
             .filter(|used| *used <= self.granted)
             .ok_or_else(|| {
                 format!(
-                    "accepted output of {delivered} tokens does not fit the held route reservation: \
+                    "accepted billable usage of {billable} tokens does not fit the held route reservation: \
                      {} used of {} granted",
                     self.used, self.granted
                 )
@@ -363,19 +364,11 @@ impl Drop for RouteReservation {
     }
 }
 
-/// Tell the seller the limit this request was actually ADMITTED for.
+/// Tell the seller the request's output-only limit.
 
-/// Admission reserves `granted` against the authoritative weekly ceiling, which is usually smaller
-/// than the caller's own `max_tokens`. Sending the caller's figure upstream asks the seller to
-/// produce output nobody reserved: the buyer's hard cap then has to throw the excess away, and a
-/// single legal multi-token chunk straddling the remaining allowance wastes the whole request. The
-/// grant belongs on the wire, not only in the buyer's bookkeeping.
-
-/// Returns the figure it actually wrote, which is what the buyer then enforces on the way back.
-/// Since the grant can be LARGER than the caller's own limit -- admission reserves the deal's
-/// unpaid identity verification on top of the ask, and whatever verification leaves unspent stays in
-/// the reservation. That remainder is headroom the deal has already paid for, not output the caller
-/// asked for, so the receiving cap is this figure and not the whole remaining grant.
+/// Admission now holds the whole free route remainder because provider-native input usage is unknown.
+/// That billing grant is sent separately. This function only clamps canonical `max_tokens` to the
+/// consumer's requested output and the available grant, and returns the output cap enforced on reply.
 fn cap_canon_to_grant(canon: &mut dexdo_proto::CanonRequest, granted: u64) -> u64 {
     let granted = u32::try_from(granted).unwrap_or(u32::MAX);
     let capped = match canon.params.as_mut() {
@@ -728,11 +721,15 @@ pub struct ApiDeal {
     pub route: Route,
     pub session: Arc<SessionSettle>,
     pub content_gate: Arc<ContentGate>,
-    delivered_tokens: Arc<AtomicU64>,
-    /// Tokens handed out to admitted requests, delivered or still in flight. Admission moves this and
+    billable_tokens: Arc<AtomicU64>,
+    /// Cumulative accepted output delivery kept separately with the legacy v2 accounting rule
+    /// (`max(token_ids.len(), 1)` per accepted content chunk). It is observational only; monetary
+    /// accounting uses `billable_tokens`.
+    route_visible_output_tokens: Arc<AtomicU64>,
+    /// Billable tokens handed out to admitted requests, used or still in flight. Admission moves this and
     /// nothing else, so two requests can never be handed the same remainder.
-    reserved_tokens: Arc<AtomicU64>,
-    /// Live ceiling on the CUMULATIVE `delivered_tokens` counter. An ordinary deal pins it to
+    reserved_billable_tokens: Arc<AtomicU64>,
+    /// Live ceiling on the CUMULATIVE `billable_tokens` counter. An ordinary deal pins it to
     /// `route.max_tokens` for the life of the deal; a subscription republishes it from the contract's
     /// own claim ceiling every time a week boundary is BOOKED.
     token_ceiling: Arc<AtomicU64>,
@@ -746,16 +743,20 @@ pub struct ApiDeal {
 impl ApiDeal {
     pub fn new(route: Route, session: Arc<SessionSettle>, content_gate: Arc<ContentGate>) -> Self {
         let token_ceiling = Arc::new(AtomicU64::new(route.max_tokens));
-        // hand the session the very counter this route accounts delivery against, so its
-        // implicit terminals are bounded by delivered work rather than by the session existing.
-        let delivered_tokens = Arc::new(AtomicU64::new(0));
-        session.bind_route_delivery(delivered_tokens.clone());
+        // Keep monetary billing and the stable v2/ delivery witness distinct: provider-native
+        // usage advances the former only after clean terminal validation, while every accepted
+        // content chunk advances the latter immediately.
+        let billable_tokens = Arc::new(AtomicU64::new(0));
+        let route_visible_output_tokens = Arc::new(AtomicU64::new(0));
+        session.bind_route_billing(billable_tokens.clone());
+        session.bind_route_delivery(route_visible_output_tokens.clone());
         Self {
             route,
             session,
             content_gate,
-            delivered_tokens,
-            reserved_tokens: Arc::new(AtomicU64::new(0)),
+            billable_tokens,
+            route_visible_output_tokens,
+            reserved_billable_tokens: Arc::new(AtomicU64::new(0)),
             token_ceiling,
             weekly: None,
             last_accepted_output_unix_secs: Arc::new(AtomicU64::new(0)),
@@ -772,11 +773,26 @@ impl ApiDeal {
         self
     }
 
-    /// Cumulative tokens this route has delivered. Production never reads it -- the ceiling and the
+    /// Cumulative input+output tokens this route has billed. Production never reads it -- the ceiling and the
     /// reservation are what callers act on -- so it exists only where its one consumer does.
     #[cfg(test)]
-    fn delivered_tokens(&self) -> u64 {
-        self.delivered_tokens.load(Ordering::SeqCst)
+    fn billable_tokens(&self) -> u64 {
+        self.billable_tokens.load(Ordering::SeqCst)
+    }
+
+    /// Record one accepted legacy-accounted output chunk for the stable buyer-event v2 high-water.
+    /// This counter is deliberately independent of the terminal input+output monetary counter.
+    pub(crate) fn record_visible_output(&self, tokens: u64) -> Result<(), String> {
+        self.route_visible_output_tokens
+            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |visible| {
+                visible.checked_add(tokens)
+            })
+            .map(|_| ())
+            .map_err(|_| "cumulative visible-output accounting overflow".to_string())
+    }
+
+    pub(crate) fn route_visible_output_tokens(&self) -> u64 {
+        self.route_visible_output_tokens.load(Ordering::SeqCst)
     }
 
     /// Tokens still deliverable under the published ceiling -- what has NOT been handed to a request.
@@ -784,14 +800,17 @@ impl ApiDeal {
         if self.weekly.as_ref().is_some_and(|w| w.is_terminal()) {
             return 0;
         }
-        self.admission_ceiling()
-            .saturating_sub(self.reserved_tokens.load(Ordering::SeqCst))
+        // This public snapshot has no fresh chain observation. Use the post-probe ordinary ceiling;
+        // request admission applies the authoritative pre-probe clamp immediately after its required
+        // chain read.
+        self.admission_ceiling(true)
+            .saturating_sub(self.reserved_billable_tokens.load(Ordering::SeqCst))
     }
 
     /// The contract admits at most its canonical trial tick until `acceptProbe` has been observed
     /// and this route's anchor/ceiling cutover is complete. The buyer enforces that cap independently
     /// of the seller's capacity recorder, including while the acceptance snapshot is in flight.
-    fn admission_ceiling(&self) -> u64 {
+    fn admission_ceiling(&self, probe_accepted: bool) -> u64 {
         // The canonical trial tick as a token count. `TICK_SIZE` is a `u128` only because the
         // contract's cumulative counters are; the canon value fits a `u64` counter exactly, and the
         // assertion is what keeps that a fact rather than an assumption.
@@ -811,38 +830,34 @@ impl ApiDeal {
             // deal, and a clamp that cannot fire reads as a protection while being none.
             return PROBE_TICK_TOKENS;
         }
-        self.token_ceiling.load(Ordering::SeqCst)
+        let published = self.token_ceiling.load(Ordering::SeqCst);
+        if self.weekly.is_none() && !probe_accepted {
+            // Before the trial tick is accepted, the seller's authoritative exposure ceiling is one
+            // tick. Sending the ordinary route's larger funded remainder as a billing grant would be
+            // rejected before the very request that makes probe acceptance reachable.
+            return published.min(PROBE_TICK_TOKENS);
+        }
+        published
     }
 
-    /// Take a request's tokens out of the published ceiling, atomically. `asked` is the caller's own
-    /// output limit; `None` asks for everything left.
+    /// Reserve the route's entire free billable remainder atomically. Provider input is unknown until
+    /// terminal usage, so concurrent requests on one deal cannot safely share this reservation.
 
-    /// A grant has two parts and they are not equal. The FLOOR is what the deal owes its
-    /// one-per-deal identity verification, which [`ContentGate::ensure_verified`] spends out of this
-    /// same reservation and nothing else; above it sits the answer's clamp. The clamp may be
-    /// SHORTENED -- a route with room for one token of a two-token ask still answers, with one token.
-    /// The floor may not: a grant that does not exceed it pays for the verification and delivers
-    /// nothing, so clamping down to it would admit precisely the paid-probe / zero-inference outcome
-    /// of. That is refused here instead, before any probe is sent.
-
-    /// Both are decided against ONE observation of the ceiling and one of the gate, re-read on every
-    /// attempt: a request that loses the compare-exchange recomputes what it owes and what is left
-    /// together, so a concurrent reservation can never leave it holding a floor it cannot cover. With
-    /// nothing owed the floor is zero and this is the ordinary "nothing left to hand out" refusal.
-    fn try_reserve(&self, asked: Option<u64>) -> Option<RouteReservation> {
-        let mut reserved = self.reserved_tokens.load(Ordering::SeqCst);
+    /// The full grant is needed because input cannot be predicted from `max_tokens`. The verification
+    /// floor still prevents consuming the last remainder on a probe that cannot be followed by an
+    /// answer. A compare-exchange loser recomputes both floor and free capacity; while the winner holds
+    /// the full remainder, every other request is refused, providing the one-in-flight invariant.
+    fn try_reserve(&self, probe_accepted: bool) -> Option<RouteReservation> {
+        let mut reserved = self.reserved_billable_tokens.load(Ordering::SeqCst);
         loop {
-            let ceiling = self.admission_ceiling();
+            let ceiling = self.admission_ceiling(probe_accepted);
             let free = ceiling.saturating_sub(reserved);
             let floor = self.content_gate.outstanding_verification_tokens();
-            let granted = match asked {
-                Some(asked) => asked.saturating_add(floor).min(free),
-                None => free,
-            };
+            let granted = free;
             if granted <= floor {
                 return None;
             }
-            match self.reserved_tokens.compare_exchange(
+            match self.reserved_billable_tokens.compare_exchange(
                 reserved,
                 reserved.saturating_add(granted),
                 Ordering::SeqCst,
@@ -850,7 +865,7 @@ impl ApiDeal {
             ) {
                 Ok(_) => {
                     return Some(RouteReservation {
-                        reserved: self.reserved_tokens.clone(),
+                        reserved: self.reserved_billable_tokens.clone(),
                         granted,
                         used: 0,
                     })
@@ -860,31 +875,32 @@ impl ApiDeal {
         }
     }
 
-    /// The pre-request admission gate: reserve this request's output cap, or say why not.
+    /// The pre-request admission gate: reserve the route's free billable remainder, or say why not.
 
-    /// An ordinary deal answers from its fixed funded budget. A subscription reconciles against the
-    /// chain first whenever its published week is spent OR has run out on the wall clock -- the second
-    /// is what stops an under-used week being carried across its boundary, and what makes the end of
-    /// the term reachable at all rather than leaving a stale positive remainder servable forever.
+    /// An ordinary deal exposes one tick until the authoritative open-state read observes an accepted
+    /// probe, then answers from its fixed funded budget. A subscription reconciles against the chain
+    /// first whenever its published week is spent OR has run out on the wall clock -- the second is what
+    /// stops an under-used week being carried across its boundary, and what makes the end of the term
+    /// reachable at all rather than leaving a stale positive remainder servable forever.
     /// Reconciliation books the boundary through the permissionless path and recomputes from the
     /// coherent state that comes back; a booking that is not due, or a read that fails, authorizes
     /// nothing.
+    #[cfg(test)]
     async fn admit(&self, requested: Option<u32>) -> RouteBudget {
-        // what a request ASKS for is not all it has to pay for. A deal that has not passed its
-        // one-per-deal identity verification owes those probe tokens too, and `ensure_verified`
-        // spends them out of THIS request's reservation and nothing else. Reserving only the
-        // caller's figure hands the first request a grant verification consumes whole, and the first
-        // real inference on a fresh deal is then refused for a zero grant -- the live 502 of. So
-        // `try_reserve` adds that debt to the ask as an unclampable floor, and an `Admitted` grant
-        // therefore always holds the whole verification AND a deliverable answer. Only the SIZE of
-        // the reservation changes, and only while the deal owes something: the gate reports zero once
-        // its verdict is cached, so every later request reserves exactly its ask. What verification
-        // does not spend returns to the route with the guard, and the answer still goes on the wire
-        // capped by the caller's own figure, so the slack is headroom for what the deal owed rather
-        // than licence to serve more than was asked.
-        let want = requested.map(u64::from).filter(|n| *n > 0);
+        self.admit_with_probe_observation(requested, true).await
+    }
+
+    /// Admit using the probe fact returned by the handler's mandatory authoritative open-state read.
+    async fn admit_with_probe_observation(
+        &self,
+        _requested: Option<u32>,
+        probe_accepted: bool,
+    ) -> RouteBudget {
+        // Provider-native input usage is not known before the terminal record. The admitted request therefore
+        // holds the whole free route remainder as its total billing grant; its canonical `max_tokens` remains
+        // an independent output-only cap. The reservation guard returns every unused token at request end.
         let Some(weekly) = self.weekly.as_ref() else {
-            return match self.try_reserve(want) {
+            return match self.try_reserve(probe_accepted) {
                 Some(reservation) => RouteBudget::Admitted(reservation),
                 None => RouteBudget::Exhausted(self.exhausted_reason()),
             };
@@ -902,7 +918,7 @@ impl ApiDeal {
             && !weekly.published_week_ran_out()
             && !weekly.anchored_before_probe()
         {
-            if let Some(reservation) = self.try_reserve(want) {
+            if let Some(reservation) = self.try_reserve(probe_accepted) {
                 return RouteBudget::Admitted(reservation);
             }
         }
@@ -912,16 +928,16 @@ impl ApiDeal {
             && !weekly.published_week_ran_out()
             && !weekly.anchored_before_probe()
         {
-            return match self.try_reserve(want) {
+            return match self.try_reserve(probe_accepted) {
                 Some(reservation) => RouteBudget::Admitted(reservation),
                 None => RouteBudget::Exhausted(self.exhausted_reason()),
             };
         }
         match weekly
-            .reconcile(&self.token_ceiling, &self.delivered_tokens)
+            .reconcile(&self.token_ceiling, &self.billable_tokens)
             .await
         {
-            Ok(()) => match self.try_reserve(want) {
+            Ok(()) => match self.try_reserve(probe_accepted) {
                 Some(reservation) => RouteBudget::Admitted(reservation),
                 None => RouteBudget::Exhausted(self.exhausted_reason()),
             },
@@ -941,22 +957,22 @@ impl ApiDeal {
         }
     }
 
-    /// Account delivered output without crossing the currently published global ceiling. Reached
-    /// only through [`ConsumerRequestGuard::record_delivered`], which validates the request's held
+    /// Account one terminal input+output total without crossing the published route ceiling. Reached
+    /// only through [`ConsumerRequestGuard::record_billing`], which validates the request's held
     /// reservation first and commits that reservation only after this atomic update succeeds.
-    fn record_delivered(&self, n: u64) -> Result<(), String> {
+    fn record_billable(&self, n: u64) -> Result<(), String> {
         let ceiling = self.token_ceiling.load(Ordering::SeqCst);
-        self.delivered_tokens
-            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |delivered| {
-                delivered.checked_add(n).filter(|next| *next <= ceiling)
+        self.billable_tokens
+            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |billable| {
+                billable.checked_add(n).filter(|next| *next <= ceiling)
             })
             .map(|_| ())
-            .map_err(|delivered| match delivered.checked_add(n) {
+            .map_err(|billable| match billable.checked_add(n) {
                 Some(next) => format!(
-                    "accepted output would raise cumulative delivery from {delivered} to {next} \
+                    "terminal usage would raise cumulative billing from {billable} to {next} \
                      tokens above the currently published route ceiling {ceiling}"
                 ),
-                None => "cumulative delivered-token accounting overflow".to_string(),
+                None => "cumulative billable-token accounting overflow".to_string(),
             })
     }
 
@@ -1011,8 +1027,8 @@ pub(crate) struct ConsumerRequestGuard {
     accepted_output_generation: Arc<AtomicU64>,
     session: Arc<SessionSettle>,
     failure_heartbeat: Option<dexdo_core::market::HeartbeatGuard>,
-    /// This request's slice of the route's remaining tokens. Dropped with the guard, which returns
-    /// whatever the stream did not deliver.
+    /// This request's whole free billing remainder. Dropped with the guard, which returns whatever
+    /// terminal input+output usage did not consume.
     reservation: Option<RouteReservation>,
 }
 
@@ -1028,27 +1044,26 @@ impl ConsumerRequestGuard {
             .unwrap_or(0)
     }
 
-    /// Account delivered output against BOTH the deal's cumulative counter and this request's
-    /// reservation, so the tokens it did not use come back to the week rather than being stranded.
-    fn record_delivered(&mut self, deal: &ApiDeal, delivered: u64) -> Result<(), String> {
+    /// Account one validated terminal input+output total against both the route and this request's
+    /// held billing reservation. Content chunks never call this money transition.
+    fn record_billing(&mut self, deal: &ApiDeal, billable: u64) -> Result<(), String> {
         // The existing anchor mutex is the acceptance cutover mutex. Every subscription chunk takes
         // it, including chunks from old reservations after the pre-probe flag has been cleared: a
         // chunk either commits before the cutover samples delivery, or validates the new ceiling.
         let _cutover = match deal.weekly.as_ref() {
             Some(weekly) => Some(weekly.claim_anchor.lock().map_err(|_| {
                 format!(
-                    "subscription {}: acceptance cutover lock is poisoned; refusing output",
+                    "subscription {}: acceptance cutover lock is poisoned; refusing billing",
                     display_token_contract(&deal.route.token_contract)
                 )
             })?),
             None => None,
         };
-        let reservation = self
-            .reservation
-            .as_mut()
-            .ok_or_else(|| "accepted output has no admitted route reservation".to_string())?;
-        let next_used = reservation.checked_used_after(delivered)?;
-        deal.record_delivered(delivered)?;
+        let reservation = self.reservation.as_mut().ok_or_else(|| {
+            "accepted billing usage has no admitted route reservation".to_string()
+        })?;
+        let next_used = reservation.checked_used_after(billable)?;
+        deal.record_billable(billable)?;
         reservation.used = next_used;
         Ok(())
     }
@@ -1216,21 +1231,13 @@ impl RouteManager {
     }
 }
 
-/// Canonical delivered-token count for a normalized chunk. Prefer structured token signals; a non-empty chunk
-/// with no token-level metadata still counts as one delivered token.
+/// Stable v2 output-delivery count for one accepted content chunk. Structured token ids retain
+/// their exact count; an accepted chunk without them retains the pre- one-token fallback.
 pub(crate) fn accounted_tokens(chunk: &CanonChunk) -> u64 {
     (chunk.token_ids.len() as u64).max(1)
 }
 
-/// What one finished consumer request actually delivered, in the figures the money path used.
-
-/// The seller bills on enqueue and the buyer accounts on render, and nothing on the wire joins the
-/// two, so the seller's count is `>=` the buyer's by construction. Closing that gap needs an
-/// acknowledgement the canon does not have. What the buyer CAN do without one is stop discarding
-/// its own half of the arithmetic: the grant a request was admitted under, what was rendered
-/// against it, and whether the render stopped short. A live campaign could establish that 28,000
-/// tokens were billed and never arrived precisely because these three numbers were never emitted;
-/// the next occurrence is attributable from the event alone.
+/// What one finished consumer request rendered and, on clean protocol completion, was billed.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RequestDelivery {
     /// The deal this request was served on.
@@ -1239,31 +1246,38 @@ pub struct RequestDelivery {
     pub protocol: &'static str,
     /// `true` for SSE, `false` for the aggregated single response.
     pub streamed: bool,
-    /// The token cap this request was admitted under - the figure that also reached the seller on
-    /// the wire, because `cap_canon_to_grant` puts it there.
-    pub grant_tokens: u64,
-    /// What this request accounted, which is what it was charged for. It is the token count of
-    /// every chunk that passed the grant, NOT the number of frames the renderer chose to emit: a
-    /// chunk carries as many tokens as the seller put in it, and a chunk with no text emits no
-    /// frame at all while still costing what it costs.
+    /// Total input+output capacity held for the request and sent on the wire.
+    pub billing_grant_tokens: u64,
+    /// Provider output cap sent independently in `CanonRequest.params.max_tokens`.
+    pub output_limit_tokens: u64,
+    /// Visible output-token lower bound rendered to the local caller.
+    pub visible_output_tokens: u64,
+    /// The request's stable v2 output-delivery count (`max(token_ids.len(), 1)` per accepted
+    /// content chunk), retained independently of provider-native billing usage.
     pub rendered_tokens: u64,
-    /// The deal's cumulative accounted delivery after this request, straight off the counter the
-    /// money path charges against. This is the figure canon bounds a claim by - "a timer
-    /// firing does not entitle the seller to consumption the buyer never received" - and until now
-    /// it existed only inside the process. Anything reconciling a seller's claim against delivery
-    /// has to read THIS, never a count of rendered frames.
+    /// The deal's cumulative stable v2 output-delivery count after this request. Like
+    /// `rendered_tokens`, it adds `max(token_ids.len(), 1)` for every accepted content chunk,
+    /// including metadata-only chunks, and remains independent of provider-native billing usage.
     pub route_delivered_tokens: Option<u64>,
+    /// Provider-native input usage, present only after a clean accepted terminal record.
+    pub input_tokens: Option<u64>,
+    /// Provider-native output usage, present only after a clean accepted terminal record.
+    pub output_tokens: Option<u64>,
+    /// Provider-native checked input+output usage charged for this request.
+    pub billable_tokens: Option<u64>,
+    /// The deal's cumulative accepted billable usage after this request.
+    pub route_billable_tokens: Option<u64>,
     /// The terminal value that went out on the wire
     /// (`stop`/`length`/`capacity`/`error`/`content_filter`, or
     /// `end_turn`/`max_tokens`/`error`/`refusal` on the Anthropic transcode).
     pub finish_reason: &'static str,
-    /// The render stopped because of THIS request's grant rather than because the seller was done:
-    /// either the next chunk did not fit what was left of it, or the grant was consumed exactly.
-    pub truncated_by_grant: bool,
-    /// The stream ended with part of the grant unspent. On its own this is not a fault - a model
+    /// The render stopped because the next content chunk did not fit the remaining output cap. Reaching
+    /// the cap exactly while the seller then ends cleanly does not by itself mark the answer truncated.
+    pub truncated_by_output_limit: bool,
+    /// The stream ended with part of the output cap unspent. On its own this is not a fault - a model
     /// that finishes early does exactly this - but it is also the shape a stream that dies in
     /// flight has, and without the figure on record the two cannot be told apart afterwards.
-    pub ended_before_grant: bool,
+    pub ended_before_output_limit: bool,
 }
 
 /// Which cumulative chain boundary a buyer-side delivery measurement observed.
@@ -1276,7 +1290,7 @@ pub enum BuyerClaimObservationKind {
     Claim,
 }
 
-/// Buyer-rendered/accounted delivery sampled immediately after a fresh cumulative chain high-water is read.
+/// Buyer-billed cumulative usage sampled immediately after a fresh chain high-water is read.
 
 /// The chain high-water is the join key for the seller's `claim_submitted` event. The buyer counter comes
 /// straight from the active [`ApiDeal`]'s bound [`SessionSettle`] counter, so the event does not re-derive
@@ -1288,6 +1302,7 @@ pub struct BuyerClaimObservation {
     pub cumulative_tokens: u128,
     pub last_claim_time: u64,
     pub route_delivered_tokens: Option<u64>,
+    pub route_billable_tokens: Option<u64>,
 }
 
 impl BuyerClaimObservation {
@@ -1305,6 +1320,7 @@ impl BuyerClaimObservation {
             "cumulative_tokens": self.cumulative_tokens.to_string(),
             "last_claim_time": self.last_claim_time,
             "route_delivered_tokens": self.route_delivered_tokens.map(|value| value.to_string()),
+            "route_billable_tokens": self.route_billable_tokens.map(|value| value.to_string()),
         })
     }
 }
@@ -1353,7 +1369,8 @@ impl BuyerClaimObservationCursor {
             kind,
             cumulative_tokens: state.tokens_pending,
             last_claim_time: state.last_claim_time,
-            route_delivered_tokens: deal.session.route_delivered_tokens(),
+            route_delivered_tokens: Some(deal.route_visible_output_tokens()),
+            route_billable_tokens: deal.session.route_billable_tokens(),
         })
     }
 }
@@ -1372,12 +1389,21 @@ pub(crate) fn report_request_delivery(events: Option<&DeliveryEvents>, delivery:
         token_contract = %display_token_contract(&delivery.token_contract),
         protocol = delivery.protocol,
         streamed = delivery.streamed,
-        grant_tokens = delivery.grant_tokens,
+        grant_tokens = delivery.output_limit_tokens,
         rendered_tokens = delivery.rendered_tokens,
         route_delivered_tokens = delivery.route_delivered_tokens,
+        truncated_by_grant = delivery.truncated_by_output_limit,
+        ended_before_grant = delivery.ended_before_output_limit,
+        billing_grant_tokens = delivery.billing_grant_tokens,
+        output_limit_tokens = delivery.output_limit_tokens,
+        visible_output_tokens = delivery.visible_output_tokens,
+        input_tokens = delivery.input_tokens,
+        output_tokens = delivery.output_tokens,
+        billable_tokens = delivery.billable_tokens,
+        route_billable_tokens = delivery.route_billable_tokens,
         finish_reason = delivery.finish_reason,
-        truncated_by_grant = delivery.truncated_by_grant,
-        ended_before_grant = delivery.ended_before_grant,
+        truncated_by_output_limit = delivery.truncated_by_output_limit,
+        ended_before_output_limit = delivery.ended_before_output_limit,
         "consumer API: request delivery"
     );
     if let Some(events) = events {
@@ -1436,14 +1462,11 @@ fn is_request_scoped_upstream_rejection(error: &str) -> bool {
 /// A stream that never opened because the seller ANSWERED with its canonical capacity refusal is
 /// request-scoped, exactly like a 4xx above -- not a dead gateway.
 
-/// Until `acceptProbe` lands the seller's authoritative cap is the one canonical trial tick
-/// ([`crate::seller::capacity`], `TICK_SIZE.min(funded_tokens)`), so on a deal funded for more than
-/// one tick the second request of a fresh session is refused with gRPC `RESOURCE_EXHAUSTED` by a
-/// seller that is reachable, authorized and correct. Settling that as `dead_gateway` submits
-/// `TokenContract.stop()`, and on an unaccepted probe `TokenContract.sol:1385-1402` burns the probe
-/// tick plus a mirror tick of the seller bond and `selfdestruct`s the deal: the buyer would destroy
-/// a healthy deal, and pay for it, because the seller obeyed the protocol. The capacity comes back
-/// on its own within `PROBE_WINDOW`, so the caller is told to retry and the chain is not touched.
+/// This covers both existing capacity boundaries: until `acceptProbe` lands the authoritative cap is
+/// one canonical trial tick, and afterwards a new request is refused while the seller's durable
+/// unclaimed billable backlog is already one tick. In either case the seller is reachable,
+/// authorized and correct. Treating that answer as `dead_gateway` could destroy a healthy deal; the
+/// caller is told to retry after capacity reconciliation and the chain is not touched here.
 pub(crate) fn is_capacity_backpressure(error: &anyhow::Error) -> bool {
     error
         .downcast_ref::<tonic::Status>()
@@ -1524,6 +1547,13 @@ pub struct ContentGate {
     verdict: OnceCell<Result<(), String>>,
 }
 
+fn verification_stream_limits(billing_grant_tokens: u64) -> (u64, u64) {
+    (
+        CONTENT_PROBE_MAX_TOKENS.min(billing_grant_tokens),
+        billing_grant_tokens,
+    )
+}
+
 impl ContentGate {
     pub fn new(check: ContentCheck, models: Arc<ModelsConfig>) -> Self {
         Self {
@@ -1552,17 +1582,18 @@ impl ContentGate {
         }
     }
 
-    /// Output tokens this deal still OWES to its one-per-deal identity verification.
+    /// Output headroom this deal still owes to its one-per-deal identity verification.
 
-    /// Verification is paid output that [`Self::ensure_verified`] spends out of the admitting
-    /// request's reservation, so this is the unclampable FLOOR of that reservation
+    /// This is the unclampable output FLOOR of the admitting request's reservation
     /// ([`ApiDeal::try_reserve`]): a request that cannot hold it and still deliver an answer is
     /// refused rather than admitted for less. It is the ceiling of what verification can cost -- the
     /// B8 fingerprint probe and then the B7-full reference spot-check, each capped at
-    /// `CONTENT_PROBE_MAX_TOKENS` -- because a gate that degrades a layer to a pass spends less and
-    /// hands the difference straight back when the request guard drops. Zero once a definitive
-    /// verdict is cached: the gate never probes twice, so every later request on the deal reserves
-    /// only what it asks for.
+    /// `CONTENT_PROBE_MAX_TOKENS`. Provider-native input is deliberately not predicted here: each
+    /// accepted probe charges its checked terminal input+output total against the held billing grant,
+    /// and fails closed if that total does not fit. Zero once a definitive
+    /// verdict is cached: the gate never probes twice, so its admission floor becomes zero. Each
+    /// later request still reserves the route's whole free billable remainder while provider-native
+    /// input is unknown.
     pub(crate) fn outstanding_verification_tokens(&self) -> u64 {
         match &self.check {
             ContentCheck::Skip => 0,
@@ -1576,10 +1607,10 @@ impl ContentGate {
     /// is propagated as `Err` WITHOUT being cached, so the next request retries. On a bail the deal is closed
     /// to new requests before the verdict is cached and returned.
 
-    /// verification spends the CALLER'S held reservation and nothing else. Each accepted probe
-    /// chunk is charged through `request_guard` before the probe stream may await again, so dropping
-    /// the handler while B7 is pending cannot return quota already spent by B8. A transport error
-    /// likewise leaves every preceding accepted chunk charged. `OnceCell` waiters do not run the
+    /// verification spends the CALLER'S held reservation and nothing else. Each clean
+    /// probe terminal charges one complete input+output total; content without such a terminal charges
+    /// zero. Dropping the handler while B7 is pending cannot return B8's already accepted terminal bill.
+    /// `OnceCell` waiters do not run the
     /// initializer, so only the request whose guard is passed into that initializer pays.
     pub(crate) async fn ensure_verified(
         &self,
@@ -1604,19 +1635,21 @@ impl ContentGate {
                     .get_or_try_init::<String, _, _>(|| async {
                         // B8 content fingerprint. The `?` makes a transport error the OUTER Err (not cached);
                         // a definitive verdict goes through `Ok(...)`.
-                        let b8_cap = request_guard
-                            .remaining_grant()
-                            .min(CONTENT_PROBE_MAX_TOKENS);
+                        let (b8_output_limit, b8_grant) =
+                            verification_stream_limits(request_guard.remaining_grant());
                         let v8 = {
-                            let mut charge = |tokens| request_guard.record_delivered(deal, tokens);
+                            let mut charge = |tokens| request_guard.record_billing(deal, tokens);
+                            let mut record_output = |tokens| deal.record_visible_output(tokens);
                             buyer
                                 .behavioral_probe(
                                     &deal.route.handover,
                                     &deal.route.token_contract,
                                     model_id,
-                                    b8_cap,
+                                    b8_output_limit,
+                                    b8_grant,
                                     models,
                                     Some(&mut charge),
+                                    Some(&mut record_output),
                                 )
                                 .await
                                 .map_err(|e| e.to_string())?
@@ -1628,19 +1661,21 @@ impl ContentGate {
                             return Ok(Err(r));
                         }
                         // B7-full reference spot-check (greedy vs the official endpoint).
-                        let b7_cap = request_guard
-                            .remaining_grant()
-                            .min(CONTENT_PROBE_MAX_TOKENS);
+                        let (b7_output_limit, b7_grant) =
+                            verification_stream_limits(request_guard.remaining_grant());
                         let v7 = {
-                            let mut charge = |tokens| request_guard.record_delivered(deal, tokens);
+                            let mut charge = |tokens| request_guard.record_billing(deal, tokens);
+                            let mut record_output = |tokens| deal.record_visible_output(tokens);
                             buyer
                                 .reference_spotcheck(
                                     &deal.route.handover,
                                     &deal.route.token_contract,
                                     model_id,
-                                    b7_cap,
+                                    b7_output_limit,
+                                    b7_grant,
                                     models,
                                     Some(&mut charge),
+                                    Some(&mut record_output),
                                 )
                                 .await
                                 .map_err(|e| e.to_string())?
@@ -1667,6 +1702,8 @@ pub struct ApiState {
     /// The configured market/frame model id -- the only one that is served (B2/B19).
     /// The request's `model` field is checked against it; outside the frame -- reject.
     pub frame_model: String,
+    /// Locally trusted explicit `--mock-model` mode; never inferred from seller-supplied manifest data.
+    pub mock_model: bool,
     /// Active deal slot. A one-shot service never replaces it; continuous service mode may publish the next
     /// already-opened handover here while keeping the local HTTP listener alive.
     pub deals: Arc<RouteManager>,
@@ -1699,11 +1736,16 @@ pub struct SessionSettle {
     failure_policy: BuyerApiFailurePolicy,
     lifetime: SessionLifetimePolicy,
     terminal_action: AtomicU8,
-    /// The consumer route's own cumulative delivered-token counter, shared by [`ApiDeal::new`].
+    /// The consumer route's cumulative stable v2 output-delivery witness: each accepted content
+    /// chunk adds `max(token_ids.len(), 1)`, including metadata-only chunks. This retains the
+    /// implicit-terminal veto and the buyer-event v2 `route_delivered_tokens` meaning.
+    route_delivery: OnceLock<Arc<AtomicU64>>,
+    /// The consumer route's own cumulative accepted billable-usage counter, shared by
+    /// [`ApiDeal::new`].
     /// It is the SAME `Arc` the route accounts against, never a copy, so this witness cannot drift
     /// from the figure the money path actually charged. `None` for a session that serves no consumer
-    /// route (the one-shot terminal), which has no delivery model here at all.
-    route_delivery: OnceLock<Arc<AtomicU64>>,
+    /// route (the one-shot terminal), which has no route-billing model here at all.
+    route_billing: OnceLock<Arc<AtomicU64>>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1850,19 +1892,32 @@ impl SessionSettle {
             lifetime,
             terminal_action: AtomicU8::new(0),
             route_delivery: OnceLock::new(),
+            route_billing: OnceLock::new(),
         }
     }
 
-    /// Bind this session to the delivered-token counter of the consumer route it settles.
+    /// Bind this session to the billable-token counter of the consumer route it settles.
     /// Called once by [`ApiDeal::new`]; a later route gets its own session, so the first binding is
     /// the only one and a repeated call is ignored rather than silently repointing the witness.
+    fn bind_route_billing(&self, billable_tokens: Arc<AtomicU64>) {
+        let _ = self.route_billing.set(billable_tokens);
+    }
+
+    /// Bind the separate output-only delivery witness used by the stable v2 compatibility surface
+    /// and the implicit-terminal decision.
     fn bind_route_delivery(&self, delivered_tokens: Arc<AtomicU64>) {
         let _ = self.route_delivery.set(delivered_tokens);
     }
 
-    /// Tokens the bound consumer route has delivered, or `None` when no route was ever bound.
     pub fn route_delivered_tokens(&self) -> Option<u64> {
         self.route_delivery
+            .get()
+            .map(|delivered| delivered.load(Ordering::SeqCst))
+    }
+
+    /// Input+output tokens the bound consumer route has billed, or `None` when no route was ever bound.
+    pub fn route_billable_tokens(&self) -> Option<u64> {
+        self.route_billing
             .get()
             .map(|delivered| delivered.load(Ordering::SeqCst))
     }
@@ -2117,7 +2172,7 @@ impl SessionSettle {
 
     /// A decrypted handover and a reachable gateway are not enough: showed that a stale handover can let the
     /// local endpoint serve a response while the TokenContract remains funded-but-never-opened and unaccounted.
-    pub async fn ensure_open_for_serving(&self) -> Result<(), String> {
+    pub async fn ensure_open_for_serving(&self) -> Result<dexdo_core::DealChainState, String> {
         let state = match self.chain.deal_state(&self.token_contract).await {
             Ok(Some(state)) => state,
             Ok(None) => {
@@ -2132,7 +2187,7 @@ impl SessionSettle {
             }
         };
         if state.funded && state.opened && !state.disputed {
-            return Ok(());
+            return Ok(state);
         }
 
         let now_secs = unix_now_secs();
@@ -2803,6 +2858,7 @@ impl ApiState {
         Self {
             buyer,
             frame_model,
+            mock_model: false,
             deals: Arc::new(RouteManager::new(deal)),
             delivery_events: None,
         }
@@ -2817,6 +2873,7 @@ impl ApiState {
         Self {
             buyer,
             frame_model,
+            mock_model: false,
             deals: Arc::new(RouteManager::lazy(initializer, initializer_timeout)),
             delivery_events: None,
         }
@@ -2831,6 +2888,7 @@ impl ApiState {
         Self {
             buyer,
             frame_model,
+            mock_model: false,
             deals: Arc::new(RouteManager::recoverable_lazy(
                 initializer,
                 initializer_timeout,
@@ -2849,6 +2907,7 @@ impl ApiState {
         Self {
             buyer,
             frame_model,
+            mock_model: false,
             deals: Arc::new(RouteManager::recoverable_lazy_with_active(
                 active,
                 initializer,
@@ -2856,6 +2915,11 @@ impl ApiState {
             )),
             delivery_events: None,
         }
+    }
+
+    pub fn with_mock_model(mut self, mock_model: bool) -> Self {
+        self.mock_model = mock_model;
+        self
     }
 
     pub async fn current_deal(&self) -> Result<ApiDeal, DealInitError> {
@@ -3187,15 +3251,24 @@ mod tests {
     }
 
     #[test]
-    fn accounted_tokens_uses_structured_token_signals() {
+    fn legacy_delivery_count_stays_distinct_from_visible_output_lower_bound() {
+        let structured = CanonChunk {
+            token_ids: vec![1, 2, 3],
+            ..CanonChunk::default()
+        };
+        assert_eq!(accounted_tokens(&structured), 3);
+        assert_eq!(structured.visible_output_tokens(), 3);
+        let metadata_only = CanonChunk::default();
         assert_eq!(
-            accounted_tokens(&CanonChunk {
-                token_ids: vec![1, 2, 3],
-                ..CanonChunk::default()
-            }),
-            3
+            accounted_tokens(&metadata_only),
+            1,
+            "the stable v2 delivery field retains its one-token fallback"
         );
-        assert_eq!(accounted_tokens(&CanonChunk::default()), 1);
+        assert_eq!(
+            metadata_only.visible_output_tokens(),
+            0,
+            "the new billing verifier does not manufacture visible provider output"
+        );
     }
 
     fn heartbeat_test_deal() -> ApiDeal {
@@ -3757,8 +3830,8 @@ mod tests {
     }
 
     /// Put a route through the accounting a SERVED request performs: begin the request, take an
-    /// admitted reservation, charge accepted output against it, and record the output heartbeat --
-    /// the same `begin_request` -> `admit` -> `record_delivered` -> `record_accepted_output`
+    /// admitted reservation, charge terminal billing usage against it, and record the output heartbeat --
+    /// the same `begin_request` -> `admit` -> `record_billing` -> `record_accepted_output`
     /// sequence `openai::chat_completions` runs (`openai.rs:48`, `:228`, `:289`).
 
     /// The routes in these tests point at a dead endpoint (`https://127.0.0.1:1`) and this crate's
@@ -3776,13 +3849,20 @@ mod tests {
             RouteBudget::Exhausted(reason) => panic!("route refused admission: {reason}"),
         }
         request
-            .record_delivered(&deal, tokens)
-            .expect("accepted output charges against the held reservation");
+            .record_billing(&deal, tokens)
+            .expect("terminal billing usage charges against the held reservation");
+        deal.record_visible_output(tokens)
+            .expect("accepted output updates the separate delivery witness");
         deal.record_accepted_output(unix_now_secs());
+        assert_eq!(
+            deal.session.route_billable_tokens(),
+            Some(tokens),
+            "the session must witness what the route billed"
+        );
         assert_eq!(
             deal.session.route_delivered_tokens(),
             Some(tokens),
-            "the session must witness what the route delivered"
+            "the session must separately witness accepted output"
         );
     }
 
@@ -3846,6 +3926,27 @@ mod tests {
         ordinary_task.await.unwrap();
         tokio::task::yield_now().await;
         assert_eq!(ordinary_chain.stop_calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn visible_delivery_without_terminal_billing_still_allows_implicit_stop() {
+        let chain = Arc::new(RecordingSettleChain::default());
+        let state = shutdown_test_state(
+            chain.clone(),
+            SessionLifetimePolicy::SettleOnExit,
+            "tc-partial-output",
+        );
+        let deal = state.deals.current().await.expect("active route");
+        deal.record_visible_output(1)
+            .expect("accepted output updates the delivery witness");
+        assert_eq!(deal.session.route_delivered_tokens(), Some(1));
+        assert_eq!(deal.session.route_billable_tokens(), Some(0));
+
+        assert!(
+            state.deals.settle_active_on_exit("shutdown").await.unwrap(),
+            "accepted output must defeat the  no-delivery veto even without terminal usage"
+        );
+        assert_eq!(chain.stop_calls.load(Ordering::SeqCst), 1);
     }
 
     fn recovery_test_deal(
@@ -4514,6 +4615,99 @@ mod tests {
         assert!(!session.is_closed());
         assert!(!session.is_settled());
         assert_eq!(chain.cleanup_unopened_calls.load(Ordering::SeqCst), 0);
+    }
+
+    /// The first ordinary request must fit the seller's authoritative one-tick pre-probe capacity;
+    /// the next request after `acceptProbe` must immediately regain the funded route remainder.
+    #[tokio::test]
+    async fn ordinary_admission_tracks_the_authoritative_probe_phase() {
+        let tick = u64::try_from(dexdo_core::TICK_SIZE).expect("canonical tick fits u64");
+        let route_budget = tick.checked_mul(3).expect("fixture route budget");
+        let chain = Arc::new(RecordingSettleChain::default());
+        let funded_time = unix_now_secs();
+        chain.set_deal_state(opened_deal_state(u128::from(route_budget), funded_time));
+        let session = Arc::new(SessionSettle::new(
+            chain.clone(),
+            "tc-ordinary-probe-phase".to_string(),
+            Arc::new(dexdo_core::LocalNote::generate()),
+        ));
+        let deal = ApiDeal::new(
+            Route {
+                handover: Handover {
+                    endpoint: "https://127.0.0.1:1".to_string(),
+                    tls_fingerprint: "00".repeat(32),
+                },
+                token_contract: "tc-ordinary-probe-phase".to_string(),
+                max_tokens: route_budget,
+            },
+            session.clone(),
+            Arc::new(ContentGate::skip()),
+        );
+
+        let before_probe = session
+            .ensure_open_for_serving()
+            .await
+            .expect("opened pre-probe deal is servable");
+        assert!(!before_probe.probe_accepted);
+        let mut first_request = deal.begin_request(funded_time);
+        let RouteBudget::Admitted(first) = deal
+            .admit_with_probe_observation(Some(8), before_probe.probe_accepted)
+            .await
+        else {
+            panic!("the trial-tick request must be admitted");
+        };
+        assert_eq!(first.granted, tick, "pre-probe grant is exactly one tick");
+        first_request.hold(first);
+        first_request
+            .record_billing(&deal, 3)
+            .expect("complete trial usage fits the one-tick grant");
+        drop(first_request);
+
+        let mut accepted = opened_deal_state(u128::from(route_budget), funded_time);
+        accepted.probe_accepted = true;
+        chain.set_deal_state(accepted);
+        let after_probe = session
+            .ensure_open_for_serving()
+            .await
+            .expect("accepted deal remains servable");
+        assert!(after_probe.probe_accepted);
+        let RouteBudget::Admitted(reopened) = deal
+            .admit_with_probe_observation(Some(8), after_probe.probe_accepted)
+            .await
+        else {
+            panic!("accepted ordinary deal must expose its funded remainder");
+        };
+        assert_eq!(
+            reopened.granted,
+            route_budget - 3,
+            "acceptance reopens everything except already billed usage"
+        );
+        drop(reopened);
+
+        let short_budget = tick - 1;
+        let short_deal = ApiDeal::new(
+            Route {
+                handover: Handover {
+                    endpoint: "https://127.0.0.1:1".to_string(),
+                    tls_fingerprint: "00".repeat(32),
+                },
+                token_contract: "tc-short-ordinary-probe-phase".to_string(),
+                max_tokens: short_budget,
+            },
+            Arc::new(SessionSettle::new(
+                chain,
+                "tc-short-ordinary-probe-phase".to_string(),
+                Arc::new(dexdo_core::LocalNote::generate()),
+            )),
+            Arc::new(ContentGate::skip()),
+        );
+        let RouteBudget::Admitted(short) = short_deal
+            .admit_with_probe_observation(Some(1), false)
+            .await
+        else {
+            panic!("a funded sub-tick route remains fully usable pre-probe");
+        };
+        assert_eq!(short.granted, short_budget, "the trial ceiling uses min");
     }
 
     #[tokio::test]
@@ -5234,7 +5428,9 @@ mod tests {
         /// Both consumer paths take the same request fields, so one body drives either endpoint --
         /// which is what makes the two paths comparable when they compete for one remainder.
         async fn ask_path(&self, path: &str, max_tokens: u64) -> (reqwest::StatusCode, String) {
-            self.ask_full(path, max_tokens, "weekly quota", true).await
+            // Most weekly-boundary tests isolate output accounting. Keep their mock input at zero;
+            // input-plus-output fixtures below pass an explicit non-empty prompt.
+            self.ask_full(path, max_tokens, "", true).await
         }
 
         /// One request with everything the adversarial cases need to vary: which consumer protocol,
@@ -5280,7 +5476,7 @@ mod tests {
                 .current()
                 .await
                 .expect("the harness route is published")
-                .delivered_tokens()
+                .billable_tokens()
         }
 
         /// The delivery records this endpoint has published so far.
@@ -5401,23 +5597,20 @@ mod tests {
         content_gate: ContentGate,
         upstream: crate::seller::UpstreamConfig,
     ) -> WeeklyRouteHarness {
-        weekly_route_harness_gated_with_policy(
+        weekly_route_harness_gated_with_policy(WeeklyRouteScenario {
             claimed,
             subscription,
             expires_in,
             upstream_tokens,
             content_gate,
             upstream,
-            BuyerApiFailurePolicy::default(),
-            SessionLifetimePolicy::Preserve,
-        )
+            failure_policy: BuyerApiFailurePolicy::default(),
+            lifetime: SessionLifetimePolicy::Preserve,
+        })
         .await
     }
 
-    /// The gated weekly route with an explicit incident policy. Only rows that must observe the
-    /// real verification-bail chain action use this extension; the existing weekly fixture keeps
-    /// its original defaults and call surface.
-    async fn weekly_route_harness_gated_with_policy(
+    struct WeeklyRouteScenario {
         claimed: u128,
         subscription: bool,
         expires_in: u64,
@@ -5426,7 +5619,24 @@ mod tests {
         upstream: crate::seller::UpstreamConfig,
         failure_policy: BuyerApiFailurePolicy,
         lifetime: SessionLifetimePolicy,
+    }
+
+    /// The gated weekly route with an explicit incident policy. Only rows that must observe the
+    /// real verification-bail chain action use this extension; the existing weekly fixture keeps
+    /// its original defaults and call surface.
+    async fn weekly_route_harness_gated_with_policy(
+        scenario: WeeklyRouteScenario,
     ) -> WeeklyRouteHarness {
+        let WeeklyRouteScenario {
+            claimed,
+            subscription,
+            expires_in,
+            upstream_tokens,
+            content_gate,
+            upstream,
+            failure_policy,
+            lifetime,
+        } = scenario;
         let token_contract = "0:".to_string() + &"9".repeat(64);
         let period_start = unix_now_secs() + expires_in - SUB_WEEK_LEN.as_secs();
         let chain = Arc::new(WeeklyQuotaChain::new(
@@ -5438,12 +5648,16 @@ mod tests {
         // shape B: the gateway makes the ONE bind. Reserving a port here and releasing it
         // before `start_gateway_with` re-binds hands it back to the kernel, and any concurrent
         // `bind(0)` can be given that exact port in between.
-        let seller = super::fixture_seller::start_gateway_with(
-            "127.0.0.1:0".parse().unwrap(),
-            upstream,
-        )
-        .await
-        .expect("TLS mock gateway");
+        let mock_model = matches!(
+            &upstream,
+            crate::seller::UpstreamConfig::Mock
+                | crate::seller::UpstreamConfig::MockWithClaimedModel(_)
+                | crate::seller::UpstreamConfig::MockScammer
+        );
+        let seller =
+            super::fixture_seller::start_gateway_with("127.0.0.1:0".parse().unwrap(), upstream)
+                .await
+                .expect("TLS mock gateway");
         let gateway_addr = seller.listen_addr;
         for _ in 0..100 {
             if tokio::net::TcpStream::connect(gateway_addr).await.is_ok() {
@@ -5454,15 +5668,10 @@ mod tests {
 
         let note: Arc<dyn Note> = Arc::new(dexdo_core::LocalNote::generate());
         let buyer = Arc::new(Buyer::from_note(note.clone()));
-        // The seller's own view of a deal whose probe has NOT been accepted yet. Before
-        // `acceptProbe` the three claim stages really are zero, so this one is built rather than
-        // derived from the probe-accepted fixture, which can never be.
-        let upstream_state = dexdo_core::DealChainState {
-            probe_accepted: false,
-            tokens_final: 0,
-            tokens_pending: 0,
-            ..weekly_state(PROBE_CLAIM)
-        };
+        // The standalone gateway has no background chain observer in this fixture. Seed its capacity
+        // anchor from the same coherent state as the buyer so the tests isolate buyer-side admission;
+        // dedicated seller-capacity tests exercise stale and advancing anchors.
+        let upstream_state = weekly_state(claimed);
         seller
             .register_stream(
                 &token_contract,
@@ -5512,7 +5721,8 @@ mod tests {
         } else {
             deal
         };
-        let mut state = ApiState::single_deal(buyer.clone(), "dexdo-mock".to_string(), deal);
+        let mut state = ApiState::single_deal(buyer.clone(), "dexdo-mock".to_string(), deal)
+            .with_mock_model(mock_model);
         let deals = state.deals.clone();
         // the harness reads the delivery records off the production channel, so what a test
         // asserts is what an operator's JSONL surface would have received.
@@ -5768,7 +5978,8 @@ mod tests {
         let harness = weekly_route_harness(WEEK_QUOTA - 12, true).await;
         assert_eq!(harness.remaining().await, 12);
 
-        // Six requests of eight tokens each: 48 asked for against 12 available.
+        // Six requests race for twelve billable tokens. Exactly one may hold the whole unknown-input
+        // grant; after its eight-token terminal bill, the unused four return.
         let mut answers = Vec::new();
         for path in [
             "/v1/chat/completions",
@@ -5785,14 +5996,15 @@ mod tests {
             .iter()
             .filter(|(status, _)| *status == reqwest::StatusCode::OK)
             .count();
-        assert!(served >= 1, "the available quota must still be servable");
+        assert_eq!(served, 1, "one request owns the entire in-flight grant");
 
         assert!(
             harness.delivered().await <= 12,
             "delivered {} exceeded the authoritative weekly remainder of 12",
             harness.delivered().await
         );
-        assert_eq!(harness.remaining().await, 0);
+        assert_eq!(harness.delivered().await, 8);
+        assert_eq!(harness.remaining().await, 4);
         for (status, body) in &answers {
             assert!(
                 *status == reqwest::StatusCode::OK
@@ -6029,17 +6241,10 @@ mod tests {
         }
     }
 
-    /// The same cap, one step in: two fat chunks fit a grant of eight, the third does not (
-    /// review 3). What must not happen is a third chunk being rendered and then noticed.
+    /// Two fat chunks fit the output cap and the third does not. Without a terminal usage record the
+    /// visible prefix remains unbilled and the whole billing reservation returns.
     #[tokio::test]
     async fn fat_chunks_stop_exactly_at_the_grant() {
-        // Red-by-design reporting shape (ci/run-red-by-design-tests.sh): the conditions below are
-        // the ones this test has always required -- the request succeeds, two four-token chunks fit
-        // a grant of nine and a third does not, and the token that could not be spent returns.
-        // They are accumulated rather than asserted one at a time so every combination is observed
-        // and the failure names its single authored cause. Nothing about what must hold changed.
-        let mut complete = true;
-        let mut observations = Vec::new();
         for path in ["/v1/chat/completions", "/v1/messages"] {
             for stream in [true, false] {
                 let harness = weekly_route_harness(WEEK_QUOTA - 9, true).await;
@@ -6048,34 +6253,30 @@ mod tests {
                 let (status, body) = harness
                     .ask_full(path, 9, "DEXDO_FIXTURE_FATCHUNK weekly quota", stream)
                     .await;
-                let delivered = harness.delivered().await;
-                let remaining = harness.remaining().await;
-                complete &=
-                    status == reqwest::StatusCode::OK && delivered == 8 && remaining == 1;
-                observations.push(format!(
-                    "{path} stream={stream}: status={status} delivered={delivered} \
-                     remaining={remaining} body={body}"
-                ));
+                assert_eq!(
+                    status,
+                    reqwest::StatusCode::OK,
+                    "{path} stream={stream}: {body}"
+                );
+                assert_eq!(harness.delivered().await, 0, "{path} stream={stream}");
+                assert_eq!(harness.remaining().await, 9, "{path} stream={stream}");
                 harness.shutdown().await;
             }
         }
-        if !complete {
-            eprintln!("{}", observations.join("\n"));
-            panic!("E2E-UPS-39A the fixture cannot build a noncompliant seller; it needs a harness that does not route through cap_canon_to_grant ()");
-        }
     }
 
-    /// The grant must reach the WIRE, and hold even when the seller ignores it.
+    /// The output cap must reach the WIRE, and hold even when the seller ignores it.
 
-    /// Admission reserves two tokens against a request that asked for eight. Two things must then be
+    /// Admission holds the two-token billing remainder for a request that asked for eight output
+    /// tokens. Two things must then be
     /// true, on both consumer protocols and whether the answer is streamed or aggregated:
 
-    /// 1. the seller is TOLD two - the outbound `CanonRequest.params.max_tokens` carries the grant,
-    /// not the caller's larger figure - which is what the seller's own delivery count proves;
+    /// 1. the seller is TOLD two - the outbound output-only `CanonRequest.params.max_tokens` is
+    /// clamped to available capacity, not left at the caller's larger figure;
     /// 2. and if the seller ignores it anyway, the buyer still refuses. This one is deliberately
     /// noncompliant: it answers with a one-token chunk and then a two-token chunk, straddling the
-    /// remaining allowance. The second chunk is never rendered, exactly one token is recorded, and
-    /// the token that was reserved but not delivered returns to the week.
+    /// remaining allowance. The second chunk is never rendered, and without an accepted terminal
+    /// usage record the complete billing reservation returns to the week.
     #[tokio::test]
     async fn the_grant_reaches_the_wire_and_holds_against_a_noncompliant_seller() {
         for path in ["/v1/chat/completions", "/v1/messages"] {
@@ -6098,25 +6299,25 @@ mod tests {
                 );
 
                 // 1. What the SELLER was told, read straight off the wire: the seller echoes the
-                // token limit it received, and it is the grant - not the caller's eight.
+                // output limit it received, and it is the available two - not the caller's eight.
                 assert!(
                     body.contains("limit=2"),
                     "{path} stream={stream}: the outbound max_tokens must be the grant, not the \
                      caller's limit: {body}"
                 );
 
-                // 2. What the BUYER accepted: the one-token chunk only. The two-token chunk did not
-                // fit the remaining grant and was refused before it could be rendered.
+                // 2. One output token was visible, but the stream ended before an accepted terminal
+                // usage record, so atomic accounting charges neither the prefix nor the overrun.
                 assert_eq!(
                     harness.delivered().await,
-                    1,
-                    "{path} stream={stream}: a straddling chunk must fail closed before render: \
+                    0,
+                    "{path} stream={stream}: a straddling stream without terminal usage must not bill: \
                      {body}"
                 );
                 assert_eq!(
                     harness.remaining().await,
-                    1,
-                    "{path} stream={stream}: the undelivered token returns to the week"
+                    2,
+                    "{path} stream={stream}: the whole billing reservation returns"
                 );
                 harness.shutdown().await;
             }
@@ -6125,12 +6326,11 @@ mod tests {
 
     /// An answer cut by the grant is not a clean stop, and it says so on the wire.
 
-    /// The seller bills on enqueue and the buyer accounts on render, so tokens can be charged and
-    /// never arrive. Joining the two needs an acknowledgement the canon does not carry. What was
-    /// separately wrong, and is fixed here, is that the buyer did not even report the half it can
-    /// see: `length` required `received == 0`, so a stream that stopped at 1,972,000 of a 2,000,000
-    /// grant rendered `stop` and was byte-identical to a finished answer. A consumer paying per
-    /// token could not tell that its answer had been cut off.
+    /// A stream can expose a prefix and then cross the output cap before reaching terminal usage.
+    /// Such an incomplete response cannot move money, but the local protocol must still report the
+    /// truncation it can see: `length` previously required `received == 0`, so a stream that stopped
+    /// at 1,972,000 of a 2,000,000 output cap rendered `stop` and was byte-identical to a finished
+    /// answer.
 
     /// This drives the real path with the real noncompliant-seller fixture rather than fabricating
     /// the end state: the seller is told two tokens and answers 1 + 2, so the second chunk cannot
@@ -6159,13 +6359,7 @@ mod tests {
                     reqwest::StatusCode::OK,
                     "{path} stream={stream}: {body}"
                 );
-                // The premise: the render really did stop short, with output already delivered.
-                assert_eq!(
-                    harness.delivered().await,
-                    1,
-                    "{path} stream={stream}: the fixture must cut the answer after one token: \
-                     {body}"
-                );
+                assert_eq!(harness.delivered().await, 0, "{path} stream={stream}");
 
                 let reason = terminal_reason(&body);
                 assert_ne!(
@@ -6183,46 +6377,44 @@ mod tests {
 
                 // And the counts that make the loss attributable afterwards.
                 let delivery = harness.last_delivery().await;
-                assert_eq!(delivery.grant_tokens, 2, "{path} stream={stream}");
-                assert_eq!(delivery.rendered_tokens, 1, "{path} stream={stream}");
+                assert_eq!(delivery.billing_grant_tokens, 2, "{path} stream={stream}");
+                assert_eq!(delivery.visible_output_tokens, 1, "{path} stream={stream}");
+                assert_eq!(delivery.billable_tokens, None, "{path} stream={stream}");
                 assert_eq!(delivery.finish_reason, cut, "{path} stream={stream}");
-                assert!(delivery.truncated_by_grant, "{path} stream={stream}");
+                assert!(delivery.truncated_by_output_limit, "{path} stream={stream}");
                 assert!(
-                    delivery.ended_before_grant,
+                    delivery.ended_before_output_limit,
                     "{path} stream={stream}: one token of a grant of two leaves the grant unspent"
                 );
                 assert_eq!(delivery.streamed, stream, "{path} stream={stream}");
                 // The quantity a claim may be reconciled against: the deal's cumulative ACCOUNTED
                 // delivery, not a count of the frames the renderer emitted.
                 assert_eq!(
-                    delivery.route_delivered_tokens,
-                    Some(1),
-                    "{path} stream={stream}: the accounted figure must reach the event"
+                    delivery.route_billable_tokens,
+                    Some(0),
+                    "{path} stream={stream}: incomplete output cannot move the monetary counter"
                 );
                 harness.shutdown().await;
             }
         }
     }
 
-    /// A render that consumes the grant exactly keeps its existing terminal value, and the numbers
-    /// carry the fact.
+    /// A clean answer that consumes the output cap exactly keeps the provider's clean terminal, and
+    /// the numbers carry the boundary fact.
 
-    /// This is a deliberate boundary. The buyer stops reading the moment the grant is spent, so it
-    /// genuinely does not know whether the seller had more to say, and there is an argument that
-    /// `length` is the honester word for it - it is what the upstream API reports for the same
-    /// situation. Changing it would relabel the ordinary happy path of every request whose cap
-    /// happens to equal the answer, which is well outside the defect being fixed and is owned by
-    /// other tests. So the wire is left alone and the delivery record states the position instead:
-    /// rendered equals granted, with nothing left unspent.
+    /// This is a deliberate compatibility boundary. Reaching `max_tokens` exactly is not proof of
+    /// truncation: the buyer keeps consuming through terminal usage and clean EOF, and reports
+    /// truncation only when a later content chunk does not fit. The complete input+output terminal
+    /// total may still consume the separate billing grant exactly.
     #[tokio::test]
     async fn a_render_that_spends_the_whole_grant_is_reported_by_the_numbers() {
-        for (path, cap) in [
+        for (path, terminal) in [
             ("/v1/chat/completions", "stop"),
             ("/v1/messages", "end_turn"),
         ] {
             for stream in [true, false] {
-                let harness = weekly_route_harness(WEEK_QUOTA - 4, true).await;
-                assert_eq!(harness.remaining().await, 4);
+                let harness = weekly_route_harness(WEEK_QUOTA - 6, true).await;
+                assert_eq!(harness.remaining().await, 6);
 
                 let (status, body) = harness.ask_full(path, 4, "weekly quota", stream).await;
                 assert_eq!(
@@ -6230,20 +6422,27 @@ mod tests {
                     reqwest::StatusCode::OK,
                     "{path} stream={stream}: {body}"
                 );
-                assert_eq!(harness.delivered().await, 4, "{path} stream={stream}");
+                assert_eq!(harness.delivered().await, 6, "{path} stream={stream}");
                 assert_eq!(
                     terminal_reason(&body).as_deref(),
-                    Some(cap),
-                    "{path} stream={stream}: the terminal value of a fully spent grant is \
-                     deliberately unchanged: {body}"
+                    Some(terminal),
+                    "{path} stream={stream}: an exact-cap answer with terminal usage and clean EOF \
+                     stays a clean completion: {body}"
                 );
 
                 let delivery = harness.last_delivery().await;
-                assert_eq!(delivery.grant_tokens, 4, "{path} stream={stream}");
-                assert_eq!(delivery.rendered_tokens, 4, "{path} stream={stream}");
-                assert!(!delivery.truncated_by_grant, "{path} stream={stream}");
+                assert_eq!(delivery.billing_grant_tokens, 6, "{path} stream={stream}");
+                assert_eq!(delivery.output_limit_tokens, 4, "{path} stream={stream}");
+                assert_eq!(delivery.visible_output_tokens, 4, "{path} stream={stream}");
+                assert_eq!(delivery.input_tokens, Some(2), "{path} stream={stream}");
+                assert_eq!(delivery.output_tokens, Some(4), "{path} stream={stream}");
+                assert_eq!(delivery.billable_tokens, Some(6), "{path} stream={stream}");
                 assert!(
-                    !delivery.ended_before_grant,
+                    !delivery.truncated_by_output_limit,
+                    "{path} stream={stream}: exact cap alone is not truncation"
+                );
+                assert!(
+                    !delivery.ended_before_output_limit,
                     "{path} stream={stream}: the grant was spent to the last token"
                 );
                 harness.shutdown().await;
@@ -6263,14 +6462,14 @@ mod tests {
     /// against delivery reads that, never a count of frames.
     #[tokio::test]
     async fn accounted_delivery_is_not_the_number_of_rendered_frames() {
-        let harness = weekly_route_harness(WEEK_QUOTA - 8, true).await;
-        assert_eq!(harness.remaining().await, 8);
+        let harness = weekly_route_harness(WEEK_QUOTA - 9, true).await;
+        assert_eq!(harness.remaining().await, 9);
 
         let (status, body) = harness
             .ask_full(
                 "/v1/chat/completions",
                 8,
-                "DEXDO_FIXTURE_FATCHUNK weekly quota",
+                "DEXDO_FIXTURE_FATCHUNK_COMPLETE",
                 true,
             )
             .await;
@@ -6289,30 +6488,26 @@ mod tests {
             })
             .count() as u64;
 
-        // What the money path charged.
-        let accounted = harness.delivered().await;
+        // What the money path charged: one input token plus eight output tokens.
+        let billable = harness.delivered().await;
         let delivery = harness.last_delivery().await;
 
+        assert_eq!(delivery.visible_output_tokens, 8, "{body}");
+        assert_eq!(delivery.input_tokens, Some(1));
+        assert_eq!(delivery.output_tokens, Some(8));
+        assert_eq!(delivery.billable_tokens, Some(9));
         assert_eq!(
-            delivery.rendered_tokens, accounted,
-            "the record reports the accounted figure: {body}"
-        );
-        assert_eq!(
-            delivery.route_delivered_tokens,
-            Some(accounted),
-            "and the deal's cumulative accounted delivery reaches the event"
+            delivery.route_billable_tokens,
+            Some(billable),
+            "the deal's cumulative billable usage reaches the event"
         );
         assert!(
-            frames < accounted,
-            "a four-token chunk is one frame: frames={frames} accounted={accounted}. If these are \
-             equal the fixture stopped exercising multi-token chunks and this proof is vacuous: \
-             {body}"
+            frames < delivery.visible_output_tokens,
+            "a four-token chunk is one frame: frames={frames}, output={}: {body}",
+            delivery.visible_output_tokens
         );
-        assert_eq!(
-            accounted,
-            frames * u64::from(crate::seller::upstream::mock::FAT_CHUNK_TOKENS),
-            "each rendered frame carried exactly the fixture's token count"
-        );
+        assert_eq!(delivery.visible_output_tokens, frames * 4);
+        assert_eq!(billable, 9);
         harness.shutdown().await;
     }
 
@@ -6321,7 +6516,7 @@ mod tests {
 
     /// The counterpart to the two above: making a cut answer visible must not relabel every short
     /// answer as truncated. A model that stops early is the normal case, it keeps `stop`/`end_turn`,
-    /// and `ended_before_grant` is where the fact that part of the grant was never spent lives.
+    /// and `ended_before_output_limit` records that the provider stopped below the output cap.
     #[tokio::test]
     async fn an_answer_the_seller_finished_stays_a_clean_stop() {
         for (path, clean) in [
@@ -6331,9 +6526,13 @@ mod tests {
             for stream in [true, false] {
                 // The seller emits three tokens against a grant of sixteen, so the stream ends well
                 // before the cap without anything having gone wrong.
-                let harness =
-                    weekly_route_harness_with_upstream(WEEK_QUOTA - 16, true, SUB_WEEK_LEN.as_secs(), 3)
-                        .await;
+                let harness = weekly_route_harness_with_upstream(
+                    WEEK_QUOTA - 16,
+                    true,
+                    SUB_WEEK_LEN.as_secs(),
+                    3,
+                )
+                .await;
                 assert_eq!(harness.remaining().await, 16);
 
                 let (status, body) = harness.ask_full(path, 16, "weekly quota", stream).await;
@@ -6342,7 +6541,7 @@ mod tests {
                     reqwest::StatusCode::OK,
                     "{path} stream={stream}: {body}"
                 );
-                assert_eq!(harness.delivered().await, 3, "{path} stream={stream}");
+                assert_eq!(harness.delivered().await, 5, "{path} stream={stream}");
                 assert_eq!(
                     terminal_reason(&body).as_deref(),
                     Some(clean),
@@ -6351,11 +6550,17 @@ mod tests {
                 );
 
                 let delivery = harness.last_delivery().await;
-                assert_eq!(delivery.grant_tokens, 16, "{path} stream={stream}");
-                assert_eq!(delivery.rendered_tokens, 3, "{path} stream={stream}");
-                assert!(!delivery.truncated_by_grant, "{path} stream={stream}");
+                assert_eq!(delivery.billing_grant_tokens, 16, "{path} stream={stream}");
+                assert_eq!(delivery.visible_output_tokens, 3, "{path} stream={stream}");
+                assert_eq!(delivery.input_tokens, Some(2), "{path} stream={stream}");
+                assert_eq!(delivery.output_tokens, Some(3), "{path} stream={stream}");
+                assert_eq!(delivery.billable_tokens, Some(5), "{path} stream={stream}");
                 assert!(
-                    delivery.ended_before_grant,
+                    !delivery.truncated_by_output_limit,
+                    "{path} stream={stream}"
+                );
+                assert!(
+                    delivery.ended_before_output_limit,
                     "{path} stream={stream}: thirteen tokens of the grant were never spent, and \
                      that is the figure a billed-but-not-received gap shows up in"
                 );
@@ -6479,14 +6684,15 @@ mod tests {
         let weekly = deal.weekly.as_ref().expect("subscription budget").clone();
         let (state, _) = harness.chain.books();
         let contradictory = u64::try_from(dexdo_core::TICK_SIZE).unwrap() + 1;
-        let mut anchor = weekly.claim_anchor.lock().unwrap();
-        assert!(
-            weekly
-                .rebase_anchor_on_probe(&state, contradictory, &mut anchor)
-                .is_err(),
-            "delivery above the flat probe claim must fail closed"
-        );
-        drop(anchor);
+        {
+            let mut anchor = weekly.claim_anchor.lock().unwrap();
+            assert!(
+                weekly
+                    .rebase_anchor_on_probe(&state, contradictory, &mut anchor)
+                    .is_err(),
+                "delivery above the flat probe claim must fail closed"
+            );
+        }
         assert!(weekly.anchored_before_probe());
         let rebase_barrier = Arc::new(std::sync::Barrier::new(2));
         *weekly.rebase_barrier.lock().unwrap() = Some(rebase_barrier.clone());
@@ -6503,13 +6709,15 @@ mod tests {
         rebase_barrier.wait();
         let first = first.await.expect("first admission task");
         let second = second.await.expect("second admission task");
-        let RouteBudget::Admitted(first) = first else {
-            panic!("the corrected week remains servable");
+        let (admitted, exhausted) = match (first, second) {
+            (RouteBudget::Admitted(reservation), RouteBudget::Exhausted(reason))
+            | (RouteBudget::Exhausted(reason), RouteBudget::Admitted(reservation)) => {
+                (reservation, reason)
+            }
+            _ => panic!("exactly one request must own the corrected week's billing remainder"),
         };
-        let RouteBudget::Admitted(second) = second else {
-            panic!("the second admission sees the corrected week");
-        };
-        drop((first, second));
+        assert!(exhausted.contains(ORDINARY_BUDGET_EXHAUSTED));
+        drop(admitted);
         assert_eq!(
             deal.remaining_tokens(),
             quota - probe,
@@ -6518,9 +6726,8 @@ mod tests {
         harness.shutdown().await;
     }
 
-    /// A pre-acceptance over-request reaches the seller with only its admitted trial-tick remainder.
-    /// A held reservation leaves two tokens free, keeping the real handler/echo path bounded while
-    /// the caller still asks for far more than the canonical pre-probe ceiling.
+    /// A pre-acceptance request holds the whole trial-tick billing remainder but keeps the caller's
+    /// output-only cap independent on the wire.
     #[tokio::test]
     async fn pre_probe_admission_and_wire_shape_are_capped_to_the_trial_tick() {
         let harness = weekly_route_harness_before_probe(SUB_WEEK_LEN.as_secs()).await;
@@ -6541,30 +6748,23 @@ mod tests {
             probe,
             "pre-probe admission is one tick"
         );
-        let RouteBudget::Admitted(held) = deal.admit(Some(u32::try_from(probe - 2).unwrap())).await
-        else {
-            panic!("the setup holds all but two tokens of the canonical trial tick");
-        };
-        assert_eq!(held.remaining(), probe - 2);
-        assert_eq!(deal.remaining_tokens(), 2);
-
         let (status, body) = harness
-            .ask_full(
-                "/v1/chat/completions",
-                u64::from(u32::MAX),
-                "DEXDO_FIXTURE_ECHOLIMIT weekly quota",
-                false,
-            )
+            .ask_full("/v1/chat/completions", 2, "DEXDO_FIXTURE_ECHOLIMIT", false)
             .await;
         assert_eq!(status, reqwest::StatusCode::OK, "{body}");
         assert!(
             body.contains("limit=2"),
-            "the seller must observe CanonRequest.params.max_tokens=2, not the caller's u32::MAX: \
+            "the seller must observe the independent CanonRequest.params.max_tokens=2: \
              {body}"
         );
-        assert_eq!(deal.delivered_tokens(), 2);
-        drop(held);
-        assert_eq!(deal.remaining_tokens(), probe - 2);
+        let delivery = harness.last_delivery().await;
+        assert_eq!(delivery.billing_grant_tokens, probe);
+        assert_eq!(delivery.output_limit_tokens, 2);
+        assert_eq!(delivery.input_tokens, Some(1));
+        assert_eq!(delivery.output_tokens, Some(2));
+        assert_eq!(delivery.billable_tokens, Some(3));
+        assert_eq!(deal.billable_tokens(), 3);
+        assert_eq!(deal.remaining_tokens(), probe - 3);
         harness.shutdown().await;
     }
 
@@ -6603,23 +6803,24 @@ mod tests {
         let delivery_deal = deal.clone();
         let delivery = tokio::spawn(async move {
             delivery_started.wait();
-            in_flight.record_delivered(&delivery_deal, 1)?;
+            in_flight.record_billing(&delivery_deal, 1)?;
             Ok::<_, String>(in_flight)
         });
         delivery_barrier.wait();
         cutover_barrier.wait();
 
-        let RouteBudget::Admitted(cutover_reservation) =
-            cutover.await.expect("acceptance cutover task")
-        else {
-            panic!("the corrected current week remains servable");
+        let RouteBudget::Exhausted(reason) = cutover.await.expect("acceptance cutover task") else {
+            panic!(
+                "the in-flight request must retain exclusive ownership of the billing remainder"
+            );
         };
+        assert!(reason.contains(ORDINARY_BUDGET_EXHAUSTED));
         let in_flight = delivery
             .await
             .expect("delivery task")
             .expect("in-flight delivery accounting");
-        assert_eq!(deal.delivered_tokens(), 1);
-        drop((cutover_reservation, in_flight));
+        assert_eq!(deal.billable_tokens(), 1);
+        drop(in_flight);
         assert_eq!(
             deal.remaining_tokens(),
             quota - probe - 1,
@@ -6658,7 +6859,7 @@ mod tests {
         };
         assert_eq!(reservation.remaining(), probe, "R=T");
         old_request.hold(reservation);
-        assert_eq!(deal.delivered_tokens(), 0, "D=0");
+        assert_eq!(deal.billable_tokens(), 0, "D=0");
         harness.chain.accepts_probe();
 
         // Hold the real acceptance cutover after it owns `claim_anchor`. The old request begins its
@@ -6674,7 +6875,7 @@ mod tests {
         let delivery_deal = deal.clone();
         let delivery = tokio::spawn(async move {
             delivery_started.wait();
-            let result = old_request.record_delivered(&delivery_deal, 1);
+            let result = old_request.record_billing(&delivery_deal, 1);
             (result, old_request)
         });
         delivery_barrier.wait();
@@ -6694,17 +6895,17 @@ mod tests {
             "rejection leaves the old reservation entirely unused"
         );
         assert_eq!(
-            deal.delivered_tokens(),
+            deal.billable_tokens(),
             0,
             "rejection leaves cumulative delivery unchanged, so no chunk can be exposed"
         );
         assert_eq!(
-            deal.reserved_tokens.load(Ordering::SeqCst),
+            deal.reserved_billable_tokens.load(Ordering::SeqCst),
             probe,
             "the held reservation is unchanged until its guard drops"
         );
         drop(old_request);
-        assert_eq!(deal.reserved_tokens.load(Ordering::SeqCst), 0);
+        assert_eq!(deal.reserved_billable_tokens.load(Ordering::SeqCst), 0);
         assert_eq!(
             deal.remaining_tokens(),
             0,
@@ -6720,10 +6921,15 @@ mod tests {
     /// if the canonical budget moved.
     const VERIFICATION_DEBT: u64 = 2 * CONTENT_PROBE_MAX_TOKENS;
 
+    /// Billable total emitted by the mock for both verification calls used below: two input words
+    /// for `identity probe`, nine for [`DEFAULT_SPOTCHECK_PROBE`], and a full output budget for each.
+    const FULL_VERIFICATION_BILLABLE: u64 = VERIFICATION_DEBT + 11;
+
     /// A models config whose ONLY verification layer is B8, and whose fingerprint the mock seller
     /// satisfies: the mock echoes the prompt after a `mock-reply: ` marker, so a one-token answer
     /// already carries it. B7 needs `DEXDO_FIXTURE_ABSENT_KEY` in the environment and degrades to a
-    /// pass without spending when it is missing, which keeps these tests to one probe exactly.
+    /// pass without spending when it is missing, which keeps these tests to one probe exactly. The
+    /// fixture opts into `SEED` explicitly because the production default is conservatively `NONE`.
     fn probe_models(probe_prompt: &str, base_url: &str, api_key_env: &str) -> Arc<ModelsConfig> {
         Arc::new(
             ModelsConfig::from_json(
@@ -6735,6 +6941,7 @@ mod tests {
                         "api_key_env": api_key_env,
                         "tokenizer_family": "mock",
                         "price_per_tick": 1000,
+                        "capabilities": { "sample_algorithm": "SEED" },
                         "fingerprints": [ {
                             "probe_prompt": probe_prompt,
                             "expected_contains": "mock-reply"
@@ -6745,6 +6952,26 @@ mod tests {
             )
             .expect("canonical probe models config"),
         )
+    }
+
+    /// Provider-native input on B8 can leave B7 less than its canonical output cap. The exact pair
+    /// passed to the second wire call must remain `(min(64, grant), grant)`, rather than asking the
+    /// gateway for an output cap larger than the request can pay in total.
+    #[test]
+    fn second_probe_limits_clamp_output_to_the_remaining_billing_grant() {
+        const FREE: u64 = VERIFICATION_DEBT + 1;
+        const B8_INPUT_TOKENS: u64 = 70;
+        const B8_BILLABLE: u64 = B8_INPUT_TOKENS + 1;
+        const REMAINING_AFTER_B8: u64 = FREE - B8_BILLABLE;
+        const B7_BILLABLE: u64 = 9 + 1;
+        const _: () = assert!(REMAINING_AFTER_B8 < CONTENT_PROBE_MAX_TOKENS);
+        const _: () = assert!(B7_BILLABLE <= REMAINING_AFTER_B8);
+
+        assert_eq!(
+            verification_stream_limits(REMAINING_AFTER_B8),
+            (REMAINING_AFTER_B8, REMAINING_AFTER_B8),
+            "the second output-only cap is clamped while the independent total grant is preserved"
+        );
     }
 
     /// A transport-only endpoint for provider-adapter acceptance rows. It reads one complete HTTP
@@ -6812,13 +7039,22 @@ mod tests {
     /// provider-native usage count. The fixture deliberately sends no tokenizer or logprob signal:
     /// only the joined visible text and native usage cross the buyer boundary.
     fn ups_visible_usage_fixtures(visible_payload: &str, native_usage: u64) -> (String, String) {
+        let billable_total = native_usage.checked_add(1).unwrap();
         let openai_content = serde_json::json!({
             "choices": [{ "delta": { "content": visible_payload } }]
         });
         let openai_usage = serde_json::json!({
             "choices": [{ "delta": {}, "finish_reason": "stop" }],
-            "usage": { "completion_tokens": native_usage },
-            "x_groq": { "usage": { "completion_tokens": native_usage } }
+            "usage": {
+                "prompt_tokens": 1,
+                "completion_tokens": native_usage,
+                "total_tokens": billable_total,
+            },
+            "x_groq": { "usage": {
+                "prompt_tokens": 1,
+                "completion_tokens": native_usage,
+                "total_tokens": billable_total,
+            } }
         });
         let anthropic_start = serde_json::json!({
             "type": "message_start",
@@ -6852,14 +7088,33 @@ mod tests {
         api_key_env: &str,
         prompts: &[&str],
     ) -> (Vec<(reqwest::StatusCode, String)>, usize, usize, u64) {
-        let (addr, task) = fixed_provider_bytes(body.to_string()).await;
-        let harness = weekly_route_harness_gated_with_policy(
-            PROBE_CLAIM,
+        observe_ups_openai_content_gate_arm_with_max_tokens(
+            body,
             subscription,
-            SUB_WEEK_LEN.as_secs(),
-            UNCONSTRAINED_UPSTREAM,
-            ContentGate::probe("dexdo-mock".to_string(), models),
-            crate::seller::UpstreamConfig::OpenAi(crate::seller::OpenAiConfig {
+            models,
+            api_key_env,
+            prompts,
+            1024,
+        )
+        .await
+    }
+
+    async fn observe_ups_openai_content_gate_arm_with_max_tokens(
+        body: &str,
+        subscription: bool,
+        models: Arc<ModelsConfig>,
+        api_key_env: &str,
+        prompts: &[&str],
+        max_tokens: u64,
+    ) -> (Vec<(reqwest::StatusCode, String)>, usize, usize, u64) {
+        let (addr, task) = fixed_provider_bytes(body.to_string()).await;
+        let harness = weekly_route_harness_gated_with_policy(WeeklyRouteScenario {
+            claimed: PROBE_CLAIM,
+            subscription,
+            expires_in: SUB_WEEK_LEN.as_secs(),
+            upstream_tokens: UNCONSTRAINED_UPSTREAM,
+            content_gate: ContentGate::probe("dexdo-mock".to_string(), models),
+            upstream: crate::seller::UpstreamConfig::OpenAi(crate::seller::OpenAiConfig {
                 base_url: format!("http://{addr}"),
                 model: "dexdo-mock".to_string(),
                 frame_model: "dexdo-mock".to_string(),
@@ -6868,25 +7123,26 @@ mod tests {
                 tokenizer_family: "mock".to_string(),
                 capabilities: crate::seller::Capabilities {
                     max_output_tokens: Some(1024),
+                    ..crate::seller::Capabilities::default()
                 },
                 identity_aliases: Vec::new(),
             }),
-            BuyerApiFailurePolicy {
+            failure_policy: BuyerApiFailurePolicy {
                 verification_bail: VerificationBailAction::Dispute,
                 ..BuyerApiFailurePolicy::default()
             },
-            if subscription {
+            lifetime: if subscription {
                 SessionLifetimePolicy::Preserve
             } else {
                 SessionLifetimePolicy::SettleOnExit
             },
-        )
+        })
         .await;
         let mut responses = Vec::new();
         for prompt in prompts {
             responses.push(
                 harness
-                    .ask_full("/v1/chat/completions", 1024, prompt, false)
+                    .ask_full("/v1/chat/completions", max_tokens, prompt, false)
                     .await,
             );
         }
@@ -6899,6 +7155,65 @@ mod tests {
         (responses, disputes, money, delivered)
     }
 
+    /// SSE text fragments are transport units, not provider-native output tokens. The
+    /// provider may split a valid 64-token answer across more than 64 non-empty events; both the
+    /// verification probe and the caller's request must accept the answer from terminal usage.
+    #[tokio::test]
+    async fn fragmented_real_stream_uses_terminal_output_usage_for_the_cap() {
+        const API_KEY: &str = "DEXDO_ISSUE1988_OPENAI_KEY";
+        std::env::set_var(API_KEY, "test-key");
+
+        let mut body = String::new();
+        for index in 0..65 {
+            let content = if index == 0 { "mock-reply" } else { "x" };
+            let chunk = serde_json::json!({
+                "choices": [{ "delta": { "content": content } }]
+            });
+            body.push_str(&format!("data: {chunk}\n\n"));
+        }
+        let usage = serde_json::json!({
+            "choices": [{ "delta": {}, "finish_reason": "stop" }],
+            "usage": {
+                "prompt_tokens": 1,
+                "completion_tokens": CONTENT_PROBE_MAX_TOKENS,
+                "total_tokens": CONTENT_PROBE_MAX_TOKENS + 1,
+            },
+            "x_groq": { "usage": {
+                "prompt_tokens": 1,
+                "completion_tokens": CONTENT_PROBE_MAX_TOKENS,
+                "total_tokens": CONTENT_PROBE_MAX_TOKENS + 1,
+            } }
+        });
+        body.push_str(&format!("data: {usage}\n\ndata: [DONE]\n\n"));
+
+        let (responses, disputes, money, delivered) =
+            observe_ups_openai_content_gate_arm_with_max_tokens(
+                &body,
+                false,
+                probe_models(
+                    "identity probe",
+                    "https://reference.invalid/v1",
+                    "DEXDO_FIXTURE_ABSENT_KEY",
+                ),
+                API_KEY,
+                &["issue 1988"],
+                CONTENT_PROBE_MAX_TOKENS,
+            )
+            .await;
+        std::env::remove_var(API_KEY);
+
+        let (status, response_body) = &responses[0];
+        assert_eq!(*status, reqwest::StatusCode::OK, "{response_body}");
+        assert!(response_body.contains("mock-reply"), "{response_body}");
+        assert_eq!(disputes, 0);
+        assert_eq!(money, 0);
+        assert_eq!(
+            delivered,
+            2 * (CONTENT_PROBE_MAX_TOKENS + 1),
+            "the B8 probe and caller request are billed only from terminal provider usage"
+        );
+    }
+
     /// Mechanical Anthropic arm launcher: real adapter + real gate + existing chain counters.
     /// The calling row owns the provider bytes and every expected outcome.
     async fn observe_ups_anthropic_content_gate_arm(
@@ -6909,13 +7224,13 @@ mod tests {
         prompts: &[&str],
     ) -> (Vec<(reqwest::StatusCode, String)>, usize, usize, u64) {
         let (addr, task) = fixed_provider_bytes(body.to_string()).await;
-        let harness = weekly_route_harness_gated_with_policy(
-            PROBE_CLAIM,
+        let harness = weekly_route_harness_gated_with_policy(WeeklyRouteScenario {
+            claimed: PROBE_CLAIM,
             subscription,
-            SUB_WEEK_LEN.as_secs(),
-            UNCONSTRAINED_UPSTREAM,
-            ContentGate::probe("dexdo-mock".to_string(), models),
-            crate::seller::UpstreamConfig::Anthropic(crate::seller::AnthropicConfig {
+            expires_in: SUB_WEEK_LEN.as_secs(),
+            upstream_tokens: UNCONSTRAINED_UPSTREAM,
+            content_gate: ContentGate::probe("dexdo-mock".to_string(), models),
+            upstream: crate::seller::UpstreamConfig::Anthropic(crate::seller::AnthropicConfig {
                 base_url: format!("http://{addr}"),
                 model: "dexdo-mock".to_string(),
                 frame_model: "dexdo-mock".to_string(),
@@ -6923,16 +7238,16 @@ mod tests {
                 tokenizer_family: "mock".to_string(),
                 max_output_tokens: Some(1024),
             }),
-            BuyerApiFailurePolicy {
+            failure_policy: BuyerApiFailurePolicy {
                 verification_bail: VerificationBailAction::Dispute,
                 ..BuyerApiFailurePolicy::default()
             },
-            if subscription {
+            lifetime: if subscription {
                 SessionLifetimePolicy::Preserve
             } else {
                 SessionLifetimePolicy::SettleOnExit
             },
-        )
+        })
         .await;
         let mut responses = Vec::new();
         for prompt in prompts {
@@ -7086,7 +7401,7 @@ mod tests {
         std::env::set_var(ANTHROPIC_KEY, "test-key");
 
         let openai_empty = concat!(
-            "data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}],\"usage\":{\"completion_tokens\":3},\"x_groq\":{\"usage\":{\"completion_tokens\":3}}}\n\n",
+            "data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}],\"usage\":{\"prompt_tokens\":1,\"completion_tokens\":3,\"total_tokens\":4},\"x_groq\":{\"usage\":{\"prompt_tokens\":1,\"completion_tokens\":3,\"total_tokens\":4}}}\n\n",
             "data: [DONE]\n\n"
         )
         .to_string();
@@ -7167,7 +7482,7 @@ mod tests {
         // Embedded negative: the same real gate must not dispute a plainly nonempty honest response.
         let honest = concat!(
             "data: {\"choices\":[{\"delta\":{\"content\":\"mock-reply\"},\"logprobs\":{\"content\":[{\"token\":\"mock-reply\",\"logprob\":-0.1,\"top_logprobs\":[]}]}}]}\n\n",
-            "data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}],\"usage\":{\"completion_tokens\":1},\"x_groq\":{\"usage\":{\"completion_tokens\":1}}}\n\n",
+            "data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}],\"usage\":{\"prompt_tokens\":1,\"completion_tokens\":1,\"total_tokens\":2},\"x_groq\":{\"usage\":{\"prompt_tokens\":1,\"completion_tokens\":1,\"total_tokens\":2}}}\n\n",
             "data: [DONE]\n\n"
         );
         let (responses, disputes, money, delivered) = observe_ups_openai_content_gate_arm(
@@ -7430,7 +7745,7 @@ mod tests {
             }
         });
         let harness = weekly_route_harness_gated(
-            0,
+            PROBE_CLAIM,
             // An ordinary by-fact deal: the shape the blocker was observed on, and the one whose
             // admission never asks the chain anything.
             false,
@@ -7448,8 +7763,8 @@ mod tests {
         )
         .await;
         let budget = harness.remaining().await;
-        let verification = VERIFICATION_DEBT;
-        assert!(budget > verification + 2, "the deal itself can afford both");
+        let verification = FULL_VERIFICATION_BILLABLE;
+        assert!(budget > verification + 5, "the deal itself can afford both");
 
         let (status, body) = harness
             .ask_full(
@@ -7471,15 +7786,22 @@ mod tests {
         );
         assert_eq!(
             harness.delivered().await,
-            verification + 2,
-            "both verification layers were issued for the canonical probe budget out of the same \
-             admission, and the answer still got the two tokens that were asked for"
+            verification + 5,
+            "both verification layers include their provider-native input totals, and the answer \
+             still got the two output tokens that were asked for"
         );
         assert_eq!(
             harness.remaining().await,
-            budget - verification - 2,
+            budget - verification - 5,
             "the deal is charged for what was delivered and nothing else: what the reservation did \
              not spend came back when the request ended"
+        );
+        let first_delivery = harness.last_delivery().await;
+        assert_eq!(first_delivery.rendered_tokens, 2);
+        assert_eq!(
+            first_delivery.route_delivered_tokens,
+            Some(2 * CONTENT_PROBE_MAX_TOKENS + 2),
+            "the stable route-delivery witness includes both verification probes and the answer"
         );
 
         // The deal is verified now, so the next request owes nothing on top of its own ask.
@@ -7495,7 +7817,7 @@ mod tests {
         assert!(body.contains("limit=2"), "{body}");
         assert_eq!(
             harness.delivered().await,
-            verification + 4,
+            verification + 10,
             "identity verification is owed once per deal, not once per request"
         );
 
@@ -7515,10 +7837,10 @@ mod tests {
     /// still be admitted, spend itself on the probe and refuse the answer for a zero grant: the
     /// reported 502, reached by resuming instead of by starting.
 
-    /// So the boundary itself is the invariant, walked one token at a time rather than by enlarging
-    /// the fixture until every grant comes out whole. `free == debt` is REFUSED with the whole
-    /// remainder untouched and nothing settled; `free == debt + 1` is admitted and answers, with the
-    /// ANSWER clamped below the ask - never the floor; `free == debt + ask` answers in full.
+    /// The admission floor is the two output probe budgets. Provider-native input is not knowable at
+    /// admission, so the request receives the whole free remainder and terminal usage remains the
+    /// authoritative boundary: a remainder equal to the output floor is refused locally, while a
+    /// remainder that fits both complete probe records and the answer succeeds.
     #[tokio::test]
     async fn a_resumed_deal_is_admitted_only_when_it_can_verify_and_still_answer() {
         const REFERENCE_KEY: &str = "DEXDO_FIXTURE_RESUMED_DEAL_REFERENCE_KEY";
@@ -7537,10 +7859,11 @@ mod tests {
             }
         });
 
+        // The answer prompt has three input tokens, so its two requested output tokens need five
+        // billable tokens after both terminal verification records.
         for (free, answered) in [
             (VERIFICATION_DEBT, None),
-            (VERIFICATION_DEBT + 1, Some(1)),
-            (VERIFICATION_DEBT + ASK, Some(ASK)),
+            (FULL_VERIFICATION_BILLABLE + 5, Some(ASK)),
         ] {
             let harness = weekly_route_harness_gated(
                 WEEK_QUOTA - u128::from(free),
@@ -7615,7 +7938,7 @@ mod tests {
                     assert_eq!(
                         status,
                         reqwest::StatusCode::OK,
-                        "free={free}: one token more than the debt is a servable deal: {body}"
+                        "free={free}: complete terminal usage fits the held remainder: {body}"
                     );
                     assert!(
                         body.contains(&format!("limit={answered}")),
@@ -7624,12 +7947,13 @@ mod tests {
                     );
                     assert_eq!(
                         harness.delivered().await,
-                        VERIFICATION_DEBT + answered,
-                        "free={free}: the whole verification the deal owed, and then the answer"
+                        FULL_VERIFICATION_BILLABLE + 3 + answered,
+                        "free={free}: both complete verification usage records, then the answer's \
+                         input and output"
                     );
                     assert_eq!(
                         harness.remaining().await,
-                        free - VERIFICATION_DEBT - answered,
+                        free - FULL_VERIFICATION_BILLABLE - 3 - answered,
                         "free={free}: the deal is charged for what was delivered and nothing else"
                     );
                 }
@@ -7642,23 +7966,12 @@ mod tests {
         std::env::remove_var(REFERENCE_KEY);
     }
 
-    /// A CONCURRENT first request is never handed a partial verification.
-
-    /// The floor has to be applied inside the same atomic attempt that reads the remainder, not
-    /// computed before it. Four first-requests race on a deal that has verified nothing: one of them
-    /// can be paid for in full, and what is left afterwards is exactly the verification debt - a
-    /// positive remainder, and the most dangerous one there is, being the precise size of a probe it
-    /// could not follow with an answer. Clamping to `min(want, free)` would hand it to a runner-up,
-    /// which would burn it on the probe and return with no inference: again, reached by a race
-    /// rather than by a restart. Exactly one racer is admitted, for its whole ask plus the whole
-    /// debt, and the remainder is left where it is.
+    /// Provider-native input is unknown before terminal usage, so concurrent first requests are
+    /// serialized by one reservation over the whole free route remainder.
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn a_concurrent_first_request_is_never_handed_a_partial_verification() {
         const ASK: u64 = 2;
-        const GRANT: u64 = ASK + VERIFICATION_DEBT;
-        // One whole admission, and then exactly the debt: the largest remainder that still cannot
-        // pay for a verification AND deliver an answer.
-        const FREE: u64 = GRANT + VERIFICATION_DEBT;
+        const FREE: u64 = ASK + 2 * VERIFICATION_DEBT;
         let harness = weekly_route_harness_gated(
             WEEK_QUOTA - FREE as u128,
             false,
@@ -7708,29 +8021,27 @@ mod tests {
             "only one of these requests can be paid for in full: {refused:?}"
         );
         assert_eq!(
-            admitted[0].granted, GRANT,
-            "the winner holds its own ask AND the whole verification the deal owes"
+            admitted[0].granted, FREE,
+            "the winner holds the entire free billing remainder"
         );
         for reason in &refused {
             assert!(
                 reason.contains(UNVERIFIED_BUDGET_CANNOT_COVER_VERIFICATION),
-                "the losers are refused for the remainder they could not cover: {reason}"
+                "the losers see no unreserved remainder: {reason}"
             );
         }
-        // Read while the winner's reservation is still HELD: the debt-sized remainder is neither
-        // reserved by a loser nor quietly consumed by the winner.
         assert_eq!(
             deal.remaining_tokens(),
-            VERIFICATION_DEBT,
-            "a remainder that cannot cover a verification stays on the route instead of being \
-             handed out as a grant the probe would consume whole"
+            0,
+            "the winner holds the whole remainder while its provider-native input is unknown"
         );
         drop(admitted);
         harness.shutdown().await;
     }
 
-    /// The OTHER side of: once the deal has PAID its verification, admission reserves exactly
-    /// the ask -- and a remainder smaller than that verification is still servable.
+    /// The OTHER side of: once the deal has PAID its verification, its admission floor becomes
+    /// zero -- and a remainder smaller than that verification is still servable. The one in-flight
+    /// request reserves that whole free billable remainder while provider-native input is unknown.
 
     /// Every other test drives the gate while the debt is outstanding, where the floor is
     /// positive. All of them stay green under a regression that made the floor unconditional -- one
@@ -7758,7 +8069,7 @@ mod tests {
         const ASK: u64 = 2;
 
         let harness = weekly_route_harness_gated(
-            0,
+            PROBE_CLAIM,
             // An ordinary by-fact deal: the shape was reported on.
             false,
             SUB_WEEK_LEN.as_secs(),
@@ -7812,7 +8123,7 @@ mod tests {
         // verification this deal has already paid for. Written against the constant, because a
         // remainder ABOVE the debt would let the unconditional-floor regression pass.
         const _: () = assert!(ASK < VERIFICATION_DEBT);
-        let spent = deal.reserved_tokens.load(Ordering::SeqCst);
+        let spent = deal.reserved_billable_tokens.load(Ordering::SeqCst);
         deal.token_ceiling.store(spent + ASK, Ordering::SeqCst);
         assert_eq!(deal.remaining_tokens(), ASK, "the tail is the fixture");
 
@@ -7840,19 +8151,21 @@ mod tests {
     /// Admission reserves the deal's unpaid verification on top of the ask, so the grant a handler
     /// still HOLDS when it caps the answer can be far larger than the caller's own limit. Here the
     /// fingerprint layer is the only one that spends - B7 has no reference key and degrades without
-    /// spending - so half the debt is still held: 66 against an ask of 2. `cap_canon_to_grant`
+    /// spending - so its complete usage is 66 tokens and the rest is still held.
+    /// `cap_canon_to_grant`
     /// returns the caller's figure and BOTH handlers must enforce THAT on the way back. A handler
     /// that reached for `request_guard.remaining_grant()` instead would be indistinguishable against
     /// a compliant seller, which is why this one is not compliant: told 2, it answers with a
-    /// one-token chunk and then a two-token chunk, straddling the ask. Only the first may be
-    /// charged, only the first may be shown, and the headroom nothing spent must come back.
+    /// one-token chunk and then a two-token chunk, straddling the ask. Only the first may be shown;
+    /// without a valid terminal usage record neither answer chunk is charged, and unused headroom
+    /// comes back.
     #[tokio::test]
     async fn verification_headroom_is_never_served_as_answer_tokens() {
         const ASK: u64 = 2;
         const GRANT: u64 = ASK + VERIFICATION_DEBT;
         // B8 probes for the canonical budget; B7 degrades on a missing reference key without
         // spending, so exactly half of the reserved debt is still held when the answer is capped.
-        const VERIFICATION_SPEND: u64 = CONTENT_PROBE_MAX_TOKENS;
+        const VERIFICATION_SPEND: u64 = CONTENT_PROBE_MAX_TOKENS + 2;
         const HELD_AT_CAP: u64 = GRANT - VERIFICATION_SPEND;
         // The divergence this test exists to catch, made a property of the fixture rather than of
         // the run: the two candidate caps are different numbers, so a handler that binds the held
@@ -7901,15 +8214,15 @@ mod tests {
             );
             assert_eq!(
                 harness.delivered().await,
-                VERIFICATION_SPEND + 1,
-                "{path}: one probe and the single answer token that fits the ask - capping on the \
-                 held grant would charge the straddling chunk too: {body}"
+                VERIFICATION_SPEND,
+                "{path}: the complete probe usage is charged, but the answer has no accepted \
+                 terminal usage after its straddling chunk: {body}"
             );
             assert_eq!(
                 harness.remaining().await,
-                GRANT - VERIFICATION_SPEND - 1,
-                "{path}: the verification the gate never spent and the answer token the seller \
-                 straddled away both return to the route"
+                GRANT - VERIFICATION_SPEND,
+                "{path}: unused verification headroom and the incomplete answer both return to the \
+                 route"
             );
             harness.shutdown().await;
         }
@@ -7989,8 +8302,9 @@ mod tests {
     /// An admitted grant now covers the whole verification a deal owes, so the probe's own
     /// budget is always the canonical one - which a four-token chunk divides exactly and can no
     /// longer straddle. A seller that chunks 1, 2, 2,... still can: it reaches 63 of the 64 and then
-    /// offers two more. That chunk is refused before it is accounted, the tokens already accepted
-    /// stay charged, and the rest of the reservation comes back.
+    /// offers two more. That chunk is refused before rendering; because the stream cannot then
+    /// reach an accepted terminal usage record, the visible prefix remains unbilled and the whole
+    /// reservation comes back.
     #[tokio::test]
     #[ignore = "EXPECTED TO FAIL until a seller harness exists that does not route through \
                 cap_canon_to_grant (). Same cause as \
@@ -8001,8 +8315,6 @@ mod tests {
     async fn a_noncompliant_probe_chunk_cannot_cross_the_verification_cap() {
         const ASK: u64 = 2;
         const GRANT: u64 = ASK + VERIFICATION_DEBT;
-        // Accepted as 1, 3, 5,... so the last chunk that fits leaves the budget one token short.
-        const ACCEPTED: u64 = CONTENT_PROBE_MAX_TOKENS - 1;
         let models = probe_models(
             "DEXDO_FIXTURE_STRADDLE identity probe",
             "https://reference.invalid/v1",
@@ -8021,13 +8333,12 @@ mod tests {
         let (status, body) = harness.ask(ASK).await;
         let delivered = harness.delivered().await;
         let remaining = harness.remaining().await;
-        // Red-by-design reporting shape (ci/run-red-by-design-tests.sh). The four conditions are
-        // unchanged: the probe is refused as a noncompliant chunk, the chunks that fit are charged,
-        // the one that would cross the cap is not, and what the refused probe did not spend returns.
+        // Red-by-design reporting shape (ci/run_red_by_design_tests.sh): the probe is refused as a
+        // noncompliant chunk, no content-only prefix moves money, and the grant returns.
         let complete = status == reqwest::StatusCode::BAD_GATEWAY
             && body.contains("noncompliant chunk")
-            && delivered == ACCEPTED
-            && remaining == GRANT - ACCEPTED;
+            && delivered == 0
+            && remaining == GRANT;
         harness.shutdown().await;
         if !complete {
             eprintln!("status={status} delivered={delivered} remaining={remaining} body={body}");
@@ -8038,8 +8349,9 @@ mod tests {
     /// Handler cancellation during B7 returns only the unused part of its held reservation.
 
     /// The grant is the caller's eight tokens plus the verification the deal owes; the seller
-    /// emits one token per stream, so the two probes spend two of it and the rest is slack the
-    /// cancellation has to give back.
+    /// emits one output token per stream. Their complete terminal usage records also include two
+    /// input tokens for B8 and nine for B7, so the two probes spend thirteen and the rest is slack
+    /// the cancellation has to give back.
     #[tokio::test]
     async fn cancelled_handler_keeps_probe_spend_in_its_reservation() {
         const ASK: u64 = 8;
@@ -8082,6 +8394,7 @@ mod tests {
         let state = ApiState {
             buyer: harness.buyer.clone(),
             frame_model: "dexdo-mock".to_string(),
+            mock_model: true,
             deals: harness.deals.clone(),
             delivery_events: None,
         };
@@ -8139,19 +8452,19 @@ mod tests {
             )
         });
         assert_eq!(
-            deal.delivered_tokens(),
-            2,
+            deal.billable_tokens(),
+            13,
             "B8 and the seller half of B7 are charged before B7 awaits its reference"
         );
         assert_eq!(deal.remaining_tokens(), 0, "the whole grant is still held");
 
         handler.abort();
         let _ = handler.await;
-        assert_eq!(deal.delivered_tokens(), 2);
+        assert_eq!(deal.billable_tokens(), 13);
         assert_eq!(
             deal.remaining_tokens(),
-            GRANT - 2,
-            "cancellation returns only the unused tokens, not the two paid probe tokens"
+            GRANT - 13,
+            "cancellation returns only the unused tokens, not the complete paid probe usage"
         );
         reference_task.abort();
         let _ = reference_task.await;
@@ -8159,9 +8472,9 @@ mod tests {
         harness.shutdown().await;
     }
 
-    /// One accepted B8 chunk remains charged when the provider stream then fails.
+    /// A partial B8 response is not charged when transport fails before terminal usage.
     #[tokio::test]
-    async fn partial_probe_transport_failure_keeps_accepted_tokens_charged() {
+    async fn partial_probe_transport_failure_bills_nothing_without_terminal_usage() {
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
         const ASK: u64 = 8;
@@ -8204,6 +8517,7 @@ mod tests {
             tokenizer_family: "mock".to_string(),
             capabilities: crate::seller::Capabilities {
                 max_output_tokens: Some(64),
+                ..crate::seller::Capabilities::default()
             },
             identity_aliases: Vec::new(),
         });
@@ -8228,36 +8542,28 @@ mod tests {
         assert_eq!(status, reqwest::StatusCode::BAD_GATEWAY, "{body}");
         assert_eq!(
             harness.delivered().await,
-            1,
-            "the complete B8 chunk preceding the transport failure remains charged"
+            0,
+            "content without a complete terminal usage record cannot move money"
         );
         assert_eq!(
             harness.remaining().await,
-            GRANT - 1,
-            "only the unused tokens return when the failed probe reservation drops"
+            GRANT,
+            "the whole grant returns when the failed probe has no terminal usage"
         );
         upstream_task.await.expect("partial upstream task");
         std::env::remove_var(UPSTREAM_KEY);
         harness.shutdown().await;
     }
 
-    /// The shared probe spend is charged exactly once, to the request that incurred it (
-    /// blocker 2).
-
-    /// `OnceCell` lets one caller run the probes while the others wait for its verdict. The spend
-    /// belongs to the caller that ran them: a counter shared on the gate would let a waiter take the
-    /// charge for output it never asked for, or let two requests each be charged for the same
-    /// tokens. Each call therefore brings its own counter, and only the initializing call writes.
+    /// Exactly one request may hold a billing grant on a deal while provider-native input remains
+    /// unknown; dropping it reopens the full unused remainder.
+    /// E2E-ROW: E2E-UPS-39/L0
     #[tokio::test]
-    async fn concurrent_waiters_are_not_charged_for_another_request_s_probe() {
-        // Each concurrent first-request is admitted for what it ASKS plus the identity verification
-        // the deal still owes - nobody has cached a verdict yet - so the fixture holds four
-        // whole admissions rather than four bare asks. The three that only wait spend none of it and
-        // hand it all back.
+    async fn one_in_flight_billing_reservation_serializes_a_deal() {
         const ASK: u64 = 64;
-        const GRANT: u64 = ASK + VERIFICATION_DEBT;
+        const FREE: u64 = ASK + VERIFICATION_DEBT;
         let harness = weekly_route_harness_gated(
-            WEEK_QUOTA - 4 * GRANT as u128,
+            WEEK_QUOTA - FREE as u128,
             true,
             SUB_WEEK_LEN.as_secs(),
             UNCONSTRAINED_UPSTREAM,
@@ -8278,42 +8584,25 @@ mod tests {
             .await
             .expect("the harness route is published");
 
-        // Four concurrent verifications, each holding its own real reservation. Only the initializer
-        // may draw down the guard it was invoked with; waiters retain their entire grants.
-        let mut guards = Vec::new();
-        for _ in 0..4 {
-            let mut guard = deal.begin_request(unix_now_secs());
-            let RouteBudget::Admitted(reservation) = deal.admit(Some(ASK as u32)).await else {
-                panic!("the fixture has four whole admissions");
-            };
-            assert_eq!(
-                reservation.granted, GRANT,
-                "admission reserves the ask plus the verification this deal owes"
-            );
-            guard.hold(reservation);
-            guards.push(guard);
-        }
-        let calls = guards.iter_mut().map(|guard| {
-            deal.content_gate
-                .ensure_verified(&harness.buyer, &deal, guard)
-        });
-        for outcome in futures::future::join_all(calls).await {
-            outcome.expect("the mock seller satisfies its own fingerprint");
-        }
+        let first = match deal.admit(Some(ASK as u32)).await {
+            RouteBudget::Admitted(reservation) => reservation,
+            RouteBudget::Exhausted(reason) => panic!("first request was refused: {reason}"),
+        };
+        assert_eq!(first.granted, FREE);
+        assert_eq!(deal.remaining_tokens(), 0);
 
-        let charged: Vec<u64> = guards
-            .iter()
-            .map(|guard| GRANT - guard.remaining_grant())
-            .collect();
-        let paying = charged.iter().filter(|spent| **spent > 0).count();
-        assert_eq!(
-            paying, 1,
-            "exactly one caller ran the probes and exactly one is charged: {charged:?}"
-        );
-        assert!(
-            charged.iter().sum::<u64>() <= CONTENT_PROBE_MAX_TOKENS,
-            "one verification, charged once: {charged:?}"
-        );
+        assert!(matches!(
+            deal.admit(Some(ASK as u32)).await,
+            RouteBudget::Exhausted(_)
+        ));
+
+        drop(first);
+        let reopened = match deal.admit(Some(ASK as u32)).await {
+            RouteBudget::Admitted(reservation) => reservation,
+            RouteBudget::Exhausted(reason) => panic!("unused grant did not reopen: {reason}"),
+        };
+        assert_eq!(reopened.granted, FREE);
+        drop(reopened);
         harness.shutdown().await;
     }
 

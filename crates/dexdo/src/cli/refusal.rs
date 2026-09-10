@@ -80,6 +80,7 @@ impl Refusal {
         }
     }
 
+    #[cfg(test)]
     pub(crate) fn kind(&self) -> Kind {
         self.kind
     }
@@ -90,6 +91,7 @@ impl Refusal {
     }
 
     /// The instruction alone, for a test that asks whether this refusal can be acted on.
+    #[cfg(test)]
     pub(crate) fn do_next(&self) -> &str {
         &self.do_next
     }
@@ -360,7 +362,8 @@ pub(crate) fn for_operator(error: &anyhow::Error) -> Option<Refusal> {
     }
     // Another instance holds this data directory. The remedy is in the operator's hands and the
     // message already carries it; what it lacked was the shape.
-    if lower.contains("instance is already using data directory") || lower.contains("instance.lock") {
+    if lower.contains("instance is already using data directory") || lower.contains("instance.lock")
+    {
         return Some(Refusal::new(
             "Another instance of this command is already using that data directory, and nothing \
              was sent.",
@@ -486,7 +489,10 @@ mod tests {
             lines[0].contains("\u{26a0} ") && lines[0].contains("No seller is offering"),
             "{rendered}"
         );
-        assert!(lines[1].trim_start().starts_with("Add --wait-for-seller"), "{rendered}");
+        assert!(
+            lines[1].trim_start().starts_with("Add --wait-for-seller"),
+            "{rendered}"
+        );
         assert_eq!(lines.len(), 2, "two lines and nothing else: {rendered}");
         assert!(
             !rendered.contains("BUYER_PREFLIGHT"),
@@ -538,7 +544,10 @@ mod tests {
 
         impl std::io::Write for Captured {
             fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
-                self.0.lock().expect("capture buffer").extend_from_slice(bytes);
+                self.0
+                    .lock()
+                    .expect("capture buffer")
+                    .extend_from_slice(bytes);
                 Ok(bytes.len())
             }
             fn flush(&mut self) -> std::io::Result<()> {
@@ -573,7 +582,8 @@ mod tests {
         });
         let recorded = String::from_utf8(at_info.0.lock().expect("buffer").clone()).expect("utf-8");
         assert!(
-            recorded.contains("100000000000 raw ECC[2] SHELL") && recorded.contains("timed out after 600s"),
+            recorded.contains("100000000000 raw ECC[2] SHELL")
+                && recorded.contains("timed out after 600s"),
             "the detail has to be recoverable with RUST_LOG=info: {recorded}"
         );
 
@@ -679,8 +689,14 @@ mod tests {
             "BUYER_PREFLIGHT matchable=false",
         )
         .with_alternatives([
-            ("queue the buy".to_string(), "dexdo buyer --wait-for-seller".to_string()),
-            ("see what is offered".to_string(), "dexdo markets".to_string()),
+            (
+                "queue the buy".to_string(),
+                "dexdo buyer --wait-for-seller".to_string(),
+            ),
+            (
+                "see what is offered".to_string(),
+                "dexdo markets".to_string(),
+            ),
         ]);
         let rendered = refusal.render_with(crate::cli::style::Palette::None);
         let lines: Vec<&str> = rendered.lines().collect();
@@ -700,12 +716,18 @@ mod tests {
             "the instruction survives the presence of alternatives -- `with_alternatives` says of \
              itself that they replace nothing: {rendered}"
         );
-        assert!(lines[2].contains("try") && lines[2].contains("dexdo buyer --wait-for-seller"), "{rendered}");
+        assert!(
+            lines[2].contains("try") && lines[2].contains("dexdo buyer --wait-for-seller"),
+            "{rendered}"
+        );
         assert!(
             !lines[3].contains("try") && lines[3].contains("dexdo markets"),
             "the second row continues under the first, without repeating the label: {rendered}"
         );
-        assert!(!rendered.contains("BUYER_PREFLIGHT"), "the record stays off the screen: {rendered}");
+        assert!(
+            !rendered.contains("BUYER_PREFLIGHT"),
+            "the record stays off the screen: {rendered}"
+        );
     }
 
     /// "after 600s" is how a timeout is stored, not how a wait is described.

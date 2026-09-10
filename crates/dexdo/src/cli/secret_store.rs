@@ -147,7 +147,9 @@ fn entry(account: &str) -> Result<keyring::Entry> {
 /// password. One `{error}` in the wrong arm and a secret is in a log.
 fn describe(error: &keyring::Error) -> String {
     match error {
-        keyring::Error::PlatformFailure(inner) => format!("platform secure storage failure: {inner}"),
+        keyring::Error::PlatformFailure(inner) => {
+            format!("platform secure storage failure: {inner}")
+        }
         keyring::Error::NoStorageAccess(inner) => {
             format!("platform secure storage is not accessible: {inner}")
         }
@@ -297,9 +299,9 @@ fn write_file(name: &SecretName, secret: &str) -> Result<()> {
                 use std::os::unix::fs::DirBuilderExt as _;
                 builder.mode(0o700);
             }
-            builder.create(parent).with_context(|| {
-                format!("create secret directory {}", parent.display())
-            })?;
+            builder
+                .create(parent)
+                .with_context(|| format!("create secret directory {}", parent.display()))?;
         }
     }
     crate::cli::note::write_private_atomic(name.file(), secret.as_bytes())
@@ -351,12 +353,7 @@ mod tests {
 
         fn read(&self, _account: &str) -> Result<Option<Zeroizing<String>>> {
             *self.reads.lock().unwrap() += 1;
-            Ok(self
-                .held
-                .lock()
-                .unwrap()
-                .clone()
-                .map(Zeroizing::new))
+            Ok(self.held.lock().unwrap().clone().map(Zeroizing::new))
         }
 
         fn write(&self, _account: &str, secret: &str) -> Result<()> {
@@ -388,7 +385,11 @@ mod tests {
         );
         store.write(&name, SECRET).expect("write the secret");
         assert_eq!(
-            store.read(&name).expect("read it back").as_deref().map(String::as_str),
+            store
+                .read(&name)
+                .expect("read it back")
+                .as_deref()
+                .map(String::as_str),
             Some(SECRET)
         );
 
@@ -418,7 +419,11 @@ mod tests {
 
         store.write(&name, SECRET).expect("write the secret");
         assert_eq!(
-            store.read(&name).expect("read it back").as_deref().map(String::as_str),
+            store
+                .read(&name)
+                .expect("read it back")
+                .as_deref()
+                .map(String::as_str),
             Some(SECRET)
         );
         assert!(
@@ -457,7 +462,11 @@ mod tests {
 
         store.write(&name, SECRET).expect("write the secret");
         assert_eq!(
-            store.read(&name).expect("read it back").as_deref().map(String::as_str),
+            store
+                .read(&name)
+                .expect("read it back")
+                .as_deref()
+                .map(String::as_str),
             Some(SECRET)
         );
         assert_eq!(
@@ -465,7 +474,10 @@ mod tests {
             0,
             "a forced file branch must not read or write the system store"
         );
-        assert!(name.file().exists(), "and the secret is in the file it forced");
+        assert!(
+            name.file().exists(),
+            "and the secret is in the file it forced"
+        );
     }
 
     /// Nobody who already has a key on disk loses it: the system branch falls through to the file.
@@ -474,7 +486,9 @@ mod tests {
         let temp = tempfile::tempdir().expect("temp dir");
         let name = SecretName::at(temp.path().join("gateway.pem"));
         let older_client = store(Some("file"), FakeSystemStore::vanishing());
-        older_client.write(&name, SECRET).expect("the key an older client wrote");
+        older_client
+            .write(&name, SECRET)
+            .expect("the key an older client wrote");
 
         let system = FakeSystemStore::persistent();
         let today = store(None, system.clone());
@@ -488,7 +502,11 @@ mod tests {
             Some(SECRET),
             "a key written before this module existed must still be found"
         );
-        assert_eq!(*system.reads.lock().unwrap(), 1, "the system store was asked first");
+        assert_eq!(
+            *system.reads.lock().unwrap(),
+            1,
+            "the system store was asked first"
+        );
     }
 
     /// A word the variable does not define is a refusal naming both words it does.
@@ -497,7 +515,8 @@ mod tests {
         let error = choose(Some("keychain"), true).expect_err("an undefined word");
         let rendered = format!("{error:#}");
         assert!(
-            rendered.contains("`system`") && rendered.contains("`file`")
+            rendered.contains("`system`")
+                && rendered.contains("`file`")
                 && rendered.contains("`keychain`"),
             "the refusal must name what was asked and what is accepted, got: {rendered}"
         );
@@ -516,7 +535,9 @@ mod tests {
     #[test]
     fn open_reads_the_variable() {
         static SERIALIZE: Mutex<()> = Mutex::new(());
-        let _guard = SERIALIZE.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        let _guard = SERIALIZE
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
 
         let previous = std::env::var(SECRET_STORE_VAR).ok();
         std::env::set_var(SECRET_STORE_VAR, "file");
@@ -558,14 +579,18 @@ mod tests {
         // Every surface this module offers while it is holding the secret.
         let system = FakeSystemStore::persistent();
         let with_system = store(None, system.clone());
-        with_system.write(&name, SECRET).expect("write into the system store");
+        with_system
+            .write(&name, SECRET)
+            .expect("write into the system store");
         rendered.push_str(&format!("{with_system:?}\n"));
         rendered.push_str(&format!("{:?}\n", with_system.backend));
         rendered.push_str(&format!("{name:?}\n"));
         rendered.push_str(&format!("{}\n", name.account()));
 
         let on_disk = store(Some("file"), FakeSystemStore::vanishing());
-        on_disk.write(&name, SECRET).expect("write into the client's own store");
+        on_disk
+            .write(&name, SECRET)
+            .expect("write into the client's own store");
         rendered.push_str(&format!("{on_disk:?}\n"));
 
         // And every failure it can produce while holding it. Both renderings of each: `{:#}` is
@@ -616,7 +641,9 @@ mod tests {
         std::fs::set_permissions(name.file(), std::fs::Permissions::from_mode(0o644))
             .expect("expose it the way a bad backup would");
 
-        let error = store.read(&name).expect_err("an exposed secret file is refused");
+        let error = store
+            .read(&name)
+            .expect_err("an exposed secret file is refused");
         let rendered = format!("{error:#}");
         assert!(
             rendered.contains("can be read by users other than its owner"),

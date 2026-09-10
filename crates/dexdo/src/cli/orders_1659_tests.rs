@@ -9,21 +9,10 @@
 //! about the path that applies it.
 
 use super::{read_live_order_snapshot_with, OrdersView};
-use crate::cli::commands::BookTarget;
 use dexdo_core::{OrderBookOrder, OrderBookSnapshot};
 
 const BOOK: &str = "0:917d85f33c24d3ed930355bf98a488456256d27de3c022d2c785315fcfcdb80f";
 const OWNER: &str = "0:3bc65e6ab529b648a74ab3da1707edc450e0c91dcc12ffea53f0850117572aa1";
-
-fn target() -> BookTarget {
-    BookTarget {
-        frame_model: "qwen--qwen3--32b".to_string(),
-        model_hash: "0x53c05e91aeb663699a720e7a7e211f2f9eb2aa4b8c68a7f87c80cc56b716d8a8".to_string(),
-        order_book: Some(BOOK.to_string()),
-        root_model: None,
-        note_addr: Some(OWNER.to_string()),
-    }
-}
 
 /// The row the book actually holds, from: linked in the owner list, counted, deadline long
 /// past, and invisible to the fold.
@@ -45,7 +34,8 @@ fn stored_row() -> OrderBookOrder {
 fn snapshot_with(orders: Vec<OrderBookOrder>) -> OrderBookSnapshot {
     OrderBookSnapshot {
         frame_model: "qwen--qwen3--32b".to_string(),
-        model_hash: "0x53c05e91aeb663699a720e7a7e211f2f9eb2aa4b8c68a7f87c80cc56b716d8a8".to_string(),
+        model_hash: "0x53c05e91aeb663699a720e7a7e211f2f9eb2aa4b8c68a7f87c80cc56b716d8a8"
+            .to_string(),
         order_book: BOOK.to_string(),
         stats: None,
         orders,
@@ -132,9 +122,10 @@ async fn an_emptiness_storage_confirms_is_reported_as_empty() {
 // -------------------------------------------------------------------------
 
 // Sites 1 and 2 refuse on an unbelieved silence; this one CONFIRMS on it, and that is the direction
-// that hands an operator a figure instead of withholding one. `order_has_left_the_book` answered
-// `true` when the fold simply did not carry the row, so a bounded history became a reported removal
-// and a reported refund.
+// that hands an operator a figure instead of withholding one. The former row-only predicate
+// answered `true` when the fold simply did not carry the row, so a bounded history became a
+// reported removal and a reported refund. `reconcile_order_removal_with` now requires direct
+// storage confirmation for that silent-fold branch.
 
 use super::reconcile_order_removal_with;
 use dexdo_core::chain::LiveBookOrder;

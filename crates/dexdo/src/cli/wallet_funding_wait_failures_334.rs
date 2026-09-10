@@ -366,10 +366,7 @@ async fn a_final_read_failure_leaves_the_funding_window_at_once() {
     // And the same discrimination once the wait is already running: the unanswered read is sat
     // through, the final one that follows ends it immediately and is what surfaces.
     let dir = temp();
-    let chain = ScriptedChain::new(
-        vec![Err(no_answer_error())],
-        Err(FINAL_ERROR.to_string()),
-    );
+    let chain = ScriptedChain::new(vec![Err(no_answer_error())], Err(FINAL_ERROR.to_string()));
     let provider = ScriptedProvider::new(RequestPresence::Absent);
     let error = run(dir.path(), &chain, &provider, patient_bounds())
         .await
@@ -429,10 +426,7 @@ async fn a_failed_wait_names_the_funding_state_it_left_behind() {
         .await
         .expect_err("the seed run leaves its request pending");
     assert_eq!(seed_provider.submits.get(), 1);
-    let chain = ScriptedChain::new(
-        vec![ScriptedChain::shell(0)],
-        Err(FINAL_ERROR.to_string()),
-    );
+    let chain = ScriptedChain::new(vec![ScriptedChain::shell(0)], Err(FINAL_ERROR.to_string()));
     let provider = ScriptedProvider::new(pending());
     let error = run(dir.path(), &chain, &provider, patient_bounds())
         .await
@@ -548,33 +542,49 @@ async fn the_funding_state_in_the_envelope_is_one_closed_set_name_and_no_secret(
     }
 }
 
-/// The human rendering of the funding state and its serialized `event` are the same name.
-
-/// The state travels through the error chain as a typed cause whose `Display` an operator reads,
-/// and out of the envelope as a serde tag a machine reads. Two spellings of one fact drift; this
-/// pins them together for every variant of the closed set.
+/// Every funding state keeps its stable machine-contract event name.
 #[test]
 fn the_funding_event_name_is_the_one_serde_writes() {
-    for notice in [
-        MachineFundingNotice::AlreadyFunded,
-        MachineFundingNotice::RequestSubmitted,
-        MachineFundingNotice::RequestAlreadyPending,
-        MachineFundingNotice::RequestExecuted,
-        MachineFundingNotice::RequestIndeterminate,
-        MachineFundingNotice::ManualTopUpRequested,
+    for (notice, expected) in [
+        (MachineFundingNotice::AlreadyFunded, "already_funded"),
+        (MachineFundingNotice::RequestSubmitted, "request_submitted"),
+        (
+            MachineFundingNotice::RequestAlreadyPending,
+            "request_already_pending",
+        ),
+        (MachineFundingNotice::RequestExecuted, "request_executed"),
+        (
+            MachineFundingNotice::RequestIndeterminate,
+            "request_indeterminate",
+        ),
+        (
+            MachineFundingNotice::ManualTopUpRequested,
+            "manual_top_up_requested",
+        ),
     ] {
         let serialized = serde_json::to_value(notice).expect("serialize the notice");
         assert_eq!(
-            serialized["event"], notice.event(),
-            "the displayed name and the serialized event must be one name: {serialized}"
-        );
-        assert_eq!(
-            machine::FundingContext::wrap(notice, anyhow!("the message the operator reads"))
-                .to_string(),
-            "the message the operator reads",
-            "carrying the state must not rewrite the operator's message"
+            serialized["event"], expected,
+            "the serialized event must remain stable: {serialized}"
         );
     }
+}
+
+/// Carrying a funding state through an error must not rewrite what the operator reads.
+#[test]
+fn the_funding_context_preserves_the_operator_message() {
+    let wrapped = machine::FundingContext::wrap(
+        MachineFundingNotice::RequestSubmitted,
+        anyhow!("the message the operator reads"),
+    );
+    assert_eq!(wrapped.to_string(), "the message the operator reads");
+    assert_eq!(
+        wrapped
+            .downcast_ref::<machine::FundingContext>()
+            .expect("typed funding context")
+            .notice(),
+        MachineFundingNotice::RequestSubmitted
+    );
 }
 
 /// Naming the funding state must not silently rename the failure.
@@ -624,7 +634,10 @@ async fn attaching_the_funding_state_does_not_change_the_error_code() {
         );
 
         let bare = machine::classify_error(OP_NOTE_DEPLOY, &failure());
-        assert_eq!(bare, expected, "{case}: the unwrapped cause names its own code");
+        assert_eq!(
+            bare, expected,
+            "{case}: the unwrapped cause names its own code"
+        );
         assert_eq!(
             machine::classify_error(OP_NOTE_DEPLOY, &error),
             bare,

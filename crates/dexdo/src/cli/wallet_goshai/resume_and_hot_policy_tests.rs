@@ -15,7 +15,6 @@
 
 use super::files;
 use super::{resume_onboarding, verify_active_hot, ActiveHotFacts, HotRefusal};
-use crate::cli::wallet::WalletNetwork;
 
 // A self-dApp address: the two 64-hex halves are equal, which is what makes it a wallet rather than
 // a contract inside somebody's DApp.
@@ -221,10 +220,7 @@ fn derive_stub(phrase: &str) -> anyhow::Result<String> {
 }
 
 /// One timed-out attempt, as the operator leaves it: phrase and draft on disk, no binding.
-fn timed_out_attempt(
-    data_dir: &std::path::Path,
-    binding_id: &str,
-) -> super::PreparedOnboarding {
+fn timed_out_attempt(data_dir: &std::path::Path, binding_id: &str) -> super::PreparedOnboarding {
     let mut prompt = OneShotPrompt(vec![format!("{} {}", hot_address(), phrase())]);
     let mut notices = Vec::new();
     super::prepare_onboarding(
@@ -253,7 +249,10 @@ fn a_second_onboarding_after_a_timeout_resumes_instead_of_asking_for_the_phrase_
     let first = timed_out_attempt(dir.path(), &binding_id);
 
     // The unfinished attempt is discoverable, and it is the one the store reserved.
-    let found = files::find_resumable(&dir.path().join("wallet"), &crate::cli::wallet::test_network_a());
+    let found = files::find_resumable(
+        &dir.path().join("wallet"),
+        &crate::cli::wallet::test_network_a(),
+    );
     assert_eq!(
         found.as_deref(),
         Some(binding_id.as_str()),
@@ -295,7 +294,10 @@ fn a_draft_from_another_network_is_not_resumed() {
     timed_out_attempt(dir.path(), &binding_id);
 
     assert_eq!(
-        files::find_resumable(&dir.path().join("wallet"), &crate::cli::wallet::test_network_b()),
+        files::find_resumable(
+            &dir.path().join("wallet"),
+            &crate::cli::wallet::test_network_b()
+        ),
         None,
         "a draft for one network is not an attempt on another"
     );
@@ -317,7 +319,10 @@ fn a_draft_from_another_network_is_not_resumed() {
 fn an_untouched_data_directory_has_nothing_to_resume() {
     let dir = tempfile::tempdir().expect("temp dir");
     assert_eq!(
-        files::find_resumable(&dir.path().join("wallet"), &crate::cli::wallet::test_network_a()),
+        files::find_resumable(
+            &dir.path().join("wallet"),
+            &crate::cli::wallet::test_network_a()
+        ),
         None
     );
     assert!(resume_onboarding(
@@ -344,7 +349,10 @@ fn a_committed_attempt_is_no_longer_resumable() {
     files::discard_draft_in(&prepared.paths.binding_dir);
 
     assert_eq!(
-        files::find_resumable(&dir.path().join("wallet"), &crate::cli::wallet::test_network_a()),
+        files::find_resumable(
+            &dir.path().join("wallet"),
+            &crate::cli::wallet::test_network_a()
+        ),
         None,
         "a committed attempt must never be adopted by a later onboarding"
     );

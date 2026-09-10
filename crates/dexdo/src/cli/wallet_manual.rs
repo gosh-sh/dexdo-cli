@@ -31,7 +31,6 @@
 //! through the existing atomic private-write helper, so it lands 0600 by rename or not at all.
 
 use anyhow::{bail, Result};
-use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
@@ -242,7 +241,10 @@ pub(crate) fn render_manual_deploy_funding_request(
         "wallet not deployed yet\n{}\n{}\n{}\n{}",
         field("network", network),
         field("address", address),
-        field("holds", &format!("{} native gas", vmshell_amount(available_raw))),
+        field(
+            "holds",
+            &format!("{} native gas", vmshell_amount(available_raw))
+        ),
         field(
             "send",
             &action(&format!(
@@ -392,13 +394,14 @@ pub(crate) fn write_payment_qr(
 /// splitting the BUILDING keeps both moments looking identical to the operator without letting the
 /// deploy's `flag=16` reach an Active wallet.
 fn write_payment_code(output: &mut dyn std::io::Write, link: &str) {
-    use std::io::Write as _;
-
     // Both this and the live line write to stderr. A spinner frame redrawn across one row of half
     // blocks makes the symbol undecodable, and an operator points a camera at a code that will not
     // scan -- so the line comes down first, for good.
     crate::cli::progress::clear_live_line();
-    let _ = writeln!(output, "  scan     to send from Acki Nacki Wallet on your phone:");
+    let _ = writeln!(
+        output,
+        "  scan     to send from Acki Nacki Wallet on your phone:"
+    );
     match crate::cli::qr_compact::smallest_code(link.as_bytes()) {
         Ok(code) => {
             if let Err(error) = crate::cli::qr_display::write_qr(output, &code) {
@@ -785,9 +788,7 @@ pub(crate) async fn ensure_manual_hot_funded_with_defaults(
 pub(crate) fn classify_manual_secret_file(contents: &str) -> Result<ManualSecretKind> {
     let words: Vec<&str> = contents.split_whitespace().collect();
     match words.as_slice() {
-        [single]
-            if single.len() == 64 && single.bytes().all(|byte| byte.is_ascii_hexdigit()) =>
-        {
+        [single] if single.len() == 64 && single.bytes().all(|byte| byte.is_ascii_hexdigit()) => {
             Ok(ManualSecretKind::Key)
         }
         _ if matches!(words.len(), 12 | 15 | 18 | 21 | 24)
@@ -840,9 +841,7 @@ fn resolve_manual_address(flag: Option<&str>) -> Result<String> {
 }
 
 mod persist {
-    use super::{
-        active_binding_path, VerifiedManualWallet, WalletBinding, WALLET_DIR,
-    };
+    use super::{active_binding_path, VerifiedManualWallet, WalletBinding, WALLET_DIR};
     use anyhow::Result;
     use slot::EmptyBindingSlot;
     use std::path::{Path, PathBuf};
@@ -930,9 +929,7 @@ mod persist {
                     Err(error)
                 }
             })
-            .map_err(|error| {
-                anyhow::anyhow!("create wallet directory {}: {error}", dir.display())
-            })
+            .map_err(|error| anyhow::anyhow!("create wallet directory {}: {error}", dir.display()))
     }
 
     /// The one refusal an already-bound operator gets, worded once.
@@ -968,14 +965,12 @@ mod persist {
     }
 }
 
-pub(crate) use persist::onboard_manual_binding;
-
 mod live {
     use super::{
         classify_manual_secret_file, manual_onboard_step, prompt_line,
         render_manual_deploy_funding_refusal, render_manual_deploy_funding_request,
         verify_manual_hot_wallet, ManualOnboardStep, ManualSecretKind, ManualSecretRef,
-        ObservedHotWallet, WalletBinding, WalletNetwork, WalletOnboardManualArgs,
+        ObservedHotWallet, WalletBinding, WalletOnboardManualArgs,
     };
     use anyhow::{bail, Result};
     use dexdo_core::chain::RetryingReads as _;
@@ -1070,7 +1065,9 @@ mod live {
     /// Pick the secret file from the flags, or ask for one and read what kind it is.
     fn resolve_manual_secret(args: &WalletOnboardManualArgs) -> Result<ManualSecretRef> {
         let path = match (&args.multisig_private_key, &args.multisig_seed_file) {
-            (Some(_), Some(_)) => bail!("use only one of --multisig-private-key or --multisig-seed-file"),
+            (Some(_), Some(_)) => {
+                bail!("use only one of --multisig-private-key or --multisig-seed-file")
+            }
             (Some(path), None) => {
                 return Ok(ManualSecretRef {
                     kind: ManualSecretKind::Key,
@@ -1153,7 +1150,6 @@ mod live {
     ];
 
     async fn ensure_manual_wallet_deployed(
-        args: &WalletOnboardManualArgs,
         chain: &dexdo_core::ChainClient,
         address: &dexdo_core::Address,
         keys: &dexdo_core::KeyPair,
@@ -1165,7 +1161,6 @@ mod live {
                 .await
                 .map_err(|error| anyhow::anyhow!("read wallet {rendered}: {error}"))?;
             Ok::<_, anyhow::Error>(match account {
-
                 Some(account) => (account.status.clone(), account.balance),
                 None => ("NotFound".to_string(), 0),
             })
@@ -1218,8 +1213,8 @@ mod live {
             // Amber, and named as what the operator must do: this is not the client working, it is
             // the client stopped until a transfer is confirmed in a phone.
             crate::cli::progress::step_needs_you(MANUAL_DEPLOY_STEPS[0].0);
-            let deadline = tokio::time::Instant::now()
-                + dexdo_core::params::WALLET_HOT_FUNDING_TIMEOUT;
+            let deadline =
+                tokio::time::Instant::now() + dexdo_core::params::WALLET_HOT_FUNDING_TIMEOUT;
             loop {
                 tokio::time::sleep(dexdo_core::params::NOTE_DEPLOY_SHELL_FUNDING_POLL_INTERVAL)
                     .await;
@@ -1267,7 +1262,7 @@ mod live {
         let manifest = manifest_for_network()?;
         // The manifest names where to dial; `--endpoint` is gone.
         let backend = dexdo_core::RealChainBackend::connect_with_endpoint(&manifest, None)
-        .map_err(|error| anyhow::anyhow!("connect to deploy the wallet: {error}"))?;
+            .map_err(|error| anyhow::anyhow!("connect to deploy the wallet: {error}"))?;
         let deployed = backend
             .deploy_multisig_self_funded(keys)
             .await
@@ -1361,16 +1356,19 @@ mod live {
         // Verification is read-only account queries against the selected network, and the
         // deployed-contracts manifest names none of the accounts they read. So the endpoint is the
         // whole input, the same one `wallet onboard ackinacki-wallet` connects with.
-        let endpoint =
-            crate::cli::wallet::wallet_read_endpoint(Some(&crate::cli::commands::manifest_path()?), crate::cli::wallet::network_from_manifest()?)?;
-        let chain = dexdo_core::ChainClient::connect(&endpoint)
-            .map_err(|error| anyhow::anyhow!("connect verification endpoint {endpoint}: {error}"))?;
+        let endpoint = crate::cli::wallet::wallet_read_endpoint(
+            Some(&crate::cli::commands::manifest_path()?),
+            crate::cli::wallet::network_from_manifest()?,
+        )?;
+        let chain = dexdo_core::ChainClient::connect(&endpoint).map_err(|error| {
+            anyhow::anyhow!("connect verification endpoint {endpoint}: {error}")
+        })?;
         let address = dexdo_core::address::parse_chain_address(&supplied_address)?;
 
         // Deploy the wallet if it is not there yet. Everything below this point is the path that
         // already existed: whatever happens here, the binding is written only for a wallet the
         // chain reports as Active with a code hash this client accepts.
-        ensure_manual_wallet_deployed(&args, &chain, &address, &keys).await?;
+        ensure_manual_wallet_deployed(&chain, &address, &keys).await?;
 
         let observed = observe_hot_wallet(&chain, &address).await?;
         let hot_address = canonical_hot_address(&chain, &address, &supplied_address).await?;
@@ -1399,7 +1397,6 @@ mod live {
         );
         Ok(verified.binding().clone())
     }
-
 }
 
 /// The ECC reader the manual funding wait uses against a real Hot.
@@ -1442,7 +1439,6 @@ pub(crate) async fn run_wallet_onboard_manual(
     live::run(args, binding_id).await
 }
 
-
 #[cfg(test)]
 mod deploy_1627_tests {
     use super::*;
@@ -1462,7 +1458,10 @@ mod deploy_1627_tests {
     /// be reachable from the other.
     #[test]
     fn an_unreadable_address_is_reported_as_unreadable_not_as_the_wrong_wallet() {
-        let whole = format!("{0}::{0}", "ef6ecd30ab17ca3280bdc29decae1e5a1c089606740dbb915bf3a33edddccb75");
+        let whole = format!(
+            "{0}::{0}",
+            "ef6ecd30ab17ca3280bdc29decae1e5a1c089606740dbb915bf3a33edddccb75"
+        );
         // Exactly what the terminal delivered: the second half cut where the line wrapped.
         let broken = format!(
             "{}::ef6ecd30ab17ca3280bdc29dec",
@@ -1549,15 +1548,14 @@ mod deploy_1627_tests {
     // Deleted rather than left unwired: a check nobody calls reads as protection, which is worse
     // than no check, and this one sat on a path that spends.
 
-    /// The manifest is not chosen by `--network` any more, so there is nothing here to assert.
+    // The manifest is not chosen by `--network` any more, so there is nothing here to assert.
 
-    /// What stood here checked that `--network mainnet` picked the mainnet manifest and that the
-    /// path it picked EXISTED in the tree -- a real defect it caught once, when a caller kept the
-    /// old directory after moved the files. The chooser is gone: one manifest, named by
-    /// `DEXDO_MANIFEST`, and there is no `--network` left to check it against. The check that used
-    /// to carry this property was deleted with the guard it drove -- the note above says why, and
-    /// naming a test that no longer exists is how a reader goes looking for coverage that is gone.
-
+    // What stood here checked that `--network mainnet` picked the mainnet manifest and that the
+    // path it picked EXISTED in the tree -- a real defect it caught once, when a caller kept the
+    // old directory after moved the files. The chooser is gone: one manifest, named by
+    // `DEXDO_MANIFEST`, and there is no `--network` left to check it against. The check that used
+    // to carry this property was deleted with the guard it drove -- the note above says why, and
+    // naming a test that no longer exists is how a reader goes looking for coverage that is gone.
 
     /// A run with nobody to ask REFUSES; it does not wait.
 
@@ -1597,7 +1595,10 @@ mod deploy_1627_tests {
             "the address is copied into a wallet app, so it is printed whole: {shown}"
         );
         assert!(
-            shown.contains(&format!("{} SHELL", MANUAL_DEPLOY_REQUEST_RAW / 1_000_000_000)),
+            shown.contains(&format!(
+                "{} SHELL",
+                MANUAL_DEPLOY_REQUEST_RAW / 1_000_000_000
+            )),
             "the amount asked for is stated: {shown}"
         );
         // Both ends of the transfer are named, because they are different things and the operator
@@ -1684,7 +1685,9 @@ mod deploy_1627_tests {
         let mut again = Vec::new();
         crate::cli::qr_display::write_qr(&mut again, &expected).expect("draw the same code");
         assert!(
-            drawn.windows(again.len()).any(|window| window == again.as_slice()),
+            drawn
+                .windows(again.len())
+                .any(|window| window == again.as_slice()),
             "the printed code does not encode the link that was built for this amount"
         );
     }
@@ -1717,7 +1720,9 @@ mod deploy_1627_tests {
         let mut again = Vec::new();
         crate::cli::qr_display::write_qr(&mut again, &expected).expect("draw the same code");
         assert!(
-            drawn.windows(again.len()).any(|window| window == again.as_slice()),
+            drawn
+                .windows(again.len())
+                .any(|window| window == again.as_slice()),
             "the code drawn must encode the address the request printed"
         );
     }
@@ -2068,8 +2073,7 @@ mod tests {
 
     const HOT: &str = "0000000000000000000000000000000000000000000000000000000000000004::\
                        1111111111111111111111111111111111111111111111111111111111111111";
-    const OWNER_PUBKEY: &str =
-        "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+    const OWNER_PUBKEY: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
     const STRANGER_PUBKEY: &str =
         "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
     const SECRET_HEX: &str = "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc";
@@ -2106,7 +2110,11 @@ mod tests {
             observed,
             "0123456789abcdef0123456789abcdef".to_string(),
         )?;
-        onboard_manual_binding(data_dir, load_active_binding(data_dir)?.as_ref(), &verified)
+        persist::onboard_manual_binding(
+            data_dir,
+            load_active_binding(data_dir)?.as_ref(),
+            &verified,
+        )
     }
 
     /// The positive control for every "nothing was saved" case below, and the shape the binding
@@ -2115,8 +2123,13 @@ mod tests {
     fn a_verified_wallet_is_bound_by_address_and_secret_file_reference() {
         let temp = tempfile::tempdir().expect("temp root");
         let secret = key_file(temp.path());
-        let path = bind(temp.path(), secret.clone(), OWNER_PUBKEY, &supported_wallet())
-            .expect("a verified manual wallet binds");
+        let path = bind(
+            temp.path(),
+            secret.clone(),
+            OWNER_PUBKEY,
+            &supported_wallet(),
+        )
+        .expect("a verified manual wallet binds");
 
         let raw = std::fs::read_to_string(&path).expect("read binding");
         let binding: WalletBinding = serde_json::from_str(&raw).expect("parse binding");
@@ -2129,7 +2142,10 @@ mod tests {
             "the binding must reference the operator's own secret file"
         );
         assert_eq!(binding.hot_seed_file, None);
-        assert_eq!(load_active_binding(temp.path()).expect("reload"), Some(binding));
+        assert_eq!(
+            load_active_binding(temp.path()).expect("reload"),
+            Some(binding)
+        );
     }
 
     /// The secret is the one thing that must never travel into the binding, so assert on the raw
@@ -2156,13 +2172,8 @@ mod tests {
     fn a_key_that_does_not_belong_is_refused_and_nothing_is_saved() {
         let temp = tempfile::tempdir().expect("temp root");
         let secret = key_file(temp.path());
-        let error = bind(
-            temp.path(),
-            secret,
-            STRANGER_PUBKEY,
-            &supported_wallet(),
-        )
-        .expect_err("a non-custodian key must be refused");
+        let error = bind(temp.path(), secret, STRANGER_PUBKEY, &supported_wallet())
+            .expect_err("a non-custodian key must be refused");
         let message = format!("{error}");
         assert!(
             message.contains("is not a custodian"),
@@ -2211,11 +2222,15 @@ mod tests {
         let temp = tempfile::tempdir().expect("temp root");
         let secret = key_file(temp.path());
         let mut observed = supported_wallet();
-        observed.code_hash = Some("3a7a53248ff39fde936a4274eab143b5fac94feac0d8e2e2748aac5e74538d5f".to_string());
+        observed.code_hash =
+            Some("3a7a53248ff39fde936a4274eab143b5fac94feac0d8e2e2748aac5e74538d5f".to_string());
         let error = bind(temp.path(), secret, OWNER_PUBKEY, &observed).expect_err("refused");
         let message = format!("{error}");
         assert!(message.contains("not a supported multisig"), "{message}");
-        assert!(message.contains(dexdo_core::canonical_multisig::CODE_HASH), "{message}");
+        assert!(
+            message.contains(dexdo_core::canonical_multisig::CODE_HASH),
+            "{message}"
+        );
         assert!(!active_binding_path(temp.path()).exists());
     }
 
@@ -2275,7 +2290,10 @@ mod tests {
 
         let inactive = bind(temp.path(), secret.clone(), OWNER_PUBKEY, &all_broken)
             .expect_err("status before code hash");
-        assert!(format!("{inactive}").contains("is not Active"), "{inactive}");
+        assert!(
+            format!("{inactive}").contains("is not Active"),
+            "{inactive}"
+        );
 
         let mut active = all_broken.clone();
         active.status = "Active".to_string();
@@ -2290,7 +2308,10 @@ mod tests {
         supported.code_hash = Some(dexdo_core::canonical_multisig::CODE_HASH.to_string());
         let bad_threshold = bind(temp.path(), secret.clone(), OWNER_PUBKEY, &supported)
             .expect_err("threshold next");
-        assert!(format!("{bad_threshold}").contains("reqConfirms=1"), "{bad_threshold}");
+        assert!(
+            format!("{bad_threshold}").contains("reqConfirms=1"),
+            "{bad_threshold}"
+        );
 
         let mut threshold_ok = supported.clone();
         threshold_ok.required_txn_confirms = 1;
@@ -2308,8 +2329,13 @@ mod tests {
     fn an_existing_binding_is_never_replaced_by_onboarding() {
         let temp = tempfile::tempdir().expect("temp root");
         let secret = key_file(temp.path());
-        let path = bind(temp.path(), secret.clone(), OWNER_PUBKEY, &supported_wallet())
-            .expect("first bind");
+        let path = bind(
+            temp.path(),
+            secret.clone(),
+            OWNER_PUBKEY,
+            &supported_wallet(),
+        )
+        .expect("first bind");
         let first = std::fs::read_to_string(&path).expect("read binding");
 
         let error = bind(temp.path(), secret, OWNER_PUBKEY, &supported_wallet())
@@ -2418,7 +2444,10 @@ mod tests {
             250,
             Duration::from_secs(600),
         );
-        assert!(text.contains(HOT), "the full canonical address must appear:\n{text}");
+        assert!(
+            text.contains(HOT),
+            "the full canonical address must appear:\n{text}"
+        );
         // SHELL is what the operator sends; the raw figure beside it is what an explorer shows.
         assert!(text.contains("missing 0.00000075 (750 raw)"), "{text}");
         assert!(text.contains("0.000001 (1000 raw) SHELL ECC[2]"), "{text}");
@@ -2445,7 +2474,10 @@ mod tests {
             Duration::from_secs(600),
         );
         assert!(text.contains(HOT), "{text}");
-        assert!(text.contains("0.00000075 (750 raw) is still missing"), "{text}");
+        assert!(
+            text.contains("0.00000075 (750 raw) is still missing"),
+            "{text}"
+        );
         assert!(text.contains("no local state was written"), "{text}");
         assert!(text.contains("run the same command again"), "{text}");
         for forbidden in ["Vault", "vault", "http", "gosh.ai"] {
@@ -2507,9 +2539,15 @@ mod tests {
         )
         .await
         .expect_err("the wait must run out");
-        assert!(format!("{error}").contains("run the same command again"), "{error}");
+        assert!(
+            format!("{error}").contains("run the same command again"),
+            "{error}"
+        );
         let first_run_reads = reader.reads.get();
-        assert!(first_run_reads >= 2, "the wait must poll: {first_run_reads}");
+        assert!(
+            first_run_reads >= 2,
+            "the wait must poll: {first_run_reads}"
+        );
         assert_eq!(
             snapshot_dir(temp.path()),
             before,

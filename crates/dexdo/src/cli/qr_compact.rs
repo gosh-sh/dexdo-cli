@@ -52,13 +52,6 @@ pub(crate) fn smallest_code(payload: &[u8]) -> Result<QrCode> {
         .context("the bee connection deep link does not fit a QR code")
 }
 
-/// Character columns and rows the rendering of `code` occupies, quiet zone included. One module
-/// per column and two per row is what keeps the module square in a terminal cell.
-pub(crate) fn size_in_cells(code: &QrCode) -> (usize, usize) {
-    let side = code.width() + 2 * QUIET_ZONE;
-    (side, side.div_ceil(2))
-}
-
 /// Write `code` to `output`. `colour` paints the light field white and the modules black; pass
 /// `false` when the destination is not a terminal, so captured or redirected output stays plain.
 pub(crate) fn write(output: &mut dyn Write, code: &QrCode, colour: bool) -> Result<()> {
@@ -66,8 +59,8 @@ pub(crate) fn write(output: &mut dyn Write, code: &QrCode, colour: bool) -> Resu
     let columns = code.width() + 2 * QUIET_ZONE;
     for top in (0..dark.len()).step_by(2) {
         let mut line = String::with_capacity(columns);
-        for column in 0..columns {
-            let index = usize::from(dark[top][column]) | usize::from(dark[top + 1][column]) << 1;
+        for (&upper, &lower) in dark[top].iter().zip(&dark[top + 1]).take(columns) {
+            let index = usize::from(upper) | usize::from(lower) << 1;
             line.push(HALVES[index]);
         }
         if colour {
@@ -129,8 +122,9 @@ mod tests {
     #[test]
     fn one_module_per_column_and_two_per_row_keeps_the_module_square() {
         let code = smallest_code(b"dexdo").expect("payload fits");
-        let (columns, rows) = size_in_cells(&code);
         let side = code.width() + 2 * QUIET_ZONE;
+        let columns = side;
+        let rows = side.div_ceil(2);
         assert_eq!(columns, side, "one module per column");
         assert_eq!(rows, side.div_ceil(2), "two modules per row");
 

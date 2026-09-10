@@ -40,7 +40,8 @@ pub(crate) struct InferenceMarketsResponse {
 #[serde(rename_all = "camelCase")]
 pub(crate) struct InferenceMarket {
     pub(crate) inference_order_book_address: String,
-    pub(crate) model: InferenceModel,
+    pub(crate) model_ref_name: String,
+    pub(crate) contract_version: String,
     pub(crate) status: String,
     pub(crate) quote_asset: String,
     pub(crate) maker_commission: String,
@@ -52,15 +53,6 @@ pub(crate) struct InferenceMarket {
     pub(crate) min_notional: String,
     pub(crate) reference_price: Option<String>,
     pub(crate) created_at: i64,
-}
-
-#[derive(Clone, Debug, Deserialize, Serialize)]
-pub(crate) struct InferenceModel {
-    pub(crate) producer: Option<String>,
-    pub(crate) name: Option<String>,
-    pub(crate) version: Option<String>,
-    #[serde(rename = "ref")]
-    pub(crate) ref_: String,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -184,8 +176,7 @@ impl ManifestIndexer {
     pub(crate) fn load(path: &std::path::Path) -> Result<Self> {
         let text = std::fs::read_to_string(path)
             .with_context(|| format!("read the manifest {}", path.display()))?;
-        Self::from_json(&text)
-            .with_context(|| format!("manifest {}", path.display()))
+        Self::from_json(&text).with_context(|| format!("manifest {}", path.display()))
     }
 
     pub(crate) fn from_json(text: &str) -> Result<Self> {
@@ -381,12 +372,10 @@ pub(crate) fn validate_cursor(cursor: Option<&str>) -> Result<()> {
 
 fn render_market_line(market: &InferenceMarket) -> String {
     format!(
-        "market address={} model_ref={} producer={} name={} version={} status={} quote_asset={} maker_commission={} taker_commission={} price_precision={} quantity_precision={} tick_size={} step_size={} min_notional={} reference_price={} created_at={}",
+        "market address={} model_ref={} contract_version={} status={} quote_asset={} maker_commission={} taker_commission={} price_precision={} quantity_precision={} tick_size={} step_size={} min_notional={} reference_price={} created_at={}",
         dexdo_core::address::display(&market.inference_order_book_address),
-        market.model.ref_,
-        opt(&market.model.producer),
-        opt(&market.model.name),
-        opt(&market.model.version),
+        market.model_ref_name,
+        market.contract_version,
         market.status,
         market.quote_asset,
         market.maker_commission,
@@ -399,10 +388,6 @@ fn render_market_line(market: &InferenceMarket) -> String {
         market.reference_price.as_deref().unwrap_or("-"),
         market.created_at
     )
-}
-
-fn opt(value: &Option<String>) -> &str {
-    value.as_deref().unwrap_or("-")
 }
 
 fn normalize_base_url(raw: &str) -> Result<String> {
@@ -431,9 +416,15 @@ fn validate_markets_response(response: &InferenceMarketsResponse) -> Result<()> 
             "inferenceOrderBookAddress",
             &market.inference_order_book_address,
         )?;
-        if market.model.ref_.trim().is_empty() {
+        if market.model_ref_name.trim().is_empty() {
             bail!(
-                "market {}: model.ref must not be empty",
+                "market {}: modelRefName must not be empty",
+                market.inference_order_book_address
+            );
+        }
+        if market.contract_version.trim().is_empty() {
+            bail!(
+                "market {}: contractVersion must not be empty",
                 market.inference_order_book_address
             );
         }
@@ -469,11 +460,12 @@ fn validate_optional_address(name: &str, value: Option<&str>) -> Result<()> {
 }
 
 fn validate_address(name: &str, value: &str) -> Result<()> {
-    dexdo_core::address::CanonicalAddress::parse(value)
-        .map_err(|error| anyhow::anyhow!(
+    dexdo_core::address::CanonicalAddress::parse(value).map_err(|error| {
+        anyhow::anyhow!(
             "{name} `{value}` is not a valid {} address: {error}",
             dexdo_core::params::current_network()
-        ))?;
+        )
+    })?;
     Ok(())
 }
 
@@ -519,6 +511,50 @@ mod tests {
 
     const ADDRESS: &str = "0:4a04daaf8aff55a23c8dd5edabf7c81eeb300c7b5d70ad0c6fa955c25eab0b76";
 
+    const MAINNET_MARKETS_FIXTURE: &[u8] = br#"{
+  "serverTime": 1788794575,
+  "nextCursor": "MTc4ODc5MDEyOTAwMDAwMDoxNzg2",
+  "hasMore": true,
+  "markets": [{
+    "inferenceOrderBookAddress": "0:33c30af6f32f86623dc9711eedc1779e35e7e7c8f7dfe38db55d20f3a51eb8af",
+    "modelRefName": "gpt-5.6-sol",
+    "contractVersion": "4.0.36",
+    "status": "TRADING",
+    "quoteAsset": "SHELL",
+    "makerCommission": "-0.02",
+    "takerCommission": "0.025",
+    "pricePrecision": 9,
+    "quantityPrecision": 0,
+    "tickSize": "1",
+    "stepSize": "1",
+    "minNotional": "1",
+    "referencePrice": null,
+    "createdAt": 1788790129
+  }]
+}"#;
+
+    const SHELLNET_MARKETS_FIXTURE: &[u8] = br#"{
+  "serverTime": 1788794583,
+  "nextCursor": "MTc4ODc5MTQ0MjAwMDAwMDo3Nzcw",
+  "hasMore": true,
+  "markets": [{
+    "inferenceOrderBookAddress": "0:ab7c42a4eba813969aba212899c875aa8c3cff6ad57d59af80d7790d1e95881b",
+    "modelRefName": "Qwen3.6-27B-oracle-noliquidity-1788791441",
+    "contractVersion": "4.0.36",
+    "status": "TRADING",
+    "quoteAsset": "SHELL",
+    "makerCommission": "-0.02",
+    "takerCommission": "0.025",
+    "pricePrecision": 9,
+    "quantityPrecision": 0,
+    "tickSize": "1",
+    "stepSize": "1",
+    "minNotional": "1",
+    "referencePrice": null,
+    "createdAt": 1788791442
+  }]
+}"#;
+
     fn markets_fixture() -> String {
         format!(
             r#"{{
@@ -528,7 +564,8 @@ mod tests {
   "markets": [
     {{
       "inferenceOrderBookAddress": "{ADDRESS}",
-      "model": {{"producer": null, "name": null, "version": null, "ref": "qwen--qwen3--32b"}},
+      "modelRefName": "qwen--qwen3--32b",
+      "contractVersion": "4.0.36",
       "status": "TRADING",
       "quoteAsset": "SHELL",
       "makerCommission": "-0.02",
@@ -570,17 +607,37 @@ mod tests {
     }
 
     #[test]
+    fn parses_current_mainnet_and_shellnet_market_shapes() {
+        for (network, fixture, expected_model_ref) in [
+            ("mainnet", MAINNET_MARKETS_FIXTURE, "gpt-5.6-sol"),
+            (
+                "shellnet",
+                SHELLNET_MARKETS_FIXTURE,
+                "Qwen3.6-27B-oracle-noliquidity-1788791441",
+            ),
+        ] {
+            let response = parse_markets_json(fixture)
+                .unwrap_or_else(|error| panic!("{network} fixture must parse: {error:#}"));
+            let market = serde_json::to_value(&response.markets[0]).unwrap();
+            assert_eq!(market["modelRefName"], expected_model_ref);
+            assert_eq!(market["contractVersion"], "4.0.36");
+            assert!(market.get("model").is_none());
+        }
+    }
+
+    #[test]
     fn parses_markets_fixture_and_renders_table() {
         let response = parse_markets_json(markets_fixture().as_bytes()).unwrap();
         assert_eq!(response.markets.len(), 1);
-        assert_eq!(response.markets[0].model.ref_, "qwen--qwen3--32b");
+        assert_eq!(response.markets[0].model_ref_name, "qwen--qwen3--32b");
+        assert_eq!(response.markets[0].contract_version, "4.0.36");
         let rendered = render_markets_table(&response, TEST_INDEXER_URL);
         assert_eq!(
             rendered,
             format!(
                 concat!(
                     "market_data source=indexer endpoint=http://indexer.example:8080 server_time=1782897900000 count=1 has_more=true next_cursor=MTc4Mjg4NDY0MTAwMDAwMDo0\n",
-                    "market address={address} model_ref=qwen--qwen3--32b producer=- name=- version=- status=TRADING quote_asset=SHELL maker_commission=-0.02 taker_commission=0.025 price_precision=9 quantity_precision=0 tick_size=0.000000001 step_size=1 min_notional=0.000000001 reference_price=- created_at=1782897852\n"
+                    "market address={address} model_ref=qwen--qwen3--32b contract_version=4.0.36 status=TRADING quote_asset=SHELL maker_commission=-0.02 taker_commission=0.025 price_precision=9 quantity_precision=0 tick_size=0.000000001 step_size=1 min_notional=0.000000001 reference_price=- created_at=1782897852\n"
                 ),
                 address = canonical_address()
             )
@@ -608,10 +665,39 @@ mod tests {
     #[test]
     fn json_output_shape_is_stable() {
         let response = parse_markets_json(markets_fixture().as_bytes()).unwrap();
-        let json = serde_json::to_string_pretty(&response.markets[0]).unwrap();
-        assert!(json.contains(r#""inferenceOrderBookAddress": "0:4a04"#));
-        assert!(json.contains(r#""ref": "qwen--qwen3--32b""#));
-        assert!(json.contains(r#""quoteAsset": "SHELL""#));
+        let json = serde_json::to_value(&response.markets[0]).unwrap();
+        assert_eq!(json["inferenceOrderBookAddress"], ADDRESS);
+        assert_eq!(json["modelRefName"], "qwen--qwen3--32b");
+        assert_eq!(json["contractVersion"], "4.0.36");
+        assert_eq!(json["quoteAsset"], "SHELL");
+        assert!(json.get("model").is_none());
+    }
+
+    #[test]
+    fn rejects_missing_or_empty_market_identity_fields() {
+        let missing_model_ref =
+            markets_fixture().replace("      \"modelRefName\": \"qwen--qwen3--32b\",\n", "");
+        let error = parse_markets_json(missing_model_ref.as_bytes()).unwrap_err();
+        assert!(format!("{error:#}").contains("modelRefName"));
+
+        let missing_contract_version =
+            markets_fixture().replace("      \"contractVersion\": \"4.0.36\",\n", "");
+        let error = parse_markets_json(missing_contract_version.as_bytes()).unwrap_err();
+        assert!(format!("{error:#}").contains("contractVersion"));
+
+        let empty_model_ref = markets_fixture().replace(
+            "\"modelRefName\": \"qwen--qwen3--32b\"",
+            "\"modelRefName\": \" \"",
+        );
+        let error = parse_markets_json(empty_model_ref.as_bytes()).unwrap_err();
+        assert!(error.to_string().contains("modelRefName"));
+
+        let empty_contract_version = markets_fixture().replace(
+            "\"contractVersion\": \"4.0.36\"",
+            "\"contractVersion\": \" \"",
+        );
+        let error = parse_markets_json(empty_contract_version.as_bytes()).unwrap_err();
+        assert!(error.to_string().contains("contractVersion"));
     }
 
     #[test]

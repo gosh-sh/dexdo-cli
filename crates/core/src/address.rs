@@ -634,7 +634,10 @@ mod tests {
     fn a_stored_foreign_dapp_address_is_not_rewritten_to_ours() {
         let account = h64('9');
         let foreign_dapp = h64('3');
-        assert_ne!(foreign_dapp, DEXDO_DAPP_ID, "the fixture must be a FOREIGN dapp");
+        assert_ne!(
+            foreign_dapp, DEXDO_DAPP_ID,
+            "the fixture must be a FOREIGN dapp"
+        );
         let ours = format!("{DEXDO_DAPP_ID}::{account}");
         let theirs = format!("{foreign_dapp}::{account}");
 
@@ -903,7 +906,8 @@ mod arg_boundary_refusal_tests {
             .expect("the refusal shows the address the operator meant");
         assert_eq!(shown, format!("{DEXDO_DAPP_ID}::{ACCOUNT}"));
         assert_eq!(
-            arg_to_chain_param(shown).expect("the address the refusal shows is refused in its turn"),
+            arg_to_chain_param(shown)
+                .expect("the address the refusal shows is refused in its turn"),
             format!("0:{ACCOUNT}"),
             "the refusal advised an address this same boundary does not accept"
         );

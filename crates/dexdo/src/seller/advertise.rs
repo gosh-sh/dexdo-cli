@@ -477,7 +477,6 @@ mod tests {
                 "0/8 this-network",
                 true,
                 octets
-                    .clone()
                     .prop_map(|(b, c, d)| format!("0.{b}.{c}.{d}:8443"))
                     .boxed(),
             ),
@@ -490,7 +489,7 @@ mod tests {
                         Just((198, 51, 100)),
                         Just((203, 0, 113))
                     ],
-                    suffix.clone(),
+                    suffix,
                 )
                     .prop_map(|((a, b, c), d)| format!("{a}.{b}.{c}.{d}:8443"))
                     .boxed(),
@@ -505,14 +504,14 @@ mod tests {
             (
                 "IPv4 multicast",
                 true,
-                (224_u8..=239, octets.clone())
+                (224_u8..=239, octets)
                     .prop_map(|(a, (b, c, d))| format!("{a}.{b}.{c}.{d}:8443"))
                     .boxed(),
             ),
             (
                 "240/4 reserved",
                 true,
-                (240_u8..=255, octets.clone())
+                (240_u8..=255, octets)
                     .prop_map(|(a, (b, c, d))| format!("{a}.{b}.{c}.{d}:8443"))
                     .boxed(),
             ),

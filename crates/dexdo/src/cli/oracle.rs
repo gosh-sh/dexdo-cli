@@ -13,6 +13,7 @@ use dexdo_core::params::{
 // A feature-gated test tree rots without anyone seeing it go red.
 use dexdo_core::params::SHELL_CURRENCY_ID;
 
+use crate::cli::args::OraclePmpExitArgs;
 use crate::cli::args::{
     OracleAddressArgs, OracleBookArgs, OracleBookCommand, OracleBookOrderArgs,
     OracleBookOrdersArgs, OracleBookStatusArgs, OracleCommand, OracleEventListAddressArgs,
@@ -20,13 +21,12 @@ use crate::cli::args::{
     OraclePmpArgs, OraclePmpCommand, OraclePmpStatusArgs, OracleProvisionArgs, OracleResolveArgs,
     OracleStateArgs, OracleWithdrawFeesArgs,
 };
-use crate::cli::args::OraclePmpExitArgs;
-use crate::cli::commands::{now_unix_secs, chain_doctor_preflight};
+use crate::cli::commands::{chain_doctor_preflight, now_unix_secs};
 // the destination reads below are account/getter reads on a money path, so they take the same
 // retrying readers every other chain read in this client takes -- a transient endpoint hiccup must
 // not read as "this destination cannot be proved" and refuse a correct withdrawal.
+use crate::cli::support::{load_market, read_secret_hex, require_note_addr};
 use dexdo_core::chain::RetryingReads as _;
-use crate::cli::support::{load_market, read_secret_hex, require_note_addr, require_note_key};
 
 #[cfg(test)]
 #[path = "oracle_exit_1120_tests.rs"]
@@ -302,7 +302,6 @@ pub(crate) async fn run_oracle(args: OracleArgs) -> Result<()> {
         OracleCommand::WithdrawFees(w) => run_oracle_withdraw_fees(w).await,
     }
 }
-
 
 fn parse_oracle_read_address(flag: &str, raw: &str) -> Result<dexdo_core::Address> {
     dexdo_core::Address::parse(raw).map_err(|e| anyhow::anyhow!("{flag} {raw}: {e}"))
@@ -581,7 +580,11 @@ async fn run_oracle_provision(args: OracleProvisionArgs) -> Result<()> {
         );
     }
     validate_oracle_deadline(args.deadline, now_unix_secs()?)?;
-    chain_doctor_preflight(&crate::cli::commands::manifest_path()?, Some(args.market.as_path())).await?;
+    chain_doctor_preflight(
+        &crate::cli::commands::manifest_path()?,
+        Some(args.market.as_path()),
+    )
+    .await?;
 
     let note_addr = args.identity.note_addr.clone().ok_or_else(|| {
         anyhow::anyhow!("oracle provision: --note-addr (PMP deployer PrivateNote) is required")
@@ -1088,7 +1091,10 @@ async fn wait_pmp_exit_postread(
 /// same line prints `note_balance=N->N` beside `status=confirmed`, which reads either as "nothing
 /// happened" or, worse, as "confirmed" meaning the money is back. Both are wrong: what was
 /// confirmed is that the stake record is GONE and the note is unfrozen.
-pub(crate) fn render_forfeit_epilogue(note_balance_before: u128, note_balance_after: u128) -> String {
+pub(crate) fn render_forfeit_epilogue(
+    note_balance_before: u128,
+    note_balance_after: u128,
+) -> String {
     let moved = note_balance_after != note_balance_before;
     let unchanged = if moved {
         "  the note balance moved, which a forfeit does not cause -- read it again before acting\n"
@@ -1167,12 +1173,14 @@ fn resolve_pmp_exit_target(args: &OraclePmpExitArgs, command: &str) -> Result<Pm
             })
         }
         (None, Some(pmp)) => {
-            let event_id = args.event_id.as_deref().ok_or_else(|| {
-                anyhow::anyhow!("{command}: --pmp needs --event-id")
-            })?;
-            let oracle_list_hash = args.oracle_list_hash.as_deref().ok_or_else(|| {
-                anyhow::anyhow!("{command}: --pmp needs --oracle-list-hash")
-            })?;
+            let event_id = args
+                .event_id
+                .as_deref()
+                .ok_or_else(|| anyhow::anyhow!("{command}: --pmp needs --event-id"))?;
+            let oracle_list_hash = args
+                .oracle_list_hash
+                .as_deref()
+                .ok_or_else(|| anyhow::anyhow!("{command}: --pmp needs --oracle-list-hash"))?;
             if args.token_type != SHELL_CURRENCY_ID {
                 bail!(
                     "{command}: --token-type {} is unsupported; dexdo markets require SHELL currency id {}",
@@ -1192,9 +1200,9 @@ fn resolve_pmp_exit_target(args: &OraclePmpExitArgs, command: &str) -> Result<Pm
             "{command}: pass either --manifest or --pmp with the triple, not both -- two sources \
              that could disagree is not a stronger check, it is an unanswered question"
         ),
-        (None, None) => bail!(
-            "{command}: needs --manifest, or --pmp with --event-id and --oracle-list-hash"
-        ),
+        (None, None) => {
+            bail!("{command}: needs --manifest, or --pmp with --event-id and --oracle-list-hash")
+        }
     }
 }
 
@@ -1746,8 +1754,13 @@ async fn run_oracle_withdraw_fees(args: OracleWithdrawFeesArgs) -> Result<()> {
     let before = chain.oracle_fee_balance_for_owner(&oracle, &signer).await?;
     let expected = oracle_fee_expected_after(before, args.amount)?;
     // Before the submit: nothing below this line can un-send a transfer.
-    let proof =
-        preflight_oracle_fee_destination(&chain, &crate::cli::commands::manifest_path()?, &to, signer.public_hex()).await?;
+    let proof = preflight_oracle_fee_destination(
+        &chain,
+        &crate::cli::commands::manifest_path()?,
+        &to,
+        signer.public_hex(),
+    )
+    .await?;
     let destination_before = read_oracle_fee_destination(&chain, &to).await;
     let submit = chain
         .withdraw_oracle_fees(&oracle, &signer, &to, args.amount)
@@ -1849,12 +1862,10 @@ mod tests {
         let manifest = dir.path().join("oracle-market.json");
         std::fs::write(&manifest, oracle_manifest(1).to_json().unwrap()).unwrap();
 
-        let error = super::run_oracle_state(super::OracleStateArgs {
-            manifest,
-        })
-        .await
-        .unwrap_err()
-        .to_string();
+        let error = super::run_oracle_state(super::OracleStateArgs { manifest })
+            .await
+            .unwrap_err()
+            .to_string();
 
         assert!(
             error.contains(&format!(

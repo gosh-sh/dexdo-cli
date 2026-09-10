@@ -805,7 +805,13 @@ mod tests {
     }
 
     #[allow(dead_code)]
-    fn __unused_tail(maker_id: u128, taker_id: u128, ticks: u128, buyer_note: &str, seller_note: &str) -> String {
+    fn __unused_tail(
+        maker_id: u128,
+        taker_id: u128,
+        ticks: u128,
+        buyer_note: &str,
+        seller_note: &str,
+    ) -> String {
         encode_event(
             "InferenceFilled",
             serde_json::json!({
@@ -999,8 +1005,9 @@ mod tests {
             message(3, filled_with_identities(17, 18, 4, NOTE, FOREIGN_NOTE)),
         ])
         .await;
-        let valid_removed_exact_maker = !valid.live_orders_at(NOW).any(|order| order.order_id == 17)
-            && valid.live_orders_at(NOW).any(|order| order.order_id == 99);
+        let valid_removed_exact_maker =
+            !valid.live_orders_at(NOW).any(|order| order.order_id == 17)
+                && valid.live_orders_at(NOW).any(|order| order.order_id == 99);
 
         let foreign = fold(vec![
             message(1, placed(17, true, 4, TC_A)),
@@ -1008,8 +1015,12 @@ mod tests {
             message(3, filled_with_identities(17, 18, 4, FOREIGN_NOTE, NOTE)),
         ])
         .await;
-        let foreign_untouched = foreign.live_orders_at(NOW).any(|order| order.order_id == 17)
-            && foreign.live_orders_at(NOW).any(|order| order.order_id == 99);
+        let foreign_untouched = foreign
+            .live_orders_at(NOW)
+            .any(|order| order.order_id == 17)
+            && foreign
+                .live_orders_at(NOW)
+                .any(|order| order.order_id == 99);
 
         assert!(
             valid_removed_exact_maker && foreign_untouched,
@@ -1112,13 +1123,17 @@ mod tests {
             message(2, expired(78, false, NOTE, TC_B)),
         ])
         .await;
-        let unrelated_preserved = unrelated.live_orders_at(NOW).any(|order| order.order_id == 77);
+        let unrelated_preserved = unrelated
+            .live_orders_at(NOW)
+            .any(|order| order.order_id == 77);
         let removed = fold(vec![
             message(1, placed(77, false, 2, TC_A)),
             message(2, expired(77, false, NOTE, TC_A)),
         ])
         .await;
-        let matching_removed = !removed.live_orders_at(NOW).any(|order| order.order_id == 77);
+        let matching_removed = !removed
+            .live_orders_at(NOW)
+            .any(|order| order.order_id == 77);
 
         assert!(
             visible_before && unrelated_preserved && matching_removed,
@@ -1181,8 +1196,12 @@ mod tests {
             message(6, placed(98, false, 1, TC_B)),
         ])
         .await;
-        let exact_removal = !positive.live_orders_at(NOW).any(|order| order.order_id == 97)
-            && positive.live_orders_at(NOW).any(|order| order.order_id == 98);
+        let exact_removal = !positive
+            .live_orders_at(NOW)
+            .any(|order| order.order_id == 97)
+            && positive
+                .live_orders_at(NOW)
+                .any(|order| order.order_id == 98);
 
         let zero_expiry = decode_book_event(&expired(107, true, NOTE, TC_A))
             .expect("decode zero-refund expiry")

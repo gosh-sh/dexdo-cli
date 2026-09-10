@@ -73,8 +73,14 @@ fn an_explicit_provider_subcommand_is_used_verbatim() {
             WalletProviderCommand::AckinackiWallet(sample_onboard_args()),
             WalletProvider::AckinackiWallet,
         ),
-        (WalletProviderCommand::GoshAi(goshai_args()), WalletProvider::GoshAi),
-        (WalletProviderCommand::Manual(manual_args()), WalletProvider::Manual),
+        (
+            WalletProviderCommand::GoshAi(goshai_args()),
+            WalletProvider::GoshAi,
+        ),
+        (
+            WalletProviderCommand::Manual(manual_args()),
+            WalletProvider::Manual,
+        ),
     ] {
         for interactive in [true, false] {
             let mut reader = Cursor::new(Vec::new());
@@ -187,12 +193,17 @@ fn the_provider_is_a_recorded_field_and_survives_a_round_trip() {
         let reserved = store.open_draft().expect("reserve the fixture's id");
         let written = binding(reserved.id(), provider, "4::abc");
         store.commit_active(&written).expect("commit");
-        let read = store.load_active(&crate::cli::wallet::test_network_a()).expect("load").expect("present");
+        let read = store
+            .load_active(&crate::cli::wallet::test_network_a())
+            .expect("load")
+            .expect("present");
         assert_eq!(read, written);
         assert_eq!(read.provider, provider);
-        let json: serde_json::Value =
-            serde_json::from_slice(&std::fs::read(store.binding_path(&crate::cli::wallet::test_network_a())).expect("read"))
-                .expect("json");
+        let json: serde_json::Value = serde_json::from_slice(
+            &std::fs::read(store.binding_path(&crate::cli::wallet::test_network_a()))
+                .expect("read"),
+        )
+        .expect("json");
         assert_eq!(json["provider"], provider.as_str());
     }
 }
@@ -203,7 +214,9 @@ fn the_provider_is_a_recorded_field_and_survives_a_round_trip() {
 fn the_same_hot_address_can_carry_a_different_provider() {
     let (_temp, store) = store();
     let same_hot = "4::0000000000000000000000000000000000000000000000000000000000000001";
-    let gosh_ai = store.open_draft().expect("reserve the gosh-ai fixture's id");
+    let gosh_ai = store
+        .open_draft()
+        .expect("reserve the gosh-ai fixture's id");
     let manual = store.open_draft().expect("reserve the manual fixture's id");
     store
         .commit_active(&binding(gosh_ai.id(), WalletProvider::GoshAi, same_hot))
@@ -234,7 +247,13 @@ fn the_same_hot_address_can_carry_a_different_provider() {
 #[test]
 fn a_binding_without_a_provider_field_is_refused_not_defaulted() {
     let (_temp, store) = store();
-    std::fs::create_dir_all(store.binding_path(&crate::cli::wallet::test_network_a()).parent().expect("parent")).expect("mkdir");
+    std::fs::create_dir_all(
+        store
+            .binding_path(&crate::cli::wallet::test_network_a())
+            .parent()
+            .expect("parent"),
+    )
+    .expect("mkdir");
     std::fs::write(
         store.binding_path(&crate::cli::wallet::test_network_a()),
         br#"{"version":1,"id":"x","network":"net-a","hot_address":"4::abc"}"#,
@@ -255,7 +274,13 @@ fn a_future_binding_version_is_refused() {
     let (_temp, store) = store();
     let mut future = binding("id", WalletProvider::Manual, "4::abc");
     future.version = BINDING_VERSION + 1;
-    std::fs::create_dir_all(store.binding_path(&crate::cli::wallet::test_network_a()).parent().expect("parent")).expect("mkdir");
+    std::fs::create_dir_all(
+        store
+            .binding_path(&crate::cli::wallet::test_network_a())
+            .parent()
+            .expect("parent"),
+    )
+    .expect("mkdir");
     std::fs::write(
         store.binding_path(&crate::cli::wallet::test_network_a()),
         serde_json::to_vec(&future).expect("serialize"),
@@ -281,8 +306,10 @@ fn the_binding_file_holds_no_secret_material() {
     full.push_profile_address = Some("0:profile".into());
     store.commit_active(&full).expect("commit");
 
-    let json: serde_json::Value =
-        serde_json::from_slice(&std::fs::read(store.binding_path(&crate::cli::wallet::test_network_a())).expect("read")).expect("json");
+    let json: serde_json::Value = serde_json::from_slice(
+        &std::fs::read(store.binding_path(&crate::cli::wallet::test_network_a())).expect("read"),
+    )
+    .expect("json");
     let mut keys: Vec<&str> = json
         .as_object()
         .expect("object")
@@ -316,8 +343,10 @@ fn absent_optional_fields_are_omitted() {
     store
         .commit_active(&binding("id", WalletProvider::GoshAi, "4::hot"))
         .expect("commit");
-    let json: serde_json::Value =
-        serde_json::from_slice(&std::fs::read(store.binding_path(&crate::cli::wallet::test_network_a())).expect("read")).expect("json");
+    let json: serde_json::Value = serde_json::from_slice(
+        &std::fs::read(store.binding_path(&crate::cli::wallet::test_network_a())).expect("read"),
+    )
+    .expect("json");
     let object = json.as_object().expect("object");
     assert!(!object.contains_key("vault_address"), "{json}");
     assert!(!object.contains_key("vault_key_file"), "{json}");
@@ -356,7 +385,10 @@ fn a_replaced_binding_is_archived_with_its_provider_intact() {
         archived.display()
     );
     assert_eq!(
-        store.load_active(&crate::cli::wallet::test_network_a()).expect("load").expect("present"),
+        store
+            .load_active(&crate::cli::wallet::test_network_a())
+            .expect("load")
+            .expect("present"),
         second,
         "the active binding is the new one"
     );
@@ -447,7 +479,10 @@ fn an_empty_draft_is_discarded_and_a_used_one_is_kept() {
 fn a_missing_binding_fails_fast_with_the_stable_code() {
     let (_temp, store) = store();
     assert!(
-        store.load_active(&crate::cli::wallet::test_network_a()).expect("load").is_none(),
+        store
+            .load_active(&crate::cli::wallet::test_network_a())
+            .expect("load")
+            .is_none(),
         "nothing is bound yet"
     );
     let error = store
@@ -481,7 +516,12 @@ fn require_active_returns_the_recorded_binding() {
     let reserved = store.open_draft().expect("reserve the fixture's id");
     let written = binding(reserved.id(), WalletProvider::Manual, "4::hot");
     store.commit_active(&written).expect("commit");
-    assert_eq!(store.require_active(&crate::cli::wallet::test_network_a()).expect("resolve"), written);
+    assert_eq!(
+        store
+            .require_active(&crate::cli::wallet::test_network_a())
+            .expect("resolve"),
+        written
+    );
 }
 
 /// A binding file that exists but cannot be read is an error, never a silent "no wallet": treating
@@ -489,10 +529,24 @@ fn require_active_returns_the_recorded_binding() {
 #[test]
 fn an_unreadable_binding_is_an_error_not_an_absent_one() {
     let (_temp, store) = store();
-    std::fs::create_dir_all(store.binding_path(&crate::cli::wallet::test_network_a()).parent().expect("parent")).expect("mkdir");
-    std::fs::write(store.binding_path(&crate::cli::wallet::test_network_a()), b"{ this is not json").expect("write");
-    assert!(store.load_active(&crate::cli::wallet::test_network_a()).is_err());
-    let error = store.require_active(&crate::cli::wallet::test_network_a()).expect_err("must not resolve");
+    std::fs::create_dir_all(
+        store
+            .binding_path(&crate::cli::wallet::test_network_a())
+            .parent()
+            .expect("parent"),
+    )
+    .expect("mkdir");
+    std::fs::write(
+        store.binding_path(&crate::cli::wallet::test_network_a()),
+        b"{ this is not json",
+    )
+    .expect("write");
+    assert!(store
+        .load_active(&crate::cli::wallet::test_network_a())
+        .is_err());
+    let error = store
+        .require_active(&crate::cli::wallet::test_network_a())
+        .expect_err("must not resolve");
     assert!(
         error.downcast_ref::<dexdo_core::DexdoError>().is_none(),
         "a corrupt binding is not the not-configured code: {error}"
@@ -525,8 +579,14 @@ fn a_failed_rebind_leaves_the_previous_binding_active_and_resolvable() {
     let key = temp.path().join("hot.key");
     std::fs::write(&key, "cc").expect("write key");
 
-    let reserved_previous = store.open_draft().expect("reserve the previous binding's id");
-    let mut previous = binding(reserved_previous.id(), WalletProvider::Manual, "4::hot-previous");
+    let reserved_previous = store
+        .open_draft()
+        .expect("reserve the previous binding's id");
+    let mut previous = binding(
+        reserved_previous.id(),
+        WalletProvider::Manual,
+        "4::hot-previous",
+    );
     previous.hot_key_file = Some(key.clone());
     store.commit_active(&previous).expect("commit previous");
 
@@ -538,17 +598,29 @@ fn a_failed_rebind_leaves_the_previous_binding_active_and_resolvable() {
 
     // Nothing was committed, so the previous binding is untouched...
     assert_eq!(
-        store.load_active(&crate::cli::wallet::test_network_a()).expect("load").expect("present"),
+        store
+            .load_active(&crate::cli::wallet::test_network_a())
+            .expect("load")
+            .expect("present"),
         previous,
         "a failed rebind must not replace the binding it was going to replace"
     );
     // ...and it still resolves as the wallet a money command would spend from.
-    let resolved = super::resolve_funding_wallet(&store, &crate::cli::wallet::test_network_a(), None, &None, &None)
-        .expect("the previous binding must still resolve as the funding wallet");
+    let resolved = super::resolve_funding_wallet(
+        &store,
+        &crate::cli::wallet::test_network_a(),
+        None,
+        &None,
+        &None,
+    )
+    .expect("the previous binding must still resolve as the funding wallet");
     assert_eq!(resolved.address, "4::hot-previous");
     assert_eq!(resolved.key, Some(key));
     // And it left no half-made binding behind to be inherited.
-    assert!(!reserved.exists(), "the reserved draft directory was not given back");
+    assert!(
+        !reserved.exists(),
+        "the reserved draft directory was not given back"
+    );
 }
 
 /// The archived binding's ADDRESS survives, which is the whole reason archiving exists.
@@ -590,8 +662,14 @@ fn rebinding_to_ackinacki_wallet_archives_the_previous_binding_and_activates_the
     let key = temp.path().join("hot.key");
     std::fs::write(&key, "cc").expect("write key");
 
-    let reserved_previous = store.open_draft().expect("reserve the previous binding's id");
-    let mut previous = binding(reserved_previous.id(), WalletProvider::Manual, "4::hot-previous");
+    let reserved_previous = store
+        .open_draft()
+        .expect("reserve the previous binding's id");
+    let mut previous = binding(
+        reserved_previous.id(),
+        WalletProvider::Manual,
+        "4::hot-previous",
+    );
     previous.hot_key_file = Some(key.clone());
     store.commit_active(&previous).expect("commit previous");
 
@@ -618,11 +696,20 @@ fn rebinding_to_ackinacki_wallet_archives_the_previous_binding_and_activates_the
         "funds can still sit in the replaced Hot, so its address must remain readable"
     );
 
-    let active = store.load_active(&crate::cli::wallet::test_network_a()).expect("load").expect("present");
+    let active = store
+        .load_active(&crate::cli::wallet::test_network_a())
+        .expect("load")
+        .expect("present");
     assert_eq!(active, replacement);
     // The binding names the Hot as the wallet to spend from -- never the Vault.
-    let resolved = super::resolve_funding_wallet(&store, &crate::cli::wallet::test_network_a(), None, &None, &None)
-        .expect("the new binding resolves as the funding wallet");
+    let resolved = super::resolve_funding_wallet(
+        &store,
+        &crate::cli::wallet::test_network_a(),
+        None,
+        &None,
+        &None,
+    )
+    .expect("the new binding resolves as the funding wallet");
     assert_eq!(
         resolved.address, "4::hot-new",
         "dexdo spends from the Hot; the Vault is custody, not a funding source"

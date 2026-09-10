@@ -360,8 +360,8 @@ fn plan(
 
     let mut delay = idle;
     for deadline in [last_deadline, next_boundary, final_close_deadline]
-    .into_iter()
-    .flatten()
+        .into_iter()
+        .flatten()
     {
         if deadline > now {
             delay = delay.min(Duration::from_secs(deadline - now));
@@ -850,8 +850,16 @@ mod tests {
             &self,
             _: &TokenContract,
             _: &dyn Note,
-            _: u128,
+            cumulative: u128,
         ) -> Result<(), ChainError> {
+            self.state
+                .lock()
+                .unwrap()
+                .current
+                .as_mut()
+                .expect("claim requires an active scripted deal")
+                .deal
+                .tokens_pending = cumulative;
             Ok(())
         }
 
@@ -1380,6 +1388,7 @@ mod tests {
         let backend = ScriptedBackend::new(before);
         let mut after = before;
         after.deal.tokens_final = 2 * TICK_SIZE;
+        after.deal.tokens_pending = 3 * TICK_SIZE;
         backend.push_finalize(Effect::Replace(Some(after)));
 
         let claimed = super::super::advance::drive_advance(
@@ -1831,13 +1840,24 @@ mod tests {
         accepted_without_a_claim_anchor.deal.last_claim_time = 0;
 
         for (name, malformed) in [
-            ("tokensPending above fundedTokens", claimed_past_the_funded_term),
-            ("weekBaseTokens above tokensPending", week_base_above_the_claim),
-            ("accepted with lastClaimTime=0", accepted_without_a_claim_anchor),
+            (
+                "tokensPending above fundedTokens",
+                claimed_past_the_funded_term,
+            ),
+            (
+                "weekBaseTokens above tokensPending",
+                week_base_above_the_claim,
+            ),
+            (
+                "accepted with lastClaimTime=0",
+                accepted_without_a_claim_anchor,
+            ),
         ] {
             let backend = ScriptedBackend::new(malformed);
             assert!(
-                step(&backend, START + SUB_WEEK_LEN.as_secs()).await.is_err(),
+                step(&backend, START + SUB_WEEK_LEN.as_secs())
+                    .await
+                    .is_err(),
                 "{name} must fail closed"
             );
             assert_eq!(backend.calls(), (0, 0), "{name} wrote before failing");

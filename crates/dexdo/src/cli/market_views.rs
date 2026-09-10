@@ -2,16 +2,15 @@
 
 use crate::cli::args::*;
 use crate::cli::commands::{
-    enforce_model_registry_policy, fold_snapshot_from_orders,
-    load_enabled_model_registry_policy, book_target_for, preload_model_registry_policy,
-    print_book_table, read_book_target, read_executable_book_target, registry_requested_model,
+    book_target_for, enforce_model_registry_policy, fold_snapshot_from_orders,
+    load_enabled_model_registry_policy, preload_model_registry_policy, print_book_table,
+    read_book_target, read_executable_book_target, registry_requested_model,
     resolve_model_registry_target, resolve_order_book_target, retry_executable_read,
     snapshot_with_executable_orders, target_from_market, target_from_market_for_model, BookRow,
     BookTarget, ReadBudget,
 };
 use crate::cli::commands::{
-    declared_model_flags, mock_chain_for_machine, mock_orders_from_offers,
-    render_model_flags_field,
+    declared_model_flags, mock_chain_for_machine, mock_orders_from_offers, render_model_flags_field,
 };
 use crate::cli::indexer::{self, DepthQuery, IndexerClient, MarketsQuery};
 use crate::cli::machine;
@@ -19,11 +18,11 @@ use anyhow::{bail, Result};
 use dexdo::registry::{BuyerMissingBookPolicy, RegistryRole};
 use dexdo_core::address as addr;
 use dexdo_core::params::INDEXER_FAST_TIMEOUT;
-use dexdo_core::{executable_quote, model_hash_for, ChainBackend};
 use dexdo_core::{
-    chain::BookEventFold, submit_safe_single_ask_quote, DobParams, ExecutableQuote,
-    OrderBookOrder, OrderBookSnapshot,
+    chain::BookEventFold, submit_safe_single_ask_quote, DobParams, ExecutableQuote, OrderBookOrder,
+    OrderBookSnapshot,
 };
+use dexdo_core::{executable_quote, model_hash_for, ChainBackend};
 use serde_json::json;
 use std::future::Future;
 
@@ -80,7 +79,8 @@ async fn read_indexer_market_context(order_book: &str) -> Result<IndexerMarketCo
 
     // That constructor is DELETED rather than fixed. It had this one caller, and a record that can
     // be built without the field is a way for this to come back that no test can watch for.
-    let manifest = indexer::ManifestIndexer::load(crate::cli::commands::manifest_path()?.as_path())?;
+    let manifest =
+        indexer::ManifestIndexer::load(crate::cli::commands::manifest_path()?.as_path())?;
     let base_url = indexer::resolve_base_url(None, Some(&manifest))?;
     let client = IndexerClient::new(base_url, INDEXER_FAST_TIMEOUT)?;
     let markets = client
@@ -161,8 +161,7 @@ where
                     },
                 )
                 .await?;
-            let from_storage =
-                row_source == crate::cli::fold_completeness::RowSource::Storage;
+            let from_storage = row_source == crate::cli::fold_completeness::RowSource::Storage;
             let (source, last_update_id) = match indexer {
                 Ok(context) => ("indexer", context.last_update_id),
                 Err(error) => {
@@ -541,7 +540,6 @@ pub(crate) async fn run_market(args: MarketArgs) -> Result<()> {
     Ok(())
 }
 
-
 /// Is this failure a state of the book (which `executable-book` reports as an empty listing plus a
 /// reason), or a failure to read it at all (which stays an error)?
 
@@ -751,7 +749,6 @@ pub(crate) async fn run_executable_book(args: ExecutableBookArgs) -> Result<()> 
     Ok(())
 }
 
-
 pub(crate) async fn run_quote(args: QuoteArgs) -> Result<()> {
     if args.mock_chain {
         return run_quote_mock(args).await;
@@ -868,7 +865,6 @@ pub(crate) async fn run_quote(args: QuoteArgs) -> Result<()> {
     }
     Ok(())
 }
-
 
 pub(crate) async fn run_market_data(args: MarketDataArgs) -> Result<()> {
     // Always loaded, never optional: the manifest is what says which indexer may answer, and
@@ -1543,7 +1539,10 @@ mod tests {
         }
 
         for reason in [
-            &format!("{}: GraphQL request failed: 502 Bad Gateway", dexdo_core::params::current_network()),
+            &format!(
+                "{}: GraphQL request failed: 502 Bad Gateway",
+                dexdo_core::params::current_network()
+            ),
             "InferenceOrderBook 0:book is not active",
             "DEXDO_MANIFEST: non-printable path",
         ] {

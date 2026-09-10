@@ -31,7 +31,6 @@
 //! provider this module invented for itself would be a funding flow the operator never bound.
 
 use std::collections::BTreeMap;
-use std::io::IsTerminal as _;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -1918,11 +1917,7 @@ fn funding_timeout_refusal(
         (0, 0) => "the balance it needs".to_string(),
         (ecc, 0) => format!("{} SHELL", shell(ecc)),
         (0, native) => format!("{} vmshell of gas", shell(native)),
-        (ecc, native) => format!(
-            "{} SHELL and {} vmshell of gas",
-            shell(ecc),
-            shell(native)
-        ),
+        (ecc, native) => format!("{} SHELL and {} vmshell of gas", shell(ecc), shell(native)),
     };
     // Why the budget ran out, when the answer is not "the transfer was never confirmed".
     // The shortfall alone is true and useless: an operator who was never asked for anything reads
@@ -2180,13 +2175,24 @@ mod funding_refusal_1432_tests {
             &shortfall_of(100 * dexdo_core::params::SHELL_UNIT),
             None,
         );
-        let first = refusal.render_with(crate::cli::style::Palette::None).lines().next().unwrap_or_default().to_string();
+        let first = refusal
+            .render_with(crate::cli::style::Palette::None)
+            .lines()
+            .next()
+            .unwrap_or_default()
+            .to_string();
 
         assert!(first.contains("100 SHELL"), "{first}");
-        assert!(!first.contains("100000000000"), "raw ECC[2] reached the operator: {first}");
+        assert!(
+            !first.contains("100000000000"),
+            "raw ECC[2] reached the operator: {first}"
+        );
         assert!(first.contains("10 minutes"), "{first}");
         assert!(!first.contains("600s"), "{first}");
-        assert!(!first.contains(hot), "the whole address reached the operator: {first}");
+        assert!(
+            !first.contains(hot),
+            "the whole address reached the operator: {first}"
+        );
         assert!(first.contains("\u{2026}7acc2b"), "{first}");
     }
 
@@ -2197,7 +2203,8 @@ mod funding_refusal_1432_tests {
         let hot = "f5d7cf2acdb781ec106701e7f02835e6625f15708e819b5822f65364f17acc2b";
         let unit = dexdo_core::params::SHELL_UNIT;
 
-        let gas_only = funding_timeout_refusal("note deploy", hot, 60, 5 * unit, &shortfall_of(0), None);
+        let gas_only =
+            funding_timeout_refusal("note deploy", hot, 60, 5 * unit, &shortfall_of(0), None);
         assert!(
             gas_only
                 .render_with(crate::cli::style::Palette::None)
@@ -2206,14 +2213,17 @@ mod funding_refusal_1432_tests {
             gas_only.render_with(crate::cli::style::Palette::None)
         );
 
-        let both = funding_timeout_refusal("note deploy", hot, 60, 5 * unit, &shortfall_of(unit), None);
+        let both =
+            funding_timeout_refusal("note deploy", hot, 60, 5 * unit, &shortfall_of(unit), None);
         let text = both.render_with(crate::cli::style::Palette::None);
         assert!(text.contains("SHELL and"), "{text}");
         assert!(text.contains("vmshell of gas"), "{text}");
 
         let neither = funding_timeout_refusal("note deploy", hot, 60, 0, &shortfall_of(0), None);
         assert!(
-            neither.render_with(crate::cli::style::Palette::None).contains("the balance it needs"),
+            neither
+                .render_with(crate::cli::style::Palette::None)
+                .contains("the balance it needs"),
             "no amount may be invented: {}",
             neither.render_with(crate::cli::style::Palette::None)
         );
@@ -2236,8 +2246,14 @@ mod funding_refusal_1432_tests {
         )
         .detail()
         .to_string();
-        assert!(rendered.contains(hot), "the whole address is still recorded");
-        assert!(rendered.contains("600s"), "the exact wait is still recorded");
+        assert!(
+            rendered.contains(hot),
+            "the whole address is still recorded"
+        );
+        assert!(
+            rendered.contains("600s"),
+            "the exact wait is still recorded"
+        );
         assert!(
             rendered.contains("100 SHELL"),
             "the amount is still recorded: {rendered}"
@@ -2688,9 +2704,10 @@ where
             chain_created_at_unix,
         } => {
             let Some(created_at_unix) = chain_created_at_unix else {
-                let reason = "the provider found the exact request in the Vault queue but supplied \
+                let reason =
+                    "the provider found the exact request in the Vault queue but supplied \
                               no finalized chain admission time for this unbound local generation"
-                    .to_string();
+                        .to_string();
                 eprintln!(
                     "{operation}: cannot safely adopt the Vault -> Hot funding request for \
                      {hot_address} ({reason}). Not submitting another one. It remains recorded as \
@@ -2864,17 +2881,32 @@ pub(crate) mod providers;
 /// before sending - is the caller's own preflight, which runs next and still refuses on its own
 /// terms. This returns once the balance HAS been observed to meet the requirement; the caller then
 /// proves it again against the figure it is about to spend.
+pub(crate) struct MoneyCommandFunding<'a> {
+    pub(crate) client: &'a dexdo_core::ChainClient,
+    pub(crate) endpoint: &'a str,
+    pub(crate) binding: Option<&'a crate::cli::wallet::WalletBinding>,
+    pub(crate) resolved_hot_address: &'a str,
+    pub(crate) network: &'a str,
+    pub(crate) requirements: FundingRequirements,
+    pub(crate) operation: &'a str,
+    pub(crate) funding_timeout: Option<Duration>,
+}
+
 pub(crate) async fn fund_hot_for_money_command(
-    client: &dexdo_core::ChainClient,
-    endpoint: &str,
-    binding: Option<&crate::cli::wallet::WalletBinding>,
-    resolved_hot_address: &str,
-    network: &str,
-    requirements: FundingRequirements,
-    operation: &str,
-    funding_timeout: Option<Duration>,
+    funding: MoneyCommandFunding<'_>,
 ) -> Result<FundingNotice> {
     use providers::{AckinackiVaultProvider, DirectTopUpProvider, RealVaultChain};
+
+    let MoneyCommandFunding {
+        client,
+        endpoint,
+        binding,
+        resolved_hot_address,
+        network,
+        requirements,
+        operation,
+        funding_timeout,
+    } = funding;
 
     let view = binding.map_or_else(
         || HotFundingBinding {

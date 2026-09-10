@@ -26,7 +26,11 @@ fn the_section_is_emitted_for_every_reading() {
             rendered.starts_with("PrivateNote withdrawTokens gates (what holds the money):"),
             "{rendered}"
         );
-        assert_eq!(rendered.lines().count(), 2, "one title, one answer: {rendered}");
+        assert_eq!(
+            rendered.lines().count(),
+            2,
+            "one title, one answer: {rendered}"
+        );
         assert!(rendered.ends_with('\n'), "{rendered}");
     }
 }
@@ -79,7 +83,10 @@ fn an_incomplete_check_says_so_and_does_not_read_as_clear() {
     // exists, this assertion would pass forever while checking nothing.
     let clear = render_note_withdraw_gate(&NoteWithdrawGate::Clear);
     let clear_phrase = "STATE gates read and closed";
-    assert!(clear.contains(clear_phrase), "the clear reading changed: {clear}");
+    assert!(
+        clear.contains(clear_phrase),
+        "the clear reading changed: {clear}"
+    );
     assert!(
         !rendered.contains(clear_phrase),
         "an unread gate rendered as a clean note: {rendered}"

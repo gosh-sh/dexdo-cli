@@ -251,11 +251,18 @@ fn gosh_ai_takes_activation_timeout_and_only_gosh_ai_does() {
     assert!(goshai.activation_timeout.is_none());
 
     // It is not a global flag and not another provider's.
-    assert!(Cli::try_parse_from(["dexdo", "wallet", "onboard", "--activation-timeout", "20m"]).is_err());
     assert!(
-        Cli::try_parse_from(["dexdo", "wallet", "onboard", "manual", "--activation-timeout", "20m"])
-            .is_err()
+        Cli::try_parse_from(["dexdo", "wallet", "onboard", "--activation-timeout", "20m"]).is_err()
     );
+    assert!(Cli::try_parse_from([
+        "dexdo",
+        "wallet",
+        "onboard",
+        "manual",
+        "--activation-timeout",
+        "20m"
+    ])
+    .is_err());
 }
 
 /// A duration is a duration, and zero is not one.
@@ -360,7 +367,10 @@ fn the_ackinacki_wallet_payload_reaches_the_dispatch_arm_intact() {
         panic!("`wallet onboard ackinacki-wallet` must parse into the shape provider_flow reads");
     };
     assert_eq!(onboard.agent_name, "build-agent");
-    assert_eq!(onboard.state, Some(std::path::PathBuf::from("session.json")));
+    assert_eq!(
+        onboard.state,
+        Some(std::path::PathBuf::from("session.json"))
+    );
     assert_eq!(onboard.hot_key, Some(std::path::PathBuf::from("hot.key")));
 }
 
@@ -380,7 +390,8 @@ fn only_the_wired_provider_shapes_avoid_the_staged_refusal() {
         "one dispatcher serves every wallet shape"
     );
     assert!(
-        wallet_rs.contains("WalletProvider::AckinackiWallet => ackinacki_flow(draft, explicit).await"),
+        wallet_rs
+            .contains("WalletProvider::AckinackiWallet => ackinacki_flow(draft, explicit).await"),
         "ackinacki-wallet must be routed from provider_flow to PR715's onboarding"
     );
     // onboard + gosh-ai: the general dispatcher, then provider_flow's wired arm.

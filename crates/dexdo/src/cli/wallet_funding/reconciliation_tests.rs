@@ -239,11 +239,12 @@ impl FakeHot {
 impl HotBalanceReader for FakeHot {
     async fn hot_balances(&self, _hot: &CanonicalAddress) -> Result<HotBalances> {
         self.reads.set(self.reads.get() + 1);
-        let balance = self.balances.borrow_mut().pop().unwrap_or_else(|| self.last.get());
-        Ok(HotBalances::new(
-            self.native.get(),
-            [(SHELL, balance)],
-        ))
+        let balance = self
+            .balances
+            .borrow_mut()
+            .pop()
+            .unwrap_or_else(|| self.last.get());
+        Ok(HotBalances::new(self.native.get(), [(SHELL, balance)]))
     }
 }
 
@@ -358,7 +359,11 @@ async fn an_external_exact_request_without_a_chain_date_fails_closed() {
 
     let _ = money_command_run(dir.path(), &vault, &hot).await;
 
-    assert_eq!(vault.submits.get(), 0, "an undated request never authorizes a submit");
+    assert_eq!(
+        vault.submits.get(),
+        0,
+        "an undated request never authorizes a submit"
+    );
     let record = record_of(dir.path()).expect("Prepared is durable before the failed adoption");
     assert_eq!(record.state, FundingState::Prepared);
     assert!(record.pending_transaction_id.is_none());
@@ -527,7 +532,10 @@ async fn an_unreadable_history_never_authorizes_another_submit() {
         1,
         "a chain read that failed means unknown, and unknown must never permit a submit"
     );
-    assert_eq!(record_of(dir.path()).expect("record").state, FundingState::Submitted);
+    assert_eq!(
+        record_of(dir.path()).expect("record").state,
+        FundingState::Submitted
+    );
 }
 
 /// A submit whose result was never observed leaves no queue id. The wallet's own
@@ -702,7 +710,10 @@ async fn the_money_command_continues_once_the_balance_arrives() {
         "only an observed balance closes the record"
     );
     assert_eq!(
-        closed.satisfied_balances.as_ref().and_then(|b| b.get(&SHELL)),
+        closed
+            .satisfied_balances
+            .as_ref()
+            .and_then(|b| b.get(&SHELL)),
         Some(&REQUIRED)
     );
 }
@@ -719,15 +730,14 @@ async fn the_provider_wire_carries_the_exact_native_shortfall() {
     let dir = temp();
     let vault = FakeVault::empty();
     let native_shortfall = 123;
-    let hot = FakeHot::with_balances(
-        vault_to_hot_native_value() - native_shortfall,
-        REQUIRED,
-    );
+    let hot = FakeHot::with_balances(vault_to_hot_native_value() - native_shortfall, REQUIRED);
 
     let _ = money_command_run(dir.path(), &vault, &hot).await;
 
     let submitted = vault.submitted.borrow();
-    let on_wire = submitted.first().expect("the provider submitted a fingerprint");
+    let on_wire = submitted
+        .first()
+        .expect("the provider submitted a fingerprint");
     assert_eq!(on_wire.value, native_shortfall);
     assert!(
         on_wire.cc.is_empty(),
@@ -769,7 +779,9 @@ async fn the_record_freezes_the_full_fingerprint_the_submit_used() {
     assert_eq!(fingerprint.payload_hash, payload_hash(VAULT_TO_HOT_PAYLOAD));
 
     let on_the_wire = vault.submitted.borrow();
-    let on_the_wire = on_the_wire.first().expect("the provider was asked to submit");
+    let on_the_wire = on_the_wire
+        .first()
+        .expect("the provider was asked to submit");
     assert_eq!(
         on_the_wire, fingerprint,
         "the transfer that went on the wire and the transfer the journal claims went on the wire \
@@ -888,12 +900,8 @@ async fn the_extended_record_carries_no_secret() {
     let hot = FakeHot::always(0);
     let _ = money_command_run(dir.path(), &vault, &hot).await;
 
-    let raw = std::fs::read_to_string(funding_journal_path(
-        dir.path(),
-        "net-a",
-        &hot_address(),
-    ))
-    .expect("read raw");
+    let raw = std::fs::read_to_string(funding_journal_path(dir.path(), "net-a", &hot_address()))
+        .expect("read raw");
     assert!(raw.contains("\"fingerprint\""), "{raw}");
     assert!(raw.contains("\"generation\""), "{raw}");
     assert!(

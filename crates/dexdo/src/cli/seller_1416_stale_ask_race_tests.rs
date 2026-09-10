@@ -292,7 +292,9 @@ async fn a_match_found_at_shutdown_is_served_not_merely_reported() {
         1,
         "the sweep must ATTEMPT to serve the buyer, not report that nobody did"
     );
-    let rendered = error.expect("this stand cannot complete a serve, so it must surface").to_string();
+    let rendered = error
+        .expect("this stand cannot complete a serve, so it must surface")
+        .to_string();
     assert!(
         rendered.contains("could not serve"),
         "a failed serve must say so, got: {rendered}"
@@ -519,10 +521,7 @@ fn an_unproven_start_plans_the_same_rearm_the_running_path_plans() {
         "the startup path must re-arm on the same pair the running path re-arms on"
     );
     // And it must agree with the running path by ASKING it, not by repeating its table.
-    assert_eq!(
-        should_rearm_watcher(&decide_after_stop(&unproven), &health),
-        true
-    );
+    assert!(should_rearm_watcher(&decide_after_stop(&unproven), &health));
 
     // Draining must still terminate: a shutdown seats the deal for the sweep and does not re-arm.
     assert_eq!(

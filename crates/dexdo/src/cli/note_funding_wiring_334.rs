@@ -30,10 +30,7 @@ fn production_source() -> &'static str {
 /// green too. `code_of` bounds by brace depth and drops both forms of comment; see
 
 fn body_of(entry: &str) -> String {
-    crate::cli::source_probe::code_of(
-        production_source(),
-        &format!("pub(crate) async fn {entry}"),
-    )
+    crate::cli::source_probe::code_of(production_source(), &format!("pub(crate) async fn {entry}"))
 }
 
 /// Both spenders call the shared mechanism. Neither may be the only one: a Hot short of SHELL is
@@ -125,9 +122,9 @@ fn an_explicit_wallet_skips_durable_binding_but_reaches_manual_route_334() {
             "{entry} must not load a durable binding when the explicit wallet won"
         );
         assert!(
-            body[end..].contains(
-                "funding_binding.as_ref(),\n        &funding_wallet.address,\n        &funding_network,"
-            ),
+            body[end..].contains("binding: funding_binding.as_ref(),")
+                && body[end..].contains("resolved_hot_address: &funding_wallet.address,")
+                && body[end..].contains("network: &funding_network,"),
             "{entry} must pass the resolved explicit Hot and manifest network to the shared \
              entrypoint that selects the ephemeral Manual flow"
         );

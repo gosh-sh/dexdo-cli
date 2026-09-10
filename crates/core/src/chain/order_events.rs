@@ -188,7 +188,9 @@ mod tests {
 
         let extra_ioc = encode_order_placed(placement_fields(
             true,
-            crate::market::flags::AON | crate::market::flags::SUBSCRIPTION | crate::market::flags::IOC,
+            crate::market::flags::AON
+                | crate::market::flags::SUBSCRIPTION
+                | crate::market::flags::IOC,
         ));
         assert!(
             decode_subscription_placement(&extra_ioc)

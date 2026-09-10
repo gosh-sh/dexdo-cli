@@ -82,7 +82,6 @@ pub fn derive_multisig_private_key_from_seed_phrase(
     })
 }
 
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -195,5 +194,4 @@ mod tests {
         };
         assert_zeroize_on_drop(&key.secret_hex);
     }
-
 }

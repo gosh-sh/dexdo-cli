@@ -92,7 +92,9 @@ impl DealMoneyFlow {
     pub fn is_inflow(&self) -> bool {
         matches!(
             self,
-            Self::EscrowFunded { .. } | Self::SellerBondFunded { .. } | Self::BuyerBondFunded { .. }
+            Self::EscrowFunded { .. }
+                | Self::SellerBondFunded { .. }
+                | Self::BuyerBondFunded { .. }
         )
     }
 
@@ -273,13 +275,14 @@ impl DealLedger {
                     })?;
             after
         } else {
-            let after = balance_before
-                .checked_sub(amount)
-                .ok_or(ConservationBreach::Overdraft {
-                    transition: flow.label(),
-                    balance: balance_before,
-                    amount,
-                })?;
+            let after =
+                balance_before
+                    .checked_sub(amount)
+                    .ok_or(ConservationBreach::Overdraft {
+                        transition: flow.label(),
+                        balance: balance_before,
+                        amount,
+                    })?;
             match &flow {
                 DealMoneyFlow::CreditedToNote { note, .. } => {
                     self.credited_out = self.credited_out.saturating_add(amount);
@@ -296,14 +299,12 @@ impl DealLedger {
             balance_before,
             balance_after,
         });
-        self.steps
-            .last()
-            .ok_or(ConservationBreach::NotConserved {
-                funded_in: self.funded_in,
-                credited_out: self.credited_out,
-                written_off: self.written_off,
-                balance: self.balance,
-            })
+        self.steps.last().ok_or(ConservationBreach::NotConserved {
+            funded_in: self.funded_in,
+            credited_out: self.credited_out,
+            written_off: self.written_off,
+            balance: self.balance,
+        })
     }
 
     pub fn balance(&self) -> u128 {
@@ -405,7 +406,10 @@ pub fn buyer_net_result(credited_to_buyer: u128, total_debit: u128) -> i128 {
 /// `0:a71399a3606cb32292628d37518d7983c430420febd0b57585eabd9ca1a3a83a`: funded in
 /// `6 050 000 000`, declared payout `5 015 121 275`, so this returns `1 034 878 725` -- the exact sum
 /// of that deal's two `reportDealWriteOff` messages, `1 000 000 000` and `34 878 725`.
-pub fn implied_write_off(funded_in: u128, declared_payout: u128) -> Result<u128, ConservationBreach> {
+pub fn implied_write_off(
+    funded_in: u128,
+    declared_payout: u128,
+) -> Result<u128, ConservationBreach> {
     funded_in
         .checked_sub(declared_payout)
         .ok_or(ConservationBreach::PayoutExceedsFunding {
@@ -421,10 +425,10 @@ pub fn check_declared_payout_against_credits(
     declared_payout: u128,
     credited: u128,
 ) -> Result<(), ConservationBreach> {
-    (declared_payout == credited)
-        .then_some(())
-        .ok_or(ConservationBreach::DeclaredPayoutDisagreesWithCredits {
+    (declared_payout == credited).then_some(()).ok_or(
+        ConservationBreach::DeclaredPayoutDisagreesWithCredits {
             declared: declared_payout,
             credited,
-        })
+        },
+    )
 }

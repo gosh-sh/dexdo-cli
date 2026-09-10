@@ -14,7 +14,11 @@ const WALLET_APP_URL: &str = "https://ackinacki.com/wallet";
 
 /// The wallet's name, clickable where that means anything.
 pub(crate) fn wallet_app() -> String {
-    linked("Acki Nacki Wallet", WALLET_APP_URL, destination_is_a_terminal())
+    linked(
+        "Acki Nacki Wallet",
+        WALLET_APP_URL,
+        destination_is_a_terminal(),
+    )
 }
 
 /// `text` as a link to `url`, or as itself.

@@ -20,9 +20,7 @@
 //! 3. **There is no cancel and no timeout.** Once SHELL is deposited the only exit is to be matched
 //! by a buyer and then claimed. That is why the planning side refuses rather than rounds.
 
-use crate::params::{
-    ACCUMULATOR_DENOMS, ACCUMULATOR_SHELL_PER_USDC_RAW, SHELL_UNIT, USDC_UNIT,
-};
+use crate::params::{ACCUMULATOR_DENOMS, ACCUMULATOR_SHELL_PER_USDC_RAW, SHELL_UNIT, USDC_UNIT};
 use serde_json::Value;
 
 /// ABI of `ShellAccumulatorRootUSDC`, vendored from the compiled artifact.
@@ -142,8 +140,7 @@ impl SellPlan {
         let lot_count = usize::try_from(lot_count).map_err(|_| SellPlanError::Overflow)?;
 
         let mut lots = Vec::new();
-        lots
-            .try_reserve_exact(lot_count)
+        lots.try_reserve_exact(lot_count)
             .map_err(|_| SellPlanError::Overflow)?;
         let mut left = usdc_whole;
         for denom in ACCUMULATOR_DENOMS {
@@ -541,7 +538,10 @@ mod tests {
             field_names(&abi_function(&root, "buyShellFor")["inputs"]),
             ["buyer"]
         );
-        assert_eq!(field_names(&abi_function(&lot, "claim")["inputs"]), [] as [&str; 0]);
+        assert_eq!(
+            field_names(&abi_function(&lot, "claim")["inputs"]),
+            [] as [&str; 0]
+        );
 
         // The sell direction has NO named method: a lot is created by a bare ECC[2] transfer into
         // `receive()`. If a future generation adds one, this assertion is where we find out.
@@ -584,7 +584,10 @@ mod tests {
         for usdc in [1u128, 5, 9, 10, 11, 99, 123, 154, 999, 1000, 1001, 12_345] {
             let plan = SellPlan::for_whole_usdc(usdc).expect("plan");
             let summed: u128 = plan.lots.iter().map(|lot| u128::from(lot.denom)).sum();
-            assert_eq!(summed, usdc, "lots must sum to the requested amount ({usdc})");
+            assert_eq!(
+                summed, usdc,
+                "lots must sum to the requested amount ({usdc})"
+            );
             assert_eq!(
                 plan.shell_committed_raw,
                 plan.lots.iter().map(|lot| lot.shell_raw).sum::<u128>()
@@ -634,12 +637,15 @@ mod tests {
     #[test]
     fn a_plan_the_wallet_cannot_fund_is_refused_without_submitting() {
         let plan = SellPlan::for_whole_usdc(10).expect("plan");
-        let err = plan.require_funded(999_999_999_999).expect_err("must refuse");
+        let err = plan
+            .require_funded(999_999_999_999)
+            .expect_err("must refuse");
         assert!(matches!(err, SellPlanError::InsufficientShell { .. }));
         let rendered = err.to_string();
         assert!(rendered.contains("nothing was submitted"), "{rendered}");
         assert!(rendered.contains("missing=1"), "{rendered}");
-        plan.require_funded(1_000_000_000_000).expect("exact funding");
+        plan.require_funded(1_000_000_000_000)
+            .expect("exact funding");
     }
 
     #[test]

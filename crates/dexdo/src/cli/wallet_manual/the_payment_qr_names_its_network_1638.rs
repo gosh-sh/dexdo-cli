@@ -38,7 +38,10 @@ fn extended_address() -> String {
 }
 
 /// A funding request for a manual Hot on `network`, short `ecc_shortfall` raw ECC[2] SHELL.
-fn top_up_request(network: &str, ecc_shortfall: u128) -> crate::cli::wallet_funding::FundingRequest {
+fn top_up_request(
+    network: &str,
+    ecc_shortfall: u128,
+) -> crate::cli::wallet_funding::FundingRequest {
     crate::cli::wallet_funding::FundingRequest {
         provider: crate::cli::wallet::WalletProvider::Manual,
         network: network.to_string(),
@@ -158,11 +161,7 @@ fn a_label_cannot_smuggle_a_second_field_into_the_link() {
         let link = super::payment_link(&address, 100, smuggled, PaymentFlag::None);
         let fields: Vec<&str> = link.split('&').skip(1).collect();
 
-        assert_eq!(
-            fields.len(),
-            3,
-            "a label added fields of its own: {link}"
-        );
+        assert_eq!(fields.len(), 3, "a label added fields of its own: {link}");
         assert!(
             !link.contains("flag="),
             "a top-up link must never carry a flag, however the label was spelled: {link}"
@@ -225,7 +224,10 @@ fn the_top_up_code_takes_its_chain_from_the_request_it_was_built_for() {
             "the code must ask on the chain the request was built for"
         );
         assert_eq!(code.address, request.hot_address);
-        assert_eq!(code.whole_shell, 100, "and for the shortfall that was measured");
+        assert_eq!(
+            code.whole_shell, 100,
+            "and for the shortfall that was measured"
+        );
     }
 
     // A provider that tops up elsewhere prints nothing here, and neither does a request with no
@@ -293,7 +295,9 @@ fn the_deploy_asks_for_gas_and_the_top_up_asks_for_currency() {
     ));
 
     assert!(
-        drawn.windows(currency.len()).any(|w| w == currency.as_slice()),
+        drawn
+            .windows(currency.len())
+            .any(|w| w == currency.as_slice()),
         "the top-up path must print the code that asks for spendable SHELL"
     );
     assert!(
@@ -334,7 +338,10 @@ fn a_flagged_link_carries_the_context_the_wallet_requires_for_a_flag() {
     assert!(
         halves.len() == 2
             && halves.iter().all(|half| {
-                half.len() == 64 && half.bytes().all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+                half.len() == 64
+                    && half
+                        .bytes()
+                        .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
             }),
         "a flag is accepted only for an extended `<dapp64>::<account64>` recipient in lowercase \
          hex, and a flagged link that is not one is rejected whole: {recipient}"
@@ -350,7 +357,7 @@ fn a_flagged_link_carries_the_context_the_wallet_requires_for_a_flag() {
 #[test]
 fn the_top_up_instruction_names_the_chain_it_wants_the_money_on() {
     use crate::cli::wallet::WalletProvider;
-    use crate::cli::wallet_funding::{HotFundingProvider, providers};
+    use crate::cli::wallet_funding::{providers, HotFundingProvider};
 
     // Both providers served by the direct top-up flow, because review found the network had been
     // given to one of them and not the other, and the address is equally ambiguous for both.

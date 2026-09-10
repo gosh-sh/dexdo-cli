@@ -140,16 +140,14 @@ impl WalletStore {
             networks.sort_by(|a, b| a.as_str().cmp(b.as_str()));
             return networks;
         };
-        networks.extend(entries
-            .flatten()
-            .filter_map(|entry| {
-                let path = entry.path();
-                if path.extension().and_then(|e| e.to_str()) != Some("json") {
-                    return None;
-                }
-                let label = path.file_stem()?.to_str()?;
-                WalletNetwork::from_manifest_label(label).ok()
-            }));
+        networks.extend(entries.flatten().filter_map(|entry| {
+            let path = entry.path();
+            if path.extension().and_then(|e| e.to_str()) != Some("json") {
+                return None;
+            }
+            let label = path.file_stem()?.to_str()?;
+            WalletNetwork::from_manifest_label(label).ok()
+        }));
         networks.sort_by(|a, b| a.as_str().cmp(b.as_str()));
         networks.dedup_by(|a, b| a.as_str() == b.as_str());
         networks
@@ -478,9 +476,12 @@ impl WalletStore {
     /// A file that exists but does not parse is an error, not a `None`: silently treating a
     /// corrupt or newer binding as "no wallet" would send the next command into onboarding while a
     /// real Hot, possibly holding funds, is already bound.
-    pub(crate) fn read_active_record(&self, network: &WalletNetwork) -> Result<Option<WalletBinding>> {
+    pub(crate) fn read_active_record(
+        &self,
+        network: &WalletNetwork,
+    ) -> Result<Option<WalletBinding>> {
         self.migrate_legacy()?;
-        self.read_record_at(&self.binding_path(&network))
+        self.read_record_at(&self.binding_path(network))
     }
 
     /// Parse one active-record file. The version gate lives here so it guards the legacy file too:
@@ -598,7 +599,7 @@ impl WalletStore {
     /// reading the legacy file in place. The version gate still applies to both, through
     /// `read_record_at`: a record this build cannot read is an error either way.
     pub(crate) fn peek_active(&self, network: &WalletNetwork) -> Result<Option<WalletBinding>> {
-        if let Some(binding) = self.read_record_at(&self.binding_path(&network))? {
+        if let Some(binding) = self.read_record_at(&self.binding_path(network))? {
             return Ok(Some(binding));
         }
         let Some(legacy) = self.read_record_at(&self.legacy_binding_path())? else {
@@ -610,7 +611,7 @@ impl WalletStore {
     }
 
     pub(crate) fn load_active(&self, network: &WalletNetwork) -> Result<Option<WalletBinding>> {
-        let Some(binding) = self.read_active_record(&network)? else {
+        let Some(binding) = self.read_active_record(network)? else {
             return Ok(None);
         };
         self.validate_binding_id(&binding)?;
@@ -636,7 +637,7 @@ impl WalletStore {
              spend on another. Run this command against {} contracts, or bind a {} wallet with \
              `dexdo wallet onboard` -- bindings are kept per network, so binding one does not \
              replace the other",
-            self.binding_path(&network).display(),
+            self.binding_path(network).display(),
             binding.network,
             network,
             binding.network,
@@ -704,7 +705,7 @@ impl WalletStore {
     /// The active binding, or the fail-fast every wallet-dependent command raises BEFORE any chain
     /// write when there is none.
     pub(crate) fn require_active(&self, network: &WalletNetwork) -> Result<WalletBinding> {
-        match self.load_active(&network)? {
+        match self.load_active(network)? {
             Some(binding) => Ok(binding),
             None => Err(self.not_configured(network)),
         }
@@ -717,7 +718,7 @@ impl WalletStore {
     /// question with the validation refusal would leave the only documented way out of a corrupt
     /// binding reachable only from a binding that is not corrupt.
     pub(crate) fn require_active_record(&self, network: &WalletNetwork) -> Result<WalletBinding> {
-        match self.read_active_record(&network)? {
+        match self.read_active_record(network)? {
             Some(binding) => Ok(binding),
             None => Err(self.not_configured(network)),
         }
@@ -728,7 +729,7 @@ impl WalletStore {
             dexdo_core::error_codes::E_WALLET_NOT_CONFIGURED,
             format!(
                 "no active wallet binding for {network} at {}",
-                self.binding_path(&network).display()
+                self.binding_path(network).display()
             ),
         )
         .with_hint(dexdo_core::error_codes::E_WALLET_NOT_CONFIGURED.fix())

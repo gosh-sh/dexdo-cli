@@ -205,14 +205,8 @@ fn state_and_hot_key_are_no_longer_required_on_the_command_line() {
         panic!("expected the ackinacki-wallet provider");
     };
 
-    assert_eq!(
-        args.state,
-        None
-    );
-    assert_eq!(
-        args.hot_key,
-        None
-    );
+    assert_eq!(args.state, None);
+    assert_eq!(args.hot_key, None);
 }
 
 /// The canonical defaults are distinct paths, and the key is not written beside a non-secret by

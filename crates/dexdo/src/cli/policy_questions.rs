@@ -67,21 +67,6 @@ impl Question {
             .map(|(index, answer)| (answer, index == suggested))
             .collect()
     }
-
-    /// The rows a picker draws: the answer, with the suggestion named as such.
-    pub(crate) fn rows(&self) -> Vec<String> {
-        self.answers
-            .iter()
-            .enumerate()
-            .map(|(index, answer)| {
-                if index == self.suggested {
-                    format!("{} (suggested)", answer.says)
-                } else {
-                    answer.says.to_string()
-                }
-            })
-            .collect()
-    }
 }
 
 /// A number the operator gives instead of choosing a row.
@@ -342,7 +327,10 @@ mod tests {
             asked.sort_unstable();
             let mut required = required.clone();
             required.sort_unstable();
-            assert_eq!(asked, required, "{role:?}: asked fields differ from required");
+            assert_eq!(
+                asked, required,
+                "{role:?}: asked fields differ from required"
+            );
         }
     }
 
@@ -371,7 +359,11 @@ mod tests {
         for question in SELLER_QUESTIONS.iter().chain(BUYER_QUESTIONS) {
             let executable = crate::cli::policy::runtime_supported(question.path);
             let offered = question.offering(executable);
-            assert!(!offered.is_empty(), "{}: nothing left to offer", question.path);
+            assert!(
+                !offered.is_empty(),
+                "{}: nothing left to offer",
+                question.path
+            );
             assert_eq!(
                 offered.iter().filter(|(_, suggested)| *suggested).count(),
                 1,
@@ -380,7 +372,12 @@ mod tests {
             );
             if let Some(values) = executable {
                 for (answer, _) in &offered {
-                    assert!(values.contains(&answer.value), "{}: {}", question.path, answer.value);
+                    assert!(
+                        values.contains(&answer.value),
+                        "{}: {}",
+                        question.path,
+                        answer.value
+                    );
                 }
             }
         }
@@ -400,15 +397,12 @@ mod tests {
     #[test]
     fn each_question_suggests_one_of_its_own_answers() {
         for question in SELLER_QUESTIONS.iter().chain(BUYER_QUESTIONS) {
-            assert!(
-                question.suggested < question.answers.len(),
-                "{}: suggestion is out of range",
-                question.path
-            );
-            assert!(question
-                .rows()
-                .iter()
-                .any(|row| row.ends_with("(suggested)")));
+            let offered = question.offering(None);
+            let suggested: Vec<Answer> = offered
+                .into_iter()
+                .filter_map(|(answer, suggested)| suggested.then_some(answer))
+                .collect();
+            assert_eq!(suggested, vec![question.suggestion()], "{}", question.path);
         }
     }
 
@@ -419,7 +413,10 @@ mod tests {
         for question in SELLER_QUESTIONS.iter().chain(BUYER_QUESTIONS) {
             let text = question.situation;
             assert!(text.ends_with('.') || text.ends_with('?'), "{text}");
-            assert!(!text.contains('.'.to_string().as_str()) || !text.contains("on."), "{text}");
+            assert!(
+                !text.contains('.'.to_string().as_str()) || !text.contains("on."),
+                "{text}"
+            );
             assert!(!text.contains('_'), "{text}");
             for answer in question.answers {
                 assert!(!answer.says.contains('_'), "{}", answer.says);

@@ -5,11 +5,9 @@
 //! streaming SSE -> normalization into `CanonChunk` (R1/R2/R5/R6).
 //! - [`anthropic`] -- native Anthropic Messages API, streaming SSE -> the same canon.
 
-//! All branches normalize the upstream output into a single canonical stream (R1). Monetary accounting
-//! uses only the adapter's authoritative source: mock token ids, and -- for both real protocols -- the
-//! provider's own terminal native output total (`usage.completion_tokens` on OpenAI-compatible APIs,
-//! `usage.output_tokens` on Anthropic;, E2E-UPS-02). `CanonChunk` framing is never itself a token
-//! count.
+//! All branches normalize output into canonical content chunks followed by one validated terminal
+//! billing record. Real adapters use provider-native input + output usage; the deterministic mock
+//! applies the same two-part accounting contract. Chunk framing is never itself money.
 
 pub mod anthropic;
 pub mod mock;
@@ -17,38 +15,19 @@ pub mod openai;
 
 use anyhow::{bail, Result};
 use dexdo_core::params::{
-    CAPABILITY_PROBE_PROMPT, UPSTREAM_HEALTH_CHANNEL_CAPACITY, UPSTREAM_HEALTH_PROBE_MAX_TOKENS,
-    UPSTREAM_HEALTH_PROBE_PROMPT,
+    SampleAlgorithm, CAPABILITY_PROBE_PROMPT, UPSTREAM_HEALTH_CHANNEL_CAPACITY,
+    UPSTREAM_HEALTH_PROBE_MAX_TOKENS, UPSTREAM_HEALTH_PROBE_PROMPT,
 };
-use dexdo_proto::{CanonChunk, CanonRequest, ChatMessage, SamplingParams};
+use dexdo_proto::{BillingUsage, CanonChunk, CanonRequest, ChatMessage, SamplingParams};
 use tokio::sync::mpsc;
 use tonic::Status;
 
 /// Seller-internal upstream event. Accounting is kept separate from the buyer-facing canon so
 /// providers that report authoritative usage without token ids do not have to invent token data.
 pub enum UpstreamEvent {
-    Chunk {
-        chunk: CanonChunk,
-        accounted_tokens: u64,
-    },
-    /// Authoritative usage for preceding successfully delivered chunks whose provider reports token usage
-    /// separately from its text frames (the native Anthropic adapter).
-    Accounted(u64),
-}
-
-/// Attach an exact structured token count to a chunk.
-
-/// **The count is the chunk's token ids and nothing else.** Empty/no-signal chunks account zero,
-/// and a provider that reports its usage separately from its text frames bills through
-/// [`UpstreamEvent::Accounted`] instead.
-#[allow(clippy::result_large_err)]
-pub fn chunk_with_structured_accounting(chunk: CanonChunk) -> UpstreamResult {
-    let token_ids = u64::try_from(chunk.token_ids.len())
-        .map_err(|_| Status::data_loss("token-id count does not fit u64"))?;
-    Ok(UpstreamEvent::Chunk {
-        chunk,
-        accounted_tokens: token_ids,
-    })
+    Chunk(CanonChunk),
+    /// One provider-native terminal input/output/total record for the preceding content.
+    Usage(BillingUsage),
 }
 
 pub type UpstreamResult = Result<UpstreamEvent, Status>;
@@ -154,25 +133,38 @@ pub(crate) fn is_seller_config_http_status(code: u16) -> bool {
 }
 
 /// Annotate a provider `4xx` that is a seller configuration fault with the concrete subject: which model was
-/// served and which generation limit was sent. The `Status` code and the `upstream HTTP <code>` prefix
-/// are preserved verbatim -- stream-error policy and the failure classifier both parse them -- so this only
-/// enriches the message the operator (and the relayed buyer error body) actually reads.
+/// served, which generation limit was sent, and which optional greedy field was present.
+/// The `Status` code and the `upstream HTTP <code>` prefix are preserved verbatim -- stream-error policy and the
+/// failure classifier both parse them -- so this only enriches the message the operator (and the relayed buyer
+/// error body) actually reads.
 pub(crate) fn annotate_seller_config_fault(
     status: Status,
     http_status: u16,
     served_model: &str,
     sent_max_tokens: u32,
     configured_output_cap: u32,
+    sample_algorithm: Option<SampleAlgorithm>,
 ) -> Status {
     if !is_seller_config_http_status(http_status) {
         return status;
     }
+    let sample_hint = sample_algorithm.map_or_else(String::new, |algorithm| {
+        let field = algorithm
+            .wire_field()
+            .expect("NONE is never attached to a request");
+        format!(
+            "; request also sent optional field \"{field}\" selected by \
+             capabilities.sample_algorithm={}; choose the provider's supported sample_algorithm \
+             if it refuses that field",
+            algorithm.profile_value()
+        )
+    });
     Status::new(
         status.code(),
         format!(
             "{} [seller configuration fault: model \"{served_model}\" sent max_tokens={sent_max_tokens} \
              at capabilities.max_output_tokens={configured_output_cap}; correct this model's \
-             max_output_tokens in the models config]",
+             max_output_tokens in the models config{sample_hint}]",
             status.message()
         ),
     )
@@ -347,7 +339,10 @@ impl UpstreamConfig {
                 };
                 (prompt, cap)
             }
-            None => (UPSTREAM_HEALTH_PROBE_PROMPT, UPSTREAM_HEALTH_PROBE_MAX_TOKENS),
+            None => (
+                UPSTREAM_HEALTH_PROBE_PROMPT,
+                UPSTREAM_HEALTH_PROBE_MAX_TOKENS,
+            ),
         };
 
         let request = CanonRequest {
@@ -359,7 +354,9 @@ impl UpstreamConfig {
                 temperature: 0.0,
                 max_tokens,
                 stop: Vec::new(),
-                greedy: true,
+                // Readiness asks only whether the provider can answer. B7's provider-specific greedy
+                // control is irrelevant here and may itself be rejected by an otherwise healthy endpoint.
+                greedy: false,
             }),
         };
         let (tx, mut rx) = mpsc::channel(UPSTREAM_HEALTH_CHANNEL_CAPACITY);
@@ -375,9 +372,10 @@ impl UpstreamConfig {
         loop {
             tokio::select! {
                 item = rx.recv() => match item {
-                    Some(Ok(UpstreamEvent::Chunk { accounted_tokens, .. }))
-                        if accounted_tokens > 0 => return Ok(()),
-                    Some(Ok(UpstreamEvent::Accounted(tokens))) if tokens > 0 => return Ok(()),
+                    // visible content is not a complete provider billing record. Read the
+                    // stream through its validated terminal usage before declaring readiness.
+                    Some(Ok(UpstreamEvent::Chunk(_))) => continue,
+                    Some(Ok(UpstreamEvent::Usage(usage))) if usage.output_tokens > 0 => return Ok(()),
                     Some(Ok(_)) => continue,
                     Some(Err(status)) => {
                         let status = match requirements {
@@ -406,9 +404,8 @@ impl UpstreamConfig {
                 _ = &mut run => {
                     while let Ok(item) = rx.try_recv() {
                         match item {
-                            Ok(UpstreamEvent::Chunk { accounted_tokens, .. })
-                                if accounted_tokens > 0 => return Ok(()),
-                            Ok(UpstreamEvent::Accounted(tokens)) if tokens > 0 => return Ok(()),
+                            Ok(UpstreamEvent::Chunk(_)) => {}
+                            Ok(UpstreamEvent::Usage(usage)) if usage.output_tokens > 0 => return Ok(()),
                             Ok(_) => {}
                             Err(status) => {
                                 let status = match requirements {
@@ -434,16 +431,17 @@ impl UpstreamConfig {
     }
 
     /// Run the upstream: normalize its output into `CanonChunk` and send it incrementally into
-    /// `tx` (R6). `count` is the stream's token budget: no more than `count` delivered tokens. `req` is
+    /// `tx` (R6). `output_limit` is the provider/model output cap; total billing is carried only by
+    /// terminal usage and checked against the separate gateway reservation. `req` is
     /// the buyer's canonical request (R1). Finishes on upstream
     /// exhaustion, on reaching `count`, or when the buyer disconnected (`tx` closed = STOP).
     pub async fn run(
         &self,
-        count: u64,
+        output_limit: u64,
         req: Option<CanonRequest>,
         tx: mpsc::Sender<UpstreamResult>,
     ) {
-        self.run_for_market(None, None, count, req, tx).await
+        self.run_for_market(None, None, output_limit, req, tx).await
     }
 
     /// [`Self::run`], for a caller that knows which market the call is being made for (seller readiness).
@@ -455,23 +453,33 @@ impl UpstreamConfig {
         &self,
         market: Option<&str>,
         requirements: Option<StartupCapabilityRequirements>,
-        count: u64,
+        output_limit: u64,
         req: Option<CanonRequest>,
         tx: mpsc::Sender<UpstreamResult>,
     ) {
         match self {
-            UpstreamConfig::Mock => mock::run(count, req.as_ref(), tx, false, None).await,
+            UpstreamConfig::Mock => mock::run(output_limit, req.as_ref(), tx, false, None).await,
             UpstreamConfig::MockWithClaimedModel(claimed_model) => {
-                mock::run(count, req.as_ref(), tx, false, Some(claimed_model.as_str())).await
+                mock::run(
+                    output_limit,
+                    req.as_ref(),
+                    tx,
+                    false,
+                    Some(claimed_model.as_str()),
+                )
+                .await
             }
-            UpstreamConfig::MockScammer => mock::run(count, req.as_ref(), tx, true, None).await,
+            UpstreamConfig::MockScammer => {
+                mock::run(output_limit, req.as_ref(), tx, true, None).await
+            }
             UpstreamConfig::OpenAi(cfg) => match requirements {
                 Some(requirements) => {
-                    openai::run_startup_probe(cfg, market, requirements, count, req, tx).await
+                    openai::run_startup_probe(cfg, market, requirements, output_limit, req, tx)
+                        .await
                 }
-                None => openai::run(cfg, market, count, req, tx).await,
+                None => openai::run(cfg, market, output_limit, req, tx).await,
             },
-            UpstreamConfig::Anthropic(cfg) => anthropic::run(cfg, count, req, tx).await,
+            UpstreamConfig::Anthropic(cfg) => anthropic::run(cfg, output_limit, req, tx).await,
         }
     }
 }
@@ -582,6 +590,7 @@ mod tests {
             price_per_tick: 1,
             capabilities: Capabilities {
                 max_output_tokens: Some(openai::DEFAULT_MAX_OUTPUT_TOKENS),
+                ..Capabilities::default()
             },
             identity_aliases: Vec::new(),
             vocab_size: None,
@@ -618,11 +627,11 @@ mod tests {
     }
 
     async fn first_claimed_model(upstream: UpstreamConfig) -> String {
-        let (tx, mut rx) = mpsc::channel(1);
+        let (tx, mut rx) = mpsc::channel(2);
         upstream.run(1, None, tx).await;
         match rx.recv().await.unwrap().unwrap() {
-            UpstreamEvent::Chunk { chunk, .. } => chunk.manifest.unwrap().claimed_model,
-            UpstreamEvent::Accounted(_) => panic!("mock must emit a chunk"),
+            UpstreamEvent::Chunk(chunk) => chunk.manifest.unwrap().claimed_model,
+            UpstreamEvent::Usage(_) => panic!("mock must emit a chunk first"),
         }
     }
 
@@ -678,6 +687,7 @@ mod tests {
             tokenizer_family: "exact".to_string(),
             capabilities: Capabilities {
                 max_output_tokens: None,
+                ..Capabilities::default()
             },
             identity_aliases: Vec::new(),
         });
@@ -712,9 +722,16 @@ mod tests {
 
     #[test]
     fn seller_configuration_annotation_keeps_the_parsed_prefix_and_code() {
-        let original = Status::unavailable("upstream HTTP 400 Bad Request: max_tokens too large");
-        let annotated =
-            annotate_seller_config_fault(original, 400, "qwen/qwen3-32b", 40_961, 40_961);
+        let original =
+            Status::unavailable("upstream HTTP 400 Bad Request: unsupported field: random_seed");
+        let annotated = annotate_seller_config_fault(
+            original,
+            400,
+            "qwen/qwen3-32b",
+            40_961,
+            40_961,
+            Some(SampleAlgorithm::RandomSeed),
+        );
         assert_eq!(annotated.code(), tonic::Code::Unavailable);
         let message = annotated.message();
         assert!(
@@ -728,25 +745,23 @@ mod tests {
             message.contains("capabilities.max_output_tokens=40961"),
             "{message}"
         );
+        assert!(
+            message.contains("optional field \"random_seed\""),
+            "{message}"
+        );
+        assert!(
+            message.contains("capabilities.sample_algorithm=RANDOM_SEED"),
+            "{message}"
+        );
 
         // Transient/auth statuses are left byte-for-byte alone.
         for code in [401, 429, 503] {
             let untouched = Status::unavailable("upstream HTTP x");
             assert_eq!(
-                annotate_seller_config_fault(untouched, code, "m", 1, 1).message(),
+                annotate_seller_config_fault(untouched, code, "m", 1, 1, None).message(),
                 "upstream HTTP x",
                 "{code}"
             );
-        }
-    }
-
-    #[test]
-    fn empty_no_signal_chunk_accounts_zero() {
-        match chunk_with_structured_accounting(CanonChunk::default()).unwrap() {
-            UpstreamEvent::Chunk {
-                accounted_tokens, ..
-            } => assert_eq!(accounted_tokens, 0),
-            UpstreamEvent::Accounted(_) => panic!("structured chunk became provider usage"),
         }
     }
 
@@ -768,7 +783,7 @@ mod tests {
         let body = concat!(
             "data: {\"choices\":[{\"delta\":{\"content\":\"OK\"}}]}\n\n",
             "data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}],",
-            "\"usage\":{\"completion_tokens\":1}}\n\n",
+            "\"usage\":{\"prompt_tokens\":0,\"completion_tokens\":1,\"total_tokens\":1}}\n\n",
             "data: [DONE]\n\n"
         )
         .to_string();
@@ -793,6 +808,7 @@ mod tests {
             api_key_env: KEY_ENV.into(),
             capabilities: Capabilities {
                 max_output_tokens: Some(openai::DEFAULT_MAX_OUTPUT_TOKENS),
+                ..Capabilities::default()
             },
             ..openai::OpenAiConfig::default()
         });
@@ -837,7 +853,7 @@ mod tests {
         for (provider_model, expect_ready) in cases {
             let body = format!(
                 "data: {{\"model\":\"{provider_model}\",\"choices\":[{{\"delta\":{{\"content\":\"OK\"}}}}]}}\n\n\
-                 data: {{\"choices\":[],\"usage\":{{\"completion_tokens\":1}}}}\n\n\
+                 data: {{\"choices\":[],\"usage\":{{\"prompt_tokens\":0,\"completion_tokens\":1,\"total_tokens\":1}}}}\n\n\
                  data: [DONE]\n\n"
             );
             let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -864,6 +880,7 @@ mod tests {
                 api_key_env: "PATH".to_string(),
                 capabilities: Capabilities {
                     max_output_tokens: Some(openai::DEFAULT_MAX_OUTPUT_TOKENS),
+                    ..Capabilities::default()
                 },
                 ..openai::OpenAiConfig::default()
             });
@@ -917,7 +934,7 @@ mod tests {
             // The provider answers honestly: exactly the slug the seller asked it for.
             let body = format!(
                 "data: {{\"model\":\"{SERVED_MODEL}\",\"choices\":[{{\"delta\":{{\"content\":\"OK\"}}}}]}}\n\n\
-                 data: {{\"choices\":[],\"usage\":{{\"completion_tokens\":1}}}}\n\n\
+                 data: {{\"choices\":[],\"usage\":{{\"prompt_tokens\":0,\"completion_tokens\":1,\"total_tokens\":1}}}}\n\n\
                  data: [DONE]\n\n"
             );
             let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -946,6 +963,7 @@ mod tests {
                 api_key_env: "PATH".to_string(),
                 capabilities: Capabilities {
                     max_output_tokens: Some(openai::DEFAULT_MAX_OUTPUT_TOKENS),
+                    ..Capabilities::default()
                 },
                 ..openai::OpenAiConfig::default()
             });

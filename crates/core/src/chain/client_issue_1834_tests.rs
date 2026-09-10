@@ -101,7 +101,6 @@ fn the_reverse_lookup_and_the_forward_one_cannot_drift_apart() {
     );
 }
 
-
 /// EVERY pin of a row that is of THIS tree's generation equals the artifact vendored beside it.
 
 /// **This is the offline binding nearly dropped.** It used to exist transitively: each row
@@ -120,14 +119,20 @@ fn the_reverse_lookup_and_the_forward_one_cannot_drift_apart() {
 fn every_pin_of_this_generation_equals_the_artifact_vendored_beside_it() {
     use crate::chain::contracts_provision::GENERATION_PINS;
 
+    type PinProjection = fn(&crate::chain::contracts_provision::GenerationPins) -> Option<String>;
+
     // (row field, the name its artifact is vendored under)
-    let bound: &[(&str, fn(&crate::chain::contracts_provision::GenerationPins) -> Option<String>)] = &[
+    let bound: &[(&str, PinProjection)] = &[
         ("SuperRoot", |row| Some(row.superroot.to_string())),
         ("RootPN", |row| Some(row.rootpn.to_string())),
         ("RootOracle", |row| Some(row.rootoracle.to_string())),
         ("PrivateNote", |row| Some(row.private_note.to_string())),
-        ("TokenContract", |row| row.token_contract_code.map(str::to_string)),
-        ("InferenceOrderBook", |row| row.inference_orderbook.map(str::to_string)),
+        ("TokenContract", |row| {
+            row.token_contract_code.map(str::to_string)
+        }),
+        ("InferenceOrderBook", |row| {
+            row.inference_orderbook.map(str::to_string)
+        }),
     ];
 
     let matching: Vec<&str> = GENERATION_PINS
@@ -191,7 +196,11 @@ fn the_artifact_binding_fails_when_a_pin_is_moved() {
         "the real pin must be accepted, or the drive below proves nothing"
     );
 
-    let moved = format!("{}{}", &real[..63], if real.ends_with('0') { '1' } else { '0' });
+    let moved = format!(
+        "{}{}",
+        &real[..63],
+        if real.ends_with('0') { '1' } else { '0' }
+    );
     assert_ne!(moved, real, "the mutation must actually change the value");
     assert_eq!(moved.len(), 64, "the mutation must stay a code hash");
     assert!(

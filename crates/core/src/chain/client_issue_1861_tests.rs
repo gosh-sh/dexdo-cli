@@ -54,7 +54,10 @@ async fn read_request(socket: &mut tokio::net::TcpStream) -> String {
     let mut buffer = Vec::new();
     let mut chunk = [0_u8; 4096];
     loop {
-        let read = socket.read(&mut chunk).await.expect("read the receipt POST");
+        let read = socket
+            .read(&mut chunk)
+            .await
+            .expect("read the receipt POST");
         if read == 0 {
             break;
         }
@@ -325,7 +328,11 @@ async fn issue_1861_a_502_on_the_multisig_delivery_receipt_is_survived() {
 
     task.await.expect("scripted edge task");
     assert_eq!(proven, Some(delivery_id()));
-    assert_eq!(log.requests(), 4, "anchor, sibling, refused receipt, receipt");
+    assert_eq!(
+        log.requests(),
+        4,
+        "anchor, sibling, refused receipt, receipt"
+    );
 }
 
 /// Read 1 of the same proof, and the first one the money path reaches. Wrapping only the receipt
@@ -349,7 +356,11 @@ async fn issue_1861_a_502_on_the_multisig_anchor_read_is_survived() {
 
     task.await.expect("scripted edge task");
     assert_eq!(proven, Some(delivery_id()));
-    assert_eq!(log.requests(), 4, "refused anchor, anchor, sibling, receipt");
+    assert_eq!(
+        log.requests(),
+        4,
+        "refused anchor, anchor, sibling, receipt"
+    );
 }
 
 /// Read 2, inside the loop over the anchor's out-messages. Same read function, different call site,
@@ -372,7 +383,11 @@ async fn issue_1861_a_502_on_a_multisig_sibling_read_is_survived() {
 
     task.await.expect("scripted edge task");
     assert_eq!(proven, Some(delivery_id()));
-    assert_eq!(log.requests(), 4, "anchor, refused sibling, sibling, receipt");
+    assert_eq!(
+        log.requests(),
+        4,
+        "anchor, refused sibling, sibling, receipt"
+    );
 }
 
 /// The negative control for the read the two tests above cover. `post_message_query` must still
@@ -392,9 +407,10 @@ async fn issue_1861_a_permanent_refusal_on_the_anchor_still_ends_the_proof_at_on
     .await;
 
     let started = std::time::Instant::now();
-    let error = prove_multisig_delivery_message(&client, &endpoint, &event_id(), &account(), &dapp())
-        .await
-        .expect_err("a 400 is a real answer and stays terminal");
+    let error =
+        prove_multisig_delivery_message(&client, &endpoint, &event_id(), &account(), &dapp())
+            .await
+            .expect_err("a 400 is a real answer and stays terminal");
     let elapsed = started.elapsed();
 
     task.await.expect("scripted edge task");

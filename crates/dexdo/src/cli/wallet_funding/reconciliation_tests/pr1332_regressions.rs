@@ -161,13 +161,10 @@ async fn a_sufficient_balance_keeps_an_indeterminate_no_id_generation_visible() 
 async fn a_fallback_sent_event_never_retires_an_indeterminate_generation() {
     let dir = temp();
     let vault = FakeVault::empty();
-    vault
-        .history
-        .borrow_mut()
-        .extend([
-            submitted_event(101, 0, QUEUED_AT),
-            sent_event(101, 0, QUEUED_AT + 1),
-        ]);
+    vault.history.borrow_mut().extend([
+        submitted_event(101, 0, QUEUED_AT),
+        sent_event(101, 0, QUEUED_AT + 1),
+    ]);
     vault.indeterminate.set(true);
 
     let hot = FakeHot::always(0);

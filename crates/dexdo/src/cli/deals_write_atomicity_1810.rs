@@ -67,7 +67,9 @@ fn the_deal_record_writer_replaces_the_file_rather_than_writing_into_it() {
     #[cfg(unix)]
     let before = {
         use std::os::unix::fs::MetadataExt as _;
-        std::fs::metadata(&path).expect("stat the first write").ino()
+        std::fs::metadata(&path)
+            .expect("stat the first write")
+            .ino()
     };
 
     // A different document, through the same writer, at the same path.
@@ -177,11 +179,15 @@ fn neither_observation_catches_an_unlink_then_create_writer_and_this_is_the_know
         let path = rewrite(1);
         let first = std::fs::read_to_string(&path).expect("the first write is readable");
         std::fs::hard_link(&path, link_at).expect("a second name for the first write");
-        let before = std::fs::metadata(&path).expect("stat the first write").ino();
+        let before = std::fs::metadata(&path)
+            .expect("stat the first write")
+            .ino();
 
         let rewritten = rewrite(2);
         assert_eq!(rewritten, path, "both writes must land at the same path");
-        let after = std::fs::metadata(&path).expect("stat the second write").ino();
+        let after = std::fs::metadata(&path)
+            .expect("stat the second write")
+            .ino();
 
         Observed {
             inode_changed: before != after,

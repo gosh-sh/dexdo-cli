@@ -32,8 +32,8 @@ pub(crate) use crate::cli::settlement_receipt::run_settlement_receipt;
 use crate::cli::support::*;
 use anyhow::{bail, Context as _, Result};
 use dexdo::registry::{
-    default_model_registry_address, resolve_registered_model_identity, resolve_registered_model_identity_with,
-    RegistrySuggestions, ModelRegistryReader,
+    default_model_registry_address, resolve_registered_model_identity,
+    resolve_registered_model_identity_with, ModelRegistryReader, RegistrySuggestions,
 };
 use dexdo::registry::{
     enforce_model_registry_policy as enforce_model_registry_policy_with_reader,
@@ -43,11 +43,10 @@ use dexdo::registry::{
     BuyerMissingBookPolicy, RegistryBookAction, RegistryRole, RegistryValidationInput,
     RegistryValidationPolicy,
 };
-use dexdo_core::params::{
-    DEFAULT_PN_POOL_PATH, EXECUTABLE_READ_BACKOFF, POOL_LOCK_POLL_INTERVAL,
-    POOL_LOCK_TIMEOUT_SECS,
-};
 use dexdo_core::chain::LiveBookOrder;
+use dexdo_core::params::{
+    DEFAULT_PN_POOL_PATH, EXECUTABLE_READ_BACKOFF, POOL_LOCK_POLL_INTERVAL, POOL_LOCK_TIMEOUT_SECS,
+};
 use dexdo_core::OrderBookSnapshot;
 use dexdo_core::{
     model_hash_for, DobParams, MockChainBackend, OfferListing, OrderBookOrder, ProtocolConsts,
@@ -96,18 +95,18 @@ pub(crate) fn manifest_path() -> Result<std::path::PathBuf> {
     }
 }
 
-/// A manifest one test wants this process to read, for the duration of that test.
+// A manifest one test wants this process to read, for the duration of that test.
 
-/// THREAD-local, and that is the whole point. The obvious way to aim an in-process command at a
-/// fixture manifest is `std::env::set_var("DEXDO_MANIFEST",...)`, and it is wrong here: the
-/// environment belongs to the PROCESS, unit tests run on many threads at once, and a fixture set by
-/// one test is read by every other test that happens to be mid-flight. Measured, not imagined --
-/// four unrelated tests went red on CI while passing locally, because the scheduling differed
-/// (pipeline 6884, `build-test-lint`): one test's `net-a` fixture, which carries no `endpoint`, was
-/// picked up by the onboarding and buyer-backend tests as the manifest of their own run.
+// THREAD-local, and that is the whole point. The obvious way to aim an in-process command at a
+// fixture manifest is `std::env::set_var("DEXDO_MANIFEST",...)`, and it is wrong here: the
+// environment belongs to the PROCESS, unit tests run on many threads at once, and a fixture set by
+// one test is read by every other test that happens to be mid-flight. Measured, not imagined --
+// four unrelated tests went red on CI while passing locally, because the scheduling differed
+// (pipeline 6884, `build-test-lint`): one test's `net-a` fixture, which carries no `endpoint`, was
+// picked up by the onboarding and buyer-backend tests as the manifest of their own run.
 
-/// A `#[tokio::test]` runs its future on the thread that started it (current-thread runtime), so a
-/// thread-local reaches the command under test and nothing else.
+// A `#[tokio::test]` runs its future on the thread that started it (current-thread runtime), so a
+// thread-local reaches the command under test and nothing else.
 #[cfg(test)]
 thread_local! {
     static TEST_MANIFEST: std::cell::RefCell<Option<std::path::PathBuf>> =
@@ -451,14 +450,14 @@ fn current_pool_lock_host_identity() -> Result<String> {
             })?;
         let bytes = identity.nodename[..end]
             .iter()
-            .map(|byte| *byte as u8)
+            .map(|byte| byte.to_ne_bytes()[0])
             .collect::<Vec<_>>();
         let host = String::from_utf8(bytes)
             .context("uname returned a host identity that is not valid UTF-8")?;
         if host.is_empty() {
             bail!("uname returned an empty host identity");
         }
-        return Ok(host);
+        Ok(host)
     }
     #[cfg(windows)]
     {
@@ -1748,13 +1747,9 @@ pub(crate) async fn preload_default_model_registry_with_endpoint(
     endpoint: Option<&str>,
 ) -> Result<()> {
     let registry_address = default_model_registry_address(contracts)?;
-    ChainModelRegistryReader::from_manifest_with_endpoint(
-        contracts,
-        endpoint,
-        &registry_address,
-    )?
-    .read_account_once()
-    .await
+    ChainModelRegistryReader::from_manifest_with_endpoint(contracts, endpoint, &registry_address)?
+        .read_account_once()
+        .await
 }
 
 pub(crate) async fn enforce_model_registry_policy(
@@ -1771,12 +1766,21 @@ pub(crate) async fn enforce_model_registry_policy(
         policy,
         contracts,
         None,
-        frame_model,
-        expected_order_book,
-        order_book_active,
-        buyer_missing_book_policy,
+        RegistryBookExpectation {
+            frame_model,
+            expected_order_book,
+            order_book_active,
+            buyer_missing_book_policy,
+        },
     )
     .await
+}
+
+pub(crate) struct RegistryBookExpectation<'a> {
+    pub(crate) frame_model: &'a str,
+    pub(crate) expected_order_book: &'a str,
+    pub(crate) order_book_active: bool,
+    pub(crate) buyer_missing_book_policy: BuyerMissingBookPolicy,
 }
 
 pub(crate) async fn enforce_model_registry_policy_with_endpoint(
@@ -1784,11 +1788,14 @@ pub(crate) async fn enforce_model_registry_policy_with_endpoint(
     policy: &RegistryValidationPolicy,
     contracts: &std::path::Path,
     endpoint: Option<&str>,
-    frame_model: &str,
-    expected_order_book: &str,
-    order_book_active: bool,
-    buyer_missing_book_policy: BuyerMissingBookPolicy,
+    expectation: RegistryBookExpectation<'_>,
 ) -> Result<RegistryBookAction> {
+    let RegistryBookExpectation {
+        frame_model,
+        expected_order_book,
+        order_book_active,
+        buyer_missing_book_policy,
+    } = expectation;
     let registry_address = policy.required_address(role)?;
     let reader = ChainModelRegistryReader::from_manifest_with_endpoint(
         contracts,
@@ -1806,7 +1813,6 @@ pub(crate) async fn enforce_model_registry_policy_with_endpoint(
     )
     .await
 }
-
 
 async fn resolve_model_registry_target_with_reader(
     reader: &dyn ModelRegistryReader,
@@ -1909,7 +1915,6 @@ pub(crate) async fn resolve_model_registry_target_with_endpoint(
     resolve_model_registry_target_with_reader(&reader, role, policy, requested_model, target).await
 }
 
-
 /// Resolve a model name against the ModelRegistry the way the BUYER resolves it, and refuse if it
 /// does not resolve.
 
@@ -1956,7 +1961,6 @@ pub(crate) async fn resolve_registry_content_identity(
     .await?;
     Ok(identity.registry_model)
 }
-
 
 #[cfg(test)]
 mod registry_target_tests {
@@ -2427,11 +2431,15 @@ mod registry_target_tests {
             )
             .unwrap();
 
-            let (target, requested) = target_from_market_for_model(&market, &no_models, name, false)
-                .unwrap_or_else(|error| panic!("`{name}` is this market's own model: {error}"));
+            let (target, requested) =
+                target_from_market_for_model(&market, &no_models, name, false)
+                    .unwrap_or_else(|error| panic!("`{name}` is this market's own model: {error}"));
             assert_eq!(target.frame_model, name);
             assert_eq!(target.model_hash, model_hash_for(name));
-            assert_eq!(requested, name, "the typed name is carried out, not dropped");
+            assert_eq!(
+                requested, name,
+                "the typed name is carried out, not dropped"
+            );
         }
     }
 
@@ -2463,13 +2471,14 @@ mod registry_target_tests {
 
         // `BookTarget` carries no `Debug`, so the success case is named by hand rather than by
         // `expect_err` -- a rendered market here would mean the guard is gone.
-        let error = match target_from_market_for_model(&market, &no_models, "some-other-model", false) {
-            Ok((target, _)) => panic!(
-                "a different model rendered this market as `{}`",
-                target.frame_model
-            ),
-            Err(error) => error.to_string(),
-        };
+        let error =
+            match target_from_market_for_model(&market, &no_models, "some-other-model", false) {
+                Ok((target, _)) => panic!(
+                    "a different model rendered this market as `{}`",
+                    target.frame_model
+                ),
+                Err(error) => error.to_string(),
+            };
         // The WRONG-MARKET refusal specifically, not merely "some error". An earlier draft accepted
         // the absent `models.json` read failure as well, and would have stayed green with the
         // mismatch check deleted outright -- which is the whole thing this test exists to hold.
@@ -2573,9 +2582,6 @@ pub(crate) fn save_runtime_deal_handle_for_network(
     }
     Ok(h)
 }
-
-
-
 
 const GATEWAY_CHECK_STAGES: [&str; 6] = [
     "dns_resolve",
@@ -2784,12 +2790,18 @@ fn render_chain_doctor_step(
     );
     if raw {
         let fields = [
-            check.address.as_deref().map(|value| format!("addr={value}")),
+            check
+                .address
+                .as_deref()
+                .map(|value| format!("addr={value}")),
             check
                 .expected
                 .as_deref()
                 .map(|value| format!("expected={value}")),
-            check.actual.as_deref().map(|value| format!("actual={value}")),
+            check
+                .actual
+                .as_deref()
+                .map(|value| format!("actual={value}")),
         ]
         .into_iter()
         .flatten()
@@ -2976,8 +2988,7 @@ fn doctor_machine_response(
                 ChainDoctorStatus::Fail => "fail",
                 ChainDoctorStatus::Skip => "skip",
             },
-            skip_reason: (check.status == ChainDoctorStatus::Skip)
-                .then(|| check.message.clone()),
+            skip_reason: (check.status == ChainDoctorStatus::Skip).then(|| check.message.clone()),
             address: check.address.clone(),
             expected: check.expected.clone(),
             actual: check.actual.clone(),
@@ -3028,8 +3039,14 @@ pub(crate) async fn chain_doctor_preflight_with_endpoint(
     // this path -- `chain_doctor_report` only consults it when no endpoint was resolved, and one
     // always is here -- but a preflight that reads mainnet while naming the chain build is the same
     // wrong answer the report itself used to print.
-    let report =
-        chain_doctor_report(&deployed.network, Some(&endpoint), contracts, market, |_, _| {}).await?;
+    let report = chain_doctor_report(
+        &deployed.network,
+        Some(&endpoint),
+        contracts,
+        market,
+        |_, _| {},
+    )
+    .await?;
     if !report.is_ok() {
         bail!("{}", render_chain_doctor_preflight_report(&report));
     }
@@ -3044,7 +3061,6 @@ fn manifest_preflight_endpoint(
     dexdo_core::resolve_endpoint(endpoint, deployed)
 }
 
-
 pub(crate) async fn run_doctor(args: DoctorArgs) -> Result<()> {
     // The network comes from the manifest, and there is no `--network` to disagree with it.
     // It used to be an argument with a compiled-in default naming the test network, so every run
@@ -3054,9 +3070,8 @@ pub(crate) async fn run_doctor(args: DoctorArgs) -> Result<()> {
     let declared = dexdo_core::Deployed::load(&manifest)
         .with_context(|| format!("load the manifest {}", manifest.display()))?
         .network;
-    let status = (!args.json).then(|| {
-        crate::cli::progress::Status::new("checking the network and deployed contracts")
-    });
+    let status = (!args.json)
+        .then(|| crate::cli::progress::Status::new("checking the network and deployed contracts"));
     let raw = crate::cli::style::raw_requested();
     let report = chain_doctor_report(
         &declared,
@@ -3064,10 +3079,9 @@ pub(crate) async fn run_doctor(args: DoctorArgs) -> Result<()> {
         &manifest,
         args.market.as_deref(),
         |index, check| {
-            if let (Some(status), Some(line)) = (
-                status.as_ref(),
-                render_chain_doctor_step(index, check, raw),
-            ) {
+            if let (Some(status), Some(line)) =
+                (status.as_ref(), render_chain_doctor_step(index, check, raw))
+            {
                 emit_doctor_step(&line, |line| status.keep_exact(line));
             }
         },
@@ -3076,10 +3090,7 @@ pub(crate) async fn run_doctor(args: DoctorArgs) -> Result<()> {
     let report = match report {
         Ok(report) => report,
         Err(error) if args.json => {
-            let code = crate::cli::machine::classify_error(
-                crate::cli::machine::OP_DOCTOR,
-                &error,
-            );
+            let code = crate::cli::machine::classify_error(crate::cli::machine::OP_DOCTOR, &error);
             crate::cli::machine::print_short_error(crate::cli::machine::OP_DOCTOR, code)?;
             return Err(crate::cli::machine::printed_error());
         }
@@ -3172,11 +3183,18 @@ mod doctor_output_1860_tests {
         let ordinary = render_chain_doctor_step(1, check, false).expect("performed check");
         assert!(ordinary.contains("\u{2714} [1/14] SuperRoot code hash checked"));
         for raw in ["addr=", "expected=", "actual="] {
-            assert!(!ordinary.contains(raw), "ordinary step leaked {raw}: {ordinary}");
+            assert!(
+                !ordinary.contains(raw),
+                "ordinary step leaked {raw}: {ordinary}"
+            );
         }
 
         let raw = render_chain_doctor_step(1, check, true).expect("performed check");
-        for field in ["addr=0:abcd", "expected=expected-hash", "actual=actual-hash"] {
+        for field in [
+            "addr=0:abcd",
+            "expected=expected-hash",
+            "actual=actual-hash",
+        ] {
             assert!(raw.contains(field), "raw step omitted {field}: {raw}");
         }
         assert!(
@@ -3192,8 +3210,16 @@ mod doctor_output_1860_tests {
         let mut emitted = Vec::new();
         emit_doctor_step(&rendered, |line| emitted.push(line.to_string()));
 
-        assert_eq!(emitted.len(), 4, "one step and three raw fields: {emitted:#?}");
-        for field in ["addr=0:abcd", "expected=expected-hash", "actual=actual-hash"] {
+        assert_eq!(
+            emitted.len(),
+            4,
+            "one step and three raw fields: {emitted:#?}"
+        );
+        for field in [
+            "addr=0:abcd",
+            "expected=expected-hash",
+            "actual=actual-hash",
+        ] {
             assert!(
                 emitted.iter().any(|line| line.contains(field)),
                 "progress writer lost {field}: {emitted:#?}"
@@ -3207,11 +3233,15 @@ mod doctor_output_1860_tests {
         assert!(rendered.contains("\nSkipped\n"), "{rendered}");
         assert!(rendered.contains("SKIP RootModel code hash"), "{rendered}");
         assert!(
-            rendered.contains("policy") && rendered.contains("not configured (optional for doctor)"),
+            rendered.contains("policy")
+                && rendered.contains("not configured (optional for doctor)"),
             "{rendered}"
         );
         for raw in ["addr=", "expected=", "actual="] {
-            assert!(!rendered.contains(raw), "human report leaked {raw}: {rendered}");
+            assert!(
+                !rendered.contains(raw),
+                "human report leaked {raw}: {rendered}"
+            );
         }
         assert_eq!(
             rendered.lines().last(),
@@ -3230,7 +3260,6 @@ mod doctor_output_1860_tests {
         );
     }
 }
-
 
 pub(crate) struct BookTarget {
     pub(crate) frame_model: String,
@@ -3376,7 +3405,10 @@ fn configured_frame_model(models: &std::path::Path, model: &str) -> Result<Optio
         return Ok(None);
     }
     let config = dexdo::seller::ModelsConfig::load(models)?;
-    Ok(config.get(model).ok().map(|entry| entry.frame_model.clone()))
+    Ok(config
+        .get(model)
+        .ok()
+        .map(|entry| entry.frame_model.clone()))
 }
 
 /// The decision the registry answer feeds, split out so it is exercised without a node -- the shape
@@ -3864,8 +3896,6 @@ pub(crate) async fn order_book_active_from_contracts(
     order_book_active(&chain, expected_order_book).await
 }
 
-
-
 pub(crate) fn mock_chain_for_machine(
     endpoints_file: Option<std::path::PathBuf>,
 ) -> Result<MockChainBackend> {
@@ -4020,10 +4050,7 @@ fn identity_free_options(deals_dir: Option<&std::path::Path>) -> String {
 
 /// Its only caller is the chain `close` path, so it exists exactly where that does -- the same
 /// boundary the settlement builders use -- rather than shipping behind a dead-code suppression.
-pub(crate) fn status_command(
-    deal: &str,
-    deals_dir: Option<&std::path::Path>,
-) -> String {
+pub(crate) fn status_command(deal: &str, deals_dir: Option<&std::path::Path>) -> String {
     let mut command = format!("dexdo status {}", crate::cli::support::shell_arg(deal));
     for (flag, path) in [("--deals-dir", deals_dir)] {
         if let Some(path) = path {
@@ -4420,8 +4447,13 @@ pub(crate) fn multisig_secret_hex(
     multisig_seed_file: &Option<std::path::PathBuf>,
 ) -> Result<(&'static str, String)> {
     match (multisig_private_key, multisig_seed_file) {
-        (Some(_), Some(_)) => bail!("use only one of --multisig-private-key or --multisig-seed-file"),
-        (Some(path), None) => Ok(("--multisig-private-key", read_secret_hex(path, "--multisig-private-key")?)),
+        (Some(_), Some(_)) => {
+            bail!("use only one of --multisig-private-key or --multisig-seed-file")
+        }
+        (Some(path), None) => Ok((
+            "--multisig-private-key",
+            read_secret_hex(path, "--multisig-private-key")?,
+        )),
         (None, Some(path)) => {
             // A seed phrase derives the key and is not less of a secret than the hex one guarded on
             // the line above; leaving it unchecked here would be's own asymmetry, one branch
@@ -4621,7 +4653,7 @@ mod printed_command_tests {
     fn the_book_fits_the_window_and_the_address_stays_whole() {
         let address = format!("0:{}", "a".repeat(64));
         let whole = dexdo_core::address::display_self_dapp(&address);
-        let rows = vec![
+        let rows = [
             BookRow {
                 price_per_tick: dexdo_core::params::SHELL_UNIT * 2,
                 max_ticks: 40,
@@ -4711,7 +4743,6 @@ mod printed_command_tests {
     fn close_guidance_names_the_command_and_states_every_input_its_handler_demands() {
         use crate::cli::support::printed_commands::assert_emitted_commands_name_only;
         let deals_dir = std::path::Path::new("/tmp/my deals");
-        let contracts = std::path::Path::new("/tmp/my deploy/deployed.json");
         for (raw_role, deal, actor) in [
             (None, "seller-0:33 with space", "seller"),
             (Some("seller"), "0:33", "seller"),
@@ -4728,7 +4759,7 @@ mod printed_command_tests {
                 &[
                     &format!("{actor} --note-key"),
                     "--deals-dir '/tmp/my deals'",
-                                    ],
+                ],
             );
             assert!(
                 guidance.contains(&crate::cli::support::shell_arg(deal)),
@@ -4797,34 +4828,23 @@ mod printed_command_tests {
         );
     }
 
-    /// the two settlement follow-ups name commands whose handlers demand a seller note and
-    /// owner key *after* clap accepts the line. Neither is known where they are printed, so both
-    /// must be prose naming the command -- and both must still carry the manifest this run used,
-    /// or the operator settles against the default deployment.
+    /// the dispute follow-up names a command whose handler demands a seller note and owner
+    /// key *after* clap accepts the line. Neither is known where it is printed, so it must be prose
+    /// naming the command.
     #[test]
     fn settlement_guidance_names_its_command_and_no_flag_that_is_gone() {
         use crate::cli::support::{
-            destroy_guidance, printed_commands::assert_emitted_commands_name_only,
-            release_dispute_guidance,
+            printed_commands::assert_emitted_commands_name_only, release_dispute_guidance,
         };
-        for guidance in [release_dispute_guidance("0:33"), destroy_guidance("0:33")] {
-            // The old name said the line "keeps the authoritative manifest", and the old body
-            // passed one in. Neither is true after: there is no manifest flag to keep, the
-            // manifest travels in `DEXDO_MANIFEST`, and the argument was already being interpolated
-            // as an empty string -- a gap in a line an operator pastes.
-            assert!(
-                !guidance.contains("--contracts"),
-                "a pasted line may not offer a flag that no longer parses: {guidance}"
-            );
-            assert_emitted_commands_name_only(
-                &guidance,
-                "settlement guidance",
-                &[
-                    "--token-contract",
-                    "--note-addr",
-                    "--note-key",
-                                    ],
-            );
-        }
+        let guidance = release_dispute_guidance("0:33");
+        assert!(
+            !guidance.contains("--contracts"),
+            "a pasted line may not offer a flag that no longer parses: {guidance}"
+        );
+        assert_emitted_commands_name_only(
+            &guidance,
+            "settlement guidance",
+            &["--token-contract", "--note-addr", "--note-key"],
+        );
     }
 }

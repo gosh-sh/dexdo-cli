@@ -26,7 +26,10 @@ fn nonzero_sell_deadline_clock_fault_1042_is_not_live() {
             timestamp: 1,
         }],
     };
-    assert_ne!(snapshot.orders[0].deadline, 0, "the defect needs a dated SELL");
+    assert_ne!(
+        snapshot.orders[0].deadline, 0,
+        "the defect needs a dated SELL"
+    );
 
     let clock = crate::cli::provenance::now_unix_at(time_before_unix_epoch());
     let error = match executable_market_rows_with_clock(&snapshot, clock) {

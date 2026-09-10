@@ -109,13 +109,8 @@ fn an_unread_destination_is_its_own_answer_and_not_confirmed() {
 /// claim would be false. It is justified by costing the operator nothing to pass the right address.
 #[test]
 fn a_deployed_contract_is_refused_as_a_destination() {
-    let kind = classify_oracle_withdraw_destination(
-        true,
-        "Active",
-        true,
-        Some("0x57E85FA6"),
-        &deployed(),
-    );
+    let kind =
+        classify_oracle_withdraw_destination(true, "Active", true, Some("0x57E85FA6"), &deployed());
     assert_eq!(
         kind,
         OracleWithdrawDestinationKind::DeployedContract("PrivateNote".to_string()),
@@ -227,7 +222,10 @@ fn a_declared_destination_is_admitted_with_no_custodians() {
 /// refused while a binding exists -- otherwise the route would admit anything once onboarded.
 #[test]
 fn a_declaration_admits_only_the_address_it_names() {
-    let declared = vec![("hot_address", "0:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb".to_string())];
+    let declared = vec![(
+        "hot_address",
+        "0:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb".to_string(),
+    )];
     let error = admit_oracle_withdraw_destination(
         TO,
         &OracleWithdrawDestinationKind::SupportedWallet,

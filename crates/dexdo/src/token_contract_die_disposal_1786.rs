@@ -194,7 +194,10 @@ fn the_exits_are_the_four_direct_callers_and_the_one_wrapper() {
         .filter(|signature| code(TOKEN_CONTRACT, signature).contains("_die("))
         .collect();
     assert_eq!(direct.len(), 4, "{direct:#?}");
-    assert!(direct.iter().any(|s| s.contains("_payOwedAndDie")), "{direct:#?}");
+    assert!(
+        direct.iter().any(|s| s.contains("_payOwedAndDie")),
+        "{direct:#?}"
+    );
     assert_eq!(TOKEN_CONTRACT.matches("_payOwedAndDie();").count(), 3);
 }
 

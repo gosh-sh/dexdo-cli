@@ -4,10 +4,7 @@ use std::sync::{
     Arc,
 };
 
-fn deal(
-    token_contract: &str,
-    session: Arc<SessionSettle>,
-) -> ApiDeal {
+fn deal(token_contract: &str, session: Arc<SessionSettle>) -> ApiDeal {
     ApiDeal::new(
         Route {
             handover: Handover {
@@ -22,9 +19,7 @@ fn deal(
     )
 }
 
-fn sessions(
-    chain: Arc<RecordingSettleChain>,
-) -> (Arc<SessionSettle>, Arc<SessionSettle>) {
+fn sessions(chain: Arc<RecordingSettleChain>) -> (Arc<SessionSettle>, Arc<SessionSettle>) {
     let note = Arc::new(dexdo_core::LocalNote::generate());
     (
         Arc::new(SessionSettle::new(
@@ -32,11 +27,7 @@ fn sessions(
             "tc-previous".to_string(),
             note.clone(),
         )),
-        Arc::new(SessionSettle::new(
-            chain,
-            "tc-next".to_string(),
-            note,
-        )),
+        Arc::new(SessionSettle::new(chain, "tc-next".to_string(), note)),
     )
 }
 

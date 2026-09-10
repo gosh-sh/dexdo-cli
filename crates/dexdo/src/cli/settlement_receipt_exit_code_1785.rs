@@ -204,7 +204,6 @@ fn identity_closed_by_construction() -> SettlementReceiptV1 {
     receipt(events, Vec::new(), Vec::new())
 }
 
-
 fn status(receipt: &SettlementReceiptV1) -> &str {
     receipt
         .conservation
@@ -252,7 +251,10 @@ fn an_unbalanced_deal_refuses_with_a_contradiction_code_not_an_insufficient_bala
     let refusal = refusal(&receipt);
 
     assert_eq!(refusal.code, ErrorCode::ContradictoryState);
-    assert!(!refusal.code.retryable(), "nothing was submitted; a retry repeats the finding");
+    assert!(
+        !refusal.code.retryable(),
+        "nothing was submitted; a retry repeats the finding"
+    );
     // The wording the text classifier would have keyed on is still present, and no longer decides.
     assert!(
         refusal.cause.to_ascii_lowercase().contains("balance"),
@@ -270,7 +272,10 @@ fn an_unevaluated_deal_refuses_with_a_contradiction_code_not_a_retryable_settlem
     let refusal = refusal(&receipt);
 
     assert_eq!(refusal.code, ErrorCode::ContradictoryState);
-    assert!(!refusal.code.retryable(), "a permanent finding must never ask to be retried");
+    assert!(
+        !refusal.code.retryable(),
+        "a permanent finding must never ask to be retried"
+    );
     assert!(
         refusal.cause.to_ascii_lowercase().contains("settlement"),
         "this test is only meaningful while the wording would still be caught: {}",
@@ -288,7 +293,10 @@ fn a_receipt_with_no_conservation_block_refuses_with_a_named_code_not_internal()
 
     assert_eq!(refusal.code, ErrorCode::ContradictoryState);
     assert_ne!(refusal.code, ErrorCode::Internal);
-    assert!(!refusal.code.retryable(), "an unreadable chain is not a retry instruction here");
+    assert!(
+        !refusal.code.retryable(),
+        "an unreadable chain is not a retry instruction here"
+    );
 }
 
 /// PR1787's `unverified`: the identity closed against itself, so it says nothing about the money.
@@ -328,7 +336,10 @@ fn rewording_a_refusal_does_not_move_its_code() {
     let first = refusal(&unbalanced());
     let second = refusal(&unbalanced_with_other_figures());
 
-    assert_ne!(first.cause, second.cause, "the two fixtures must differ in wording");
+    assert_ne!(
+        first.cause, second.cause,
+        "the two fixtures must differ in wording"
+    );
     assert_eq!(first.code, second.code);
     assert_eq!(first.code, ErrorCode::ContradictoryState);
 }
@@ -337,10 +348,15 @@ fn rewording_a_refusal_does_not_move_its_code() {
 /// operator still has to be told which of three situations they are in.
 #[test]
 fn each_failing_verdict_refuses_in_its_own_words() {
-    let causes: Vec<String> = [unbalanced(), incomplete(), identity_closed_by_construction(), no_conservation_block()]
-        .iter()
-        .map(|receipt| refusal(receipt).cause)
-        .collect();
+    let causes: Vec<String> = [
+        unbalanced(),
+        incomplete(),
+        identity_closed_by_construction(),
+        no_conservation_block(),
+    ]
+    .iter()
+    .map(|receipt| refusal(receipt).cause)
+    .collect();
     for (first, second) in [(0, 1), (0, 2), (0, 3), (1, 2), (1, 3), (2, 3)] {
         assert_ne!(
             causes[first], causes[second],

@@ -75,8 +75,8 @@ const DEFAULT_COLUMNS: usize = 80;
 const BAR_WIDTH: usize = 16;
 pub(super) const TICK: Duration = Duration::from_millis(120);
 const FRAMES: [&str; 10] = [
-    "\u{280b}", "\u{2819}", "\u{2839}", "\u{2838}", "\u{283c}", "\u{2834}", "\u{2826}",
-    "\u{2827}", "\u{2807}", "\u{280f}",
+    "\u{280b}", "\u{2819}", "\u{2839}", "\u{2838}", "\u{283c}", "\u{2834}", "\u{2826}", "\u{2827}",
+    "\u{2807}", "\u{280f}",
 ];
 const DIM: &str = "\x1b[2m";
 /// The same amber a refusal uses for "this one is yours": it marks the line an operator has to act
@@ -111,11 +111,9 @@ impl Measure {
         } else {
             (self.done.min(self.total) as usize * width).div_ceil(self.total.max(1) as usize)
         };
-        let percent = if self.total == 0 {
-            0
-        } else {
-            self.done.min(self.total) * 100 / self.total
-        };
+        let percent = (self.done.min(self.total) * 100)
+            .checked_div(self.total)
+            .unwrap_or(0);
         format!(
             "\u{2595}{}{}\u{258f}{percent:>3}%",
             "\u{2588}".repeat(filled.min(width)),
@@ -259,7 +257,6 @@ impl Shared {
         };
         self.line(&text);
     }
-
 }
 
 /// Cut `text` to `columns` of VISIBLE width, marking the cut.
@@ -377,7 +374,10 @@ mod tests {
         // Rendering writes to the sink; what is asserted is the decision that produced it, because
         // the sink here is a captured pipe and the frame is not readable back from it.
         assert!(shared.needs_you, "the operator's wait keeps its mark");
-        assert!(!client_side.needs_you, "the client's own work does not take it");
+        assert!(
+            !client_side.needs_you,
+            "the client's own work does not take it"
+        );
     }
 
     #[test]
@@ -411,11 +411,28 @@ mod tests {
     /// end, and never wider than it was asked for.
     #[test]
     fn a_bar_reads_as_the_proportion_it_is() {
-        assert!(Measure { done: 0, total: 191 }.bar(8).contains("  0%"));
-        assert!(Measure { done: 191, total: 191 }.bar(8).contains("100%"));
-        let half = Measure { done: 96, total: 191 }.bar(8);
+        assert!(Measure {
+            done: 0,
+            total: 191
+        }
+        .bar(8)
+        .contains("  0%"));
+        assert!(Measure {
+            done: 191,
+            total: 191
+        }
+        .bar(8)
+        .contains("100%"));
+        let half = Measure {
+            done: 96,
+            total: 191,
+        }
+        .bar(8);
         assert!(half.contains(" 50%"), "{half}");
-        assert_eq!(half.matches('\u{2588}').count() + half.matches('\u{2591}').count(), 8);
+        assert_eq!(
+            half.matches('\u{2588}').count() + half.matches('\u{2591}').count(),
+            8
+        );
     }
 
     /// A total nobody knows is not a bar. A wait with no denominator gets the spinner and the
@@ -460,7 +477,7 @@ mod tests {
     /// Cutting must not split a character in half.
 
     /// The label is multi-byte on purpose -- a byte-indexed cut would land inside a character and
-    /// panic. It is also not Cyrillic on purpose: `ci/check-no-cyrillic.sh` refuses Cyrillic
+    /// panic. It is also not Cyrillic on purpose: `ci/check_no_cyrillic.sh` refuses Cyrillic
     /// anywhere in source, string literals included, and this test is what taught me that.
     #[test]
     fn cutting_keeps_whole_characters() {

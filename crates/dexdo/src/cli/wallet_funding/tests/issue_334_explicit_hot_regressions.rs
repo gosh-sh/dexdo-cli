@@ -58,10 +58,7 @@ async fn explicit_hot_at_the_money_command_entrypoint_is_not_a_noop() {
         native_shortfall: 0,
     });
     assert!(instruction.contains(&view.hot_address), "{instruction}");
-    assert!(
-        instruction.contains("0.000001 SHELL"),
-        "{instruction}"
-    );
+    assert!(instruction.contains("0.000001 SHELL"), "{instruction}");
     assert!(!instruction.contains("Vault") && !instruction.contains("http"));
 }
 

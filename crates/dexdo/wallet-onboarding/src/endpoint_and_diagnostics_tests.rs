@@ -88,7 +88,11 @@ fn a_failed_bee_operation_reports_its_structured_cause() {
 
     // An error carrying nothing but a message must still read as one clean line, not as a row of
     // empty fields.
-    let bare = describe_bee_failure("query bee wallet onboarding context", &AppError::new("no"), &[]);
+    let bare = describe_bee_failure(
+        "query bee wallet onboarding context",
+        &AppError::new("no"),
+        &[],
+    );
     assert_eq!(bare, "query bee wallet onboarding context: no");
 }
 

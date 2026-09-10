@@ -240,11 +240,12 @@ struct Secondary {
 /// Build it with [`DexdoError::new`] and the `with_*` modifiers; render it with `Display`.
 #[derive(Debug)]
 pub struct DexdoError {
-    code: ErrorCode,
+    code: &'static str,
+    kind: ErrorKind,
     message: String,
     /// Appended to the headline as ` (stage:...)` -- which step of a multi-step operation failed.
     stage: Option<&'static str>,
-    hint: Option<String>,
+    hint: Option<Box<str>>,
     source: Option<BoxError>,
     /// When the source was *adopted* (its `Display` became the message), the first cause line
     /// would repeat the headline verbatim; skip it instead of flattening the chain away.
@@ -257,7 +258,8 @@ impl DexdoError {
     /// concrete subject (address, TokenContract, file, order id).
     pub fn new(code: ErrorCode, message: impl Into<String>) -> Self {
         Self {
-            code,
+            code: code.code(),
+            kind: code.kind(),
             message: message.into(),
             stage: None,
             hint: None,
@@ -275,7 +277,8 @@ impl DexdoError {
         let error = error.into();
         let message = error.to_string();
         Self {
-            code,
+            code: code.code(),
+            kind: code.kind(),
             message,
             stage: None,
             hint: None,
@@ -304,7 +307,7 @@ impl DexdoError {
     /// buyer|seller` -- it must state the fix, not restate the problem. A multi-line hint is
     /// rendered verbatim, so the caller controls its continuation indent.
     pub fn with_hint(mut self, hint: impl Into<String>) -> Self {
-        self.hint = Some(hint.into());
+        self.hint = Some(hint.into().into_boxed_str());
         self
     }
 
@@ -320,12 +323,12 @@ impl DexdoError {
 
     /// The stable code, for `grep` and for the documented table.
     pub const fn code(&self) -> &'static str {
-        self.code.code()
+        self.code
     }
 
     /// The coarse category.
     pub const fn kind(&self) -> ErrorKind {
-        self.code.kind()
+        self.kind
     }
 
     /// The human sentence, without the code/kind prefix and without the stage suffix.
@@ -353,16 +356,9 @@ impl DexdoError {
         match self.stage {
             Some(stage) => format!(
                 "error[{}] ({}): {} (stage: {stage})",
-                self.code.code(),
-                self.code.kind(),
-                self.message
+                self.code, self.kind, self.message
             ),
-            None => format!(
-                "error[{}] ({}): {}",
-                self.code.code(),
-                self.code.kind(),
-                self.message
-            ),
+            None => format!("error[{}] ({}): {}", self.code, self.kind, self.message),
         }
     }
 

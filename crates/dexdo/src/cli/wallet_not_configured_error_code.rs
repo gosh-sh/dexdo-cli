@@ -26,7 +26,7 @@ use super::{
     classify_error, error_cause, forbidden_machine_fragment, ErrorCode, MachineError, ERROR_SCHEMA,
     OP_NOTE_DEPLOY, WALLET_NOT_CONFIGURED_CODE,
 };
-use crate::cli::wallet::{resolve_funding_wallet, WalletNetwork, WalletStore};
+use crate::cli::wallet::{resolve_funding_wallet, WalletStore};
 
 /// `note topup` shares the fail-fast but has no `--json` surface of its own, so it has no operation
 /// constant. Classification must not depend on which command asked.
@@ -36,8 +36,14 @@ const OP_NOTE_TOPUP: &str = "note_topup";
 fn wallet_fail_fast() -> (tempfile::TempDir, anyhow::Error) {
     let dir = tempfile::tempdir().expect("temp dir");
     let store = WalletStore::at(dir.path().join("wallet"));
-    let error = resolve_funding_wallet(&store, &crate::cli::wallet::test_network_a(), None, &None, &None)
-        .expect_err("a command that spends the Hot cannot proceed without one");
+    let error = resolve_funding_wallet(
+        &store,
+        &crate::cli::wallet::test_network_a(),
+        None,
+        &None,
+        &None,
+    )
+    .expect_err("a command that spends the Hot cannot proceed without one");
     (dir, error)
 }
 
@@ -87,8 +93,7 @@ fn the_emitted_envelope_names_the_code_and_the_remediation() {
         let message = value["message"].as_str().expect("a message");
         assert_ne!(message, "internal invariant failed", "{operation}");
         assert_eq!(
-            message,
-            "wallet is not configured; run `dexdo wallet onboard gosh-ai` first",
+            message, "wallet is not configured; run `dexdo wallet onboard gosh-ai` first",
             "{operation}: the remediation must be directly executable"
         );
 

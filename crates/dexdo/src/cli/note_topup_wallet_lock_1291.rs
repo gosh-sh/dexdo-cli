@@ -105,8 +105,9 @@ async fn note_topup_refuses_while_note_deploy_holds_the_funding_wallet_1291() {
         None => std::env::remove_var(LOCK_TIMEOUT_VAR),
     }
 
-    let error = outcome
-        .expect_err("note topup must not spend from a wallet another dexdo command is spending from");
+    let error = outcome.expect_err(
+        "note topup must not spend from a wallet another dexdo command is spending from",
+    );
     let rendered = format!("{error:#}");
     assert!(
         rendered.contains("funding wallet busy"),
@@ -181,8 +182,7 @@ fn funding_wallet_lock_key_separates_networks_and_joins_address_forms_1291() {
     let canonical = format!("{DEXDO_DAPP_ID}::{account_id}");
 
     let net_a_legacy = super::funding_wallet_lock_path("net-a", &legacy).expect("legacy");
-    let net_a_canonical =
-        super::funding_wallet_lock_path("net-a", &canonical).expect("canonical");
+    let net_a_canonical = super::funding_wallet_lock_path("net-a", &canonical).expect("canonical");
     let net_b_legacy = super::funding_wallet_lock_path("mainnet", &legacy).expect("mainnet");
 
     assert_eq!(

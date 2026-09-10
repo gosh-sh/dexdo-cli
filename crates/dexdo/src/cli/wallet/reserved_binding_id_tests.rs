@@ -50,18 +50,25 @@ fn binding_with(id: &str, key: Option<PathBuf>) -> WalletBinding {
 /// The directory `wallet/bindings/<id>` names, resolved from the id the FILE holds -- never from the
 /// id the test happened to pass in.
 fn recorded_secrets_dir(store: &WalletStore) -> (String, PathBuf) {
-    let json: serde_json::Value =
-        serde_json::from_slice(&std::fs::read(store.binding_path(&crate::cli::wallet::test_network_a())).expect("read binding.json"))
-            .expect("binding.json is json");
-    let id = json["id"].as_str().expect("binding.json has an id").to_string();
+    let json: serde_json::Value = serde_json::from_slice(
+        &std::fs::read(store.binding_path(&crate::cli::wallet::test_network_a()))
+            .expect("read binding.json"),
+    )
+    .expect("binding.json is json");
+    let id = json["id"]
+        .as_str()
+        .expect("binding.json has an id")
+        .to_string();
     let dir = store.bindings_dir().join(&id);
     (id, dir)
 }
 
 fn recorded_key_file(store: &WalletStore) -> PathBuf {
-    let json: serde_json::Value =
-        serde_json::from_slice(&std::fs::read(store.binding_path(&crate::cli::wallet::test_network_a())).expect("read binding.json"))
-            .expect("binding.json is json");
+    let json: serde_json::Value = serde_json::from_slice(
+        &std::fs::read(store.binding_path(&crate::cli::wallet::test_network_a()))
+            .expect("read binding.json"),
+    )
+    .expect("binding.json is json");
     PathBuf::from(
         json["hot_key_file"]
             .as_str()
@@ -140,7 +147,10 @@ fn a_flow_that_mints_a_second_id_is_refused_and_writes_nothing() {
     );
 
     assert!(
-        store.load_active(&crate::cli::wallet::test_network_a()).expect("load").is_none(),
+        store
+            .load_active(&crate::cli::wallet::test_network_a())
+            .expect("load")
+            .is_none(),
         "nothing may be recorded when the id does not name the reserved directory"
     );
     assert!(
@@ -162,15 +172,18 @@ fn a_second_id_on_a_rebind_leaves_the_previous_binding_active_and_resolvable() {
     let (temp, store) = store();
     let previous_key = temp.path().join("previous-hot.key");
     std::fs::write(&previous_key, b"cc").expect("write the previous key");
-    let mut previous = binding_with("00000000000000000000000000000000", Some(previous_key.clone()));
+    let mut previous = binding_with(
+        "00000000000000000000000000000000",
+        Some(previous_key.clone()),
+    );
     previous.hot_address = "4::hot-previous".to_string();
     // The secrets directory its id names, which every real binding has and which the reader has
     // required since.
-    std::fs::create_dir_all(
-        store.bindings_dir().join(&previous.id),
-    )
-    .expect("create the previous binding's secrets directory");
-    store.commit_active(&previous).expect("commit the previous binding");
+    std::fs::create_dir_all(store.bindings_dir().join(&previous.id))
+        .expect("create the previous binding's secrets directory");
+    store
+        .commit_active(&previous)
+        .expect("commit the previous binding");
 
     let draft = store.open_draft().expect("reserve a draft");
     let key = key_in(draft.dir());
@@ -178,12 +191,21 @@ fn a_second_id_on_a_rebind_leaves_the_previous_binding_active_and_resolvable() {
         .expect_err("a rebind to an id that names no directory must be refused");
 
     assert_eq!(
-        store.load_active(&crate::cli::wallet::test_network_a()).expect("load").expect("present"),
+        store
+            .load_active(&crate::cli::wallet::test_network_a())
+            .expect("load")
+            .expect("present"),
         previous,
         "the refusal must not replace the binding it was going to replace"
     );
-    let resolved = resolve_funding_wallet(&store, &crate::cli::wallet::test_network_a(), None, &None, &None)
-        .expect("the previous binding still resolves as the funding wallet");
+    let resolved = resolve_funding_wallet(
+        &store,
+        &crate::cli::wallet::test_network_a(),
+        None,
+        &None,
+        &None,
+    )
+    .expect("the previous binding still resolves as the funding wallet");
     assert_eq!(resolved.address, "4::hot-previous");
     assert_eq!(resolved.key, Some(previous_key));
 }

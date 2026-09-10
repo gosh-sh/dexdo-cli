@@ -16,9 +16,18 @@ fn the_ackinacki_notice_is_drawn_as_a_call_to_act_only_where_colour_is_allowed()
     use crate::cli::style::{self, Palette};
 
     let painted = render_ackinacki_funding_notice(NOTICE, true, false);
-    assert_eq!(painted, style::action(Palette::resolved(true, false), NOTICE));
-    assert!(painted.contains(NOTICE), "the sentence survives the drawing: {painted}");
-    assert!(painted.contains("\u{1b}[1m"), "a call to act carries its weight: {painted}");
+    assert_eq!(
+        painted,
+        style::action(Palette::resolved(true, false), NOTICE)
+    );
+    assert!(
+        painted.contains(NOTICE),
+        "the sentence survives the drawing: {painted}"
+    );
+    assert!(
+        painted.contains("\u{1b}[1m"),
+        "a call to act carries its weight: {painted}"
+    );
     assert_ne!(painted, NOTICE, "a terminal that takes colour gets it");
 
     assert_eq!(

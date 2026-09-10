@@ -26,8 +26,11 @@ use std::path::{Path, PathBuf};
 /// at creation, and `support.rs` explains why.
 fn file_at(dir: &Path, name: &str, mode: u32) -> PathBuf {
     let path = dir.join(name);
-    std::fs::write(&path, "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef")
-        .expect("write the fixture secret");
+    std::fs::write(
+        &path,
+        "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+    )
+    .expect("write the fixture secret");
     std::fs::set_permissions(&path, std::fs::Permissions::from_mode(mode))
         .expect("set the fixture mode");
     path
@@ -51,7 +54,9 @@ fn the_guard_refuses_exposure_and_admits_owner_only() {
     for mode in [0o640, 0o620, 0o604, 0o602, 0o644, 0o666] {
         let path = file_at(dir.path(), &format!("bad-{mode:o}"), mode);
         let error = refuse_exposed_secret_file(&path, "the fixture")
-            .expect_err(&format!("mode {mode:o} is readable or writable beyond its owner"))
+            .expect_err(&format!(
+                "mode {mode:o} is readable or writable beyond its owner"
+            ))
             .to_string();
         assert!(
             error.contains(&format!("{mode:04o}")),
@@ -119,7 +124,11 @@ fn load_pool_json_refuses_an_exposed_pool_and_reads_an_owner_only_one() {
     std::fs::set_permissions(&owner_only, std::fs::Permissions::from_mode(0o600))
         .expect("restrict the pool");
     let outcome = crate::cli::commands::load_pool_json(&owner_only);
-    let rendered = outcome.as_ref().err().map(ToString::to_string).unwrap_or_default();
+    let rendered = outcome
+        .as_ref()
+        .err()
+        .map(ToString::to_string)
+        .unwrap_or_default();
     assert!(
         !rendered.contains("can be read by users other than its owner"),
         "an owner-only pool must get PAST the guard; whatever happens after is not this test's \
@@ -133,11 +142,9 @@ fn the_note_deploy_recovery_reader_refuses_an_exposed_file() {
     let dir = tempfile::tempdir().expect("create fixture dir");
 
     let absent = dir.path().join("no-recovery.json");
-    assert!(
-        crate::cli::note::load_note_deploy_recovery(&absent)
-            .expect("a recovery file that was never written is the ordinary case")
-            .is_none()
-    );
+    assert!(crate::cli::note::load_note_deploy_recovery(&absent)
+        .expect("a recovery file that was never written is the ordinary case")
+        .is_none());
 
     let exposed = dir.path().join("recovery.json");
     std::fs::write(&exposed, r#"{"schema":"x"}"#).expect("write recovery");
@@ -191,9 +198,9 @@ fn every_secret_read_is_preceded_by_the_permission_check() {
         ),
     ] {
         let body = crate::cli::source_probe::code_of(source, signature);
-        let at_guard = body.find(guard).unwrap_or_else(|| {
-            panic!("`{signature}` does not check permissions at all:\n{body}")
-        });
+        let at_guard = body
+            .find(guard)
+            .unwrap_or_else(|| panic!("`{signature}` does not check permissions at all:\n{body}"));
         let at_read = body
             .find(read)
             .unwrap_or_else(|| panic!("`{signature}` no longer reads with `{read}`"));

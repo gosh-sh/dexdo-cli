@@ -12,7 +12,9 @@
 //! decimal point. Counts and clock readings are the exception and are named below, one by one, with
 //! the reason each is not money.
 
-use dexdo_core::market::{DealChainState, ExecutableQuote, OrderBookOrder, QuoteFill, StreamSnapshot};
+use dexdo_core::market::{
+    DealChainState, ExecutableQuote, OrderBookOrder, QuoteFill, StreamSnapshot,
+};
 
 /// Money as the chain holds it: raw ECC[2]. Read as SHELL each is small; printed unconverted each
 /// is nine digits longer, which is exactly what this test hunts for.
@@ -228,8 +230,8 @@ fn no_human_line_shows_a_figure_in_raw_units() {
     // others when the acceptance matrix runs the suite -- which is what that matrix
     // runs. Its record and its live facts are built from their own on-disk and getter shapes.
     {
-        let record: crate::cli::buyer::BuyerSubscriptionOrderRecord = serde_json::from_value(
-            serde_json::json!({
+        let record: crate::cli::buyer::BuyerSubscriptionOrderRecord =
+            serde_json::from_value(serde_json::json!({
                 "frame_model": "openai--gpt-4.1--mini",
                 "model_hash": "0x2f0f",
                 "order_book": "0:1111111111111111111111111111111111111111111111111111111111111111",
@@ -245,9 +247,8 @@ fn no_human_line_shows_a_figure_in_raw_units() {
                                 "seen_token_contracts_at_last_seen": []},
                 "phase": "resting",
                 "matched": null,
-            }),
-        )
-        .expect("the subscription record is read from its own on-disk shape");
+            }))
+            .expect("the subscription record is read from its own on-disk shape");
         let snapshot: dexdo_core::OrderBookSnapshot = serde_json::from_value(serde_json::json!({
             "frame_model": "openai--gpt-4.1--mini",
             "model_hash": "0x2f0f",
@@ -256,8 +257,8 @@ fn no_human_line_shows_a_figure_in_raw_units() {
             "orders": [],
         }))
         .expect("the book snapshot is read from its own wire shape");
-        let facts: crate::cli::buyer::SubscriptionDealFacts = serde_json::from_value(
-            serde_json::json!({
+        let facts: crate::cli::buyer::SubscriptionDealFacts =
+            serde_json::from_value(serde_json::json!({
                 "state": deal_state(),
                 "subscription": {"deal_flags": 0u8, "sub_weeks": 4u8, "week_index": 1u8,
                                  "tokens_per_week": 4_000_000u64, "funded_tokens": 16_000_000u64,
@@ -269,17 +270,15 @@ fn no_human_line_shows_a_figure_in_raw_units() {
                 "model_name": "openai--gpt-4.1--mini",
                 "model_hash": "0x2f0f",
                 "buyer_note": "0:6666666666666666666666666666666666666666666666666666666666666666",
-            }),
-        )
-        .expect("the subscription facts are read from their getter shape");
-        let quota: crate::cli::buyer::SubscriptionQuotaView = serde_json::from_value(
-            serde_json::json!({
+            }))
+            .expect("the subscription facts are read from their getter shape");
+        let quota: crate::cli::buyer::SubscriptionQuotaView =
+            serde_json::from_value(serde_json::json!({
                 "claimed_current_week": 2_000_000u64,
                 "remaining_current_week": 2_000_000u64,
                 "buyer_locked_total": BUYER_LOCKED,
-            }),
-        )
-        .expect("the weekly quota is read from its own shape");
+            }))
+            .expect("the weekly quota is read from its own shape");
 
         lines.push((
             "subscription line (dexdo buyer subscriptions)",

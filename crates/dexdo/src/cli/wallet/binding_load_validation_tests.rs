@@ -62,8 +62,7 @@ fn seed_record(store: &WalletStore, id: &str) -> WalletBinding {
 
 /// Give a binding the secrets directory a healthy one has.
 fn create_secrets_dir(store: &WalletStore, id: &str) {
-    std::fs::create_dir_all(store.bindings_dir().join(id))
-        .expect("create the secrets directory");
+    std::fs::create_dir_all(store.bindings_dir().join(id)).expect("create the secrets directory");
 }
 
 /// The one id shape the store mints: what `new_binding_id` produces.
@@ -97,8 +96,14 @@ fn a_binding_whose_id_names_its_secrets_directory_still_loads() {
         .expect("present");
     assert_eq!(loaded, expected);
 
-    let resolved = resolve_funding_wallet(&store, &crate::cli::wallet::test_network_a(), None, &None, &None)
-        .expect("and it resolves as the funding wallet");
+    let resolved = resolve_funding_wallet(
+        &store,
+        &crate::cli::wallet::test_network_a(),
+        None,
+        &None,
+        &None,
+    )
+    .expect("and it resolves as the funding wallet");
     assert_eq!(resolved.address, expected.hot_address);
 }
 
@@ -195,8 +200,14 @@ fn a_binding_that_names_nothing_never_resolves_as_the_funding_wallet() {
     let (_temp, store) = store();
     seed_record(&store, GOOD_ID);
 
-    let error = resolve_funding_wallet(&store, &crate::cli::wallet::test_network_a(), None, &None, &None)
-        .expect_err("a binding that names no secrets directory must not become the funding wallet");
+    let error = resolve_funding_wallet(
+        &store,
+        &crate::cli::wallet::test_network_a(),
+        None,
+        &None,
+        &None,
+    )
+    .expect_err("a binding that names no secrets directory must not become the funding wallet");
     assert_names_file_and_remediation(&format!("{error:#}"), &store);
 }
 
@@ -208,8 +219,14 @@ fn an_explicit_address_still_wins_over_a_broken_binding() {
     let (_temp, store) = store();
     seed_record(&store, "");
 
-    let resolved = resolve_funding_wallet(&store, &crate::cli::wallet::test_network_a(), Some("4::explicit"), &None, &None)
-        .expect("an explicit address does not read the binding at all");
+    let resolved = resolve_funding_wallet(
+        &store,
+        &crate::cli::wallet::test_network_a(),
+        Some("4::explicit"),
+        &None,
+        &None,
+    )
+    .expect("an explicit address does not read the binding at all");
     assert_eq!(resolved.address, "4::explicit");
 }
 
@@ -244,7 +261,10 @@ fn a_corrupt_binding_can_still_be_archived_and_replaced() {
 
     create_secrets_dir(&store, GOOD_ID);
     assert_eq!(
-        store.load_active(&crate::cli::wallet::test_network_a()).expect("load").expect("present"),
+        store
+            .load_active(&crate::cli::wallet::test_network_a())
+            .expect("load")
+            .expect("present"),
         replacement,
         "and the replacement is what loads afterwards"
     );

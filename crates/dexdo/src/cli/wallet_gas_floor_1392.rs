@@ -194,9 +194,7 @@ fn accumulator_sell_states_the_floor_before_the_first_lot() {
     let persist = body
         .find("persist_pending(")
         .expect("run_sell records its plan before sending");
-    let send = body
-        .find("send_ecc(")
-        .expect("run_sell sends its lots");
+    let send = body.find("send_ecc(").expect("run_sell sends its lots");
     assert!(
         floor < persist && persist < send,
         "the floor must be stated before anything irreversible is written or sent: {body}"

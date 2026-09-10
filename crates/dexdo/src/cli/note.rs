@@ -3196,7 +3196,6 @@ mod note_deploy_tests {
             ),
             "spendable trading-money prefix missing: {out}"
         );
-
     }
 
     /// a configured nominal must not look like proof that the note is funded.
@@ -3943,7 +3942,8 @@ mod note_deploy_tests {
     #[test]
     fn pool_output_does_not_contain_seed_words() {
         let phrase = tvm_tonos_fixture_phrase();
-        let derived = dexdo::wallet_seed::derive_multisig_private_key_from_seed_phrase(&phrase).unwrap();
+        let derived =
+            dexdo::wallet_seed::derive_multisig_private_key_from_seed_phrase(&phrase).unwrap();
         let mut state = complete_state();
         state.owner_public_key_hex = Some(derived.public_hex().to_string());
         state.owner_secret_key_hex = Some(derived.secret_hex().to_string().into());
@@ -3968,10 +3968,7 @@ mod note_deploy_tests {
         let (dir, _cleanup) = temp_dir("dexdo-note-recovery-test");
         let path = dir.join("pn_pool.json.recovery.json");
         let state = NoteDeployRecoveryState::new(
-            recovery_request(
-                "https://net-a.example",
-                &format!("0:{}", "a".repeat(64)),
-            ),
+            recovery_request("https://net-a.example", &format!("0:{}", "a".repeat(64))),
             &derive_owner_pubkey_from_secret_hex(&fixture_secret_hex()).unwrap(),
             &fixture_secret_hex(),
         )
@@ -4561,23 +4558,12 @@ mod stage_one_native_is_flat_deploy_gas {
     /// inbound ECC[2] transfer, and it decomposes into the two readings above exactly -- which is
     /// what makes the smaller half safe to build a shipped constant on. A cost that had drifted
     /// would break this identity rather than quietly move the figure with it.
-    #[test]
-    fn the_deploy_cost_reconciles_with_the_figure_already_recorded_in_the_tree() {
-        const RECORDED_DEPLOY_PLUS_FIRST_INBOUND_RAW: u128 = 156_222_000;
-        let first_inbound = AFTER_DEPLOY_RAW - AFTER_FIRST_INBOUND_RAW;
-        assert_eq!(
-            MEASURED_DEPLOY_COST_RAW + first_inbound,
-            RECORDED_DEPLOY_PLUS_FIRST_INBOUND_RAW,
-            "the deploy measured here ({MEASURED_DEPLOY_COST_RAW} raw) plus the first inbound \
-             transfer ({first_inbound} raw) must be the {RECORDED_DEPLOY_PLUS_FIRST_INBOUND_RAW} \
-             raw already recorded for both together; if they no longer add up, one of the two \
-             readings is not what it claims to be"
-        );
-        assert!(
-            MEASURED_DEPLOY_COST_RAW < RECORDED_DEPLOY_PLUS_FIRST_INBOUND_RAW,
-            "the deploy alone must be the smaller half of the recorded total"
-        );
-    }
+    const RECORDED_DEPLOY_PLUS_FIRST_INBOUND_RAW: u128 = 156_222_000;
+    const _: () = assert!(
+        MEASURED_DEPLOY_COST_RAW + (AFTER_DEPLOY_RAW - AFTER_FIRST_INBOUND_RAW)
+            == RECORDED_DEPLOY_PLUS_FIRST_INBOUND_RAW
+    );
+    const _: () = assert!(MEASURED_DEPLOY_COST_RAW < RECORDED_DEPLOY_PLUS_FIRST_INBOUND_RAW);
 
     /// A wallet that deploys and then cannot send is useless, so the stage-one figure must cover the
     /// deploy AND the wallet's own note-deploy submits -- each of which costs the attached
@@ -4686,7 +4672,7 @@ mod stage_one_native_is_flat_deploy_gas {
 /// The pool file is a durable operator artifact, not a view. It is written by us and read by
 /// programs that are not ours to change -- the out-of-tree `mint_pn_pool`, which emits
 /// `0:<64hex>`, and `ci/shell_only_funding_bootstrap.sh:370`, which is why that assertion now takes
-/// both spellings, on the route `ci/release-artifact-gate.sh` runs before a release. Reading stays
+/// both spellings, on the route `ci/release_artifact_gate.sh` runs before a release. Reading stays
 /// tolerant of both forms in every matcher, so a pool written by an earlier release keeps working
 /// without a migration.
 

@@ -12,7 +12,8 @@ use super::{https_client_refusal, is_https_client_build_failure};
 
 /// The underlying sentence, as it actually arrives after crossing `reqwest` -> `tvm_client` ->
 /// `gosh-ackinacki`. Used as an opaque input: nothing here asserts its contents.
-const UNDERLYING: &str = "create local tvm client context: Can not create http client: builder error";
+const UNDERLYING: &str =
+    "create local tvm client context: Can not create http client: builder error";
 
 /// Handles an operator can act on, recognised by SHAPE so that any rewording still counts:
 /// an environment variable they can echo, an absolute path they can list, or a backticked token
@@ -24,7 +25,7 @@ const UNDERLYING: &str = "create local tvm client context: Can not create http c
 fn checkable_handles(text: &str) -> std::collections::BTreeSet<String> {
     let mut found = std::collections::BTreeSet::new();
     for token in text.split_whitespace() {
-        let path = token.trim_end_matches(|c: char| c == ',' || c == '.' || c == ';');
+        let path = token.trim_end_matches([',', '.', ';']);
         if path.starts_with('/') && path.len() >= 5 && path[1..].contains('/') {
             found.insert(path.to_string());
         }

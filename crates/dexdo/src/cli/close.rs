@@ -1,17 +1,16 @@
 //! Deal-close command handlers (Track C7, move-only).
 
 use crate::cli::args::{CloseArgs, DealRoleArg};
-use crate::cli::commands::{close_guidance, status_command};
 use crate::cli::commands::{
-    close_hint, deal_contracts_path, load_deal_target, chain_doctor_preflight_market,
+    chain_doctor_preflight_market, close_hint, deal_contracts_path, load_deal_target,
 };
+use crate::cli::commands::{close_guidance, status_command};
 use crate::cli::commands::{
     mock_chain_for_machine, require_close_target_identity, resolve_mock_deal_target, role_arg_str,
 };
 use crate::cli::deals;
 use crate::cli::machine;
 use crate::cli::recover::check_reclaimable_state;
-use crate::cli::support::read_secret_hex;
 use anyhow::{bail, Result};
 use dexdo_core::ChainBackend;
 
@@ -339,7 +338,6 @@ async fn refuse_close_unless_unsold(
     role: deals::DealHandleRole,
     state: &deals::DealStateSummary,
     token_contract: &dexdo_core::Address,
-    note: &dexdo_core::Address,
 ) -> Result<()> {
     let token_contract_display =
         dexdo_core::address::display_self_dapp(&token_contract.with_workchain());
@@ -788,7 +786,7 @@ pub(crate) async fn run_close(args: CloseArgs) -> Result<()> {
             if !s.funded {
                 let note = dexdo_core::address::parse_chain_address(&note_addr)
                     .map_err(|e| anyhow::anyhow!("--note-addr {note_addr}: {e}"))?;
-                refuse_close_unless_unsold(&chain, role, &s, &tc, &note).await?;
+                refuse_close_unless_unsold(&chain, role, &s, &tc).await?;
                 let secret = crate::cli::support::note_owner_secret_for(
                     args.note_key.as_deref(),
                     &note_addr,
@@ -816,14 +814,7 @@ pub(crate) async fn run_close(args: CloseArgs) -> Result<()> {
                 return Ok(());
             }
             if s.kind != deals::DealStateKind::Stopped {
-                bail!(
-                    "{}",
-                    close_hint(
-                        &target,
-                        &s,
-                        args.deals_dir.as_deref()
-                    )
-                );
+                bail!("{}", close_hint(&target, &s, args.deals_dir.as_deref()));
             }
             let secret = crate::cli::support::note_owner_secret_for(
                 args.note_key.as_deref(),
@@ -978,10 +969,7 @@ pub(crate) async fn run_close(args: CloseArgs) -> Result<()> {
                             "buyer",
                             args.deals_dir.as_deref()
                         ),
-                        status_command(
-                            &args.deal,
-                            args.deals_dir.as_deref()
-                        )
+                        status_command(&args.deal, args.deals_dir.as_deref())
                     )
                 })?;
                 submit_then_observe_cleanup(
@@ -1016,19 +1004,11 @@ pub(crate) async fn run_close(args: CloseArgs) -> Result<()> {
                 );
                 return Ok(());
             }
-            bail!(
-                "{}",
-                close_hint(
-                    &target,
-                    &s,
-                    args.deals_dir.as_deref()
-                )
-            );
+            bail!("{}", close_hint(&target, &s, args.deals_dir.as_deref()));
         }
     }
     Ok(())
 }
-
 
 #[cfg(test)]
 mod tests {
@@ -1324,7 +1304,11 @@ mod tests {
         crate::cli::deals::summarize_deal_snapshot(&unsold_snapshot(false, false, false))
     }
 
-    fn unsold_snapshot(funded: bool, opened: bool, disputed: bool) -> dexdo_core::DealChainSnapshot {
+    fn unsold_snapshot(
+        funded: bool,
+        opened: bool,
+        disputed: bool,
+    ) -> dexdo_core::DealChainSnapshot {
         dexdo_core::DealChainSnapshot {
             account_code_hash: "code".to_string(),
             account_boc_hash: "boc".to_string(),
@@ -1454,7 +1438,6 @@ mod tests {
             crate::cli::deals::DealHandleRole::Seller,
             &summary,
             &token_contract,
-            &note,
         )
         .await
         .expect("an unsold deal with no resting ask is closeable");
@@ -1524,8 +1507,6 @@ mod tests {
     async fn close_of_an_unsold_deal_refuses_before_spending_and_names_the_state() {
         let token_contract =
             dexdo_core::Address::parse(&format!("0:{}", "33".repeat(32))).expect("token contract");
-        let note =
-            dexdo_core::Address::parse(&format!("0:{}", "55".repeat(32))).expect("seller note");
         let offerless = || {
             Some(dexdo_core::DealOfferLatch {
                 offer_posted: false,
@@ -1539,11 +1520,13 @@ mod tests {
             crate::cli::deals::DealHandleRole::Buyer,
             &unsold_deal_summary(),
             &token_contract,
-            &note,
         )
         .await
         .expect_err("buyer role must never reach TokenContract.close()");
-        assert!(wrong_role.to_string().contains("seller's door"), "{wrong_role:#}");
+        assert!(
+            wrong_role.to_string().contains("seller's door"),
+            "{wrong_role:#}"
+        );
         assert!(chain.calls().is_empty(), "{:?}", chain.calls());
 
         // A deal that ever matched reverts inside `require(!_funded,...)`; one getter said so.
@@ -1562,7 +1545,6 @@ mod tests {
                 crate::cli::deals::DealHandleRole::Seller,
                 &summary,
                 &token_contract,
-                &note,
             )
             .await
             .expect_err("a deal that matched is not an unsold deal");
@@ -1573,18 +1555,13 @@ mod tests {
         }
 
         // The trap branch: `close()` here SUCCEEDS and leaves the deal alive on the book.
-        let chain = FakeCloseUnsoldChain::new(
-            Some(dexdo_core::DealOfferLatch {
-                offer_posted: true,
-            }),
-            &[],
-        );
+        let chain =
+            FakeCloseUnsoldChain::new(Some(dexdo_core::DealOfferLatch { offer_posted: true }), &[]);
         let resting = super::refuse_close_unless_unsold(
             &chain,
             crate::cli::deals::DealHandleRole::Seller,
             &unsold_deal_summary(),
             &token_contract,
-            &note,
         )
         .await
         .expect_err("a deal whose ask still rests must not be reported as closed")
@@ -1607,7 +1584,6 @@ mod tests {
             crate::cli::deals::DealHandleRole::Seller,
             &unsold_deal_summary(),
             &token_contract,
-            &note,
         )
         .await
         .expect_err("an inactive contract must not be sent a close")
@@ -1644,7 +1620,7 @@ mod tests {
         );
 
         let refuse = body[unsold..]
-            .find("refuse_close_unless_unsold(&chain, role, &s, &tc, &note).await?")
+            .find("refuse_close_unless_unsold(&chain, role, &s, &tc).await?")
             .expect("read-only refusals must run in the unsold arm");
         // Keyed on the request for the key, not on the words it used to refuse with: the key comes
         // from `--note-key` or from the pool entry now, and the rule this pins is the ORDER --
@@ -1879,8 +1855,7 @@ mod tests {
     #[test]
     fn chain_buyer_close_routes_through_shared_explicit_stop() {
         let source = include_str!("close.rs");
-        let body =
-            crate::cli::source_probe::code_of(source, "deals::DealHandleRole::Buyer =>");
+        let body = crate::cli::source_probe::code_of(source, "deals::DealHandleRole::Buyer =>");
         assert!(body.contains(".explicit_buyer_stop(&note, &keys, &tc)"));
         assert!(!body.contains("chain.stream_stop(&note, &keys, &tc)"));
     }

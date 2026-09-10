@@ -5,8 +5,8 @@ use super::{
 };
 use crate::seller::models::ModelConfig;
 use dexdo_core::params::UPSTREAM_SSE_FRAME_MAX_BYTES;
-use dexdo_proto::{CanonChunk, CanonRequest, SignalManifest};
-use serde::{Deserialize, Serialize};
+use dexdo_proto::{BillingUsage, CanonChunk, CanonRequest, SignalManifest};
+use serde::{Deserialize, Deserializer, Serialize};
 use tokio::sync::mpsc;
 use tonic::Status;
 
@@ -171,7 +171,7 @@ pub async fn run(
         return;
     };
     if let Err(status) = stream_upstream(cfg, &key, count, &req, &tx, model_output_cap).await {
-        let _ = tx.send(Err(status)).await;
+        let _ = tx.send(Err(*status)).await;
     }
 }
 
@@ -182,7 +182,7 @@ async fn stream_upstream(
     req: &CanonRequest,
     tx: &mpsc::Sender<UpstreamResult>,
     model_output_cap: u32,
-) -> Result<(), Status> {
+) -> Result<(), Box<Status>> {
     use futures::StreamExt;
 
     let client = reqwest::Client::new();
@@ -193,13 +193,14 @@ async fn stream_upstream(
         .map_err(|e| Status::unavailable(format!("upstream connect failed: {e}")))?;
     if !response.status().is_success() {
         // a `4xx` rejects a request the seller built end to end -- name the model and the sent limit.
-        return Err(annotate_seller_config_fault(
+        return Err(Box::new(annotate_seller_config_fault(
             Status::unavailable(format!("upstream HTTP {}", response.status())),
             response.status().as_u16(),
             &cfg.model,
             body.max_tokens,
             model_output_cap,
-        ));
+            None,
+        )));
     }
 
     let mut stream = response.bytes_stream();
@@ -209,14 +210,22 @@ async fn stream_upstream(
     // later decrease/malformed terminal event cannot leave a partially advanced monetary high-water.
     let mut reported_output: Option<u64> = None;
     let mut post_output_reported: Option<u64> = None;
+    let mut reported_input: Option<u64> = None;
+    let mut message_started = false;
     while let Some(part) = stream.next().await {
         let bytes = part.map_err(|e| Status::unavailable(format!("upstream read failed: {e}")))?;
         buffer.extend_from_slice(&bytes);
         for event in drain_complete_events(&mut buffer)? {
             match parse_event(&event)? {
-                ParsedEvent::Delta { text, reasoning }
-                    if !text.is_empty() || !reasoning.is_empty() =>
-                {
+                ParsedEvent::Delta { text, reasoning } => {
+                    if !message_started {
+                        return Err(Box::new(Status::data_loss(
+                            "Anthropic content arrived before message_start usage",
+                        )));
+                    }
+                    if text.is_empty() && reasoning.is_empty() {
+                        continue;
+                    }
                     post_output_reported = None;
                     let chunk = CanonChunk {
                         text,
@@ -228,61 +237,87 @@ async fn stream_upstream(
                             has_token_ids: false,
                             claimed_model: cfg.frame_model.clone(),
                         }),
+                        usage: None,
                     };
                     seq += 1;
-                    if tx
-                        .send(Ok(UpstreamEvent::Chunk {
-                            chunk,
-                            accounted_tokens: 0,
-                        }))
-                        .await
-                        .is_err()
-                    {
+                    if tx.send(Ok(UpstreamEvent::Chunk(chunk))).await.is_err() {
                         return Ok(());
                     }
                 }
                 ParsedEvent::InitialUsage {
-                    input_tokens: _,
+                    input_tokens,
                     output_tokens,
                 } => {
+                    if message_started {
+                        return Err(Box::new(Status::data_loss(
+                            "Anthropic message_start usage repeated within one stream",
+                        )));
+                    }
+                    let input_tokens = input_tokens.ok_or_else(|| {
+                        Status::data_loss("Anthropic initial usage is missing input_tokens")
+                    })?;
+                    message_started = true;
+                    reported_input = Some(input_tokens);
+                    let output_tokens = output_tokens.unwrap_or(0);
                     if reported_output.is_some_and(|previous| output_tokens < previous) {
-                        return Err(Status::data_loss(
+                        return Err(Box::new(Status::data_loss(
                             "Anthropic cumulative output_tokens decreased",
-                        ));
+                        )));
                     }
                     if output_tokens > count {
-                        return Err(Status::data_loss(
+                        return Err(Box::new(Status::data_loss(
                             "Anthropic cumulative output_tokens exceeds the requested token limit",
-                        ));
+                        )));
                     }
                     reported_output = Some(output_tokens);
                 }
                 ParsedEvent::CumulativeUsage {
-                    input_tokens: _,
+                    input_tokens,
                     output_tokens,
                 } => {
+                    if !message_started {
+                        return Err(Box::new(Status::data_loss(
+                            "Anthropic message_delta usage arrived before message_start usage",
+                        )));
+                    }
+                    if let Some(input_tokens) = input_tokens {
+                        if reported_input != Some(input_tokens) {
+                            return Err(Box::new(Status::data_loss(
+                                "Anthropic cumulative usage input_tokens disagrees with initial usage",
+                            )));
+                        }
+                    }
+                    let output_tokens = output_tokens.ok_or_else(|| {
+                        Status::data_loss("Anthropic cumulative usage is missing output_tokens")
+                    })?;
                     if reported_output.is_some_and(|previous| output_tokens < previous) {
-                        return Err(Status::data_loss(
+                        return Err(Box::new(Status::data_loss(
                             "Anthropic cumulative output_tokens decreased",
-                        ));
+                        )));
                     }
                     if output_tokens > count {
-                        return Err(Status::data_loss(
+                        return Err(Box::new(Status::data_loss(
                             "Anthropic cumulative output_tokens exceeds the requested token limit",
-                        ));
+                        )));
                     }
                     reported_output = Some(output_tokens);
-                    if seq > 0 {
-                        post_output_reported = Some(output_tokens);
-                    }
+                    post_output_reported = Some(output_tokens);
                 }
-                ParsedEvent::Delta { .. } | ParsedEvent::Other => {}
+                ParsedEvent::Other => {}
                 ParsedEvent::Stop => {
+                    let input_tokens = reported_input.ok_or_else(|| {
+                        Status::data_loss("Anthropic output ended without initial input_tokens")
+                    })?;
                     if seq == 0 {
-                        if reported_output.unwrap_or(0) != 0 {
-                            return Err(Status::data_loss(
+                        let output_tokens = post_output_reported.ok_or_else(|| {
+                            Status::data_loss(
+                                "Anthropic output ended without final cumulative output_tokens",
+                            )
+                        })?;
+                        if output_tokens != 0 {
+                            return Err(Box::new(Status::data_loss(
                                 "Anthropic usage reports output tokens without delivered output",
-                            ));
+                            )));
                         }
                         return Ok(());
                     }
@@ -293,29 +328,29 @@ async fn stream_upstream(
                                 "Anthropic output ended without positive post-output cumulative output_tokens",
                             )
                         })?;
-                    if tx
-                        .send(Ok(UpstreamEvent::Accounted(output_tokens)))
-                        .await
-                        .is_err()
-                    {
+                    let usage = BillingUsage::new(input_tokens, output_tokens, None)
+                        .map_err(Status::data_loss)?;
+                    if tx.send(Ok(UpstreamEvent::Usage(usage))).await.is_err() {
                         return Ok(());
                     }
                     return Ok(());
                 }
                 ParsedEvent::Error(message) => {
-                    return Err(Status::unavailable(format!(
+                    return Err(Box::new(Status::unavailable(format!(
                         "Anthropic stream error: {message}"
-                    )));
+                    ))));
                 }
             }
         }
     }
     if !buffer.is_empty() {
-        return Err(Status::data_loss("incomplete Anthropic SSE frame at EOF"));
+        return Err(Box::new(Status::data_loss(
+            "incomplete Anthropic SSE frame at EOF",
+        )));
     }
-    Err(Status::data_loss(
+    Err(Box::new(Status::data_loss(
         "Anthropic SSE ended without message_stop",
-    ))
+    )))
 }
 
 #[allow(clippy::result_large_err)]
@@ -372,12 +407,35 @@ struct EventMessage {
     usage: Option<EventUsage>,
 }
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+enum UsageCount {
+    #[default]
+    Missing,
+    Value(u64),
+}
+
+impl UsageCount {
+    fn into_option(self) -> Option<u64> {
+        match self {
+            Self::Missing => None,
+            Self::Value(value) => Some(value),
+        }
+    }
+}
+
+fn deserialize_usage_count<'de, D>(deserializer: D) -> Result<UsageCount, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    u64::deserialize(deserializer).map(UsageCount::Value)
+}
+
 #[derive(Clone, Copy, Debug, Default, Deserialize, PartialEq, Eq)]
 struct EventUsage {
-    #[serde(default)]
-    input_tokens: u64,
-    #[serde(default)]
-    output_tokens: u64,
+    #[serde(default, deserialize_with = "deserialize_usage_count")]
+    input_tokens: UsageCount,
+    #[serde(default, deserialize_with = "deserialize_usage_count")]
+    output_tokens: UsageCount,
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -387,12 +445,12 @@ enum ParsedEvent {
         reasoning: String,
     },
     InitialUsage {
-        input_tokens: u64,
-        output_tokens: u64,
+        input_tokens: Option<u64>,
+        output_tokens: Option<u64>,
     },
     CumulativeUsage {
-        input_tokens: u64,
-        output_tokens: u64,
+        input_tokens: Option<u64>,
+        output_tokens: Option<u64>,
     },
     Stop,
     Error(String),
@@ -430,23 +488,26 @@ fn parse_event(event: &str) -> Result<ParsedEvent, Status> {
             text: String::new(),
             reasoning: event.delta.thinking,
         },
-        ("message_start", _) => {
-            event
-                .message
-                .and_then(|message| message.usage)
-                .map_or(ParsedEvent::Other, |usage| ParsedEvent::InitialUsage {
-                    input_tokens: usage.input_tokens,
-                    output_tokens: usage.output_tokens,
-                })
-        }
-        ("message_delta", _) => {
-            event
-                .usage
-                .map_or(ParsedEvent::Other, |usage| ParsedEvent::CumulativeUsage {
-                    input_tokens: usage.input_tokens,
-                    output_tokens: usage.output_tokens,
-                })
-        }
+        ("message_start", _) => event.message.and_then(|message| message.usage).map_or(
+            ParsedEvent::InitialUsage {
+                input_tokens: None,
+                output_tokens: None,
+            },
+            |usage| ParsedEvent::InitialUsage {
+                input_tokens: usage.input_tokens.into_option(),
+                output_tokens: usage.output_tokens.into_option(),
+            },
+        ),
+        ("message_delta", _) => event.usage.map_or(
+            ParsedEvent::CumulativeUsage {
+                input_tokens: None,
+                output_tokens: None,
+            },
+            |usage| ParsedEvent::CumulativeUsage {
+                input_tokens: usage.input_tokens.into_option(),
+                output_tokens: usage.output_tokens.into_option(),
+            },
+        ),
         ("message_stop", _) => ParsedEvent::Stop,
         _ => ParsedEvent::Other,
     })
@@ -472,7 +533,7 @@ mod tests {
         }
     }
 
-    async fn run_test_stream(body: Vec<u8>) -> (Result<(), Status>, Vec<UpstreamEvent>) {
+    async fn run_test_stream(body: Vec<u8>) -> (Result<(), Box<Status>>, Vec<UpstreamEvent>) {
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -706,15 +767,61 @@ mod tests {
     fn handles_message_usage_and_stop_events() {
         assert_eq!(
             parse_event("event: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"usage\":{\"input_tokens\":12,\"output_tokens\":1}}}").unwrap(),
-            ParsedEvent::InitialUsage { input_tokens: 12, output_tokens: 1 }
+            ParsedEvent::InitialUsage { input_tokens: Some(12), output_tokens: Some(1) }
         );
         assert_eq!(
             parse_event("event: message_delta\ndata: {\"type\":\"message_delta\",\"usage\":{\"output_tokens\":7}}").unwrap(),
-            ParsedEvent::CumulativeUsage { input_tokens: 0, output_tokens: 7 }
+            ParsedEvent::CumulativeUsage { input_tokens: None, output_tokens: Some(7) }
         );
         assert_eq!(
             parse_event("event: message_stop\ndata: {\"type\":\"message_stop\"}").unwrap(),
             ParsedEvent::Stop
+        );
+    }
+
+    #[test]
+    fn explicit_null_or_non_count_anthropic_usage_fields_fail_closed() {
+        for data in [
+            r#"{"type":"message_start","message":{"usage":{"input_tokens":null,"output_tokens":0}}}"#,
+            r#"{"type":"message_start","message":{"usage":{"input_tokens":-1,"output_tokens":0}}}"#,
+            r#"{"type":"message_start","message":{"usage":{"input_tokens":1.5,"output_tokens":0}}}"#,
+            r#"{"type":"message_delta","usage":{"input_tokens":null,"output_tokens":1}}"#,
+            r#"{"type":"message_delta","usage":{"input_tokens":"1","output_tokens":1}}"#,
+            r#"{"type":"message_delta","usage":{"output_tokens":null}}"#,
+            r#"{"type":"message_delta","usage":{"output_tokens":18446744073709551616}}"#,
+        ] {
+            let event_name = if data.contains("message_start") {
+                "message_start"
+            } else {
+                "message_delta"
+            };
+            let status =
+                parse_event(&format!("event: {event_name}\ndata: {data}")).expect_err(data);
+            assert_eq!(status.code(), tonic::Code::DataLoss, "{data}");
+        }
+    }
+
+    #[test]
+    fn optional_repeated_anthropic_input_may_be_absent_but_must_match_when_present() {
+        assert_eq!(
+            parse_event(
+                "event: message_delta\ndata: {\"type\":\"message_delta\",\"usage\":{\"output_tokens\":7}}"
+            )
+            .unwrap(),
+            ParsedEvent::CumulativeUsage {
+                input_tokens: None,
+                output_tokens: Some(7)
+            }
+        );
+        assert_eq!(
+            parse_event(
+                "event: message_delta\ndata: {\"type\":\"message_delta\",\"usage\":{\"input_tokens\":12,\"output_tokens\":7}}"
+            )
+            .unwrap(),
+            ParsedEvent::CumulativeUsage {
+                input_tokens: Some(12),
+                output_tokens: Some(7)
+            }
         );
     }
 
@@ -770,18 +877,15 @@ mod tests {
         let mut accounted = 0;
         while let Some(event) = rx.recv().await {
             match event.unwrap() {
-                UpstreamEvent::Chunk {
-                    chunk,
-                    accounted_tokens,
-                } => {
-                    assert_eq!(accounted_tokens, 0);
-                    chunks.push(chunk);
-                }
-                UpstreamEvent::Accounted(tokens) => accounted += tokens,
+                UpstreamEvent::Chunk(chunk) => chunks.push(chunk),
+                UpstreamEvent::Usage(usage) => accounted += usage.total_tokens,
             }
         }
         assert_eq!(chunks.len(), 2, "SSE delta count remains a framing detail");
-        assert_eq!(accounted, 5, "billing follows cumulative model usage");
+        assert_eq!(
+            accounted, 8,
+            "billing follows input plus cumulative output usage"
+        );
         assert_eq!(chunks[0].seq, 0);
         assert_eq!(chunks[0].text, "Hello");
         assert!(chunks[0].manifest.is_some());
@@ -834,6 +938,8 @@ mod tests {
     #[tokio::test]
     async fn http_200_midstream_error_fails_instead_of_clean_completion() {
         let sse = concat!(
+            "event: message_start\n",
+            "data: {\"type\":\"message_start\",\"message\":{\"usage\":{\"input_tokens\":3,\"output_tokens\":0}}}\n\n",
             "event: content_block_delta\n",
             "data: {\"type\":\"content_block_delta\",\"delta\":{\"type\":\"text_delta\",\"text\":\"partial\"}}\n\n",
             "event: error\n",
@@ -841,7 +947,91 @@ mod tests {
         );
         let (result, events) = run_test_stream(sse.as_bytes().to_vec()).await;
         assert_eq!(result.unwrap_err().code(), tonic::Code::Unavailable);
-        assert!(matches!(events.as_slice(), [UpstreamEvent::Chunk { .. }]));
+        assert!(matches!(events.as_slice(), [UpstreamEvent::Chunk(_)]));
+    }
+
+    #[tokio::test]
+    async fn content_before_message_start_is_rejected_without_authoritative_usage() {
+        let sse = concat!(
+            "event: content_block_delta\n",
+            "data: {\"type\":\"content_block_delta\",\"delta\":{\"type\":\"text_delta\",\"text\":\"ok\"}}\n\n",
+            "event: message_start\n",
+            "data: {\"type\":\"message_start\",\"message\":{\"usage\":{\"input_tokens\":3,\"output_tokens\":0}}}\n\n",
+            "event: message_delta\n",
+            "data: {\"type\":\"message_delta\",\"usage\":{\"output_tokens\":1}}\n\n",
+            "event: message_stop\n",
+            "data: {\"type\":\"message_stop\"}\n\n"
+        );
+        let (result, events) = run_test_stream(sse.as_bytes().to_vec()).await;
+        let status = result.expect_err("content before message_start must fail closed");
+        assert_eq!(status.code(), tonic::Code::DataLoss);
+        assert!(status.message().contains("before message_start"));
+        assert!(events.is_empty(), "the malformed order authorizes no event");
+    }
+
+    #[tokio::test]
+    async fn message_delta_before_message_start_is_rejected_without_authoritative_usage() {
+        let sse = concat!(
+            "event: message_delta\n",
+            "data: {\"type\":\"message_delta\",\"usage\":{\"output_tokens\":1}}\n\n",
+            "event: message_start\n",
+            "data: {\"type\":\"message_start\",\"message\":{\"usage\":{\"input_tokens\":3,\"output_tokens\":0}}}\n\n",
+            "event: message_stop\n",
+            "data: {\"type\":\"message_stop\"}\n\n"
+        );
+        let (result, events) = run_test_stream(sse.as_bytes().to_vec()).await;
+        let status = result.expect_err("message_delta before message_start must fail closed");
+        assert_eq!(status.code(), tonic::Code::DataLoss);
+        assert!(status.message().contains("before message_start"));
+        assert!(events.is_empty(), "the malformed order authorizes no event");
+    }
+
+    #[tokio::test]
+    async fn duplicate_or_late_message_start_is_rejected_without_authoritative_usage() {
+        for (sse, expected_chunks) in [
+            (
+                concat!(
+                    "event: message_start\n",
+                    "data: {\"type\":\"message_start\",\"message\":{\"usage\":{\"input_tokens\":3,\"output_tokens\":0}}}\n\n",
+                    "event: message_start\n",
+                    "data: {\"type\":\"message_start\",\"message\":{\"usage\":{\"input_tokens\":3,\"output_tokens\":0}}}\n\n"
+                ),
+                0,
+            ),
+            (
+                concat!(
+                    "event: message_start\n",
+                    "data: {\"type\":\"message_start\",\"message\":{\"usage\":{\"input_tokens\":3,\"output_tokens\":0}}}\n\n",
+                    "event: content_block_delta\n",
+                    "data: {\"type\":\"content_block_delta\",\"delta\":{\"type\":\"text_delta\",\"text\":\"ok\"}}\n\n",
+                    "event: message_start\n",
+                    "data: {\"type\":\"message_start\",\"message\":{\"usage\":{\"input_tokens\":3,\"output_tokens\":0}}}\n\n",
+                    "event: message_delta\n",
+                    "data: {\"type\":\"message_delta\",\"usage\":{\"output_tokens\":1}}\n\n",
+                    "event: message_stop\n",
+                    "data: {\"type\":\"message_stop\"}\n\n"
+                ),
+                1,
+            ),
+        ] {
+            let (result, events) = run_test_stream(sse.as_bytes().to_vec()).await;
+            let status = result.expect_err("message_start may occur exactly once");
+            assert_eq!(status.code(), tonic::Code::DataLoss);
+            assert!(status.message().contains("message_start usage repeated"));
+            assert_eq!(
+                events
+                    .iter()
+                    .filter(|event| matches!(event, UpstreamEvent::Chunk(_)))
+                    .count(),
+                expected_chunks
+            );
+            assert!(
+                events
+                    .iter()
+                    .all(|event| matches!(event, UpstreamEvent::Chunk(_))),
+                "a duplicate start authorizes no usage"
+            );
+        }
     }
 
     /// E2E-ROW: E2E-UPS-18/L0
@@ -855,6 +1045,8 @@ mod tests {
     #[tokio::test]
     async fn one_delta_with_usage_one_accounts_exactly_one() {
         let sse = concat!(
+            "event: message_start\n",
+            "data: {\"type\":\"message_start\",\"message\":{\"usage\":{\"input_tokens\":3,\"output_tokens\":0}}}\n\n",
             "event: content_block_delta\n",
             "data: {\"type\":\"content_block_delta\",\"delta\":{\"type\":\"text_delta\",\"text\":\"ok\"}}\n\n",
             "event: message_delta\n",
@@ -867,11 +1059,52 @@ mod tests {
         let accounted: u64 = events
             .iter()
             .filter_map(|event| match event {
-                UpstreamEvent::Accounted(tokens) => Some(*tokens),
-                UpstreamEvent::Chunk { .. } => None,
+                UpstreamEvent::Usage(usage) => Some(usage.total_tokens),
+                UpstreamEvent::Chunk(_) => None,
             })
             .sum();
-        assert_eq!(accounted, 1);
+        assert_eq!(accounted, 4);
+    }
+
+    #[tokio::test]
+    async fn anthropic_input_is_billed_without_becoming_part_of_the_output_cap() {
+        let sse = concat!(
+            "event: message_start\n",
+            "data: {\"type\":\"message_start\",\"message\":{\"usage\":{\"input_tokens\":100,\"output_tokens\":0}}}\n\n",
+            "event: content_block_delta\n",
+            "data: {\"type\":\"content_block_delta\",\"delta\":{\"type\":\"text_delta\",\"text\":\"ok\"}}\n\n",
+            "event: message_delta\n",
+            "data: {\"type\":\"message_delta\",\"usage\":{\"output_tokens\":1}}\n\n",
+            "event: message_stop\n",
+            "data: {\"type\":\"message_stop\"}\n\n"
+        );
+        let (result, events) = run_test_stream(sse.as_bytes().to_vec()).await;
+        result.expect("input tokens do not consume the output-only cap");
+        assert!(events.iter().any(|event| matches!(
+            event,
+            UpstreamEvent::Usage(usage)
+                if usage.input_tokens == 100
+                    && usage.output_tokens == 1
+                    && usage.total_tokens == 101
+        )));
+    }
+
+    #[tokio::test]
+    async fn repeated_anthropic_input_must_equal_the_initial_count() {
+        let sse = concat!(
+            "event: message_start\n",
+            "data: {\"type\":\"message_start\",\"message\":{\"usage\":{\"input_tokens\":3,\"output_tokens\":0}}}\n\n",
+            "event: content_block_delta\n",
+            "data: {\"type\":\"content_block_delta\",\"delta\":{\"type\":\"text_delta\",\"text\":\"ok\"}}\n\n",
+            "event: message_delta\n",
+            "data: {\"type\":\"message_delta\",\"usage\":{\"input_tokens\":4,\"output_tokens\":1}}\n\n"
+        );
+        let (result, events) = run_test_stream(sse.as_bytes().to_vec()).await;
+        let status = result.expect_err("conflicting repeated input must fail");
+        assert!(status.message().contains("disagrees with initial usage"));
+        assert!(events
+            .iter()
+            .all(|event| matches!(event, UpstreamEvent::Chunk(_))));
     }
 
     #[tokio::test]
@@ -887,14 +1120,26 @@ mod tests {
         let (result, events) = run_test_stream(sse.as_bytes().to_vec()).await;
         assert_eq!(result.unwrap_err().code(), tonic::Code::DataLoss);
         assert!(
-            events.iter().all(|event| matches!(
-                event,
-                UpstreamEvent::Chunk {
-                    accounted_tokens: 0,
-                    ..
-                }
-            )),
+            events
+                .iter()
+                .all(|event| matches!(event, UpstreamEvent::Chunk(_))),
             "no guessed usage may be emitted"
+        );
+    }
+
+    #[tokio::test]
+    async fn message_stop_without_input_usage_fails_closed() {
+        let sse = concat!(
+            "event: message_stop\n",
+            "data: {\"type\":\"message_stop\"}\n\n"
+        );
+        let (result, events) = run_test_stream(sse.as_bytes().to_vec()).await;
+        let status = result.expect_err("a terminator is not an input-usage record");
+        assert_eq!(status.code(), tonic::Code::DataLoss);
+        assert!(status.message().contains("without initial input_tokens"));
+        assert!(
+            events.is_empty(),
+            "missing input usage authorizes no accounting"
         );
     }
 
@@ -911,13 +1156,9 @@ mod tests {
         let (result, events) = run_test_stream(sse.as_bytes().to_vec()).await;
         assert_eq!(result.unwrap_err().code(), tonic::Code::DataLoss);
         assert!(
-            events.iter().all(|event| matches!(
-                event,
-                UpstreamEvent::Chunk {
-                    accounted_tokens: 0,
-                    ..
-                }
-            )),
+            events
+                .iter()
+                .all(|event| matches!(event, UpstreamEvent::Chunk(_))),
             "initial usage is not final usage and must not advance monetary accounting"
         );
     }
@@ -926,6 +1167,8 @@ mod tests {
     #[tokio::test]
     async fn decreasing_cumulative_usage_fails_without_partial_accounting() {
         let sse = concat!(
+            "event: message_start\n",
+            "data: {\"type\":\"message_start\",\"message\":{\"usage\":{\"input_tokens\":3,\"output_tokens\":0}}}\n\n",
             "event: content_block_delta\n",
             "data: {\"type\":\"content_block_delta\",\"delta\":{\"type\":\"text_delta\",\"text\":\"output\"}}\n\n",
             "event: message_delta\n",
@@ -938,13 +1181,9 @@ mod tests {
         let (result, events) = run_test_stream(sse.as_bytes().to_vec()).await;
         assert_eq!(result.unwrap_err().code(), tonic::Code::DataLoss);
         assert!(
-            events.iter().all(|event| matches!(
-                event,
-                UpstreamEvent::Chunk {
-                    accounted_tokens: 0,
-                    ..
-                }
-            )),
+            events
+                .iter()
+                .all(|event| matches!(event, UpstreamEvent::Chunk(_))),
             "a contradictory cumulative sequence must not advance monetary usage"
         );
     }
@@ -953,6 +1192,8 @@ mod tests {
     #[tokio::test]
     async fn overflowing_usage_value_fails_without_accounting() {
         let sse = concat!(
+            "event: message_start\n",
+            "data: {\"type\":\"message_start\",\"message\":{\"usage\":{\"input_tokens\":3,\"output_tokens\":0}}}\n\n",
             "event: content_block_delta\n",
             "data: {\"type\":\"content_block_delta\",\"delta\":{\"type\":\"text_delta\",\"text\":\"output\"}}\n\n",
             "event: message_delta\n",
@@ -962,13 +1203,9 @@ mod tests {
         );
         let (result, events) = run_test_stream(sse.as_bytes().to_vec()).await;
         assert_eq!(result.unwrap_err().code(), tonic::Code::DataLoss);
-        assert!(events.iter().all(|event| matches!(
-            event,
-            UpstreamEvent::Chunk {
-                accounted_tokens: 0,
-                ..
-            }
-        )));
+        assert!(events
+            .iter()
+            .all(|event| matches!(event, UpstreamEvent::Chunk(_))));
     }
 
     /// UPS-B5, the native-Anthropic half of the row: the first text delta is EMPTY and no
@@ -982,6 +1219,8 @@ mod tests {
     #[tokio::test]
     async fn an_empty_first_text_delta_delivers_nothing_and_thinking_is_billed() {
         let sse = concat!(
+            "event: message_start\n",
+            "data: {\"type\":\"message_start\",\"message\":{\"usage\":{\"input_tokens\":3,\"output_tokens\":0}}}\n\n",
             "event: content_block_delta\n",
             "data: {\"type\":\"content_block_delta\",\"delta\":{\"type\":\"text_delta\",\"text\":\"\"}}\n\n",
             "event: content_block_delta\n",
@@ -994,14 +1233,15 @@ mod tests {
             "data: {\"type\":\"message_stop\"}\n\n"
         );
         let (result, events) = run_test_stream(sse.as_bytes().to_vec()).await;
-        result.expect("a thinking-only Anthropic stream is delivered output, not an empty response");
+        result
+            .expect("a thinking-only Anthropic stream is delivered output, not an empty response");
 
         let mut chunks = Vec::new();
         let mut accounted = Vec::new();
         for event in events {
             match event {
-                UpstreamEvent::Chunk { chunk, .. } => chunks.push(chunk),
-                UpstreamEvent::Accounted(tokens) => accounted.push(tokens),
+                UpstreamEvent::Chunk(chunk) => chunks.push(chunk),
+                UpstreamEvent::Usage(usage) => accounted.push(usage.total_tokens),
             }
         }
         assert_eq!(
@@ -1032,8 +1272,8 @@ mod tests {
         assert!(chunks[1].manifest.is_none());
         assert_eq!(
             accounted,
-            vec![4],
-            "the bill is the provider's own post-output cumulative output_tokens"
+            vec![7],
+            "the bill is initial input plus final cumulative output"
         );
     }
 }

@@ -1417,8 +1417,8 @@ mod tests {
             )
             .unwrap_or_else(|error| panic!("parse {name}: {error}"));
 
-            let address = default_registry_address(&path)
-                .unwrap_or_else(|error| panic!("{name}: {error:#}"));
+            let address =
+                default_registry_address(&path).unwrap_or_else(|error| panic!("{name}: {error:#}"));
             assert_eq!(
                 Some(address.as_str()),
                 declared["model_registry"].as_str(),
@@ -1427,7 +1427,11 @@ mod tests {
             checked += 1;
         }
 
-        assert!(checked >= 1, "no committed manifest was found in {}", dir.display());
+        assert!(
+            checked >= 1,
+            "no committed manifest was found in {}",
+            dir.display()
+        );
     }
 
     #[derive(Default)]
@@ -2328,7 +2332,6 @@ mod issue_1076_tests {
             .unwrap()
             .with_workchain()
     }
-
 
     fn suggestions_from_error(error: &str) -> Vec<String> {
         let (_, suggestions) = error

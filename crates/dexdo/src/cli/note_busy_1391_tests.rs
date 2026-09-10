@@ -40,17 +40,16 @@ fn account() -> NoteAccountSnapshot {
         status: "Active".into(),
         native_raw: 141_415_488_000,
         ecc: vec![(2, 309_000_000_000)],
-        code_hash: Some(
-            "57e85fa67cc90284b907ea7e9d8c6d35830c02d14bd04d4be6ec884b5748ca0c".into(),
-        ),
+        code_hash: Some("57e85fa67cc90284b907ea7e9d8c6d35830c02d14bd04d4be6ec884b5748ca0c".into()),
     }
 }
 
 /// Everything `run_note_balance` prints for one `getDetails` response, composed exactly as the
 /// command composes it, so what is asserted here is what the operator reads.
 fn rendered_note_balance(details: Option<&Value>) -> String {
-    let view = build_note_balance_view("0:note", Some(account()), note_getter_balance_maps(details))
-        .expect("balance view");
+    let view =
+        build_note_balance_view("0:note", Some(account()), note_getter_balance_maps(details))
+            .expect("balance view");
     let mut out = render_note_balance(&view);
     out.push_str(&render_note_busy_latch(&note_busy_latch(details)));
     out
@@ -89,8 +88,7 @@ fn note_balance_says_a_note_with_no_latch_is_not_busy() {
     let free = free_details();
     let section = render_note_busy_latch(&note_busy_latch(Some(&free)));
     assert_eq!(
-        section,
-        "PrivateNote.getDetails busyAddress (in-flight operation latch):\n  not busy\n",
+        section, "PrivateNote.getDetails busyAddress (in-flight operation latch):\n  not busy\n",
         "a free note must state that it is not busy"
     );
 

@@ -28,7 +28,6 @@ pub(crate) struct DashboardAppState {
 }
 
 impl DashboardAppState {
-
     pub(crate) fn for_chain(deals_dir: PathBuf) -> Self {
         Self {
             deals_dir,
@@ -72,8 +71,6 @@ pub(crate) struct DashboardByFact {
     pub(crate) burned: Option<u128>,
     pub(crate) closed: Option<bool>,
 }
-
-
 
 #[cfg(test)]
 pub(crate) struct FakeChainDashboardBackend<C> {

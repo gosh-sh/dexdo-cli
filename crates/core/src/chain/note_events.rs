@@ -6,8 +6,8 @@
 
 use anyhow::{anyhow, Result};
 use base64::Engine as _;
-use tvm_abi::token::TokenValue;
 use tvm_abi::contract::ABI_VERSION_2_4;
+use tvm_abi::token::TokenValue;
 use tvm_abi::{Contract, Event};
 use tvm_types::SliceData;
 
@@ -370,11 +370,11 @@ fn inference_order_call_fields(tokens: &[tvm_abi::Token]) -> Option<InferenceOrd
 /// `onInferencePlaced(modelHash, tokenContract, orderId, clientOrderId, isBuy, price, ticks)`.
 pub(super) fn decode_inference_placed_call(body_b64: &str) -> Result<Option<InferenceOrderCall>> {
     match decode_note_call(body_b64)? {
-        Some((name, tokens)) if name == "onInferencePlaced" => {
-            inference_order_call_fields(&tokens).map(Some).ok_or_else(|| {
+        Some((name, tokens)) if name == "onInferencePlaced" => inference_order_call_fields(&tokens)
+            .map(Some)
+            .ok_or_else(|| {
                 anyhow!("onInferencePlaced body missing modelHash/orderId -- ABI drift")
-            })
-        }
+            }),
         _ => Ok(None),
     }
 }
@@ -390,9 +390,11 @@ pub(super) fn decode_inference_order_removed_call(
 ) -> Result<Option<InferenceOrderCall>> {
     match decode_note_call(body_b64)? {
         Some((name, tokens)) if name == "onInferenceOrderRemoved" => {
-            inference_order_call_fields(&tokens).map(Some).ok_or_else(|| {
-                anyhow!("onInferenceOrderRemoved body missing modelHash/orderId -- ABI drift")
-            })
+            inference_order_call_fields(&tokens)
+                .map(Some)
+                .ok_or_else(|| {
+                    anyhow!("onInferenceOrderRemoved body missing modelHash/orderId -- ABI drift")
+                })
         }
         _ => Ok(None),
     }
@@ -416,7 +418,10 @@ pub(super) fn resting_inference_order_key(book: &str, order_id: u128) -> Result<
         .map_err(|e| anyhow!("resting order key: book address {book}: {e}"))?;
     let tokens = vec![
         tvm_abi::Token::new("book", TokenValue::Address(address)),
-        tvm_abi::Token::new("orderId", TokenValue::Uint(tvm_abi::Uint::new(order_id, 128))),
+        tvm_abi::Token::new(
+            "orderId",
+            TokenValue::Uint(tvm_abi::Uint::new(order_id, 128)),
+        ),
     ];
     let builder = TokenValue::pack_values_into_chain(&tokens, Vec::new(), &ABI_VERSION_2_4)
         .map_err(|e| anyhow!("resting order key: pack abi.encode(book, orderId): {e}"))?;
@@ -450,8 +455,7 @@ mod tests {
         )
         .expect("the key is computable for a well formed book address");
         assert_eq!(
-            key,
-            "0x8eed5e92bd3da53e81200adcc8ad58dcc1c51c6a30a000ebf3c9543ba025b581",
+            key, "0x8eed5e92bd3da53e81200adcc8ad58dcc1c51c6a30a000ebf3c9543ba025b581",
             "abi.encode(book, orderId) must serialise exactly as the TVM cell spec lays it out"
         );
     }
@@ -467,7 +471,10 @@ mod tests {
         let key_ab = super::resting_inference_order_key(a, 7).expect("key");
         let key_bb = super::resting_inference_order_key(b, 7).expect("key");
         let key_a9 = super::resting_inference_order_key(a, 9).expect("key");
-        assert_ne!(key_ab, key_bb, "the same order id in two books is two orders");
+        assert_ne!(
+            key_ab, key_bb,
+            "the same order id in two books is two orders"
+        );
         assert_ne!(key_ab, key_a9, "two order ids in one book are two orders");
     }
 

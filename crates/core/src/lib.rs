@@ -37,8 +37,8 @@ pub mod manifest;
 pub mod oracle_manifest;
 // wallet-address parse/normalize (`half1::half2` -> `0:<half2>`), fail-loud. Non-gated so
 // the format logic is offline-tested; consumed by the real money path (the chain build) and the seed-wallet CLI.
-pub mod wallet;
 mod canonical_multisig_allowlist;
+pub mod wallet;
 // real chain backend on top of the gosh.ackinacki SDK (behind a cargo feature that no longer exists).
 pub mod canonical_multisig;
 /// Stable classification prefix emitted when the chain read policy exhausts its retry budget.
@@ -50,9 +50,9 @@ pub mod chain;
 /// per-gate regression the money directive asks for must run in the default build.
 pub mod note_withdraw_gate;
 pub use note_withdraw_gate::{
-    check_withdrawal_arrival, note_withdraw_gate_from_storage, NoteWithdrawalArrival,
-    refusal_carries_a_withdraw_gate_code, withdraw_gate_line,
-    NoteWithdrawGate, WithdrawGate, WITHDRAW_GATE_EXIT_CODES, WITHDRAW_GATE_FIELDS,
+    check_withdrawal_arrival, note_withdraw_gate_from_storage,
+    refusal_carries_a_withdraw_gate_code, withdraw_gate_line, NoteWithdrawGate,
+    NoteWithdrawalArrival, WithdrawGate, WITHDRAW_GATE_EXIT_CODES, WITHDRAW_GATE_FIELDS,
 };
 
 /// SDK chain types -- re-exported behind the chain build for the live harness and the production CLI note-deploy
@@ -65,54 +65,47 @@ pub use gosh_ackinacki::{
 pub mod ackinacki_wallet {
     pub use gosh_ackinacki::wallet::query;
 }
-pub use chain::{PlaceInferenceBuyReceipt, TokenContractInboundCall};
 pub use chain::{
-    endpoint_urls, keypair_ed_pubkey, normalize_endpoint, note_transfer_amount_refusal,
-    note_transfer_deposit_identifier_hash, note_transfer_dest_refusal, note_transfer_sender_refusal,
-    note_transfer_submit_hint, note_withdraw_gate_from_account_boc, real_market_deal_view,
-    resolve_endpoint,
-    chain_clock_skew_preflight, chain_http_client, DealContext, Deployed, MoneySubmitError,
-    NoteTransferRefusal, RealBuyerBackend, RealChainBackend, RealDealBackend, RealNote,
-    RealSellerBackend,
-    ChainDoctorCheck, ChainDoctorReport, ChainDoctorStatus, TokenContractCurrentFacts,
-    CHAIN_DOCTOR_CHECK_COUNT,
-    NoteDealCreditReceipt,
+    chain_clock_skew_preflight, chain_http_client, endpoint_urls, keypair_ed_pubkey,
+    normalize_endpoint, note_transfer_amount_refusal, note_transfer_deposit_identifier_hash,
+    note_transfer_dest_refusal, note_transfer_sender_refusal, note_transfer_submit_hint,
+    note_withdraw_gate_from_account_boc, real_market_deal_view, resolve_endpoint, ChainDoctorCheck,
+    ChainDoctorReport, ChainDoctorStatus, DealContext, Deployed, MoneySubmitError,
+    NoteDealCreditReceipt, NoteTransferRefusal, RealBuyerBackend, RealChainBackend,
+    RealDealBackend, RealNote, RealSellerBackend, TokenContractCurrentFacts,
     TokenContractReceiptChainData, TokenContractSettlementEvent, TokenContractSettlementReceipt,
-    TokenContractSettlementReceipts,
+    TokenContractSettlementReceipts, CHAIN_DOCTOR_CHECK_COUNT,
 };
+pub use chain::{PlaceInferenceBuyReceipt, TokenContractInboundCall};
 
 pub use address::{CanonicalAddress, DEXDO_DAPP_ID};
-pub use market::flags as order_flags;
-pub use market::{
-    aggregate_tree, buyer_net_result, buyer_total_debit,
-    check_buy_deposit_headroom, check_declared_payout_against_credits, check_disputable,
-    check_matched_token_contract_state, check_reclaimable, check_recoverable,
-    check_release_disputable, check_seller_pubkey, check_subscription_buy_reserve,
-    check_withdrawable_shell, deal_anomalies, executable_quote, implied_write_off,
-    order_deadline_is_live,
-    ordinary_buy_reserve, per_model_breakdown, required_escrow_for_buy,
-    submit_safe_single_ask_quote, subscription_buy_clearing_refund, subscription_buy_reserve,
-    subscription_claim_cap_at,
-    subscription_current_week_headroom, validate_seller_resume_state, BuyerOrderFact,
-    BuyerOrderFactKind, BuyerStopTerminalFact, BuyerStopTerminalReceipt, ChainBackend, ChainError,
-    ClaimBounds, CounterpartyTally,
-    ConservationBreach, DealAnomaly, DealBuyerBond, DealChainSnapshot, DealChainState,
-    DealLedger, DealLedgerStep, DealMoneyFlow, DealOfferLatch, DealRole, DealSettlement,
-    DealSellerBond, DealSubscription, DealView, ExecutableQuote, InferenceSubscriptionPlacement, Match,
-    MatchWatchCursor, MatchedFill, MatchedTokenContractStatus, MockChainBackend,
-    MockSubscriptionExit, MockSubscriptionTerminal, ModelBreakdown,
-    NoteSnapshot, OfferListing, OrderBookOrder, OrderBookSnapshot, OrderBookStats, QuoteFill,
-    RawUint128, SellOffer, SellOfferOutcome, SettlementAction,
-    SettlementActionBondState, SettlementActionEvent, SettlementActionPostState,
-    SettlementActionReceipt, StreamSnapshot, SubscriptionBuyReserve, TokenContract, TreeSnapshot,
-    UNKNOWN_MODEL,
-};
 pub use error::{codes as error_codes, BoxError, DexdoError, ErrorCode, ErrorKind};
 pub use handover::Handover;
 pub use machine::{InvariantError, Settlement, StreamMachine, StreamState, Tick};
 pub use manifest::{
     model_hash_for, parse_canonical_model_id, resolve_model_name, validate_canonical_model_id,
     AttestedModelPrecision, CanonicalModelFlags, CanonicalModelId, MarketManifest,
+};
+pub use market::flags as order_flags;
+pub use market::{
+    aggregate_tree, buyer_net_result, buyer_total_debit, check_buy_deposit_headroom,
+    check_declared_payout_against_credits, check_disputable, check_matched_token_contract_state,
+    check_reclaimable, check_recoverable, check_release_disputable, check_seller_pubkey,
+    check_subscription_buy_reserve, check_withdrawable_shell, deal_anomalies, executable_quote,
+    implied_write_off, order_deadline_is_live, ordinary_buy_reserve, per_model_breakdown,
+    required_escrow_for_buy, submit_safe_single_ask_quote, subscription_buy_clearing_refund,
+    subscription_buy_reserve, subscription_claim_cap_at, subscription_current_week_headroom,
+    validate_seller_resume_state, BuyerOrderFact, BuyerOrderFactKind, BuyerStopTerminalFact,
+    BuyerStopTerminalReceipt, ChainBackend, ChainError, ClaimBounds, ConservationBreach,
+    CounterpartyTally, DealAnomaly, DealBuyerBond, DealChainSnapshot, DealChainState, DealLedger,
+    DealLedgerStep, DealMoneyFlow, DealOfferLatch, DealRole, DealSellerBond, DealSettlement,
+    DealSubscription, DealView, ExecutableQuote, InferenceSubscriptionPlacement, Match,
+    MatchWatchCursor, MatchedFill, MatchedTokenContractStatus, MockChainBackend,
+    MockSubscriptionExit, MockSubscriptionTerminal, ModelBreakdown, NoteSnapshot, OfferListing,
+    OrderBookOrder, OrderBookSnapshot, OrderBookStats, QuoteFill, RawUint128, SellOffer,
+    SellOfferOutcome, SettlementAction, SettlementActionBondState, SettlementActionEvent,
+    SettlementActionPostState, SettlementActionReceipt, StreamSnapshot, SubscriptionBuyReserve,
+    TokenContract, TreeSnapshot, UNKNOWN_MODEL,
 };
 pub use note::{verify, LocalNote, Note, NoteError, NotePubkey, NoteTree, Signature};
 pub use onchain_diagnostics::{
@@ -122,14 +115,13 @@ pub use onchain_diagnostics::{
 pub use oracle_manifest::OracleMarketManifest;
 pub use params::{
     cli_buy_deadline_is_valid, default_buy_deadline, price_raw_from_shell, probe_seed_owed,
-    shell_amount, shell_amount_of_text, shell_amount_raw, DobParams, ProtocolConsts,
-    Shell, DEAL_SNAPSHOT_MAX_ATTEMPTS, DEFAULT_BUY_TTL, MATCH_OPEN_TIMEOUT,
-    BUYER_HANDOVER_WAIT_SECS, BUYER_ON_DEMAND_PURCHASE_SECS, MATCH_OPEN_TIMEOUT_SECS,
-    MAX_SELL_TTL, MIN_STREAM_BUY_TICKS, PLATFORM_FEE_BPS, PRICE_STEP,
-    PROBE_SEED_TOKENS, SELLER_TERMINAL_RECEIPT_POLL_INTERVAL, SELLER_TERMINAL_RECEIPT_TIMEOUT,
-    SHELL_ECC_ID, SUBSCRIPTION_BUYER_BOND_TICKS, SUBSCRIPTION_MAX_TICKS,
-    SUBSCRIPTION_ORDER_RECONCILE_POLL, SUBSCRIPTION_WEEKS, SUB_TICKS_PER_WEEK, SUB_WEEK_LEN,
-    TICK_SIZE,
+    shell_amount, shell_amount_of_text, shell_amount_raw, DobParams, ProtocolConsts, Shell,
+    BUYER_HANDOVER_WAIT_SECS, BUYER_ON_DEMAND_PURCHASE_SECS, DEAL_SNAPSHOT_MAX_ATTEMPTS,
+    DEFAULT_BUY_TTL, MATCH_OPEN_TIMEOUT, MATCH_OPEN_TIMEOUT_SECS, MAX_SELL_TTL,
+    MIN_STREAM_BUY_TICKS, PLATFORM_FEE_BPS, PRICE_STEP, PROBE_SEED_TOKENS,
+    SELLER_TERMINAL_RECEIPT_POLL_INTERVAL, SELLER_TERMINAL_RECEIPT_TIMEOUT, SHELL_ECC_ID,
+    SUBSCRIPTION_BUYER_BOND_TICKS, SUBSCRIPTION_MAX_TICKS, SUBSCRIPTION_ORDER_RECONCILE_POLL,
+    SUBSCRIPTION_WEEKS, SUB_TICKS_PER_WEEK, SUB_WEEK_LEN, TICK_SIZE,
 };
 pub use settle::{
     contested_burn, fee, net_burn, probe_burn, rebate, rebate_rate_bps, ContestedBurn,

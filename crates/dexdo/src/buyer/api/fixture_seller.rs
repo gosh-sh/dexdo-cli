@@ -1,9 +1,9 @@
 //! Test-only seller seam for buyer-side adversarial stream fixtures.
 
-//! Ordinary requests delegate to the production gateway unchanged. A request carrying the existing
-//! `DEXDO_FIXTURE_FATCHUNK` marker takes a bare gRPC branch after authorization: that branch observes
-//! the cap on the wire but deliberately does not turn it into a seller reservation. It therefore
-//! models a third-party seller that can send the first four-token chunk crossing the remaining grant.
+//! Ordinary requests delegate to the production gateway unchanged. A request carrying an existing
+//! adversarial-output marker takes a bare gRPC branch after authorization: that branch observes the
+//! output cap on the wire but deliberately does not turn it into a seller reservation. It therefore
+//! models a third-party seller that can send a chunk crossing the remaining output allowance.
 
 use crate::seller::auth::AuthRegistry;
 use crate::seller::gateway::{GatewayService, GatewayState};
@@ -78,24 +78,39 @@ impl Gateway for FixtureGateway {
         &self,
         request: Request<StreamRequest>,
     ) -> Result<Response<Self::OpenStreamStream>, Status> {
-        let fat_chunk = is_fat_chunk_request(request.get_ref());
-        authorize_fixture_request(&self.fixture_auth, request.get_ref())?;
-        if !fat_chunk {
+        let adversarial_output = is_adversarial_output_request(request.get_ref());
+        authorize_fixture_request(&self.fixture_auth, request.get_ref())
+            .map_err(|status| *status)?;
+        if !adversarial_output {
             let response = self.production.open_stream(request).await?;
             return Ok(Response::new(Box::pin(response.into_inner())));
         }
 
         let mut request = request.into_inner();
-        let canon = request.request.take().ok_or_else(|| {
-            Status::invalid_argument("fat-chunk fixture has no canonical request")
-        })?;
+        let canon = request
+            .request
+            .take()
+            .ok_or_else(|| Status::invalid_argument("output fixture has no canonical request"))?;
         let wire_max = canon
             .params
             .as_ref()
             .map(|params| u64::from(params.max_tokens))
             .filter(|max| *max > 0)
-            .ok_or_else(|| Status::invalid_argument("fat-chunk fixture has no wire grant"))?;
-        let chunks = wire_max / u64::from(mock::FAT_CHUNK_TOKENS) + 1;
+            .ok_or_else(|| Status::invalid_argument("output fixture has no wire output cap"))?;
+        let prompt = canon
+            .messages
+            .iter()
+            .rev()
+            .find(|message| message.role == "user")
+            .map(|message| message.content.as_str())
+            .unwrap_or("");
+        let chunks = if prompt.contains("DEXDO_FIXTURE_FATCHUNK_COMPLETE") {
+            wire_max / u64::from(mock::FAT_CHUNK_TOKENS)
+        } else if prompt.contains("DEXDO_FIXTURE_FATCHUNK") {
+            wire_max / u64::from(mock::FAT_CHUNK_TOKENS) + 1
+        } else {
+            2
+        };
 
         let (up_tx, mut up_rx) = mpsc::channel(GATEWAY_UPSTREAM_CHANNEL_CAPACITY);
         let (client_tx, client_rx) = mpsc::channel(GATEWAY_CLIENT_CHANNEL_CAPACITY);
@@ -105,12 +120,21 @@ impl Gateway for FixtureGateway {
             });
             while let Some(event) = up_rx.recv().await {
                 match event {
-                    Ok(UpstreamEvent::Chunk { chunk, .. }) => {
+                    Ok(UpstreamEvent::Chunk(chunk)) => {
                         if client_tx.send(Ok(chunk)).await.is_err() {
                             break;
                         }
                     }
-                    Ok(UpstreamEvent::Accounted(_)) => {}
+                    Ok(UpstreamEvent::Usage(usage)) => {
+                        let terminal = dexdo_proto::CanonChunk {
+                            seq: chunks,
+                            usage: Some(usage),
+                            ..Default::default()
+                        };
+                        if client_tx.send(Ok(terminal)).await.is_err() {
+                            break;
+                        }
+                    }
                     Err(status) => {
                         let _ = client_tx.send(Err(status)).await;
                         break;
@@ -125,7 +149,7 @@ impl Gateway for FixtureGateway {
     }
 }
 
-fn is_fat_chunk_request(request: &StreamRequest) -> bool {
+fn is_adversarial_output_request(request: &StreamRequest) -> bool {
     request
         .request
         .as_ref()
@@ -136,21 +160,29 @@ fn is_fat_chunk_request(request: &StreamRequest) -> bool {
                 .rev()
                 .find(|message| message.role == "user")
         })
-        .is_some_and(|message| message.content.contains("DEXDO_FIXTURE_FATCHUNK"))
+        .is_some_and(|message| {
+            message.content.contains("DEXDO_FIXTURE_FATCHUNK")
+                || message.content.contains("DEXDO_FIXTURE_STRADDLE")
+        })
 }
 
-fn authorize_fixture_request(auth: &AuthRegistry, request: &StreamRequest) -> Result<(), Status> {
+fn authorize_fixture_request(
+    auth: &AuthRegistry,
+    request: &StreamRequest,
+) -> Result<(), Box<Status>> {
     let signature: [u8; 64] = request
         .signature
         .as_slice()
         .try_into()
-        .map_err(|_| Status::unauthenticated("bad signature length"))?;
+        .map_err(|_| Box::new(Status::unauthenticated("bad signature length")))?;
     if !auth.verify_response(
         &request.token_contract,
         &request.nonce,
         &Signature(signature),
     ) {
-        return Err(Status::unauthenticated("challenge-response failed"));
+        return Err(Box::new(Status::unauthenticated(
+            "challenge-response failed",
+        )));
     }
     Ok(())
 }

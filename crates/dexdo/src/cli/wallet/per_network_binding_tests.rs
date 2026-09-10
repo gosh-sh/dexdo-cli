@@ -58,7 +58,12 @@ fn chain_binding() -> WalletBinding {
 }
 
 fn net_b_binding() -> WalletBinding {
-    binding(NET_B_ID, crate::cli::wallet::test_network_b(), NET_B_HOT, NET_B_KEY)
+    binding(
+        NET_B_ID,
+        crate::cli::wallet::test_network_b(),
+        NET_B_HOT,
+        NET_B_KEY,
+    )
 }
 
 /// The secrets directory the id names. `open_draft` creates one before any key exists and the
@@ -113,8 +118,14 @@ fn a_net_b_command_refuses_the_chain_binding_instead_of_spending_it() {
     let root = dir.path().join("wallet");
     let store = store_with(&root, &[chain_binding()]);
 
-    let error = resolve_funding_wallet(&store, &crate::cli::wallet::test_network_b(), None, &None, &None)
-        .expect_err("a wallet bound on the chain must never fund a net_b spend");
+    let error = resolve_funding_wallet(
+        &store,
+        &crate::cli::wallet::test_network_b(),
+        None,
+        &None,
+        &None,
+    )
+    .expect_err("a wallet bound on the chain must never fund a net_b spend");
 
     let rendered = format!("{error:#}");
     assert!(
@@ -138,8 +149,14 @@ fn a_net_a_command_refuses_the_net_b_binding_instead_of_spending_it() {
     let root = dir.path().join("wallet");
     let store = store_with(&root, &[net_b_binding()]);
 
-    let error = resolve_funding_wallet(&store, &crate::cli::wallet::test_network_a(), None, &None, &None)
-        .expect_err("a wallet bound on net_b must never fund a net_a spend");
+    let error = resolve_funding_wallet(
+        &store,
+        &crate::cli::wallet::test_network_a(),
+        None,
+        &None,
+        &None,
+    )
+    .expect_err("a wallet bound on net_b must never fund a net_a spend");
     let rendered = format!("{error:#}");
     assert!(
         !rendered.contains(NET_B_HOT),
@@ -155,8 +172,14 @@ fn a_matching_network_resolves_the_binding_it_is_bound_to() {
     let root = dir.path().join("wallet");
     let store = store_with(&root, &[chain_binding()]);
 
-    let resolved = resolve_funding_wallet(&store, &crate::cli::wallet::test_network_a(), None, &None, &None)
-        .expect("a net_a command resolves the net_a binding");
+    let resolved = resolve_funding_wallet(
+        &store,
+        &crate::cli::wallet::test_network_a(),
+        None,
+        &None,
+        &None,
+    )
+    .expect("a net_a command resolves the net_a binding");
     assert_eq!(resolved.address, NET_A_HOT);
     assert_eq!(resolved.key, Some(PathBuf::from(NET_A_KEY)));
 }
@@ -169,10 +192,22 @@ fn two_networks_are_bound_side_by_side_and_each_resolves_its_own_wallet() {
     let root = dir.path().join("wallet");
     let store = store_with(&root, &[chain_binding(), net_b_binding()]);
 
-    let net_a = resolve_funding_wallet(&store, &crate::cli::wallet::test_network_a(), None, &None, &None)
-        .expect("the net_a binding survived the net_b commit");
-    let net_b = resolve_funding_wallet(&store, &crate::cli::wallet::test_network_b(), None, &None, &None)
-        .expect("the net_b binding resolves on net_b");
+    let net_a = resolve_funding_wallet(
+        &store,
+        &crate::cli::wallet::test_network_a(),
+        None,
+        &None,
+        &None,
+    )
+    .expect("the net_a binding survived the net_b commit");
+    let net_b = resolve_funding_wallet(
+        &store,
+        &crate::cli::wallet::test_network_b(),
+        None,
+        &None,
+        &None,
+    )
+    .expect("the net_b binding resolves on net_b");
 
     assert_eq!(net_a.address, NET_A_HOT);
     assert_eq!(net_b.address, NET_B_HOT);
@@ -181,8 +216,12 @@ fn two_networks_are_bound_side_by_side_and_each_resolves_its_own_wallet() {
         "each network must resolve its own Hot, never one shared record"
     );
     assert_eq!(
-        store.binding_path(&crate::cli::wallet::test_network_a()).exists(),
-        store.binding_path(&crate::cli::wallet::test_network_b()).exists(),
+        store
+            .binding_path(&crate::cli::wallet::test_network_a())
+            .exists(),
+        store
+            .binding_path(&crate::cli::wallet::test_network_b())
+            .exists(),
         "both active files must exist: binding one network must not replace the other"
     );
 }
@@ -195,8 +234,14 @@ fn a_network_with_no_binding_of_its_own_is_the_ordinary_fail_fast() {
     let root = dir.path().join("wallet");
     let store = WalletStore::at(&root);
 
-    let error = resolve_funding_wallet(&store, &crate::cli::wallet::test_network_b(), None, &None, &None)
-        .expect_err("no binding at all is still no binding");
+    let error = resolve_funding_wallet(
+        &store,
+        &crate::cli::wallet::test_network_b(),
+        None,
+        &None,
+        &None,
+    )
+    .expect_err("no binding at all is still no binding");
     assert!(
         is_wallet_not_configured(&error),
         "an empty store must still raise E_WALLET_NOT_CONFIGURED: {error:#}"
@@ -223,8 +268,14 @@ fn a_record_sitting_in_the_wrong_networks_slot_is_refused_and_not_obeyed() {
     )
     .expect("copy the record into the other network's slot");
 
-    let error = resolve_funding_wallet(&store, &crate::cli::wallet::test_network_b(), None, &None, &None)
-        .expect_err("a record that says net_a must not fund a net_b spend from a net_b slot");
+    let error = resolve_funding_wallet(
+        &store,
+        &crate::cli::wallet::test_network_b(),
+        None,
+        &None,
+        &None,
+    )
+    .expect_err("a record that says net_a must not fund a net_b spend from a net_b slot");
     let rendered = format!("{error:#}");
     assert!(
         !rendered.contains(NET_A_HOT),
@@ -244,7 +295,10 @@ fn an_explicit_wallet_still_wins_and_is_unaffected_by_the_network() {
     let root = dir.path().join("wallet");
     let store = store_with(&root, &[chain_binding()]);
 
-    for network in [crate::cli::wallet::test_network_a(), crate::cli::wallet::test_network_b()] {
+    for network in [
+        crate::cli::wallet::test_network_a(),
+        crate::cli::wallet::test_network_b(),
+    ] {
         let resolved = resolve_funding_wallet(
             &store,
             &network,
@@ -294,19 +348,29 @@ fn a_legacy_binding_migrates_by_its_own_network_and_not_by_the_asking_one() {
     let legacy_path = write_legacy(&root, &chain_binding());
     let store = WalletStore::at(&root);
 
-    let error = resolve_funding_wallet(&store, &crate::cli::wallet::test_network_b(), None, &None, &None)
-        .expect_err("a legacy net_a binding must not answer a net_b command");
+    let error = resolve_funding_wallet(
+        &store,
+        &crate::cli::wallet::test_network_b(),
+        None,
+        &None,
+        &None,
+    )
+    .expect_err("a legacy net_a binding must not answer a net_b command");
     assert!(
         !format!("{error:#}").contains(NET_A_HOT),
         "the legacy net_a Hot must not reach a net_b spend: {error:#}"
     );
 
     assert!(
-        store.binding_path(&crate::cli::wallet::test_network_a()).exists(),
+        store
+            .binding_path(&crate::cli::wallet::test_network_a())
+            .exists(),
         "the legacy record must be migrated into the slot its own network names"
     );
     assert!(
-        !store.binding_path(&crate::cli::wallet::test_network_b()).exists(),
+        !store
+            .binding_path(&crate::cli::wallet::test_network_b())
+            .exists(),
         "it must NOT be migrated into the slot of the network that happened to ask"
     );
     assert!(
@@ -315,8 +379,14 @@ fn a_legacy_binding_migrates_by_its_own_network_and_not_by_the_asking_one() {
     );
 
     // And it is still the operator's wallet on the network it was bound for.
-    let resolved = resolve_funding_wallet(&store, &crate::cli::wallet::test_network_a(), None, &None, &None)
-        .expect("the migrated binding still funds net_a");
+    let resolved = resolve_funding_wallet(
+        &store,
+        &crate::cli::wallet::test_network_a(),
+        None,
+        &None,
+        &None,
+    )
+    .expect("the migrated binding still funds net_a");
     assert_eq!(resolved.address, NET_A_HOT);
     assert_eq!(resolved.key, Some(PathBuf::from(NET_A_KEY)));
 }
@@ -330,11 +400,19 @@ fn a_legacy_binding_keeps_working_on_the_network_it_was_bound_for() {
     let legacy_path = write_legacy(&root, &chain_binding());
     let store = WalletStore::at(&root);
 
-    let resolved = resolve_funding_wallet(&store, &crate::cli::wallet::test_network_a(), None, &None, &None)
-        .expect("an existing operator is not locked out by the upgrade");
+    let resolved = resolve_funding_wallet(
+        &store,
+        &crate::cli::wallet::test_network_a(),
+        None,
+        &None,
+        &None,
+    )
+    .expect("an existing operator is not locked out by the upgrade");
     assert_eq!(resolved.address, NET_A_HOT);
     assert!(!legacy_path.exists());
-    assert!(store.binding_path(&crate::cli::wallet::test_network_a()).exists());
+    assert!(store
+        .binding_path(&crate::cli::wallet::test_network_a())
+        .exists());
 }
 
 /// Migration runs once and is safe to repeat: the second read finds no legacy file and the same
@@ -346,10 +424,22 @@ fn migrating_twice_changes_nothing() {
     write_legacy(&root, &chain_binding());
     let store = WalletStore::at(&root);
 
-    let first = resolve_funding_wallet(&store, &crate::cli::wallet::test_network_a(), None, &None, &None)
-        .expect("first read migrates");
-    let second = resolve_funding_wallet(&store, &crate::cli::wallet::test_network_a(), None, &None, &None)
-        .expect("second read finds the migrated record");
+    let first = resolve_funding_wallet(
+        &store,
+        &crate::cli::wallet::test_network_a(),
+        None,
+        &None,
+        &None,
+    )
+    .expect("first read migrates");
+    let second = resolve_funding_wallet(
+        &store,
+        &crate::cli::wallet::test_network_a(),
+        None,
+        &None,
+        &None,
+    )
+    .expect("second read finds the migrated record");
     assert_eq!(first, second);
 }
 
@@ -360,11 +450,17 @@ fn an_interrupted_migration_is_completed_rather_than_reported() {
     let dir = tempfile::tempdir().unwrap();
     let root = dir.path().join("wallet");
     let record = chain_binding();
-    let store = store_with(&root, &[record.clone()]);
+    let store = store_with(&root, std::slice::from_ref(&record));
     let legacy_path = write_legacy(&root, &record);
 
-    let resolved = resolve_funding_wallet(&store, &crate::cli::wallet::test_network_a(), None, &None, &None)
-        .expect("identical records are not a conflict");
+    let resolved = resolve_funding_wallet(
+        &store,
+        &crate::cli::wallet::test_network_a(),
+        None,
+        &None,
+        &None,
+    )
+    .expect("identical records are not a conflict");
     assert_eq!(resolved.address, NET_A_HOT);
     assert!(!legacy_path.exists(), "the duplicate must be cleared");
 }
@@ -385,8 +481,14 @@ fn a_legacy_binding_that_disagrees_with_a_migrated_one_refuses_rather_than_picki
     );
     let legacy_path = write_legacy(&root, &other);
 
-    let error = resolve_funding_wallet(&store, &crate::cli::wallet::test_network_a(), None, &None, &None)
-        .expect_err("two different records for one network must not be silently ranked");
+    let error = resolve_funding_wallet(
+        &store,
+        &crate::cli::wallet::test_network_a(),
+        None,
+        &None,
+        &None,
+    )
+    .expect_err("two different records for one network must not be silently ranked");
     let rendered = format!("{error:#}");
     assert!(
         rendered.contains("4::a-different-hot") && rendered.contains(NET_A_HOT),
@@ -408,8 +510,14 @@ fn an_unparseable_legacy_binding_is_refused_rather_than_treated_as_absent() {
     std::fs::write(root.join("binding.json"), b"{ this is not json").unwrap();
     let store = WalletStore::at(&root);
 
-    let error = resolve_funding_wallet(&store, &crate::cli::wallet::test_network_a(), None, &None, &None)
-        .expect_err("a legacy record that cannot be read must not be treated as absent");
+    let error = resolve_funding_wallet(
+        &store,
+        &crate::cli::wallet::test_network_a(),
+        None,
+        &None,
+        &None,
+    )
+    .expect_err("a legacy record that cannot be read must not be treated as absent");
     assert!(
         !is_wallet_not_configured(&error),
         "an unreadable binding is a different problem from an absent one: {error:#}"
@@ -491,13 +599,22 @@ fn every_committed_manifest_keys_a_binding_of_its_own() {
         }
         let deployed = dexdo_core::Deployed::load(&path)
             .unwrap_or_else(|error| panic!("load {name}: {error}"));
-        let network = WalletNetwork::from_manifest_label(&deployed.network)
-            .unwrap_or_else(|error| panic!("{name} declares a label the wallet layer refuses: {error}"));
+        let network =
+            WalletNetwork::from_manifest_label(&deployed.network).unwrap_or_else(|error| {
+                panic!("{name} declares a label the wallet layer refuses: {error}")
+            });
 
         if let Some(other) = seen.insert(network.as_str().to_string(), name.to_string()) {
-            panic!("{name} and {other} both key the binding `{}`", network.as_str());
+            panic!(
+                "{name} and {other} both key the binding `{}`",
+                network.as_str()
+            );
         }
     }
 
-    assert!(!seen.is_empty(), "no committed manifest was found in {}", dir.display());
+    assert!(
+        !seen.is_empty(),
+        "no committed manifest was found in {}",
+        dir.display()
+    );
 }

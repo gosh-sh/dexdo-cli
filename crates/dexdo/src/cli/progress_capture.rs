@@ -161,10 +161,7 @@ impl Drop for ProverOutputFold {
 }
 
 #[cfg(unix)]
-fn drain(
-    lines: std::io::Lines<std::io::BufReader<std::fs::File>>,
-    shared: &Arc<Mutex<Shared>>,
-) {
+fn drain(lines: std::io::Lines<std::io::BufReader<std::fs::File>>, shared: &Arc<Mutex<Shared>>) {
     // The distance the chain had to cover when this wait was first seen. The prover reports the
     // remaining distance and never the span, so the first sighting is the only denominator there
     // is -- and a bar drawn from an invented one would be a lie told in a picture.
@@ -261,7 +258,10 @@ fn chain_wait(line: &str) -> Option<(u64, u64)> {
 /// The number that follows `key`, up to the first character that cannot be part of it.
 fn field_after(text: &str, key: &str) -> Option<u64> {
     let start = text.find(key)? + key.len();
-    let digits: String = text[start..].chars().take_while(char::is_ascii_digit).collect();
+    let digits: String = text[start..]
+        .chars()
+        .take_while(char::is_ascii_digit)
+        .collect();
     digits.parse().ok()
 }
 
@@ -279,7 +279,10 @@ fn field_after(text: &str, key: &str) -> Option<u64> {
 fn prover_chatter(line: &str) -> Option<String> {
     let line = line.trim();
     for (opening, phase) in [
-        ("Loading cached KZG SRS", "proving: loading the reference string"),
+        (
+            "Loading cached KZG SRS",
+            "proving: loading the reference string",
+        ),
         ("Generating proof", "proving: generating the proof"),
         ("Proof:", "proving: proof produced"),
     ] {
@@ -331,7 +334,8 @@ mod tests {
     /// characters were a file path the operator is not being asked to open.
     #[test]
     fn a_recovery_note_keeps_its_first_clause_and_drops_the_path() {
-        let line = "note deploy recovery: recorded deposit voucher proof in /tmp/pool.recovery.json; \
+        let line =
+            "note deploy recovery: recorded deposit voucher proof in /tmp/pool.recovery.json; \
                     reruns will not re-spend this voucher.";
         let phase = phase_of(line).expect("a recovery note is a phase");
         assert_eq!(phase, "recovery: recorded deposit voucher proof");
@@ -363,8 +367,14 @@ mod tests {
     /// is worse than none, because it renders as progress that is not being measured.
     #[test]
     fn a_line_without_both_numbers_is_not_a_chain_wait() {
-        assert_eq!(chain_wait("[halo2-live] L0: target=8942208, latest=None"), None);
-        assert_eq!(chain_wait("[halo2-time] generate_proof (warm): 9.91s"), None);
+        assert_eq!(
+            chain_wait("[halo2-live] L0: target=8942208, latest=None"),
+            None
+        );
+        assert_eq!(
+            chain_wait("[halo2-time] generate_proof (warm): 9.91s"),
+            None
+        );
     }
 
     /// A colon that is part of the message, not a duration separator, must not truncate it.

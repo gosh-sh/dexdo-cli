@@ -28,7 +28,9 @@ async fn accepted_request_then_refusal(
     )
     .await
     .expect_err("the accepted request has not funded the Hot yet");
-    assert!(first_error.chain().any(|cause| cause.to_string().contains("timed out")));
+    assert!(first_error
+        .chain()
+        .any(|cause| cause.to_string().contains("timed out")));
     let pending = record(dir.path()).expect("the timeout retains the accepted request");
     assert_eq!(pending.state, FundingState::Submitted);
     assert_eq!(pending.pending_transaction_id.as_deref(), Some("pending"));

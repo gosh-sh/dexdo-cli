@@ -18,15 +18,11 @@ pub(crate) const SCOPE_OWNER_RESTING: &str = "owner-resting-orders";
 /// Only asks a buy could actually match (`market`).
 pub(crate) const SCOPE_EXECUTABLE_ASKS: &str = "executable-asks";
 /// Raw indexer levels; neither expiry nor TokenContract liveness is applied (`market-data depth`).
-pub(crate) const SCOPE_RAW_INDEXER_LEVELS_UNGATED: &str =
-    "raw-indexer-levels-ungated";
+pub(crate) const SCOPE_RAW_INDEXER_LEVELS_UNGATED: &str = "raw-indexer-levels-ungated";
 
 /// Wall-clock seconds at which the snapshot was read. A pre-epoch clock is an error.
-pub(crate) fn now_unix_at(
-    now: std::time::SystemTime,
-) -> Result<u64, dexdo_core::ChainError> {
-    now
-        .duration_since(std::time::UNIX_EPOCH)
+pub(crate) fn now_unix_at(now: std::time::SystemTime) -> Result<u64, dexdo_core::ChainError> {
+    now.duration_since(std::time::UNIX_EPOCH)
         .map(|elapsed| elapsed.as_secs())
         .map_err(|error| {
             dexdo_core::ChainError::Chain(format!(

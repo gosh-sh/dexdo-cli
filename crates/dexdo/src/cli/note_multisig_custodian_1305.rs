@@ -76,10 +76,14 @@ fn the_getter_reader_normalizes_through_the_shared_function() {
 fn a_custodian_is_recognized_in_every_rendering() {
     for rendering in RENDERINGS {
         for derived in RENDERINGS {
-            ensure_multisig_private_key_is_custodian(FUNDING_WALLET, derived, &custodians(&[rendering]))
-                .unwrap_or_else(|error| {
-                    panic!("custodian {rendering} must accept the same key spelled {derived}: {error}")
-                });
+            ensure_multisig_private_key_is_custodian(
+                FUNDING_WALLET,
+                derived,
+                &custodians(&[rendering]),
+            )
+            .unwrap_or_else(|error| {
+                panic!("custodian {rendering} must accept the same key spelled {derived}: {error}")
+            });
         }
     }
 }
