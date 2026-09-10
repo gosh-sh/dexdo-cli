@@ -32,6 +32,7 @@ use dexdo_core::{
     SellOfferOutcome, TokenContract, SUBSCRIPTION_MAX_TICKS, SUBSCRIPTION_WEEKS,
 };
 use gateway::{GatewayService, GatewayState};
+use sha2::{Digest, Sha256};
 use std::io::Write as _;
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
@@ -133,12 +134,38 @@ pub(crate) struct SellerOfferSubmission {
     #[serde(default)]
     event_since_unix: Option<u64>,
     submitted_at_unix: u64,
+    /// A one-shot permit created only by the explicit audited recovery command.
+    /// Normal service/controller startup deliberately never consumes it.
+    #[serde(default)]
+    manual_recovery: Option<SellerOfferManualRecoveryPermit>,
 }
 
 impl SellerOfferSubmission {
     fn event_since_unix(&self) -> u64 {
         self.event_since_unix.unwrap_or(self.submitted_at_unix)
     }
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+struct SellerOfferManualRecoveryPermit {
+    version: u32,
+    audit_path: String,
+    audit_sha256: String,
+    authorized_at_unix: u64,
+    #[serde(default)]
+    consumed_at_unix: Option<u64>,
+}
+
+#[derive(serde::Serialize)]
+struct SellerOfferManualRecoveryAudit<'a> {
+    version: u32,
+    #[serde(with = "dexdo_core::address::serde_self_dapp")]
+    token_contract: &'a TokenContract,
+    marker_sha256: String,
+    evidence_cursor_unix: u64,
+    evidence_outcome: &'static str,
+    authorized_at_unix: u64,
 }
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
@@ -451,6 +478,7 @@ pub(crate) fn persist_offer_submission(
             submitted_at_unix.saturating_sub(dexdo_core::params::SELLER_OFFER_EVENT_LOOKBACK_SECS),
         ),
         submitted_at_unix,
+        manual_recovery: None,
     };
     cursor.publication = Some(marker.clone());
     cursor.save(cursor_path)?;
@@ -464,6 +492,167 @@ pub(crate) fn clear_offer_submission(
     let _lock = lock_offer_submission(cursor_path)?;
     let mut cursor = SellerMatchWatchCursor::load_or_new(cursor_path, token_contract)?;
     cursor.publication = None;
+    cursor.save(cursor_path)
+}
+
+fn sha256_hex(bytes: &[u8]) -> String {
+    Sha256::digest(bytes)
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect()
+}
+
+fn write_immutable_manual_recovery_audit(
+    cursor_path: &Path,
+    token_contract: &TokenContract,
+    marker: &SellerOfferSubmission,
+    authorized_at_unix: u64,
+) -> Result<SellerOfferManualRecoveryPermit> {
+    let marker_sha256 = sha256_hex(&serde_json::to_vec(marker)?);
+    let audit = SellerOfferManualRecoveryAudit {
+        version: 1,
+        token_contract,
+        marker_sha256,
+        evidence_cursor_unix: marker.event_since_unix(),
+        evidence_outcome: "exact_negative",
+        authorized_at_unix,
+    };
+    let audit_bytes = serde_json::to_vec_pretty(&audit)?;
+    let audit_sha256 = sha256_hex(&audit_bytes);
+    let parent = cursor_path.parent().ok_or_else(|| {
+        anyhow!(
+            "seller publication marker {} has no parent directory",
+            cursor_path.display()
+        )
+    })?;
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_err(|error| anyhow!("manual recovery clock before epoch: {error}"))?
+        .as_nanos();
+    let audit_path = parent.join(format!(
+        ".{}.publication-recovery.{}.{}.json",
+        cursor_path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or("seller-watch"),
+        authorized_at_unix,
+        nanos
+    ));
+    let mut file = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&audit_path)
+        .map_err(|error| {
+            anyhow!(
+                "create immutable manual recovery audit {}: {error}",
+                audit_path.display()
+            )
+        })?;
+    file.write_all(&audit_bytes)
+        .and_then(|()| file.sync_all())
+        .map_err(|error| {
+            anyhow!(
+                "write immutable manual recovery audit {}: {error}",
+                audit_path.display()
+            )
+        })?;
+    sync_seller_cursor_parent(parent)?;
+    Ok(SellerOfferManualRecoveryPermit {
+        version: 1,
+        audit_path: audit_path.display().to_string(),
+        audit_sha256,
+        authorized_at_unix,
+        consumed_at_unix: None,
+    })
+}
+
+/// Explicitly authorize one fresh seller start after an old marked publication
+/// has been proven absent.  This is deliberately separate from ordinary
+/// startup: a controller/timer cannot obtain this permit by merely restarting.
+pub(crate) async fn authorize_exact_negative_manual_recovery(
+    chain: &dyn ChainBackend,
+    cfg: &SellerConfig,
+    expected_owner: &str,
+    cursor_path: &Path,
+    operator_token_contract: &str,
+) -> Result<()> {
+    if !operator_token_contract.eq_ignore_ascii_case(&cfg.token_contract) {
+        bail!(
+            "manual publication recovery contract {} does not match selected TokenContract {}",
+            display_token_contract(operator_token_contract),
+            display_token_contract(&cfg.token_contract)
+        );
+    }
+    let _lock = lock_offer_submission(cursor_path)?;
+    let mut cursor = SellerMatchWatchCursor::load_or_new(cursor_path, &cfg.token_contract)?;
+    let marker = cursor.publication.as_ref().ok_or_else(|| {
+        publication_unconfirmed(
+            &cfg.token_contract,
+            "manual recovery requires an existing retained publication marker",
+        )
+    })?;
+    if marker.manual_recovery.is_some() {
+        bail!(
+            "manual publication recovery is already authorized for {}; a controller cannot consume it and a second authorization is refused",
+            display_token_contract(&cfg.token_contract)
+        );
+    }
+    match reconcile_pending_offer_submission(chain, cfg, Some(expected_owner), marker).await? {
+        PendingPublicationResolution::Negative => {}
+        PendingPublicationResolution::Resting { order_id } => bail!(
+            "manual publication recovery refused for {}: exact raw SELL is resting as order {order_id}",
+            display_token_contract(&cfg.token_contract)
+        ),
+        PendingPublicationResolution::Funded => bail!(
+            "manual publication recovery refused for {}: exact match is funded",
+            display_token_contract(&cfg.token_contract)
+        ),
+    }
+    let authorized_at_unix = now_unix()?;
+    // The audit is committed first.  A crash before the cursor permit is saved
+    // leaves an orphan immutable record but never enables a repost.
+    let permit = write_immutable_manual_recovery_audit(
+        cursor_path,
+        &cfg.token_contract,
+        marker,
+        authorized_at_unix,
+    )?;
+    cursor
+        .publication
+        .as_mut()
+        .expect("marker was checked above")
+        .manual_recovery = Some(permit);
+    cursor.save(cursor_path)
+}
+
+/// Consume a durable audited permit before the single explicit post path.
+/// The consumed bit is persisted before any chain write, so a crash cannot
+/// turn a service restart into another manual recovery attempt.
+pub(crate) fn consume_exact_negative_manual_recovery(
+    cursor_path: &Path,
+    token_contract: &TokenContract,
+) -> Result<()> {
+    let _lock = lock_offer_submission(cursor_path)?;
+    let mut cursor = SellerMatchWatchCursor::load_or_new(cursor_path, token_contract)?;
+    let marker = cursor.publication.as_mut().ok_or_else(|| {
+        publication_unconfirmed(
+            token_contract,
+            "manual recovery permit disappeared before the explicit post",
+        )
+    })?;
+    let permit = marker.manual_recovery.as_mut().ok_or_else(|| {
+        publication_unconfirmed(
+            token_contract,
+            "manual recovery has no durable audited permit",
+        )
+    })?;
+    if permit.consumed_at_unix.is_some() {
+        bail!(
+            "manual publication recovery permit for {} was already consumed; automatic restart remains refused",
+            display_token_contract(token_contract)
+        );
+    }
+    permit.consumed_at_unix = Some(now_unix()?);
     cursor.save(cursor_path)
 }
 
@@ -2119,6 +2308,108 @@ mod tests {
             flags: 0,
             timestamp: 1,
         }
+    }
+
+    #[tokio::test]
+    async fn manual_publication_recovery_requires_new_exact_negative_proof_and_writes_audit() {
+        let tc = chain_address('a');
+        let owner = chain_address('b');
+        let cfg = test_cfg(&tc);
+        let backend = StartupBackend::without_match(RawStartupRead::Orders(Vec::new()))
+            .with_offer_latch(false)
+            .with_offer_outcome(None);
+        let (dir, cursor) = temp_cursor_path("manual-publication-negative");
+        persist_offer_submission(&cursor, &tc).unwrap();
+
+        authorize_exact_negative_manual_recovery(&backend, &cfg, &owner, &cursor, &tc)
+            .await
+            .expect("only an exact negative proof may authorize recovery");
+        let marker = pending_offer_submission(&cursor, &tc)
+            .unwrap()
+            .expect("marker stays until the one-shot post is reconciled");
+        let permit = marker.manual_recovery.expect("durable manual permit");
+        let audit = std::fs::read_to_string(&permit.audit_path).expect("immutable audit exists");
+        assert!(audit.contains("exact_negative"), "{audit}");
+        assert!(audit.contains("marker_sha256"), "{audit}");
+        assert!(audit.contains("evidence_cursor_unix"), "{audit}");
+        assert!(permit.consumed_at_unix.is_none());
+        assert!(permit
+            .audit_path
+            .starts_with(&dir.path().display().to_string()));
+
+        consume_exact_negative_manual_recovery(&cursor, &tc).expect("consume exactly once");
+        let second = consume_exact_negative_manual_recovery(&cursor, &tc)
+            .expect_err("crash/restart cannot consume the same permit twice");
+        assert!(
+            second.to_string().contains("already consumed"),
+            "{second:#}"
+        );
+    }
+
+    #[tokio::test]
+    async fn manual_publication_recovery_refuses_positive_or_unreadable_evidence() {
+        let tc = chain_address('a');
+        let owner = chain_address('b');
+        let cfg = test_cfg(&tc);
+        let resting = raw_sell(
+            77,
+            &owner,
+            Some(&tc),
+            u128::from(cfg.price_per_tick),
+            u128::from(cfg.max_ticks),
+        );
+        let positive = StartupBackend::without_match(RawStartupRead::Orders(vec![resting]));
+        let (_dir, cursor) = temp_cursor_path("manual-publication-positive");
+        persist_offer_submission(&cursor, &tc).unwrap();
+        let error = authorize_exact_negative_manual_recovery(&positive, &cfg, &owner, &cursor, &tc)
+            .await
+            .expect_err("resting exact SELL must refuse manual recovery");
+        assert!(error.to_string().contains("resting"), "{error:#}");
+        assert!(pending_offer_submission(&cursor, &tc)
+            .unwrap()
+            .unwrap()
+            .manual_recovery
+            .is_none());
+
+        let unreadable = StartupBackend::without_match(RawStartupRead::Orders(Vec::new()))
+            .with_offer_latch(false)
+            .with_offer_outcome_failure("event API timeout");
+        let (_dir, cursor) = temp_cursor_path("manual-publication-unreadable");
+        persist_offer_submission(&cursor, &tc).unwrap();
+        let error =
+            authorize_exact_negative_manual_recovery(&unreadable, &cfg, &owner, &cursor, &tc)
+                .await
+                .expect_err("unreadable evidence must remain fail closed");
+        assert!(
+            error.to_string().contains("publication_unconfirmed"),
+            "{error:#}"
+        );
+        assert!(pending_offer_submission(&cursor, &tc)
+            .unwrap()
+            .unwrap()
+            .manual_recovery
+            .is_none());
+    }
+
+    #[tokio::test]
+    async fn manual_publication_recovery_lock_excludes_a_second_operator() {
+        let tc = chain_address('a');
+        let owner = chain_address('b');
+        let cfg = test_cfg(&tc);
+        let backend = StartupBackend::without_match(RawStartupRead::Orders(Vec::new()))
+            .with_offer_latch(false)
+            .with_offer_outcome(None);
+        let (_dir, cursor) = temp_cursor_path("manual-publication-lock");
+        persist_offer_submission(&cursor, &tc).unwrap();
+        let held = lock_offer_submission(&cursor).expect("hold first operator lock");
+        let error = authorize_exact_negative_manual_recovery(&backend, &cfg, &owner, &cursor, &tc)
+            .await
+            .expect_err("second operator must not obtain a permit concurrently");
+        assert!(
+            error.to_string().contains("durable publication lock"),
+            "{error:#}"
+        );
+        drop(held);
     }
 
     #[tokio::test]

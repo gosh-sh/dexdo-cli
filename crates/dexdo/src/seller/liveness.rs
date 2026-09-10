@@ -1,5 +1,6 @@
 use super::{
-    clear_offer_submission, inspect_seller_offer, pending_offer_submission,
+    authorize_exact_negative_manual_recovery, clear_offer_submission,
+    consume_exact_negative_manual_recovery, inspect_seller_offer, pending_offer_submission,
     persist_offer_submission, prepare_seller_offer, reconcile_pending_offer_submission,
     validate_resting_offer, wait_for_match, RunningSeller, SellerConfig, SellerMatchWatchConfig,
     SellerOfferInspection, SellerOfferStartup,
@@ -2189,6 +2190,79 @@ where
     }
 }
 
+/// The only route that may make a fresh post after a retained marker has an
+/// exact negative proof.  Its caller must be an explicit operator command;
+/// ordinary liveness/controller startup always uses the wrapper above and
+/// remains unable to consume this permit.
+pub async fn prepare_seller_offer_with_audited_manual_recovery_liveness<S>(
+    seller: &RunningSeller,
+    chain: &dyn ChainBackend,
+    cfg: &SellerConfig,
+    expected_owner: &str,
+    existing_identity: Option<&RestingOfferIdentity>,
+    cursor_path: &Path,
+    operator_token_contract: &str,
+    shutdown: S,
+    advertise_probe: AdvertiseProbePolicy,
+) -> Result<SellerStartupOutcome>
+where
+    S: Future<Output = ()>,
+{
+    authorize_exact_negative_manual_recovery(
+        chain,
+        cfg,
+        expected_owner,
+        cursor_path,
+        operator_token_contract,
+    )
+    .await?;
+    // Persist this one-shot transition before `prepare_seller_offer_with_liveness`
+    // reaches its only post path. A process crash here is conservative: another
+    // automatic run sees the consumed marker and remains blocked.
+    consume_exact_negative_manual_recovery(cursor_path, &cfg.token_contract)?;
+    let started = prepare_seller_offer_with_liveness(
+        seller,
+        chain,
+        cfg,
+        expected_owner,
+        existing_identity,
+        shutdown,
+        advertise_probe,
+    )
+    .await;
+    let marker = pending_offer_submission(cursor_path, &cfg.token_contract)?.ok_or_else(|| {
+        anyhow!(
+            "publication_unconfirmed token_contract={}: audited manual recovery marker disappeared before reconciliation",
+            display_token_contract(&cfg.token_contract)
+        )
+    })?;
+    match reconcile_pending_offer_submission(chain, cfg, Some(expected_owner), &marker).await {
+        Ok(super::PendingPublicationResolution::Resting { order_id }) => {
+            clear_offer_submission(cursor_path, &cfg.token_contract)?;
+            match started {
+                Ok(SellerStartupOutcome::Stopped { .. }) => Ok(SellerStartupOutcome::Ready(
+                    SellerOfferStartup::ResumedResting { order_id },
+                )),
+                other => other,
+            }
+        }
+        Ok(super::PendingPublicationResolution::Funded) => {
+            clear_offer_submission(cursor_path, &cfg.token_contract)?;
+            match started {
+                Ok(SellerStartupOutcome::Stopped { .. }) => Ok(SellerStartupOutcome::Ready(
+                    SellerOfferStartup::ResumedFunded,
+                )),
+                other => other,
+            }
+        }
+        Ok(super::PendingPublicationResolution::Negative) => Err(anyhow!(
+            "publication_unconfirmed token_contract={}: audited manual recovery post has an exact negative proof; the consumed marker is retained and no automatic retry is permitted",
+            display_token_contract(&cfg.token_contract)
+        )),
+        Err(error) => Err(error),
+    }
+}
+
 #[derive(Clone, Copy)]
 struct SupervisionTiming {
     health_interval: Duration,
@@ -3459,6 +3533,44 @@ mod tests {
                 .unwrap()
                 .is_some());
         }
+        seller.server_task.abort();
+    }
+
+    #[tokio::test]
+    async fn explicit_audited_recovery_is_the_only_liveness_route_that_reposts_a_negative_marker() {
+        let seller = super::super::start_gateway_with_note(
+            "127.0.0.1:0".parse().unwrap(),
+            UpstreamConfig::Mock,
+            Arc::new(LocalNote::generate()),
+        )
+        .await
+        .unwrap();
+        wait_for_gateway_ready(&seller).await;
+        let owner = address('a');
+        let tc = address('b');
+        let config = cfg_for_seller(&tc, &seller);
+        let backend = CancelBackend::new(Vec::new(), owner.clone(), 701, CancelBehavior::Remove);
+        let (_dir, watch) = watch("publication-explicit-manual-recovery");
+        persist_offer_submission(&watch.cursor_path, &tc).unwrap();
+
+        let outcome = prepare_seller_offer_with_audited_manual_recovery_liveness(
+            &seller,
+            &backend,
+            &config,
+            &owner,
+            None,
+            &watch.cursor_path,
+            &tc,
+            std::future::pending(),
+            AdvertiseProbePolicy::default(),
+        )
+        .await
+        .expect("explicit audited recovery may make exactly one replacement post");
+        assert!(matches!(outcome, SellerStartupOutcome::Ready(_)));
+        assert_eq!(backend.posts.load(Ordering::Relaxed), 1);
+        assert!(pending_offer_submission(&watch.cursor_path, &tc)
+            .unwrap()
+            .is_none());
         seller.server_task.abort();
     }
 
