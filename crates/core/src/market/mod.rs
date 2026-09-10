@@ -160,6 +160,22 @@ pub trait ChainBackend: Send + Sync {
     ) -> Result<Option<SellOfferOutcome>, ChainError> {
         Ok(None)
     }
+    /// Read the owner-note placement/match facts for one exact TokenContract
+    /// from a durable event lower bound.  This is intentionally separate from
+    /// `confirm_offer_outcome`: reconciliation after a service restart cannot
+    /// depend on a backend-local "post started" timestamp that vanished with
+    /// the old process.  A backend which cannot make this authoritative read
+    /// must return an error so a persisted seller marker remains fail-closed.
+    async fn seller_offer_outcome_since(
+        &self,
+        _token_contract: &TokenContract,
+        _since_unix: u64,
+    ) -> Result<Option<SellOfferOutcome>, ChainError> {
+        Err(ChainError::Chain(
+            "marker-bounded seller offer event reconciliation is not supported by this backend"
+                .to_string(),
+        ))
+    }
     /// Read the exact deal's post-offer latch.  This is deliberately separate from a
     /// book row: a successful `postSellOffer` can be accepted before an index/read
     /// path catches up, and a returned placement value is not by itself a proof that

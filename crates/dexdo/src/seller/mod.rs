@@ -128,7 +128,17 @@ pub(crate) struct SellerOfferSubmission {
     version: u32,
     #[serde(with = "dexdo_core::address::serde_self_dapp")]
     token_contract: TokenContract,
+    /// Lower bound for the owner-note event scan.  Unlike the old backend-local
+    /// timestamp, this survives a process restart.
+    #[serde(default)]
+    event_since_unix: Option<u64>,
     submitted_at_unix: u64,
+}
+
+impl SellerOfferSubmission {
+    fn event_since_unix(&self) -> u64 {
+        self.event_since_unix.unwrap_or(self.submitted_at_unix)
+    }
 }
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
@@ -296,11 +306,19 @@ impl SellerMatchWatchCursor {
                 })?;
             }
         }
-        let tmp = path.with_extension(format!("json.tmp.{}", std::process::id()));
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_err(|error| anyhow!("seller watch cursor clock before epoch: {error}"))?
+            .as_nanos();
+        let tmp = path.with_extension(format!("json.tmp.{}.{}", std::process::id(), nanos));
         let bytes = serde_json::to_vec_pretty(self)?;
-        let mut file = std::fs::File::create(&tmp).map_err(|e| {
-            anyhow::anyhow!("create seller watch cursor temp {}: {e}", tmp.display())
-        })?;
+        let mut file = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&tmp)
+            .map_err(|e| {
+                anyhow::anyhow!("create seller watch cursor temp {}: {e}", tmp.display())
+            })?;
         file.write_all(&bytes)
             .and_then(|()| file.sync_all())
             .map_err(|e| {
@@ -312,8 +330,77 @@ impl SellerMatchWatchCursor {
                 path.display(),
                 tmp.display()
             )
-        })
+        })?;
+        if let Some(parent) = path.parent() {
+            if !parent.as_os_str().is_empty() {
+                sync_seller_cursor_parent(parent)?;
+            }
+        }
+        Ok(())
     }
+}
+
+/// A rename is not crash-durable on Unix until its containing directory has
+/// been synced.  Windows' rename API is already write-through at this layer;
+/// `File::sync_all` on a directory is not supported there.
+#[cfg(unix)]
+fn sync_seller_cursor_parent(parent: &Path) -> Result<()> {
+    std::fs::File::open(parent)
+        .and_then(|directory| directory.sync_all())
+        .map_err(|error| anyhow!("sync seller watch cursor dir {}: {error}", parent.display()))
+}
+
+#[cfg(not(unix))]
+fn sync_seller_cursor_parent(_parent: &Path) -> Result<()> {
+    Ok(())
+}
+
+/// Serializes durable publication-marker mutation across independently started
+/// CLI and service processes.  The marker itself is the long-lived fence; this
+/// short-lived lock only closes the read-none/write-marker race.
+struct SellerOfferSubmissionLock {
+    path: PathBuf,
+    _file: std::fs::File,
+}
+
+impl Drop for SellerOfferSubmissionLock {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.path);
+        if let Some(parent) = self.path.parent() {
+            let _ = sync_seller_cursor_parent(parent);
+        }
+    }
+}
+
+fn lock_offer_submission(cursor_path: &Path) -> Result<SellerOfferSubmissionLock> {
+    let parent = cursor_path.parent().ok_or_else(|| {
+        anyhow!(
+            "seller publication marker {} has no parent directory",
+            cursor_path.display()
+        )
+    })?;
+    std::fs::create_dir_all(parent).map_err(|error| {
+        anyhow!(
+            "create seller publication marker directory {}: {error}",
+            parent.display()
+        )
+    })?;
+    let path = cursor_path.with_extension("publication.lock");
+    let file = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&path)
+        .map_err(|error| {
+            anyhow!(
+                "publication_unconfirmed token_contract cursor={}: durable publication lock {} is held or unreadable ({error}); no automatic postSellOffer retry is permitted",
+                cursor_path.display(),
+                path.display()
+            )
+        })?;
+    file.sync_all()
+        .map_err(|error| anyhow!("sync seller publication lock {}: {error}", path.display()))?;
+    sync_seller_cursor_parent(parent)?;
+    Ok(SellerOfferSubmissionLock { path, _file: file })
 }
 
 pub(crate) fn pending_offer_submission(
@@ -345,7 +432,8 @@ pub(crate) fn pending_offer_submission(
 pub(crate) fn persist_offer_submission(
     cursor_path: &Path,
     token_contract: &TokenContract,
-) -> Result<()> {
+) -> Result<SellerOfferSubmission> {
+    let _lock = lock_offer_submission(cursor_path)?;
     let mut cursor = SellerMatchWatchCursor::load_or_new(cursor_path, token_contract)?;
     if cursor.publication.is_some() {
         bail!(
@@ -354,18 +442,26 @@ pub(crate) fn persist_offer_submission(
             display_token_contract(token_contract)
         );
     }
-    cursor.publication = Some(SellerOfferSubmission {
+    let submitted_at_unix = now_unix()?;
+    let marker = SellerOfferSubmission {
         version: SELLER_OFFER_SUBMISSION_VERSION,
         token_contract: token_contract.clone(),
-        submitted_at_unix: now_unix()?,
-    });
-    cursor.save(cursor_path)
+        // This margin is a durable event cursor, not an in-memory post clock.
+        event_since_unix: Some(
+            submitted_at_unix.saturating_sub(dexdo_core::params::SELLER_OFFER_EVENT_LOOKBACK_SECS),
+        ),
+        submitted_at_unix,
+    };
+    cursor.publication = Some(marker.clone());
+    cursor.save(cursor_path)?;
+    Ok(marker)
 }
 
 pub(crate) fn clear_offer_submission(
     cursor_path: &Path,
     token_contract: &TokenContract,
 ) -> Result<()> {
+    let _lock = lock_offer_submission(cursor_path)?;
     let mut cursor = SellerMatchWatchCursor::load_or_new(cursor_path, token_contract)?;
     cursor.publication = None;
     cursor.save(cursor_path)
@@ -827,6 +923,7 @@ pub(crate) async fn reconcile_pending_offer_submission(
     chain: &dyn ChainBackend,
     cfg: &SellerConfig,
     expected_owner: Option<&str>,
+    marker: &SellerOfferSubmission,
 ) -> Result<PendingPublicationResolution> {
     match inspect_seller_offer(chain, cfg, expected_owner).await {
         Ok(SellerOfferInspection::Funded) => return Ok(PendingPublicationResolution::Funded),
@@ -854,12 +951,15 @@ pub(crate) async fn reconcile_pending_offer_submission(
         })?;
 
     let outcome = chain
-        .confirm_offer_outcome(&cfg.token_contract)
+        .seller_offer_outcome_since(&cfg.token_contract, marker.event_since_unix())
         .await
         .map_err(|error| {
             publication_unconfirmed(
                 &cfg.token_contract,
-                format!("marker-bounded event/outcome reconciliation is unreadable: {error}"),
+                format!(
+                    "marker-bounded event/outcome reconciliation since {} is unreadable: {error}",
+                    marker.event_since_unix()
+                ),
             )
         })?;
     match outcome {
@@ -889,7 +989,7 @@ pub async fn prepare_seller_offer_with_persisted_submission(
     cursor_path: &Path,
 ) -> Result<SellerOfferStartup> {
     if let Some(marker) = pending_offer_submission(cursor_path, &cfg.token_contract)? {
-        match reconcile_pending_offer_submission(chain, cfg, expected_owner).await {
+        match reconcile_pending_offer_submission(chain, cfg, expected_owner, &marker).await {
             Ok(PendingPublicationResolution::Resting { order_id }) => {
                 clear_offer_submission(cursor_path, &cfg.token_contract)?;
                 return Ok(SellerOfferStartup::ResumedResting { order_id });
@@ -899,11 +999,10 @@ pub async fn prepare_seller_offer_with_persisted_submission(
                 return Ok(SellerOfferStartup::ResumedFunded);
             }
             Ok(PendingPublicationResolution::Negative) => {
-                clear_offer_submission(cursor_path, &cfg.token_contract)?;
                 return Err(publication_unconfirmed(
                     &cfg.token_contract,
                     format!(
-                        "submission marker from {} has an exact negative proof (no match, raw SELL, offer latch, or event outcome); a fresh explicit seller start may retry",
+                        "submission marker from {} has an exact negative proof (no match, raw SELL, offer latch, or event outcome); marker is retained so an automatic restart cannot retry — use an audited manual recovery operation",
                         marker.submitted_at_unix
                     ),
                 ));
@@ -924,9 +1023,9 @@ pub async fn prepare_seller_offer_with_persisted_submission(
             // Write-ahead persistence is deliberately before the write.  A
             // crash in the narrow interval thereafter is conservative: the
             // next process reconciles instead of guessing the write did not run.
-            persist_offer_submission(cursor_path, &cfg.token_contract)?;
+            let marker = persist_offer_submission(cursor_path, &cfg.token_contract)?;
             let _submit_error = post_offer_with_note(note, chain, cfg).await.err();
-            match reconcile_pending_offer_submission(chain, cfg, expected_owner).await {
+            match reconcile_pending_offer_submission(chain, cfg, expected_owner, &marker).await {
                 Ok(PendingPublicationResolution::Resting { order_id }) => {
                     clear_offer_submission(cursor_path, &cfg.token_contract)?;
                     Ok(SellerOfferStartup::Posted {
@@ -940,10 +1039,9 @@ pub async fn prepare_seller_offer_with_persisted_submission(
                     })
                 }
                 Ok(PendingPublicationResolution::Negative) => {
-                    clear_offer_submission(cursor_path, &cfg.token_contract)?;
                     Err(publication_unconfirmed(
                         &cfg.token_contract,
-                        "postSellOffer has an exact negative proof; a fresh explicit seller start may retry",
+                        "postSellOffer has an exact negative proof; marker is retained so an automatic restart cannot retry — use an audited manual recovery operation",
                     ))
                 }
                 Err(error) => {
@@ -1780,6 +1878,17 @@ mod tests {
             Ok(self.outcome.clone())
         }
 
+        async fn seller_offer_outcome_since(
+            &self,
+            _: &TokenContract,
+            _: u64,
+        ) -> Result<Option<SellOfferOutcome>, ChainError> {
+            if let Some(failure) = &self.outcome_failure {
+                return Err(ChainError::Transport(failure.clone()));
+            }
+            Ok(self.outcome.clone())
+        }
+
         async fn seller_offer_latch(
             &self,
             _: &TokenContract,
@@ -2090,7 +2199,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn publication_marker_requires_a_second_explicit_start_after_exact_negative_proof() {
+    async fn publication_marker_negative_proof_is_retained_and_blocks_automatic_restarts() {
         let tc = chain_address('e');
         let owner = chain_address('f');
         let cfg = test_cfg(&tc);
@@ -2111,10 +2220,11 @@ mod tests {
         .expect_err("a negative proof is not an in-process repost permit");
         assert!(first.to_string().contains("publication_unconfirmed"));
         assert_eq!(backend.post_calls.load(Ordering::Relaxed), 1);
-        assert!(pending_offer_submission(&cursor, &tc).unwrap().is_none());
+        assert!(pending_offer_submission(&cursor, &tc).unwrap().is_some());
 
-        // The following *explicit* startup is allowed to submit exactly once.
-        let _ = prepare_seller_offer_with_persisted_submission(
+        // A process supervisor cannot masquerade as a fresh manual request:
+        // the durable negative marker remains and no second post is emitted.
+        let restart = prepare_seller_offer_with_persisted_submission(
             &note,
             &backend,
             &cfg,
@@ -2122,8 +2232,24 @@ mod tests {
             &cursor,
         )
         .await
-        .expect_err("the fixture still provides a negative proof");
-        assert_eq!(backend.post_calls.load(Ordering::Relaxed), 2);
+        .expect_err("automatic restart must stay fenced by the negative marker");
+        assert!(restart.to_string().contains("publication_unconfirmed"));
+        assert_eq!(backend.post_calls.load(Ordering::Relaxed), 1);
+        assert!(pending_offer_submission(&cursor, &tc).unwrap().is_some());
+    }
+
+    #[test]
+    fn publication_marker_lock_excludes_a_second_cli_or_service_start() {
+        let tc = chain_address('d');
+        let (_dir, cursor) = temp_cursor_path("publication-exclusive-lock");
+        let guard = lock_offer_submission(&cursor).expect("acquire first durable marker lock");
+        let blocked = persist_offer_submission(&cursor, &tc)
+            .expect_err("second start must not race marker creation");
+        assert!(blocked.to_string().contains("publication_unconfirmed"));
+        drop(guard);
+        persist_offer_submission(&cursor, &tc)
+            .expect("marker can be committed after the first exclusive lock is released");
+        assert!(pending_offer_submission(&cursor, &tc).unwrap().is_some());
     }
 
     #[tokio::test]

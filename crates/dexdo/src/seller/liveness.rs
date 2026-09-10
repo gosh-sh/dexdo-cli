@@ -2113,18 +2113,23 @@ pub async fn prepare_seller_offer_with_persisted_liveness<S>(
 where
     S: Future<Output = ()>,
 {
-    if pending_offer_submission(cursor_path, &cfg.token_contract)?.is_some() {
-        match reconcile_pending_offer_submission(chain, cfg, Some(expected_owner)).await {
-            Ok(
-                super::PendingPublicationResolution::Resting { .. }
-                | super::PendingPublicationResolution::Funded,
-            ) => {
+    if let Some(marker) = pending_offer_submission(cursor_path, &cfg.token_contract)? {
+        match reconcile_pending_offer_submission(chain, cfg, Some(expected_owner), &marker).await {
+            Ok(super::PendingPublicationResolution::Resting { order_id }) => {
                 clear_offer_submission(cursor_path, &cfg.token_contract)?;
+                return Ok(SellerStartupOutcome::Ready(
+                    SellerOfferStartup::ResumedResting { order_id },
+                ));
+            }
+            Ok(super::PendingPublicationResolution::Funded) => {
+                clear_offer_submission(cursor_path, &cfg.token_contract)?;
+                return Ok(SellerStartupOutcome::Ready(
+                    SellerOfferStartup::ResumedFunded,
+                ));
             }
             Ok(super::PendingPublicationResolution::Negative) => {
-                clear_offer_submission(cursor_path, &cfg.token_contract)?;
                 return Err(anyhow!(
-                    "publication_unconfirmed token_contract={}: the prior marked post has an exact negative proof; a fresh explicit seller start may retry, but this start will not repost automatically",
+                    "publication_unconfirmed token_contract={}: the prior marked post has an exact negative proof; marker is retained so an automatic restart cannot retry — use an audited manual recovery operation",
                     display_token_contract(&cfg.token_contract)
                 ));
             }
@@ -2149,7 +2154,13 @@ where
     )
     .await;
 
-    match reconcile_pending_offer_submission(chain, cfg, Some(expected_owner)).await {
+    let marker = pending_offer_submission(cursor_path, &cfg.token_contract)?.ok_or_else(|| {
+        anyhow!(
+            "publication_unconfirmed token_contract={}: durable marker disappeared before postSellOffer reconciliation",
+            display_token_contract(&cfg.token_contract)
+        )
+    })?;
+    match reconcile_pending_offer_submission(chain, cfg, Some(expected_owner), &marker).await {
         Ok(super::PendingPublicationResolution::Resting { order_id }) => {
             clear_offer_submission(cursor_path, &cfg.token_contract)?;
             match started {
@@ -2169,9 +2180,8 @@ where
             }
         }
         Ok(super::PendingPublicationResolution::Negative) => {
-            clear_offer_submission(cursor_path, &cfg.token_contract)?;
             Err(anyhow!(
-                "publication_unconfirmed token_contract={}: the marked post has an exact negative proof; a fresh explicit seller start may retry, but this start will not repost automatically",
+                "publication_unconfirmed token_contract={}: the marked post has an exact negative proof; marker is retained so an automatic restart cannot retry — use an audited manual recovery operation",
                 display_token_contract(&cfg.token_contract)
             ))
         }
@@ -3096,6 +3106,39 @@ mod tests {
             }))
         }
 
+        async fn seller_offer_outcome_since(
+            &self,
+            token_contract: &TokenContract,
+            _: u64,
+        ) -> Result<Option<SellOfferOutcome>, ChainError> {
+            if self.matched.lock().unwrap().is_some() {
+                return Ok(Some(SellOfferOutcome::Matched));
+            }
+            Ok(self
+                .orders
+                .lock()
+                .unwrap()
+                .iter()
+                .find(|order| order.token_contract.as_ref() == Some(token_contract))
+                .map(|order| SellOfferOutcome::Rested {
+                    order_id: order.order_id,
+                }))
+        }
+
+        async fn seller_offer_latch(
+            &self,
+            token_contract: &TokenContract,
+        ) -> Result<Option<DealOfferLatch>, ChainError> {
+            Ok(Some(DealOfferLatch {
+                offer_posted: self
+                    .orders
+                    .lock()
+                    .unwrap()
+                    .iter()
+                    .any(|order| order.token_contract.as_ref() == Some(token_contract)),
+            }))
+        }
+
         async fn raw_resting_sell_orders_for_tc(
             &self,
             token_contract: &TokenContract,
@@ -3375,6 +3418,95 @@ mod tests {
             token_contract: token_contract.to_string(),
             order_id,
         }
+    }
+
+    #[tokio::test]
+    async fn persisted_liveness_negative_marker_blocks_an_automatic_service_restart() {
+        let seller = super::super::start_gateway_with_note(
+            "127.0.0.1:0".parse().unwrap(),
+            UpstreamConfig::Mock,
+            Arc::new(LocalNote::generate()),
+        )
+        .await
+        .unwrap();
+        let owner = address('a');
+        let tc = address('b');
+        let config = cfg_for_seller(&tc, &seller);
+        let backend = CancelBackend::new(Vec::new(), owner.clone(), 700, CancelBehavior::Remove);
+        let (_dir, watch) = watch("publication-negative-service-restart");
+        persist_offer_submission(&watch.cursor_path, &tc).unwrap();
+
+        for attempt in 0..2 {
+            let error = prepare_seller_offer_with_persisted_liveness(
+                &seller,
+                &backend,
+                &config,
+                &owner,
+                None,
+                &watch.cursor_path,
+                std::future::pending(),
+                AdvertiseProbePolicy::default(),
+            )
+            .await
+            .expect_err("negative marker must fence automatic service restart");
+            assert!(error.to_string().contains("publication_unconfirmed"));
+            assert_eq!(
+                backend.posts.load(Ordering::Relaxed),
+                0,
+                "attempt {attempt} posted despite the retained negative marker"
+            );
+            assert!(pending_offer_submission(&watch.cursor_path, &tc)
+                .unwrap()
+                .is_some());
+        }
+        seller.server_task.abort();
+    }
+
+    #[tokio::test]
+    async fn persisted_liveness_adopts_a_confirmed_exact_resting_sell_without_entering_post_path() {
+        let seller = super::super::start_gateway_with_note(
+            "127.0.0.1:0".parse().unwrap(),
+            UpstreamConfig::Mock,
+            Arc::new(LocalNote::generate()),
+        )
+        .await
+        .unwrap();
+        let owner = address('c');
+        let tc = address('d');
+        let config = cfg_for_seller(&tc, &seller);
+        let backend = CancelBackend::new(
+            vec![order(701, &owner, &tc)],
+            owner.clone(),
+            701,
+            CancelBehavior::Remove,
+        );
+        let (_dir, watch) = watch("publication-resting-service-restart");
+        persist_offer_submission(&watch.cursor_path, &tc).unwrap();
+
+        let outcome = prepare_seller_offer_with_persisted_liveness(
+            &seller,
+            &backend,
+            &config,
+            &owner,
+            None,
+            &watch.cursor_path,
+            std::future::pending(),
+            AdvertiseProbePolicy::default(),
+        )
+        .await
+        .unwrap();
+        assert!(
+            matches!(
+                outcome,
+                SellerStartupOutcome::Ready(SellerOfferStartup::ResumedResting { order_id: 701 })
+            ),
+            "unexpected persisted startup outcome: {outcome:?}"
+        );
+        assert_eq!(backend.posts.load(Ordering::Relaxed), 0);
+        assert!(pending_offer_submission(&watch.cursor_path, &tc)
+            .unwrap()
+            .is_none());
+        seller.server_task.abort();
     }
 
     /// A resting SELL as the chain can actually hold one. The deadline is live and finite because a
