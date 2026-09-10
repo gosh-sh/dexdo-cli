@@ -1,8 +1,10 @@
 use super::{
-    inspect_seller_offer, prepare_seller_offer, validate_resting_offer, wait_for_match,
-    RunningSeller, SellerConfig, SellerMatchWatchConfig, SellerOfferInspection, SellerOfferStartup,
+    clear_offer_submission, inspect_seller_offer, pending_offer_submission,
+    persist_offer_submission, prepare_seller_offer, reconcile_pending_offer_submission,
+    validate_resting_offer, wait_for_match, RunningSeller, SellerConfig, SellerMatchWatchConfig,
+    SellerOfferInspection, SellerOfferStartup,
 };
-use anyhow::Result;
+use anyhow::{anyhow, Result};
 use dexdo_core::{
     market::{RestingSellCancelStartError, RestingSellCancelWatch},
     params::{
@@ -13,6 +15,7 @@ use dexdo_core::{
 };
 use dexdo_proto::{ChallengeRequest, GatewayClient};
 use std::future::Future;
+use std::path::Path;
 use std::time::Duration;
 
 use crate::seller::auth::HEALTH_CHALLENGE_TC;
@@ -2013,21 +2016,25 @@ where
                 }
                 Ok(startup) => Ok(SellerStartupOutcome::Ready(startup)),
                 Err(error) => {
+                    // A post/confirmation error is not proof that the fresh
+                    // write failed.  In particular, cancelling a row which
+                    // becomes visible during this error path turns a
+                    // transport timeout into an unauthorized lifecycle
+                    // action.  Leave it fail-closed for the durable marker
+                    // reconciler instead; it is the only path allowed to
+                    // adopt a later exact-TC fact or permit a future retry.
                     let reason = RestingStopReason::Watcher(format!(
-                        "seller offer post or confirmation failed: {error}"
+                        "publication_unconfirmed: seller offer post or confirmation failed: {error}"
                     ));
-                    resolve_interrupted_startup(
-                        seller,
-                        chain,
-                        cfg,
-                        expected_owner,
-                        None,
-                        (
-                            reason,
-                            tokio::time::Instant::now() + timing.cycle_timeout,
-                        ),
-                        timing,
-                    ).await
+                    Ok(SellerStartupOutcome::Stopped {
+                        identity: None,
+                        reason,
+                        disposition: CancellationDisposition::UnknownFailure {
+                            known_result: format!(
+                                "publication_unconfirmed; no cancellation or repost was submitted after seller post/confirmation error: {error}"
+                            ),
+                        },
+                    })
                 }
             };
         }
@@ -2085,6 +2092,91 @@ where
         canonical_timing(true, advertise_probe),
     )
     .await
+}
+
+/// Production-only write-ahead wrapper around the normal liveness startup.
+///
+/// The existing liveness path owns readiness, cancellation and gateway
+/// supervision.  This wrapper adds one invariant at its outer money boundary:
+/// after a marker exists, the next start first reconciles the exact deal and
+/// never falls through to another post merely because a read timed out.
+pub async fn prepare_seller_offer_with_persisted_liveness<S>(
+    seller: &RunningSeller,
+    chain: &dyn ChainBackend,
+    cfg: &SellerConfig,
+    expected_owner: &str,
+    existing_identity: Option<&RestingOfferIdentity>,
+    cursor_path: &Path,
+    shutdown: S,
+    advertise_probe: AdvertiseProbePolicy,
+) -> Result<SellerStartupOutcome>
+where
+    S: Future<Output = ()>,
+{
+    if pending_offer_submission(cursor_path, &cfg.token_contract)?.is_some() {
+        match reconcile_pending_offer_submission(chain, cfg, Some(expected_owner)).await {
+            Ok(
+                super::PendingPublicationResolution::Resting { .. }
+                | super::PendingPublicationResolution::Funded,
+            ) => {
+                clear_offer_submission(cursor_path, &cfg.token_contract)?;
+            }
+            Ok(super::PendingPublicationResolution::Negative) => {
+                clear_offer_submission(cursor_path, &cfg.token_contract)?;
+                return Err(anyhow!(
+                    "publication_unconfirmed token_contract={}: the prior marked post has an exact negative proof; a fresh explicit seller start may retry, but this start will not repost automatically",
+                    display_token_contract(&cfg.token_contract)
+                ));
+            }
+            Err(error) => return Err(error),
+        }
+    } else {
+        // This write is intentionally before liveness enters the only path
+        // which can call postSellOffer.  If readiness aborts before the write,
+        // the next explicit start obtains a harmless exact negative proof; the
+        // conservative false-positive is preferable to a duplicate SELL.
+        persist_offer_submission(cursor_path, &cfg.token_contract)?;
+    }
+
+    let started = prepare_seller_offer_with_liveness(
+        seller,
+        chain,
+        cfg,
+        expected_owner,
+        existing_identity,
+        shutdown,
+        advertise_probe,
+    )
+    .await;
+
+    match reconcile_pending_offer_submission(chain, cfg, Some(expected_owner)).await {
+        Ok(super::PendingPublicationResolution::Resting { order_id }) => {
+            clear_offer_submission(cursor_path, &cfg.token_contract)?;
+            match started {
+                Ok(SellerStartupOutcome::Stopped { .. }) => Ok(SellerStartupOutcome::Ready(
+                    SellerOfferStartup::ResumedResting { order_id },
+                )),
+                other => other,
+            }
+        }
+        Ok(super::PendingPublicationResolution::Funded) => {
+            clear_offer_submission(cursor_path, &cfg.token_contract)?;
+            match started {
+                Ok(SellerStartupOutcome::Stopped { .. }) => Ok(SellerStartupOutcome::Ready(
+                    SellerOfferStartup::ResumedFunded,
+                )),
+                other => other,
+            }
+        }
+        Ok(super::PendingPublicationResolution::Negative) => {
+            clear_offer_submission(cursor_path, &cfg.token_contract)?;
+            Err(anyhow!(
+                "publication_unconfirmed token_contract={}: the marked post has an exact negative proof; a fresh explicit seller start may retry, but this start will not repost automatically",
+                display_token_contract(&cfg.token_contract)
+            ))
+        }
+        Err(error) => Err(error),
+    }
 }
 
 #[derive(Clone, Copy)]

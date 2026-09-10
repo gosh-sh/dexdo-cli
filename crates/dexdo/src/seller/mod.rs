@@ -1,4 +1,4 @@
-//! Seller client: gateway + authorization + mock upstream + stream opening.
+//! Seller client (§10.3, §10.5): gateway + authorization + mock upstream + stream opening.
 //! Headless (R12): starts without a GUI and serves the stream as a daemon.
 
 pub mod advance;
@@ -32,6 +32,7 @@ use dexdo_core::{
     SellOfferOutcome, TokenContract, SUBSCRIPTION_MAX_TICKS, SUBSCRIPTION_WEEKS,
 };
 use gateway::{GatewayService, GatewayState};
+use std::io::Write as _;
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -42,17 +43,18 @@ use tonic::transport::{Identity, Server, ServerTlsConfig};
 
 const SUBSCRIPTION_SELL_FLAGS: u8 = order_flags::AON | order_flags::SUBSCRIPTION;
 const SELLER_MATCH_WATCH_CURSOR_VERSION: u32 = 1;
+const SELLER_OFFER_SUBMISSION_VERSION: u32 = 1;
 
 fn display_token_contract(token_contract: &str) -> String {
     dexdo_core::address::display_self_dapp(token_contract)
 }
 
-/// Seller configuration for one stream.
+/// Seller configuration for one stream (minimum for Directive 1).
 #[derive(Debug, Clone)]
 pub struct SellerConfig {
-    /// Contract -- the deal's handover point.
+    /// Contract — the deal's handover point (§2.1).
     pub token_contract: TokenContract,
-    /// Tick price `P` in raw ECC[2] units. Stated on the command line in whole SHELL
+    /// Tick price `P` in raw ECC[2] units (§1). Stated on the command line in whole SHELL
     /// (`--price-per-tick 3`) and converted once, at the argument.
     pub price_per_tick: u64,
     /// Maximum ticks in the offer.
@@ -61,7 +63,7 @@ pub struct SellerConfig {
     pub subscription: bool,
     /// Public gateway host:port that will be encrypted to the buyer (R15).
     pub gateway_advertise: String,
-    /// How many fake tokens to yield (mock model). `0` = a deliberate seller no-show.
+    /// How many fake tokens to yield (mock model). `0` = a deliberate seller no-show (§3.1.2).
     /// Real upstreams are limited by the buyer request's `max_tokens` and the matched TC's strict
     /// `fundedTokens`/weekly cap, not by this debug fixture or the seller's advertised maximum.
     pub mock_token_count: u64,
@@ -84,14 +86,14 @@ pub enum SellerOfferInspection {
 /// A running seller gateway: state handle + handle to the server's background task.
 pub struct RunningSeller {
     pub state: Arc<GatewayState>,
-    /// The seller's note -- **polymorphic**: `LocalNote` (mock path) OR `RealNote` (a real chain,
-    /// one SDK key for signing+handover). The gateway encrypts the endpoint `note.encrypt_to(buyer_pubkey)` -- on
+    /// The seller's note — **polymorphic** (D10): `LocalNote` (mock path) OR `RealNote` (a real chain,
+    /// one SDK key for signing+handover). The gateway encrypts the endpoint `note.encrypt_to(buyer_pubkey)` — on
     /// the real path `buyer_pubkey` is reconstructed by the seller from on-chain ed25519 (F1).
     pub note: Arc<dyn Note>,
     pub server_task: tokio::task::JoinHandle<()>,
     /// The socket address actually bound before the server task was spawned.
     pub listen_addr: SocketAddr,
-    /// Fingerprint of the gateway's self-signed TLS certificate -- goes into the handover.
+    /// Fingerprint of the gateway's self-signed TLS certificate (§3.1.3) — goes into the handover.
     pub tls_fingerprint: String,
 }
 
@@ -112,6 +114,21 @@ struct SellerMatchWatchCursor {
     opened_at_unix: Option<u64>,
     #[serde(default)]
     fill: Option<SellerFillLineage>,
+    /// A write-ahead marker for `postSellOffer`.  It is retained until an
+    /// authoritative exact-TC reconciliation proves what the write did.  This
+    /// must live with the durable watch cursor, rather than in the in-memory
+    /// chain adapter, because a service restart is the failure case it protects.
+    #[serde(default)]
+    publication: Option<SellerOfferSubmission>,
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct SellerOfferSubmission {
+    version: u32,
+    #[serde(with = "dexdo_core::address::serde_self_dapp")]
+    token_contract: TokenContract,
+    submitted_at_unix: u64,
 }
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
@@ -158,6 +175,7 @@ impl SellerMatchWatchCursor {
             last_polled_unix: None,
             opened_at_unix: None,
             fill: None,
+            publication: None,
         })
     }
 
@@ -280,9 +298,14 @@ impl SellerMatchWatchCursor {
         }
         let tmp = path.with_extension(format!("json.tmp.{}", std::process::id()));
         let bytes = serde_json::to_vec_pretty(self)?;
-        std::fs::write(&tmp, bytes).map_err(|e| {
-            anyhow::anyhow!("write seller watch cursor temp {}: {e}", tmp.display())
+        let mut file = std::fs::File::create(&tmp).map_err(|e| {
+            anyhow::anyhow!("create seller watch cursor temp {}: {e}", tmp.display())
         })?;
+        file.write_all(&bytes)
+            .and_then(|()| file.sync_all())
+            .map_err(|e| {
+                anyhow::anyhow!("write seller watch cursor temp {}: {e}", tmp.display())
+            })?;
         std::fs::rename(&tmp, path).map_err(|e| {
             anyhow::anyhow!(
                 "commit seller watch cursor {} from temp {}: {e}",
@@ -291,6 +314,61 @@ impl SellerMatchWatchCursor {
             )
         })
     }
+}
+
+pub(crate) fn pending_offer_submission(
+    cursor_path: &Path,
+    token_contract: &TokenContract,
+) -> Result<Option<SellerOfferSubmission>> {
+    let cursor = SellerMatchWatchCursor::load_or_new(cursor_path, token_contract)?;
+    if let Some(marker) = cursor.publication.as_ref() {
+        if marker.version != SELLER_OFFER_SUBMISSION_VERSION {
+            bail!(
+                "seller publication marker {} has version {}; expected {}",
+                cursor_path.display(),
+                marker.version,
+                SELLER_OFFER_SUBMISSION_VERSION
+            );
+        }
+        if !marker.token_contract.eq_ignore_ascii_case(token_contract) {
+            bail!(
+                "seller publication marker {} is for TokenContract {}, not {}",
+                cursor_path.display(),
+                display_token_contract(&marker.token_contract),
+                display_token_contract(token_contract)
+            );
+        }
+    }
+    Ok(cursor.publication)
+}
+
+pub(crate) fn persist_offer_submission(
+    cursor_path: &Path,
+    token_contract: &TokenContract,
+) -> Result<()> {
+    let mut cursor = SellerMatchWatchCursor::load_or_new(cursor_path, token_contract)?;
+    if cursor.publication.is_some() {
+        bail!(
+            "seller publication marker {} already exists for {}; reconcile it before another postSellOffer",
+            cursor_path.display(),
+            display_token_contract(token_contract)
+        );
+    }
+    cursor.publication = Some(SellerOfferSubmission {
+        version: SELLER_OFFER_SUBMISSION_VERSION,
+        token_contract: token_contract.clone(),
+        submitted_at_unix: now_unix()?,
+    });
+    cursor.save(cursor_path)
+}
+
+pub(crate) fn clear_offer_submission(
+    cursor_path: &Path,
+    token_contract: &TokenContract,
+) -> Result<()> {
+    let mut cursor = SellerMatchWatchCursor::load_or_new(cursor_path, token_contract)?;
+    cursor.publication = None;
+    cursor.save(cursor_path)
 }
 
 pub fn read_seller_fill_lineage(
@@ -347,7 +425,7 @@ fn now_unix() -> Result<u64> {
         .as_secs())
 }
 
-/// Bring up the seller's gRPC gateway (headless) **over TLS**: a self-signed certificate
+/// Bring up the seller's gRPC gateway (headless) **over TLS** (§3.1.3): a self-signed certificate
 /// is generated at startup, its fingerprint is returned for recording in the handover. Returns
 /// handles for orchestrating the stream.
 pub async fn start_gateway(addr: SocketAddr) -> Result<RunningSeller> {
@@ -355,17 +433,17 @@ pub async fn start_gateway(addr: SocketAddr) -> Result<RunningSeller> {
 }
 
 /// Like [`start_gateway`], but with an upstream choice (mock model or real OpenAI-compatible,
-/// ). The mock path (`UpstreamConfig::Mock`) is identical to.
+/// Directive 3). The mock path (`UpstreamConfig::Mock`) is identical to Directive 1.
 pub async fn start_gateway_with(
     addr: SocketAddr,
     upstream: UpstreamConfig,
 ) -> Result<RunningSeller> {
-    // The ephemeral note is a mock fixture; the production path is `start_gateway_with_note`.
+    // The ephemeral note is a mock fixture (Directive 7); the production path is `start_gateway_with_note`.
     start_gateway_with_note(addr, upstream, Arc::new(LocalNote::generate())).await
 }
 
-/// Like [`start_gateway_with`], but with a **loaded persistent** seller note:
-/// the identity (from `--note-key`/wallet) is reused across runs -- its offer/deals are
+/// Like [`start_gateway_with`], but with a **loaded persistent** seller note (Directive 7):
+/// the identity (from `--note-key`/wallet) is reused across runs — its offer/deals are
 /// visible in the next run. `start_gateway_with` substitutes an ephemeral `generate()` here.
 pub async fn start_gateway_with_note(
     addr: SocketAddr,
@@ -419,7 +497,7 @@ async fn start_gateway_with_note_and_capacity_dir(
     deals_dir: Option<PathBuf>,
     gw_tls: GatewayTls,
 ) -> Result<RunningSeller> {
-    // this process is about to serve buyers, and a buyer that hangs up mid-stream must give
+    // #1571: this process is about to serve buyers, and a buyer that hangs up mid-stream must give
     // this gateway an `EPIPE` to handle rather than a signal that kills it. `main` restores the
     // default SIGPIPE disposition for one-shot printers; a gateway needs it ignored. Do not delete
     // this as a duplicate of the entry policy -- it is the opposite decision, for the opposite kind
@@ -432,7 +510,7 @@ async fn start_gateway_with_note_and_capacity_dir(
     let service = GatewayService::new(state.clone()).into_server();
 
     // Both rustls providers (ring/aws-lc-rs) are present in the tree; pin the process
-    // default explicitly (ring) -- otherwise rustls panics, unable to pick on its own. Idempotent.
+    // default explicitly (ring) — otherwise rustls panics, unable to pick on its own. Idempotent.
     tls::ensure_crypto_provider();
 
     let tls_fingerprint = gw_tls.fingerprint.clone();
@@ -467,7 +545,7 @@ async fn start_gateway_with_note_and_capacity_dir(
     })
 }
 
-/// Post a sell offer from the note into the book. Done before the
+/// Post a sell offer from the note into the book (§10.3 step 2, §2.1). Done before the
 /// buyer places a buy order.
 pub async fn post_offer(
     seller: &RunningSeller,
@@ -719,11 +797,174 @@ pub async fn prepare_seller_offer(
     }
 }
 
-/// Open the stream for a match:
-/// 1. reads the match (the buyer's pubkey is recorded in the contract);
-/// 2. encrypts the endpoint to the buyer's pubkey and `open_stream` (probe freeze +
-/// exact `2P` seller bond + writing the enc-endpoint into the endpoints file);
-/// 3. registers the buyer's pubkey and the fake-token budget in the gateway for authorization.
+/// The terminal fact for a previously submitted seller publication marker.
+///
+/// `Negative` does not mean "post again now".  It means every required read
+/// completed and proved that the earlier write made no offer.  The current
+/// invocation still returns `publication_unconfirmed`; a later explicit
+/// seller start may make the next write.  This keeps a transport failure from
+/// becoming an invisible repost loop.
+pub(crate) enum PendingPublicationResolution {
+    Resting { order_id: u128 },
+    Funded,
+    Negative,
+}
+
+fn publication_unconfirmed(
+    token_contract: &TokenContract,
+    detail: impl std::fmt::Display,
+) -> anyhow::Error {
+    anyhow!(
+        "publication_unconfirmed token_contract={}: {detail}; no automatic postSellOffer retry is permitted",
+        display_token_contract(token_contract)
+    )
+}
+
+/// Reconcile a persisted write-ahead marker solely from exact, read-only facts.
+/// Every source is required for the negative verdict: an unavailable raw book,
+/// match read, offer latch, or event/outcome read leaves the marker in place.
+pub(crate) async fn reconcile_pending_offer_submission(
+    chain: &dyn ChainBackend,
+    cfg: &SellerConfig,
+    expected_owner: Option<&str>,
+) -> Result<PendingPublicationResolution> {
+    match inspect_seller_offer(chain, cfg, expected_owner).await {
+        Ok(SellerOfferInspection::Funded) => return Ok(PendingPublicationResolution::Funded),
+        Ok(SellerOfferInspection::Resting { order_id }) => {
+            return Ok(PendingPublicationResolution::Resting { order_id });
+        }
+        Ok(SellerOfferInspection::Vacant) => {}
+        Err(error) => return Err(publication_unconfirmed(&cfg.token_contract, error)),
+    }
+
+    let latch = chain
+        .seller_offer_latch(&cfg.token_contract)
+        .await
+        .map_err(|error| {
+            publication_unconfirmed(
+                &cfg.token_contract,
+                format!("exact TokenContract offer latch is unreadable: {error}"),
+            )
+        })?
+        .ok_or_else(|| {
+            publication_unconfirmed(
+                &cfg.token_contract,
+                "exact TokenContract offer latch is unavailable",
+            )
+        })?;
+
+    let outcome = chain
+        .confirm_offer_outcome(&cfg.token_contract)
+        .await
+        .map_err(|error| {
+            publication_unconfirmed(
+                &cfg.token_contract,
+                format!("marker-bounded event/outcome reconciliation is unreadable: {error}"),
+            )
+        })?;
+    match outcome {
+        Some(SellOfferOutcome::Matched) => return Ok(PendingPublicationResolution::Funded),
+        Some(SellOfferOutcome::Rested { order_id }) => {
+            return Ok(PendingPublicationResolution::Resting { order_id });
+        }
+        None => {}
+    }
+    if latch.offer_posted {
+        return Err(publication_unconfirmed(
+            &cfg.token_contract,
+            "TokenContract getOffer().offerPosted=true while no exact raw SELL row is visible",
+        ));
+    }
+    Ok(PendingPublicationResolution::Negative)
+}
+
+/// Persistent counterpart of [`prepare_seller_offer`] for production seller
+/// runs.  It records a marker before the only chain write and makes every
+/// subsequent start reconcile that marker before it can submit again.
+pub async fn prepare_seller_offer_with_persisted_submission(
+    note: &dyn Note,
+    chain: &dyn ChainBackend,
+    cfg: &SellerConfig,
+    expected_owner: Option<&str>,
+    cursor_path: &Path,
+) -> Result<SellerOfferStartup> {
+    if let Some(marker) = pending_offer_submission(cursor_path, &cfg.token_contract)? {
+        match reconcile_pending_offer_submission(chain, cfg, expected_owner).await {
+            Ok(PendingPublicationResolution::Resting { order_id }) => {
+                clear_offer_submission(cursor_path, &cfg.token_contract)?;
+                return Ok(SellerOfferStartup::ResumedResting { order_id });
+            }
+            Ok(PendingPublicationResolution::Funded) => {
+                clear_offer_submission(cursor_path, &cfg.token_contract)?;
+                return Ok(SellerOfferStartup::ResumedFunded);
+            }
+            Ok(PendingPublicationResolution::Negative) => {
+                clear_offer_submission(cursor_path, &cfg.token_contract)?;
+                return Err(publication_unconfirmed(
+                    &cfg.token_contract,
+                    format!(
+                        "submission marker from {} has an exact negative proof (no match, raw SELL, offer latch, or event outcome); a fresh explicit seller start may retry",
+                        marker.submitted_at_unix
+                    ),
+                ));
+            }
+            Err(error) => return Err(error),
+        }
+    }
+
+    match inspect_seller_offer(chain, cfg, expected_owner).await? {
+        SellerOfferInspection::Funded => Ok(SellerOfferStartup::ResumedFunded),
+        SellerOfferInspection::Resting { order_id } => {
+            Ok(SellerOfferStartup::ResumedResting { order_id })
+        }
+        SellerOfferInspection::Vacant => {
+            chain
+                .assert_token_contract_fresh(&cfg.token_contract)
+                .await?;
+            // Write-ahead persistence is deliberately before the write.  A
+            // crash in the narrow interval thereafter is conservative: the
+            // next process reconciles instead of guessing the write did not run.
+            persist_offer_submission(cursor_path, &cfg.token_contract)?;
+            let _submit_error = post_offer_with_note(note, chain, cfg).await.err();
+            match reconcile_pending_offer_submission(chain, cfg, expected_owner).await {
+                Ok(PendingPublicationResolution::Resting { order_id }) => {
+                    clear_offer_submission(cursor_path, &cfg.token_contract)?;
+                    Ok(SellerOfferStartup::Posted {
+                        outcome: Some(SellOfferOutcome::Rested { order_id }),
+                    })
+                }
+                Ok(PendingPublicationResolution::Funded) => {
+                    clear_offer_submission(cursor_path, &cfg.token_contract)?;
+                    Ok(SellerOfferStartup::Posted {
+                        outcome: Some(SellOfferOutcome::Matched),
+                    })
+                }
+                Ok(PendingPublicationResolution::Negative) => {
+                    clear_offer_submission(cursor_path, &cfg.token_contract)?;
+                    Err(publication_unconfirmed(
+                        &cfg.token_contract,
+                        "postSellOffer has an exact negative proof; a fresh explicit seller start may retry",
+                    ))
+                }
+                Err(error) => {
+                    if let Some(submit_error) = _submit_error {
+                        return Err(publication_unconfirmed(
+                            &cfg.token_contract,
+                            format!("postSellOffer returned {submit_error}; {error}"),
+                        ));
+                    }
+                    Err(error)
+                }
+            }
+        }
+    }
+}
+
+/// Open the stream for a match (§10.3 step 3):
+///  1. reads the match (the buyer's pubkey is recorded in the contract);
+///  2. encrypts the endpoint to the buyer's pubkey and `open_stream` (probe freeze +
+///     exact `2P` seller bond + writing the enc-endpoint into the endpoints file);
+///  3. registers the buyer's pubkey and the fake-token budget in the gateway for authorization.
 pub async fn serve_match(
     seller: &RunningSeller,
     chain: &dyn ChainBackend,
@@ -783,7 +1024,7 @@ pub async fn provision_match(
             display_token_contract(&cfg.token_contract)
         );
     }
-    // the handover {gateway endpoint, TLS fingerprint} is encrypted to the buyer's pubkey.
+    // §3.1/§3.1.3: the handover {gateway endpoint, TLS fingerprint} is encrypted to the buyer's pubkey.
     // The endpoint points at the GATEWAY over TLS (R15); the buyer pins the fingerprint on connect.
     let handover = Handover {
         endpoint: format!("https://{}", cfg.gateway_advertise),
@@ -796,11 +1037,11 @@ pub async fn provision_match(
         &handover.to_deal_bytes(&cfg.token_contract),
     );
 
-    // the gateway must authorize the matched buyer BEFORE that buyer can connect.
+    // §3.1.1: the gateway must authorize the matched buyer BEFORE that buyer can connect.
     // Register buyer+budget BEFORE writing the handover on-chain: the buyer learns the endpoint only
     // after reading the on-chain ciphertext (written by `open_stream`), so register-before-open rules out a race. Otherwise on a
     // real (slow) chain the buyer manages to knock in the window between open_stream and register_stream
-    // -> the gateway still has no pubkey -> `challenge-response failed` (the mock timing did not expose this).
+    // → the gateway still has no pubkey → `challenge-response failed` (the mock timing did not expose this).
     let (state, deal) = read_coherent_deal_capacity(chain, &cfg.token_contract).await?;
     if cfg.subscription != deal.is_subscription() {
         let expected = if cfg.subscription {
@@ -964,7 +1205,7 @@ pub async fn poll_match_and_maybe_open(
 }
 
 /// Wait for one authoritative match without beginning the on-chain handover write.
-
+///
 /// Keeping this phase read-only lets the resting-offer supervisor select shutdown/health safely. Once a
 /// match is observed, [`serve_watched_match`] runs the existing handover path to completion outside that
 /// cancellable select.
@@ -1033,7 +1274,8 @@ mod tests {
     use super::*;
     use dexdo_core::{
         validate_seller_resume_state, ChainError, DealBuyerBond, DealChainSnapshot, DealChainState,
-        DealSellerBond, LocalNote, NotePubkey, OfferListing, SellOffer, Settlement, StreamSnapshot,
+        DealOfferLatch, DealSellerBond, LocalNote, NotePubkey, OfferListing, SellOffer,
+        SellOfferOutcome, Settlement, StreamSnapshot,
     };
     use dexdo_proto::{CanonRequest, ChallengeRequest, GatewayClient, StreamRequest};
     use proptest::prelude::*;
@@ -1406,7 +1648,10 @@ mod tests {
     }
 
     struct StartupBackend {
-        raw: RawStartupRead,
+        raw: Mutex<RawStartupRead>,
+        outcome: Option<SellOfferOutcome>,
+        outcome_failure: Option<String>,
+        offer_latch: Option<bool>,
         startup_match: Option<Match>,
         watcher_match: Option<Match>,
         post_calls: AtomicU64,
@@ -1423,7 +1668,10 @@ mod tests {
     impl StartupBackend {
         fn new(raw: RawStartupRead, startup_match: Option<Match>, watcher_match: Match) -> Self {
             Self {
-                raw,
+                raw: Mutex::new(raw),
+                outcome: Some(SellOfferOutcome::Rested { order_id: 835 }),
+                outcome_failure: None,
+                offer_latch: None,
                 startup_match,
                 watcher_match: Some(watcher_match),
                 post_calls: AtomicU64::new(0),
@@ -1440,7 +1688,10 @@ mod tests {
 
         fn without_match(raw: RawStartupRead) -> Self {
             Self {
-                raw,
+                raw: Mutex::new(raw),
+                outcome: Some(SellOfferOutcome::Rested { order_id: 835 }),
+                outcome_failure: None,
+                offer_latch: None,
                 startup_match: None,
                 watcher_match: None,
                 post_calls: AtomicU64::new(0),
@@ -1469,6 +1720,21 @@ mod tests {
             self.resume_facts = Some((state, price_per_tick));
             self
         }
+
+        fn with_offer_outcome(mut self, outcome: Option<SellOfferOutcome>) -> Self {
+            self.outcome = outcome;
+            self
+        }
+
+        fn with_offer_outcome_failure(mut self, failure: impl Into<String>) -> Self {
+            self.outcome_failure = Some(failure.into());
+            self
+        }
+
+        fn with_offer_latch(mut self, offer_posted: bool) -> Self {
+            self.offer_latch = Some(offer_posted);
+            self
+        }
     }
 
     #[async_trait::async_trait]
@@ -1482,7 +1748,7 @@ mod tests {
             _: &TokenContract,
         ) -> Result<Vec<OrderBookOrder>, ChainError> {
             self.raw_reads.fetch_add(1, Ordering::Relaxed);
-            match &self.raw {
+            match &*self.raw.lock().unwrap() {
                 RawStartupRead::Orders(orders) => Ok(orders.clone()),
                 RawStartupRead::ChainFailure => {
                     Err(ChainError::Chain("raw book getter failed".to_string()))
@@ -1508,7 +1774,19 @@ mod tests {
             &self,
             _: &TokenContract,
         ) -> Result<Option<SellOfferOutcome>, ChainError> {
-            Ok(Some(SellOfferOutcome::Rested { order_id: 835 }))
+            if let Some(failure) = &self.outcome_failure {
+                return Err(ChainError::Transport(failure.clone()));
+            }
+            Ok(self.outcome.clone())
+        }
+
+        async fn seller_offer_latch(
+            &self,
+            _: &TokenContract,
+        ) -> Result<Option<DealOfferLatch>, ChainError> {
+            Ok(self
+                .offer_latch
+                .map(|offer_posted| DealOfferLatch { offer_posted }))
         }
 
         async fn read_openable_match_now(
@@ -1690,8 +1968,8 @@ mod tests {
         }
     }
 
-    /// the directory is returned with the path and must be held for as long as the cursor is
-    /// read or written -- the previous `<pid>-<seconds>` directory was never removed.
+    /// #822: the directory is returned with the path and must be held for as long as the cursor is
+    /// read or written — the previous `<pid>-<seconds>` directory was never removed.
     fn temp_cursor_path(name: &str) -> (tempfile::TempDir, PathBuf) {
         let dir = tempfile::Builder::new()
             .prefix("dexdo-seller-watch-test")
@@ -1734,38 +2012,213 @@ mod tests {
         }
     }
 
-    /// Issues ** /** at a money-path consumer, where the equality DECIDES something.
+    #[tokio::test]
+    async fn publication_marker_reconciles_late_exact_resting_sell_without_repost() {
+        let tc = chain_address('a');
+        let owner = chain_address('b');
+        let cfg = test_cfg(&tc);
+        let late_order = raw_sell(
+            44,
+            &owner,
+            Some(&tc),
+            u128::from(cfg.price_per_tick),
+            u128::from(cfg.max_ticks),
+        );
+        let backend = StartupBackend::without_match(RawStartupRead::Orders(Vec::new()))
+            .with_offer_latch(false)
+            .with_offer_outcome_failure("book/event read temporarily unavailable");
+        let note = LocalNote::generate();
+        let (_dir, cursor) = temp_cursor_path("publication-late-resting");
 
-    /// The helpers that drop the dapp id -- `to_chain_param`, `normalize_wallet_address`,
-    /// `parse_chain_address` -- are all documented to yield the workchain form, so asserting that
+        // The write succeeds but the post-write outcome endpoint times out.  The
+        // write-ahead marker survives and the seller is explicitly unavailable.
+        let first = prepare_seller_offer_with_persisted_submission(
+            &note,
+            &backend,
+            &cfg,
+            Some(&owner),
+            &cursor,
+        )
+        .await
+        .expect_err("unavailable exact outcome must remain unconfirmed");
+        assert!(first.to_string().contains("publication_unconfirmed"));
+        assert_eq!(backend.post_calls.load(Ordering::Relaxed), 1);
+        assert!(pending_offer_submission(&cursor, &tc).unwrap().is_some());
+
+        // The delayed exact row becomes visible after the process stopped.
+        *backend.raw.lock().unwrap() = RawStartupRead::Orders(vec![late_order]);
+
+        // A process restart adopts the exact row and never emits a duplicate
+        // postSellOffer for the same TokenContract.
+        let second = prepare_seller_offer_with_persisted_submission(
+            &note,
+            &backend,
+            &cfg,
+            Some(&owner),
+            &cursor,
+        )
+        .await
+        .unwrap();
+        assert_eq!(second, SellerOfferStartup::ResumedResting { order_id: 44 });
+        assert_eq!(backend.post_calls.load(Ordering::Relaxed), 1);
+    }
+
+    #[tokio::test]
+    async fn publication_marker_stays_fail_closed_when_all_authoritative_reads_fail() {
+        let tc = chain_address('c');
+        let owner = chain_address('d');
+        let cfg = test_cfg(&tc);
+        let backend = StartupBackend::without_match(RawStartupRead::ChainFailure)
+            .with_offer_latch(false)
+            .with_offer_outcome_failure("events unavailable");
+        let note = LocalNote::generate();
+        let (_dir, cursor) = temp_cursor_path("publication-all-reads-fail");
+        persist_offer_submission(&cursor, &tc).unwrap();
+
+        let error = prepare_seller_offer_with_persisted_submission(
+            &note,
+            &backend,
+            &cfg,
+            Some(&owner),
+            &cursor,
+        )
+        .await
+        .expect_err("unreadable exact book must not permit a new post");
+        assert!(error.to_string().contains("publication_unconfirmed"));
+        assert_eq!(backend.post_calls.load(Ordering::Relaxed), 0);
+        assert!(pending_offer_submission(&cursor, &tc).unwrap().is_some());
+    }
+
+    #[tokio::test]
+    async fn publication_marker_requires_a_second_explicit_start_after_exact_negative_proof() {
+        let tc = chain_address('e');
+        let owner = chain_address('f');
+        let cfg = test_cfg(&tc);
+        let backend = StartupBackend::without_match(RawStartupRead::Orders(Vec::new()))
+            .with_offer_latch(false)
+            .with_offer_outcome(None);
+        let note = LocalNote::generate();
+        let (_dir, cursor) = temp_cursor_path("publication-negative-proof");
+
+        let first = prepare_seller_offer_with_persisted_submission(
+            &note,
+            &backend,
+            &cfg,
+            Some(&owner),
+            &cursor,
+        )
+        .await
+        .expect_err("a negative proof is not an in-process repost permit");
+        assert!(first.to_string().contains("publication_unconfirmed"));
+        assert_eq!(backend.post_calls.load(Ordering::Relaxed), 1);
+        assert!(pending_offer_submission(&cursor, &tc).unwrap().is_none());
+
+        // The following *explicit* startup is allowed to submit exactly once.
+        let _ = prepare_seller_offer_with_persisted_submission(
+            &note,
+            &backend,
+            &cfg,
+            Some(&owner),
+            &cursor,
+        )
+        .await
+        .expect_err("the fixture still provides a negative proof");
+        assert_eq!(backend.post_calls.load(Ordering::Relaxed), 2);
+    }
+
+    #[tokio::test]
+    async fn publication_marker_adopts_immediate_match_after_accepted_write() {
+        let tc = chain_address('1');
+        let owner = chain_address('2');
+        let cfg = test_cfg(&tc);
+        let backend = StartupBackend::without_match(RawStartupRead::Orders(Vec::new()))
+            .with_offer_latch(false)
+            .with_offer_outcome(Some(SellOfferOutcome::Matched));
+        let note = LocalNote::generate();
+        let (_dir, cursor) = temp_cursor_path("publication-immediate-match");
+
+        let startup = prepare_seller_offer_with_persisted_submission(
+            &note,
+            &backend,
+            &cfg,
+            Some(&owner),
+            &cursor,
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            startup,
+            SellerOfferStartup::Posted {
+                outcome: Some(SellOfferOutcome::Matched)
+            }
+        );
+        assert_eq!(backend.post_calls.load(Ordering::Relaxed), 1);
+        assert!(pending_offer_submission(&cursor, &tc).unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn publication_marker_never_posts_over_an_existing_exact_sell() {
+        let tc = chain_address('3');
+        let owner = chain_address('4');
+        let cfg = test_cfg(&tc);
+        let existing = raw_sell(
+            99,
+            &owner,
+            Some(&tc),
+            u128::from(cfg.price_per_tick),
+            u128::from(cfg.max_ticks),
+        );
+        let backend = StartupBackend::without_match(RawStartupRead::Orders(vec![existing]))
+            .with_offer_latch(true);
+        let note = LocalNote::generate();
+        let (_dir, cursor) = temp_cursor_path("publication-duplicate-sell");
+
+        let startup = prepare_seller_offer_with_persisted_submission(
+            &note,
+            &backend,
+            &cfg,
+            Some(&owner),
+            &cursor,
+        )
+        .await
+        .unwrap();
+        assert_eq!(startup, SellerOfferStartup::ResumedResting { order_id: 99 });
+        assert_eq!(backend.post_calls.load(Ordering::Relaxed), 0);
+        assert!(pending_offer_submission(&cursor, &tc).unwrap().is_none());
+    }
+
+    /// Issues **#839 / #723** at a money-path consumer, where the equality DECIDES something.
+    ///
+    /// The helpers that drop the dapp id — `to_chain_param`, `normalize_wallet_address`,
+    /// `parse_chain_address` — are all documented to yield the workchain form, so asserting that
     /// they preserve it would be asserting against intended behaviour. The defect is not the
     /// conversion; it is that consumers then treat two DIFFERENT accounts as one.
-
+    ///
     /// [`validate_resting_offer`] (`seller/mod.rs:508`) is such a consumer, and the decision it
     /// makes is whether this seller ADOPTS a resting SELL as its own. It normalises both sides
     /// through `normalize_wallet_address` (`core/src/wallet.rs:20-24`, which is
     /// `CanonicalAddress::parse(..).legacy()`) and compares:
-
+    ///
     /// ```text
-    /// if actual_tc != wanted_tc { return Err(..) } //:546
+    /// if actual_tc != wanted_tc { return Err(..) }      // :546
     /// if actual_owner != wanted_owner { return Err(..) } // the same shape, for the owner note
     /// ```
-
+    ///
     /// Because both sides collapse to `0:<account_id>`, a resting order belonging to an account in
-    /// a DIFFERENT DApp -- a different contract, with different code and different money -- compares
+    /// a DIFFERENT DApp — a different contract, with different code and different money — compares
     /// equal to this seller's own. `inspect_seller_offer` (`:650`) then classifies it `Resting` and
     /// `prepare_seller_offer` resumes it INSTEAD of posting: the seller ends up watching, and later
     /// serving a match against, a TokenContract that is not its own.
-
+    ///
     /// Both operands are swept, because they are separate `require`-shaped comparisons and fixing
     /// one would leave the other: a foreign-dapp TOKEN CONTRACT, and a foreign-dapp OWNER NOTE.
-
-    /// Asserted on the verdict `validate_resting_offer` returns -- the production decision -- not on
+    ///
+    /// Asserted on the verdict `validate_resting_offer` returns — the production decision — not on
     /// the rendering of any address.
-
+    ///
     /// RED on this head, for both operands.
     #[test]
-    #[ignore = "issues : address identity collapses to the account id, so a foreign-dapp \
+    #[ignore = "issues #839/#723: address identity collapses to the account id, so a foreign-dapp \
                 TokenContract or owner note is adopted as this seller's own. RED until the code PR \
                 carries the dapp id into the comparison. UN-IGNORE there."]
     fn a_foreign_dapp_order_is_not_adopted_as_this_sellers_own() {
@@ -1788,7 +2241,7 @@ mod tests {
         };
         let ours_owner = format!("0:{owner_account}");
 
-        // Operand 1 -- the order's TokenContract lives in another DApp.
+        // Operand 1 — the order's TokenContract lives in another DApp.
         let foreign_tc = format!("{foreign_dapp}::{account}");
         let order = raw_sell(
             1,
@@ -1800,13 +2253,13 @@ mod tests {
         let verdict = validate_resting_offer(&order, Some(&ours_owner), &cfg);
         assert!(
             verdict.is_err(),
-            "a resting SELL on TokenContract {foreign_tc} -- a different DApp from this seller's \
-             {} -- was adopted as this seller's own; the seller will watch and serve a contract it \
+            "a resting SELL on TokenContract {foreign_tc} — a different DApp from this seller's \
+             {} — was adopted as this seller's own; the seller will watch and serve a contract it \
              does not own",
             cfg.token_contract
         );
 
-        // Operand 2 -- the order's OWNER NOTE lives in another DApp.
+        // Operand 2 — the order's OWNER NOTE lives in another DApp.
         let foreign_owner = format!("{foreign_dapp}::{owner_account}");
         let order = raw_sell(
             2,
@@ -1818,13 +2271,13 @@ mod tests {
         let verdict = validate_resting_offer(&order, Some(&ours_owner), &cfg);
         assert!(
             verdict.is_err(),
-            "a resting SELL owned by note {foreign_owner} -- a different DApp from this seller's \
-             {ours_owner} -- was accepted as this seller's own order"
+            "a resting SELL owned by note {foreign_owner} — a different DApp from this seller's \
+             {ours_owner} — was accepted as this seller's own order"
         );
 
         // The controls, and they carry the property under test. A control that is only ever
         // written in the LEGACY `0:<account>` form shares nothing with the negatives above, so the
-        // pair would pass on a change that rejected every canonical `::` address -- including valid
+        // pair would pass on a change that rejected every canonical `::` address — including valid
         // same-DApp orders. That change is a plausible over-correction of exactly this defect, so
         // the accepted cases must include the canonical form of THIS seller's own DApp.
         let canonical_tc = format!("{}::{account}", dexdo_core::DEXDO_DAPP_ID);
@@ -1878,7 +2331,7 @@ mod tests {
             validate_resting_offer(&order, Some(&expected_owner), &cfg).unwrap_or_else(|error| {
                 panic!(
                     "{label}: a same-DApp order was refused, so the rejection above cannot be \
-                     attributed to the FOREIGN dapp -- it rejects the canonical form as such: \
+                     attributed to the FOREIGN dapp — it rejects the canonical form as such: \
                      {error}"
                 )
             });
@@ -1930,9 +2383,9 @@ mod tests {
             "expected `{expected_error}` in `{error}`"
         );
         // Identify the TC by its ACCOUNT ID, not by one spelling of the address. The error renders
-        // the canonical `<dapp>::<account>` form now while `cfg.token_contract` holds the
+        // the canonical `<dapp>::<account>` form now (#723) while `cfg.token_contract` holds the
         // legacy `0:<account>` one, so a whole-string match asserted the rendering rather than the
-        // identification -- and broke the moment the rendering moved, which is exactly what it did.
+        // identification — and broke the moment the rendering moved, which is exactly what it did.
         // The account id is common to every form the client can print, so this survives the next
         // rendering change too.
         let tc_account = cfg.token_contract.trim_start_matches("0:");
@@ -2240,7 +2693,7 @@ mod tests {
                 .expect_err("terminal zero-deposit TC must fail startup");
             let error = error.to_string();
 
-            // Account id, not one spelling of the address -- the message is canonical now.
+            // Account id, not one spelling of the address — the message is canonical now (#723).
             assert!(error.contains(tc.trim_start_matches("0:")), "{error}");
             assert!(error.contains("deposit=0"), "{error}");
             assert!(

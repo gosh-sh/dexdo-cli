@@ -160,6 +160,17 @@ pub trait ChainBackend: Send + Sync {
     ) -> Result<Option<SellOfferOutcome>, ChainError> {
         Ok(None)
     }
+    /// Read the exact deal's post-offer latch.  This is deliberately separate from a
+    /// book row: a successful `postSellOffer` can be accepted before an index/read
+    /// path catches up, and a returned placement value is not by itself a proof that
+    /// a successor post is safe.  Backends which cannot read the live deal return
+    /// `None`; a persisted real-seller submission must then remain unconfirmed.
+    async fn seller_offer_latch(
+        &self,
+        _token_contract: &TokenContract,
+    ) -> Result<Option<DealOfferLatch>, ChainError> {
+        Ok(None)
+    }
     /// Read the authoritative sell-offer terms for a real per-deal `TokenContract`. The real seller path uses
     /// this before posting an ask so CLI defaults/prompts cannot diverge from the already-deployed TC config.
     /// Mock backends have no on-chain TC config, so they return `None`.

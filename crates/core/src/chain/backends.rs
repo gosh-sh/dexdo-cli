@@ -8707,6 +8707,17 @@ impl ChainBackend for RealSellerBackend {
         )))
     }
 
+    async fn seller_offer_latch(
+        &self,
+        token_contract: &TokenContract,
+    ) -> Result<Option<DealOfferLatch>, ChainError> {
+        let tc = parse_tc(token_contract)?;
+        retry_seller_read("seller TokenContract offer latch", || async {
+            self.chain.token_contract_offer(&tc).await.map_err(map_err)
+        })
+        .await
+    }
+
     async fn sell_offer_terms(
         &self,
         token_contract: &TokenContract,

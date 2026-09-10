@@ -2248,12 +2248,13 @@ where
         dexdo::seller::SellerOfferInspection::Funded
         | dexdo::seller::SellerOfferInspection::Vacant => None,
     };
-    let startup = match dexdo::seller::liveness::prepare_seller_offer_with_liveness(
+    let startup = match dexdo::seller::liveness::prepare_seller_offer_with_persisted_liveness(
         seller,
         deal.chain.as_ref(),
         &deal.cfg,
         context.note_addr,
         inspected_identity.as_ref(),
+        &deal.watch.cursor_path,
         shutdown.as_mut(),
         context.advertise_probe,
     )
