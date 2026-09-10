@@ -588,12 +588,14 @@ pub(crate) async fn authorize_exact_negative_manual_recovery(
     cursor_path: &Path,
     operator_token_contract: &str,
 ) -> Result<()> {
-    if !operator_token_contract.eq_ignore_ascii_case(&cfg.token_contract) {
-        bail!(
-            "manual publication recovery contract {} does not match selected TokenContract {}",
-            display_token_contract(operator_token_contract),
-            display_token_contract(&cfg.token_contract)
-        );
+    let operator_token_contract_normalized = normalize_wallet_address(operator_token_contract)
+        .map_err(|error| {
+            anyhow!("manual publication recovery TokenContract is invalid: {error}")
+        })?;
+    let selected_token_contract_normalized = normalize_wallet_address(&cfg.token_contract)
+        .map_err(|error| anyhow!("selected TokenContract is invalid: {error}"))?;
+    if operator_token_contract_normalized != selected_token_contract_normalized {
+        bail!("manual publication recovery contract does not match the selected TokenContract");
     }
     let _lock = lock_offer_submission(cursor_path)?;
     let mut cursor = SellerMatchWatchCursor::load_or_new(cursor_path, &cfg.token_contract)?;
@@ -2384,9 +2386,12 @@ mod tests {
         let (dir, cursor) = temp_cursor_path("manual-publication-negative");
         persist_offer_submission(&cursor, &tc).unwrap();
 
-        authorize_exact_negative_manual_recovery(&backend, &cfg, &owner, &cursor, &tc)
+        // The explicit operator command may use canonical display form while the
+        // persisted market/config retains the legacy contract-parameter form.
+        let canonical_tc = dexdo_core::address::display_self_dapp(&tc);
+        authorize_exact_negative_manual_recovery(&backend, &cfg, &owner, &cursor, &canonical_tc)
             .await
-            .expect("only an exact negative proof may authorize recovery");
+            .expect("equivalent canonical address may authorize exact-negative recovery");
         let marker = pending_offer_submission(&cursor, &tc)
             .unwrap()
             .expect("marker stays until the one-shot post is reconciled");

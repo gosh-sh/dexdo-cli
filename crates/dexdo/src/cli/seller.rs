@@ -3750,11 +3750,23 @@ pub(crate) async fn run_seller_with_deal_gas_overhead(
         (Some(_), false) => bail!(
             "--recover-publication requires --confirm-recover-publication; automatic service/timer restarts must not use this escape hatch"
         ),
-        (Some(operator_tc), true) if !operator_tc.eq_ignore_ascii_case(&token_contract) => bail!(
-            "--recover-publication {} does not match selected TokenContract {}",
-            display_token_contract(operator_tc),
-            display_token_contract(&token_contract)
-        ),
+        (Some(operator_tc), true) => {
+            // A market manifest and a human command may name the same account in
+            // different accepted address representations.  Compare the parsed
+            // account, not its spelling; the recovery still binds to the selected
+            // manifest token contract below.
+            let operator_tc = dexdo_core::normalize_wallet_address(operator_tc).map_err(|error| {
+                anyhow::anyhow!("--recover-publication has an invalid TokenContract: {error}")
+            })?;
+            let selected_tc = dexdo_core::normalize_wallet_address(&token_contract).map_err(|error| {
+                anyhow::anyhow!("selected TokenContract is invalid: {error}")
+            })?;
+            if operator_tc != selected_tc {
+                bail!(
+                    "--recover-publication does not match the selected TokenContract"
+                );
+            }
+        }
         (None, true) => unreachable!("clap requires --recover-publication"),
         _ => {}
     }
@@ -4458,7 +4470,13 @@ pub(crate) async fn run_seller_with_deal_gas_overhead(
         frame_model,
         gateway_advertise: &gateway_advertise,
         advertise_probe: args.advertise_probe_policy(),
-        recover_publication: args.recover_publication.as_deref(),
+        // The operator's spelling was checked above.  Pass the selected runtime
+        // identity forward so the audited one-shot permit uses precisely the
+        // token contract that this seller will serve.
+        recover_publication: args
+            .recover_publication
+            .as_deref()
+            .map(|_| token_contract.as_str()),
     };
     if !args.mock.mock_chain {
         sweep_configured_seller_model_books(&args, note_addr, context.frame_model, &token_contract)
