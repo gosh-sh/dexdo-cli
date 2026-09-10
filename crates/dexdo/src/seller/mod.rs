@@ -168,6 +168,18 @@ struct SellerOfferManualRecoveryAudit<'a> {
     authorized_at_unix: u64,
 }
 
+#[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct SellerOfferManualRecoveryAuditRead {
+    version: u32,
+    #[serde(with = "dexdo_core::address::serde_self_dapp")]
+    token_contract: TokenContract,
+    marker_sha256: String,
+    evidence_cursor_unix: u64,
+    evidence_outcome: String,
+    authorized_at_unix: u64,
+}
+
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct SellerFillLineage {
@@ -640,6 +652,14 @@ pub(crate) fn consume_exact_negative_manual_recovery(
             "manual recovery permit disappeared before the explicit post",
         )
     })?;
+    let expected_cursor = marker.event_since_unix();
+    let expected_marker_sha256 = sha256_hex(&serde_json::to_vec(&SellerOfferSubmission {
+        version: marker.version,
+        token_contract: marker.token_contract.clone(),
+        event_since_unix: marker.event_since_unix,
+        submitted_at_unix: marker.submitted_at_unix,
+        manual_recovery: None,
+    })?);
     let permit = marker.manual_recovery.as_mut().ok_or_else(|| {
         publication_unconfirmed(
             token_contract,
@@ -651,6 +671,49 @@ pub(crate) fn consume_exact_negative_manual_recovery(
             "manual publication recovery permit for {} was already consumed; automatic restart remains refused",
             display_token_contract(token_contract)
         );
+    }
+    let audit_bytes = std::fs::read(&permit.audit_path).map_err(|error| {
+        publication_unconfirmed(
+            token_contract,
+            format!(
+                "audited manual recovery record {} is missing or unreadable: {error}",
+                permit.audit_path
+            ),
+        )
+    })?;
+    if sha256_hex(&audit_bytes) != permit.audit_sha256 {
+        return Err(publication_unconfirmed(
+            token_contract,
+            format!(
+                "audited manual recovery record {} SHA-256 does not match its durable permit",
+                permit.audit_path
+            ),
+        ));
+    }
+    let audit: SellerOfferManualRecoveryAuditRead =
+        serde_json::from_slice(&audit_bytes).map_err(|error| {
+            publication_unconfirmed(
+                token_contract,
+                format!(
+                    "audited manual recovery record {} is invalid: {error}",
+                    permit.audit_path
+                ),
+            )
+        })?;
+    if audit.version != 1
+        || !audit.token_contract.eq_ignore_ascii_case(token_contract)
+        || audit.marker_sha256 != expected_marker_sha256
+        || audit.evidence_cursor_unix != expected_cursor
+        || audit.evidence_outcome != "exact_negative"
+        || audit.authorized_at_unix != permit.authorized_at_unix
+    {
+        return Err(publication_unconfirmed(
+            token_contract,
+            format!(
+                "audited manual recovery record {} is not bound to this retained publication marker",
+                permit.audit_path
+            ),
+        ));
     }
     permit.consumed_at_unix = Some(now_unix()?);
     cursor.save(cursor_path)
@@ -2410,6 +2473,65 @@ mod tests {
             "{error:#}"
         );
         drop(held);
+    }
+
+    #[tokio::test]
+    async fn manual_publication_recovery_refuses_missing_or_tampered_audit_before_consumption() {
+        let tc = chain_address('a');
+        let owner = chain_address('b');
+        let cfg = test_cfg(&tc);
+        let backend = StartupBackend::without_match(RawStartupRead::Orders(Vec::new()))
+            .with_offer_latch(false)
+            .with_offer_outcome(None);
+
+        let (_dir, cursor) = temp_cursor_path("manual-publication-missing-audit");
+        persist_offer_submission(&cursor, &tc).unwrap();
+        authorize_exact_negative_manual_recovery(&backend, &cfg, &owner, &cursor, &tc)
+            .await
+            .unwrap();
+        let audit_path = pending_offer_submission(&cursor, &tc)
+            .unwrap()
+            .unwrap()
+            .manual_recovery
+            .unwrap()
+            .audit_path;
+        std::fs::remove_file(&audit_path).unwrap();
+        let error = consume_exact_negative_manual_recovery(&cursor, &tc)
+            .expect_err("a deleted audit must not permit a post");
+        assert!(
+            error.to_string().contains("missing or unreadable"),
+            "{error:#}"
+        );
+        assert!(pending_offer_submission(&cursor, &tc)
+            .unwrap()
+            .unwrap()
+            .manual_recovery
+            .unwrap()
+            .consumed_at_unix
+            .is_none());
+
+        let (_dir, cursor) = temp_cursor_path("manual-publication-tampered-audit");
+        persist_offer_submission(&cursor, &tc).unwrap();
+        authorize_exact_negative_manual_recovery(&backend, &cfg, &owner, &cursor, &tc)
+            .await
+            .unwrap();
+        let audit_path = pending_offer_submission(&cursor, &tc)
+            .unwrap()
+            .unwrap()
+            .manual_recovery
+            .unwrap()
+            .audit_path;
+        std::fs::write(&audit_path, b"tampered").unwrap();
+        let error = consume_exact_negative_manual_recovery(&cursor, &tc)
+            .expect_err("a modified audit must not permit a post");
+        assert!(error.to_string().contains("SHA-256"), "{error:#}");
+        assert!(pending_offer_submission(&cursor, &tc)
+            .unwrap()
+            .unwrap()
+            .manual_recovery
+            .unwrap()
+            .consumed_at_unix
+            .is_none());
     }
 
     #[tokio::test]
