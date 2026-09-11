@@ -18,6 +18,7 @@ impl Issue1057Pool {
             frame_model: self.frame_model,
             gateway_advertise: &self.gateway,
             advertise_probe: dexdo::seller::liveness::AdvertiseProbePolicy::default(),
+            recover_publication: None,
         }
     }
 }

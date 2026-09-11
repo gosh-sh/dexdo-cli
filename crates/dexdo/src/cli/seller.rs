@@ -1232,6 +1232,9 @@ struct SellerPoolContext<'a> {
     gateway_advertise: &'a str,
     /// how a failed `advertised_gateway` self-probe is treated.
     advertise_probe: dexdo::seller::liveness::AdvertiseProbePolicy,
+    /// Present only for a human-invoked seller command which supplied both
+    /// explicit recovery flags.  Timer/controller startup constructs `None`.
+    recover_publication: Option<&'a str>,
 }
 
 fn save_pool_deal_handle(context: &SellerPoolContext<'_>, deal: &SellerPoolDeal) -> Result<()> {
@@ -2248,17 +2251,37 @@ where
         dexdo::seller::SellerOfferInspection::Funded
         | dexdo::seller::SellerOfferInspection::Vacant => None,
     };
-    let startup = match dexdo::seller::liveness::prepare_seller_offer_with_liveness(
-        seller,
-        deal.chain.as_ref(),
-        &deal.cfg,
-        context.note_addr,
-        inspected_identity.as_ref(),
-        shutdown.as_mut(),
-        context.advertise_probe,
-    )
-    .await?
-    {
+    let manual_recovery = context.recover_publication.is_some_and(|token_contract| {
+        token_contract.eq_ignore_ascii_case(&deal.cfg.token_contract)
+    });
+    let startup = match if manual_recovery {
+        dexdo::seller::liveness::prepare_seller_offer_with_audited_manual_recovery_liveness(
+            seller,
+            deal.chain.as_ref(),
+            &deal.cfg,
+            context.note_addr,
+            inspected_identity.as_ref(),
+            &deal.watch.cursor_path,
+            context
+                .recover_publication
+                .expect("manual recovery was checked"),
+            shutdown.as_mut(),
+            context.advertise_probe,
+        )
+        .await
+    } else {
+        dexdo::seller::liveness::prepare_seller_offer_with_persisted_liveness(
+            seller,
+            deal.chain.as_ref(),
+            &deal.cfg,
+            context.note_addr,
+            inspected_identity.as_ref(),
+            &deal.watch.cursor_path,
+            shutdown.as_mut(),
+            context.advertise_probe,
+        )
+        .await
+    }? {
         dexdo::seller::liveness::SellerStartupOutcome::Ready(startup) => {
             // shutdown can win the startup select, then an already-matched SELL turns the
             // result back into `Ready`. The completed `Fuse` is the retained witness that this
@@ -3720,6 +3743,33 @@ pub(crate) async fn run_seller_with_deal_gas_overhead(
     // The manifest's frame_model (if any) is validated against `--model` inside `seller_real_backend`.
     let (mut token_contract, mut market_frame_model, market_nonce) =
         resolve_market_fields(args.market.as_deref(), args.token_contract.as_deref(), None)?;
+    match (
+        args.recover_publication.as_deref(),
+        args.confirm_recover_publication,
+    ) {
+        (Some(_), false) => bail!(
+            "--recover-publication requires --confirm-recover-publication; automatic service/timer restarts must not use this escape hatch"
+        ),
+        (Some(operator_tc), true) => {
+            // A market manifest and a human command may name the same account in
+            // different accepted address representations.  Compare the parsed
+            // account, not its spelling; the recovery still binds to the selected
+            // manifest token contract below.
+            let operator_tc = dexdo_core::normalize_wallet_address(operator_tc).map_err(|error| {
+                anyhow::anyhow!("--recover-publication has an invalid TokenContract: {error}")
+            })?;
+            let selected_tc = dexdo_core::normalize_wallet_address(&token_contract).map_err(|error| {
+                anyhow::anyhow!("selected TokenContract is invalid: {error}")
+            })?;
+            if operator_tc != selected_tc {
+                bail!(
+                    "--recover-publication does not match the selected TokenContract"
+                );
+            }
+        }
+        (None, true) => unreachable!("clap requires --recover-publication"),
+        _ => {}
+    }
     let mut startup_market = args.market.as_deref().map(load_market).transpose()?;
     // Review: the deal nonce comes from `--market` (the manifest) or the explicit `--nonce` flag --
     // never both (the manifest is the single source of truth). The real-chain seller path requires
@@ -4420,6 +4470,13 @@ pub(crate) async fn run_seller_with_deal_gas_overhead(
         frame_model,
         gateway_advertise: &gateway_advertise,
         advertise_probe: args.advertise_probe_policy(),
+        // The operator's spelling was checked above.  Pass the selected runtime
+        // identity forward so the audited one-shot permit uses precisely the
+        // token contract that this seller will serve.
+        recover_publication: args
+            .recover_publication
+            .as_deref()
+            .map(|_| token_contract.as_str()),
     };
     if !args.mock.mock_chain {
         sweep_configured_seller_model_books(&args, note_addr, context.frame_model, &token_contract)
@@ -4671,6 +4728,8 @@ mod tests {
             allow_unverified_model: false,
             models: root.path().join("missing-models.json"),
             policy: Some(policy_path),
+            recover_publication: None,
+            confirm_recover_publication: false,
         })
         .await
         .expect_err("second seller process for one note must fail on the production lock");
@@ -5135,6 +5194,7 @@ mod tests {
             frame_model: "mock",
             gateway_advertise: &config.gateway_advertise,
             advertise_probe: dexdo::seller::liveness::AdvertiseProbePolicy::default(),
+            recover_publication: None,
         };
         let mut provisioner = |_: String, _: u64, _: u64, _: u64| {
             futures::future::ready(Err::<
@@ -5437,6 +5497,7 @@ mod tests {
             frame_model: "mock",
             gateway_advertise: &gateway_advertise,
             advertise_probe: dexdo::seller::liveness::AdvertiseProbePolicy::default(),
+            recover_publication: None,
         };
         let shutdown = futures::future::pending::<()>();
         tokio::pin!(shutdown);
@@ -5734,6 +5795,8 @@ mod tests {
             allow_unverified_model: false,
             models: root.join("models.json"),
             policy: None,
+            recover_publication: None,
+            confirm_recover_publication: false,
         })
         .await;
         let error = match case {
@@ -6585,6 +6648,7 @@ mod tests {
                     frame_model,
                     gateway_advertise: &gateway,
                     advertise_probe: dexdo::seller::liveness::AdvertiseProbePolicy::default(),
+                    recover_publication: None,
                 },
                 &pool_test_policy(2),
                 &mut provision,
@@ -6843,6 +6907,7 @@ mod tests {
                     frame_model: "openai/gpt-oss-20b",
                     gateway_advertise: &gateway,
                     advertise_probe: dexdo::seller::liveness::AdvertiseProbePolicy::default(),
+                    recover_publication: None,
                 },
                 &pool_test_policy(1),
                 &mut provision,
@@ -7349,6 +7414,7 @@ mod tests {
                 frame_model: "openai/gpt-oss-20b",
                 gateway_advertise: &gateway,
                 advertise_probe: dexdo::seller::liveness::AdvertiseProbePolicy::default(),
+                recover_publication: None,
             },
             false,
             shutdown.as_mut(),
@@ -7495,6 +7561,7 @@ mod tests {
                     frame_model,
                     gateway_advertise: &gateway,
                     advertise_probe: dexdo::seller::liveness::AdvertiseProbePolicy::default(),
+                    recover_publication: None,
                 },
                 &pool_test_policy(3),
                 &mut provision,
@@ -7566,6 +7633,7 @@ mod tests {
                 frame_model,
                 gateway_advertise: gateway,
                 advertise_probe: dexdo::seller::liveness::AdvertiseProbePolicy::default(),
+                recover_publication: None,
             }
         }
 
@@ -8097,6 +8165,7 @@ mod tests {
                 // `unreachable` is a closed loopback port, so it is not public and the
                 // production default is still fatal -- the cascade under test is reached.
                 advertise_probe: dexdo::seller::liveness::AdvertiseProbePolicy::default(),
+                recover_publication: None,
             },
             &pool_test_policy(2),
             &mut provision,
@@ -8198,6 +8267,8 @@ mod tests {
             allow_unverified_model: false,
             models: root.path().join("unused-models.json"),
             policy: None,
+            recover_publication: None,
+            confirm_recover_publication: false,
         };
         assert_eq!(
             args.checked_gateway_advertise_addr().unwrap(),
@@ -8393,6 +8464,8 @@ mod tests {
             allow_unverified_model: false,
             models: root.path().join("unused-models.json"),
             policy: None,
+            recover_publication: None,
+            confirm_recover_publication: false,
         };
 
         let seller = super::run_seller(args);
@@ -8591,6 +8664,7 @@ mod tests {
                 frame_model: "mock",
                 gateway_advertise: &advertise,
                 advertise_probe: args.advertise_probe_policy(),
+                recover_publication: None,
             },
             &pool_test_policy(1),
             &mut provision,
@@ -8697,6 +8771,7 @@ mod tests {
                 frame_model: "mock",
                 gateway_advertise: &advertise,
                 advertise_probe: args.advertise_probe_policy(),
+                recover_publication: None,
             },
             &pool_test_policy(1),
             &mut provision,
@@ -8752,6 +8827,8 @@ mod tests {
             allow_unverified_model: false,
             models: root.join("unused-models.json"),
             policy: None,
+            recover_publication: None,
+            confirm_recover_publication: false,
         }
     }
 

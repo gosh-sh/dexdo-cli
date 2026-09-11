@@ -281,6 +281,15 @@ pub(crate) struct SellerArgs {
     /// to the legacy XDG/Windows config path. Real seller startup fails closed if missing or incomplete.
     #[arg(long)]
     pub(crate) policy: Option<PathBuf>,
+    /// Recovery escape hatch for a retained publication marker.  The value must
+    /// exactly name the selected TokenContract and is accepted only with the
+    /// separate confirmation flag; service/timer units must never set it.
+    #[arg(long, value_name = "TOKEN_CONTRACT")]
+    pub(crate) recover_publication: Option<String>,
+    /// Acknowledge that `--recover-publication` creates an immutable audit and
+    /// permits exactly one fresh explicit seller post after exact-negative proof.
+    #[arg(long, requires = "recover_publication")]
+    pub(crate) confirm_recover_publication: bool,
 }
 
 impl SellerArgs {

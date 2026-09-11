@@ -8707,6 +8707,62 @@ impl ChainBackend for RealSellerBackend {
         )))
     }
 
+    async fn seller_offer_outcome_since(
+        &self,
+        tc: &TokenContract,
+        since: u64,
+    ) -> Result<Option<SellOfferOutcome>, ChainError> {
+        // This path is used by a durable submission marker after a restart.
+        // Do not read `offer_post_started_at` here: it belongs to the former
+        // process and therefore cannot establish an event boundary safely.
+        let ob = retry_seller_read("seller marker outcome order-book address", || async {
+            self.chain
+                .inference_orderbook_address(&self.note, &self.model_hash, self.tick_size)
+                .await
+                .map_err(map_err)
+        })
+        .await?;
+        let tc_addr = parse_tc(tc)?;
+        let events = retry_seller_read("seller marker-bounded outcome events", || async {
+            self.chain
+                .seller_offer_events_since(&self.note, &ob, &tc_addr, since)
+                .await
+                .map_err(map_err)
+        })
+        .await?;
+        let matched_state = retry_seller_read("seller marker immediate-match state", || async {
+            self.read_openable_match_once(tc).await
+        })
+        .await?
+        .is_some();
+        match classify_seller_offer_outcome(events, matched_state) {
+            Ok(outcome) => Ok(outcome),
+            Err(ChainError::DuplicateSell(_)) => {
+                let latch =
+                    retry_seller_read("seller marker TokenContract offer latch", || async {
+                        self.chain
+                            .token_contract_offer(&tc_addr)
+                            .await
+                            .map_err(map_err)
+                    })
+                    .await?;
+                Err(duplicate_sell_from_offer_latch(&tc_addr, latch))
+            }
+            Err(other) => Err(other),
+        }
+    }
+
+    async fn seller_offer_latch(
+        &self,
+        token_contract: &TokenContract,
+    ) -> Result<Option<DealOfferLatch>, ChainError> {
+        let tc = parse_tc(token_contract)?;
+        retry_seller_read("seller TokenContract offer latch", || async {
+            self.chain.token_contract_offer(&tc).await.map_err(map_err)
+        })
+        .await
+    }
+
     async fn sell_offer_terms(
         &self,
         token_contract: &TokenContract,
