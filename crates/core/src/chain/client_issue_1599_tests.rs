@@ -240,10 +240,13 @@ async fn serve_stub(listener: tokio::net::TcpListener, connections: usize) {
         let body = if head.starts_with("GET") {
             json!({ "dapp_id": "2".repeat(64) }).to_string()
         } else {
-            json!({"data": {"blockchain": {"account": {"messages": {
-                "pageInfo": {"startCursor": null, "hasPreviousPage": false},
-                "edges": []
-            }}}}})
+            json!({"data": {"blockchain": {"account": {
+                "info": {"id": "1".repeat(64)},
+                "messages": {
+                    "pageInfo": {"startCursor": null, "hasPreviousPage": false},
+                    "edges": []
+                }
+            }}}})
             .to_string()
         };
         let response = format!(

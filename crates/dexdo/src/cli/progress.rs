@@ -78,6 +78,83 @@ fn current() -> Option<Arc<Mutex<Shared>>> {
         .unwrap_or(None)
 }
 
+/// A weak, command-owned route to one status display.
+
+/// Most command work stays on the thread that registered [`CURRENT`], but a lazy local API starts
+/// its first purchase from an Axum task. Carrying this handle lets that task update only the
+/// command that created it, without turning the thread-local slot back into process-global state.
+#[derive(Clone)]
+pub(crate) struct ProgressHandle {
+    shared: Weak<Mutex<Shared>>,
+}
+
+impl ProgressHandle {
+    fn current(&self) -> Option<Arc<Mutex<Shared>>> {
+        self.shared.upgrade()
+    }
+
+    pub(crate) fn refresh_live_step(&self, label: impl Into<String>) -> bool {
+        refresh_live_step_on(self.current(), label.into())
+    }
+
+    /// Temporarily draw a spawned task's wait over the command's live label.
+
+    /// The on-demand API can accept its first request before the command publishes the endpoint
+    /// handoff. The request-owned wait must become the live line while it exists. The command may
+    /// still advance while the wait is visible, so removing it reveals the owner's latest state
+    /// instead of restoring a stale snapshot.
+    pub(crate) fn temporary_live_step(
+        &self,
+        label: impl Into<String>,
+    ) -> Option<TemporaryLiveStep> {
+        let shared = self.current()?;
+        let mut guard = lock(&shared);
+        if !guard.live {
+            return None;
+        }
+        let label = label.into();
+        let position = {
+            let mut plan = guard.plan.clone();
+            plan.advance_to(&label);
+            plan.position()
+        };
+        let overlay_id = guard.install_overlay(label, position);
+        Some(TemporaryLiveStep {
+            shared: self.shared.clone(),
+            overlay_id,
+        })
+    }
+
+    pub(crate) fn hold(&self) -> Hold {
+        hold_shared(self.current())
+    }
+}
+
+/// Removes a spawned task's overlay to reveal the command owner's latest display state.
+pub(crate) struct TemporaryLiveStep {
+    shared: Weak<Mutex<Shared>>,
+    overlay_id: u64,
+}
+
+impl TemporaryLiveStep {
+    pub(crate) fn refresh_live_step(&mut self, label: impl Into<String>) -> bool {
+        let Some(shared) = self.shared.upgrade() else {
+            return false;
+        };
+        let refreshed = lock(&shared).refresh_overlay(self.overlay_id, label.into());
+        refreshed
+    }
+}
+
+impl Drop for TemporaryLiveStep {
+    fn drop(&mut self) {
+        let Some(shared) = self.shared.upgrade() else {
+            return;
+        };
+        lock(&shared).remove_overlay(self.overlay_id);
+    }
+}
+
 /// Say what is happening now. Silently does nothing when the running command has no display.
 pub(crate) fn step(label: impl Into<String>) {
     if let Some(shared) = current() {
@@ -100,6 +177,46 @@ pub(crate) fn step_if_showing(label: impl Into<String>) -> bool {
     };
     set_step(&shared, label.into());
     lock(&shared).needs_you = false;
+    true
+}
+
+/// Advance a step only when stderr has a live status line.
+
+/// Redirected output needs its own durable record instead of a renderer-owned line, while a live
+/// terminal needs the checklist cursor and its elapsed clock to move to this step.
+pub(crate) fn step_if_live(label: impl Into<String>) -> bool {
+    let Some(shared) = current() else {
+        return false;
+    };
+    if !lock(&shared).live {
+        return false;
+    }
+    set_step(&shared, label.into());
+    lock(&shared).needs_you = false;
+    true
+}
+
+/// Refresh details inside the current live step without restarting its elapsed clock.
+pub(crate) fn refresh_live_step(label: impl Into<String>) -> bool {
+    refresh_live_step_on(current(), label.into())
+}
+
+fn refresh_live_step_on(shared: Option<Arc<Mutex<Shared>>>, label: String) -> bool {
+    let Some(shared) = shared else {
+        return false;
+    };
+    let mut guard = lock(&shared);
+    if !guard.live {
+        return false;
+    }
+    if guard.label != label {
+        for passed in guard.plan.advance_to(&label) {
+            guard.ticked(&passed);
+        }
+        guard.label = label;
+        guard.render();
+    }
+    guard.needs_you = false;
     true
 }
 
@@ -160,20 +277,27 @@ pub(crate) fn complete() {
 /// or by the operator pressing Ctrl-C -- and a live line that is never restored leaves the rest of
 /// the command silent.
 pub(crate) fn hold() -> Hold {
-    if let Some(shared) = current() {
+    hold_shared(current())
+}
+
+fn hold_shared(shared: Option<Arc<Mutex<Shared>>>) -> Hold {
+    let weak = shared.as_ref().map(Arc::downgrade);
+    if let Some(shared) = shared {
         let mut guard = lock(&shared);
         guard.erase();
         guard.held = true;
     }
-    Hold
+    Hold { shared: weak }
 }
 
 /// Restores the live line when it goes. See [`hold`].
-pub(crate) struct Hold;
+pub(crate) struct Hold {
+    shared: Option<Weak<Mutex<Shared>>>,
+}
 
 impl Drop for Hold {
     fn drop(&mut self) {
-        if let Some(shared) = current() {
+        if let Some(shared) = self.shared.as_ref().and_then(Weak::upgrade) {
             lock(&shared).held = false;
         }
     }
@@ -308,6 +432,13 @@ impl Status {
     /// Keep a caller-rendered line above the live status line without adding another glyph.
     pub(crate) fn keep_exact(&self, line: impl AsRef<str>) {
         lock(&self.shared).line(line.as_ref());
+    }
+
+    /// A weak handle for work that legitimately crosses the command thread boundary.
+    pub(crate) fn handle(&self) -> ProgressHandle {
+        ProgressHandle {
+            shared: Arc::downgrade(&self.shared),
+        }
     }
 
     /// The state this display shares with [`super::progress_capture`], which needs to write through
@@ -501,6 +632,95 @@ mod tests {
         let before = lock(&status.shared).started;
         status.step("second");
         assert!(lock(&status.shared).started > before);
+    }
+
+    #[test]
+    fn issue_1446_refreshing_a_live_step_keeps_its_elapsed_clock() {
+        let _alone = alone();
+        let status = Status::new("waiting for a seller: funded=true opened=false reclaim_in=600s");
+        let mut guard = lock(&status.shared);
+        guard.live = true;
+        let before = guard.started;
+        drop(guard);
+
+        assert!(refresh_live_step(
+            "waiting for a seller: funded=true opened=false reclaim_in=570s"
+        ));
+        let guard = lock(&status.shared);
+        assert_eq!(
+            guard.label,
+            "waiting for a seller: funded=true opened=false reclaim_in=570s"
+        );
+        assert_eq!(guard.started, before);
+    }
+
+    #[test]
+    fn issue_1446_plain_destination_does_not_emit_live_step_refreshes() {
+        let _alone = alone();
+        let status = Status::new("checking the network and contracts");
+
+        assert!(!step_if_live(
+            "waiting for a seller: funded=true opened=false reclaim_in=600s"
+        ));
+        assert!(!refresh_live_step(
+            "waiting for a seller: funded=true opened=false reclaim_in=570s"
+        ));
+        assert_eq!(
+            lock(&status.shared).label,
+            "checking the network and contracts",
+            "redirected output is owned by the durable initial record and compact heartbeat"
+        );
+    }
+
+    #[test]
+    fn issue_1446_explicit_handle_updates_only_its_live_display_across_threads() {
+        let _alone = alone();
+        let status = Status::new("bringing the local endpoint up");
+        lock(&status.shared).live = true;
+        let handle = status.handle();
+
+        let (handle, mut temporary) = std::thread::spawn(move || {
+            assert!(
+                !step_if_live("must not find the command through another thread's CURRENT"),
+                "the spawned task must not inherit a thread-local display"
+            );
+            let temporary = handle
+                .temporary_live_step(
+                    "waiting for a seller: funded=true opened=false reclaim_in=600s",
+                )
+                .expect("the explicit handle reaches its live display");
+            (handle, temporary)
+        })
+        .join()
+        .expect("cross-thread progress update joins");
+
+        assert_eq!(
+            lock(&status.shared).displayed_label(),
+            "waiting for a seller: funded=true opened=false reclaim_in=600s"
+        );
+        let wait_started = lock(&status.shared).displayed_started();
+        assert!(temporary
+            .refresh_live_step("waiting for a seller: funded=true opened=false reclaim_in=570s"));
+        let guard = lock(&status.shared);
+        assert_eq!(
+            guard.displayed_label(),
+            "waiting for a seller: funded=true opened=false reclaim_in=570s"
+        );
+        assert_eq!(
+            guard.displayed_started(),
+            wait_started,
+            "refreshing the overlay must preserve the wait's elapsed clock"
+        );
+        drop(guard);
+        drop(temporary);
+        assert_eq!(lock(&status.shared).label, "bringing the local endpoint up");
+        drop(status);
+        assert!(
+            !handle.refresh_live_step(
+                "waiting for a seller: funded=true opened=false reclaim_in=570s"
+            ),
+            "the weak handle must not keep a completed command's display alive"
+        );
     }
 
     /// The free entry point exists for code that never sees the display; it must reach the same

@@ -33,6 +33,33 @@ fn body_of(entry: &str) -> String {
     crate::cli::source_probe::code_of(production_source(), &format!("pub(crate) async fn {entry}"))
 }
 
+fn note_deploy_entry_body() -> String {
+    crate::cli::source_probe::code_of(
+        production_source(),
+        "async fn run_note_deploy_with_wallet_store",
+    )
+}
+
+fn note_deploy_resolved_body() -> String {
+    crate::cli::source_probe::code_of(production_source(), "async fn run_note_deploy_resolved")
+}
+
+fn note_deploy_funding_body() -> String {
+    let implementation = production_source()
+        .split_once("impl NoteDeployResolvedOps for NoteDeployProductionOps")
+        .expect("note deploy production operations")
+        .1;
+    crate::cli::source_probe::code_of(implementation, "async fn prepare_funding")
+}
+
+fn note_deploy_preflight_body() -> String {
+    let implementation = production_source()
+        .split_once("impl NoteDeployResolvedOps for NoteDeployProductionOps")
+        .expect("note deploy production operations")
+        .1;
+    crate::cli::source_probe::code_of(implementation, "async fn preflight_doctor")
+}
+
 /// Both spenders call the shared mechanism. Neither may be the only one: a Hot short of SHELL is
 /// equally unable to deploy a note and to top one up, and a funding flow wired into one command is a
 /// funding flow the other silently does without.
@@ -45,12 +72,14 @@ fn both_money_commands_call_the_shared_funding_mechanism_334() {
         2,
         "note deploy AND note topup must both arrange the Hot's funding through the one mechanism"
     );
-    for entry in ["run_note_deploy", "run_note_topup"] {
-        assert!(
-            body_of(entry).contains("wallet_funding::fund_hot_for_money_command("),
-            "{entry} must call the shared funding mechanism"
-        );
-    }
+    assert!(
+        note_deploy_funding_body().contains("wallet_funding::fund_hot_for_money_command("),
+        "note deploy must call the shared funding mechanism after recovery routing"
+    );
+    assert!(
+        body_of("run_note_topup").contains("wallet_funding::fund_hot_for_money_command("),
+        "note topup must call the shared funding mechanism"
+    );
 }
 
 /// The funding step runs INSIDE the wallet's turn.
@@ -62,20 +91,24 @@ fn both_money_commands_call_the_shared_funding_mechanism_334() {
 /// taking a second one here, which would serialize nothing the first does not.
 #[test]
 fn the_funding_step_runs_inside_the_wallet_turn_334() {
-    for entry in ["run_note_deploy", "run_note_topup"] {
-        let body = body_of(entry);
-        let lock = body
-            .find("acquire_funding_wallet_lock(")
-            .unwrap_or_else(|| panic!("{entry} takes the funding wallet's turn"));
-        let funding = body
-            .find("wallet_funding::fund_hot_for_money_command(")
-            .unwrap_or_else(|| panic!("{entry} arranges funding"));
-        assert!(
-            lock < funding,
-            "{entry} must hold the funding wallet's turn BEFORE it reads a balance and decides to \
-             ask the Vault for money"
-        );
-    }
+    let deploy = note_deploy_entry_body();
+    let deploy_lock = deploy
+        .find("acquire_funding_wallet_lock(")
+        .expect("note deploy takes the funding wallet's turn");
+    let routed = deploy
+        .find("run_note_deploy_resolved(")
+        .expect("note deploy enters recovery-routed operations");
+    assert!(deploy_lock < routed);
+    assert!(note_deploy_funding_body().contains("wallet_funding::fund_hot_for_money_command("));
+
+    let topup = body_of("run_note_topup");
+    let topup_lock = topup
+        .find("acquire_funding_wallet_lock(")
+        .expect("note topup takes the funding wallet's turn");
+    let topup_funding = topup
+        .find("wallet_funding::fund_hot_for_money_command(")
+        .expect("note topup arranges funding");
+    assert!(topup_lock < topup_funding);
 }
 
 /// The funding step comes before the refusal it exists to replace.
@@ -108,10 +141,18 @@ fn note_topup_arranges_funding_before_it_refuses_on_a_short_balance_334() {
 #[test]
 fn an_explicit_wallet_skips_durable_binding_but_reaches_manual_route_334() {
     for entry in ["run_note_deploy", "run_note_topup"] {
-        let body = body_of(entry);
+        let body = if entry == "run_note_deploy" {
+            note_deploy_entry_body()
+        } else {
+            body_of(entry)
+        };
         let end = body
-            .find("wallet_funding::fund_hot_for_money_command(")
-            .expect("funding call");
+            .find(if entry == "run_note_deploy" {
+                "run_note_deploy_resolved("
+            } else {
+                "wallet_funding::fund_hot_for_money_command("
+            })
+            .expect("funding route");
         let head = &body[..end];
         assert!(
             head.contains("let funding_binding = match args.multisig_address.as_deref() {"),
@@ -121,10 +162,18 @@ fn an_explicit_wallet_skips_durable_binding_but_reaches_manual_route_334() {
             head.contains("Some(_) => None,"),
             "{entry} must not load a durable binding when the explicit wallet won"
         );
+        let funding = if entry == "run_note_deploy" {
+            note_deploy_funding_body()
+        } else {
+            body[end..].to_string()
+        };
         assert!(
-            body[end..].contains("binding: funding_binding.as_ref(),")
-                && body[end..].contains("resolved_hot_address: &funding_wallet.address,")
-                && body[end..].contains("network: &funding_network,"),
+            (funding.contains("binding: self.funding_binding,")
+                && funding.contains("resolved_hot_address: self.resolved_hot_address,")
+                && funding.contains("network: self.funding_network,"))
+                || (funding.contains("binding: funding_binding.as_ref(),")
+                    && funding.contains("resolved_hot_address: &funding_wallet.address,")
+                    && funding.contains("network: &funding_network,")),
             "{entry} must pass the resolved explicit Hot and manifest network to the shared \
              entrypoint that selects the ephemeral Manual flow"
         );
@@ -140,20 +189,31 @@ fn an_explicit_wallet_skips_durable_binding_but_reaches_manual_route_334() {
 /// moment entirely. The same helper serves both - there is no second notion of a sane clock.
 #[test]
 fn both_commands_check_the_clock_before_the_funding_flow_reads_one_334() {
-    for entry in ["run_note_deploy", "run_note_topup"] {
-        let body = body_of(entry);
-        let skew = body
-            .find("chain_clock_skew_preflight(")
-            .unwrap_or_else(|| panic!("{entry} checks this machine's clock against the chain"));
-        let funding = body
-            .find("wallet_funding::fund_hot_for_money_command(")
-            .unwrap_or_else(|| panic!("{entry} arranges funding"));
-        assert!(
-            skew < funding,
-            "{entry} must prove its clock before the funding flow reads one, or the reconciliation \
-             decides against a clock nothing has checked"
-        );
-    }
+    assert!(
+        note_deploy_preflight_body().contains("chain_clock_skew_preflight("),
+        "run_note_deploy checks this machine's clock against the chain"
+    );
+    let deploy = note_deploy_resolved_body();
+    let deploy_skew = deploy
+        .find("ops.preflight_doctor().await?")
+        .expect("note deploy runs its clock-bearing preflight");
+    let deploy_funding = deploy
+        .find("ops.prepare_funding(funding_route).await?")
+        .expect("note deploy arranges funding");
+    assert!(deploy_skew < deploy_funding);
+
+    let topup = body_of("run_note_topup");
+    let topup_skew = topup
+        .find("chain_clock_skew_preflight(")
+        .expect("run_note_topup checks this machine's clock against the chain");
+    let topup_funding = topup
+        .find("wallet_funding::fund_hot_for_money_command(")
+        .expect("run_note_topup arranges funding");
+    assert!(
+        topup_skew < topup_funding,
+        "run_note_topup must prove its clock before the funding flow reads one, or the \
+         reconciliation decides against a clock nothing has checked"
+    );
 }
 
 /// The documented override reaches the mechanism from both commands.

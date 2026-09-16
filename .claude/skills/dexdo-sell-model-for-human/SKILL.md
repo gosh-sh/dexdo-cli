@@ -130,10 +130,13 @@ dexdo note deploy \
 `--nominal` has no default, deliberately: this is a real spend. Use `--multisig-private-key` with a
 file holding the 32-byte hex secret if that is the form you keep.
 
-The note's address and its owner secret are written into `pn_pool.json`. **Do not copy the secret
-out of it.** Every command that signs for a note reads it back from that file, which is why you will
-not see a `--note-key` flag on the trading commands below. Treat `pn_pool.json` as a secret file:
-never commit it, never paste it, never put it in a bug report.
+Before wallet onboarding, wallet funding, or chain preflight, dexdo atomically writes the fresh owner key to
+`pn_pool.json.recovery.json` with owner-only permissions. The completed pool holds note credentials,
+not funding-wallet provenance: notes funded by different multisigs may share it when nominal and
+token type match. The note's address and owner secret are written into `pn_pool.json`. **Do not copy
+the secret out of it.** Every command that signs for a note reads it back from that file, which is
+why you will not see a `--note-key` flag on the trading commands below. Treat `pn_pool.json` as a
+secret file: never commit it, never paste it, never put it in a bug report.
 
 Keep the address to hand -- the read-only commands take it:
 
@@ -163,7 +166,7 @@ visible to every process on the machine and land in your shell history.
 Look at the market before you pick a number:
 
 ```sh
-dexdo market Qwen3.6-27B --note-addr "$NOTE_ADDR"
+dexdo market Qwen3.8-27B --note-addr "$NOTE_ADDR"
 ```
 
 Read-only; it writes nothing and costs nothing. It prints the resting asks -- price per tick and
@@ -204,7 +207,7 @@ anything, so a policy problem always stops you for free.
 ```sh
 dexdo provision \
   --policy "$POLICY" \
-  --frame-model Qwen3.6-27B \
+  --frame-model Qwen3.8-27B \
   --nonce 1 \
   --price-per-tick 1 \
   --max-ticks 1024 \
@@ -274,7 +277,7 @@ Give the buyer either the `market.json` file or the `token_contract` string from
 `<DAPP-ID>::<ACCOUNT-ID>` form.
 
 If you hand over the bare string rather than the file, you **must also tell them the canonical frame
-model** -- `Qwen3.6-27B` -- because they need it as `--frame-model` alongside
+model** -- `Qwen3.8-27B` -- because they need it as `--frame-model` alongside
 `--token-contract`. Hand over the string without the model and their command cannot be completed.
 
 ---
@@ -322,7 +325,8 @@ When the cause is not obvious, run `dexdo doctor` before anything else.
 Know these before you type them:
 
 - **`dexdo destroy`** selfdestructs a stopped deal's contract. The unrecovered remainder is gone.
-- **`dexdo note withdraw`** is one-shot and irreversible.
+- **`dexdo note withdraw`** is one-shot and irreversible; its canonical
+  `--to <DAPP-ID>::<ACCOUNT-ID>` is always explicit and is never inferred from the pool or funding wallet.
 - **the first funding leg** converts SHELL into native gas permanently.
 - **a spent `--nonce`** cannot be reused; the deal address is derived from it.
 

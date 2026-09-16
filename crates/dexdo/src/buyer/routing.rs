@@ -486,12 +486,6 @@ where
             if let Err(error) = usage.validate() {
                 return Err(DealOutcome::Scam(error.to_string()));
             }
-            if usage.output_tokens > output_limit_tokens {
-                return Err(DealOutcome::Scam(format!(
-                    "terminal output usage {} exceeds output limit {}",
-                    usage.output_tokens, output_limit_tokens
-                )));
-            }
             if usage.total_tokens > billing_grant_tokens {
                 return Err(DealOutcome::Scam(format!(
                     "terminal billable usage {} exceeds billing grant {}",
@@ -773,7 +767,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn gateway_accepts_more_text_fragments_than_terminal_output_tokens() {
+    async fn gateway_accepts_reasoning_inclusive_billing_above_the_output_limit() {
         let mut chunks = Vec::with_capacity(66);
         for seq in 0..65 {
             chunks.push(Ok(CanonChunk {
@@ -784,19 +778,19 @@ mod tests {
         }
         chunks.push(Ok(CanonChunk {
             seq: 65,
-            usage: Some(BillingUsage::new(1, 64, None).unwrap()),
+            usage: Some(BillingUsage::new(1, 65, None).unwrap()),
             ..CanonChunk::default()
         }));
         let mut stream = tokio_stream::iter(chunks);
         let mut verifier = StreamVerifier::new();
 
         let (usage, accepted_output_tokens) =
-            receive_gateway_stream(&mut stream, &mut verifier, 64, 65, false)
+            receive_gateway_stream(&mut stream, &mut verifier, 64, 66, false)
                 .await
-                .expect("SSE fragments are not provider-native output tokens");
+                .expect("billing output can include reasoning above the visible-output limit");
 
-        assert_eq!(usage, BillingUsage::new(1, 64, None).unwrap());
-        assert_eq!(accepted_output_tokens, 64);
+        assert_eq!(usage, BillingUsage::new(1, 65, None).unwrap());
+        assert_eq!(accepted_output_tokens, 65);
     }
 
     // ---- Path A fail-closed content-identity gate ----

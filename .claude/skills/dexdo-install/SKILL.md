@@ -518,6 +518,12 @@ expect the account's own ECC[2] to equal the nominal -- since 4.0.33 a note is b
 `RootPN.GAS_DEPOSIT` in that pocket, and a fully funded note can read `0` there while its record
 holds the whole balance.
 
+The recovery file is created atomically with mode `0600` before wallet onboarding, funding, or chain preflight,
+so an interruption leaves the exact owner key needed to resume. The completed pool deliberately
+does not record which multisig funded each note; homogeneous notes funded by different multisigs may
+share one pool. Any later `note withdraw --to` or `note sweep --to` must name its canonical
+destination explicitly -- neither command derives it from this pool or funding history.
+
 ### Other prerequisites
 
 1. A **model access key** for the seller only (for example `GROQ_API_KEY`), exported in the

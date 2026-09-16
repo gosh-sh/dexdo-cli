@@ -6399,18 +6399,18 @@ mod tests {
         }
     }
 
-    /// A clean answer that consumes the output cap exactly keeps the provider's clean terminal, and
-    /// the numbers carry the boundary fact.
+    /// A complete answer that consumes the paid billing grant tells the buyer that no paid volume
+    /// remains, while preserving the full answer and its accepted terminal usage.
 
     /// This is a deliberate compatibility boundary. Reaching `max_tokens` exactly is not proof of
     /// truncation: the buyer keeps consuming through terminal usage and clean EOF, and reports
-    /// truncation only when a later content chunk does not fit. The complete input+output terminal
-    /// total may still consume the separate billing grant exactly.
+    /// truncation only when a later content chunk does not fit. Independently, an input+output
+    /// terminal total equal to the billing grant means the paid volume is exhausted.
     #[tokio::test]
-    async fn a_render_that_spends_the_whole_grant_is_reported_by_the_numbers() {
+    async fn a_complete_render_that_spends_the_whole_grant_reports_capacity_exhaustion() {
         for (path, terminal) in [
-            ("/v1/chat/completions", "stop"),
-            ("/v1/messages", "end_turn"),
+            ("/v1/chat/completions", "capacity"),
+            ("/v1/messages", "max_tokens"),
         ] {
             for stream in [true, false] {
                 let harness = weekly_route_harness(WEEK_QUOTA - 6, true).await;
@@ -6426,8 +6426,8 @@ mod tests {
                 assert_eq!(
                     terminal_reason(&body).as_deref(),
                     Some(terminal),
-                    "{path} stream={stream}: an exact-cap answer with terminal usage and clean EOF \
-                     stays a clean completion: {body}"
+                    "{path} stream={stream}: the full answer is present, but its accepted billing \
+                     usage consumed the paid grant: {body}"
                 );
 
                 let delivery = harness.last_delivery().await;

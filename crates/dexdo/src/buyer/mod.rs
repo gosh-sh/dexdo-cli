@@ -201,13 +201,6 @@ impl Buyer {
                     );
                 }
                 usage.validate().map_err(anyhow::Error::msg)?;
-                if usage.output_tokens > output_limit_tokens {
-                    anyhow::bail!(
-                        "terminal output usage {} exceeds output limit {}",
-                        usage.output_tokens,
-                        output_limit_tokens
-                    );
-                }
                 if usage.total_tokens > billing_grant_tokens {
                     anyhow::bail!(
                         "terminal billable usage {} exceeds billing grant {}",

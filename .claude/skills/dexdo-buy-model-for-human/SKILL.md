@@ -114,10 +114,13 @@ dexdo note deploy \
 `--nominal` has no default on purpose: this is a real spend. Use `--multisig-private-key` with a
 file holding the 32-byte hex secret if that is the form you keep.
 
-The address and the owner secret land in `pn_pool.json`. **Do not copy the secret out.** Every
-command that signs reads it back from that file, which is why no `--note-key` appears on the trading
-commands below. Treat the pool file as a secret: never commit it, never paste it, never attach it to
-a report.
+Before wallet onboarding, wallet funding, or chain preflight, dexdo atomically writes the fresh owner key to
+`pn_pool.json.recovery.json` with owner-only permissions. The completed pool holds note credentials,
+not funding-wallet provenance: notes funded by different multisigs may share it when nominal and
+token type match. The address and owner secret land in `pn_pool.json`. **Do not copy the secret
+out.** Every command that signs reads it back from that file, which is why no `--note-key` appears
+on the trading commands below. Treat the pool file as a secret: never commit it, never paste it,
+never attach it to a report.
 
 ```sh
 NOTE_ADDR=$(jq -r '.notes[-1].address' pn_pool.json)
@@ -164,7 +167,7 @@ nothing loads it under that name.
 Read-only; these write nothing:
 
 ```sh
-dexdo market Qwen3.6-27B --market market.json
+dexdo market Qwen3.8-27B --market market.json
 dexdo quote --market market.json --ticks 8
 ```
 
@@ -210,7 +213,7 @@ Or straight from the model's order book, with no `market.json` at all:
 
 ```sh
 dexdo buyer \
-  --frame-model Qwen3.6-27B \
+  --frame-model Qwen3.8-27B \
   --models models.json \
   --ticks 8 \
   --max-price-per-tick 1 \
@@ -254,7 +257,7 @@ The `model` field must be the deal's frame model, or omitted:
 ```sh
 curl http://127.0.0.1:8080/v1/chat/completions \
   -H "Content-Type: application/json" \
-  -d '{"model":"Qwen3.6-27B","messages":[{"role":"user","content":"hello"}],"stream":true}'
+  -d '{"model":"Qwen3.8-27B","messages":[{"role":"user","content":"hello"}],"stream":true}'
 ```
 
 For OpenAI-compatible tools and SDKs:
@@ -310,7 +313,8 @@ When the cause is not obvious, run `dexdo doctor` first.
 ## 12. What cannot be undone
 
 - **the first funding leg** turns SHELL into native gas permanently.
-- **`dexdo note withdraw`** is one-shot and irreversible.
+- **`dexdo note withdraw`** is one-shot and irreversible; its canonical
+  `--to <DAPP-ID>::<ACCOUNT-ID>` is always explicit and is never inferred from the pool or funding wallet.
 - **a committed buy** is committed; what is not delivered comes back to you, but the purchase is not
   cancelled by closing the terminal.
 

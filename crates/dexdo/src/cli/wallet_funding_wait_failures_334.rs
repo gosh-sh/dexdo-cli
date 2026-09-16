@@ -547,6 +547,10 @@ async fn the_funding_state_in_the_envelope_is_one_closed_set_name_and_no_secret(
 fn the_funding_event_name_is_the_one_serde_writes() {
     for (notice, expected) in [
         (MachineFundingNotice::AlreadyFunded, "already_funded"),
+        (
+            MachineFundingNotice::VoucherSubmittedWaitingEventOrProof,
+            "voucher_submitted_waiting_event_or_proof",
+        ),
         (MachineFundingNotice::RequestSubmitted, "request_submitted"),
         (
             MachineFundingNotice::RequestAlreadyPending,

@@ -1,6 +1,6 @@
 use crate::cli::policy;
 use anyhow::{anyhow, bail, Result};
-use dexdo_core::{ChainBackend, ChainError};
+use dexdo_core::{ChainBackend, ChainError, DealTerminalSettlement};
 
 pub(crate) async fn apply_seller_dispute_policy(
     chain: &dyn ChainBackend,
@@ -142,31 +142,46 @@ pub(crate) fn is_err_not_open(error: &ChainError) -> bool {
     }
 }
 
-/// Recognise an advance failure that is really the deal's own terminal `ProbeBurned`.
+/// Recognise an advance failure that is really the deal's immutable terminal settlement.
 
-/// A buyer that stops during the probe burns it, and that settlement destroys the TokenContract. Every
-/// getter the seller reconciles against goes with it -- `getState` starts answering nothing -- so the
-/// driver's read fails and the failure arrives here wearing no exit code at all. It is neither
-/// `ERR_NOT_OPEN` nor a dispute, so it used to fall through both classifiers and become the seller's
-/// first fatal error: the process died on an outcome the protocol allows and it had nothing left to do
-/// about.
+/// Every terminal destroys the TokenContract. Its getters disappear, so a late reconciliation can
+/// fail even though settlement already completed. Immutable receipts outlive the account and are
+/// the only authoritative fact still available.
 
-/// The receipts outlive the account, so the terminal is still provable after the fact. Proving it here
-/// only retires the deal -- the seller submits nothing further against a contract that no longer exists.
-/// Anything short of an exact, unambiguous `ProbeBurned` leaves the existing classification untouched.
-pub(crate) async fn classify_terminal_probe_burn(
+/// Proving the terminal here only retires the deal; the seller submits nothing further against a
+/// contract that no longer exists. Anything short of one exact terminal leaves the existing
+/// failure classification untouched.
+pub(crate) async fn classify_terminal_settlement(
     chain: &dyn ChainBackend,
     token_contract: &dexdo_core::TokenContract,
 ) -> Result<Option<String>> {
-    let Some((burned_probe, burned_bond, refund_to_buyer)) =
-        chain.probe_burned_settlement(token_contract).await?
-    else {
+    let Some(settlement) = chain.terminal_settlement(token_contract).await? else {
         return Ok(None);
     };
-    Ok(Some(format!(
-        "reason=probe_burned_terminal burnedProbe={burned_probe} burnedBond={burned_bond} \
-         refundToBuyer={refund_to_buyer}"
-    )))
+    Ok(Some(match settlement {
+        DealTerminalSettlement::ProbeBurned {
+            burned_probe,
+            burned_bond,
+            refund_to_buyer,
+        } => format!(
+            "reason=probe_burned_terminal burnedProbe={burned_probe} burnedBond={burned_bond} \
+             refundToBuyer={refund_to_buyer}"
+        ),
+        DealTerminalSettlement::StreamStopped {
+            to_seller,
+            refund_to_buyer,
+        } => format!(
+            "reason=stream_stopped_terminal toSeller={to_seller} refundToBuyer={refund_to_buyer}"
+        ),
+        DealTerminalSettlement::DisputeResolved {
+            to_seller,
+            refund_to_buyer,
+            released,
+        } => format!(
+            "reason=dispute_resolved_terminal toSeller={to_seller} \
+             refundToBuyer={refund_to_buyer} released={released}"
+        ),
+    }))
 }
 
 pub(crate) async fn classify_by_fact_advance_failure(

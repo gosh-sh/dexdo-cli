@@ -441,6 +441,9 @@ pub const CONSUMER_DEMAND_RECENT_SECS: u64 = 30;
 /// Interval between reads while waiting for a seller handover.
 pub const BUYER_HANDOVER_POLL_INTERVAL: Duration = Duration::from_millis(500);
 
+/// Interval between durable human-readable status records during the seller handover wait.
+pub const BUYER_HANDOVER_PROGRESS_INTERVAL: Duration = Duration::from_secs(30);
+
 /// Maximum wait for a seller's `postSellOffer` submit response.
 pub const POST_SELL_OFFER_SUBMIT_TIMEOUT: Duration = Duration::from_secs(120);
 
@@ -3234,6 +3237,7 @@ mod tests {
             "RENEWAL_FAILURE_BACKOFF_SECS",
             "CONSUMER_DEMAND_RECENT_SECS",
             "BUYER_HANDOVER_POLL_INTERVAL",
+            "BUYER_HANDOVER_PROGRESS_INTERVAL",
             "POST_SELL_OFFER_SUBMIT_TIMEOUT",
             "OFFER_ACCEPTANCE_TIMEOUT",
             "SELLER_READ_BACKOFF",

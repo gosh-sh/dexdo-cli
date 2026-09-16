@@ -184,35 +184,38 @@ fn the_destination_is_refused_before_the_secret_is_read_or_anything_is_sent() {
     assert!(owner < submit, "owner must be checked before money moves");
 }
 
-/// `--to` carries the DApp id, so it is required and has no default.
+/// `--to` carries the DApp id, so both irreversible exits require it and have no default.
 
 /// Measured rather than assumed: the contract takes `dapp_id` as its own second parameter and sends
 /// to it as `dest_dapp_id`, so the destination's DApp half is load-bearing and not decoration. A
 /// default here would be a guess at where someone's money goes.
 #[test]
-fn the_destination_argument_has_no_default() {
+fn irreversible_destination_arguments_have_no_default() {
     let source = include_str!("args.rs");
-    let start = source
-        .find("pub(crate) struct NoteSweepArgs")
-        .expect("NoteSweepArgs present");
-    let end = source[start..]
-        .find("\n}")
-        .map(|o| start + o)
-        .expect("struct closes");
-    let body = &source[start..end];
-    let to = body.find("pub(crate) to: String").expect("--to present");
-    let before_to = &body[..to];
-    assert!(
-        !before_to
-            .rsplit("#[arg(")
-            .next()
-            .is_some_and(|attr| attr.contains("default_value")),
-        "--to must not carry a default: an irreversible transfer never guesses its destination"
-    );
-    assert!(
-        body.contains("REQUIRED"),
-        "the doc comment must say so, because the help text is where an operator reads it"
-    );
+    for command in ["NoteWithdrawArgs", "NoteSweepArgs"] {
+        let marker = format!("pub(crate) struct {command}");
+        let start = source
+            .find(&marker)
+            .unwrap_or_else(|| panic!("{command} present"));
+        let end = source[start..]
+            .find("\n}")
+            .map(|o| start + o)
+            .expect("struct closes");
+        let body = &source[start..end];
+        let to = body.find("pub(crate) to: String").expect("--to present");
+        let before_to = &body[..to];
+        assert!(
+            !before_to
+                .rsplit("#[arg(")
+                .next()
+                .is_some_and(|attr| attr.contains("default_value")),
+            "{command} --to must not carry a default: an irreversible transfer never guesses its destination"
+        );
+        assert!(
+            body.contains("REQUIRED") && body.contains("never defaulted"),
+            "{command} help must state that the destination is always explicit"
+        );
+    }
 }
 
 /// `note sweep` encodes its call with `note withdraw`'s payload builder, and that is only sound

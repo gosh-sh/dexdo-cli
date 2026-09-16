@@ -299,6 +299,8 @@ fn sse_response(
         } else {
             None
         };
+        let billing_exhausted = accepted_usage
+            .is_some_and(|usage| usage.total_tokens == billing_grant_tokens);
         // stop_reason does NOT pass off a bail/error as an honest `end_turn` -- bail -> `refusal`,
         // transport error -> `error`, otherwise `end_turn`.
 
@@ -307,7 +309,7 @@ fn sse_response(
         // that finished. The cap ends the answer at any `received`, not only at zero.
         let stop_reason = if bailed {
             "refusal"
-        } else if capped {
+        } else if capped || billing_exhausted {
             "max_tokens"
         } else if stream_error.is_some() || received == 0 {
             "error"
@@ -434,6 +436,8 @@ async fn aggregate_response(
     } else {
         None
     };
+    let billing_exhausted =
+        accepted_usage.is_some_and(|usage| usage.total_tokens == billing_grant_tokens);
     // every terminal below records the same three figures, including the two that answer 502.
     let report = |stop_reason: &'static str| {
         report_request_delivery(
@@ -481,7 +485,7 @@ async fn aggregate_response(
     // part of it had been aggregated reported `end_turn`, which is what a finished model reports.
     let stop_reason = if bailed {
         "refusal"
-    } else if capped {
+    } else if capped || billing_exhausted {
         "max_tokens"
     } else {
         "end_turn"

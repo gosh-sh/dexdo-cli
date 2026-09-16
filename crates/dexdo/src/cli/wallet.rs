@@ -968,6 +968,68 @@ pub(crate) struct FundingWallet {
     pub(crate) seed_file: Option<std::path::PathBuf>,
 }
 
+/// An active binding names the right Hot but cannot supply the credential needed for a new spend.
+
+/// Typed separately from an absent binding: onboarding over an existing binding is unsafe, while a
+/// machine consumer must not receive `INTERNAL` for an operator-remediable wallet state.
+#[derive(Debug)]
+pub(crate) struct WalletBindingCannotSign {
+    message: String,
+}
+
+impl WalletBindingCannotSign {
+    pub(crate) fn new(message: impl Into<String>) -> Self {
+        Self {
+            message: message.into(),
+        }
+    }
+
+    pub(crate) fn for_binding(binding: &WalletBinding) -> Self {
+        Self::new(format!(
+            "wallet binding {} (provider `{}`, Hot {}) records no local Hot key or seed file, so \
+             this instance cannot sign a spend from it; re-bind it with a provider flow that \
+             stores one, or pass `--multisig-address` and `--multisig-private-key` for this run",
+            binding.id, binding.provider, binding.hot_address,
+        ))
+    }
+}
+
+impl std::fmt::Display for WalletBindingCannotSign {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(&self.message)
+    }
+}
+
+impl std::error::Error for WalletBindingCannotSign {}
+
+/// Resolve only the public Hot identity and any credential path the binding happens to carry.
+
+/// Recovery of an already submitted voucher needs the identity to match its journal, but must not
+/// demand a signing credential: that recovery waits for or proves the existing submit and never
+/// signs a second one. Commands that are about to make a fresh spend keep using
+/// [`resolve_funding_wallet`], which enforces the credential.
+pub(crate) fn resolve_funding_wallet_identity(
+    store: &WalletStore,
+    network: &WalletNetwork,
+    explicit_address: Option<&str>,
+    explicit_key: &Option<std::path::PathBuf>,
+    explicit_seed_file: &Option<std::path::PathBuf>,
+) -> Result<FundingWallet> {
+    if let Some(address) = explicit_address {
+        return Ok(FundingWallet {
+            address: address.to_string(),
+            key: explicit_key.clone(),
+            seed_file: explicit_seed_file.clone(),
+        });
+    }
+    let binding = store.require_active(network)?;
+    Ok(FundingWallet {
+        address: binding.hot_address,
+        key: binding.hot_key_file,
+        seed_file: binding.hot_seed_file,
+    })
+}
+
 /// Decide which Hot a money command spends from, before it reaches the chain.
 
 /// `network` is the chain the command is ACTUALLY running on, taken from the deployed contracts
@@ -1005,29 +1067,65 @@ pub(crate) fn resolve_funding_wallet(
     explicit_key: &Option<std::path::PathBuf>,
     explicit_seed_file: &Option<std::path::PathBuf>,
 ) -> Result<FundingWallet> {
-    if let Some(address) = explicit_address {
-        return Ok(FundingWallet {
-            address: address.to_string(),
-            key: explicit_key.clone(),
-            seed_file: explicit_seed_file.clone(),
-        });
+    let wallet = resolve_funding_wallet_identity(
+        store,
+        network,
+        explicit_address,
+        explicit_key,
+        explicit_seed_file,
+    )?;
+    if explicit_address.is_none() && wallet.key.is_none() && wallet.seed_file.is_none() {
+        let binding = store.require_active(network)?;
+        return Err(WalletBindingCannotSign::for_binding(&binding).into());
     }
-    let binding = store.require_active(network)?;
-    if binding.hot_key_file.is_none() && binding.hot_seed_file.is_none() {
-        bail!(
-            "wallet binding {} (provider `{}`, Hot {}) records no local Hot key or seed file, so \
-             this instance cannot sign a spend from it; re-bind it with a provider flow that \
-             stores one, or pass `--multisig-address` and `--multisig-private-key` for this run",
-            binding.id,
-            binding.provider,
-            binding.hot_address,
-        );
+    Ok(wallet)
+}
+
+/// Resolve the public funding identity, onboarding only when no binding exists.
+
+/// Unlike [`resolve_funding_wallet_or_onboard`], a valid binding without a local credential is a
+/// successful identity lookup. `note deploy` decides after loading recovery whether this run will
+/// sign anything; only that branch may reject the missing credential.
+pub(crate) async fn resolve_funding_wallet_identity_or_onboard(
+    store: &WalletStore,
+    network: &WalletNetwork,
+    explicit_address: Option<&str>,
+    explicit_key: &Option<std::path::PathBuf>,
+    explicit_seed_file: &Option<std::path::PathBuf>,
+    purpose: &str,
+) -> Result<FundingWallet> {
+    let refusal = match resolve_funding_wallet_identity(
+        store,
+        network,
+        explicit_address,
+        explicit_key,
+        explicit_seed_file,
+    ) {
+        Ok(wallet) => return Ok(wallet),
+        Err(refusal) => refusal,
+    };
+    if !is_wallet_not_configured(&refusal) || !onboarding_can_be_run() {
+        return Err(refusal);
     }
-    Ok(FundingWallet {
-        address: binding.hot_address,
-        key: binding.hot_key_file,
-        seed_file: binding.hot_seed_file,
-    })
+    eprintln!(
+        "no {} wallet is bound yet, and {purpose} spends from one. Starting wallet \
+         onboarding now; it continues by itself once the wallet answers.",
+        network.as_str()
+    );
+    run_selected(
+        WalletAction::Onboard,
+        WalletProvider::AckinackiWallet,
+        None,
+        false,
+    )
+    .await?;
+    resolve_funding_wallet_identity(
+        store,
+        network,
+        explicit_address,
+        explicit_key,
+        explicit_seed_file,
+    )
 }
 
 /// Resolve the funding wallet, and where there is none, onboard one instead of dead-ending.

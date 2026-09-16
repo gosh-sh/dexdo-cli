@@ -13,7 +13,7 @@ use crate::cli::deals;
 use crate::cli::policy;
 use crate::cli::seller_policy::{
     apply_seller_dispute_policy, apply_seller_terminal_policy, classify_by_fact_advance_failure,
-    classify_terminal_probe_burn, is_err_not_open, AdvanceFailureDisposition,
+    classify_terminal_settlement, is_err_not_open, AdvanceFailureDisposition,
 };
 use crate::cli::support::*;
 use anyhow::{bail, Result};
@@ -1082,7 +1082,45 @@ async fn record_advance_result(
                 claimed_tokens,
                 "seller pool deal reached terminal by-fact state"
             );
+            let mut seller_stop_attempted = false;
             match chain.deal_state(&token_contract).await {
+                Ok(Some(state))
+                    if delivery
+                        .billing_exhausted
+                        .load(std::sync::atomic::Ordering::Acquire)
+                        && state.opened
+                        && !state.disputed =>
+                {
+                    seller_stop_attempted = true;
+                    match chain.seller_stop(&token_contract).await {
+                        Ok(settlement) => {
+                            tracing::info!(
+                                token_contract = %display_token_contract(&token_contract),
+                                claimed_tokens,
+                                ?settlement,
+                                "seller closed an open deal after its paid billing reservation was exhausted"
+                            );
+                            if let Err(error) = seller.state.mark_deal_terminal(&token_contract) {
+                                first_error.get_or_insert_with(|| {
+                                    anyhow::anyhow!(
+                                        "--token-contract {}: sellerStop succeeded after billing exhaustion, \
+                                         but terminal capacity cleanup failed: {error}",
+                                        display_token_contract(&token_contract)
+                                    )
+                                });
+                            }
+                        }
+                        Err(error) => {
+                            first_error.get_or_insert_with(|| {
+                                anyhow::anyhow!(
+                                    "--token-contract {}: paid billing reservation was exhausted, \
+                                     but sellerStop failed: {error}",
+                                    display_token_contract(&token_contract)
+                                )
+                            });
+                        }
+                    }
+                }
                 Ok(Some(state)) => {
                     if let Err(error) = apply_seller_terminal_policy(
                         &token_contract,
@@ -1121,7 +1159,9 @@ async fn record_advance_result(
                 }
             }
             seller.state.unregister_stream(&token_contract);
-            spawn_buyer_stop_receipt_wait(terminal_receipts, token_contract, chain, delivery);
+            if !seller_stop_attempted {
+                spawn_buyer_stop_receipt_wait(terminal_receipts, token_contract, chain, delivery);
+            }
         }
         Ok((token_contract, chain, delivery, _, Err(error))) => {
             tracing::error!(
@@ -1163,14 +1203,12 @@ async fn record_advance_result(
                     }
                 }
             } else {
-                // a buyer that stops on the probe burns it, and that settlement destroys the
-                // TokenContract. The advance then fails on a getter that answers nothing, carrying
-                // no exit code, so it matches neither `is_err_not_open` nor a dispute and used to
-                // become the seller's first fatal error. The immutable receipts outlive the account
-                // and still prove the terminal, so classify from them before treating an outcome the
-                // protocol allows as a fault that kills the whole seller.
-                let terminal_probe_burn =
-                    match classify_terminal_probe_burn(chain.as_ref(), &token_contract).await {
+                // every terminal destroys the TokenContract. A late advance then fails on
+                // getters that answer nothing even though immutable receipts already prove that
+                // the deal finished. Classify that full lifecycle before treating a normal
+                // terminal as a fault that kills the whole seller.
+                let terminal =
+                    match classify_terminal_settlement(chain.as_ref(), &token_contract).await {
                         Ok(reason) => reason,
                         Err(receipt_error) => {
                             tracing::warn!(
@@ -1182,11 +1220,11 @@ async fn record_advance_result(
                             None
                         }
                     };
-                if let Some(reason) = terminal_probe_burn {
+                if let Some(reason) = terminal {
                     tracing::info!(
                         token_contract = %display_token_contract(&token_contract),
                         %reason,
-                        "seller pool retired a deal that terminated on its burned probe"
+                        "seller pool retired a deal with an immutable terminal settlement"
                     );
                     true
                 } else {
@@ -5882,14 +5920,17 @@ mod tests {
         exists: AtomicBool,
         matched: AtomicBool,
         opened: AtomicBool,
+        probe_accepted: AtomicBool,
         post_calls: AtomicU64,
         open_calls: AtomicU64,
+        seller_stop_calls: AtomicU64,
+        buyer_stop_calls: AtomicU64,
         open_fail_once: AtomicBool,
         inspection_fail_once: AtomicBool,
         created_at: i64,
-        /// The immutable `ProbeBurned` receipt the destroyed contract left behind, if it burned its
-        /// probe. It outlives `exists`, exactly as the on-chain event outlives the account.
-        probe_burn: Mutex<Option<(u128, u128, u128)>>,
+        /// The immutable terminal receipt the destroyed contract left behind. It outlives
+        /// `exists`, exactly as the on-chain event outlives the account.
+        terminal_settlement: Mutex<Option<dexdo_core::DealTerminalSettlement>>,
         /// (load-bearing): report one resting SELL row for this TokenContract.
 
         /// Default `false` keeps the inherited `ChainBackend::raw_resting_sell_orders_for_tc`
@@ -5968,8 +6009,11 @@ mod tests {
                 exists: AtomicBool::new(true),
                 matched: AtomicBool::new(matched),
                 opened: AtomicBool::new(false),
+                probe_accepted: AtomicBool::new(false),
                 post_calls: AtomicU64::new(0),
                 open_calls: AtomicU64::new(0),
+                seller_stop_calls: AtomicU64::new(0),
+                buyer_stop_calls: AtomicU64::new(0),
                 open_fail_once: AtomicBool::new(false),
                 inspection_fail_once: AtomicBool::new(false),
                 // all three default OFF, so every pre-existing fixture keeps the inherited
@@ -5979,14 +6023,25 @@ mod tests {
                 cancel_confirms: AtomicBool::new(false),
                 cancel_submitted: AtomicBool::new(false),
                 created_at,
-                probe_burn: Mutex::new(None),
+                terminal_settlement: Mutex::new(None),
                 getdeal_gone: AtomicBool::new(false),
                 terminal_owner_fills: Mutex::new(std::collections::HashSet::new()),
             }
         }
 
         fn with_probe_burn(self, settlement: (u128, u128, u128)) -> Self {
-            *self.probe_burn.lock().unwrap() = Some(settlement);
+            let (burned_probe, burned_bond, refund_to_buyer) = settlement;
+            *self.terminal_settlement.lock().unwrap() =
+                Some(dexdo_core::DealTerminalSettlement::ProbeBurned {
+                    burned_probe,
+                    burned_bond,
+                    refund_to_buyer,
+                });
+            self
+        }
+
+        fn with_terminal_settlement(self, settlement: dexdo_core::DealTerminalSettlement) -> Self {
+            *self.terminal_settlement.lock().unwrap() = Some(settlement);
             self
         }
 
@@ -6198,7 +6253,21 @@ mod tests {
         }
 
         async fn stop(&self, _: &TokenContract, _: &dyn Note) -> Result<Settlement, ChainError> {
+            self.buyer_stop_calls.fetch_add(1, Ordering::Relaxed);
             unreachable!("the test exits before the fixed probe window")
+        }
+
+        async fn seller_stop(
+            &self,
+            token_contract: &TokenContract,
+        ) -> Result<Settlement, ChainError> {
+            assert_eq!(token_contract, &self.token_contract);
+            self.seller_stop_calls.fetch_add(1, Ordering::Relaxed);
+            self.opened.store(false, Ordering::Relaxed);
+            Ok(Settlement::AmicableSplit {
+                to_seller_ticks: self.matched_ticks,
+                to_buyer_refund: 0,
+            })
         }
 
         async fn deal_state(
@@ -6216,7 +6285,7 @@ mod tests {
             Ok(self.exists.load(Ordering::Relaxed).then(|| DealChainState {
                 funded: self.matched.load(Ordering::Relaxed),
                 opened: self.opened.load(Ordering::Relaxed),
-                probe_accepted: false,
+                probe_accepted: self.probe_accepted.load(Ordering::Relaxed),
                 disputed: false,
                 deposit: if self.matched.load(Ordering::Relaxed) {
                     u128::from(self.price_per_tick) * u128::from(self.matched_ticks)
@@ -6277,7 +6346,21 @@ mod tests {
             &self,
             _: &TokenContract,
         ) -> Result<Option<(u128, u128, u128)>, ChainError> {
-            Ok(*self.probe_burn.lock().unwrap())
+            Ok(match &*self.terminal_settlement.lock().unwrap() {
+                Some(dexdo_core::DealTerminalSettlement::ProbeBurned {
+                    burned_probe,
+                    burned_bond,
+                    refund_to_buyer,
+                }) => Some((*burned_probe, *burned_bond, *refund_to_buyer)),
+                _ => None,
+            })
+        }
+
+        async fn terminal_settlement(
+            &self,
+            _: &TokenContract,
+        ) -> Result<Option<dexdo_core::DealTerminalSettlement>, ChainError> {
+            Ok(self.terminal_settlement.lock().unwrap().clone())
         }
     }
 
@@ -6315,11 +6398,10 @@ mod tests {
         }
     }
 
-    /// Measured live on the test chain, 2026-08-04. The buyer could not open the seller gateway
-    /// ("upstream open failed after retry: transport error") and stopped the deal on the probe.
-    /// TokenContract emitted `ProbeBurned burnedProbe=4000000000 burnedBond=4000000000
-    /// refundToBuyer=4200000000` and selfdestructed; the seller's trading balance moved 10000 ->
-    /// 9996 SHELL, agreeing with the burned bond.
+    /// every terminal takes the per-deal TokenContract account with it. The immutable receipt
+    /// must retire only that deal instead of turning a late getter failure into the pool's fatal
+    /// error. The reported `ProbeBurned` carried the exact 2026-08-04 amounts below; the 2026-09-03
+    /// occurrence was an ordinary paid `StreamStopped` under `after_deal_done: retire`.
 
     /// The seller's next advance then read the account that no longer existed and failed with
     /// "getState returned no data while reconciling the cumulative claim high-water". That message
@@ -6328,17 +6410,15 @@ mod tests {
     /// first fatal error and the whole seller process exited -- on an outcome the protocol allows
     /// and about which there was nothing left for the seller to do.
 
-    /// A `ProbeBurned` receipt is immutable and outlives the account, so the terminal stays provable
-    /// after every getter is gone. The classification must come from it, and only from it: the same
-    /// unreadable deal with no such receipt is still an unexplained failure and must stay fatal.
+    /// The same unreadable deal without one exact terminal receipt is still an unexplained failure
+    /// and must stay fatal.
     #[tokio::test]
-    async fn terminal_probe_burn_retires_the_deal_instead_of_killing_the_seller() {
-        let advance_failure = || {
-            ChainError::Chain(
-                "TokenContract 0:probe-burned getState returned no data while reconciling the \
+    async fn issue_1923_every_terminal_retires_the_deal_instead_of_killing_the_seller() {
+        let advance_failure = |token_contract: &str| {
+            ChainError::Chain(format!(
+                "TokenContract {token_contract} getState returned no data while reconciling the \
                  cumulative claim high-water"
-                    .to_string(),
-            )
+            ))
         };
         let mut seller = dexdo::seller::start_gateway_with_note(
             "127.0.0.1:0".parse().unwrap(),
@@ -6349,43 +6429,73 @@ mod tests {
         .unwrap();
         let mut terminal_receipts = tokio::task::JoinSet::new();
 
-        // The deal that really did burn its probe: destroyed account, one exact receipt.
-        let burned = PoolTestBackend::new(
-            Arc::new(Mutex::new(Vec::new())),
-            "0:probe-burned".to_string(),
-            98,
-            2,
-            true,
-            1,
-        )
-        .with_probe_burn((4_000_000_000, 4_000_000_000, 4_200_000_000));
-        burned.opened.store(true, Ordering::Relaxed);
-        burned.exists.store(false, Ordering::Relaxed);
-        let token_contract = burned.token_contract.clone();
-        let chain: Arc<dyn ChainBackend> = Arc::new(burned);
-        assert!(
-            chain.deal_state(&token_contract).await.unwrap().is_none(),
-            "the terminal settlement destroyed the account this test is about"
-        );
-        let mut first_error = None;
-        record_advance_result(
-            &seller,
-            Ok((
-                token_contract.clone(),
-                chain,
-                seller.state.delivery(&token_contract),
-                false,
-                Err(advance_failure()),
-            )),
-            &mut terminal_receipts,
-            &pool_test_policy(4),
-            &mut first_error,
-        )
-        .await;
-        assert!(
-            first_error.is_none(),
-            "a proven ProbeBurned terminal must not become the seller's fatal error: {first_error:?}"
-        );
+        let terminals = [
+            (
+                "0:probe-burned",
+                dexdo_core::DealTerminalSettlement::ProbeBurned {
+                    burned_probe: 4_000_000_000,
+                    burned_bond: 4_000_000_000,
+                    refund_to_buyer: 4_200_000_000,
+                },
+            ),
+            (
+                "0:stream-stopped",
+                dexdo_core::DealTerminalSettlement::StreamStopped {
+                    to_seller: 3_000_400_000,
+                    refund_to_buyer: 4_075_000_000,
+                },
+            ),
+            (
+                "0:dispute-resolved",
+                dexdo_core::DealTerminalSettlement::DisputeResolved {
+                    to_seller: 1_000_000_000,
+                    refund_to_buyer: 5_100_000_000,
+                    released: false,
+                },
+            ),
+        ];
+        for (address, terminal) in terminals {
+            let backend = PoolTestBackend::new(
+                Arc::new(Mutex::new(Vec::new())),
+                address.to_string(),
+                98,
+                2,
+                true,
+                1,
+            )
+            .with_terminal_settlement(terminal);
+            backend.opened.store(true, Ordering::Relaxed);
+            backend.exists.store(false, Ordering::Relaxed);
+            let token_contract = backend.token_contract.clone();
+            let chain: Arc<dyn ChainBackend> = Arc::new(backend);
+            assert!(
+                chain.deal_state(&token_contract).await.unwrap().is_none(),
+                "the terminal settlement destroyed the account this test is about"
+            );
+            let mut first_error = None;
+            record_advance_result(
+                &seller,
+                Ok((
+                    token_contract.clone(),
+                    chain,
+                    seller.state.delivery(&token_contract),
+                    false,
+                    Err(advance_failure(&token_contract)),
+                )),
+                &mut terminal_receipts,
+                &pool_test_policy(4),
+                &mut first_error,
+            )
+            .await;
+            assert!(
+                first_error.is_none(),
+                "a proven terminal must not become the seller's fatal error: {first_error:?}"
+            );
+            assert!(
+                !seller.server_task.is_finished(),
+                "retiring one terminal deal must leave the seller gateway running"
+            );
+        }
 
         // The same unreadable deal without that proof stays exactly as fatal as it was.
         let unexplained = PoolTestBackend::new(
@@ -6408,7 +6518,7 @@ mod tests {
                 chain,
                 seller.state.delivery(&token_contract),
                 false,
-                Err(advance_failure()),
+                Err(advance_failure(&token_contract)),
             )),
             &mut terminal_receipts,
             &pool_test_policy(4),
@@ -6961,6 +7071,86 @@ mod tests {
             first_error,
         )
         .await;
+    }
+
+    #[tokio::test]
+    async fn exhausted_billing_stops_the_open_deal_from_the_seller_side_only_after_advance() {
+        let mut seller = dexdo::seller::start_gateway_with_note(
+            "127.0.0.1:0".parse().unwrap(),
+            dexdo::seller::UpstreamConfig::Mock,
+            Arc::new(LocalNote::generate()),
+        )
+        .await
+        .unwrap();
+        let mut terminal_receipts = tokio::task::JoinSet::new();
+        for probe_accepted in [false, true] {
+            let token_contract = format!("0:billing-exhausted-{probe_accepted}");
+            let backend = Arc::new(PoolTestBackend::new(
+                Arc::new(Mutex::new(Vec::new())),
+                token_contract.clone(),
+                8,
+                3,
+                true,
+                1,
+            ));
+            backend.opened.store(true, Ordering::Relaxed);
+            backend
+                .probe_accepted
+                .store(probe_accepted, Ordering::Relaxed);
+            let delivery = seller.state.delivery(&token_contract);
+            delivery.count.store(2, Ordering::Release);
+            delivery.done.store(true, Ordering::Release);
+            delivery.billing_exhausted.store(true, Ordering::Release);
+            let mut first_error = None;
+            let chain: Arc<dyn ChainBackend> = backend.clone();
+
+            record_advance_result(
+                &seller,
+                Ok((token_contract, chain, delivery, false, Ok(2))),
+                &mut terminal_receipts,
+                &pool_test_policy(4),
+                &mut first_error,
+            )
+            .await;
+
+            assert!(first_error.is_none(), "{first_error:?}");
+            assert_eq!(backend.seller_stop_calls.load(Ordering::Relaxed), 1);
+            assert_eq!(backend.buyer_stop_calls.load(Ordering::Relaxed), 0);
+        }
+        assert!(
+            terminal_receipts.is_empty(),
+            "sellerStop must not be reported through the buyer-stop receipt path"
+        );
+
+        let ordinary_done = Arc::new(PoolTestBackend::new(
+            Arc::new(Mutex::new(Vec::new())),
+            "0:ordinary-session-done".to_string(),
+            8,
+            3,
+            true,
+            1,
+        ));
+        ordinary_done.opened.store(true, Ordering::Relaxed);
+        ordinary_done.probe_accepted.store(true, Ordering::Relaxed);
+        let token_contract = ordinary_done.token_contract.clone();
+        let delivery = seller.state.delivery(&token_contract);
+        delivery.done.store(true, Ordering::Release);
+        let chain: Arc<dyn ChainBackend> = ordinary_done.clone();
+        let mut first_error = None;
+        record_advance_result(
+            &seller,
+            Ok((token_contract, chain, delivery, false, Ok(2))),
+            &mut terminal_receipts,
+            &pool_test_policy(4),
+            &mut first_error,
+        )
+        .await;
+        assert!(first_error.is_none(), "{first_error:?}");
+        assert_eq!(ordinary_done.seller_stop_calls.load(Ordering::Relaxed), 0);
+
+        terminal_receipts.abort_all();
+        seller.server_task.abort();
+        let _ = (&mut seller.server_task).await;
     }
 
     #[tokio::test]

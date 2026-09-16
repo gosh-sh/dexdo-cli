@@ -1904,32 +1904,80 @@ fn market_manifest_lying_about() -> Option<std::path::PathBuf> {
         })
 }
 
-/// `dexdo provision` REQUIRES an explicit, deal-unique `--nonce`. The per-deal `TokenContract` derives
-/// from `(sellerPubkey, nonce)`, so a reused/default nonce collides -- a second provisioned deal overwrites the
-/// first deal's TC. The old `--nonce 0` default silently reused it; this fails loud and forces a distinct nonce
-/// per deal. Pure.
-pub(crate) fn require_provision_nonce(nonce: Option<u64>) -> Result<u64> {
+/// `dexdo provision` requires an explicit nonce choice: a numeric value for reproducible
+/// operation, or `auto` for a random candidate whose address is checked before provisioning.
+/// The old implicit `0` default remains forbidden.
+pub(crate) fn require_provision_nonce(
+    nonce: Option<ProvisionNonceArg>,
+) -> Result<ProvisionNonceArg> {
     nonce.ok_or_else(|| {
         anyhow::anyhow!(
-            "--nonce <n> is required and must be UNIQUE per deal: the per-deal TokenContract derives from \
-             (sellerPubkey, nonce), so a reused/default nonce collides -- overwriting a prior deal's TC. Pass a \
-             distinct --nonce for each provisioned deal (e.g. an incrementing counter)."
+            "--nonce is required and must be UNIQUE per deal: pass `--nonce auto` (recommended for \
+             a normal new market) to choose and verify a random 64-bit nonce, or `--nonce <n>` for \
+             a reproducible explicit value"
         )
     })
 }
 
 #[cfg(test)]
 mod provision_nonce_tests {
-    use super::require_provision_nonce;
+    use super::{require_provision_nonce, ProvisionNonceArg};
+    use clap::Parser as _;
+    use std::str::FromStr;
+
+    fn parsed_provision_nonce(value: &str) -> ProvisionNonceArg {
+        let crate::Command::Provision(args) = crate::Cli::try_parse_from([
+            "dexdo",
+            "provision",
+            "--frame-model",
+            "qwen--qwen3--32b",
+            "--nonce",
+            value,
+        ])
+        .expect("provision nonce must parse")
+        .command
+        else {
+            panic!("expected provision command");
+        };
+        args.nonce.expect("parsed nonce")
+    }
 
     /// `provision` refuses an absent `--nonce` (the old unsafe `0` default -> collision across deals)
     /// and accepts an explicit deal-unique value.
     #[test]
-    fn provision_nonce_required_and_explicit() {
-        assert_eq!(require_provision_nonce(Some(7)).unwrap(), 7);
+    fn provision_nonce_requires_an_explicit_mode_and_accepts_numeric_or_auto() {
+        assert_eq!(
+            require_provision_nonce(Some(ProvisionNonceArg::Explicit(7))).unwrap(),
+            ProvisionNonceArg::Explicit(7)
+        );
+        assert_eq!(
+            ProvisionNonceArg::from_str("auto").unwrap(),
+            ProvisionNonceArg::Auto
+        );
+        assert_eq!(
+            ProvisionNonceArg::from_str("18446744073709551615").unwrap(),
+            ProvisionNonceArg::Explicit(u64::MAX)
+        );
+        assert_eq!(parsed_provision_nonce("auto"), ProvisionNonceArg::Auto);
+        assert_eq!(
+            parsed_provision_nonce("42"),
+            ProvisionNonceArg::Explicit(42)
+        );
+        let invalid = ProvisionNonceArg::from_str("-1").unwrap_err();
+        assert!(invalid.contains("unsigned 64-bit integer"), "{invalid}");
+        assert!(crate::Cli::try_parse_from([
+            "dexdo",
+            "provision",
+            "--frame-model",
+            "qwen--qwen3--32b",
+            "--nonce",
+            "-1",
+        ])
+        .is_err());
         let err = require_provision_nonce(None).unwrap_err().to_string();
         assert!(err.contains("UNIQUE per deal"), "{err}");
-        assert!(err.contains("--nonce"), "{err}");
+        assert!(err.contains("--nonce auto"), "{err}");
+        assert!(err.contains("recommended for a normal new market"), "{err}");
     }
 }
 

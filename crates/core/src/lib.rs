@@ -99,13 +99,14 @@ pub use market::{
     BuyerStopTerminalReceipt, ChainBackend, ChainError, ClaimBounds, ConservationBreach,
     CounterpartyTally, DealAnomaly, DealBuyerBond, DealChainSnapshot, DealChainState, DealLedger,
     DealLedgerStep, DealMoneyFlow, DealOfferLatch, DealRole, DealSellerBond, DealSettlement,
-    DealSubscription, DealView, ExecutableQuote, InferenceSubscriptionPlacement, Match,
-    MatchWatchCursor, MatchedFill, MatchedTokenContractStatus, MockChainBackend,
-    MockSubscriptionExit, MockSubscriptionTerminal, ModelBreakdown, NoteSnapshot, OfferListing,
-    OrderBookOrder, OrderBookSnapshot, OrderBookStats, QuoteFill, RawUint128, SellOffer,
-    SellOfferOutcome, SettlementAction, SettlementActionBondState, SettlementActionEvent,
-    SettlementActionPostState, SettlementActionReceipt, StreamSnapshot, SubscriptionBuyReserve,
-    TokenContract, TreeSnapshot, UNKNOWN_MODEL,
+    DealSubscription, DealTerminalSettlement, DealView, ExecutableQuote,
+    InferenceSubscriptionPlacement, Match, MatchWatchCursor, MatchedFill,
+    MatchedTokenContractStatus, MockChainBackend, MockSubscriptionExit, MockSubscriptionTerminal,
+    ModelBreakdown, NoteSnapshot, OfferListing, OrderBookOrder, OrderBookSnapshot, OrderBookStats,
+    QuoteFill, RawUint128, SellOffer, SellOfferOutcome, SettlementAction,
+    SettlementActionBondState, SettlementActionEvent, SettlementActionPostState,
+    SettlementActionReceipt, StreamSnapshot, SubscriptionBuyReserve, TokenContract, TreeSnapshot,
+    UNKNOWN_MODEL,
 };
 pub use note::{verify, LocalNote, Note, NoteError, NotePubkey, NoteTree, Signature};
 pub use onchain_diagnostics::{

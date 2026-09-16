@@ -98,7 +98,8 @@ pub(crate) struct ChainReadTimeoutArgs {
 /// First-class mock flags -- common to both roles.
 #[derive(Args, Clone)]
 pub(crate) struct MockFlags {
-    /// Mock model: fake tokens instead of a real upstream.
+    /// Mock model: fake tokens instead of a real upstream. Allowed with
+    /// `--mock-chain` and on real shellnet, but refused on production mainnet.
     #[arg(long)]
     pub(crate) mock_model: bool,
     /// Mock chain: `MockChainBackend` instead of a real chain.
@@ -107,6 +108,19 @@ pub(crate) struct MockFlags {
 }
 
 impl MockFlags {
+    /// deterministic fake output must never enter the production market for real SHELL.
+    /// The real-shellnet stage remains intentional and supported.
+    pub(crate) fn reject_mainnet_mock_model(&self, network: &str) -> Result<()> {
+        if self.mock_model && !self.mock_chain && network == "mainnet" {
+            bail!(
+                "--mock-model cannot run against mainnet: it serves deterministic fake output \
+                 into a real market for real SHELL; remove --mock-model, or point \
+                 DEXDO_MANIFEST at shellnet for the mock-model + real-chain test stage"
+            );
+        }
+        Ok(())
+    }
+
     /// Buyer mock-demo: on a mock chain the upstream is also mock -- there is no real stream, so
     /// we require `--mock-model`. The chain is selected separately (`--mock-chain` -> mock, otherwise real
     /// the chain backend behind the feature) -- the former `bail!` about "" is removed (the real backend is available).
@@ -605,6 +619,26 @@ pub(crate) enum PolicyValidateRoleArg {
     Seller,
 }
 
+/// How `provision` obtains the per-deal nonce.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ProvisionNonceArg {
+    Auto,
+    Explicit(u64),
+}
+
+impl FromStr for ProvisionNonceArg {
+    type Err = String;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        if value.eq_ignore_ascii_case("auto") {
+            return Ok(Self::Auto);
+        }
+        value.parse::<u64>().map(Self::Explicit).map_err(|_| {
+            format!("invalid nonce {value:?}: expected `auto` or an unsigned 64-bit integer")
+        })
+    }
+}
+
 /// Provision arguments: bring up a per-deal market from the seller note alone.
 #[derive(Args)]
 pub(crate) struct ProvisionArgs {
@@ -621,11 +655,12 @@ pub(crate) struct ProvisionArgs {
     /// it are paid for and can never trade. Same flag, same meaning, same opt-out as `dexdo buyer`.
     #[arg(long)]
     pub(crate) allow_unverified_model: bool,
-    /// Deal nonce -- disambiguates multiple `TokenContract`s under one `RootModel`.: REQUIRED and must be
-    /// UNIQUE per deal -- the per-deal `TokenContract` derives from `(sellerPubkey, nonce)`, so a reused/default
-    /// nonce collides (overwrites a prior deal's TC). No unsafe `0` default; pass a distinct value per deal.
+    /// Deal nonce (required). For a normal new market, use `auto` (recommended): it chooses and
+    /// verifies a random 64-bit value. Use an explicit unsigned integer only for reproducible or
+    /// operator-controlled provisioning. The per-deal `TokenContract` derives from
+    /// `(sellerPubkey, nonce)`, so every selected value must be unique for that seller.
     #[arg(long)]
-    pub(crate) nonce: Option<u64>,
+    pub(crate) nonce: Option<ProvisionNonceArg>,
     /// Tick price P in whole SHELL: `3` is three SHELL a tick. One SHELL is the book's price step,
     /// and a price that is not a whole multiple of it the book refuses.
     #[arg(long, default_value = "1", value_parser = crate::cli::args::parse_price_shell)]
@@ -1840,8 +1875,10 @@ pub(crate) struct NoteTransferArgs {
 pub(crate) struct NoteWithdrawArgs {
     #[command(flatten)]
     pub(crate) identity: IdentityArgs,
-    /// Destination wallet address in canonical `<dapp_id>::<account_id>` form. Account-only legacy
-    /// `0:<account_id>` is refused because it carries no destination DApp for withdrawal evidence.
+    /// Destination wallet address in canonical `<dapp_id>::<account_id>` form. REQUIRED, and
+    /// deliberately never defaulted or inferred from the note pool/funding wallet: the transfer is
+    /// irreversible. Account-only legacy `0:<account_id>` is refused because it carries no
+    /// destination DApp for withdrawal evidence.
     #[arg(long)]
     pub(crate) to: String,
 }
@@ -2401,6 +2438,36 @@ pub(crate) struct AccumulatorClaimArgs {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn mock_model_network_policy_refuses_only_real_mainnet() {
+        for network in ["mainnet", "shellnet"] {
+            for mock_chain in [false, true] {
+                for mock_model in [false, true] {
+                    let flags = super::MockFlags {
+                        mock_model,
+                        mock_chain,
+                    };
+                    let result = flags.reject_mainnet_mock_model(network);
+                    let refused = network == "mainnet" && mock_model && !mock_chain;
+
+                    if refused {
+                        assert_eq!(
+                            result.expect_err("real mainnet mock-model must be refused").to_string(),
+                            "--mock-model cannot run against mainnet: it serves deterministic fake output into a real market for real SHELL; remove --mock-model, or point DEXDO_MANIFEST at shellnet for the mock-model + real-chain test stage"
+                        );
+                    } else {
+                        result.unwrap_or_else(|error| {
+                            panic!(
+                                "network={network} mock_chain={mock_chain} mock_model={mock_model} \
+                                 must remain allowed: {error}"
+                            )
+                        });
+                    }
+                }
+            }
+        }
+    }
+
     #[test]
     fn migrated_cli_consumers_do_not_redeclare_canonical_parameters() {
         let args_source = include_str!("args.rs")

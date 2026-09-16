@@ -1,3 +1,17 @@
+## v0.4.0
+
+### Fixes
+
+- Fixed `dexdo note deploy` so a new PrivateNote owner key is saved before wallet onboarding, chain checks, or wallet spending. PN pool files no longer reject or group notes by the multisig that funded them, and legacy funding provenance is removed on the next pool update.
+- Fixed `dexdo note deploy` recovery after an already submitted deposit voucher: reruns now reconcile that voucher without requesting a Hot top-up or signing a second wallet transfer, and machine output reports `voucher_submitted_waiting_event_or_proof` while recovery is pending.
+- Fixed reasoning-capable provider responses being rejected when provider billing usage exceeded the visible-output limit. The completed answer is now returned, charges cannot exceed the paid reservation, capacity exhaustion is reported to the buyer, and the seller closes the exhausted deal.
+- Made `dexdo doctor` lead with a clear upgrade instruction when the installed manifest is older than the live chain, instead of leaving users to infer the remedy from contract hash failures.
+- Fixed the seller process exiting when a completed deal's token contract had already been destroyed. A verified final settlement now retires only that deal while the seller keeps serving other offers; missing or conflicting settlement history still fails closed.
+- Fixed slow or retried chain-time reads being counted as local clock skew, which could falsely block signed writes and make `dexdo doctor` recommend repairing an already-correct system clock.
+- Prevented `--mock-model` from running with the real chain on production mainnet, so deterministic fake responses cannot be sold for mainnet SHELL. Mock-chain demos and the real-shellnet mock-model stage remain supported.
+- Fixed buyer handover progress for matched deals that are funded but not yet opened: it now shows elapsed time, `funded=true opened=false`, and the reclaim countdown, prints the actionable `dexdo status '<TokenContract>'` command once, and emits bounded compact heartbeats in redirected output instead of appearing hung.
+- Fixed settlement and recovery for deal addresses accidentally reused after a seller nonce was reset. Receipts from an earlier deployment no longer block or falsely complete the current deal, while duplicate settlement in the current deployment remains blocked. New nonce reuse is refused before deal deployment, seller offer posting, or buyer escrow. The required provisioning nonce now accepts `--nonce auto`, the recommended choice for a normal new market, while explicit numeric nonces remain available for reproducible operator workflows.
+
 ## v0.3.0
 
 ### New / Improvements

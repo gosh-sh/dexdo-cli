@@ -247,6 +247,11 @@ private, never commit it. `dexdo note deploy` is the user note-creation path. Po
 commands at the pool it creates. Success is the block that opens `Note deployed` and carries an `address:` line with the note and a
 `folded:` line with the pool; do not advance on an earlier progress line.
 
+Before wallet onboarding, wallet funding, or chain preflight, dexdo atomically persists the fresh owner key in
+`pn_pool.json.recovery.json` with owner-only permissions. A completed pool stores note credentials,
+not funding-wallet provenance; notes funded by different multisigs may share it when nominal and
+token type match.
+
 Point later seller commands at the pool it creates:
 
 ```sh
@@ -284,9 +289,9 @@ the deal deploy (Phase 6, whole SHELL) plus runtime gas. If it is short, deploy 
 {
   "models": {
     "qwen": {
-      "frame_model": "Qwen3.6-27B",
+      "frame_model": "Qwen3.8-27B",
       "base_url": "https://api.groq.com/openai/v1",
-      "served_model": "qwen/qwen3.6-27b",
+      "served_model": "qwen/qwen3.8-27b",
       "api_key_env": "GROQ_API_KEY",
       "tokenizer_family": "qwen",
       "price_per_tick": 1,
@@ -297,7 +302,7 @@ the deal deploy (Phase 6, whole SHELL) plus runtime gas. If it is short, deploy 
 ```
 
 `capabilities.max_output_tokens` is the model's own maximum completion length at that provider (Groq
-answers `400` above `16384` for `qwen/qwen3.6-27b`). The seller clamps every outbound request to it, so the
+answers `400` above `16384` for `qwen/qwen3.8-27b`). The seller clamps every outbound request to it, so the
 field is REQUIRED: a model entry without it is refused before the provider is contacted rather than served
 with an unbounded limit. Take the number from your provider's model card.
 
@@ -346,7 +351,7 @@ First look at the model's shared order book (read-only, writes nothing) so you c
 against the market:
 
 ```sh
-dexdo market Qwen3.6-27B --note-addr "$NOTE_ADDR"
+dexdo market Qwen3.8-27B --note-addr "$NOTE_ADDR"
 ```
 
 It prints the resting asks (price per tick, max ticks) and their deal addresses. `dexdo markets
@@ -416,7 +421,7 @@ transaction:
 dexdo policy validate --role seller --path "$POLICY"
 dexdo provision \
   --policy "$POLICY" \
-  --frame-model Qwen3.6-27B \
+  --frame-model Qwen3.8-27B \
   --nonce 1 \
   --price-per-tick 1 \
   --max-ticks 1024 \
@@ -478,7 +483,7 @@ tick. The wait for a buyer is open-ended -- the resting offer is not torn down.
 Give the buyer either the `market.json` file OR the `token_contract` string
 (`<DAPP-ID>::<ACCOUNT-ID>`) from it. If you hand over the bare `token_contract` (not the file), you
 **must also give the buyer the canonical
-frame model** `Qwen3.6-27B` -- the buyer needs it as `--frame-model` alongside
+frame model** `Qwen3.8-27B` -- the buyer needs it as `--frame-model` alongside
 `--token-contract`. The buyer places the buy; the gateway opens the stream automatically and forces
 the configured model.
 
@@ -553,7 +558,8 @@ dexdo note withdraw --note-addr "$NOTE_ADDR" --to <DAPP-ID>::<ACCOUNT-ID>
 ```
 
 `note withdraw` still names its note -- it is one-shot and it will not choose which note to end --
-but not its key.
+but not its key. Its canonical `--to` is required every time and is never inferred from the pool,
+the funding wallet or a previous command.
 
 ---
 

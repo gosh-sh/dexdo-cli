@@ -132,14 +132,16 @@ impl UpstreamFailure {
 /// Per-deal billable-usage tracking. `count` is the **cumulative** checked
 /// input-plus-output total committed across all of this deal's gRPC streams. A deal/session serves many
 /// sequential requests on one `token_contract`, so each clean request terminal adds exactly once to the same
-/// counter. `done` means **no more billable usage will ever arrive for this deal/session** -- it is owned by the
-/// buyer **session lifecycle**, not by any single stream. The seller's `drive_advance` reads both
-/// (Acquire) so finalized ticks never exceed accepted billable usage, and only stops waiting once the session
-/// is truly `done` (or the deal closes on-chain).
+/// counter. `done` means **no more billable usage will ever arrive for this deal/session**. The ordinary owner
+/// is the buyer **session lifecycle**; a provider bill beyond one request's paid reservation also closes
+/// that lifecycle after committing the capped amount. `billing_exhausted` distinguishes only that latter fact,
+/// so an ordinary clean session end never causes a seller-initiated close. The seller's `drive_advance` reads
+/// `count` and `done` (Acquire) so finalized ticks never exceed accepted billable usage.
 #[derive(Clone, Default)]
 pub struct DealDelivery {
     pub count: Arc<AtomicU64>,
     pub done: Arc<AtomicBool>,
+    pub billing_exhausted: Arc<AtomicBool>,
     update_lock: Arc<Mutex<()>>,
     event_sequence: Arc<AtomicU64>,
     terminal_trail_emitted: Arc<AtomicBool>,
@@ -196,6 +198,11 @@ pub trait AuthoritativeDeliveryRecorder: Send + Sync {
         &self,
         event: AuthoritativeDeliveryEvent,
     ) -> Result<(), Status>;
+
+    /// Mark that the provider's terminal bill exceeded this request's authorized reservation.
+    /// The accepted amount is recorded first; `done` then tells the existing advance driver that no
+    /// later request may add billable usage to this deal.
+    fn mark_billing_exhausted(&self) {}
 }
 
 impl AuthoritativeDeliveryRecorder for DealDelivery {
@@ -214,6 +221,11 @@ impl AuthoritativeDeliveryRecorder for DealDelivery {
             }
             AuthoritativeDeliveryEvent::Finished(_) => Ok(()),
         }
+    }
+
+    fn mark_billing_exhausted(&self) {
+        self.billing_exhausted.store(true, Ordering::Release);
+        self.done.store(true, Ordering::Release);
     }
 }
 
@@ -261,6 +273,13 @@ impl AuthoritativeDeliveryRecorder for CapacityDeliveryRecorder {
                 Ok(())
             }
         }
+    }
+
+    fn mark_billing_exhausted(&self) {
+        self.delivery
+            .billing_exhausted
+            .store(true, Ordering::Release);
+        self.delivery.done.store(true, Ordering::Release);
     }
 }
 
@@ -592,6 +611,7 @@ async fn relay_counting_with_chain_availability<R>(
     let mut visible_output_tokens = 0u64;
     let mut next_seq = 0u64;
     let mut terminal_usage: Option<BillingUsage> = None;
+    let mut billing_exhausted = false;
     let mut terminal_error = None;
     let finish = 'relay: loop {
         let event = if let Some(unavailable) = chain_unavailable.as_mut() {
@@ -639,6 +659,9 @@ async fn relay_counting_with_chain_availability<R>(
             {
                 terminal_error = Some(status);
                 break unfinished_delivery_finish(saw_output);
+            }
+            if billing_exhausted {
+                recorder.mark_billing_exhausted();
             }
             permit.send(Ok(CanonChunk {
                 seq: next_seq,
@@ -703,7 +726,7 @@ async fn relay_counting_with_chain_availability<R>(
                 permit.send(Ok(chunk));
                 saw_output |= has_output;
             }
-            Ok(UpstreamEvent::Usage(usage)) => {
+            Ok(UpstreamEvent::Usage(mut usage)) => {
                 if terminal_usage.is_some() {
                     terminal_error = Some(Status::data_loss(
                         "upstream emitted duplicate terminal billing usage",
@@ -714,19 +737,11 @@ async fn relay_counting_with_chain_availability<R>(
                     terminal_error = Some(Status::data_loss(error));
                     break unfinished_delivery_finish(saw_output);
                 }
-                if usage.output_tokens > output_limit_tokens {
-                    terminal_error = Some(Status::data_loss(format!(
-                        "terminal output usage {} exceeds output limit {output_limit_tokens}",
-                        usage.output_tokens
-                    )));
-                    break unfinished_delivery_finish(saw_output);
-                }
                 if usage.total_tokens > billing_grant_tokens {
-                    terminal_error = Some(Status::data_loss(format!(
-                        "terminal billable usage {} exceeds billing grant {billing_grant_tokens}",
-                        usage.total_tokens
-                    )));
-                    break unfinished_delivery_finish(saw_output);
+                    billing_exhausted = true;
+                    usage.output_tokens = usage.output_tokens.min(billing_grant_tokens);
+                    usage.input_tokens = billing_grant_tokens - usage.output_tokens;
+                    usage.total_tokens = billing_grant_tokens;
                 }
                 let output_matches = if exact_output_usage {
                     usage.output_tokens == visible_output_tokens
@@ -1164,6 +1179,10 @@ mod tests {
         ) -> Result<(), Status> {
             self.delivery.record_authoritative_delivery(event)?;
             self.events.record_authoritative_delivery(event)
+        }
+
+        fn mark_billing_exhausted(&self) {
+            self.delivery.mark_billing_exhausted();
         }
     }
 
@@ -1678,7 +1697,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn terminal_total_above_reservation_is_rejected_without_accounting_delta() {
+    async fn terminal_total_above_reservation_delivers_the_full_response_and_caps_billing() {
         let state = GatewayState::new();
         let tc = "0:fat-structured-chunk";
         state
@@ -1696,7 +1715,7 @@ mod tests {
         let (tx, mut rx) = mpsc::channel::<Result<CanonChunk, Status>>(2);
         up_tx
             .send(Ok(UpstreamEvent::Chunk(CanonChunk {
-                token_ids: vec![1, 2, 3],
+                text: "full provider response".into(),
                 ..CanonChunk::default()
             })))
             .await
@@ -1709,7 +1728,7 @@ mod tests {
             .unwrap();
         drop(up_tx);
 
-        relay_counting(
+        relay_counting_with_chain_availability(
             up_rx,
             tx,
             CapacityDeliveryRecorder {
@@ -1717,17 +1736,28 @@ mod tests {
                 delivery: state.delivery(tc),
             },
             None,
+            None,
+            2,
+            2,
+            false,
         )
         .await;
-        assert_eq!(rx.recv().await.unwrap().unwrap().token_ids, vec![1, 2, 3]);
-        let status = rx.recv().await.unwrap().unwrap_err();
-        assert_eq!(status.code(), tonic::Code::DataLoss);
+        assert_eq!(
+            rx.recv().await.unwrap().unwrap().text,
+            "full provider response"
+        );
+        let usage = rx.recv().await.unwrap().unwrap().usage.unwrap();
+        assert_eq!(usage.input_tokens, 0);
+        assert_eq!(usage.output_tokens, 2);
+        assert_eq!(usage.total_tokens, 2);
         assert!(rx.recv().await.is_none());
         let snapshot = state.capacity_snapshot(tc).unwrap().unwrap();
-        assert_eq!(snapshot.local_delivered_after_anchor, 0);
-        assert_eq!(snapshot.outstanding_reservation, 2);
+        assert_eq!(snapshot.local_delivered_after_anchor, 2);
+        assert_eq!(snapshot.outstanding_reservation, 0);
         assert_eq!(snapshot.available().unwrap(), 0);
-        assert_eq!(state.delivery(tc).count.load(Ordering::Acquire), 0);
+        assert_eq!(state.delivery(tc).count.load(Ordering::Acquire), 2);
+        assert!(state.delivery(tc).done.load(Ordering::Acquire));
+        assert!(state.delivery(tc).billing_exhausted.load(Ordering::Acquire));
     }
 
     #[tokio::test]
@@ -1762,13 +1792,13 @@ mod tests {
             .unwrap();
         up_tx
             .send(Ok(UpstreamEvent::Usage(
-                BillingUsage::new(0, 1, None).unwrap(),
+                BillingUsage::new(2, 1, None).unwrap(),
             )))
             .await
             .unwrap();
         drop(up_tx);
 
-        relay_counting(
+        relay_counting_with_chain_availability(
             up_rx,
             tx,
             CapacityDeliveryRecorder {
@@ -1776,6 +1806,10 @@ mod tests {
                 delivery: delivery.clone(),
             },
             None,
+            None,
+            1,
+            2,
+            true,
         )
         .await;
         assert_eq!(rx.recv().await.unwrap().unwrap().token_ids, vec![1]);
@@ -1791,6 +1825,8 @@ mod tests {
         assert_eq!(snapshot.outstanding_reservation, 2);
         assert_eq!(snapshot.available().unwrap(), 0);
         assert_eq!(delivery.count.load(Ordering::Acquire), u64::MAX);
+        assert!(!delivery.done.load(Ordering::Acquire));
+        assert!(!delivery.billing_exhausted.load(Ordering::Acquire));
     }
 
     #[tokio::test]
@@ -1882,7 +1918,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn terminal_total_above_the_private_capacity_fails_without_a_durable_bill() {
+    async fn terminal_total_above_the_private_capacity_is_capped_and_marks_the_deal_done() {
         let state = Arc::new(GatewayState::new());
         let buyer = LocalNote::generate();
         let tc = "0:open-stream-private-cap-overflow";
@@ -1907,33 +1943,35 @@ mod tests {
             .expect("the authoritative remainder can reserve before provider usage is known");
         let mut stream = response.into_inner();
         let mut output = 0_u64;
-        let mut terminal_error = None;
+        let mut terminal = None;
         while let Some(item) = stream.next().await {
-            match item {
-                Ok(chunk) => {
-                    assert!(chunk.usage.is_none());
-                    output += chunk.visible_output_tokens();
-                }
-                Err(status) => terminal_error = Some(status),
+            let chunk = item.expect("provider overrun is capped to the authorized reservation");
+            if let Some(usage) = chunk.usage {
+                terminal = Some(usage);
+            } else {
+                output += chunk.visible_output_tokens();
             }
         }
         assert_eq!(
             output, 3,
             "the effective output cap is the private reservation"
         );
-        let status = terminal_error.expect("input 1 + output 3 exceeds capacity 3");
-        assert_eq!(status.code(), tonic::Code::DataLoss);
-        assert!(status.message().contains("exceeds billing grant 3"));
+        let usage = terminal.expect("the buyer receives the capped terminal billing record");
+        assert_eq!(usage.input_tokens, 0);
+        assert_eq!(usage.output_tokens, 3);
+        assert_eq!(usage.total_tokens, 3);
         let snapshot = state.capacity_snapshot(tc).unwrap().unwrap();
         assert_eq!(
-            snapshot.local_delivered_after_anchor, 0,
-            "invalid terminal usage never becomes durable billable delivery"
+            snapshot.local_delivered_after_anchor, 3,
+            "only the authorized reservation becomes durable billable delivery"
         );
         assert_eq!(
-            snapshot.outstanding_reservation, 3,
-            "post-output ambiguity retains the conservative reservation"
+            snapshot.outstanding_reservation, 0,
+            "the accepted capped delivery consumes the reservation"
         );
-        assert_eq!(state.delivery(tc).count.load(Ordering::Acquire), 0);
+        assert_eq!(state.delivery(tc).count.load(Ordering::Acquire), 3);
+        assert!(state.delivery(tc).done.load(Ordering::Acquire));
+        assert!(state.delivery(tc).billing_exhausted.load(Ordering::Acquire));
     }
 
     #[tokio::test]
@@ -2377,9 +2415,9 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn relay_accepts_total_equal_to_grant_and_rejects_grant_plus_one() {
-        for (input_tokens, accepted) in [(3, true), (4, false)] {
-            let events = EventRecorder::default();
+    async fn relay_accepts_total_equal_to_grant_and_caps_grant_plus_one() {
+        for (input_tokens, exhausted) in [(3, false), (4, true)] {
+            let recorder = RecordingDelivery::default();
             let (up_tx, up_rx) = mpsc::channel(2);
             let (tx, mut rx) = mpsc::channel::<Result<CanonChunk, Status>>(3);
             up_tx
@@ -2400,7 +2438,7 @@ mod tests {
             relay_counting_with_chain_availability(
                 up_rx,
                 tx,
-                events.clone(),
+                recorder.clone(),
                 None,
                 None,
                 1,
@@ -2409,45 +2447,30 @@ mod tests {
             )
             .await;
             assert_eq!(rx.recv().await.unwrap().unwrap().text, "one");
-            if accepted {
-                assert_eq!(
-                    rx.recv()
-                        .await
-                        .unwrap()
-                        .unwrap()
-                        .usage
-                        .unwrap()
-                        .total_tokens,
-                    4
-                );
-                assert_eq!(
-                    events.events(),
-                    vec![AuthoritativeDeliveryEvent::Completed(
-                        NonZeroU64::new(4).unwrap()
-                    )]
-                );
-            } else {
-                assert_eq!(
-                    rx.recv().await.unwrap().unwrap_err().code(),
-                    tonic::Code::DataLoss
-                );
-                assert_eq!(
-                    events.events(),
-                    vec![AuthoritativeDeliveryEvent::Finished(
-                        AuthoritativeDeliveryFinish::AmbiguousUsage
-                    )],
-                    "usage beyond the grant after forwarded output keeps the reservation ambiguous"
-                );
-            }
+            let usage = rx.recv().await.unwrap().unwrap().usage.unwrap();
+            assert_eq!(usage.input_tokens, 3);
+            assert_eq!(usage.output_tokens, 1);
+            assert_eq!(usage.total_tokens, 4);
+            assert_eq!(
+                recorder.events.events(),
+                vec![AuthoritativeDeliveryEvent::Completed(
+                    NonZeroU64::new(4).unwrap()
+                )]
+            );
+            assert_eq!(
+                recorder.delivery.billing_exhausted.load(Ordering::Acquire),
+                exhausted
+            );
+            assert_eq!(recorder.delivery.done.load(Ordering::Acquire), exhausted);
         }
     }
 
-    /// text-only SSE fragments are not token units. Terminal provider usage decides the
-    /// output cap, while an over-cap terminal record still commits no authoritative delivery.
+    /// text-only SSE fragments are not token units, and provider billing output can
+    /// include hidden reasoning above the visible-output generation limit.
     #[tokio::test]
-    async fn fragmented_real_output_accepts_64_terminal_tokens_and_rejects_65() {
-        for (output_tokens, accepted) in [(64, true), (65, false)] {
-            let events = EventRecorder::default();
+    async fn fragmented_real_output_accepts_billing_above_the_visible_output_limit() {
+        for output_tokens in [64, 65] {
+            let recorder = RecordingDelivery::default();
             let (up_tx, up_rx) = mpsc::channel(66);
             let (tx, mut rx) = mpsc::channel::<Result<CanonChunk, Status>>(67);
             for seq in 0..65 {
@@ -2471,7 +2494,7 @@ mod tests {
             relay_counting_with_chain_availability(
                 up_rx,
                 tx,
-                events.clone(),
+                recorder.clone(),
                 None,
                 None,
                 64,
@@ -2491,26 +2514,22 @@ mod tests {
                 }
             }
             assert_eq!(content_chunks, 65, "all transport fragments are forwarded");
-            if accepted {
-                assert_eq!(terminal.unwrap().output_tokens, 64);
-                assert!(error.is_none());
-                assert_eq!(
-                    events.events(),
-                    vec![AuthoritativeDeliveryEvent::Completed(
-                        NonZeroU64::new(65).unwrap()
-                    )]
-                );
-            } else {
-                assert!(terminal.is_none());
-                assert_eq!(error.unwrap().code(), tonic::Code::DataLoss);
-                assert_eq!(
-                    events.events(),
-                    vec![AuthoritativeDeliveryEvent::Finished(
-                        AuthoritativeDeliveryFinish::AmbiguousUsage
-                    )],
-                    "terminal output above the request cap has no monetary delta"
-                );
-            }
+            assert_eq!(terminal.unwrap().output_tokens, output_tokens);
+            assert!(error.is_none());
+            assert_eq!(
+                recorder.events.events(),
+                vec![AuthoritativeDeliveryEvent::Completed(
+                    NonZeroU64::new(output_tokens + 1).unwrap()
+                )]
+            );
+            assert!(
+                !recorder.delivery.done.load(Ordering::Acquire),
+                "billing above the visible-output cap alone must not close the deal"
+            );
+            assert!(
+                !recorder.delivery.billing_exhausted.load(Ordering::Acquire),
+                "only billing beyond the reservation marks exhaustion"
+            );
         }
     }
 

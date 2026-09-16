@@ -931,7 +931,7 @@ async fn stream_response(
         cfg,
         market,
         requirements,
-        count,
+        count: _,
         tx,
     } = context;
 
@@ -1097,11 +1097,6 @@ async fn stream_response(
                         if has_output {
                             return Err(Box::new(Status::data_loss(
                                 "OpenAI-compatible usage is attached to an output delta, not a terminal record",
-                            )));
-                        }
-                        if reported.output_tokens > count {
-                            return Err(Box::new(Status::data_loss(
-                                "OpenAI-compatible completion_tokens exceeds the requested output limit",
                             )));
                         }
                         // UPS-24: one request carries exactly one authoritative aggregate, and it is billed
@@ -3139,15 +3134,17 @@ mod tests {
         }
     }
 
-    /// A terminal total above the request's own token limit is rejected rather than clamped and paid.
+    /// Provider billing output may include hidden reasoning, so it is not bounded by the visible-output
+    /// generation limit sent in the request.
     #[tokio::test]
-    async fn terminal_usage_above_the_requested_limit_is_rejected() {
+    async fn terminal_billing_output_above_the_requested_limit_is_preserved() {
         let mut body = unstructured_sse_frame("output");
         body.push_str(&usage_frame(9));
         body.push_str("data: [DONE]\n\n");
         let (result, events, _) = run_test_stream_with_capabilities(body, 8, no_logprobs()).await;
-        assert_status(result, "exceeds the requested output limit");
-        assert_eq!(accounted_total(events), 0);
+        result.expect("reasoning-inclusive billing usage is not the visible-output limit");
+        assert_eq!(forwarded_text(&events), vec!["output"]);
+        assert_eq!(accounted_total(events), 9);
     }
 
     // --- / E2E-UPS-38: the provider's text survives the network read boundary ---

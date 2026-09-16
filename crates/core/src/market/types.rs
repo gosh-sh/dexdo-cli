@@ -97,6 +97,28 @@ pub enum SellOfferOutcome {
     Matched,
 }
 
+/// One immutable terminal settlement emitted before a per-deal TokenContract destroys itself.
+
+/// The account getters disappear with the contract, so seller reconciliation uses this receipt
+/// shape only to prove that the deal is already finished. It never authorizes another write.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DealTerminalSettlement {
+    ProbeBurned {
+        burned_probe: u128,
+        burned_bond: u128,
+        refund_to_buyer: u128,
+    },
+    StreamStopped {
+        to_seller: u128,
+        refund_to_buyer: u128,
+    },
+    DisputeResolved {
+        to_seller: u128,
+        refund_to_buyer: u128,
+        released: bool,
+    },
+}
+
 /// Sell offer in the book: the endpoint is NOT published.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SellOffer {

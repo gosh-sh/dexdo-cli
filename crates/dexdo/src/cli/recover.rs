@@ -94,7 +94,7 @@ pub(crate) fn exact_prior_stop_receipt(
     // In particular, `StreamStopped.buyer` is the settlement beneficiary for both `stop()` and
     // `sellerStop()`; it must never be interpreted as the action actor.
     let actions = receipts
-        .events
+        .current_lifecycle()
         .iter()
         .filter(|receipt| {
             matches!(
@@ -1575,6 +1575,84 @@ mod tests {
             assert_eq!(marker_calls.load(Ordering::SeqCst), 0);
             assert_eq!(stop_calls.load(Ordering::SeqCst), 0);
         }
+    }
+
+    #[test]
+    fn issue_1948_recycled_prior_stop_with_same_buyer_is_not_current_noop() {
+        let buyer = format!("0:{}", "11".repeat(32));
+        let tc = format!("0:{}", "22".repeat(32));
+        let receipt =
+            |message_id: &str, created_at: u64, event: dexdo_core::TokenContractSettlementEvent| {
+                dexdo_core::TokenContractSettlementReceipt {
+                    message_id: message_id.to_string(),
+                    created_at,
+                    cursor: format!("cursor-{message_id}"),
+                    event,
+                }
+            };
+        let mut receipts = dexdo_core::TokenContractSettlementReceipts {
+            events: vec![
+                receipt(
+                    "old-deploy",
+                    1,
+                    dexdo_core::TokenContractSettlementEvent::ContractDeployed {
+                        token_contract: tc.clone(),
+                    },
+                ),
+                receipt(
+                    "old-stop",
+                    2,
+                    dexdo_core::TokenContractSettlementEvent::StreamStopped {
+                        buyer: buyer.clone(),
+                        to_seller: 4,
+                        refund_to_buyer: 5,
+                    },
+                ),
+                receipt(
+                    "old-destroy",
+                    3,
+                    dexdo_core::TokenContractSettlementEvent::ContractDestroyed {
+                        token_contract: tc.clone(),
+                    },
+                ),
+                receipt(
+                    "current-deploy",
+                    4,
+                    dexdo_core::TokenContractSettlementEvent::ContractDeployed {
+                        token_contract: tc,
+                    },
+                ),
+                receipt(
+                    "current-open",
+                    5,
+                    dexdo_core::TokenContractSettlementEvent::StreamOpened {
+                        buyer: buyer.clone(),
+                        price_per_tick: 1,
+                    },
+                ),
+            ],
+        };
+
+        assert!(super::exact_prior_stop_receipt(&receipts, &buyer)
+            .expect("the prior lifecycle must not be reconciled as current")
+            .is_none());
+
+        receipts.events.push(receipt(
+            "current-stop",
+            6,
+            dexdo_core::TokenContractSettlementEvent::StreamStopped {
+                buyer: buyer.clone(),
+                to_seller: 6,
+                refund_to_buyer: 7,
+            },
+        ));
+        assert_eq!(
+            super::exact_prior_stop_receipt(&receipts, &buyer)
+                .expect("the current lifecycle terminal is valid")
+                .expect("the current terminal must reconcile")
+                .message_id,
+            "current-stop"
+        );
     }
 
     #[test]

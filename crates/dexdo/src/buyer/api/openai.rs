@@ -321,6 +321,8 @@ fn sse_response(
         } else {
             None
         };
+        let billing_exhausted = accepted_usage
+            .is_some_and(|usage| usage.total_tokens == billing_grant_tokens);
         // the terminal chunk does NOT pass off a bail or an upstream error as a clean
         // `stop` -- bail -> `content_filter`, capacity refusal -> `capacity`, other transport error ->
         // `error`, otherwise an honest `stop`.
@@ -334,7 +336,9 @@ fn sse_response(
             "content_filter"
         } else if capped {
             "length"
-        } else if stream_error.as_ref().is_some_and(|error| error.is_capacity()) {
+        } else if billing_exhausted
+            || stream_error.as_ref().is_some_and(|error| error.is_capacity())
+        {
             "capacity"
         } else if stream_error.is_some() || received == 0 {
             "error"
@@ -462,6 +466,8 @@ async fn aggregate_response(
     } else {
         None
     };
+    let billing_exhausted =
+        accepted_usage.is_some_and(|usage| usage.total_tokens == billing_grant_tokens);
     // every terminal below records the same three figures, including the two that answer 502.
     // A request that failed after paying for output is exactly the one worth being able to attribute.
     let report = |finish_reason: &'static str| {
@@ -519,6 +525,8 @@ async fn aggregate_response(
         "content_filter"
     } else if capped {
         "length"
+    } else if billing_exhausted {
+        "capacity"
     } else {
         "stop"
     };

@@ -391,8 +391,7 @@ pub(crate) async fn run_note_recover(args: NoteRecoverArgs) -> Result<()> {
         &recovery,
         details.as_ref().and_then(|d| d["ephemeralPubkey"].as_str()),
     )?;
-    let n =
-        note_deploy_fold_state_into_pool(&pool_path, &state, &recovery.funding_multisig_address)?;
+    let n = note_deploy_fold_state_into_pool(&pool_path, &state)?;
     std::fs::remove_file(&recovery_path).map_err(|e| {
         anyhow::anyhow!(
             "note recover: remove consumed recovery file {}: {e}",
@@ -3637,6 +3636,8 @@ trait NoteDeployResolvedOps {
 
     async fn load_recovery(&mut self) -> Result<crate::cli::note::NoteDeployRecoveryState>;
 
+    async fn prepare_funding(&mut self, route: NoteDeployFundingRoute) -> Result<()>;
+
     async fn preflight_prover(&mut self) -> Result<()>;
 
     async fn resume_chain(
@@ -3651,6 +3652,30 @@ trait NoteDeployResolvedOps {
     ) -> Result<()>;
 }
 
+/// Whether this invocation may enter the Hot balance/top-up/signing path after recovery is read.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum NoteDeployFundingRoute {
+    FreshSpend,
+    VoucherRecoveryRequired,
+    ResumeWithoutFunding,
+}
+
+fn note_deploy_funding_route(
+    recovery: &crate::cli::note::NoteDeployRecoveryState,
+) -> NoteDeployFundingRoute {
+    let voucher_recovery_required = recovery.pn_address.is_none()
+        && recovery.deposit_voucher.as_ref().is_some_and(|voucher| {
+            voucher.submit_maybe_sent || voucher.event.is_some() || voucher.proof.is_some()
+        });
+    if voucher_recovery_required {
+        NoteDeployFundingRoute::VoucherRecoveryRequired
+    } else if crate::cli::note::note_deploy_recovery_has_no_possible_spend(recovery) {
+        NoteDeployFundingRoute::FreshSpend
+    } else {
+        NoteDeployFundingRoute::ResumeWithoutFunding
+    }
+}
+
 async fn run_note_deploy_resolved<O>(ops: &mut O) -> Result<()>
 where
     O: NoteDeployResolvedOps,
@@ -3658,23 +3683,37 @@ where
     // The declared steps, in the order they run. Named for what the operator would say happened,
     // not for the function that does it -- this is what the checklist above the status line shows,
     // including the steps still ahead.
-    crate::cli::progress::step(NOTE_DEPLOY_STEP_CHECKING);
-    ops.preflight_doctor().await?;
-    // After the read-only generation guard, recovery loading is the first stateful action. Cache/SRS work is
-    // allowed only if the persisted state proves that this run can reach a new proof. Completed and
-    // persisted-proof recoveries must remain able to finish chain recovery and pool finalization with a missing
-    // or contended cache.
+    // the randomly generated note owner key is durable before the first chain preflight and
+    // before any path can fund a wallet or submit a voucher. A local write failure therefore costs
+    // no SHELL, while a later chain failure leaves the exact key required to resume.
     crate::cli::progress::step(NOTE_DEPLOY_STEP_RECOVERY);
     let mut recovery = ops.load_recovery().await?;
     recovery.validate()?;
-    if note_deploy_recovery_needs_new_proof(&recovery) {
-        crate::cli::progress::step(NOTE_DEPLOY_STEP_PROVING_MATERIAL);
-        ops.preflight_prover().await?;
+    crate::cli::progress::step(NOTE_DEPLOY_STEP_CHECKING);
+    ops.preflight_doctor().await?;
+    let funding_route = note_deploy_funding_route(&recovery);
+    ops.prepare_funding(funding_route).await?;
+    let outcome = async {
+        if note_deploy_recovery_needs_new_proof(&recovery) {
+            crate::cli::progress::step(NOTE_DEPLOY_STEP_PROVING_MATERIAL);
+            ops.preflight_prover().await?;
+        }
+        crate::cli::progress::step(NOTE_DEPLOY_STEP_CHAIN);
+        let state = ops.resume_chain(&mut recovery).await?;
+        crate::cli::progress::step(NOTE_DEPLOY_STEP_POOL);
+        ops.finalize_pool(&recovery, &state).await
     }
-    crate::cli::progress::step(NOTE_DEPLOY_STEP_CHAIN);
-    let state = ops.resume_chain(&mut recovery).await?;
-    crate::cli::progress::step(NOTE_DEPLOY_STEP_POOL);
-    ops.finalize_pool(&recovery, &state).await
+    .await;
+    if funding_route == NoteDeployFundingRoute::VoucherRecoveryRequired {
+        outcome.map_err(|error| {
+            crate::cli::machine::FundingContext::wrap(
+                crate::cli::machine::MachineFundingNotice::VoucherSubmittedWaitingEventOrProof,
+                error,
+            )
+        })
+    } else {
+        outcome
+    }
 }
 
 /// The checklist `note deploy` declares, in order.
@@ -3692,8 +3731,8 @@ pub(crate) const NOTE_DEPLOY_STEP_POOL: &str = "recording the note in the pool";
 /// behind. A finished run reads as a report of what happened, not as five copies of what was about
 /// to happen.
 pub(crate) const NOTE_DEPLOY_STEPS: [(&str, &str); 5] = [
-    (NOTE_DEPLOY_STEP_CHECKING, "network and contracts checked"),
     (NOTE_DEPLOY_STEP_RECOVERY, "state of an earlier run read"),
+    (NOTE_DEPLOY_STEP_CHECKING, "network and contracts checked"),
     (
         NOTE_DEPLOY_STEP_PROVING_MATERIAL,
         "proving material prepared",
@@ -3709,10 +3748,69 @@ struct NoteDeployProductionOps<'a> {
     pool_path: &'a std::path::Path,
     funding_multisig_address: &'a str,
     recovery_request: crate::cli::note::NoteDeployRecoveryRequest<'a>,
+    funding_binding: Option<&'a crate::cli::wallet::WalletBinding>,
+    resolved_hot_address: &'a str,
+    funding_network: &'a str,
+    nominal: crate::cli::note::NoteNominal,
     pn_keys: Option<dexdo_core::KeyPair>,
     halo2_paths: &'a dexdo_core::private_note::Halo2Paths,
     voucher_failpoints: NoteDeployVoucherFailpoints,
     funding_notice: crate::cli::machine::MachineFundingNotice,
+}
+
+fn prepare_note_deploy_owner_recovery(
+    recovery_path: &std::path::Path,
+    pool_path: &std::path::Path,
+    endpoint: &str,
+    nominal: &str,
+    token_type: u32,
+    raw_value: u64,
+) -> Result<crate::cli::note::NoteDeployRecoveryState> {
+    use crate::cli::note::{
+        load_note_deploy_recovery, recovery_owner_key_written_message, NoteDeployRecoveryState,
+    };
+
+    let existing = match load_note_deploy_recovery(recovery_path)? {
+        Some(state) => {
+            match crate::cli::note::retire_a_finished_deploy(recovery_path, &state, pool_path)? {
+                crate::cli::note::FinishedDeploy::Unfinished => Some(state),
+                crate::cli::note::FinishedDeploy::Retired => {
+                    eprintln!(
+                        "note deploy recovery: {} held a deploy the pool already records with the same owner key; \
+                         retired it and deploying a new note.",
+                        recovery_path.display()
+                    );
+                    None
+                }
+            }
+        }
+        None => None,
+    };
+    let recovery = match existing {
+        Some(state) => {
+            state.ensure_matches_unbound_request(endpoint, nominal, token_type, raw_value)?;
+            eprintln!(
+                "note deploy recovery: using existing state file {}.",
+                recovery_path.display()
+            );
+            state
+        }
+        None => {
+            let pn_keys = dexdo_core::KeyPair::generate();
+            let state = NoteDeployRecoveryState::new_unbound(
+                endpoint,
+                nominal,
+                token_type,
+                raw_value,
+                pn_keys.public_hex(),
+                pn_keys.secret_hex(),
+            )?;
+            crate::cli::note::write_note_deploy_recovery(recovery_path, &state)?;
+            state
+        }
+    };
+    eprintln!("{}", recovery_owner_key_written_message(recovery_path));
+    Ok(recovery)
 }
 
 #[derive(serde::Serialize)]
@@ -3837,6 +3935,7 @@ fn note_deploy_json_result(
 #[async_trait::async_trait(?Send)]
 impl NoteDeployResolvedOps for NoteDeployProductionOps<'_> {
     async fn preflight_doctor(&mut self) -> Result<()> {
+        dexdo_core::chain_clock_skew_preflight(self.recovery_request.endpoint).await?;
         chain_doctor_preflight_with_endpoint(
             &crate::cli::commands::manifest_path()?,
             Some(self.recovery_request.endpoint),
@@ -3847,64 +3946,65 @@ impl NoteDeployResolvedOps for NoteDeployProductionOps<'_> {
     }
 
     async fn load_recovery(&mut self) -> Result<crate::cli::note::NoteDeployRecoveryState> {
-        use crate::cli::note::{
-            load_note_deploy_recovery, recovery_owner_key_written_message, NoteDeployRecoveryState,
-        };
-
-        // A file left by an older client, or by a run whose retire did not happen: if it holds a
-        // deploy the pool already records under the same key, it is a spent second copy, and
-        // keeping it would make this run resume a finished attempt instead of deploying -- the
-        // failure that only showed itself at the pool write, after a wallet confirmation.
-        let existing = match load_note_deploy_recovery(self.recovery_path)? {
-            Some(state) => {
-                match crate::cli::note::retire_a_finished_deploy(
-                    self.recovery_path,
-                    &state,
-                    self.pool_path,
-                )? {
-                    crate::cli::note::FinishedDeploy::Unfinished => Some(state),
-                    crate::cli::note::FinishedDeploy::Retired => {
-                        eprintln!(
-                            "note deploy recovery: {} held a deploy the pool already records with the same owner key; \
-                             retired it and deploying a new note.",
-                            self.recovery_path.display()
-                        );
-                        None
-                    }
-                }
-            }
-            None => None,
-        };
-        let (recovery, already_persisted) = match existing {
-            Some(state) => {
-                state.ensure_matches_request(self.recovery_request)?;
-                eprintln!(
-                    "note deploy recovery: using existing state file {}.",
+        let recovery = crate::cli::note::load_note_deploy_recovery(self.recovery_path)?
+            .ok_or_else(|| {
+                anyhow::anyhow!(
+                    "note deploy recovery {} disappeared after its owner key was persisted",
                     self.recovery_path.display()
-                );
-                (state, true)
-            }
-            None => {
-                let pn_keys = dexdo_core::KeyPair::generate();
-                let state = NoteDeployRecoveryState::new(
-                    self.recovery_request,
-                    pn_keys.public_hex(),
-                    pn_keys.secret_hex(),
-                )?;
-                // Keep a brand-new recovery in memory until the funding wallet passes the exact
-                // UpdateCustodian/sole-custodian guard. The first voucher checkpoint persists the owner
-                // key and checkpoint together before any signed BOC or wallet submit.
-                (state, false)
-            }
-        };
-        if already_persisted {
-            eprintln!("{}", recovery_owner_key_written_message(self.recovery_path));
-        }
+                )
+            })?;
+        recovery.ensure_matches_request(self.recovery_request)?;
         self.pn_keys = Some(
             dexdo_core::KeyPair::from_secret_hex(&recovery.owner_secret_key_hex)
                 .map_err(|e| anyhow::anyhow!("note deploy recovery owner key: {e:?}"))?,
         );
         Ok(recovery)
+    }
+
+    async fn prepare_funding(&mut self, route: NoteDeployFundingRoute) -> Result<()> {
+        match route {
+            NoteDeployFundingRoute::VoucherRecoveryRequired => {
+                self.funding_notice =
+                    crate::cli::machine::MachineFundingNotice::VoucherSubmittedWaitingEventOrProof;
+                eprintln!(
+                    "note deploy recovery: the deposit voucher was already submitted or proved; \
+                     waiting for or proving that voucher without checking, topping up, or \
+                     re-submitting the funding wallet."
+                );
+                Ok(())
+            }
+            NoteDeployFundingRoute::ResumeWithoutFunding => Ok(()),
+            NoteDeployFundingRoute::FreshSpend => {
+                if let Some(binding) = self.funding_binding {
+                    if self.args.multisig_private_key.is_none()
+                        && self.args.multisig_seed_file.is_none()
+                    {
+                        return Err(crate::cli::wallet::WalletBindingCannotSign::for_binding(
+                            binding,
+                        )
+                        .into());
+                    }
+                }
+                self.funding_notice = crate::cli::wallet_funding::fund_hot_for_money_command(
+                    crate::cli::wallet_funding::MoneyCommandFunding {
+                        client: self.client,
+                        endpoint: self.recovery_request.endpoint,
+                        binding: self.funding_binding,
+                        resolved_hot_address: self.resolved_hot_address,
+                        network: self.funding_network,
+                        requirements: crate::cli::wallet_funding::FundingRequirements::new([(
+                            SHELL_CURRENCY_ID,
+                            crate::cli::note::operator_wallet_funding_raw(self.nominal),
+                        )]),
+                        operation: "note deploy",
+                        funding_timeout: self.args.funding_timeout,
+                    },
+                )
+                .await?
+                .machine_notice();
+                Ok(())
+            }
+        }
     }
 
     async fn preflight_prover(&mut self) -> Result<()> {
@@ -4003,11 +4103,7 @@ impl NoteDeployResolvedOps for NoteDeployProductionOps<'_> {
             );
         }
 
-        let n = note_deploy_fold_state_into_pool(
-            self.pool_path,
-            state,
-            &recovery.funding_multisig_address,
-        )?;
+        let n = note_deploy_fold_state_into_pool(self.pool_path, state)?;
         let note_display = dexdo_core::address::display(&note_addr);
         // The pool now holds this note AND its owner key, so the recovery file has become a second
         // copy of a secret rather than the only one -- and a kept file is what made the NEXT
@@ -4077,6 +4173,16 @@ impl NoteDeployResolvedOps for NoteDeployProductionOps<'_> {
 /// The seed phrase is never printed/logged/stored. The owner secret lands in the pool file (the consumers need it)
 /// but is NEVER printed/logged.
 pub(crate) async fn run_note_deploy(args: NoteDeployArgs) -> Result<()> {
+    let manifest = crate::cli::commands::manifest_path()?;
+    let wallet_store = crate::cli::wallet::WalletStore::open()?;
+    run_note_deploy_with_wallet_store(args, &wallet_store, &manifest).await
+}
+
+async fn run_note_deploy_with_wallet_store(
+    args: NoteDeployArgs,
+    wallet_store: &crate::cli::wallet::WalletStore,
+    manifest: &std::path::Path,
+) -> Result<()> {
     use crate::cli::note::{
         default_note_deploy_recovery_path, resolve_private_file_path, NoteDeployRecoveryRequest,
         NoteNominal,
@@ -4093,7 +4199,7 @@ pub(crate) async fn run_note_deploy(args: NoteDeployArgs) -> Result<()> {
     // what this run will do before it does it. Both this and the prover fold are terminal-only and
     // both undo themselves, so redirected output and `--json` consumers see what they saw before.
     let status =
-        crate::cli::progress::Status::with_plan(NOTE_DEPLOY_STEP_CHECKING, NOTE_DEPLOY_STEPS);
+        crate::cli::progress::Status::with_plan(NOTE_DEPLOY_STEP_RECOVERY, NOTE_DEPLOY_STEPS);
     let _prover_output_fold = crate::cli::progress_capture::ProverOutputFold::install(&status);
 
     if args.token_type != SHELL_CURRENCY_LABEL {
@@ -4110,20 +4216,15 @@ pub(crate) async fn run_note_deploy(args: NoteDeployArgs) -> Result<()> {
     )?;
     note_deploy_same_file_pool_guard(std::env::var_os("DEXDO_PN_POOL").as_deref(), &pool_path)?;
     validate_existing_pool_if_present(&pool_path)?;
-    // settle WHICH Hot this deploy spends from before anything reaches the chain. A passed-in
-    // `--multisig-address` wins and the binding is never read; without one the active binding
-    // answers; with neither this is `E_WALLET_NOT_CONFIGURED`. Everything above is local input
-    // validation and everything below eventually spends, so this is the last free point to refuse.
     let mut args = args;
     // Which chain this deploy is running on, from the manifest's own `network` field -- the same
     // read, of the same field, that keys the funding-wallet lock below. Bindings are kept per
     // network, so this decides WHICH binding may answer: a wallet bound on another chain is
     // refused rather than spent. One read, used for both, so the wallet that
     // is resolved and the wallet whose turn is taken can never be decided on different networks.
-    let manifest = crate::cli::commands::manifest_path()?;
-    let funding_network = dexdo_core::Deployed::load(&manifest)
-        .map_err(|e| anyhow::anyhow!("manifest {}: {e}", manifest.display()))?
-        .network;
+    let deployed = dexdo_core::Deployed::load(manifest)
+        .map_err(|e| anyhow::anyhow!("manifest {}: {e}", manifest.display()))?;
+    let funding_network = deployed.network.clone();
     // prove that label against the endpoint HERE, at the last free point named above.
     // Everywhere else the same check rides on `RealChainBackend::connect*`, which refuses before a
     // client exists -- but this command spends from the wallet before it builds one: the Hot funding
@@ -4135,22 +4236,59 @@ pub(crate) async fn run_note_deploy(args: NoteDeployArgs) -> Result<()> {
     // The endpoint the manifest itself names, unless the operator overrode it. Reading it here,
     // once, is what stopped the old mandatory default from deciding the chain: it was substituted
     // on every run and always won over this field.
-    let manifest_for_endpoint =
-        dexdo_core::Deployed::load(&crate::cli::commands::manifest_path()?)?;
-    let endpoint = dexdo_core::chain::resolve_endpoint(None, &manifest_for_endpoint)?;
+    let endpoint = dexdo_core::chain::resolve_endpoint(None, &deployed)?;
     // Both halves are the same manifest's, so there is nothing left to compare.
-    let wallet_store = crate::cli::wallet::WalletStore::open()?;
+    let nominal = NoteNominal::parse(&args.nominal)?;
+    let token_type = TokenType::parse(&args.token_type)?;
+    let nominal_label = nominal.label().to_string();
+    let token_type_label = token_type.label().to_string();
+    let endpoint = note_endpoint_url(&endpoint)?;
+    let raw_value = nominal.raw_value(token_type.decimals());
+    let recovery_path = args
+        .recovery
+        .clone()
+        .unwrap_or_else(|| default_note_deploy_recovery_path(&pool_path));
+    let recovery_path = resolve_private_file_path(&recovery_path, "--recovery")?;
+    note_deploy_recovery_pool_guard(&pool_path, &recovery_path)?;
+
+    // reserve the note owner key before the next call can enter wallet onboarding. With no
+    // binding, onboarding may deploy/fund a wallet on chain, so starting inside the resolved-note
+    // orchestration is too late. The temporary unbound form is valid only while it has no possible
+    // spend evidence; immediately after the funding identity is known it is bound and rewritten.
+    let mut recovery = prepare_note_deploy_owner_recovery(
+        &recovery_path,
+        &pool_path,
+        &endpoint,
+        &nominal_label,
+        token_type.id(),
+        raw_value,
+    )?;
+    let recovery_already_bound = recovery.funding_multisig_address.is_some();
     let funding_wallet_network =
         crate::cli::wallet::WalletNetwork::from_manifest_label(&funding_network)?;
-    let funding_wallet = crate::cli::wallet::resolve_funding_wallet_or_onboard(
-        &wallet_store,
-        &funding_wallet_network,
-        args.multisig_address.as_deref(),
-        &args.multisig_private_key,
-        &args.multisig_seed_file,
-        "deploying a note",
-    )
-    .await?;
+    // Resolve the Hot's public identity without requiring a local signing credential. A persisted
+    // voucher may already represent the only wallet submit this deploy needs; recovery routing
+    // below decides whether a new signature is required before the credential is enforced. An
+    // already-bound recovery never onboards a replacement wallet: it must resume its recorded one.
+    let funding_wallet = if recovery_already_bound {
+        crate::cli::wallet::resolve_funding_wallet_identity(
+            wallet_store,
+            &funding_wallet_network,
+            args.multisig_address.as_deref(),
+            &args.multisig_private_key,
+            &args.multisig_seed_file,
+        )?
+    } else {
+        crate::cli::wallet::resolve_funding_wallet_identity_or_onboard(
+            wallet_store,
+            &funding_wallet_network,
+            args.multisig_address.as_deref(),
+            &args.multisig_private_key,
+            &args.multisig_seed_file,
+            "deploying a note",
+        )
+        .await?
+    };
     // The binding is what selects a FUNDING flow, and it is read only when the binding is what
     // chose the wallet. A `--multisig-address` wins outright and is used exactly as given, so it
     // has no recorded provider - and forbids inferring one from an address, a code hash or any
@@ -4167,12 +4305,16 @@ pub(crate) async fn run_note_deploy(args: NoteDeployArgs) -> Result<()> {
     let funding_multisig_address = dexdo_core::CanonicalAddress::parse(&funding_multisig_identity)
         .map_err(|e| anyhow::anyhow!("--multisig-address: {e}"))?
         .legacy();
-    let nominal = NoteNominal::parse(&args.nominal)?;
-    let token_type = TokenType::parse(&args.token_type)?;
-    let nominal_label = nominal.label().to_string();
-    let token_type_label = token_type.label().to_string();
-    let endpoint = note_endpoint_url(&endpoint)?;
-    dexdo_core::chain_clock_skew_preflight(&endpoint).await?;
+    let recovery_request = NoteDeployRecoveryRequest {
+        endpoint: &endpoint,
+        nominal: &nominal_label,
+        token_type: token_type.id(),
+        raw_value,
+        funding_multisig_address: &funding_multisig_identity,
+    };
+    recovery.bind_funding_multisig(recovery_request)?;
+    crate::cli::note::write_note_deploy_recovery(&recovery_path, &recovery)?;
+
     let client = ChainClient::connect(&endpoint)?;
     // Held for the whole deploy, and deliberately not keyed to the wallet, the endpoint or the
     // prover cache: what two concurrent deploys contend for is this machine's CPU, and losing that
@@ -4189,52 +4331,6 @@ pub(crate) async fn run_note_deploy(args: NoteDeployArgs) -> Result<()> {
     // the resolved identity in its legacy form -- the same form the lock key is built from, so
     // `note deploy` and `note topup` land on one lock whichever spelling either was given.
     let _wallet_lock = acquire_funding_wallet_lock(&funding_network, &funding_multisig_address)?;
-    // the bound Hot is brought UP to what this deploy will spend before the deploy starts,
-    // through the provider the operator bound - the Vault -> Hot request for `ackinacki-wallet`, the
-    // top-up instruction and an on-chain wait for the others. Taken here, inside the wallet's turn
-    // and before any recovery file or prover work exists, so a Hot that is short waits with nothing
-    // paid rather than failing several minutes and one halo2 proof later.
-
-    // The figure is the one `dexdo note wallet` prints as the funding recipe, which is the same
-    // total the per-leg preflight checks: a user told to send X and a client that waits for
-    // Y would be two different numbers for one deploy.
-
-    // (rymkapro, 2026-08-17): this used to end "ECC[2] only, exactly as the preflight is - the
-    // native leg is not part of what either of them checks", and both halves of that are now false.
-    // `FundingRequirements` carries `required_native` and `met_by` is satisfied only when BOTH legs
-    // are, so this wait covers native; and gave the preflight its own native floor. A comment
-    // that tells the next reader a money check does not exist is worse than no comment: it invites
-    // them to add the check that is already there, or to trust a gap that is closed.
-    let funding_notice = crate::cli::wallet_funding::fund_hot_for_money_command(
-        crate::cli::wallet_funding::MoneyCommandFunding {
-            client: &client,
-            endpoint: &endpoint,
-            binding: funding_binding.as_ref(),
-            resolved_hot_address: &funding_wallet.address,
-            network: &funding_network,
-            requirements: crate::cli::wallet_funding::FundingRequirements::new([(
-                SHELL_CURRENCY_ID,
-                crate::cli::note::operator_wallet_funding_raw(nominal),
-            )]),
-            operation: "note deploy",
-            funding_timeout: args.funding_timeout,
-        },
-    )
-    .await?
-    .machine_notice();
-    let recovery_path = args
-        .recovery
-        .clone()
-        .unwrap_or_else(|| default_note_deploy_recovery_path(&pool_path));
-    let recovery_path = resolve_private_file_path(&recovery_path, "--recovery")?;
-    note_deploy_recovery_pool_guard(&pool_path, &recovery_path)?;
-    let recovery_request = NoteDeployRecoveryRequest {
-        endpoint: &endpoint,
-        nominal: &nominal_label,
-        token_type: token_type.id(),
-        raw_value: nominal.raw_value(token_type.decimals()),
-        funding_multisig_address: &funding_multisig_identity,
-    };
     let halo2_paths = Halo2Paths::from_env();
 
     // What this run is about to do, which the status line says as it happens: at `info` it is there
@@ -4259,10 +4355,14 @@ pub(crate) async fn run_note_deploy(args: NoteDeployArgs) -> Result<()> {
         pool_path: &pool_path,
         funding_multisig_address: &funding_multisig_address,
         recovery_request,
+        funding_binding: funding_binding.as_ref(),
+        resolved_hot_address: &funding_wallet.address,
+        funding_network: &funding_network,
+        nominal,
         pn_keys: None,
         halo2_paths: &halo2_paths,
         voucher_failpoints,
-        funding_notice,
+        funding_notice: crate::cli::machine::MachineFundingNotice::AlreadyFunded,
     };
     let outcome = run_note_deploy_resolved(&mut ops).await;
     // Only a run that got all the way through ticks its last step. A failure leaves the checklist
@@ -7251,6 +7351,71 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn note_deploy_entry_persists_owner_key_before_missing_wallet_can_onboard() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind network trap");
+        let endpoint = format!("http://{}", listener.local_addr().unwrap());
+        let mut manifest: serde_json::Value = serde_json::from_str(include_str!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../manifest/mainnet.manifest.json"
+        )))
+        .expect("mainnet manifest fixture");
+        manifest["endpoint"] = serde_json::json!(endpoint);
+        let manifest_path = temp.path().join("mainnet.manifest.json");
+        std::fs::write(
+            &manifest_path,
+            serde_json::to_vec_pretty(&manifest).expect("serialize manifest"),
+        )
+        .expect("write manifest");
+
+        let pool_path = temp.path().join("pn_pool.json");
+        let recovery_path = temp.path().join("note.recovery.json");
+        let wallet_store = crate::cli::wallet::WalletStore::at(temp.path().join("wallet"));
+        let error = tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            super::run_note_deploy_with_wallet_store(
+                super::NoteDeployArgs {
+                    json: false,
+                    multisig_address: None,
+                    multisig_private_key: None,
+                    multisig_seed_file: None,
+                    nominal: "N100".to_string(),
+                    token_type: dexdo_core::params::SHELL_CURRENCY_LABEL.to_string(),
+                    pool: Some(pool_path.clone()),
+                    recovery: Some(recovery_path.clone()),
+                    simulate_interrupt_after_spend_before_pool: false,
+                    simulate_interrupt_after_deposit_voucher_submit: false,
+                    simulate_interrupt_after_deposit_voucher_event: false,
+                    simulate_interrupt_after_deploy_before_note_record: false,
+                    funding_timeout: None,
+                },
+                &wallet_store,
+                &manifest_path,
+            ),
+        )
+        .await
+        .expect("missing-wallet refusal must not wait for the chain")
+        .expect_err("an empty isolated wallet store has no binding")
+        .to_string();
+
+        assert!(error.contains("E_WALLET_NOT_CONFIGURED"), "{error}");
+        let recovery = crate::cli::note::load_note_deploy_recovery(&recovery_path)
+            .expect("load recovery")
+            .expect("owner recovery must already exist");
+        assert!(recovery.funding_multisig_address.is_none());
+        assert!(crate::cli::note::note_deploy_recovery_has_no_possible_spend(&recovery));
+        assert!(!pool_path.exists());
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(50), listener.accept())
+                .await
+                .is_err(),
+            "wallet resolution must refuse only after the owner key write and before any chain request"
+        );
+    }
+
+    #[tokio::test]
     async fn note_recover_rejects_existing_bad_currency_before_getter() {
         let temp = tempfile::tempdir().expect("temp dir");
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
@@ -8329,7 +8494,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn note_deploy_missing_recovery_remains_in_memory_before_wallet_preflight() {
+    async fn note_deploy_prepared_recovery_is_loaded_before_wallet_preflight() {
         let temp = tempfile::tempdir().expect("temp dir");
         let recovery_path = temp.path().join("fresh.recovery.json");
         let pool_path = temp.path().join("fresh.pool.json");
@@ -8360,6 +8525,21 @@ mod tests {
             raw_value: 100_000_000_000,
             funding_multisig_address: &funding_wallet,
         };
+        let mut prepared = super::prepare_note_deploy_owner_recovery(
+            &recovery_path,
+            &pool_path,
+            recovery_request.endpoint,
+            recovery_request.nominal,
+            recovery_request.token_type,
+            recovery_request.raw_value,
+        )
+        .expect("persist fresh owner key before wallet resolution");
+        assert!(prepared.funding_multisig_address.is_none());
+        prepared
+            .bind_funding_multisig(recovery_request)
+            .expect("bind the locally resolved funding identity");
+        crate::cli::note::write_note_deploy_recovery(&recovery_path, &prepared)
+            .expect("persist exact funding identity before wallet preflight");
         let mut ops = super::NoteDeployProductionOps {
             args: &args,
             client: &client,
@@ -8367,6 +8547,10 @@ mod tests {
             pool_path: &pool_path,
             funding_multisig_address: &funding_wallet,
             recovery_request,
+            funding_binding: None,
+            resolved_hot_address: &funding_wallet,
+            funding_network: "shellnet",
+            nominal: crate::cli::note::NoteNominal::N100,
             pn_keys: None,
             halo2_paths: &halo2_paths,
             voucher_failpoints: Default::default(),
@@ -8375,15 +8559,18 @@ mod tests {
 
         let recovery = super::NoteDeployResolvedOps::load_recovery(&mut ops)
             .await
-            .expect("create fresh recovery in memory");
+            .expect("load fresh durable recovery");
         assert!(
             ops.pn_keys.is_some(),
             "fresh owner key must remain available in memory"
         );
         assert!(recovery.deposit_voucher.is_none());
-        assert!(
-            !recovery_path.exists(),
-            "fresh journal must wait for wallet preflight"
+        let persisted = crate::cli::note::load_note_deploy_recovery(&recovery_path)
+            .expect("read recovery written before wallet preflight")
+            .expect("fresh recovery exists");
+        assert_eq!(
+            persisted.owner_secret_key_hex, recovery.owner_secret_key_hex,
+            "the durable key must be the one this run will deploy"
         );
         assert!(!pool_path.exists(), "fresh pool must not exist");
     }
@@ -9602,6 +9789,26 @@ mod tests {
         .expect("test recovery state")
     }
 
+    fn submitted_voucher_recovery_state() -> crate::cli::note::NoteDeployRecoveryState {
+        use crate::cli::note::{NoteDeployVoucherCheckpoint, NoteDeployVoucherKind};
+
+        let mut recovery = test_recovery_state();
+        let mut voucher = NoteDeployVoucherCheckpoint::new(
+            &recovery.owner_public_key_hex,
+            recovery.token_type,
+            recovery.raw_value,
+            false,
+            "8".repeat(64),
+            "9".repeat(64),
+        )
+        .expect("deposit voucher checkpoint");
+        voucher.submit_maybe_sent = true;
+        recovery
+            .set_voucher_checkpoint(NoteDeployVoucherKind::Deposit, voucher)
+            .expect("persist submitted deposit voucher");
+        recovery
+    }
+
     fn persisted_voucher_checkpoint(
         owner_public_key_hex: &str,
         token_type: u32,
@@ -10056,10 +10263,13 @@ mod tests {
         pool_path: std::path::PathBuf,
         cache_unavailable_or_contended: bool,
         doctor_preflight_error: Option<&'static str>,
+        chain_resume_error: Option<&'static str>,
         events: Vec<&'static str>,
         doctor_preflight_calls: usize,
         recovery_loads: usize,
         key_material_actions: usize,
+        funding_path_entries: usize,
+        funding_key_loads: usize,
         preflight_calls: usize,
         wallet_signs: usize,
         wallet_submits: usize,
@@ -10094,6 +10304,25 @@ mod tests {
                 .ok_or_else(|| anyhow::anyhow!("fake recovery is missing"))
         }
 
+        async fn prepare_funding(
+            &mut self,
+            route: super::NoteDeployFundingRoute,
+        ) -> anyhow::Result<()> {
+            match route {
+                super::NoteDeployFundingRoute::FreshSpend => {
+                    self.funding_path_entries += 1;
+                    self.events.push("funding_preflight");
+                }
+                super::NoteDeployFundingRoute::VoucherRecoveryRequired => {
+                    self.events.push("voucher_recovery_required");
+                }
+                super::NoteDeployFundingRoute::ResumeWithoutFunding => {
+                    self.events.push("recovery_funding_bypass");
+                }
+            }
+            Ok(())
+        }
+
         async fn preflight_prover(&mut self) -> anyhow::Result<()> {
             self.preflight_calls += 1;
             self.events.push("prover_preflight");
@@ -10114,19 +10343,29 @@ mod tests {
                 return recovery.to_onboard_state();
             }
 
-            let both_proofs_persisted = [NoteDeployVoucherKind::Deposit].into_iter().all(|kind| {
-                recovery
-                    .voucher_checkpoint(kind)
-                    .and_then(|checkpoint| checkpoint.proof.as_ref())
-                    .is_some()
+            let paid_voucher_recovery = [NoteDeployVoucherKind::Deposit].into_iter().all(|kind| {
+                recovery.voucher_checkpoint(kind).is_some_and(|checkpoint| {
+                    checkpoint.submit_maybe_sent
+                        || checkpoint.event.is_some()
+                        || checkpoint.proof.is_some()
+                })
             });
-            if both_proofs_persisted {
+            if paid_voucher_recovery {
+                if recovery
+                    .voucher_checkpoint(NoteDeployVoucherKind::Deposit)
+                    .and_then(|checkpoint| checkpoint.proof.as_ref())
+                    .is_none()
+                {
+                    self.events.push("voucher_recovery");
+                    self.proof_calls += 1;
+                }
                 self.events.push("chain_resume");
                 self.chain_resumes += 1;
             } else {
                 if self.preflight_calls != 1 {
                     anyhow::bail!("fresh recovery reached wallet submit before prover preflight");
                 }
+                self.funding_key_loads += 1;
                 self.events.push("wallet_submit");
                 self.wallet_signs += 1;
                 self.wallet_submits += 1;
@@ -10135,6 +10374,10 @@ mod tests {
                 self.proof_calls += 1;
                 self.events.push("chain_resume");
                 self.chain_resumes += 1;
+            }
+
+            if let Some(error) = self.chain_resume_error {
+                anyhow::bail!(error);
             }
 
             recovery.mark_private_note_deployed(
@@ -10159,11 +10402,7 @@ mod tests {
                 .voucher_checkpoint(NoteDeployVoucherKind::Deposit)
                 .and_then(|checkpoint| checkpoint.proof.as_ref())
                 .is_some();
-            super::note_deploy_fold_state_into_pool(
-                &self.pool_path,
-                state,
-                &recovery.funding_multisig_address,
-            )?;
+            super::note_deploy_fold_state_into_pool(&self.pool_path, state)?;
             Ok(())
         }
     }
@@ -10622,7 +10861,7 @@ mod tests {
         );
     }
 
-    async fn assert_note_deploy_generation_rejected_before_writes(
+    async fn assert_note_deploy_generation_rejected_after_key_persistence_without_money(
         mut ops: FakeNoteDeployResolvedOps,
     ) -> anyhow::Error {
         let pool_path = ops.pool_path.clone();
@@ -10630,8 +10869,10 @@ mod tests {
             .await
             .expect_err("stale or unreadable generation must reject note deploy");
         assert_eq!(ops.doctor_preflight_calls, 1);
-        assert_eq!(ops.recovery_loads, 0);
-        assert_eq!(ops.key_material_actions, 0);
+        assert_eq!(ops.recovery_loads, 1);
+        assert_eq!(ops.key_material_actions, 1);
+        assert_eq!(ops.funding_path_entries, 0);
+        assert_eq!(ops.funding_key_loads, 0);
         assert_eq!(ops.preflight_calls, 0);
         assert_eq!(ops.wallet_signs, 0);
         assert_eq!(ops.wallet_submits, 0);
@@ -10639,17 +10880,17 @@ mod tests {
         assert_eq!(ops.proof_calls, 0);
         assert_eq!(ops.chain_resumes, 0);
         assert_eq!(ops.pool_finalizations, 0);
-        assert_eq!(ops.events, ["doctor_preflight"]);
+        assert_eq!(ops.events, ["recovery_load", "doctor_preflight"]);
         assert!(
-            ops.recovery.is_some(),
-            "recovery must not be loaded/mutated"
+            ops.recovery.is_none(),
+            "the key must be taken into durable recovery before the chain preflight"
         );
         assert!(!pool_path.exists(), "pool must not be created or mutated");
         error
     }
 
     #[tokio::test]
-    async fn note_deploy_generation_failures_are_stable_and_precede_all_writes() {
+    async fn note_deploy_generation_failures_preserve_the_key_and_precede_all_money() {
         let cases = [
             (
                 "stale RootPN",
@@ -10686,7 +10927,9 @@ mod tests {
                 doctor_preflight_error: Some(doctor_error),
                 ..Default::default()
             };
-            let error = assert_note_deploy_generation_rejected_before_writes(ops).await;
+            let error =
+                assert_note_deploy_generation_rejected_after_key_persistence_without_money(ops)
+                    .await;
             let rendered = format!("{error:#}");
             assert!(
                 rendered.starts_with(crate::cli::machine::NOTE_DEPLOY_GENERATION_MISMATCH_MARKER),
@@ -10736,8 +10979,9 @@ mod tests {
         assert_eq!(
             ops.events,
             [
-                "doctor_preflight",
                 "recovery_load",
+                "doctor_preflight",
+                "recovery_funding_bypass",
                 "completed_recovery",
                 "pool_finalize"
             ]
@@ -10786,14 +11030,89 @@ mod tests {
         assert_eq!(
             ops.events,
             [
-                "doctor_preflight",
                 "recovery_load",
+                "doctor_preflight",
+                "voucher_recovery_required",
                 "chain_resume",
                 "pool_finalize"
             ]
         );
         assert!(ops.pool_path.exists(), "chain recovery did not write pool");
         assert!(ops.deposit_proof_preserved);
+    }
+
+    #[tokio::test]
+    async fn note_deploy_submitted_voucher_recovery_bypasses_funding_and_finalizes_once() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let pool_path = temp.path().join("submitted-voucher-pool.json");
+        let mut ops = FakeNoteDeployResolvedOps {
+            recovery: Some(submitted_voucher_recovery_state()),
+            pool_path: pool_path.clone(),
+            ..Default::default()
+        };
+
+        super::run_note_deploy_resolved(&mut ops)
+            .await
+            .expect("submitted voucher recovery should finish without fresh funding");
+
+        assert_eq!(ops.funding_path_entries, 0, "no Hot balance/top-up path");
+        assert_eq!(ops.funding_key_loads, 0, "no funding key may be loaded");
+        assert_eq!(
+            ops.wallet_submits, 0,
+            "the voucher must not be submitted twice"
+        );
+        assert_eq!(
+            ops.voucher_generations, 0,
+            "the voucher must not be regenerated"
+        );
+        assert_eq!(ops.chain_resumes, 1);
+        assert_eq!(ops.pool_finalizations, 1);
+        assert_eq!(
+            ops.events,
+            [
+                "recovery_load",
+                "doctor_preflight",
+                "voucher_recovery_required",
+                "prover_preflight",
+                "voucher_recovery",
+                "chain_resume",
+                "pool_finalize"
+            ]
+        );
+        let pool: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&pool_path).expect("read finalized pool"))
+                .expect("parse finalized pool");
+        assert_eq!(pool["notes"].as_array().expect("pool notes").len(), 1);
+    }
+
+    #[tokio::test]
+    async fn note_deploy_submitted_voucher_failure_carries_machine_recovery_state() {
+        let mut ops = FakeNoteDeployResolvedOps {
+            recovery: Some(submitted_voucher_recovery_state()),
+            chain_resume_error: Some("voucher event is not available yet"),
+            ..Default::default()
+        };
+
+        let error = super::run_note_deploy_resolved(&mut ops)
+            .await
+            .expect_err("unfinished voucher recovery must remain visible");
+        let code = crate::cli::machine::classify_error(crate::cli::machine::OP_NOTE_DEPLOY, &error);
+        let envelope = serde_json::to_value(crate::cli::machine::machine_error(
+            crate::cli::machine::OP_NOTE_DEPLOY,
+            code,
+            &error,
+        ))
+        .expect("serialize machine error");
+
+        assert_eq!(ops.funding_path_entries, 0);
+        assert_eq!(ops.funding_key_loads, 0);
+        assert_eq!(ops.wallet_submits, 0);
+        assert_eq!(
+            envelope["funding_notice"],
+            serde_json::json!({
+                "event": "voucher_submitted_waiting_event_or_proof"
+            })
+        );
     }
 
     #[tokio::test]
@@ -10813,6 +11132,8 @@ mod tests {
         assert_eq!(ops.doctor_preflight_calls, 1);
         assert_eq!(ops.recovery_loads, 1);
         assert_eq!(ops.key_material_actions, 1);
+        assert_eq!(ops.funding_path_entries, 1);
+        assert_eq!(ops.funding_key_loads, 1);
         assert_eq!(ops.wallet_signs, 1);
         assert_eq!(ops.wallet_submits, 1);
         assert_eq!(ops.voucher_generations, 1);
@@ -10822,8 +11143,9 @@ mod tests {
         assert_eq!(
             ops.events,
             [
-                "doctor_preflight",
                 "recovery_load",
+                "doctor_preflight",
+                "funding_preflight",
                 "prover_preflight",
                 "wallet_submit",
                 "prove",
@@ -11184,7 +11506,7 @@ mod tests {
             dexdo_core::params::SHELL_CURRENCY_ID,
             std::path::Path::new("pn_pool.json"),
             1,
-            crate::cli::machine::MachineFundingNotice::RequestSubmitted,
+            crate::cli::machine::MachineFundingNotice::VoucherSubmittedWaitingEventOrProof,
         )
         .expect("serialize note deploy result");
         assert_eq!(rendered.lines().count(), 1);
@@ -11202,7 +11524,7 @@ mod tests {
         assert_eq!(value["note_count"], 1);
         assert_eq!(
             value["funding_notice"],
-            serde_json::json!({ "event": "request_submitted" })
+            serde_json::json!({ "event": "voucher_submitted_waiting_event_or_proof" })
         );
         assert!(value["error"].is_null());
         assert_eq!(value.as_object().expect("object").len(), 9);

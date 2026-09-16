@@ -140,6 +140,13 @@ pub(super) struct Shared {
     sink: Sink,
     /// Is the current step waiting on the OPERATOR rather than on the client?
     pub(super) needs_you: bool,
+    /// A request-owned wait drawn over the command's latest state without becoming that state.
+
+    /// The on-demand buyer can accept its first request before the command finishes publishing the
+    /// endpoint step. That request must stay visible while it waits for a seller, but the command
+    /// remains the owner of the checklist and of the state revealed when the wait ends.
+    overlay: Option<Overlay>,
+    next_overlay_id: u64,
     /// The live line is off while something else owns the screen.
 
     /// An interview asks its questions on `/dev/tty` and the operator types the answer there. The
@@ -169,7 +176,67 @@ impl Shared {
             sink,
             held: false,
             needs_you: false,
+            overlay: None,
+            next_overlay_id: 0,
         }
+    }
+
+    pub(super) fn install_overlay(
+        &mut self,
+        label: String,
+        position: Option<(usize, usize)>,
+    ) -> u64 {
+        self.next_overlay_id = self.next_overlay_id.wrapping_add(1).max(1);
+        let id = self.next_overlay_id;
+        self.overlay = Some(Overlay {
+            id,
+            label,
+            started: Instant::now(),
+            position,
+        });
+        self.render();
+        id
+    }
+
+    pub(super) fn refresh_overlay(&mut self, id: u64, label: String) -> bool {
+        let Some(overlay) = self.overlay.as_mut().filter(|overlay| overlay.id == id) else {
+            return false;
+        };
+        if overlay.label != label {
+            overlay.label = label;
+            self.render();
+        }
+        true
+    }
+
+    pub(super) fn remove_overlay(&mut self, id: u64) -> bool {
+        if !self
+            .overlay
+            .as_ref()
+            .is_some_and(|overlay| overlay.id == id)
+        {
+            return false;
+        }
+        self.erase();
+        self.overlay = None;
+        self.render();
+        true
+    }
+
+    #[cfg(test)]
+    pub(super) fn displayed_label(&self) -> &str {
+        self.overlay
+            .as_ref()
+            .map(|overlay| overlay.label.as_str())
+            .unwrap_or(&self.label)
+    }
+
+    #[cfg(test)]
+    pub(super) fn displayed_started(&self) -> Instant {
+        self.overlay
+            .as_ref()
+            .map(|overlay| overlay.started)
+            .unwrap_or(self.started)
     }
 
     fn write(&mut self, text: &str) {
@@ -184,18 +251,33 @@ impl Shared {
         }
         self.frame = (self.frame + 1) % FRAMES.len();
         let spinner = FRAMES[self.frame];
-        let seconds = format!("{}s", self.started.elapsed().as_secs());
+        let (label, started, measure, needs_you, position) = match self.overlay.as_ref() {
+            Some(overlay) => (
+                overlay.label.clone(),
+                overlay.started,
+                None,
+                false,
+                overlay.position,
+            ),
+            None => (
+                self.label.clone(),
+                self.started,
+                self.measure,
+                self.needs_you,
+                self.plan.position(),
+            ),
+        };
+        let seconds = format!("{}s", started.elapsed().as_secs());
         // Where the run stands, beside what it is doing: the checklist itself cannot be shown as a
         // block, because nothing above the cursor may be redrawn.
-        let label = match self.plan.position() {
-            Some((step, total)) => format!("[{step}/{total}] {}", self.label),
-            None => self.label.clone(),
+        let label = match position {
+            Some((step, total)) => format!("[{step}/{total}] {label}"),
+            None => label,
         };
         // The spinner, two spaces and the seconds are the fixed part; whatever room is left is the
         // label's, and a label that does not fit is cut rather than wrapped -- a wrapped line is
         // two lines, and the next frame's `\r` would only rewrite the second.
-        let bar = self
-            .measure
+        let bar = measure
             .filter(|measure| measure.total > 0)
             .map(|measure| format!(" {}", measure.bar(BAR_WIDTH)))
             .unwrap_or_default();
@@ -214,8 +296,8 @@ impl Shared {
         // own work. Colour is the only difference, and it is deliberately not the only signal: the
         // label itself is written as an instruction, so a plain terminal reads the same.
         let text = if self.colour {
-            let mark = if self.needs_you { AMBER } else { CYAN };
-            let body = if self.needs_you {
+            let mark = if needs_you { AMBER } else { CYAN };
+            let body = if needs_you {
                 format!("{AMBER}{label}{RESET}")
             } else {
                 label.clone()
@@ -257,6 +339,13 @@ impl Shared {
         };
         self.line(&text);
     }
+}
+
+struct Overlay {
+    id: u64,
+    label: String,
+    started: Instant,
+    position: Option<(usize, usize)>,
 }
 
 /// Cut `text` to `columns` of VISIBLE width, marking the cut.

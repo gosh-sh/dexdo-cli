@@ -24,9 +24,9 @@
 
 use super::{
     classify_error, error_cause, forbidden_machine_fragment, ErrorCode, MachineError, ERROR_SCHEMA,
-    OP_NOTE_DEPLOY, WALLET_NOT_CONFIGURED_CODE,
+    OP_NOTE_DEPLOY, WALLET_BINDING_CANNOT_SIGN_CODE, WALLET_NOT_CONFIGURED_CODE,
 };
-use crate::cli::wallet::{resolve_funding_wallet, WalletStore};
+use crate::cli::wallet::{resolve_funding_wallet, WalletBindingCannotSign, WalletStore};
 
 /// `note topup` shares the fail-fast but has no `--json` surface of its own, so it has no operation
 /// constant. Classification must not depend on which command asked.
@@ -64,6 +64,22 @@ fn the_wallet_fail_fast_classifies_as_its_own_code_and_never_as_internal() {
         assert_ne!(code, ErrorCode::Internal, "{operation}");
         assert_ne!(code.as_str(), "INTERNAL", "{operation}");
     }
+}
+
+#[test]
+fn a_binding_that_cannot_sign_is_typed_and_never_internal() {
+    let error = anyhow::Error::new(WalletBindingCannotSign::new(
+        "active binding matches the Hot but has no local signing credential",
+    ));
+    let code = classify_error(OP_NOTE_DEPLOY, &error);
+    assert_eq!(code, ErrorCode::WalletBindingCannotSign);
+    assert_eq!(code.as_str(), WALLET_BINDING_CANNOT_SIGN_CODE);
+    assert_eq!(code.as_str(), "wallet_binding_cannot_sign");
+    assert_ne!(code, ErrorCode::Internal);
+    assert_eq!(
+        MachineError::new(OP_NOTE_DEPLOY, code).message,
+        "the active wallet binding cannot sign the required Hot-wallet spend"
+    );
 }
 
 /// The emitted envelope, field by field, as `--json` prints it.

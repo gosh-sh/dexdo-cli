@@ -1077,10 +1077,10 @@ async fn fetch_chain_time_secs(http: &reqwest::Client, endpoint: &str) -> Result
 /// The two readings are injected so a regression can prove the measured skew does not grow with the
 /// number of retries -- the property this exists for, and the one a later change to the budget would
 /// otherwise silently break.
-async fn clock_skew_check_from_one_attempt<Read, Fut, Now>(
+async fn clock_skew_sample_from_one_attempt<Read, Fut, Now>(
     read_chain: Read,
     now: Now,
-) -> Result<ChainDoctorCheck>
+) -> Result<(u64, u64)>
 where
     Read: Fn() -> Fut,
     Fut: std::future::Future<Output = Result<u64>>,
@@ -1089,7 +1089,7 @@ where
     retry_transient_read(|| async {
         let chain_unix = read_chain().await?;
         let local_unix = now()?;
-        Ok(clock_skew_check(local_unix, chain_unix))
+        Ok((local_unix, chain_unix))
     })
     .await
 }
@@ -1098,11 +1098,12 @@ where
 /// five-minute `expireAt` window.
 pub async fn chain_clock_skew_preflight(endpoint: &str) -> Result<()> {
     let http = chain_http_client()?;
-    let check = clock_skew_check_from_one_attempt(
+    let (local_unix, chain_unix) = clock_skew_sample_from_one_attempt(
         || fetch_chain_time_secs(&http, endpoint),
         local_unix_secs,
     )
     .await?;
+    let check = clock_skew_check(local_unix, chain_unix);
     if check.status == ChainDoctorStatus::Fail {
         return Err(anyhow!(check.message));
     }
@@ -4349,6 +4350,16 @@ pub(super) struct ExtOutPage {
     pub previous_cursor: Option<String>,
 }
 
+#[derive(Debug, thiserror::Error)]
+#[error("account {account_id} is absent from ext-out GraphQL")]
+struct ExtOutAccountAbsent {
+    account_id: String,
+}
+
+fn is_ext_out_account_absent(error: &anyhow::Error) -> bool {
+    error.chain().any(|cause| cause.is::<ExtOutAccountAbsent>())
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct TokenContractParties {
     buyer: String,
@@ -4900,6 +4911,45 @@ pub struct TokenContractSettlementReceipts {
     pub events: Vec<TokenContractSettlementReceipt>,
 }
 
+impl TokenContractSettlementReceipts {
+    /// The immutable events emitted by the address's latest deployment.
+
+    /// A destroyed `TokenContract` address can be deployed again when a caller reuses the same
+    /// seller nonce. The indexer keeps both deployments in one ext-out history, so an address
+    /// history is not necessarily one deal history. `ContractDeployed` is the on-chain boundary:
+    /// current-deal classifiers must ignore every event before its last occurrence.
+
+    /// Histories without a decoded `ContractDeployed` retain their old fail-closed behaviour by
+    /// returning the full slice. That keeps incomplete/older evidence visible instead of silently
+    /// declaring it unrelated.
+    pub fn current_lifecycle(&self) -> &[TokenContractSettlementReceipt] {
+        let start = self
+            .events
+            .iter()
+            .rposition(|receipt| {
+                matches!(
+                    receipt.event,
+                    TokenContractSettlementEvent::ContractDeployed { .. }
+                )
+            })
+            .unwrap_or(0);
+        &self.events[start..]
+    }
+
+    /// Whether the latest deployment has immutable address history before it.
+    pub(crate) fn has_prior_lifecycle(&self) -> bool {
+        self.events
+            .iter()
+            .rposition(|receipt| {
+                matches!(
+                    receipt.event,
+                    TokenContractSettlementEvent::ContractDeployed { .. }
+                )
+            })
+            .map_or(!self.events.is_empty(), |start| start > 0)
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct TokenContractCurrentFacts {
     pub state: Value,
@@ -4972,6 +5022,7 @@ pub(super) async fn fetch_ext_out_page(
         query($accountId: String!, $dappId: String!, $last: Int!, $before: String) {
           blockchain {
             account(account_id: $accountId, dapp_id: $dappId) {
+              info { id }
               messages(msg_type: [ExtOut], last: $last, before: $before) {
                 pageInfo { startCursor hasPreviousPage }
                 edges { cursor node { id body created_at } }
@@ -5003,12 +5054,34 @@ pub(super) async fn fetch_ext_out_page(
         return Err(anyhow::Error::new(GraphQlBodyError::from_errors(errors))
             .context(format!("account {account_id} ext-out GraphQL errors")));
     }
-    let page = response
-        .pointer("/data/blockchain/account/messages")
+    let account = response
+        .pointer("/data/blockchain/account")
+        .ok_or_else(|| anyhow!("account {account_id} ext-out GraphQL shape changed: {response}"))?;
+    if account.is_null() {
+        return Err(anyhow::Error::new(ExtOutAccountAbsent {
+            account_id: account_id.to_string(),
+        }));
+    }
+    let info = account
+        .get("info")
+        .ok_or_else(|| anyhow!("account {account_id} ext-out GraphQL shape changed: {response}"))?;
+    let page = account
+        .get("messages")
         .ok_or_else(|| anyhow!("account {account_id} ext-out GraphQL shape changed: {response}"))?;
     let edges = page["edges"]
         .as_array()
         .ok_or_else(|| anyhow!("account {account_id} ext-out GraphQL edges missing: {response}"))?;
+    let previous_cursor =
+        previous_page_cursor(&format!("account {account_id} ext-out"), page, before)?;
+    // Shellnet represents a fresh routed address as an account projection with no current info and
+    // an empty message connection, rather than `account: null`. Only the first page can establish
+    // that the complete history is empty. A destroyed account also has `info: null`, but its ext-out
+    // edges are the immutable history this reader must preserve.
+    if before.is_none() && info.is_null() && edges.is_empty() && previous_cursor.is_none() {
+        return Err(anyhow::Error::new(ExtOutAccountAbsent {
+            account_id: account_id.to_string(),
+        }));
+    }
     let mut messages = Vec::with_capacity(edges.len());
     for edge in edges {
         let cursor = edge["cursor"]
@@ -5038,11 +5111,7 @@ pub(super) async fn fetch_ext_out_page(
     }
     Ok(ExtOutPage {
         messages,
-        previous_cursor: previous_page_cursor(
-            &format!("account {account_id} ext-out"),
-            page,
-            before,
-        )?,
+        previous_cursor,
     })
 }
 
@@ -5814,7 +5883,7 @@ fn select_prior_buyer_terminal_receipt(
     receipts: &TokenContractSettlementReceipts,
 ) -> Result<Option<BuyerStopTerminalReceipt>> {
     let actions = receipts
-        .events
+        .current_lifecycle()
         .iter()
         .filter(|receipt| settlement_action_event_kind(&receipt.event).is_some())
         .collect::<Vec<_>>();
@@ -5906,7 +5975,7 @@ fn reject_prior_settlement_action(
 ) -> Result<()> {
     let token_contract = display_token_contract(token_contract);
     let actions = receipts
-        .events
+        .current_lifecycle()
         .iter()
         .filter(|receipt| settlement_action_event_kind(&receipt.event).is_some())
         .collect::<Vec<_>>();
@@ -6963,11 +7032,12 @@ impl RealChainBackend {
     }
 
     async fn clock_skew_preflight(&self) -> Result<()> {
-        let check = clock_skew_check(
-            local_unix_secs()?,
-            retry_transient_read(|| fetch_chain_time_secs(&self.http, self.client.endpoint()))
-                .await?,
-        );
+        let (local_unix, chain_unix) = clock_skew_sample_from_one_attempt(
+            || fetch_chain_time_secs(&self.http, self.client.endpoint()),
+            local_unix_secs,
+        )
+        .await?;
+        let check = clock_skew_check(local_unix, chain_unix);
         if check.status == ChainDoctorStatus::Fail {
             return Err(anyhow!(check.message));
         }
@@ -7229,10 +7299,11 @@ impl RealChainBackend {
         let mut checks = Vec::new();
         self.liveness().await?;
         record_doctor_check(&mut checks, &mut observe, self.endpoint_reachable_check());
-        let local_unix = local_unix_secs()?;
-        let chain_unix =
-            retry_transient_read(|| fetch_chain_time_secs(&self.http, self.client.endpoint()))
-                .await?;
+        let (local_unix, chain_unix) = clock_skew_sample_from_one_attempt(
+            || fetch_chain_time_secs(&self.http, self.client.endpoint()),
+            local_unix_secs,
+        )
+        .await?;
         let clock_skew_seconds = signed_clock_skew_seconds(local_unix, chain_unix);
         record_doctor_check(
             &mut checks,
@@ -7586,6 +7657,35 @@ impl RealChainBackend {
     ) -> Result<Address> {
         self.token_contract_stateinit_address(seller.public_hex(), root_model, nonce)
             .await
+    }
+
+    /// Whether a random nonce candidate resolves to a TokenContract address that is absent from
+    /// both current state and immutable GraphQL history. This is a read-only preflight for
+    /// `--nonce auto`; provisioning repeats the same checks before its first per-deal money message.
+    pub async fn token_contract_nonce_is_available(
+        &self,
+        seller: &KeyPair,
+        nonce: u64,
+    ) -> Result<bool> {
+        let seller_pubkey = json!(format!("0x{}", seller.public_hex()));
+        let root_model = self.root_model_address_for(&seller_pubkey).await?;
+        let token_contract = self
+            .token_contract_deploy_address(seller, &root_model, nonce)
+            .await?;
+        // Unlike deploy polling, candidate selection must not turn a state-read error or an
+        // uninitialised-but-funded account into "available". Only authoritative absence qualifies.
+        if self
+            .client
+            .get_account_retrying(&token_contract)
+            .await?
+            .is_some()
+        {
+            return Ok(false);
+        }
+        Ok(self
+            .token_contract_settlement_receipts_if_present(&token_contract)
+            .await?
+            .is_none())
     }
 
     /// Read the endpoint ciphertext from `TokenContract` -- getter
@@ -9523,8 +9623,9 @@ impl RealChainBackend {
         Ok(normalize_addr(&call.source)? == normalize_addr(&buyer_note.with_workchain())?)
     }
 
-    /// Read ordered lifecycle receipts for one deal. `StreamStopped` proves the clean
-    /// post-probe-accept split; `ProbeBurned` proves the mutually exclusive probe-burn path.
+    /// Read the ordered immutable receipt history for one deterministic TokenContract address.
+    /// `events` deliberately retains every deployment for audit/reconciliation; current-deal
+    /// decisions must use [`TokenContractSettlementReceipts::current_lifecycle`].
     pub async fn token_contract_settlement_receipts(
         &self,
         token_contract: &Address,
@@ -9558,6 +9659,24 @@ impl RealChainBackend {
         })
         .await?;
         decode_token_contract_settlement_receipts(messages)
+    }
+
+    /// Read immutable history while preserving the one meaningful distinction for fresh-address
+    /// preflights: `None` is authoritative GraphQL absence (`account: null` or a complete first-page
+    /// empty `info: null` account shell), while every transport, schema, decoding, and pagination
+    /// failure remains an error.
+    pub(super) async fn token_contract_settlement_receipts_if_present(
+        &self,
+        token_contract: &Address,
+    ) -> Result<Option<TokenContractSettlementReceipts>> {
+        match self
+            .token_contract_settlement_receipts(token_contract)
+            .await
+        {
+            Ok(receipts) => Ok(Some(receipts)),
+            Err(error) if is_ext_out_account_absent(&error) => Ok(None),
+            Err(error) => Err(error),
+        }
     }
 
     /// Read current getters when active and immutable ext-out history for one TokenContract.
@@ -11299,6 +11418,23 @@ impl RealChainBackend {
                 ));
             }
         } else {
+            // an inactive address is not necessarily unused. `TokenContract` selfdestructs
+            // after settlement, while its immutable ext-out history survives and the same seller
+            // nonce deterministically derives the same address. Re-deploying there creates a
+            // second deal behind one address identity and lets old terminal receipts poison new
+            // money actions. Refuse before `deployDeal` spends the note's reserve.
+            let prior = self
+                .token_contract_settlement_receipts_if_present(&tc)
+                .await?;
+            if let Some(prior) = prior.filter(|receipts| !receipts.events.is_empty()) {
+                return Err(anyhow!(
+                    "TokenContract {} is inactive but has {} immutable lifecycle events; nonce \
+                     {nonce} was already used and this per-deal address must not be redeployed. \
+                     Choose a fresh --nonce; no deployDeal money message was prepared or submitted",
+                    display_token_contract(&tc),
+                    prior.events.len()
+                ));
+            }
             // Deploy-if-absent, FROM THE NOTE (contracts 4.0.36). One owner call replaces what used
             // to be two steps: `fundDeployShell` placing ECC[2] at the uninit address, then a
             // seller-signed external deploy carrying the code. The constructor refuses an external
@@ -14294,11 +14430,21 @@ mod tests {
                     body["variables"]["dappId"],
                     "2222222222222222222222222222222222222222222222222222222222222222"
                 );
+                assert!(
+                    body["query"]
+                        .as_str()
+                        .expect("GraphQL query text")
+                        .contains("info { id }"),
+                    "the history read must distinguish absent current info from destroyed history"
+                );
                 let response_body = json!({
-                    "data": {"blockchain": {"account": {"messages": {
+                    "data": {"blockchain": {"account": {
+                      "info": {"id": "account"},
+                      "messages": {
                         "pageInfo": {"startCursor": null, "hasPreviousPage": false},
                         "edges": []
-                    }}}}
+                      }
+                    }}}
                 })
                 .to_string();
                 let response = format!(
@@ -14331,6 +14477,98 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn issue_1948_absent_shapes_are_absent_but_destroyed_history_is_preserved() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind GraphQL fixture");
+        let endpoint = format!("http://{}", listener.local_addr().unwrap());
+        let account_id = format!("0:{}", "1".repeat(64));
+        let dapp_id = format!("0:{}", "2".repeat(64));
+        let history_body =
+            encode_token_contract_event("ContractDeployed", json!({"self": account_id.clone()}));
+        let task = tokio::spawn(async move {
+            for account in [
+                Value::Null,
+                json!({
+                    "info": null,
+                    "messages": {
+                        "pageInfo": {"startCursor": null, "hasPreviousPage": false},
+                        "edges": []
+                    }
+                }),
+                json!({
+                    "info": null,
+                    "messages": {
+                        "pageInfo": {"startCursor": null, "hasPreviousPage": false},
+                        "edges": [{
+                            "cursor": "destroyed-history-cursor",
+                            "node": {
+                                "id": "destroyed-history-deploy",
+                                "body": history_body,
+                                "created_at": 1
+                            }
+                        }]
+                    }
+                }),
+            ] {
+                let (mut socket, _) = listener.accept().await.expect("accept GraphQL request");
+                let _ = read_fixture_http_request(&mut socket).await;
+                let response_body = json!({
+                    "data": {"blockchain": {"account": account}}
+                })
+                .to_string();
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    response_body.len(),
+                    response_body
+                );
+                socket
+                    .write_all(response.as_bytes())
+                    .await
+                    .expect("write GraphQL response");
+            }
+        });
+
+        for shape in ["account:null", "info:null with empty messages"] {
+            let error = fetch_ext_out_page(
+                &RequestGate::new(ChainRequestCeiling::Unlimited),
+                &reqwest::Client::new(),
+                &endpoint,
+                &account_id,
+                &dapp_id,
+                100,
+                None,
+            )
+            .await
+            .expect_err(shape);
+            assert!(is_ext_out_account_absent(&error), "{shape}: {error:#}");
+        }
+
+        let page = fetch_ext_out_page(
+            &RequestGate::new(ChainRequestCeiling::Unlimited),
+            &reqwest::Client::new(),
+            &endpoint,
+            &account_id,
+            &dapp_id,
+            100,
+            None,
+        )
+        .await
+        .expect("info:null with immutable ext-out is destroyed history, not absence");
+        let receipts = decode_token_contract_settlement_receipts(page.messages)
+            .expect("the destroyed account history must remain decodable");
+        assert!(matches!(
+            receipts.events.as_slice(),
+            [TokenContractSettlementReceipt {
+                event: TokenContractSettlementEvent::ContractDeployed { .. },
+                ..
+            }]
+        ));
+
+        task.await.expect("GraphQL fixture task");
+    }
+
+    #[tokio::test]
     async fn settlement_receipts_fail_closed_when_message_id_is_missing() {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
             .await
@@ -14340,13 +14578,16 @@ mod tests {
             let (mut socket, _) = listener.accept().await.expect("accept GraphQL request");
             let _ = read_fixture_http_request(&mut socket).await;
             let response_body = json!({
-                "data": {"blockchain": {"account": {"messages": {
+                "data": {"blockchain": {"account": {
+                  "info": null,
+                  "messages": {
                     "pageInfo": {"startCursor": null, "hasPreviousPage": false},
                     "edges": [{
                         "cursor": "opaque-cursor",
                         "node": {"body": "ignored", "created_at": 1}
                     }]
-                }}}}
+                  }
+                }}}
             })
             .to_string();
             let response = format!(
@@ -14373,6 +14614,10 @@ mod tests {
         .expect_err("cursor must never stand in for a missing message id");
         task.await.expect("GraphQL fixture task");
         let message = format!("{error:#}");
+        assert!(
+            !is_ext_out_account_absent(&error),
+            "info:null with an ext-out edge is destroyed-account history, not absence: {message}"
+        );
         assert!(message.contains("no message id"), "{message}");
         assert!(message.contains("opaque-cursor"), "{message}");
     }
@@ -14472,9 +14717,14 @@ mod tests {
     struct SkewFixtureServer {
         task: tokio::task::JoinHandle<()>,
         unrecognized: Arc<Mutex<Option<String>>>,
+        chain_time_attempts: Arc<AtomicUsize>,
     }
 
     impl SkewFixtureServer {
+        fn chain_time_attempts(&self) -> usize {
+            self.chain_time_attempts.load(Ordering::SeqCst)
+        }
+
         fn abort(&self) {
             let unrecognized = self.unrecognized.lock().unwrap().clone();
             self.task.abort();
@@ -14622,10 +14872,13 @@ mod tests {
             }));
         }
         json!({
-            "data": {"blockchain": {"account": {"messages": {
-                "pageInfo": {"startCursor": null, "hasPreviousPage": false},
-                "edges": edges,
-            }}}}
+            "data": {"blockchain": {"account": {
+                "info": {"id": "1111111111111111111111111111111111111111111111111111111111111111"},
+                "messages": {
+                    "pageInfo": {"startCursor": null, "hasPreviousPage": false},
+                    "edges": edges,
+                }
+            }}}
         })
     }
 
@@ -14653,6 +14906,21 @@ mod tests {
         Arc<Mutex<Vec<String>>>,
         SkewFixtureServer,
     ) {
+        skew_fixture_backend_with_clock(chain_offset, 0, std::time::Duration::ZERO, deployed(""))
+            .await
+    }
+
+    async fn skew_fixture_backend_with_clock(
+        chain_offset: i64,
+        transient_chain_time_failures: usize,
+        successful_chain_time_delay: std::time::Duration,
+        deployed: Deployed,
+    ) -> (
+        RealChainBackend,
+        Arc<AtomicUsize>,
+        Arc<Mutex<Vec<String>>>,
+        SkewFixtureServer,
+    ) {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let endpoint = format!("http://{}", listener.local_addr().unwrap());
         let fixture_account_id = "1".repeat(64);
@@ -14667,6 +14935,8 @@ mod tests {
         let server_bocs = Arc::clone(&posted_bocs);
         let unrecognized = Arc::new(Mutex::new(None));
         let server_unrecognized = Arc::clone(&unrecognized);
+        let chain_time_attempts = Arc::new(AtomicUsize::new(0));
+        let server_chain_time_attempts = Arc::clone(&chain_time_attempts);
         let task = tokio::spawn(async move {
             loop {
                 let (mut socket, _) = listener.accept().await.unwrap();
@@ -14682,10 +14952,19 @@ mod tests {
                     let query = payload
                         .as_ref()
                         .and_then(|payload| payload["query"].as_str());
-                    if query.is_some_and(|query| query.contains("blocks(last:1)")) {
-                        let local = local_unix_secs().unwrap() as i64;
-                        let chain = (local + chain_offset) as u64;
-                        json!({"data":{"blockchain":{"blocks":{"edges":[{"node":{"gen_utime":chain}}]}}}}).to_string()
+                    if query.is_some_and(|query| query.contains("info { time }")) {
+                        let now = local_unix_secs().unwrap();
+                        json!({"data":{"info":{"time":now * 1_000},"blockchain":{"blocks":{"edges":[{"node":{"seq_no":1,"gen_utime":now}}]}}}}).to_string()
+                    } else if query.is_some_and(|query| query.contains("blocks(last:1)")) {
+                        let attempt = server_chain_time_attempts.fetch_add(1, Ordering::SeqCst) + 1;
+                        if attempt <= transient_chain_time_failures {
+                            json!({"errors":[{"message":"pool timed out while waiting for an open connection"}]}).to_string()
+                        } else {
+                            tokio::time::sleep(successful_chain_time_delay).await;
+                            let local = local_unix_secs().unwrap() as i64;
+                            let chain = (local + chain_offset) as u64;
+                            json!({"data":{"blockchain":{"blocks":{"edges":[{"node":{"gen_utime":chain}}]}}}}).to_string()
+                        }
                     } else if query
                         .is_some_and(|query| query.contains("messages(msg_type: [ExtOut]"))
                     {
@@ -14734,7 +15013,6 @@ mod tests {
                 socket.write_all(response.as_bytes()).await.unwrap();
             }
         });
-        let deployed = deployed("");
         let backend = RealChainBackend {
             client: LimitedChainClient::new(
                 ChainClient::connect(&endpoint).unwrap(),
@@ -14749,8 +15027,101 @@ mod tests {
             backend,
             posts,
             posted_bocs,
-            SkewFixtureServer { task, unrecognized },
+            SkewFixtureServer {
+                task,
+                unrecognized,
+                chain_time_attempts,
+            },
         )
+    }
+
+    #[tokio::test]
+    async fn issue_2008_retried_chain_time_does_not_create_false_skew_before_a_signed_post() {
+        let safe_behind = i64::try_from(MAX_CLOCK_BEHIND_SECS - 1).unwrap();
+        let (backend, posts, _, server) = skew_fixture_backend_with_clock(
+            safe_behind,
+            1,
+            std::time::Duration::from_secs(2),
+            deployed(""),
+        )
+        .await;
+        let address = Address::parse(&format!("0:{}", "1".repeat(64))).unwrap();
+        let keys = KeyPair::from_secret_hex(&"3a".repeat(32)).unwrap();
+
+        backend
+            .submit_pmp_cancel_event(&address, &keys)
+            .await
+            .expect("a safe clock must survive the retry delay and submit once");
+
+        assert_eq!(server.chain_time_attempts(), 2, "the fixture must retry");
+        assert_eq!(posts.load(Ordering::SeqCst), 1, "one signed POST");
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn issue_2008_doctor_clock_check_and_report_ignore_the_chain_time_retry_delay() {
+        let safe_behind = i64::try_from(MAX_CLOCK_BEHIND_SECS - 1).unwrap();
+        let mut doctor_deployed = deployed("");
+        doctor_deployed.version = Some("4.0.36".to_string());
+        doctor_deployed.dapp_config.clear();
+        let (backend, posts, _, server) = skew_fixture_backend_with_clock(
+            safe_behind,
+            1,
+            std::time::Duration::from_secs(2),
+            doctor_deployed,
+        )
+        .await;
+
+        let report = backend
+            .doctor_observing(None, |_, _| {})
+            .await
+            .expect("doctor must finish after a transient chain-time failure");
+        let clock_check = report
+            .checks
+            .iter()
+            .find(|check| check.name == "local clock vs chain time")
+            .expect("doctor clock check");
+
+        assert_eq!(server.chain_time_attempts(), 2, "the fixture must retry");
+        assert_eq!(clock_check.status, ChainDoctorStatus::Pass);
+        assert!(
+            (-safe_behind..=-safe_behind + 1).contains(&report.clock_skew_seconds),
+            "doctor reported retry time as skew: {}",
+            report.clock_skew_seconds
+        );
+        assert_eq!(posts.load(Ordering::SeqCst), 0, "doctor is read-only");
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn issue_2008_unanswered_chain_time_still_prevents_every_signed_post() {
+        let (backend, posts, _, server) = skew_fixture_backend_with_clock(
+            0,
+            crate::params::TRANSIENT_READ_ATTEMPTS,
+            std::time::Duration::ZERO,
+            deployed(""),
+        )
+        .await;
+        let address = Address::parse(&format!("0:{}", "1".repeat(64))).unwrap();
+        let keys = KeyPair::from_secret_hex(&"3a".repeat(32)).unwrap();
+
+        let error = backend
+            .submit_pmp_cancel_event(&address, &keys)
+            .await
+            .expect_err("unknown chain time must fail before submit");
+        let displayed = format!("{error:#}");
+
+        assert!(
+            displayed.contains(crate::CHAIN_READ_EXHAUSTED_MESSAGE_PREFIX),
+            "{displayed}"
+        );
+        assert!(!displayed.contains("CLOCK_SKEW"), "{displayed}");
+        assert_eq!(
+            server.chain_time_attempts(),
+            crate::params::TRANSIENT_READ_ATTEMPTS
+        );
+        assert_eq!(posts.load(Ordering::SeqCst), 0, "no signed POST");
+        server.abort();
     }
 
     #[tokio::test]
@@ -15725,6 +16096,175 @@ mod tests {
             created_at,
             cursor: format!("opaque-{id}"),
             event,
+        }
+    }
+
+    fn test_deploy_receipt(id: &str, created_at: u64) -> TokenContractSettlementReceipt {
+        test_action_receipt(
+            id,
+            created_at,
+            TokenContractSettlementEvent::ContractDeployed {
+                token_contract: "0:tc".to_string(),
+            },
+        )
+    }
+
+    fn test_destroy_receipt(id: &str, created_at: u64) -> TokenContractSettlementReceipt {
+        test_action_receipt(
+            id,
+            created_at,
+            TokenContractSettlementEvent::ContractDestroyed {
+                token_contract: "0:tc".to_string(),
+            },
+        )
+    }
+
+    #[test]
+    fn issue_1948_recycled_address_actions_are_scoped_to_the_latest_deployment() {
+        let old_buyer = format!("0:{}", "11".repeat(32));
+        let current_buyer = format!("0:{}", "22".repeat(32));
+        let mut receipts = TokenContractSettlementReceipts {
+            events: vec![
+                test_deploy_receipt("old-deploy", 1),
+                test_action_receipt(
+                    "old-stop",
+                    2,
+                    TokenContractSettlementEvent::StreamStopped {
+                        buyer: old_buyer,
+                        to_seller: 10,
+                        refund_to_buyer: 90,
+                    },
+                ),
+                test_destroy_receipt("old-destroy", 3),
+                test_deploy_receipt("second-old-deploy", 4),
+                test_action_receipt(
+                    "second-old-probe-burned",
+                    5,
+                    TokenContractSettlementEvent::ProbeBurned {
+                        buyer: current_buyer.clone(),
+                        burned_probe: 1,
+                        burned_bond: 2,
+                        refund_to_buyer: 3,
+                    },
+                ),
+                test_destroy_receipt("second-old-destroy", 6),
+                test_deploy_receipt("current-deploy", 7),
+                test_action_receipt(
+                    "current-open",
+                    8,
+                    TokenContractSettlementEvent::StreamOpened {
+                        buyer: current_buyer.clone(),
+                        price_per_tick: 1,
+                    },
+                ),
+            ],
+        };
+
+        assert!(receipts.has_prior_lifecycle());
+        assert_eq!(receipts.current_lifecycle()[0].message_id, "current-deploy");
+        assert!(
+            select_prior_buyer_terminal_receipt("0:tc", &current_buyer, &receipts)
+                .expect("the old buyer beneficiary is outside the current lifecycle")
+                .is_none()
+        );
+        reject_prior_settlement_action(
+            "0:tc",
+            SettlementAction::SellerStop,
+            Some(&current_buyer),
+            &receipts,
+        )
+        .expect("the old STOP must not block the live deployment");
+
+        receipts.events.push(test_action_receipt(
+            "current-stop",
+            9,
+            TokenContractSettlementEvent::StreamStopped {
+                buyer: current_buyer.clone(),
+                to_seller: 11,
+                refund_to_buyer: 89,
+            },
+        ));
+        let exact = reject_prior_settlement_action(
+            "0:tc",
+            SettlementAction::SellerStop,
+            Some(&current_buyer),
+            &receipts,
+        )
+        .expect_err("a retry inside the latest deployment must still be blocked")
+        .to_string();
+        assert!(exact.contains("exact StreamStopped"), "{exact}");
+        assert!(exact.contains("refusing a duplicate money POST"), "{exact}");
+    }
+
+    #[test]
+    fn issue_1948_provision_checks_history_before_preparing_deploy_deal_money() {
+        let source = include_str!("client.rs");
+        let start = source
+            .find("pub async fn provision_market_with_deal_gas_overhead(")
+            .expect("provision implementation");
+        let end = source[start..]
+            .find("pub async fn root_oracle_address(")
+            .map(|offset| start + offset)
+            .expect("method after provision implementation");
+        let body = &source[start..end];
+        let compact: String = body.chars().filter(|ch| !ch.is_whitespace()).collect();
+        let history_check = compact
+            .find("self.token_contract_settlement_receipts_if_present(&tc)")
+            .expect("immutable address-history preflight");
+        let money_prepare = compact
+            .find("self.note_deploy_deal(")
+            .expect("PrivateNote.deployDeal money path");
+
+        assert!(
+            history_check < money_prepare,
+            "immutable reuse evidence must be read before deployDeal is prepared or submitted"
+        );
+        assert!(
+            compact[history_check..money_prepare]
+                .contains("prior.filter(|receipts|!receipts.events.is_empty())"),
+            "non-empty immutable history must refuse before deployDeal"
+        );
+    }
+
+    proptest::proptest! {
+        #![proptest_config(proptest::prelude::ProptestConfig::with_cases(32))]
+
+        #[test]
+        fn issue_1948_current_action_classification_ignores_complete_prior_lifecycles(
+            old_probe_burns in proptest::collection::vec(proptest::bool::ANY, 0..16)
+        ) {
+            let buyer = format!("0:{}", "33".repeat(32));
+            let mut events = Vec::new();
+            for (index, probe_burned) in old_probe_burns.into_iter().enumerate() {
+                let base = (index as u64) * 3;
+                events.push(test_deploy_receipt(&format!("deploy-{index}"), base));
+                let terminal = if probe_burned {
+                    TokenContractSettlementEvent::ProbeBurned {
+                        buyer: buyer.clone(),
+                        burned_probe: 1,
+                        burned_bond: 1,
+                        refund_to_buyer: 98,
+                    }
+                } else {
+                    TokenContractSettlementEvent::StreamStopped {
+                        buyer: buyer.clone(),
+                        to_seller: 10,
+                        refund_to_buyer: 90,
+                    }
+                };
+                events.push(test_action_receipt(&format!("terminal-{index}"), base + 1, terminal));
+                events.push(test_destroy_receipt(&format!("destroy-{index}"), base + 2));
+            }
+            events.push(test_deploy_receipt("current-deploy", 10_000));
+            let receipts = TokenContractSettlementReceipts { events };
+
+            proptest::prop_assert!(reject_prior_settlement_action(
+                "0:tc",
+                SettlementAction::BuyerStop,
+                Some(&buyer),
+                &receipts,
+            ).is_ok());
+            proptest::prop_assert_eq!(receipts.current_lifecycle().len(), 1);
         }
     }
 

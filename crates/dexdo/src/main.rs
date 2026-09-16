@@ -663,14 +663,27 @@ async fn main() -> Result<()> {
     // the machine surface is known.
     cli::interaction::configure(cli.non_interactive, machine_operation.is_some());
     cli::style::configure_raw(cli.raw);
-    let instance_lock = cli::data_dir::configure(cli.data_dir.take()).and_then(|()| {
-        cli.command.apply_data_dir_defaults()?;
-        cli.command
-            .instance_lock_request()
-            .map(|(role, legacy_uses_shared_defaults)| {
-                cli::data_dir::acquire_instance_lock(role, legacy_uses_shared_defaults)
-            })
-            .unwrap_or(Ok(None))
+    // reject the one unsafe mock combination before `data_dir::configure` can create a
+    // directory or instance lock. A contended lock must not hide the production-mainnet refusal.
+    let instance_lock = match &cli.command {
+        Command::Seller(args) => args
+            .mock
+            .reject_mainnet_mock_model(dexdo_core::params::current_network()),
+        Command::Buyer(args) => args
+            .mock
+            .reject_mainnet_mock_model(dexdo_core::params::current_network()),
+        _ => Ok(()),
+    }
+    .and_then(|()| {
+        cli::data_dir::configure(cli.data_dir.take()).and_then(|()| {
+            cli.command.apply_data_dir_defaults()?;
+            cli.command
+                .instance_lock_request()
+                .map(|(role, legacy_uses_shared_defaults)| {
+                    cli::data_dir::acquire_instance_lock(role, legacy_uses_shared_defaults)
+                })
+                .unwrap_or(Ok(None))
+        })
     });
 
     let result = match instance_lock {
@@ -4243,6 +4256,18 @@ mod tests {
         assert!(!help.contains("fund-10"), "{help}");
         assert!(!help.contains("MIN_BALANCE"), "{help}");
         assert!(!help.contains("REGISTER_FORWARD_VALUE"), "{help}");
+    }
+
+    #[test]
+    fn provision_nonce_help_keeps_the_choice_required_and_recommends_auto() {
+        let help = subcommand_long_help("provision");
+        assert!(help.contains("Deal nonce (required)"), "{help}");
+        assert!(help.contains("use `auto` (recommended)"), "{help}");
+        assert!(help.contains("random 64-bit value"), "{help}");
+        assert!(
+            help.contains("explicit unsigned integer only for reproducible or operator-controlled"),
+            "{help}"
+        );
     }
 
     #[test]

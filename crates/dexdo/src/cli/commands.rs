@@ -1546,6 +1546,7 @@ pub(crate) fn persist_pool_recovery_record(record: &PoolRecoveryRecord) -> Resul
 
 fn persist_pool_recovery_record_locked(record: &PoolRecoveryRecord) -> Result<()> {
     let mut pool = load_pool_json(&record.pool_path)?;
+    crate::cli::note::remove_legacy_pool_funding_multisig(&mut pool);
     let notes = pool["notes"]
         .as_array_mut()
         .ok_or_else(|| anyhow::anyhow!("DEXDO_PN_POOL: malformed (\"notes\" is not an array)"))?;
@@ -2854,6 +2855,26 @@ fn render_clock_skew(seconds: i64) -> String {
     }
 }
 
+fn parse_contract_generation(generation: &str) -> Option<(u64, u64, u64)> {
+    let mut parts = generation.split('.');
+    let parsed = (
+        parts.next()?.parse().ok()?,
+        parts.next()?.parse().ok()?,
+        parts.next()?.parse().ok()?,
+    );
+    parts.next().is_none().then_some(parsed)
+}
+
+fn doctor_upgrade_notice(report: &dexdo_core::ChainDoctorReport) -> Option<String> {
+    let manifest = report.manifest_generation.as_deref()?;
+    let chain = report.chain_generation.as_deref()?;
+    (parse_contract_generation(manifest)? < parse_contract_generation(chain)?).then(|| {
+        format!(
+            "Upgrade dexdo: this installation's manifest generation {manifest} is behind the live chain generation {chain}."
+        )
+    })
+}
+
 fn render_chain_doctor_report(
     report: &dexdo_core::ChainDoctorReport,
     policy: &policy::DoctorPolicyAssessment,
@@ -2863,6 +2884,10 @@ fn render_chain_doctor_report(
 
     let palette = Palette::stdout();
     let mut out = String::new();
+    if let Some(notice) = doctor_upgrade_notice(report) {
+        out.push_str(&notice);
+        out.push('\n');
+    }
     out.push_str("Doctor report\n");
     out.push_str(&format!(
         "{}\n",
@@ -3258,6 +3283,37 @@ mod doctor_output_1860_tests {
             rendered.lines().last(),
             Some("dexdo doctor: FAIL - 1 checks failed: SuperRoot code hash")
         );
+    }
+
+    #[test]
+    fn a_manifest_behind_the_chain_leads_with_upgrade_guidance() {
+        let mut report = report();
+        report.manifest_generation = Some("4.0.35".to_string());
+        report.chain_generation = Some("4.0.36".to_string());
+        report.checks[0].status = ChainDoctorStatus::Fail;
+
+        let rendered = render_chain_doctor_report(&report, &missing_policy());
+
+        assert_eq!(
+            rendered.lines().next(),
+            Some(
+                "Upgrade dexdo: this installation's manifest generation 4.0.35 is behind the live chain generation 4.0.36."
+            )
+        );
+        assert_eq!(rendered.matches("Upgrade dexdo:").count(), 1, "{rendered}");
+    }
+
+    #[test]
+    fn doctor_does_not_guess_that_upgrade_is_the_fix() {
+        let mut report = report();
+        report.manifest_generation = Some("4.0.37".to_string());
+        report.chain_generation = Some("4.0.36".to_string());
+        report.checks[0].status = ChainDoctorStatus::Fail;
+
+        let rendered = render_chain_doctor_report(&report, &missing_policy());
+
+        assert_eq!(rendered.lines().next(), Some("Doctor report"));
+        assert!(!rendered.contains("Upgrade dexdo:"), "{rendered}");
     }
 }
 
@@ -4048,8 +4104,8 @@ fn identity_free_options(deals_dir: Option<&std::path::Path>) -> String {
 /// and the run's own `--deals-dir`/`--contracts` are carried, so the line resolves the same deal
 /// against the same deployment.
 
-/// Its only caller is the chain `close` path, so it exists exactly where that does -- the same
-/// boundary the settlement builders use -- rather than shipping behind a dead-code suppression.
+/// It lives beside the other identity-free follow-up builders so every human path uses the same
+/// quoting and data-directory convention.
 pub(crate) fn status_command(deal: &str, deals_dir: Option<&std::path::Path>) -> String {
     let mut command = format!("dexdo status {}", crate::cli::support::shell_arg(deal));
     for (flag, path) in [("--deals-dir", deals_dir)] {
@@ -4483,17 +4539,15 @@ pub(crate) fn note_deploy_now_unix() -> Result<u64> {
 pub(crate) fn note_deploy_fold_state_into_pool(
     pool_path: &std::path::Path,
     state: &crate::cli::note::OnboardPnState,
-    funding_multisig_address: &str,
 ) -> Result<usize> {
     with_pool_write_lock(pool_path, |pool_path| {
-        note_deploy_fold_state_into_pool_locked(pool_path, state, funding_multisig_address, || {})
+        note_deploy_fold_state_into_pool_locked(pool_path, state, || {})
     })
 }
 
 pub(crate) fn note_deploy_fold_state_into_pool_locked(
     pool_path: &std::path::Path,
     state: &crate::cli::note::OnboardPnState,
-    funding_multisig_address: &str,
     after_read: impl FnOnce(),
 ) -> Result<usize> {
     use crate::cli::note::{pn_state_to_pool_note, pool_with_note_added};
@@ -4511,7 +4565,7 @@ pub(crate) fn note_deploy_fold_state_into_pool_locked(
     };
     after_read();
     let now = note_deploy_now_unix()?;
-    let pool = pool_with_note_added(existing, state, note, now, funding_multisig_address)?;
+    let pool = pool_with_note_added(existing, state, note, now)?;
     let pool_json = serde_json::to_string_pretty(&pool)?;
     write_pool_private(pool_path, pool_json.as_bytes())?;
     Ok(pool["notes"].as_array().map(|a| a.len()).unwrap_or(0))

@@ -264,11 +264,6 @@ async fn stream_upstream(
                             "Anthropic cumulative output_tokens decreased",
                         )));
                     }
-                    if output_tokens > count {
-                        return Err(Box::new(Status::data_loss(
-                            "Anthropic cumulative output_tokens exceeds the requested token limit",
-                        )));
-                    }
                     reported_output = Some(output_tokens);
                 }
                 ParsedEvent::CumulativeUsage {
@@ -293,11 +288,6 @@ async fn stream_upstream(
                     if reported_output.is_some_and(|previous| output_tokens < previous) {
                         return Err(Box::new(Status::data_loss(
                             "Anthropic cumulative output_tokens decreased",
-                        )));
-                    }
-                    if output_tokens > count {
-                        return Err(Box::new(Status::data_loss(
-                            "Anthropic cumulative output_tokens exceeds the requested token limit",
                         )));
                     }
                     reported_output = Some(output_tokens);
@@ -892,6 +882,33 @@ mod tests {
         assert_eq!(chunks[1].seq, 1);
         assert_eq!(chunks[1].text, " world");
         assert!(chunks[1].manifest.is_none());
+    }
+
+    #[tokio::test]
+    async fn terminal_billing_output_above_the_requested_limit_is_preserved() {
+        let sse = concat!(
+            "event: message_start\n",
+            "data: {\"type\":\"message_start\",\"message\":{\"usage\":{\"input_tokens\":3,\"output_tokens\":0}}}\n\n",
+            "event: content_block_delta\n",
+            "data: {\"type\":\"content_block_delta\",\"delta\":{\"type\":\"thinking_delta\",\"thinking\":\"reasoning and answer\"}}\n\n",
+            "event: message_delta\n",
+            "data: {\"type\":\"message_delta\",\"usage\":{\"output_tokens\":9}}\n\n",
+            "event: message_stop\n",
+            "data: {\"type\":\"message_stop\"}\n\n"
+        );
+        let (result, events) = run_test_stream(sse.as_bytes().to_vec()).await;
+        result.expect("reasoning-inclusive billing usage is not the visible-output limit");
+        assert!(matches!(
+            &events[0],
+            UpstreamEvent::Chunk(chunk) if chunk.reasoning == "reasoning and answer"
+        ));
+        assert!(matches!(
+            &events[1],
+            UpstreamEvent::Usage(usage)
+                if usage.input_tokens == 3
+                    && usage.output_tokens == 9
+                    && usage.total_tokens == 12
+        ));
     }
 
     #[test]

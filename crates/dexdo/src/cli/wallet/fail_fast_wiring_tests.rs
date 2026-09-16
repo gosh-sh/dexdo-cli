@@ -5,8 +5,8 @@
 //! suite happens to have bound.
 
 use super::{
-    resolve_funding_wallet, FundingWallet, WalletBinding, WalletProvider, WalletStore,
-    BINDING_VERSION,
+    resolve_funding_wallet, resolve_funding_wallet_identity, FundingWallet, WalletBinding,
+    WalletBindingCannotSign, WalletProvider, WalletStore, BINDING_VERSION,
 };
 use crate::Cli;
 use clap::Parser as _;
@@ -208,6 +208,17 @@ fn a_binding_with_no_local_secret_is_refused_as_itself() {
         binding.hot_key_file = None;
         binding.hot_seed_file = None;
     });
+    let identity = resolve_funding_wallet_identity(
+        &store,
+        &crate::cli::wallet::test_network_a(),
+        None,
+        &None,
+        &None,
+    )
+    .expect("recovery may resolve the public Hot without a signing credential");
+    assert_eq!(identity.address, HOT);
+    assert_eq!(identity.key, None);
+    assert_eq!(identity.seed_file, None);
     let error = resolve_funding_wallet(
         &store,
         &crate::cli::wallet::test_network_a(),
@@ -217,6 +228,7 @@ fn a_binding_with_no_local_secret_is_refused_as_itself() {
     )
     .expect_err("a binding with no secret cannot fund a spend");
     assert!(!is_wallet_not_configured(&error), "{error:#}");
+    assert!(error.downcast_ref::<WalletBindingCannotSign>().is_some());
     assert!(
         format!("{error:#}").contains("cannot sign a spend"),
         "{error:#}"

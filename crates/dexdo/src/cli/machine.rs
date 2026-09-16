@@ -102,6 +102,7 @@ pub(crate) struct DoctorResponse {
 #[serde(tag = "event", rename_all = "snake_case")]
 pub(crate) enum MachineFundingNotice {
     AlreadyFunded,
+    VoucherSubmittedWaitingEventOrProof,
     RequestSubmitted,
     RequestAlreadyPending,
     RequestExecuted,
@@ -109,12 +110,13 @@ pub(crate) enum MachineFundingNotice {
     ManualTopUpRequested,
 }
 
-/// The funding state a money command had already reached when it failed.
+/// The funding/recovery state a money command had already reached when it failed.
 
 /// A `note deploy` that creates a Vault -> Hot request and then times out waiting for the balance
 /// leaves an orchestrator with the one question it cannot answer from an exit code: has money
-/// already left the Vault? The success object answers it with `funding_notice`; before this, the
-/// failure answered it only in `stderr` prose.
+/// already left the Vault or Hot? The success object answers it with `funding_notice`; before this,
+/// the failure answered it only in `stderr` prose. A submitted voucher recovery uses the same
+/// carrier to state that it bypassed fresh funding and is reconciling the existing submit.
 
 /// Carried as a typed cause rather than as wording, so the envelope is built by matching a type -
 /// the same way `classify_error` reads every other machine-relevant fact - and the operator-facing
@@ -248,6 +250,10 @@ pub(crate) const WALLET_NOT_CONFIGURED_CODE: &str = "wallet_not_configured";
 pub(crate) const WALLET_NOT_CONFIGURED_MESSAGE: &str =
     "wallet is not configured; run `dexdo wallet onboard gosh-ai` first";
 
+pub(crate) const WALLET_BINDING_CANNOT_SIGN_CODE: &str = "wallet_binding_cannot_sign";
+pub(crate) const WALLET_BINDING_CANNOT_SIGN_MESSAGE: &str =
+    "the active wallet binding cannot sign the required Hot-wallet spend";
+
 #[derive(Debug)]
 pub(crate) struct MachineErrorPrinted;
 
@@ -345,6 +351,9 @@ pub(crate) enum ErrorCode {
     /// operator's own configuration state, not a client fault, and the fix is a setup command -- so
     /// it is its own code rather than `INTERNAL`, which tells an orchestrator to escalate a bug.
     WalletNotConfigured,
+    /// The active binding names a Hot but cannot supply the credential a fresh spend requires.
+    /// Recovery that has already submitted its voucher never reaches this branch.
+    WalletBindingCannotSign,
     Internal,
 }
 
@@ -375,6 +384,7 @@ impl ErrorCode {
             Self::ContradictoryState => "CONTRADICTORY_STATE",
             Self::BuyAlreadyResting => "BUY_ALREADY_RESTING",
             Self::WalletNotConfigured => WALLET_NOT_CONFIGURED_CODE,
+            Self::WalletBindingCannotSign => WALLET_BINDING_CANNOT_SIGN_CODE,
             Self::Internal => "INTERNAL",
         }
     }
@@ -422,6 +432,7 @@ impl ErrorCode {
             Self::ContradictoryState => "durable and on-chain records contradict each other",
             Self::BuyAlreadyResting => "a buy from this note is already resting in the book",
             Self::WalletNotConfigured => WALLET_NOT_CONFIGURED_MESSAGE,
+            Self::WalletBindingCannotSign => WALLET_BINDING_CANNOT_SIGN_MESSAGE,
             Self::Internal => "internal invariant failed",
         }
     }
@@ -449,6 +460,12 @@ pub(crate) fn classify_error(operation: &str, err: &anyhow::Error) -> ErrorCode 
             .is_some()
         {
             return ErrorCode::AccountUnreadable;
+        }
+        if cause
+            .downcast_ref::<super::wallet::WalletBindingCannotSign>()
+            .is_some()
+        {
+            return ErrorCode::WalletBindingCannotSign;
         }
         // The refusal that says the deal is NOT disputed. `:1067` reserves DISPUTED_DEAL for
         // "Deal is disputed and cannot be closed", so the old verdict told the consumer the reverse
@@ -623,9 +640,10 @@ pub(crate) struct MachineError {
     pub(crate) retryable_after_unix: Option<u64>,
     /// re-audit item 8: the funding state the command had already reached when it failed.
 
-    /// Present only when this run created a Vault -> Hot request or found one of its own still
-    /// pending - the states in which a failure cannot tell an orchestrator whether money has left
-    /// the Vault. Absent means no funding request of this run exists, which is itself the answer.
+    /// Present when this run created/found a Vault -> Hot request, or when `note deploy` found a
+    /// submitted voucher recovery and bypassed fresh Hot funding. These are the states in which an
+    /// exit code alone cannot tell an orchestrator whether money already moved. Absent means no
+    /// such funding/recovery state was reached, which is itself the answer.
 
     /// It carries the same stable event the success object carries, and nothing else.
     #[serde(skip_serializing_if = "Option::is_none")]

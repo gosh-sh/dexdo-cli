@@ -308,6 +308,11 @@ the pool file that money-moving buyer commands require. Success is the block
 that opens `Note deployed` and carries `address: <dapp>::<account>` and a `folded:` line naming the
 pool; do not advance on an earlier progress line.
 
+Before wallet onboarding, wallet funding, or chain preflight, dexdo atomically persists the fresh owner key in
+`pn_pool.json.recovery.json` with owner-only permissions. A completed pool stores note credentials,
+not funding-wallet provenance; notes funded by different multisigs may share it when nominal and
+token type match.
+
 Point the CLI at that same pool after deploy:
 
 ```sh
@@ -366,17 +371,17 @@ using the shape below.
 {
   "models": {
     "qwen": {
-      "frame_model": "Qwen3.6-27B",
+      "frame_model": "Qwen3.8-27B",
       "base_url": "https://api.groq.com/openai/v1",
-      "served_model": "qwen/qwen3.6-27b",
+      "served_model": "qwen/qwen3.8-27b",
       "api_key_env": "GROQ_API_KEY",
       "tokenizer_family": "qwen",
       "price_per_tick": 1,
-      "identity_aliases": ["Qwen/Qwen3.6-27B"],
+      "identity_aliases": ["Qwen/Qwen3.8-27B"],
       "fingerprints": [
         {
-          "probe_prompt": "What is 17*23? Think step by step.",
-          "expected_contains": "<think>"
+          "probe_prompt": "Reply with exactly: QWEN38",
+          "expected_contains": "QWEN38"
         }
       ],
       "capabilities": { "max_output_tokens": 16384 }
@@ -397,7 +402,7 @@ read the book and price the deal read-only (writes nothing):
 
 ```sh
 # The resting asks (SHELL per tick) and their deal addresses:
-dexdo market Qwen3.6-27B --market market.json
+dexdo market Qwen3.8-27B --market market.json
 
 # Executable cost for the ticks you intend to buy -- `total_with_fee` is the SHELL escrow you need:
 dexdo quote --market market.json --ticks 8
@@ -501,7 +506,7 @@ To buy from the discovered model order book without `market.json`, use:
 
 ```sh
 dexdo buyer \
-  --frame-model Qwen3.6-27B \
+  --frame-model Qwen3.8-27B \
   --models models.json \
   --ticks 8 \
   --max-price-per-tick 1 \
@@ -529,16 +534,16 @@ Two flags worth knowing:
 
 ## Phase 9. Use the model
 
-The request `model` field must equal the deal's frame model (`Qwen3.6-27B`) or be omitted.
+The request `model` field must equal the deal's frame model (`Qwen3.8-27B`) or be omitted.
 
 ```sh
 curl http://127.0.0.1:8080/v1/chat/completions \
   -H "Content-Type: application/json" \
-  -d '{"model":"Qwen3.6-27B","messages":[{"role":"user","content":"hello"}],"stream":true}'
+  -d '{"model":"Qwen3.8-27B","messages":[{"role":"user","content":"hello"}],"stream":true}'
 ```
 
 For OpenAI-compatible tools and SDKs, point them at the local endpoint and set the model to
-`Qwen3.6-27B`:
+`Qwen3.8-27B`:
 
 ```sh
 export OPENAI_BASE_URL="http://127.0.0.1:8080/v1"
@@ -623,19 +628,21 @@ on-demand` -- when you are not actively sending requests.
 
   ```sh
   dexdo buyer --resume \
-    --frame-model Qwen3.6-27B \
+    --frame-model Qwen3.8-27B \
     --local-listen 127.0.0.1:8080
   ```
 
   (`--resume` also accepts `--market`/`--token-contract`.) If no match happened at all, check the
   seller is up on the same manifest and that your `--max-price-per-tick` was >= the ask (Phase 6).
-- request rejected as `outside the configured frame` -- send `model` as `Qwen3.6-27B` (or omit it).
+- request rejected as `outside the configured frame` -- send `model` as `Qwen3.8-27B` (or omit it).
 
 ## Hard rules
 
 - Never print, log, or commit the wallet seed/key, the note owner secret (`owner_secret_key_hex`),
   or the pool file.
 - Never re-run a timed-out buy verbatim -- reconnect with `--resume` (a fresh buy double-pays).
+- Never let a note withdrawal or sweep infer its destination: supply canonical
+  `--to <DAPP-ID>::<ACCOUNT-ID>` explicitly every time.
 - Do not set `--escrow` by hand without a reason (risk of stranded surplus).
 - Buy against the deal `token_contract`, not an order-book address.
 - Your on-chain lock per open deal never exceeds 2 ticks.

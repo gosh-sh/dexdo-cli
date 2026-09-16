@@ -138,15 +138,6 @@ impl CanonStreamDriver {
                     if let Err(error) = usage.validate() {
                         return CanonStreamNext::Errored(error.to_string().into());
                     }
-                    if usage.output_tokens > self.output_limit {
-                        return CanonStreamNext::Errored(
-                            format!(
-                                "terminal output usage {} exceeds output limit {}",
-                                usage.output_tokens, self.output_limit
-                            )
-                            .into(),
-                        );
-                    }
                     if usage.total_tokens > self.billing_grant {
                         return CanonStreamNext::Errored(
                             format!(

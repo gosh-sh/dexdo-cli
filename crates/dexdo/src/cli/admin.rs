@@ -1,6 +1,6 @@
 //! Market/pool lifecycle administration command handlers.
 
-use crate::cli::args::{DestroyArgs, MarketDeployArgs, ProvisionArgs};
+use crate::cli::args::{DestroyArgs, MarketDeployArgs, ProvisionArgs, ProvisionNonceArg};
 use crate::cli::commands::{
     chain_doctor_preflight, enforce_model_registry_policy,
     enforce_model_registry_policy_with_endpoint, load_enabled_model_registry_policy,
@@ -19,6 +19,29 @@ use dexdo::registry::{BuyerMissingBookPolicy, RegistryRole, RegistrySuggestions}
 use dexdo_core::params::{
     MARKET_DEPLOY_ACTIVATION_MAX_READS, MARKET_DEPLOY_ACTIVATION_POLL_INTERVAL,
 };
+use rand::RngCore as _;
+use std::future::Future;
+
+async fn choose_provision_nonce<G, C, Fut>(
+    requested: ProvisionNonceArg,
+    mut generate: G,
+    mut candidate_is_available: C,
+) -> Result<u64>
+where
+    G: FnMut() -> u64,
+    C: FnMut(u64) -> Fut,
+    Fut: Future<Output = Result<bool>>,
+{
+    match requested {
+        ProvisionNonceArg::Explicit(nonce) => Ok(nonce),
+        ProvisionNonceArg::Auto => loop {
+            let candidate = generate();
+            if candidate_is_available(candidate).await? {
+                return Ok(candidate);
+            }
+        },
+    }
+}
 
 /// refuse a provision whose model name the buyer's registry lookup would reject.
 
@@ -472,9 +495,20 @@ pub(crate) async fn run_provision_with_deal_gas_overhead(
         )
         .await?;
     }
-    // REQUIRE an explicit, deal-unique nonce BEFORE any deposit/deploy -- the per-deal TokenContract derives
-    // from (sellerPubkey, nonce); the old `--nonce 0` default silently reused (overwrote) a prior deal's TC.
-    let nonce = require_provision_nonce(args.nonce)?;
+    // A numeric nonce remains deterministic. `auto` draws from the OS CSPRNG and rejects a candidate
+    // read-only when its deterministic address is active or has immutable history. The provisioning
+    // path checks again before deployDeal, so this selection cannot weaken the money guard.
+    let requested_nonce = require_provision_nonce(args.nonce)?;
+    let mut rng = rand::rngs::OsRng;
+    let nonce = choose_provision_nonce(
+        requested_nonce,
+        || rng.next_u64(),
+        |candidate| chain.token_contract_nonce_is_available(&keys, candidate),
+    )
+    .await?;
+    if requested_nonce == ProvisionNonceArg::Auto {
+        eprintln!("selected random deal nonce: {nonce}");
+    }
     // the note deposit is a user-chosen provision parameter (default >=100 SHELL), framed by deal volume --
     // NOT a MIN_BALANCE-anchored per-op gas knob. 1 SHELL = 1e9 raw ECC[2]. The deposit is split across the
     // RootModel + per-deal `TokenContract` deploys, funded from the note's own ECC[2].
@@ -584,6 +618,37 @@ mod admin_1855_registry_gate_tests;
 mod tests {
     use super::*;
     use crate::cli::args::{IdentityArgs, ModelRegistryValidationArgs};
+
+    #[tokio::test]
+    async fn auto_nonce_retries_collisions_while_explicit_nonce_is_unchanged() {
+        let mut candidates = [7, 8, 9].into_iter();
+        let auto = choose_provision_nonce(
+            ProvisionNonceArg::Auto,
+            || candidates.next().expect("scripted random candidate"),
+            |candidate| async move { Ok(candidate == 9) },
+        )
+        .await
+        .unwrap();
+        assert_eq!(auto, 9);
+
+        let explicit = choose_provision_nonce(
+            ProvisionNonceArg::Explicit(42),
+            || panic!("explicit nonce must not use randomness"),
+            |_| async { panic!("explicit nonce must not probe random candidates") },
+        )
+        .await
+        .unwrap();
+        assert_eq!(explicit, 42);
+
+        let error = choose_provision_nonce(
+            ProvisionNonceArg::Auto,
+            || 10,
+            |_| async { anyhow::bail!("history lookup failed") },
+        )
+        .await
+        .unwrap_err();
+        assert!(error.to_string().contains("history lookup failed"));
+    }
 
     /// - DISPATCH, not the guard.
 

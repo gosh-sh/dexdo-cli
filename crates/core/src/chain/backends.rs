@@ -16,9 +16,9 @@ use crate::market::{
     check_buy_deposit_headroom, coalesce_equivalent_resting_asks, validate_seller_resume_state,
     BuyerStopTerminalFact, BuyerStopTerminalReceipt, ChainBackend, ChainError, ClaimBounds,
     DealChainSnapshot, DealChainState, DealOfferLatch, DealRole, DealSellerBond, DealSubscription,
-    DealView, Match, MatchWatchCursor, MatchedFill, OrderBookOrder, OrderBookSnapshot,
-    OrderBookStats, RestingSellCancelStartError, RestingSellCancelWatch, SellOffer,
-    SellOfferOutcome, StreamSnapshot, TokenContract,
+    DealTerminalSettlement, DealView, Match, MatchWatchCursor, MatchedFill, OrderBookOrder,
+    OrderBookSnapshot, OrderBookStats, RestingSellCancelStartError, RestingSellCancelWatch,
+    SellOffer, SellOfferOutcome, StreamSnapshot, TokenContract,
 };
 use crate::note::{LocalNote, Note, NoteError, NotePubkey, Signature};
 #[cfg(test)]
@@ -5343,6 +5343,45 @@ fn token_contract_used_reason(state: DealChainState) -> Option<String> {
     state.used_reason()
 }
 
+fn check_token_contract_history_fresh_for_new_money(
+    token_contract: &str,
+    receipts: &TokenContractSettlementReceipts,
+    currently_active: bool,
+) -> Result<(), String> {
+    if receipts.has_prior_lifecycle() {
+        return Err(format!(
+            "TokenContract {} has immutable history before its latest ContractDeployed; the \
+             seller nonce was reused for a second deal at one address. Refusing before any new \
+             offer or buyer escrow; use a fresh nonce and TokenContract",
+            display_token_contract(token_contract)
+        ));
+    }
+    if currently_active
+        && receipts.current_lifecycle().iter().any(|receipt| {
+            matches!(
+                receipt.event,
+                TokenContractSettlementEvent::ContractDestroyed { .. }
+            )
+        })
+    {
+        return Err(format!(
+            "TokenContract {} is active but its latest indexed lifecycle is already destroyed; \
+             the current ContractDeployed boundary may not be indexed yet. Refusing before any \
+             new offer or buyer escrow",
+            display_token_contract(token_contract)
+        ));
+    }
+    if !currently_active && !receipts.events.is_empty() {
+        return Err(format!(
+            "TokenContract {} is inactive but has immutable lifecycle history; the seller nonce \
+             was already used. Refusing before any new offer or buyer escrow; use a fresh nonce \
+             and TokenContract",
+            display_token_contract(token_contract)
+        ));
+    }
+    Ok(())
+}
+
 fn check_selected_token_contract_unused(
     token_contract: &str,
     state: Option<DealChainState>,
@@ -6072,42 +6111,112 @@ async fn real_tc_snapshot(
     })
 }
 
+fn terminal_settlement_from_event(
+    event: &TokenContractSettlementEvent,
+) -> Option<DealTerminalSettlement> {
+    match event {
+        TokenContractSettlementEvent::ProbeBurned {
+            burned_probe,
+            burned_bond,
+            refund_to_buyer,
+            ..
+        } => Some(DealTerminalSettlement::ProbeBurned {
+            burned_probe: *burned_probe,
+            burned_bond: *burned_bond,
+            refund_to_buyer: *refund_to_buyer,
+        }),
+        TokenContractSettlementEvent::StreamStopped {
+            to_seller,
+            refund_to_buyer,
+            ..
+        } => Some(DealTerminalSettlement::StreamStopped {
+            to_seller: *to_seller,
+            refund_to_buyer: *refund_to_buyer,
+        }),
+        TokenContractSettlementEvent::DisputeResolved {
+            to_seller,
+            refund_to_buyer,
+            released,
+        } => Some(DealTerminalSettlement::DisputeResolved {
+            to_seller: *to_seller,
+            refund_to_buyer: *refund_to_buyer,
+            released: *released,
+        }),
+        TokenContractSettlementEvent::ContractDeployed { .. }
+        | TokenContractSettlementEvent::StreamFunded { .. }
+        | TokenContractSettlementEvent::SellerBondFunded { .. }
+        | TokenContractSettlementEvent::BuyerBondFunded { .. }
+        | TokenContractSettlementEvent::StreamOpened { .. }
+        | TokenContractSettlementEvent::ProbeAccepted { .. }
+        | TokenContractSettlementEvent::TickFinalized { .. }
+        | TokenContractSettlementEvent::TicksClaimed { .. }
+        | TokenContractSettlementEvent::StreamDisputed { .. }
+        | TokenContractSettlementEvent::StreamReclaimed { .. }
+        | TokenContractSettlementEvent::ShellWithdrawn { .. }
+        | TokenContractSettlementEvent::ContractDestroyed { .. } => None,
+    }
+}
+
+/// Select the one terminal emitted by the address's current lifecycle.
+
+/// Lifecycle events before the terminal are expected. After it, only the matching account
+/// destruction is possible; any second terminal or later activity is contradictory evidence.
+fn exact_terminal_settlement(
+    receipts: TokenContractSettlementReceipts,
+) -> Result<Option<DealTerminalSettlement>, ChainError> {
+    let mut terminal = None;
+    let mut destroyed = false;
+    for receipt in receipts.current_lifecycle() {
+        if destroyed {
+            return Err(ChainError::Chain(format!(
+                "TokenContract emitted {:?} after ContractDestroyed; this lifecycle is contradictory",
+                receipt.event
+            )));
+        }
+        if matches!(
+            receipt.event,
+            TokenContractSettlementEvent::ContractDestroyed { .. }
+        ) {
+            destroyed = true;
+            continue;
+        }
+        if let Some(observed) = terminal_settlement_from_event(&receipt.event) {
+            if let Some(previous) = terminal {
+                return Err(ChainError::Chain(format!(
+                    "TokenContract emitted more than one terminal event: {previous:?}, then {observed:?}"
+                )));
+            }
+            terminal = Some(observed);
+        } else if let Some(previous) = &terminal {
+            return Err(ChainError::Chain(format!(
+                "TokenContract emitted {:?} after terminal {previous:?}; this lifecycle is contradictory",
+                receipt.event
+            )));
+        }
+    }
+    if destroyed && terminal.is_none() {
+        return Err(ChainError::Chain(
+            "TokenContract emitted ContractDestroyed without a terminal settlement event"
+                .to_string(),
+        ));
+    }
+    Ok(terminal)
+}
+
 fn exact_buyer_stop_settlement(
     receipts: TokenContractSettlementReceipts,
 ) -> Result<Option<(u128, u128)>, ChainError> {
-    let mut found = None;
-    for receipt in receipts.events {
-        let (to_seller, refund_to_buyer) = match receipt.event {
-            TokenContractSettlementEvent::StreamStopped {
-                to_seller,
-                refund_to_buyer,
-                ..
-            } => (to_seller, refund_to_buyer),
-            // ProbeBurned records a pre-probe stop, not the authoritative
-            // buyer STOP settlement represented by StreamStopped.
-            TokenContractSettlementEvent::ProbeAccepted { .. }
-            | TokenContractSettlementEvent::ContractDeployed { .. }
-            | TokenContractSettlementEvent::StreamFunded { .. }
-            | TokenContractSettlementEvent::SellerBondFunded { .. }
-            | TokenContractSettlementEvent::BuyerBondFunded { .. }
-            | TokenContractSettlementEvent::StreamOpened { .. }
-            | TokenContractSettlementEvent::StreamReclaimed { .. }
-            | TokenContractSettlementEvent::ShellWithdrawn { .. }
-            | TokenContractSettlementEvent::ContractDestroyed { .. }
-            | TokenContractSettlementEvent::ProbeBurned { .. }
-            | TokenContractSettlementEvent::StreamDisputed { .. }
-            | TokenContractSettlementEvent::DisputeResolved { .. }
-            | TokenContractSettlementEvent::TickFinalized { .. }
-            | TokenContractSettlementEvent::TicksClaimed { .. } => continue,
-        };
-        if found.is_some() {
-            return Err(ChainError::Chain(
-                "TokenContract emitted more than one buyer STOP terminal event".to_string(),
-            ));
-        }
-        found = Some((to_seller, refund_to_buyer));
+    match exact_terminal_settlement(receipts)? {
+        Some(DealTerminalSettlement::StreamStopped {
+            to_seller,
+            refund_to_buyer,
+        }) => Ok(Some((to_seller, refund_to_buyer))),
+        Some(
+            DealTerminalSettlement::ProbeBurned { .. }
+            | DealTerminalSettlement::DisputeResolved { .. },
+        )
+        | None => Ok(None),
     }
-    Ok(found)
 }
 
 /// Recognise a deal that terminated on an unaccepted probe, from its immutable receipts alone.
@@ -6115,35 +6224,24 @@ fn exact_buyer_stop_settlement(
 /// `ProbeBurned` settles the deal and destroys the account, so the getters that describe every other
 /// terminal are already gone by the time anyone asks. The receipts are not: they outlive the account.
 
-/// This proves terminality and nothing else -- deliberately not who submitted the STOP, since a
-/// dispute timeout emits the same event (see [`exact_buyer_stop_settlement`], which skips `ProbeBurned`
-/// for exactly that reason). It is exact: a burned probe was never accepted, so no other lifecycle
-/// event can have been emitted by that contract, and any history that carries one is contradictory
-/// rather than terminal. Fail closed there instead of retiring a deal on ambiguous evidence.
+/// This proves terminality and nothing else -- deliberately not who submitted the STOP, since older
+/// dispute-timeout paths can emit the same event. The common selector validates the complete
+/// current lifecycle and refuses multiple or post-terminal events.
 fn exact_probe_burn_settlement(
     receipts: TokenContractSettlementReceipts,
 ) -> Result<Option<(u128, u128, u128)>, ChainError> {
-    let mut events = receipts.events.into_iter();
-    let Some(first) = events.next() else {
-        return Ok(None);
-    };
-    let TokenContractSettlementEvent::ProbeBurned {
-        burned_probe,
-        burned_bond,
-        refund_to_buyer,
-        ..
-    } = first.event
-    else {
-        return Ok(None);
-    };
-    if let Some(extra) = events.next() {
-        return Err(ChainError::Chain(format!(
-            "TokenContract emitted {:?} after ProbeBurned; a burned probe was never accepted, so \
-             this history is contradictory",
-            extra.event
-        )));
+    match exact_terminal_settlement(receipts)? {
+        Some(DealTerminalSettlement::ProbeBurned {
+            burned_probe,
+            burned_bond,
+            refund_to_buyer,
+        }) => Ok(Some((burned_probe, burned_bond, refund_to_buyer))),
+        Some(
+            DealTerminalSettlement::StreamStopped { .. }
+            | DealTerminalSettlement::DisputeResolved { .. },
+        )
+        | None => Ok(None),
     }
-    Ok(Some((burned_probe, burned_bond, refund_to_buyer)))
 }
 
 /// Read one market's deal into a monitor [`DealView`] from the **authoritative on-chain getters** (issue,
@@ -6604,15 +6702,67 @@ mod stop_settlement_tests {
         assert_eq!(stopped, (3, 4));
     }
 
-    /// the one terminal whose getters are already gone when anyone asks about it.
+    #[test]
+    fn issue_1948_buyer_stop_settlement_ignores_a_previous_address_lifecycle() {
+        let buyer = "0:buyer".to_string();
+        let receipt = |message_id: &str, event| TokenContractSettlementReceipt {
+            message_id: message_id.to_string(),
+            created_at: 7,
+            cursor: format!("cursor-{message_id}"),
+            event,
+        };
+        let mut receipts = TokenContractSettlementReceipts {
+            events: vec![
+                receipt(
+                    "old-deploy",
+                    TokenContractSettlementEvent::ContractDeployed {
+                        token_contract: "0:tc".to_string(),
+                    },
+                ),
+                receipt(
+                    "old-stop",
+                    TokenContractSettlementEvent::StreamStopped {
+                        buyer: buyer.clone(),
+                        to_seller: 3,
+                        refund_to_buyer: 4,
+                    },
+                ),
+                receipt(
+                    "old-destroy",
+                    TokenContractSettlementEvent::ContractDestroyed {
+                        token_contract: "0:tc".to_string(),
+                    },
+                ),
+                receipt(
+                    "current-deploy",
+                    TokenContractSettlementEvent::ContractDeployed {
+                        token_contract: "0:tc".to_string(),
+                    },
+                ),
+            ],
+        };
+        assert_eq!(exact_buyer_stop_settlement(receipts.clone()).unwrap(), None);
+
+        receipts.events.push(receipt(
+            "current-stop",
+            TokenContractSettlementEvent::StreamStopped {
+                buyer,
+                to_seller: 5,
+                refund_to_buyer: 6,
+            },
+        ));
+        assert_eq!(exact_buyer_stop_settlement(receipts).unwrap(), Some((5, 6)));
+    }
+
+    /// the synthetic one-event baseline remains accepted.
 
     /// `exact_buyer_stop_settlement` skips `ProbeBurned` on purpose -- a dispute timeout emits the
     /// same event, so it cannot attribute a buyer STOP. Terminality is a weaker claim than
     /// attribution and the receipt does prove it, which is what the seller needs to stop treating a
-    /// finished deal as an unexplained failure. It stays exact: a burned probe was never accepted,
-    /// so nothing else can have been emitted, and any other history is refused rather than retired.
+    /// finished deal as an unexplained failure. Post-terminal activity and duplicate terminals are
+    /// still refused rather than retired.
     #[test]
-    fn only_a_lone_probe_burned_receipt_proves_a_terminal_burned_probe() {
+    fn a_lone_probe_burned_receipt_proves_a_terminal_burned_probe() {
         let receipt = |event| TokenContractSettlementReceipt {
             message_id: "receipt".to_string(),
             created_at: 7,
@@ -6651,17 +6801,22 @@ mod stop_settlement_tests {
             None,
             "an accepted probe settles as StreamStopped and is not this terminal"
         );
+
+        let recycled = TokenContractSettlementReceipts {
+            events: vec![
+                receipt(probe_burned()),
+                receipt(TokenContractSettlementEvent::ContractDestroyed {
+                    token_contract: "0:tc".to_string(),
+                }),
+                receipt(TokenContractSettlementEvent::ContractDeployed {
+                    token_contract: "0:tc".to_string(),
+                }),
+            ],
+        };
         assert_eq!(
-            classify(vec![
-                TokenContractSettlementEvent::StreamDisputed {
-                    buyer: "0:buyer".to_string(),
-                    at: 1,
-                },
-                probe_burned(),
-            ])
-            .unwrap(),
+            exact_probe_burn_settlement(recycled).unwrap(),
             None,
-            "a dispute-timeout burn is not classified from the burn alone"
+            "a previous lifecycle's ProbeBurned is not the current deal's terminal"
         );
         for contradictory in [
             vec![probe_burned(), probe_burned()],
@@ -6686,6 +6841,159 @@ mod stop_settlement_tests {
                 "a history that contradicts a burned probe fails closed"
             );
         }
+    }
+
+    /// the immutable reader returns the complete current lifecycle, not a synthetic
+    /// one-event settlement. The production classifier must find the terminal inside that real
+    /// history while still carrying its exact amounts.
+    #[test]
+    fn issue_1923_real_probe_burn_lifecycle_proves_the_terminal() {
+        let receipt = |event| TokenContractSettlementReceipt {
+            message_id: "receipt".to_string(),
+            created_at: 7,
+            cursor: "cursor".to_string(),
+            event,
+        };
+        let token_contract = "0:tc".to_string();
+        let buyer = "0:buyer".to_string();
+        let receipts = TokenContractSettlementReceipts {
+            events: vec![
+                receipt(TokenContractSettlementEvent::ContractDeployed {
+                    token_contract: token_contract.clone(),
+                }),
+                receipt(TokenContractSettlementEvent::StreamFunded {
+                    buyer: buyer.clone(),
+                    deposit: 8_200_000_000,
+                }),
+                receipt(TokenContractSettlementEvent::BuyerBondFunded {
+                    amount: 4_000_000_000,
+                }),
+                receipt(TokenContractSettlementEvent::SellerBondFunded {
+                    amount: 4_000_000_000,
+                }),
+                receipt(TokenContractSettlementEvent::StreamOpened {
+                    buyer: buyer.clone(),
+                    price_per_tick: 4_000_000_000,
+                }),
+                receipt(TokenContractSettlementEvent::ProbeBurned {
+                    buyer,
+                    burned_probe: 4_000_000_000,
+                    burned_bond: 4_000_000_000,
+                    refund_to_buyer: 4_200_000_000,
+                }),
+                receipt(TokenContractSettlementEvent::ContractDestroyed { token_contract }),
+            ],
+        };
+
+        assert_eq!(
+            exact_probe_burn_settlement(receipts).unwrap(),
+            Some((4_000_000_000, 4_000_000_000, 4_200_000_000))
+        );
+
+        let disputed_lifecycle = TokenContractSettlementReceipts {
+            events: vec![
+                receipt(TokenContractSettlementEvent::ContractDeployed {
+                    token_contract: "0:disputed".to_string(),
+                }),
+                receipt(TokenContractSettlementEvent::StreamFunded {
+                    buyer: "0:buyer".to_string(),
+                    deposit: 8_200_000_000,
+                }),
+                receipt(TokenContractSettlementEvent::StreamOpened {
+                    buyer: "0:buyer".to_string(),
+                    price_per_tick: 4_000_000_000,
+                }),
+                receipt(TokenContractSettlementEvent::ProbeAccepted {
+                    buyer: "0:buyer".to_string(),
+                    to_seller: 4_000_000_000,
+                    bond_returned: 4_000_000_000,
+                }),
+                receipt(TokenContractSettlementEvent::StreamDisputed {
+                    buyer: "0:buyer".to_string(),
+                    at: 8,
+                }),
+                receipt(TokenContractSettlementEvent::ProbeBurned {
+                    buyer: "0:buyer".to_string(),
+                    burned_probe: 4_000_000_000,
+                    burned_bond: 4_000_000_000,
+                    refund_to_buyer: 4_200_000_000,
+                }),
+                receipt(TokenContractSettlementEvent::ContractDestroyed {
+                    token_contract: "0:disputed".to_string(),
+                }),
+            ],
+        };
+        assert_eq!(
+            exact_probe_burn_settlement(disputed_lifecycle).unwrap(),
+            Some((4_000_000_000, 4_000_000_000, 4_200_000_000)),
+            "a dispute transition before ProbeBurned changes attribution, not terminality"
+        );
+    }
+
+    #[test]
+    fn issue_1923_only_current_terminal_kinds_are_selected_from_their_lifecycle() {
+        let receipt = |event| TokenContractSettlementReceipt {
+            message_id: "receipt".to_string(),
+            created_at: 7,
+            cursor: "cursor".to_string(),
+            event,
+        };
+        let classify = |event| {
+            exact_terminal_settlement(TokenContractSettlementReceipts {
+                events: vec![
+                    receipt(TokenContractSettlementEvent::ContractDeployed {
+                        token_contract: "0:tc".to_string(),
+                    }),
+                    receipt(event),
+                    receipt(TokenContractSettlementEvent::ContractDestroyed {
+                        token_contract: "0:tc".to_string(),
+                    }),
+                ],
+            })
+            .unwrap()
+        };
+
+        assert_eq!(
+            classify(TokenContractSettlementEvent::StreamStopped {
+                buyer: "0:buyer".to_string(),
+                to_seller: 3,
+                refund_to_buyer: 4,
+            }),
+            Some(DealTerminalSettlement::StreamStopped {
+                to_seller: 3,
+                refund_to_buyer: 4,
+            })
+        );
+        assert_eq!(
+            classify(TokenContractSettlementEvent::DisputeResolved {
+                to_seller: 5,
+                refund_to_buyer: 6,
+                released: false,
+            }),
+            Some(DealTerminalSettlement::DisputeResolved {
+                to_seller: 5,
+                refund_to_buyer: 6,
+                released: false,
+            })
+        );
+        assert!(
+            exact_terminal_settlement(TokenContractSettlementReceipts {
+                events: vec![
+                    receipt(TokenContractSettlementEvent::ContractDeployed {
+                        token_contract: "0:tc".to_string(),
+                    }),
+                    receipt(TokenContractSettlementEvent::StreamReclaimed {
+                        buyer: "0:buyer".to_string(),
+                        refund_to_buyer: 7,
+                    }),
+                    receipt(TokenContractSettlementEvent::ContractDestroyed {
+                        token_contract: "0:tc".to_string(),
+                    }),
+                ],
+            })
+            .is_err(),
+            "the unused legacy StreamReclaimed ABI event must not prove a current terminal settlement"
+        );
     }
 
     fn valid_stop_state() -> Value {
@@ -8518,14 +8826,34 @@ impl ChainBackend for RealSellerBackend {
     /// not-yet-active (undeployed) TC is not "used" -- let the deploy path handle it.
     async fn assert_token_contract_fresh(&self, tc: &TokenContract) -> Result<(), ChainError> {
         let addr = parse_tc(tc)?;
-        let Some(state) = retry_seller_read("seller TokenContract freshness", || async {
+        let receipts = retry_seller_read("seller TokenContract immutable history", || async {
+            self.chain
+                .token_contract_settlement_receipts_if_present(&addr)
+                .await
+                .map_err(map_err)
+        })
+        .await?;
+        let state = retry_seller_read("seller TokenContract freshness", || async {
             self.chain
                 .token_contract_deal_state(&addr)
                 .await
                 .map_err(map_err)
         })
-        .await?
-        else {
+        .await?;
+        let Some(receipts) = receipts else {
+            return if state.is_none() {
+                Ok(())
+            } else {
+                Err(ChainError::Chain(format!(
+                    "deal TokenContract {} is active but its immutable GraphQL history is absent; \
+                     refusing before postSellOffer",
+                    display_token_contract(tc)
+                )))
+            };
+        };
+        check_token_contract_history_fresh_for_new_money(tc, &receipts, state.is_some())
+            .map_err(ChainError::Chain)?;
+        let Some(state) = state else {
             return Ok(());
         };
         if let Some(reason) = token_contract_used_reason(state) {
@@ -9174,6 +9502,19 @@ impl ChainBackend for RealSellerBackend {
         exact_probe_burn_settlement(receipts)
     }
 
+    async fn terminal_settlement(
+        &self,
+        token_contract: &TokenContract,
+    ) -> Result<Option<DealTerminalSettlement>, ChainError> {
+        let tc = parse_tc(token_contract)?;
+        let receipts = self
+            .chain
+            .token_contract_settlement_receipts(&tc)
+            .await
+            .map_err(map_err)?;
+        exact_terminal_settlement(receipts)
+    }
+
     async fn release_dispute(
         &self,
         token_contract: &TokenContract,
@@ -9427,11 +9768,27 @@ impl RealBuyerBackend {
         order_book: &str,
     ) -> Result<(), ChainError> {
         let tc = parse_tc(&token_contract.to_string())?;
+        let receipts = self
+            .chain
+            .token_contract_settlement_receipts(&tc)
+            .await
+            .map_err(map_err)?;
         let state = self
             .chain
             .token_contract_deal_state(&tc)
             .await
             .map_err(map_err)?;
+        check_token_contract_history_fresh_for_new_money(
+            token_contract,
+            &receipts,
+            state.is_some(),
+        )
+        .map_err(|e| {
+            ChainError::Chain(format!(
+                "buyer selected-TC preflight failed for InferenceOrderBook {}: {e}",
+                display_dexdo_address(order_book)
+            ))
+        })?;
         check_selected_token_contract_unused(token_contract, state).map_err(|e| {
             ChainError::Chain(format!(
                 "buyer selected-TC preflight failed for InferenceOrderBook {}: {e}",
@@ -10817,6 +11174,72 @@ mod codecell_tests {
             token_contract_used_reason(timestamp_only).as_deref(),
             Some("lastClaimTime=7"),
             "a residual authoritative timestamp is evidence that the per-deal TC was used"
+        );
+    }
+
+    #[test]
+    fn issue_1948_immutable_history_rejects_a_redeployed_token_contract_before_new_money() {
+        let event = |message_id: &str, event| TokenContractSettlementReceipt {
+            message_id: message_id.to_string(),
+            created_at: 1,
+            cursor: format!("cursor-{message_id}"),
+            event,
+        };
+        let deploy = || TokenContractSettlementEvent::ContractDeployed {
+            token_contract: "0:tc".to_string(),
+        };
+        let destroy = || TokenContractSettlementEvent::ContractDestroyed {
+            token_contract: "0:tc".to_string(),
+        };
+
+        let first_lifecycle = TokenContractSettlementReceipts {
+            events: vec![event("current-deploy", deploy())],
+        };
+        check_token_contract_history_fresh_for_new_money("0:tc", &first_lifecycle, true)
+            .expect("the first deployment is the one allowed lifecycle");
+        assert!(
+            check_token_contract_history_fresh_for_new_money("0:tc", &first_lifecycle, false)
+                .expect_err("destroyed first lifecycle must make its nonce used")
+                .contains("inactive but has immutable lifecycle history")
+        );
+
+        let redeployed = TokenContractSettlementReceipts {
+            events: vec![
+                event("old-deploy", deploy()),
+                event("old-destroy", destroy()),
+                event("current-deploy", deploy()),
+            ],
+        };
+        let error = check_token_contract_history_fresh_for_new_money("0:tc", &redeployed, true)
+            .expect_err("an address with a prior lifecycle must not receive new money");
+        assert!(error.contains("seller nonce was reused"), "{error}");
+        assert!(
+            error.contains("before any new offer or buyer escrow"),
+            "{error}"
+        );
+
+        let incomplete_old_history = TokenContractSettlementReceipts {
+            events: vec![event("old-destroy", destroy())],
+        };
+        assert!(check_token_contract_history_fresh_for_new_money(
+            "0:tc",
+            &incomplete_old_history,
+            false
+        )
+        .is_err());
+
+        let deployment_index_lag = TokenContractSettlementReceipts {
+            events: vec![
+                event("old-deploy", deploy()),
+                event("old-destroy", destroy()),
+            ],
+        };
+        let error =
+            check_token_contract_history_fresh_for_new_money("0:tc", &deployment_index_lag, true)
+                .expect_err("active state must not outrun a missing current deployment boundary");
+        assert!(
+            error.contains("latest indexed lifecycle is already destroyed"),
+            "{error}"
         );
     }
 

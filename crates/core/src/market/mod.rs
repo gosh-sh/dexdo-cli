@@ -571,6 +571,36 @@ pub trait ChainBackend: Send + Sync {
     ) -> Result<Option<(u128, u128, u128)>, ChainError> {
         Ok(None)
     }
+    /// Observe the deal's one immutable terminal settlement after its TokenContract getters have
+    /// disappeared. Real backends validate the complete current lifecycle in one read; the default
+    /// preserves existing mock backends that expose only the older STOP/burn-specific readers.
+    async fn terminal_settlement(
+        &self,
+        token_contract: &TokenContract,
+    ) -> Result<Option<DealTerminalSettlement>, ChainError> {
+        let stopped = self.buyer_stop_settlement(token_contract).await?;
+        let burned = self.probe_burned_settlement(token_contract).await?;
+        match (stopped, burned) {
+            (Some(_), Some(_)) => Err(ChainError::Chain(
+                "TokenContract exposes contradictory StreamStopped and ProbeBurned terminal receipts"
+                    .to_string(),
+            )),
+            (Some((to_seller, refund_to_buyer)), None) => {
+                Ok(Some(DealTerminalSettlement::StreamStopped {
+                    to_seller,
+                    refund_to_buyer,
+                }))
+            }
+            (None, Some((burned_probe, burned_bond, refund_to_buyer))) => {
+                Ok(Some(DealTerminalSettlement::ProbeBurned {
+                    burned_probe,
+                    burned_bond,
+                    refund_to_buyer,
+                }))
+            }
+            (None, None) => Ok(None),
+        }
+    }
     /// The seller abandons the deal (hardware died, model pulled). Pays by FACT on every deal shape --
     /// a seller who walks out mid-week stopped reserving capacity, so take-or-pay does not apply to him.
     /// He forfeits the pending tail exactly as the buyer would, so quitting never pays better than

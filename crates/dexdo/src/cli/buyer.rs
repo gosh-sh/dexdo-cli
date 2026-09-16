@@ -42,7 +42,7 @@ use dexdo_core::params::BUYER_SUBMIT_RECONCILE_POLL_INTERVAL;
 #[cfg(test)]
 use dexdo_core::params::EXECUTABLE_READ_BACKOFF;
 use dexdo_core::params::{
-    BUYER_API_READINESS_TIMEOUT, BUYER_HANDOVER_POLL_INTERVAL,
+    BUYER_API_READINESS_TIMEOUT, BUYER_HANDOVER_POLL_INTERVAL, BUYER_HANDOVER_PROGRESS_INTERVAL,
     BUYER_REPLAY_PROTECTION_BACKOFF_STEP_SECS, BUYER_REPLAY_PROTECTION_MAX_ATTEMPTS,
     CONSUMER_DEMAND_RECENT_SECS, DEAL_WAIT_SECS, RENEWAL_FAILURE_BACKOFF_SECS,
     RESUME_LOOKBACK_SECS, TRANSIENT_QUOTE_ATTEMPTS, TRANSIENT_QUOTE_INITIAL_BACKOFF,
@@ -5972,6 +5972,156 @@ fn matched_state_summary(
     }
 }
 
+/// Human progress for the contract-bounded interval between a funded match and its handover.
+
+/// The live progress label may refresh its chain countdown without restarting the checklist's
+/// elapsed clock. The initial durable line is deliberately written outside the width-limited
+/// spinner renderer: a full TokenContract is the argument that makes the suggested `dexdo status`
+/// command actionable in redirected output and narrow terminals.
+struct BuyerHandoverProgress {
+    human: bool,
+    display: Option<crate::cli::progress::ProgressHandle>,
+    live_step: Option<crate::cli::progress::TemporaryLiveStep>,
+    started: std::time::Instant,
+    last_reported: Option<std::time::Instant>,
+    interval: std::time::Duration,
+    deals_dir: Option<std::path::PathBuf>,
+    #[cfg(test)]
+    reported_lines: Vec<String>,
+    #[cfg(test)]
+    progress_labels: Vec<String>,
+}
+
+impl BuyerHandoverProgress {
+    fn new(
+        human: bool,
+        deals_dir: Option<&std::path::Path>,
+        display: Option<crate::cli::progress::ProgressHandle>,
+    ) -> Self {
+        Self {
+            human,
+            display,
+            live_step: None,
+            started: std::time::Instant::now(),
+            last_reported: None,
+            interval: BUYER_HANDOVER_PROGRESS_INTERVAL,
+            deals_dir: deals_dir.map(std::path::Path::to_path_buf),
+            #[cfg(test)]
+            reported_lines: Vec::new(),
+            #[cfg(test)]
+            progress_labels: Vec::new(),
+        }
+    }
+
+    #[cfg(test)]
+    fn for_test(human: bool, interval: std::time::Duration) -> Self {
+        let mut progress = Self::new(human, None, None);
+        progress.interval = interval;
+        progress
+    }
+
+    async fn report_if_due(
+        &mut self,
+        chain: &dyn ChainBackend,
+        token_contract: &dexdo_core::TokenContract,
+    ) {
+        if !self.human {
+            return;
+        }
+        let observed_at = std::time::Instant::now();
+        if self
+            .last_reported
+            .is_some_and(|last| observed_at.duration_since(last) < self.interval)
+        {
+            return;
+        }
+        let initial_report = self.last_reported.replace(observed_at).is_none();
+
+        let state = validate_reported_match_state(chain, token_contract).await;
+        let state_label = match &state {
+            Ok(MatchedTokenContractStatus::Opened) => "funded=true opened=true".to_string(),
+            Ok(MatchedTokenContractStatus::FundedNeverOpened { remaining_secs, .. }) => {
+                let reclaim_in = remaining_secs
+                    .map(|seconds| format!("{seconds}s"))
+                    .unwrap_or_else(|| "unknown".to_string());
+                format!("funded=true opened=false reclaim_in={reclaim_in}")
+            }
+            Err(error) => format!("chain state unavailable: {error}"),
+        };
+        let progress_label = format!("{}: {state_label}", BUYER_STEP_WAITING.0);
+        #[cfg(test)]
+        self.progress_labels.push(progress_label.clone());
+        let shown_live = match (&self.display, initial_report) {
+            (Some(display), true) => {
+                let live_step = display.temporary_live_step(progress_label);
+                let shown = live_step.is_some();
+                self.live_step = live_step;
+                shown
+            }
+            (Some(display), false) => match self.live_step.as_mut() {
+                Some(live_step) => live_step.refresh_live_step(progress_label),
+                None => display.refresh_live_step(progress_label),
+            },
+            (None, true) => crate::cli::progress::step_if_live(progress_label),
+            (None, false) => crate::cli::progress::refresh_live_step(progress_label),
+        };
+        let elapsed = self.started.elapsed().as_secs();
+        let report = if initial_report {
+            let state_record = match &state {
+                Ok(status) => matched_state_summary(token_contract, status),
+                Err(error) => format!("chain state unavailable: {error}"),
+            };
+            let token_contract = dexdo_core::address::display_self_dapp(token_contract);
+            let status_command =
+                crate::cli::commands::status_command(&token_contract, self.deals_dir.as_deref());
+            format!(
+                "buyer: waiting for a seller handover elapsed={elapsed}s; {state_record}; \
+                 inspect with `{status_command}`"
+            )
+        } else {
+            format!(
+                "buyer: still waiting for a seller handover elapsed={elapsed}s \
+                 {state_label}"
+            )
+        };
+
+        if initial_report || !shown_live {
+            #[cfg(test)]
+            self.reported_lines.push(report.clone());
+            let _hold = match &self.display {
+                Some(display) => display.hold(),
+                None => crate::cli::progress::hold(),
+            };
+            eprintln!("{report}");
+        }
+    }
+
+    #[cfg(test)]
+    fn reported_lines(&self) -> &[String] {
+        &self.reported_lines
+    }
+
+    #[cfg(test)]
+    fn progress_labels(&self) -> &[String] {
+        &self.progress_labels
+    }
+}
+
+/// Report one still-pending handover wait and delay until its next chain poll.
+async fn wait_for_seller_handover_poll(
+    chain: &dyn ChainBackend,
+    token_contract: &dexdo_core::TokenContract,
+    progress: &mut BuyerHandoverProgress,
+    error: &anyhow::Error,
+) {
+    progress.report_if_due(chain, token_contract).await;
+    tracing::debug!(
+        error = %error,
+        "buyer: no handover yet -- waiting for the seller's open_stream"
+    );
+    tokio::time::sleep(BUYER_HANDOVER_POLL_INTERVAL).await;
+}
+
 async fn handover_timeout_diagnostic(
     chain: &dyn ChainBackend,
     token_contract: &dexdo_core::TokenContract,
@@ -10131,6 +10281,7 @@ async fn prepare_lazy_buyer_api_deal_with_replay_backoff(
     buyer_policy: Option<policy::BuyerRuntimePolicy>,
     api_failure_policy: dexdo::buyer::api::BuyerApiFailurePolicy,
     events: SharedBuyerEvents,
+    progress_display: Option<crate::cli::progress::ProgressHandle>,
     raised_money: Option<BuyerQuoteSubmitOutcome>,
     chain_preflight: BuyerChainPreflight,
 ) -> std::result::Result<dexdo::buyer::api::ApiDeal, dexdo::buyer::api::DealInitError> {
@@ -10147,6 +10298,7 @@ async fn prepare_lazy_buyer_api_deal_with_replay_backoff(
             buyer_policy.clone(),
             api_failure_policy,
             events.clone(),
+            progress_display.clone(),
             raised_money.clone(),
             chain_preflight,
         )
@@ -10184,6 +10336,7 @@ async fn prepare_lazy_buyer_api_deal_once(
     buyer_policy: Option<policy::BuyerRuntimePolicy>,
     api_failure_policy: dexdo::buyer::api::BuyerApiFailurePolicy,
     events: SharedBuyerEvents,
+    progress_display: Option<crate::cli::progress::ProgressHandle>,
     raised_money: Option<BuyerQuoteSubmitOutcome>,
     chain_preflight: BuyerChainPreflight,
 ) -> Result<dexdo::buyer::api::ApiDeal> {
@@ -10650,6 +10803,11 @@ async fn prepare_lazy_buyer_api_deal_once(
             }),
         )
         .await?;
+        let mut wait_progress = BuyerHandoverProgress::new(
+            events.is_none(),
+            args.deals_dir.as_deref(),
+            progress_display.clone(),
+        );
         loop {
             match buyer
                 .resolve_endpoint(chain.as_ref(), &token_contract)
@@ -10717,7 +10875,13 @@ async fn prepare_lazy_buyer_api_deal_once(
                         }
                         return Err(e.context(diagnostic));
                     }
-                    tokio::time::sleep(BUYER_HANDOVER_POLL_INTERVAL).await;
+                    wait_for_seller_handover_poll(
+                        chain.as_ref(),
+                        &token_contract,
+                        &mut wait_progress,
+                        &e,
+                    )
+                    .await;
                 }
             }
         }
@@ -10845,6 +11009,7 @@ fn build_on_demand_buyer_api_state(
     buyer_policy: Option<policy::BuyerRuntimePolicy>,
     api_failure_policy: dexdo::buyer::api::BuyerApiFailurePolicy,
     events: SharedBuyerEvents,
+    progress_display: Option<crate::cli::progress::ProgressHandle>,
     raised_money: Option<BuyerQuoteSubmitOutcome>,
     chain_preflight: BuyerChainPreflight,
     pre_adopted_deal: Option<dexdo::buyer::api::ApiDeal>,
@@ -10872,6 +11037,7 @@ fn build_on_demand_buyer_api_state(
             let models_cfg = models_cfg.clone();
             let buyer_policy = buyer_policy.clone();
             let events = events.clone();
+            let progress_display = progress_display.clone();
             let raised_money = raised_money
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner())
@@ -10888,6 +11054,7 @@ fn build_on_demand_buyer_api_state(
                     buyer_policy,
                     api_failure_policy,
                     events,
+                    progress_display,
                     raised_money,
                     chain_preflight,
                 )
@@ -11088,6 +11255,7 @@ async fn run_buyer_on_demand_local_api(
     buyer_policy: Option<policy::BuyerRuntimePolicy>,
     api_failure_policy: dexdo::buyer::api::BuyerApiFailurePolicy,
     events: SharedBuyerEvents,
+    progress_display: Option<crate::cli::progress::ProgressHandle>,
     raised_money: Option<BuyerQuoteSubmitOutcome>,
     chain_preflight: BuyerChainPreflight,
     shutdown: BuyerShutdownSignal,
@@ -11118,6 +11286,7 @@ async fn run_buyer_on_demand_local_api(
                 buyer_policy.clone(),
                 api_failure_policy,
                 events.clone(),
+                None,
                 raised_money.clone(),
                 chain_preflight,
             )
@@ -11178,6 +11347,7 @@ async fn run_buyer_on_demand_local_api(
         buyer_policy,
         api_failure_policy,
         events.clone(),
+        progress_display,
         initializer_raised_money,
         chain_preflight,
         pre_adopted_deal,
@@ -11472,12 +11642,24 @@ async fn run_buyer_on_demand_local_api(
     Ok(())
 }
 
+fn render_allow_unverified_model_warning() -> String {
+    crate::cli::style::glyph_line(
+        crate::cli::style::Palette::stderr(),
+        crate::cli::style::WARN,
+        crate::cli::style::Role::Wait,
+        "model identity may be name-only: --allow-unverified-model permits this buyer to pay when no content check can verify the seller's model",
+    )
+}
+
 async fn run_buyer_inner(
     mut args: BuyerArgs,
     machine_events: &mut Option<machine::BuyerEventWriter>,
     machine_context: &mut BuyerMachineErrorContext,
     runtime: BuyerCommandRuntime,
 ) -> Result<()> {
+    if args.allow_unverified_model && !args.mock.mock_chain && machine_events.is_none() {
+        eprintln!("{}", render_allow_unverified_model_warning());
+    }
     let BuyerCommandRuntime {
         backend,
         chain_preflight,
@@ -11564,7 +11746,7 @@ async fn run_buyer_inner(
     // network to check and no seller to wait for, and its output is what several contracts read word
     // for word. A checklist there would announce work that does not happen -- so the layers belong to
     // the run that actually waits.
-    let _display = (!args.mock.mock_chain).then(|| {
+    let display = (!args.mock.mock_chain).then(|| {
         crate::cli::progress::Status::with_plan(
             BUYER_STEP_CHECKING.0,
             buyer_progress_plan(args.local_listen.is_some()),
@@ -11758,7 +11940,8 @@ async fn run_buyer_inner(
                 "mode": if args.resume { "resume" } else { "buy" },
                 "requested_bind_addr": args.local_listen.map(|a| a.to_string()),
                 "anthropic_compat": args.anthropic_compat,
-                "continuity_mode": args.continuity_mode.as_str()
+                "continuity_mode": args.continuity_mode.as_str(),
+                "allow_unverified_model": args.allow_unverified_model
             }),
         )?;
     }
@@ -11943,6 +12126,7 @@ async fn run_buyer_inner(
             buyer_policy,
             api_failure_policy,
             events,
+            display.as_ref().map(crate::cli::progress::Status::handle),
             raised_money,
             chain_preflight,
             shutdown,
@@ -12432,29 +12616,12 @@ async fn run_buyer_inner(
                         }),
                     )?;
                 } else {
-                    // A step, not a transcript. What an operator needs at this moment is one fact --
-                    // somebody took the buy and paid into a deal -- and the address of that deal is
-                    // 128 characters they neither read nor copy: the client carries it from here on
-                    // its own, and `dexdo status` prints it when it is asked to.
-
                     // The address and the seven-field standing (`fundedTime`, `cleanup_after`,
                     // `cleanup_ready`, `cleanup_wait_secs`...) are what a reconstruction needs, so
                     // they are recorded rather than dropped. Both used to be printed at the moment
                     // an operator was watching, where they answered no question anyone was asking.
-                    // The step that is now RUNNING, never the one that just finished: the checklist
-                    // advances by the label of what starts, and ticks what it passed on the way. It
-                    // was given the finished step's `done` text here, which matches no declared
-                    // step at all -- so the cursor never moved, `[3/4]` spun under a sentence in the
-                    // past tense for the rest of the run, and `[4/4]` was unreachable.
-
-                    // Where there is no endpoint to bring up -- a one-shot buy -- everything the plan
-                    // declared is behind, and the checklist finishes instead of pointing at a step
-                    // that does not exist.
-                    if args.local_listen.is_some() {
-                        crate::cli::progress::step(BUYER_STEP_ENDPOINT.0);
-                    } else {
-                        crate::cli::progress::complete();
-                    }
+                    // The next progress transition belongs to the first failed handover read below:
+                    // an immediately available handover is not a wait.
                     tracing::info!(
                         "matched deal TokenContract: {}",
                         dexdo_core::address::display_self_dapp(&outcome.token_contract)
@@ -12561,6 +12728,8 @@ async fn run_buyer_inner(
                 }),
             )?;
         }
+        let mut wait_progress =
+            BuyerHandoverProgress::new(machine_events.is_none(), args.deals_dir.as_deref(), None);
         loop {
             match buyer
                 .resolve_endpoint(chain.as_ref(), &token_contract)
@@ -12626,12 +12795,26 @@ async fn run_buyer_inner(
                         }
                         return Err(e.context(diagnostic));
                     }
-                    tracing::debug!(error = %e, "buyer: no handover yet -- waiting for the seller's open_stream");
-                    tokio::time::sleep(BUYER_HANDOVER_POLL_INTERVAL).await;
+                    wait_for_seller_handover_poll(
+                        chain.as_ref(),
+                        &token_contract,
+                        &mut wait_progress,
+                        &e,
+                    )
+                    .await;
                 }
             }
         }
     };
+    if machine_events.is_none() {
+        // A local endpoint begins only after the seller handover exists. For a one-shot buyer the
+        // wait was the final declared step, so receiving the handover completes its checklist.
+        if args.local_listen.is_some() {
+            crate::cli::progress::step(BUYER_STEP_ENDPOINT.0);
+        } else {
+            crate::cli::progress::complete();
+        }
+    }
     let mut deal_handle = deals::make_handle_id(&token_contract, deals::DealHandleRole::Buyer);
     if let Some(events) = machine_events.as_mut() {
         events.event(
@@ -15721,17 +15904,11 @@ mod tests {
         std::fs::create_dir(&dir).unwrap();
         let _cleanup = TempDirCleanup(dir.clone());
         let pool_path = dir.join("pn_pool.json");
-        let wallet = format!("0:{}", "c".repeat(64));
         let initial_state = state(0x1a, 'd');
         let initial_note = crate::cli::note::pn_state_to_pool_note(&initial_state).unwrap();
-        let initial_pool = crate::cli::note::pool_with_note_added(
-            None,
-            &initial_state,
-            initial_note,
-            1_000,
-            &wallet,
-        )
-        .unwrap();
+        let initial_pool =
+            crate::cli::note::pool_with_note_added(None, &initial_state, initial_note, 1_000)
+                .unwrap();
         crate::cli::support::write_owner_only_key_fixture(
             &pool_path,
             &serde_json::to_string(&initial_pool).unwrap(),
@@ -15746,18 +15923,12 @@ mod tests {
         let (first_read_tx, first_read_rx) = std::sync::mpsc::channel();
         let (release_first_tx, release_first_rx) = std::sync::mpsc::channel();
         let first_pool = first_alias;
-        let first_wallet = wallet.clone();
         let first = std::thread::spawn(move || {
             super::with_pool_write_lock(&first_pool, |first_pool| {
-                super::note_deploy_fold_state_into_pool_locked(
-                    first_pool,
-                    &first_state,
-                    &first_wallet,
-                    || {
-                        first_read_tx.send(()).unwrap();
-                        release_first_rx.recv().unwrap();
-                    },
-                )
+                super::note_deploy_fold_state_into_pool_locked(first_pool, &first_state, || {
+                    first_read_tx.send(()).unwrap();
+                    release_first_rx.recv().unwrap();
+                })
             })
             .unwrap();
         });
@@ -15768,7 +15939,7 @@ mod tests {
         let second_pool = second_alias;
         let second = std::thread::spawn(move || {
             second_started_tx.send(()).unwrap();
-            super::note_deploy_fold_state_into_pool(&second_pool, &second_state, &wallet).unwrap();
+            super::note_deploy_fold_state_into_pool(&second_pool, &second_state).unwrap();
             second_done_tx.send(()).unwrap();
         });
         second_started_rx.recv().unwrap();
@@ -16220,6 +16391,7 @@ mod tests {
         let secret = "2a".repeat(32);
         let pool_bytes = serde_json::to_vec_pretty(&serde_json::json!({
             "token_type": dexdo_core::params::SHELL_CURRENCY_ID,
+            "funding_multisig_address": format!("0:{}", "a".repeat(64)),
             "notes": [{
                 "address": note_addr,
                 "owner_secret_key_hex": secret,
@@ -16260,6 +16432,7 @@ mod tests {
         super::persist_pool_recovery_record(&record).unwrap();
 
         let original = super::load_pool_json(&original_pool).unwrap();
+        assert!(original.get("funding_multisig_address").is_none());
         assert_ne!(
             original["notes"][0]["token_contract_updated_at_unix"],
             serde_json::json!(99)
@@ -16877,6 +17050,9 @@ mod tests {
         reclaim_ambiguous_remaining: std::sync::atomic::AtomicUsize,
         reclaim_ambiguous_stays_open: std::sync::atomic::AtomicBool,
         reclaim_delay_ms: std::sync::atomic::AtomicU64,
+        handover_reads: std::sync::atomic::AtomicUsize,
+        handover: std::sync::Mutex<Option<Vec<u8>>>,
+        handover_thread: std::sync::Mutex<Option<std::thread::ThreadId>>,
     }
 
     impl RecordingRecoveryChain {
@@ -17054,7 +17230,10 @@ mod tests {
             &self,
             _token_contract: &dexdo_core::TokenContract,
         ) -> Result<Option<Vec<u8>>, dexdo_core::ChainError> {
-            unimplemented!("not needed by recovery monitor tests")
+            self.handover_reads
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            *self.handover_thread.lock().unwrap() = Some(std::thread::current().id());
+            Ok(self.handover.lock().unwrap().clone())
         }
 
         async fn stop(
@@ -17266,6 +17445,8 @@ mod tests {
             self.snapshot.clone()
         }
     }
+
+    include!("buyer/issue_1446_test.rs");
 
     #[test]
     fn confirmed_buyer_stop_terminal_record_names_the_submitted_stop() {
@@ -26189,6 +26370,7 @@ mod tests {
             dexdo::buyer::api::BuyerApiFailurePolicy::default(),
             None,
             None,
+            None,
             super::BuyerChainPreflight::OfflineTest,
             None,
             true,
@@ -29757,6 +29939,7 @@ mod tests {
             std::sync::Arc::new(dexdo::seller::ModelsConfig::empty()),
             None,
             dexdo::buyer::api::BuyerApiFailurePolicy::default(),
+            None,
             None,
             None,
             super::BuyerChainPreflight::Production,

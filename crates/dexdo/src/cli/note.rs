@@ -648,8 +648,12 @@ pub(crate) struct NoteDeployRecoveryState {
     pub nominal: String,
     pub token_type: u32,
     pub raw_value: u64,
-    #[serde(serialize_with = "dexdo_core::address::serde_self_dapp::serialize")]
-    pub funding_multisig_address: String,
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        serialize_with = "dexdo_core::address::serde_self_dapp_opt::serialize"
+    )]
+    pub funding_multisig_address: Option<String>,
     pub owner_public_key_hex: String,
     pub owner_secret_key_hex: Zeroizing<String>,
     #[serde(with = "dexdo_core::address::serde_canonical_opt")]
@@ -681,9 +685,9 @@ pub(crate) struct NoteDeployRecoveryRequest<'a> {
     pub funding_multisig_address: &'a str,
 }
 
-/// Normalize persisted funding provenance without inventing a DApp for legacy data. Canonical
-/// input retains both halves; account-only input remains account-only so old recovery/pool files
-/// stay honest about the identity information they actually contain.
+/// Normalize the funding identity persisted in an operation's recovery state without inventing a
+/// DApp for legacy data. Canonical input retains both halves; account-only input remains
+/// account-only so old recovery files stay honest about the identity information they contain.
 pub(crate) fn normalize_funding_multisig_identity(value: &str) -> Result<String> {
     let value = value.trim();
     let address = dexdo_core::CanonicalAddress::parse(value).map_err(|error| anyhow!("{error}"))?;
@@ -1101,23 +1105,24 @@ impl NoteDeployVoucherProof {
 }
 
 impl NoteDeployRecoveryState {
-    pub(crate) fn new(
-        request: NoteDeployRecoveryRequest<'_>,
+    pub(crate) fn new_unbound(
+        endpoint: &str,
+        nominal: &str,
+        token_type: u32,
+        raw_value: u64,
         owner_public_key_hex: &str,
         owner_secret_key_hex: &str,
     ) -> Result<Self> {
-        let funding_multisig_address =
-            normalize_funding_multisig_identity(request.funding_multisig_address)?;
         let owner_public_key_hex =
             normalize_owner_pubkey_hex(owner_public_key_hex, "owner_public_key_hex")?;
         let owner_secret_key_hex = normalize_secret_hex(owner_secret_key_hex)?;
         let state = Self {
             version: NOTE_DEPLOY_RECOVERY_VERSION,
-            endpoint: request.endpoint.to_string(),
-            nominal: request.nominal.to_string(),
-            token_type: request.token_type,
-            raw_value: request.raw_value,
-            funding_multisig_address,
+            endpoint: endpoint.to_string(),
+            nominal: nominal.to_string(),
+            token_type,
+            raw_value,
+            funding_multisig_address: None,
             owner_public_key_hex,
             owner_secret_key_hex: owner_secret_key_hex.into(),
             pn_address: None,
@@ -1128,6 +1133,24 @@ impl NoteDeployRecoveryState {
             sanity_checked: false,
         };
         state.validate()?;
+        Ok(state)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn new(
+        request: NoteDeployRecoveryRequest<'_>,
+        owner_public_key_hex: &str,
+        owner_secret_key_hex: &str,
+    ) -> Result<Self> {
+        let mut state = Self::new_unbound(
+            request.endpoint,
+            request.nominal,
+            request.token_type,
+            request.raw_value,
+            owner_public_key_hex,
+            owner_secret_key_hex,
+        )?;
+        state.bind_funding_multisig(request)?;
         Ok(state)
     }
 
@@ -1146,11 +1169,18 @@ impl NoteDeployRecoveryState {
             bail!("note deploy recovery file has empty nominal");
         }
         ensure_shell_currency_id(self.token_type, "note deploy recovery file")?;
-        let normalized_wallet = normalize_funding_multisig_identity(&self.funding_multisig_address)
-            .map_err(|e| anyhow!("note deploy recovery funding_multisig_address: {e}"))?;
-        if normalized_wallet != self.funding_multisig_address {
+        if let Some(funding_multisig_address) = &self.funding_multisig_address {
+            let normalized_wallet =
+                normalize_funding_multisig_identity(funding_multisig_address)
+                    .map_err(|e| anyhow!("note deploy recovery funding_multisig_address: {e}"))?;
+            if normalized_wallet != *funding_multisig_address {
+                bail!(
+                    "note deploy recovery funding_multisig_address must be normalized as {normalized_wallet}"
+                );
+            }
+        } else if !note_deploy_recovery_has_no_possible_spend(self) {
             bail!(
-                "note deploy recovery funding_multisig_address must be normalized as {normalized_wallet}"
+                "note deploy recovery has possible wallet-spend state but no funding_multisig_address"
             );
         }
         ensure_pool_note_keypair_matches(
@@ -1185,10 +1215,12 @@ impl NoteDeployRecoveryState {
             || self.nominal != request.nominal
             || self.token_type != request.token_type
             || self.raw_value != request.raw_value
-            || !funding_multisig_identities_match(
-                &self.funding_multisig_address,
-                &funding_multisig_address,
-            )
+            || !self
+                .funding_multisig_address
+                .as_deref()
+                .is_some_and(|recorded| {
+                    funding_multisig_identities_match(recorded, &funding_multisig_address)
+                })
         {
             bail!(
                 "note deploy recovery file does not match this deploy request. Refusing to mix recovery state \
@@ -1197,6 +1229,56 @@ impl NoteDeployRecoveryState {
             );
         }
         Ok(())
+    }
+
+    pub(crate) fn ensure_matches_unbound_request(
+        &self,
+        endpoint: &str,
+        nominal: &str,
+        token_type: u32,
+        raw_value: u64,
+    ) -> Result<()> {
+        if self.endpoint != endpoint
+            || self.nominal != nominal
+            || self.token_type != token_type
+            || self.raw_value != raw_value
+        {
+            bail!(
+                "note deploy recovery file does not match this deploy request. Refusing to mix recovery state \
+                 with a different endpoint/nominal/token-type; pass the matching --recovery file or deploy \
+                 into a fresh --pool/--recovery pair."
+            );
+        }
+        Ok(())
+    }
+
+    pub(crate) fn bind_funding_multisig(
+        &mut self,
+        request: NoteDeployRecoveryRequest<'_>,
+    ) -> Result<()> {
+        self.ensure_matches_unbound_request(
+            request.endpoint,
+            request.nominal,
+            request.token_type,
+            request.raw_value,
+        )?;
+        let funding_multisig_address =
+            normalize_funding_multisig_identity(request.funding_multisig_address)?;
+        if self
+            .funding_multisig_address
+            .as_deref()
+            .is_some_and(|recorded| {
+                !funding_multisig_identities_match(recorded, &funding_multisig_address)
+            })
+        {
+            bail!(
+                "note deploy recovery file does not match this deploy request. Refusing to mix recovery state \
+                 with a different wallet/endpoint/nominal/token-type; pass the matching --recovery file or \
+                 deploy into a fresh --pool/--recovery pair."
+            );
+        }
+        self.funding_multisig_address = Some(funding_multisig_address);
+        self.validate()
     }
 
     pub(crate) fn mark_private_note_deployed(
@@ -1440,10 +1522,14 @@ fn note_deploy_request_fields_match(
         && left.nominal == right.nominal
         && left.token_type == right.token_type
         && left.raw_value == right.raw_value
-        && funding_multisig_identities_match(
-            &left.funding_multisig_address,
-            &right.funding_multisig_address,
-        )
+        && match (
+            left.funding_multisig_address.as_deref(),
+            right.funding_multisig_address.as_deref(),
+        ) {
+            (Some(left), Some(right)) => funding_multisig_identities_match(left, right),
+            (None, _) => true,
+            (Some(_), None) => false,
+        }
 }
 
 pub(crate) fn note_deploy_recovery_has_no_possible_spend(state: &NoteDeployRecoveryState) -> bool {
@@ -1585,12 +1671,13 @@ pub(crate) fn recovery_owner_key_written_message(path: &Path) -> String {
     // `--pool <pool>` is a shell redirection rather than a value. The pool file is named by role,
     // not as a hardcoded `pn_pool.json`, since `--pool` is arbitrary.
     format!(
-        "note deploy recovery: owner key persisted to {} (0600) before wallet spend. If interrupted before \
-         recovery is finalized, re-run this same `dexdo note deploy` command unchanged -- same funding \
-         wallet, same `--nominal`, same `--pool`, and the same `--recovery` path if you passed one: it \
-         resumes from this file instead of spending again. If recovery is already finalized but the pool \
-         file was never written, finalize it with `dexdo note recover`, passing this file to `--recovery` \
-         and that pool path to `--pool`.",
+        "note deploy recovery: owner key persisted to {} (0600) before wallet spend or any note-deploy chain \
+         preflight. Before a note spend, this recovery is also bound to the exact funding wallet selected \
+         by the command. If interrupted before recovery is finalized, re-run this same `dexdo note deploy` \
+         command unchanged -- same wallet inputs, same `--nominal`, same `--pool`, and the same `--recovery` \
+         path if you passed one: it resumes from this file instead of spending again. If recovery is already \
+         finalized but the pool file was never written, finalize it with `dexdo note recover`, passing this \
+         file to `--recovery` and that pool path to `--pool`.",
         path.display()
     )
 }
@@ -1763,9 +1850,8 @@ impl From<dexdo_core::private_note::DeployPrivateNoteResult> for OnboardPnState 
 
 /// The one spelling a note address is RECORDED in: canonical `<dapp_id>::<account_id>`.
 
-/// The pool is a file the operator reads, and it was holding two conventions side by side -- a
-/// canonical `funding_multisig_address` next to notes spelled `0:<account_id>`, which names no DApp
-/// at all. Downstream that legacy spelling is what makes `note list` print `<account>::<account>`:
+/// The pool is a file the operator reads. A legacy note spelling is what makes `note list` print
+/// `<account>::<account>`:
 /// [`dexdo_core::address::display_self_dapp`] reconstructs a SELF-DApp identity for anything that
 /// arrives without one, and a `PrivateNote` is not a self-DApp account -- it lives in
 /// [`dexdo_core::DEXDO_DAPP_ID`] (`crates/core/src/address.rs`), which is how `dexdo history` prints
@@ -1833,24 +1919,8 @@ pub(crate) fn pool_with_note_added(
     s: &OnboardPnState,
     note: Value,
     created_at_unix: u64,
-    funding_multisig_address: &str,
 ) -> Result<Value> {
     ensure_shell_currency_id(s.token_type, "note deploy state")?;
-    let funding_multisig_address = normalize_funding_multisig_identity(funding_multisig_address)?;
-    // THE WALLET KEEPS THE FORM IT WAS GIVEN, and the note does not. That asymmetry is deliberate
-    // and an earlier revision of this change got it wrong by making both canonical.
-
-    // A note's DApp is knowable: `PrivateNote` lives in `DEXDO_DAPP_ID`, so writing it is recording
-    // a fact. A multisig is a self-DApp account, so its canonical form is `<account>::<account>` --
-    // which `display_self_dapp` RECONSTRUCTS from the account id rather than reads from anywhere.
-    // Storing that in a provenance field would record a claim this client never verified on chain.
-
-    // It also broke the identity comparison, which is what the field is for.
-    // `funding_multisig_identities_match` compares by account alone whenever either side carries no
-    // DApp; canonicalising on write removed that escape, so a pool created from `0:AAAA...` and a
-    // later note deployed with `<dapp_id>::AAAA...` -- the SAME wallet -- compared as two different
-    // multisigs and the run refused with "rewards provenance must not mix PrivateNotes funded by
-    // different multisigs".
     let mut pool = match existing {
         Some(p) => p,
         None => json!({
@@ -1859,10 +1929,14 @@ pub(crate) fn pool_with_note_added(
             "nominal": s.nominal,
             "token_type": s.token_type,
             "raw_value_per_pn": s.raw_value,
-            "funding_multisig_address": funding_multisig_address,
             "notes": [],
         }),
     };
+    // a pool is key material for notes, not a rewards-program provenance record. Old pools
+    // remain readable, and their obsolete root field is removed the next time this writer updates
+    // them. Which wallet funded a deploy stays in its recovery state, where it is required to
+    // resume that exact operation without charging another wallet.
+    remove_legacy_pool_funding_multisig(&mut pool);
     // Homogeneity: a pool is one nominal + token_type (the seller/buyer pick any note assuming uniform value).
     if pool["nominal"] != json!(s.nominal) || pool["token_type"] != json!(s.token_type) {
         bail!(
@@ -1873,37 +1947,6 @@ pub(crate) fn pool_with_note_added(
             s.nominal,
             s.token_type
         );
-    }
-    match pool.get("funding_multisig_address").and_then(Value::as_str) {
-        Some(existing) => {
-            let existing = normalize_funding_multisig_identity(existing).map_err(|e| {
-                anyhow!("--pool: malformed funding_multisig_address `{existing}`: {e}")
-            })?;
-            if !funding_multisig_identities_match(&existing, &funding_multisig_address) {
-                bail!(
-                    "pool funding_multisig_address {} != this note's {}: \
-                     rewards provenance must not mix PrivateNotes funded by different multisigs. Use a separate \
-                     --pool file for each funding multisig.",
-                    dexdo_core::address::display_self_dapp(&existing),
-                    dexdo_core::address::display_self_dapp(&funding_multisig_address)
-                );
-            }
-            pool["funding_multisig_address"] = json!(existing);
-        }
-        None => {
-            let has_existing_notes = pool["notes"]
-                .as_array()
-                .map(|notes| !notes.is_empty())
-                .unwrap_or(false);
-            if has_existing_notes {
-                bail!(
-                    "--pool has existing notes but no funding_multisig_address: refusing to attach new rewards \
-                     provenance to older notes of unknown origin. Create a fresh --pool or migrate the old pool \
-                     explicitly after verifying its funding multisig."
-                );
-            }
-            pool["funding_multisig_address"] = json!(funding_multisig_address);
-        }
     }
     let notes = pool["notes"]
         .as_array_mut()
@@ -2071,6 +2114,7 @@ pub(crate) fn pool_with_note_token_contract_recorded(
     role: &str,
     updated_at_unix: u64,
 ) -> Result<Value> {
+    remove_legacy_pool_funding_multisig(&mut pool);
     if role != "buyer" && role != "seller" {
         bail!("token_contract_role must be buyer or seller, got `{role}`");
     }
@@ -2133,6 +2177,14 @@ pub(crate) fn pool_with_note_token_contract_recorded(
             "DEXDO_PN_POOL has {matched} entries for note {}; refusing ambiguous TokenContract metadata",
             dexdo_core::address::display(&note_addr)
         ),
+    }
+}
+
+/// every writer that mutates a PN pool also migrates away the obsolete wallet-provenance
+/// root field. Readers remain tolerant so an old pool is usable before its next write.
+pub(crate) fn remove_legacy_pool_funding_multisig(pool: &mut Value) {
+    if let Some(object) = pool.as_object_mut() {
+        object.remove("funding_multisig_address");
     }
 }
 
@@ -2890,7 +2942,7 @@ mod note_deploy_tests {
             nominal: state.nominal,
             token_type: state.token_type,
             raw_value: state.raw_value,
-            funding_multisig_address: format!("0:{}", "a".repeat(64)),
+            funding_multisig_address: Some(format!("0:{}", "a".repeat(64))),
             owner_public_key_hex: state.owner_public_key_hex.unwrap(),
             owner_secret_key_hex: state.owner_secret_key_hex.unwrap(),
             pn_address: state.pn_address,
@@ -2902,14 +2954,8 @@ mod note_deploy_tests {
         }
     }
 
-    /// A pool file holding exactly the notes named, funded by `funding` -- a pool with notes and no
-    /// funding wallet is refused before anything about duplicates is decided, which is not what
-    /// these cases are about.
-    fn pool_file_with(
-        dir: &std::path::Path,
-        addresses: &[&str],
-        funding: &str,
-    ) -> std::path::PathBuf {
+    /// A pool file holding exactly the notes named.
+    fn pool_file_with(dir: &std::path::Path, addresses: &[&str]) -> std::path::PathBuf {
         let path = dir.join("pn_pool.json");
         // With the owner key the fixture recovery carries: a pool entry is only a safe second copy
         // when it holds the same secret, and that is what retiring checks.
@@ -2927,7 +2973,6 @@ mod note_deploy_tests {
             serde_json::to_vec(&json!({
                 "token_type": SHELL_CURRENCY_ID,
                 "nominal": "N100",
-                "funding_multisig_address": funding,
                 "notes": notes,
             }))
             .expect("serialize pool"),
@@ -2945,11 +2990,7 @@ mod note_deploy_tests {
         let temp = tempfile::tempdir().expect("temp dir");
         let recovery = complete_recovery_state();
         let deployed = recovery.pn_address.clone().expect("fixture deploys a note");
-        let pool = pool_file_with(
-            temp.path(),
-            &[&deployed],
-            &recovery.funding_multisig_address,
-        );
+        let pool = pool_file_with(temp.path(), &[&deployed]);
         let recovery_path = temp.path().join("pn_pool.json.recovery.json");
 
         crate::cli::support::write_owner_only_key_fixture(&recovery_path, "{}");
@@ -2975,7 +3016,6 @@ mod note_deploy_tests {
             serde_json::to_vec(&json!({
                 "token_type": SHELL_CURRENCY_ID,
                 "nominal": "N100",
-                "funding_multisig_address": recovery.funding_multisig_address,
                 "notes": [{ "address": deployed, "owner_secret_key_hex": "ff".repeat(32) }],
             }))
             .expect("serialize pool"),
@@ -2997,11 +3037,7 @@ mod note_deploy_tests {
     fn a_deploy_the_pool_never_recorded_is_still_resumable() {
         let temp = tempfile::tempdir().expect("temp dir");
         let recovery = complete_recovery_state();
-        let pool = pool_file_with(
-            temp.path(),
-            &[&format!("0:{}", "d".repeat(64))],
-            &recovery.funding_multisig_address,
-        );
+        let pool = pool_file_with(temp.path(), &[&format!("0:{}", "d".repeat(64))]);
 
         assert_eq!(
             retire_a_finished_deploy(&temp.path().join("r.json"), &recovery, &pool)
@@ -3017,7 +3053,7 @@ mod note_deploy_tests {
         let temp = tempfile::tempdir().expect("temp dir");
         let mut unfinished = complete_recovery_state();
         unfinished.pn_address = None;
-        let pool = pool_file_with(temp.path(), &[], &unfinished.funding_multisig_address);
+        let pool = pool_file_with(temp.path(), &[]);
         assert_eq!(
             retire_a_finished_deploy(&temp.path().join("r.json"), &unfinished, &pool)
                 .expect("an attempt with no note is what resuming is for"),
@@ -3049,8 +3085,6 @@ mod note_deploy_tests {
         let temp = tempfile::tempdir().expect("temp dir");
         let recovery = complete_recovery_state();
         let deployed = recovery.pn_address.clone().expect("fixture deploys a note");
-        let funding = recovery.funding_multisig_address.clone();
-
         for (index, recorded) in [
             deployed.clone(),
             deployed.to_ascii_uppercase(),
@@ -3061,7 +3095,7 @@ mod note_deploy_tests {
         {
             let dir = temp.path().join(format!("case-{index}"));
             std::fs::create_dir_all(&dir).expect("case dir");
-            let pool_path = pool_file_with(&dir, &[&recorded], &funding);
+            let pool_path = pool_file_with(&dir, &[&recorded]);
             let recovery_path = dir.join("r.json");
             crate::cli::support::write_owner_only_key_fixture(&recovery_path, "{}");
 
@@ -3079,7 +3113,6 @@ mod note_deploy_tests {
                 &complete_state(),
                 json!({ "address": deployed, "nominal": "N100" }),
                 42,
-                &funding,
             )
             .err()
             .is_some_and(|error| error.to_string().contains("already in the pool"));
@@ -3547,24 +3580,16 @@ mod note_deploy_tests {
     fn pool_create_then_append() {
         let s = complete_state();
         let n1 = pn_state_to_pool_note(&s).unwrap();
-        let wallet = format!("0:{}", "a".repeat(64));
-        let pool = pool_with_note_added(None, &s, n1, 42, &wallet).unwrap();
+        let pool = pool_with_note_added(None, &s, n1, 42).unwrap();
         assert_eq!(pool["nominal"], "N100");
         assert_eq!(pool["raw_value_per_pn"], 100_000_000_000u64);
-        // the WALLET keeps the form it was given, while the note is recorded canonically.
-        // A note's DApp is a fact (`PrivateNote` lives in the dexdo DApp); a multisig's self-DApp
-        // half is only reconstructed from its own account id, and storing that would record an
-        // unverified claim -- and would break the account-only identity comparison this field
-        // exists for.
-        assert_eq!(pool["funding_multisig_address"], wallet);
+        assert!(pool.get("funding_multisig_address").is_none());
         assert_eq!(pool["notes"].as_array().unwrap().len(), 1);
 
         let mut s2 = complete_state();
         s2.pn_address = Some("0:def".into());
         let n2 = pn_state_to_pool_note(&s2).unwrap();
-        let pool = pool_with_note_added(Some(pool), &s2, n2, 43, &wallet).unwrap();
-        // The append keeps what the pool already recorded -- it does not re-render it.
-        assert_eq!(pool["funding_multisig_address"], wallet);
+        let pool = pool_with_note_added(Some(pool), &s2, n2, 43).unwrap();
         assert_eq!(pool["notes"].as_array().unwrap().len(), 2);
     }
 
@@ -3574,9 +3599,9 @@ mod note_deploy_tests {
     fn pool_records_token_contract_next_to_note_entry() {
         let mut s = complete_state();
         s.pn_address = Some(format!("0:{}", "1".repeat(64)));
-        let wallet = format!("0:{}", "a".repeat(64));
-        let pool =
-            pool_with_note_added(None, &s, pn_state_to_pool_note(&s).unwrap(), 1, &wallet).unwrap();
+        let mut pool =
+            pool_with_note_added(None, &s, pn_state_to_pool_note(&s).unwrap(), 1).unwrap();
+        pool["funding_multisig_address"] = json!(format!("0:{}", "a".repeat(64)));
         let note_addr = s.pn_address.as_deref().unwrap();
         let tc = format!("0:{}", "b".repeat(64));
 
@@ -3595,6 +3620,7 @@ mod note_deploy_tests {
         );
         assert_eq!(note["token_contract_role"], "buyer");
         assert_eq!(note["token_contract_updated_at_unix"], 99);
+        assert!(pool.get("funding_multisig_address").is_none());
         let records = pool_note_recovery_records(&pool).unwrap();
         assert_eq!(records.len(), 1);
         // Destructured, not `assert_eq!`d: a new recorded field breaks this pattern exactly as it would
@@ -3622,9 +3648,7 @@ mod note_deploy_tests {
     fn pool_token_contract_record_requires_matching_note() {
         let mut s = complete_state();
         s.pn_address = Some(format!("0:{}", "1".repeat(64)));
-        let wallet = format!("0:{}", "a".repeat(64));
-        let pool =
-            pool_with_note_added(None, &s, pn_state_to_pool_note(&s).unwrap(), 1, &wallet).unwrap();
+        let pool = pool_with_note_added(None, &s, pn_state_to_pool_note(&s).unwrap(), 1).unwrap();
         let err = pool_with_note_token_contract_recorded(
             pool,
             &format!("0:{}", "c".repeat(64)),
@@ -3641,9 +3665,7 @@ mod note_deploy_tests {
     fn pool_note_entry_preflight_requires_unique_note() {
         let mut s = complete_state();
         s.pn_address = Some(format!("0:{}", "1".repeat(64)));
-        let wallet = format!("0:{}", "a".repeat(64));
-        let pool =
-            pool_with_note_added(None, &s, pn_state_to_pool_note(&s).unwrap(), 1, &wallet).unwrap();
+        let pool = pool_with_note_added(None, &s, pn_state_to_pool_note(&s).unwrap(), 1).unwrap();
         pool_has_unique_note_entry(&pool, s.pn_address.as_deref().unwrap()).unwrap();
         let err = pool_has_unique_note_entry(&pool, &format!("0:{}", "c".repeat(64)))
             .unwrap_err()
@@ -3655,84 +3677,44 @@ mod note_deploy_tests {
     #[test]
     fn pool_refuses_duplicate_and_mixed() {
         let s = complete_state();
-        let wallet = format!("0:{}", "a".repeat(64));
-        let pool =
-            pool_with_note_added(None, &s, pn_state_to_pool_note(&s).unwrap(), 1, &wallet).unwrap();
+        let pool = pool_with_note_added(None, &s, pn_state_to_pool_note(&s).unwrap(), 1).unwrap();
         // duplicate address
         let dup = pn_state_to_pool_note(&s).unwrap();
-        assert!(
-            pool_with_note_added(Some(pool.clone()), &s, dup, 2, &wallet)
-                .unwrap_err()
-                .to_string()
-                .contains("duplicate")
-        );
+        assert!(pool_with_note_added(Some(pool.clone()), &s, dup, 2)
+            .unwrap_err()
+            .to_string()
+            .contains("duplicate"));
         // mixed nominal
         let mut s2 = complete_state();
         s2.nominal = "N1000".into();
         s2.pn_address = Some("0:xyz".into());
         let n2 = pn_state_to_pool_note(&s2).unwrap();
-        assert!(pool_with_note_added(Some(pool), &s2, n2, 3, &wallet)
+        assert!(pool_with_note_added(Some(pool), &s2, n2, 3)
             .unwrap_err()
             .to_string()
             .contains("homogeneous pool"));
     }
 
-    /// rewards provenance is root-level and cannot silently mix funding multisigs or backfill legacy pools.
+    /// a pool contains note keys, not the rewards provenance of wallets that funded them.
     #[test]
-    fn pool_records_and_guards_funding_multisig_provenance() {
+    fn pool_has_no_funding_multisig_provenance_and_removes_the_legacy_field() {
         let s = complete_state();
-        let h1 = "1".repeat(64);
-        let h2 = "B".repeat(64);
-        let wallet_half_form = format!("{h1}::{h2}");
-        let wallet = format!("0:{}", h2.to_ascii_lowercase());
-        let other_wallet = format!("0:{}", "c".repeat(64));
-
-        let pool = pool_with_note_added(
-            None,
-            &s,
-            pn_state_to_pool_note(&s).unwrap(),
-            1,
-            &wallet_half_form,
-        )
-        .unwrap();
-        assert_eq!(
-            pool["funding_multisig_address"],
-            format!("{h1}::{}", h2.to_ascii_lowercase())
-        );
+        let pool = pool_with_note_added(None, &s, pn_state_to_pool_note(&s).unwrap(), 1).unwrap();
+        assert!(pool.get("funding_multisig_address").is_none());
 
         let mut s2 = complete_state();
         s2.pn_address = Some("0:def".into());
-        let err = pool_with_note_added(
-            Some(pool.clone()),
-            &s2,
-            pn_state_to_pool_note(&s2).unwrap(),
-            2,
-            &other_wallet,
-        )
-        .unwrap_err()
-        .to_string();
-        assert!(err.contains("funding_multisig_address"), "{err}");
-
         let mut legacy = pool;
-        legacy
-            .as_object_mut()
-            .unwrap()
-            .remove("funding_multisig_address");
-        let err = pool_with_note_added(
-            Some(legacy),
-            &s2,
-            pn_state_to_pool_note(&s2).unwrap(),
-            3,
-            &wallet,
-        )
-        .unwrap_err()
-        .to_string();
-        assert!(err.contains("unknown origin"), "{err}");
+        legacy["funding_multisig_address"] = json!(format!("0:{}", "a".repeat(64)));
+        let updated =
+            pool_with_note_added(Some(legacy), &s2, pn_state_to_pool_note(&s2).unwrap(), 2)
+                .expect("legacy funding provenance must not block another note");
+        assert!(updated.get("funding_multisig_address").is_none());
+        assert_eq!(updated["notes"].as_array().unwrap().len(), 2);
     }
 
-    /// a supplied DApp half is persisted, not collapsed into the account-only chain
-    /// parameter. Recovery and pool round-trips must therefore distinguish equal accounts that
-    /// belong to different DApps.
+    /// recovery persists the exact funding identity needed to resume, even though the
+    /// completed pool deliberately carries no funding provenance.
     #[test]
     fn canonical_funding_identities_with_equal_accounts_persist_and_recover_distinctly() {
         let temp = tempfile::tempdir().expect("temp dir");
@@ -3740,7 +3722,6 @@ mod note_deploy_tests {
         let owner_secret = fixture_secret_hex();
         let owner_public = derive_owner_pubkey_from_secret_hex(&owner_secret).expect("owner key");
         let mut recovered_identities = Vec::new();
-        let mut pool_identities = Vec::new();
 
         for (index, dapp) in ["a".repeat(64), "b".repeat(64)].into_iter().enumerate() {
             let supplied = format!(
@@ -3755,7 +3736,7 @@ mod note_deploy_tests {
                 &owner_secret,
             )
             .expect("canonical recovery state");
-            assert_eq!(state.funding_multisig_address, expected);
+            assert_eq!(state.funding_multisig_address, Some(expected.clone()));
 
             let recovery_path = temp.path().join(format!("canonical-{index}.recovery.json"));
             write_note_deploy_recovery(&recovery_path, &state).expect("persist recovery");
@@ -3767,29 +3748,11 @@ mod note_deploy_tests {
             let recovered = load_note_deploy_recovery(&recovery_path)
                 .expect("load recovery")
                 .expect("recovery exists");
-            assert_eq!(recovered.funding_multisig_address, expected);
+            assert_eq!(recovered.funding_multisig_address, Some(expected.clone()));
             recovered_identities.push(recovered.funding_multisig_address);
-
-            let state = complete_state();
-            let pool = pool_with_note_added(
-                None,
-                &state,
-                pn_state_to_pool_note(&state).expect("pool note"),
-                1,
-                &supplied,
-            )
-            .expect("persist pool identity");
-            assert_eq!(pool["funding_multisig_address"], expected);
-            pool_identities.push(
-                pool["funding_multisig_address"]
-                    .as_str()
-                    .expect("pool funding identity")
-                    .to_string(),
-            );
         }
 
         assert_ne!(recovered_identities[0], recovered_identities[1]);
-        assert_ne!(pool_identities[0], pool_identities[1]);
     }
 
     /// compatibility: this fixture is written by hand in the exact account-only shape used
@@ -3924,16 +3887,10 @@ mod note_deploy_tests {
         .expect("parse legacy pool");
         let onboard = recovery.to_onboard_state().expect("recover deploy state");
         let note = pn_state_to_pool_note(&onboard).expect("recover pool note");
-        let updated = pool_with_note_added(
-            Some(existing_pool),
-            &onboard,
-            note,
-            1235,
-            &recovery.funding_multisig_address,
-        )
-        .expect("legacy pool remains usable by the deploy fold");
+        let updated = pool_with_note_added(Some(existing_pool), &onboard, note, 1235)
+            .expect("legacy pool remains usable by the deploy fold");
 
-        assert_eq!(updated["funding_multisig_address"], legacy_funding);
+        assert!(updated.get("funding_multisig_address").is_none());
         assert_eq!(updated["notes"].as_array().expect("pool notes").len(), 2);
     }
 
@@ -3947,15 +3904,8 @@ mod note_deploy_tests {
         let mut state = complete_state();
         state.owner_public_key_hex = Some(derived.public_hex().to_string());
         state.owner_secret_key_hex = Some(derived.secret_hex().to_string().into());
-        let wallet = format!("0:{}", "a".repeat(64));
-        let pool = pool_with_note_added(
-            None,
-            &state,
-            pn_state_to_pool_note(&state).unwrap(),
-            1,
-            &wallet,
-        )
-        .unwrap();
+        let pool =
+            pool_with_note_added(None, &state, pn_state_to_pool_note(&state).unwrap(), 1).unwrap();
         let json = serde_json::to_string(&pool).unwrap();
         for word in phrase.split_whitespace() {
             assert!(!json.contains(word), "pool output contains a seed word");
@@ -3985,6 +3935,29 @@ mod note_deploy_tests {
             let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
             assert_eq!(mode, 0o600, "recovery file must be 0600");
         }
+    }
+
+    #[test]
+    fn unbound_recovery_cannot_carry_possible_wallet_spend() {
+        let (dir, _cleanup) = temp_dir("dexdo-unbound-note-recovery-test");
+        let path = dir.join("unbound.recovery.json");
+        let mut state = NoteDeployRecoveryState::new_unbound(
+            "https://net-a.example",
+            "N100",
+            SHELL_CURRENCY_ID,
+            100_000_000_000,
+            &derive_owner_pubkey_from_secret_hex(&fixture_secret_hex()).unwrap(),
+            &fixture_secret_hex(),
+        )
+        .unwrap();
+        state.shell_funded = true;
+
+        let error = write_note_deploy_recovery(&path, &state)
+            .expect_err("possible spend state must name its exact funding wallet")
+            .to_string();
+
+        assert!(error.contains("possible wallet-spend state"), "{error}");
+        assert!(!path.exists());
     }
 
     #[cfg(unix)]
@@ -4206,9 +4179,7 @@ mod note_deploy_tests {
         state.ensure_ready_for_pool().unwrap();
         let onboard = state.to_onboard_state().unwrap();
         let note = pn_state_to_pool_note(&onboard).unwrap();
-        let pool =
-            pool_with_note_added(None, &onboard, note, 1234, &state.funding_multisig_address)
-                .unwrap();
+        let pool = pool_with_note_added(None, &onboard, note, 1234).unwrap();
 
         assert_eq!(pool["notes"].as_array().unwrap().len(), 1);
         assert_eq!(pool["notes"][0]["address"], state.pn_address.unwrap());
@@ -4325,7 +4296,7 @@ mod note_deploy_tests {
         let err = state
             .ensure_matches_request(recovery_request(
                 "https://other-chain.example",
-                &state.funding_multisig_address,
+                state.funding_multisig_address.as_deref().unwrap(),
             ))
             .unwrap_err()
             .to_string();
@@ -4484,7 +4455,7 @@ mod note_deploy_tests {
                     nominal: &complete.nominal,
                     token_type: complete.token_type,
                     raw_value: complete.raw_value,
-                    funding_multisig_address: &complete.funding_multisig_address,
+                    funding_multisig_address: complete.funding_multisig_address.as_deref().unwrap(),
                 })
                 .expect_err("a mismatched request is refused")
                 .to_string(),
@@ -4660,8 +4631,8 @@ mod stage_one_native_is_flat_deploy_gas {
 /// incident (below) and it over-reached: what that incident actually cost was a write that
 /// re-rendered OTHER notes' addresses, plus a consumer that handed pool bytes to the SDK without
 /// normalising. keeps the first half of that rule and drops the second, because the pool is
-/// an artifact an operator reads and it was showing two conventions in one file -- a canonical
-/// `funding_multisig_address` beside notes spelled `0:<account_id>`, which names no DApp at all.
+/// an artifact an operator reads and it was recording notes as `0:<account_id>`, which names no
+/// DApp at all.
 
 /// What the incident is now handled by instead: [`crate::cli::note_pick::ask_which`] converts the
 /// picked address to the workchain form before any caller can reach `Address::parse`, which is what
@@ -4731,11 +4702,10 @@ mod pool_address_form_tests {
     fn fold_and_round_trip(
         existing: Option<serde_json::Value>,
         state: &OnboardPnState,
-        wallet: &str,
         path: &std::path::Path,
     ) -> serde_json::Value {
         let note = pn_state_to_pool_note(state).expect("pool note");
-        let pool = pool_with_note_added(existing, state, note, 1234, wallet).expect("fold");
+        let pool = pool_with_note_added(existing, state, note, 1234).expect("fold");
         let bytes = serde_json::to_string_pretty(&pool).expect("serialize pool");
         write_private_atomic(path, bytes.as_bytes()).expect("write pool");
         serde_json::from_slice(&std::fs::read(path).expect("read pool back")).expect("pool is json")
@@ -4785,7 +4755,7 @@ mod pool_address_form_tests {
             "notes": [{ "address": already_there, "owner_secret_key_hex": "00" }],
         });
 
-        let grown = fold_and_round_trip(Some(seeded), &state_for(&added, "3b"), &wallet, &path);
+        let grown = fold_and_round_trip(Some(seeded), &state_for(&added, "3b"), &path);
         assert_eq!(
             addresses(&grown)[0],
             already_there,
@@ -4797,10 +4767,9 @@ mod pool_address_form_tests {
             2,
             "the second note has to actually be in the file, or the check above compares nothing"
         );
-        assert_eq!(
-            grown["funding_multisig_address"].as_str().expect("wallet"),
-            wallet,
-            "the funding wallet identity keeps its stored form too"
+        assert!(
+            grown.get("funding_multisig_address").is_none(),
+            "an updated pool must drop obsolete rewards provenance"
         );
     }
 
@@ -4808,9 +4777,8 @@ mod pool_address_form_tests {
     /// state carries the legacy spelling.
 
     /// The legacy `0:<account_id>` is the form an ABI-encoded contract parameter takes, and the
-    /// only place it belongs. Storage is not that place: the pool held it beside a canonical
-    /// `funding_multisig_address`, so one file showed two conventions and the same note reached the
-    /// operator spelled three different ways across `note list`, `history` and this file.
+    /// only place it belongs. Storage is not that place: the same note reached the operator spelled
+    /// three different ways across `note list`, `history` and this file.
 
     /// The account half is unchanged -- this upgrades the identity the spelling failed to carry, it
     /// does not move the address.
@@ -4819,8 +4787,7 @@ mod pool_address_form_tests {
         let dir = tempfile::tempdir().expect("tempdir");
         let path = dir.path().join("pn_pool.json");
         let account = hex64("a1");
-        let stored =
-            fold_and_round_trip(None, &state_for(&legacy("a1"), "2a"), &legacy("b"), &path);
+        let stored = fold_and_round_trip(None, &state_for(&legacy("a1"), "2a"), &path);
 
         assert_eq!(
             addresses(&stored),
@@ -4836,17 +4803,12 @@ mod pool_address_form_tests {
     fn a_canonical_address_survives_a_write_byte_for_byte() {
         let dir = tempfile::tempdir().expect("tempdir");
         let path = dir.path().join("pn_pool.json");
-        let wallet = canonical("b", "b");
         let first = canonical("4", "a1");
         let second = canonical("4", "c3");
 
-        let seeded = fold_and_round_trip(None, &state_for(&first, "2a"), &wallet, &path);
-        let grown = fold_and_round_trip(Some(seeded), &state_for(&second, "3b"), &wallet, &path);
+        let seeded = fold_and_round_trip(None, &state_for(&first, "2a"), &path);
+        let grown = fold_and_round_trip(Some(seeded), &state_for(&second, "3b"), &path);
         assert_eq!(addresses(&grown), vec![first, second]);
-        assert_eq!(
-            grown["funding_multisig_address"].as_str().expect("wallet"),
-            wallet
-        );
     }
 
     /// The guard on the guard: these fixtures must be addresses the canonical renderer would

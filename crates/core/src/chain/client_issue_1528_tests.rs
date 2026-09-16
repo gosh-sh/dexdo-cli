@@ -42,7 +42,7 @@ async fn the_measured_skew_does_not_grow_with_the_number_of_retries() {
     let started = tokio::time::Instant::now();
     let attempts = Cell::new(0_u32);
 
-    let check = super::clock_skew_check_from_one_attempt(
+    let (local_unix, chain_unix) = super::clock_skew_sample_from_one_attempt(
         || async {
             attempts.set(attempts.get() + 1);
             if attempts.get() <= 2 {
@@ -56,6 +56,7 @@ async fn the_measured_skew_does_not_grow_with_the_number_of_retries() {
     )
     .await
     .expect("a transient read that eventually answers must not fail the preflight");
+    let check = super::clock_skew_check(local_unix, chain_unix);
 
     assert_eq!(attempts.get(), 3, "the fixture must actually have retried");
     let burned = started.elapsed().as_secs();
@@ -108,7 +109,7 @@ async fn the_chain_request_duration_is_not_measured_as_skew() {
     // than the timeout: a request slower than that ceiling is a different subject.
     let slow_request = 15;
 
-    let check = super::clock_skew_check_from_one_attempt(
+    let (local_unix, chain_unix) = super::clock_skew_sample_from_one_attempt(
         || async {
             tokio::time::sleep(std::time::Duration::from_secs(slow_request)).await;
             Ok(virtual_now(started))
@@ -117,6 +118,7 @@ async fn the_chain_request_duration_is_not_measured_as_skew() {
     )
     .await
     .expect("a slow but successful read is not a failure");
+    let check = super::clock_skew_check(local_unix, chain_unix);
 
     // Asserted on the measured value, not on the verdict: 15s is inside the permitted band, so a
     // status assertion would pass either way and hold nothing.
@@ -133,7 +135,7 @@ async fn a_first_attempt_answer_is_measured_exactly_as_before() {
     let started = tokio::time::Instant::now();
     let attempts = Cell::new(0_u32);
 
-    let check = super::clock_skew_check_from_one_attempt(
+    let (local_unix, chain_unix) = super::clock_skew_sample_from_one_attempt(
         || async {
             attempts.set(attempts.get() + 1);
             Ok(virtual_now(started))
@@ -142,6 +144,7 @@ async fn a_first_attempt_answer_is_measured_exactly_as_before() {
     )
     .await
     .expect("a clock read that answers at once cannot fail");
+    let check = super::clock_skew_check(local_unix, chain_unix);
 
     assert_eq!(attempts.get(), 1);
     assert_eq!(check.status, super::ChainDoctorStatus::Pass);
@@ -154,12 +157,13 @@ async fn a_genuinely_skewed_clock_is_still_refused() {
     let started = tokio::time::Instant::now();
     let behind = super::MAX_CLOCK_BEHIND_SECS + 5;
 
-    let check = super::clock_skew_check_from_one_attempt(
+    let (local_unix, chain_unix) = super::clock_skew_sample_from_one_attempt(
         || async { Ok(virtual_now(started) + behind) },
         || Ok(virtual_now(started)),
     )
     .await
     .expect("a verdict is a verdict, not a transport error");
+    let check = super::clock_skew_check(local_unix, chain_unix);
 
     assert_eq!(
         check.status,
