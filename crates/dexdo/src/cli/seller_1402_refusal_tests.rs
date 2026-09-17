@@ -51,6 +51,8 @@ fn refusal_seller_args(
         allow_unverified_model: false,
         models: root.join("unused-models.json"),
         policy: Some(policy),
+        recover_publication: None,
+        confirm_recover_publication: false,
     }
 }
 

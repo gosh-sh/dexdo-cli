@@ -166,6 +166,8 @@ fn issue_1056_seller_args(
         allow_unverified_model: false,
         models: root.join("unused-models.json"),
         policy: None,
+        recover_publication: None,
+        confirm_recover_publication: false,
     }
 }
 
