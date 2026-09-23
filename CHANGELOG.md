@@ -1,3 +1,17 @@
+## v0.5.0
+
+### New / Improvements
+
+- Added a guide for withdrawing all spendable PrivateNote funds to an explicitly selected wallet and collecting late ECC[2] refunds with `dexdo note sweep`.
+- The buyer's local endpoint now accepts text-only OpenAI Responses requests at `POST /v1/responses`, with JSON and streaming replies charged to the same purchased deal. Tool calls are not supported and are rejected explicitly; `/v1/chat/completions` remains available. The buyer `request_delivery` event labels the new route `openai_responses`.
+
+### Fixes
+
+- The buyer's `/v1/chat/completions` endpoint now rejects requests with non-empty `tools` before contacting the seller or charging the deal; tool calls are not supported by the text-only buyer API.
+- Added provider-native token usage to the local OpenAI-compatible API, including opt-in streaming usage, and made buyer request totals visible in human output and durable deal records so they remain readable after settlement destroys the TokenContract.
+- Fixed `dexdo note withdraw` sending funds toward an account that does not exist or has no deployed code. The command now verifies the exact canonical account in its named DApp and refuses before submission when the destination cannot receive the withdrawal.
+- `dexdo recover` now clears a note's stale deal record when its TokenContract no longer exists, waits for the note's 60-second touch interval, and confirms removal before reporting success. This may unblock `dexdo note withdraw` when no other locks remain; it does not restore escrow from the destroyed deal.
+
 ## v0.4.0
 
 ### Fixes

@@ -559,7 +559,8 @@ dexdo note withdraw --note-addr "$NOTE_ADDR" --to <DAPP-ID>::<ACCOUNT-ID>
 
 `note withdraw` still names its note -- it is one-shot and it will not choose which note to end --
 but not its key. Its canonical `--to` is required every time and is never inferred from the pool,
-the funding wallet or a previous command.
+the funding wallet or a previous command. That exact destination must already exist in the named
+DApp and contain deployed code, or the client refuses before submit.
 
 ---
 

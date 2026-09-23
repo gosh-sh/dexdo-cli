@@ -204,6 +204,9 @@ which would still spend the sender note's gas.
 
 ### Withdraw a finished note
 
+For a complete human and automation procedure, including before/after reconciliation and late
+refund handling, see [Withdraw PrivateNote funds to a wallet](withdraw-private-note-to-wallet.md).
+
 ```bash
 dexdo note withdraw \
   --note-addr <DAPP-ID>::<ACCOUNT-ID> \
@@ -213,7 +216,9 @@ dexdo note withdraw \
 `note withdraw` is owner-signed. A successful withdrawal is one-shot and
 irreversible: when all contract gates are clear, it drains both the trading
 record and the physical ECC[2] pocket to the canonical destination wallet. It
-does not withdraw the note's native vmshell. Outstanding orders, live deals,
+does not withdraw the note's native vmshell. The exact canonical destination
+must already exist in its named DApp and contain deployed code; otherwise the
+client refuses before submitting the withdrawal. Outstanding orders, live deals,
 pending operations, stakes, or debt must be cleared first; `note balance`
 reports the withdrawal gate it can read. If `RootPN` lacks the required
 liquidity, `PrivateNote.revertWithdraw` restores the trading balance and
@@ -289,4 +294,3 @@ another note you control. This CLI neither reuses nor withdraws an unsupported
 old-generation note: the `code_hash` safety check refuses withdrawal before any
 on-chain write because that operation could otherwise destroy the balance
 without crediting the destination.
-

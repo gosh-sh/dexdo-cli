@@ -205,9 +205,11 @@ async fn selected_fixture(
 async fn versionless_and_known_records_resume_with_identical_behavior_and_numbers() {
     let legacy = selected_fixture(None).await;
     let explicit_pre_versioning = selected_fixture(Some(0)).await;
+    let prior = selected_fixture(Some(deals::DEAL_HANDLE_VERSION - 1)).await;
     let current = selected_fixture(Some(deals::DEAL_HANDLE_VERSION)).await;
 
     assert_eq!(legacy, explicit_pre_versioning);
+    assert_eq!(legacy, prior);
     assert_eq!(legacy, current);
     assert_eq!(legacy.0.token_contract, token_contract());
     assert_eq!(

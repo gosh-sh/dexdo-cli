@@ -10042,6 +10042,116 @@ fn request_delivery_fields(delivery: &dexdo::buyer::api::RequestDelivery) -> Val
     })
 }
 
+fn persist_buyer_last_observed_usage(
+    deals_dir: Option<&std::path::Path>,
+    delivery: &dexdo::buyer::api::RequestDelivery,
+) -> Result<Option<deals::LastObservedUsage>> {
+    let (Some(input_tokens), Some(output_tokens), Some(total_tokens)) = (
+        delivery.input_tokens,
+        delivery.output_tokens,
+        delivery.billable_tokens,
+    ) else {
+        return Ok(None);
+    };
+    let dir = deals::resolve_deals_dir(deals_dir)?;
+    let Some((path, _handle)) = deals::resolve_deal_ref(
+        &delivery.token_contract,
+        &dir,
+        Some(deals::DealHandleRole::Buyer),
+        None,
+    )?
+    else {
+        return Ok(None);
+    };
+    deals::accumulate_last_observed_usage(&path, input_tokens, output_tokens, total_tokens)
+        .map(Some)
+}
+
+fn observe_request_delivery_usage(
+    deals_dir: Option<&std::path::Path>,
+    delivery: &dexdo::buyer::api::RequestDelivery,
+) -> Option<deals::LastObservedUsage> {
+    match persist_buyer_last_observed_usage(deals_dir, delivery) {
+        Ok(observation) => observation,
+        Err(error) => {
+            tracing::warn!(
+                token_contract = %delivery.token_contract,
+                %error,
+                "buyer could not persist accepted consumer request usage"
+            );
+            None
+        }
+    }
+}
+
+fn request_delivery_text(
+    delivery: &dexdo::buyer::api::RequestDelivery,
+    cumulative: Option<deals::LastObservedUsage>,
+) -> String {
+    let request = match (
+        delivery.input_tokens,
+        delivery.output_tokens,
+        delivery.billable_tokens,
+    ) {
+        (Some(input), Some(output), Some(total)) => {
+            format!("input_tokens={input} output_tokens={output} total_tokens={total}")
+        }
+        _ => "usage=unavailable".to_string(),
+    };
+    let session = match cumulative {
+        Some(usage) => format!(
+            "session_input_tokens={} session_output_tokens={} session_total_tokens={} \
+             session_tick_fraction={}/{}",
+            usage.input_tokens,
+            usage.output_tokens,
+            usage.total_tokens,
+            usage.total_tokens,
+            dexdo_core::TICK_SIZE,
+        ),
+        None => "session_usage=unavailable".to_string(),
+    };
+    format!(
+        "buyer request_delivery protocol={} streamed={} {request} {session} finish_reason={}",
+        delivery.protocol, delivery.streamed, delivery.finish_reason
+    )
+}
+
+async fn publish_shared_request_delivery(
+    events: &SharedBuyerEvents,
+    deals_dir: Option<&std::path::Path>,
+    delivery: &dexdo::buyer::api::RequestDelivery,
+) -> Result<()> {
+    let cumulative = observe_request_delivery_usage(deals_dir, delivery);
+    if events.is_none() {
+        println!("{}", request_delivery_text(delivery, cumulative));
+    }
+    emit_shared_buyer_event(
+        events,
+        REQUEST_DELIVERY_EVENT,
+        machine::OP_BUYER_RUNTIME,
+        request_delivery_fields(delivery),
+    )
+    .await
+}
+
+fn publish_request_delivery(
+    machine_events: &mut Option<machine::BuyerEventWriter>,
+    deals_dir: Option<&std::path::Path>,
+    delivery: &dexdo::buyer::api::RequestDelivery,
+) -> Result<()> {
+    let cumulative = observe_request_delivery_usage(deals_dir, delivery);
+    if let Some(events) = machine_events.as_mut() {
+        events.event(
+            REQUEST_DELIVERY_EVENT,
+            machine::OP_BUYER_RUNTIME,
+            request_delivery_fields(delivery),
+        )?;
+    } else {
+        println!("{}", request_delivery_text(delivery, cumulative));
+    }
+    Ok(())
+}
+
 /// The event name the delivery record is published under.
 const REQUEST_DELIVERY_EVENT: &str = "request_delivery";
 
@@ -11487,11 +11597,10 @@ async fn run_buyer_on_demand_local_api(
                 break joined.map_err(anyhow::Error::from);
             }
             Some(delivery) = deliveries.recv() => {
-                if let Err(error) = emit_shared_buyer_event(
+                if let Err(error) = publish_shared_request_delivery(
                     &events,
-                    REQUEST_DELIVERY_EVENT,
-                    machine::OP_BUYER_RUNTIME,
-                    request_delivery_fields(&delivery),
+                    args.deals_dir.as_deref(),
+                    &delivery,
                 )
                 .await {
                     break Err(error);
@@ -11511,13 +11620,7 @@ async fn run_buyer_on_demand_local_api(
     // Whatever landed between the last poll and the join. The endpoint holds the only sender, so
     // once it is gone this drains and stops.
     while let Ok(delivery) = deliveries.try_recv() {
-        emit_shared_buyer_event(
-            &events,
-            REQUEST_DELIVERY_EVENT,
-            machine::OP_BUYER_RUNTIME,
-            request_delivery_fields(&delivery),
-        )
-        .await?;
+        publish_shared_request_delivery(&events, args.deals_dir.as_deref(), &delivery).await?;
     }
 
     let active = deals.current().await;
@@ -13023,14 +13126,12 @@ async fn run_buyer_inner(
                     break joined.map_err(anyhow::Error::from);
                 }
                 Some(delivery) = deliveries.recv() => {
-                    if let Some(events) = machine_events.as_mut() {
-                        if let Err(error) = events.event(
-                            REQUEST_DELIVERY_EVENT,
-                            machine::OP_BUYER_RUNTIME,
-                            request_delivery_fields(&delivery),
-                        ) {
-                            break Err(error);
-                        }
+                    if let Err(error) = publish_request_delivery(
+                        machine_events,
+                        args.deals_dir.as_deref(),
+                        &delivery,
+                    ) {
+                        break Err(error);
                     }
                 }
                 Some(observation) = claim_observations.recv() => {
@@ -13045,13 +13146,7 @@ async fn run_buyer_inner(
             emit_buyer_claim_observation(machine_events, &observation);
         }
         while let Ok(delivery) = deliveries.try_recv() {
-            if let Some(events) = machine_events.as_mut() {
-                events.event(
-                    REQUEST_DELIVERY_EVENT,
-                    machine::OP_BUYER_RUNTIME,
-                    request_delivery_fields(&delivery),
-                )?;
-            }
+            publish_request_delivery(machine_events, args.deals_dir.as_deref(), &delivery)?;
         }
         if let Some(events) = machine_events.as_mut() {
             let shutdown_report = buyer_shutdown_report(Some(session.as_ref()));
@@ -13359,6 +13454,100 @@ mod tests {
     #[test]
     fn request_delivery_event_name_is_the_contract_name() {
         assert_eq!(super::REQUEST_DELIVERY_EVENT, "request_delivery");
+    }
+
+    #[test]
+    fn accepted_request_usage_is_durable_and_human_readable_below_one_tick() {
+        let dir = tempfile::tempdir().unwrap();
+        let token_contract = format!("0:{}", "b".repeat(64));
+        let note_addr = format!("0:{}", "a".repeat(64));
+        let handle = crate::cli::deals::DealHandle {
+            version: crate::cli::deals::DEAL_HANDLE_VERSION,
+            handle: crate::cli::deals::make_handle_id(
+                &token_contract,
+                crate::cli::deals::DealHandleRole::Buyer,
+            ),
+            role: crate::cli::deals::DealHandleRole::Buyer,
+            network: "network-x".to_string(),
+            token_contract: token_contract.clone(),
+            note_addr,
+            frame_model: "model-x".to_string(),
+            model_hash: Some(dexdo_core::model_hash_for("model-x")),
+            order_book: None,
+            root_model: None,
+            market: None,
+            contracts: "offline-contracts.json".to_string(),
+            endpoint: None,
+            created_order_ids: Vec::new(),
+            created_at_unix: 1_700_000_000,
+        };
+        crate::cli::deals::save_deal_handle(dir.path(), &handle).unwrap();
+        let delivery = dexdo::buyer::api::RequestDelivery {
+            token_contract,
+            protocol: "openai",
+            streamed: false,
+            billing_grant_tokens: 1_000_000,
+            output_limit_tokens: 256,
+            visible_output_tokens: 57,
+            rendered_tokens: 2,
+            route_delivered_tokens: Some(2),
+            input_tokens: Some(7),
+            output_tokens: Some(57),
+            billable_tokens: Some(64),
+            route_billable_tokens: Some(64),
+            finish_reason: "stop",
+            truncated_by_output_limit: false,
+            ended_before_output_limit: true,
+        };
+
+        let first = super::persist_buyer_last_observed_usage(Some(dir.path()), &delivery)
+            .unwrap()
+            .unwrap();
+        assert_eq!(first.total_tokens, 64);
+        let cumulative = super::persist_buyer_last_observed_usage(Some(dir.path()), &delivery)
+            .unwrap()
+            .unwrap();
+        assert_eq!(cumulative.input_tokens, 14);
+        assert_eq!(cumulative.output_tokens, 114);
+        assert_eq!(cumulative.total_tokens, 128);
+
+        assert_eq!(
+            super::request_delivery_text(&delivery, Some(cumulative)),
+            "buyer request_delivery protocol=openai streamed=false input_tokens=7 \
+             output_tokens=57 total_tokens=64 session_input_tokens=14 \
+             session_output_tokens=114 session_total_tokens=128 \
+             session_tick_fraction=128/1000000 finish_reason=stop"
+        );
+    }
+
+    #[test]
+    fn request_without_accepted_terminal_usage_is_not_persisted_as_zero() {
+        let delivery = dexdo::buyer::api::RequestDelivery {
+            token_contract: "0:3333".to_string(),
+            protocol: "openai",
+            streamed: true,
+            billing_grant_tokens: 1_000_000,
+            output_limit_tokens: 256,
+            visible_output_tokens: 1,
+            rendered_tokens: 1,
+            route_delivered_tokens: Some(1),
+            input_tokens: None,
+            output_tokens: None,
+            billable_tokens: None,
+            route_billable_tokens: Some(0),
+            finish_reason: "error",
+            truncated_by_output_limit: false,
+            ended_before_output_limit: true,
+        };
+
+        assert!(super::persist_buyer_last_observed_usage(None, &delivery)
+            .unwrap()
+            .is_none());
+        assert_eq!(
+            super::request_delivery_text(&delivery, None),
+            "buyer request_delivery protocol=openai streamed=true usage=unavailable \
+             session_usage=unavailable finish_reason=error"
+        );
     }
 
     fn ordinary_gateway_snapshot(

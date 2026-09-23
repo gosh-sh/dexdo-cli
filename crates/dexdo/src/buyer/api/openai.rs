@@ -14,7 +14,7 @@ use axum::response::sse::{Event, Sse};
 use axum::response::{IntoResponse, Response};
 use axum::Json;
 use dexdo_core::params::BUYER_UPSTREAM_OPEN_RETRIES;
-use dexdo_proto::{BillingUsage, CanonChunk};
+use dexdo_proto::{BillingUsage, CanonChunk, CanonRequest};
 use futures::Stream;
 use http::StatusCode;
 use std::convert::Infallible;
@@ -38,6 +38,81 @@ pub async fn chat_completions(
     State(state): State<ApiState>,
     Json(req): Json<OpenAiChatRequest>,
 ) -> Response {
+    if !req.tools.is_empty() {
+        return reject(
+            StatusCode::BAD_REQUEST,
+            "unsupported Chat Completions field: tools",
+        );
+    }
+    let model = req.model.clone();
+    let stream = req.stream;
+    let include_usage = req
+        .stream_options
+        .as_ref()
+        .is_some_and(|options| options.include_usage);
+    let max_tokens = req.max_tokens;
+    handle_text_request(
+        state,
+        ConsumerInput {
+            model,
+            stream,
+            include_usage,
+            max_tokens,
+            canon: render::openai_to_canon(req),
+            wire: WireFormat::Chat,
+        },
+    )
+    .await
+}
+
+/// Text-only Responses wire format on the same buyer deal and billing path.
+pub async fn responses(
+    State(state): State<ApiState>,
+    Json(body): Json<serde_json::Value>,
+) -> Response {
+    let req = match render::responses_text_request(body) {
+        Ok(req) => req,
+        Err(reason) => return reject(StatusCode::BAD_REQUEST, &reason),
+    };
+    handle_text_request(
+        state,
+        ConsumerInput {
+            model: req.model,
+            stream: req.stream,
+            include_usage: false,
+            max_tokens: req.max_output_tokens,
+            canon: req.canon,
+            wire: WireFormat::Responses,
+        },
+    )
+    .await
+}
+
+#[derive(Clone, Copy)]
+enum WireFormat {
+    Chat,
+    Responses,
+}
+
+impl WireFormat {
+    fn protocol(self) -> &'static str {
+        match self {
+            Self::Chat => "openai",
+            Self::Responses => "openai_responses",
+        }
+    }
+}
+
+struct ConsumerInput {
+    model: Option<String>,
+    stream: bool,
+    include_usage: bool,
+    max_tokens: Option<u32>,
+    canon: CanonRequest,
+    wire: WireFormat,
+}
+
+async fn handle_text_request(state: ApiState, req: ConsumerInput) -> Response {
     // The model is forced by the market (B2/B19): a request outside the frame -- reject BEFORE opening the stream.
     if let Err(reason) = state.check_model(req.model.as_deref()) {
         return reject(StatusCode::BAD_REQUEST, &reason);
@@ -57,6 +132,7 @@ pub async fn chat_completions(
         Err(reason) => return reject(StatusCode::BAD_GATEWAY, &reason),
     };
     let stream = req.stream;
+    let include_usage = req.include_usage;
     let requested_max_tokens = req.max_tokens;
     // admission reserves the route's entire free billable remainder before the model is
     // contacted, so two concurrent requests can never share an unknown provider-native input bill. For a
@@ -99,13 +175,16 @@ pub async fn chat_completions(
              request was not sent and the next one starts from a verified deal",
         );
     }
-    let mut canon = render::openai_to_canon(req);
+    let mut canon = req.canon;
     // the grant may still hold what verification did not spend. The answer is bounded by what
     // was actually asked for, on the wire and on the way back alike.
     let max_tokens = cap_canon_to_grant(&mut canon, billing_grant_tokens);
-    let id = completion_id();
-    let model = state.frame_model.clone();
     let created = now_secs();
+    let id = match req.wire {
+        WireFormat::Chat => completion_id(),
+        WireFormat::Responses => responses_id(created),
+    };
+    let model = state.frame_model.clone();
     let reclaim_heartbeat = deal.accepted_output_guard();
     request_guard.arm_upstream_failure();
 
@@ -200,6 +279,8 @@ pub async fn chat_completions(
             deal,
             request_guard,
             delivery_events,
+            include_usage,
+            req.wire,
         )
         .into_response()
     } else {
@@ -214,6 +295,7 @@ pub async fn chat_completions(
             deal,
             request_guard,
             delivery_events,
+            req.wire,
         )
         .await
         .into_response()
@@ -236,6 +318,8 @@ fn sse_response(
     deal: ApiDeal,
     mut request_guard: ConsumerRequestGuard,
     delivery_events: Option<DeliveryEvents>,
+    include_usage: bool,
+    wire: WireFormat,
 ) -> Sse<impl Stream<Item = Result<Event, Infallible>>> {
     let sse = async_stream::stream! {
         let mut driver = CanonStreamDriver::new(
@@ -250,6 +334,26 @@ fn sse_response(
         let mut capped = false;
         let mut stream_error = None;
         let mut billing_usage: Option<BillingUsage> = None;
+        let mut content = String::new();
+        let message_id = format!("msg_{id}");
+        if matches!(wire, WireFormat::Responses) {
+            yield Ok(responses_event("response.created", serde_json::json!({
+                "response": {"id": id, "object": "response", "created_at": created,
+                    "status": "in_progress", "model": model, "output": [], "usage": null}
+            })));
+            yield Ok(responses_event("response.in_progress", serde_json::json!({
+                "response": {"id": id, "object": "response", "created_at": created,
+                    "status": "in_progress", "model": model, "output": [], "usage": null}
+            })));
+            yield Ok(responses_event("response.output_item.added", serde_json::json!({
+                "output_index": 0, "item": {"id": message_id, "type": "message",
+                    "status": "in_progress", "role": "assistant", "content": []}
+            })));
+            yield Ok(responses_event("response.content_part.added", serde_json::json!({
+                "item_id": message_id, "output_index": 0, "content_index": 0,
+                "part": {"type": "output_text", "text": "", "annotations": []}
+            })));
+        }
         loop {
             let chunk = match driver.next().await {
                 CanonStreamNext::Chunk(c) => c,
@@ -281,7 +385,24 @@ fn sse_response(
             driver.account_rendered(&chunk);
             debug_assert!(driver.received() >= before);
             if !chunk.text.is_empty() {
-                yield Ok(openai_content_event(&deal, &id, &model, created, &chunk.text, first));
+                if matches!(wire, WireFormat::Responses) {
+                    deal.record_accepted_output(now_secs());
+                    content.push_str(&chunk.text);
+                    yield Ok(responses_event("response.output_text.delta", serde_json::json!({
+                        "item_id": message_id, "output_index": 0, "content_index": 0,
+                        "delta": chunk.text
+                    })));
+                } else {
+                    yield Ok(openai_content_event(
+                        &deal,
+                        &id,
+                        &model,
+                        created,
+                        &chunk.text,
+                        first,
+                        include_usage,
+                    ));
+                }
                 first = false;
             }
         }
@@ -349,7 +470,7 @@ fn sse_response(
             delivery_events.as_ref(),
             RequestDelivery {
                 token_contract: deal.route.token_contract.clone(),
-                protocol: "openai",
+                protocol: wire.protocol(),
                 streamed: true,
                 billing_grant_tokens,
                 output_limit_tokens: max_tokens,
@@ -365,10 +486,42 @@ fn sse_response(
                 ended_before_output_limit: received < max_tokens,
             },
         );
-        yield Ok(Event::default().data(render::openai_final_chunk(&id, &model, created, finish_reason)));
+        if matches!(wire, WireFormat::Responses) {
+            yield Ok(responses_event("response.output_text.done", serde_json::json!({
+                "item_id": message_id, "output_index": 0, "content_index": 0, "text": content
+            })));
+            yield Ok(responses_event("response.content_part.done", serde_json::json!({
+                "item_id": message_id, "output_index": 0, "content_index": 0,
+                "part": {"type": "output_text", "text": content, "annotations": []}
+            })));
+            let response = render::responses_response(&id, &model, created, &content, finish_reason, accepted_usage);
+            yield Ok(responses_event("response.output_item.done", serde_json::json!({
+                "output_index": 0, "item": response["output"][0].clone()
+            })));
+            let terminal = match response["status"].as_str() {
+                Some("completed") => "response.completed",
+                Some("incomplete") => "response.incomplete",
+                _ => "response.failed",
+            };
+            yield Ok(responses_event(terminal, serde_json::json!({"response": response})));
+        } else {
+            yield Ok(Event::default().data(render::openai_final_chunk(
+                &id, &model, created, finish_reason, include_usage,
+            )));
+            if include_usage {
+                if let Some(usage) = accepted_usage {
+                    yield Ok(Event::default().data(render::openai_usage_chunk(&id, &model, created, usage)));
+                }
+            }
+        }
         yield Ok(Event::default().data("[DONE]"));
     };
     Sse::new(sse)
+}
+
+fn responses_event(kind: &'static str, mut body: serde_json::Value) -> Event {
+    body["type"] = serde_json::Value::String(kind.into());
+    Event::default().event(kind).data(body.to_string())
 }
 
 fn openai_content_event(
@@ -378,15 +531,23 @@ fn openai_content_event(
     created: u64,
     text: &str,
     first: bool,
+    include_usage: bool,
 ) -> Event {
     deal.record_accepted_output(now_secs());
-    Event::default().data(render::openai_delta_chunk(id, model, created, text, first))
+    Event::default().data(render::openai_delta_chunk(
+        id,
+        model,
+        created,
+        text,
+        first,
+        include_usage,
+    ))
 }
 
 #[cfg(test)]
 pub(super) fn heartbeat_poll_test_stream(deal: ApiDeal) -> impl Stream<Item = Event> {
     async_stream::stream! {
-        yield openai_content_event(&deal, "id", "model", 1, "content", true);
+        yield openai_content_event(&deal, "id", "model", 1, "content", true, false);
     }
 }
 
@@ -403,6 +564,7 @@ async fn aggregate_response(
     deal: ApiDeal,
     mut request_guard: ConsumerRequestGuard,
     delivery_events: Option<DeliveryEvents>,
+    wire: WireFormat,
 ) -> Response {
     let mut content = String::new();
     let mut capped = false;
@@ -475,7 +637,7 @@ async fn aggregate_response(
             delivery_events.as_ref(),
             RequestDelivery {
                 token_contract: deal.route.token_contract.clone(),
-                protocol: "openai",
+                protocol: wire.protocol(),
                 streamed: false,
                 billing_grant_tokens,
                 output_limit_tokens: max_tokens,
@@ -498,7 +660,25 @@ async fn aggregate_response(
         if e.is_capacity() {
             request_guard.complete();
             report("capacity");
-            let body = render::openai_completion(&id, &model, created, &content, "capacity");
+            let body = match wire {
+                WireFormat::Chat => render::openai_completion(
+                    &id,
+                    &model,
+                    created,
+                    &content,
+                    "capacity",
+                    accepted_usage,
+                ),
+                WireFormat::Responses => render::responses_response(
+                    &id,
+                    &model,
+                    created,
+                    &content,
+                    "capacity",
+                    accepted_usage,
+                )
+                .to_string(),
+            };
             return ([(http::header::CONTENT_TYPE, "application/json")], body).into_response();
         }
         if handle_stream_error_policy(&deal, received, e.policy_message()).await
@@ -531,7 +711,25 @@ async fn aggregate_response(
         "stop"
     };
     report(finish_reason);
-    let body = render::openai_completion(&id, &model, created, &content, finish_reason);
+    let body = match wire {
+        WireFormat::Chat => render::openai_completion(
+            &id,
+            &model,
+            created,
+            &content,
+            finish_reason,
+            accepted_usage,
+        ),
+        WireFormat::Responses => render::responses_response(
+            &id,
+            &model,
+            created,
+            &content,
+            finish_reason,
+            accepted_usage,
+        )
+        .to_string(),
+    };
     ([(http::header::CONTENT_TYPE, "application/json")], body).into_response()
 }
 
@@ -573,6 +771,10 @@ fn completion_id() -> String {
     format!("chatcmpl-dexdo-{}", now_secs())
 }
 
+fn responses_id(created: u64) -> String {
+    format!("resp-dexdo-{created}-{:032x}", rand::random::<u128>())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -589,5 +791,13 @@ mod tests {
             deal_init_error_status("on-demand purchase timed out before a deal became ready"),
             StatusCode::SERVICE_UNAVAILABLE
         );
+    }
+
+    #[test]
+    fn responses_created_in_the_same_second_have_distinct_response_and_message_ids() {
+        let first = responses_id(42);
+        let second = responses_id(42);
+        assert_ne!(first, second);
+        assert_ne!(format!("msg_{first}"), format!("msg_{second}"));
     }
 }

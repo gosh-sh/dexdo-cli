@@ -327,6 +327,8 @@ Know these before you type them:
 - **`dexdo destroy`** selfdestructs a stopped deal's contract. The unrecovered remainder is gone.
 - **`dexdo note withdraw`** is one-shot and irreversible; its canonical
   `--to <DAPP-ID>::<ACCOUNT-ID>` is always explicit and is never inferred from the pool or funding wallet.
+  The exact destination must already exist in that DApp and contain deployed code, or the client
+  refuses before submit.
 - **the first funding leg** converts SHELL into native gas permanently.
 - **a spent `--nonce`** cannot be reused; the deal address is derived from it.
 

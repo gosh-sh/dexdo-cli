@@ -9,9 +9,10 @@ use std::path::{Path, PathBuf};
 
 /// Durable deal-record schema written by this runtime. An absent field is the understood
 /// pre-versioning schema 0; this value changes only when the record meaning changes.
-pub(crate) const DEAL_HANDLE_VERSION: u32 = 2;
+pub(crate) const DEAL_HANDLE_VERSION: u32 = 3;
 
 const LAST_OBSERVED_PROMOTION_FIELD: &str = "last_observed_promotion";
+const LAST_OBSERVED_USAGE_FIELD: &str = "last_observed_usage";
 
 #[derive(Debug, Deserialize)]
 struct DealHandleVersionProbe {
@@ -117,6 +118,53 @@ pub(crate) struct LastObservedPromotion {
     pub(crate) last_claim_time: u64,
 }
 
+/// Cumulative provider-native usage accepted for this buyer's completed consumer API requests.
+
+/// Internal model-verification traffic is deliberately not folded into this user-facing total.
+/// The values advance only from the same terminal usage records returned by the local API.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct LastObservedUsage {
+    #[serde(with = "decimal_u64")]
+    pub(crate) input_tokens: u64,
+    #[serde(with = "decimal_u64")]
+    pub(crate) output_tokens: u64,
+    #[serde(with = "decimal_u64")]
+    pub(crate) total_tokens: u64,
+}
+
+impl LastObservedUsage {
+    fn checked_after(
+        self,
+        input_tokens: u64,
+        output_tokens: u64,
+        total_tokens: u64,
+    ) -> Result<Self> {
+        let checked_total = input_tokens.checked_add(output_tokens).ok_or_else(|| {
+            anyhow::anyhow!("provider-native request usage input + output overflows u64")
+        })?;
+        if checked_total != total_tokens {
+            bail!(
+                "provider-native request usage total {total_tokens} != input {input_tokens} + output {output_tokens}"
+            );
+        }
+        Ok(Self {
+            input_tokens: self.input_tokens.checked_add(input_tokens).ok_or_else(|| {
+                anyhow::anyhow!("cumulative provider-native input usage overflows u64")
+            })?,
+            output_tokens: self
+                .output_tokens
+                .checked_add(output_tokens)
+                .ok_or_else(|| {
+                    anyhow::anyhow!("cumulative provider-native output usage overflows u64")
+                })?,
+            total_tokens: self.total_tokens.checked_add(total_tokens).ok_or_else(|| {
+                anyhow::anyhow!("cumulative provider-native total usage overflows u64")
+            })?,
+        })
+    }
+}
+
 impl From<DealChainState> for LastObservedPromotion {
     fn from(state: DealChainState) -> Self {
         Self {
@@ -131,6 +179,7 @@ impl From<DealChainState> for LastObservedPromotion {
 pub(crate) struct DealRecord {
     pub(crate) handle: DealHandle,
     pub(crate) last_observed_promotion: Option<LastObservedPromotion>,
+    pub(crate) last_observed_usage: Option<LastObservedUsage>,
 }
 
 // `Placed`/`FundedButNeverOpened`/`Disputed` are produced only by the chain-state summariser.
@@ -295,17 +344,20 @@ pub(crate) fn save_deal_handle(dir: &Path, handle: &DealHandle) -> Result<PathBu
     std::fs::create_dir_all(dir)
         .map_err(|e| anyhow::anyhow!("create deals dir {}: {e}", dir.display()))?;
     let path = handle_path(dir, &handle.handle);
+    let _lock = acquire_deal_record_lock(&path)?;
     // A runtime restart rewrites the same durable identity. Retain a valid observation already in
     // that record rather than erasing the only non-circular audit fact before a later settlement.
-    let last_observed_promotion = if path.exists() {
+    let (last_observed_promotion, last_observed_usage) = if path.exists() {
         let record = load_deal_record(&path)?;
-        same_deal_side(&record.handle, handle)
-            .then_some(record.last_observed_promotion)
-            .flatten()
+        if same_deal_side(&record.handle, handle) {
+            (record.last_observed_promotion, record.last_observed_usage)
+        } else {
+            (None, None)
+        }
     } else {
-        None
+        (None, None)
     };
-    let bytes = serialize_deal_record(handle, last_observed_promotion)?;
+    let bytes = serialize_deal_record(handle, last_observed_promotion, last_observed_usage)?;
     write_private_atomic(&path, &bytes)?;
     Ok(path)
 }
@@ -343,12 +395,24 @@ pub(crate) fn load_deal_record(path: &Path) -> Result<DealRecord> {
             )
         })?
         .flatten();
+    let last_observed_usage = object
+        .remove(LAST_OBSERVED_USAGE_FIELD)
+        .map(serde_json::from_value)
+        .transpose()
+        .map_err(|e| {
+            anyhow::anyhow!(
+                "parse deal handle {} field {LAST_OBSERVED_USAGE_FIELD}: {e}",
+                path.display()
+            )
+        })?
+        .flatten();
     let h: DealHandle = serde_json::from_value(value)
         .map_err(|e| anyhow::anyhow!("parse deal handle {}: {e}", path.display()))?;
     validate_deal_handle(&h)?;
     Ok(DealRecord {
         handle: h,
         last_observed_promotion,
+        last_observed_usage,
     })
 }
 
@@ -356,15 +420,119 @@ pub(crate) fn persist_last_observed_promotion(
     path: &Path,
     observation: LastObservedPromotion,
 ) -> Result<()> {
-    let mut record = load_deal_record(path)?;
+    update_deal_record(path, |record| update_promotion(record, observation))
+}
+
+fn update_promotion(
+    record: &mut DealRecord,
+    observation: LastObservedPromotion,
+) -> Result<((), bool)> {
     if record.handle.version == DEAL_HANDLE_VERSION
         && record.last_observed_promotion == Some(observation)
     {
-        return Ok(());
+        return Ok(((), false));
     }
     record.handle.version = DEAL_HANDLE_VERSION;
-    let bytes = serialize_deal_record(&record.handle, Some(observation))?;
-    write_private_atomic(path, &bytes)
+    record.last_observed_promotion = Some(observation);
+    Ok(((), true))
+}
+
+/// Atomically add one accepted consumer request's provider-native usage to its durable buyer
+/// record. A missing observation remains distinguishable from an observed zero request.
+pub(crate) fn accumulate_last_observed_usage(
+    path: &Path,
+    input_tokens: u64,
+    output_tokens: u64,
+    total_tokens: u64,
+) -> Result<LastObservedUsage> {
+    update_deal_record(path, |record| {
+        update_usage(record, input_tokens, output_tokens, total_tokens)
+    })
+}
+
+fn update_usage(
+    record: &mut DealRecord,
+    input_tokens: u64,
+    output_tokens: u64,
+    total_tokens: u64,
+) -> Result<(LastObservedUsage, bool)> {
+    let next = record
+        .last_observed_usage
+        .unwrap_or_default()
+        .checked_after(input_tokens, output_tokens, total_tokens)?;
+    record.handle.version = DEAL_HANDLE_VERSION;
+    record.last_observed_usage = Some(next);
+    Ok((next, true))
+}
+
+/// Serialize one complete load/update/atomic-write transaction for a durable deal record.
+
+/// The lock lives at a stable sibling path rather than on the JSON file itself: every successful
+/// write replaces the JSON inode, so locking that inode would let a later opener bypass the holder.
+/// Keeping the advisory lock file also lets separate `dexdo` processes coordinate, while the OS
+/// releases the lock automatically if a writer exits.
+fn update_deal_record<T>(
+    path: &Path,
+    update: impl FnOnce(&mut DealRecord) -> Result<(T, bool)>,
+) -> Result<T> {
+    let _lock = acquire_deal_record_lock(path)?;
+    let mut record = load_deal_record(path)?;
+    let (result, changed) = update(&mut record)?;
+    if changed {
+        let bytes = serialize_deal_record(
+            &record.handle,
+            record.last_observed_promotion,
+            record.last_observed_usage,
+        )?;
+        write_private_atomic(path, &bytes)?;
+    }
+    Ok(result)
+}
+
+struct DealRecordLock {
+    file: std::fs::File,
+}
+
+impl Drop for DealRecordLock {
+    fn drop(&mut self) {
+        let _ = fs2::FileExt::unlock(&self.file);
+    }
+}
+
+fn deal_record_lock_path(path: &Path) -> PathBuf {
+    let name = path
+        .file_name()
+        .unwrap_or_else(|| std::ffi::OsStr::new("deal.json"));
+    let mut lock_name = std::ffi::OsString::from(".");
+    lock_name.push(name);
+    lock_name.push(".lock");
+    path.with_file_name(lock_name)
+}
+
+fn open_deal_record_lock(path: &Path) -> Result<std::fs::File> {
+    let lock_path = deal_record_lock_path(path);
+    let mut options = std::fs::OpenOptions::new();
+    options.read(true).write(true).create(true).truncate(false);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt as _;
+        options.mode(0o600);
+    }
+    options
+        .open(&lock_path)
+        .map_err(|error| anyhow::anyhow!("open deal-record lock {}: {error}", lock_path.display()))
+}
+
+fn acquire_deal_record_lock(path: &Path) -> Result<DealRecordLock> {
+    let file = open_deal_record_lock(path)?;
+    fs2::FileExt::lock_exclusive(&file).map_err(|error| {
+        anyhow::anyhow!(
+            "lock deal record {} through {}: {error}",
+            path.display(),
+            deal_record_lock_path(path).display()
+        )
+    })?;
+    Ok(DealRecordLock { file })
 }
 
 /// Does this refusal carry the one class the sweep may NOT skip?
@@ -644,6 +812,7 @@ fn same_deal_side(left: &DealHandle, right: &DealHandle) -> bool {
 fn serialize_deal_record(
     handle: &DealHandle,
     last_observed_promotion: Option<LastObservedPromotion>,
+    last_observed_usage: Option<LastObservedUsage>,
 ) -> Result<Vec<u8>> {
     let mut value = serde_json::to_value(handle)?;
     value
@@ -652,6 +821,13 @@ fn serialize_deal_record(
         .insert(
             LAST_OBSERVED_PROMOTION_FIELD.to_string(),
             serde_json::to_value(last_observed_promotion)?,
+        );
+    value
+        .as_object_mut()
+        .expect("DealHandle serializes as a JSON object")
+        .insert(
+            LAST_OBSERVED_USAGE_FIELD.to_string(),
+            serde_json::to_value(last_observed_usage)?,
         );
     Ok(serde_json::to_vec_pretty(&value)?)
 }
@@ -819,6 +995,26 @@ mod decimal_u128 {
     }
 
     pub fn deserialize<'de, D>(deserializer: D) -> Result<u128, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        String::deserialize(deserializer)?
+            .parse()
+            .map_err(D::Error::custom)
+    }
+}
+
+mod decimal_u64 {
+    use serde::{de::Error as _, Deserialize as _, Deserializer, Serializer};
+
+    pub fn serialize<S>(value: &u64, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        serializer.serialize_str(&value.to_string())
+    }
+
+    pub fn deserialize<'de, D>(deserializer: D) -> Result<u64, D::Error>
     where
         D: Deserializer<'de>,
     {
@@ -1271,6 +1467,168 @@ mod tests {
         let observed = load_deal_record(&path).unwrap();
         assert_eq!(observed.last_observed_promotion, Some(zero));
         assert_ne!(observed.last_observed_promotion, None);
+    }
+
+    #[test]
+    fn accepted_usage_accumulates_without_erasing_the_promotion() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = save_deal_handle(temp.path(), &buyer_handle()).unwrap();
+        let promotion = LastObservedPromotion {
+            tokens_final: dexdo_core::TICK_SIZE,
+            tokens_pending: dexdo_core::TICK_SIZE,
+            last_claim_time: 1_754_006_402,
+        };
+        persist_last_observed_promotion(&path, promotion).unwrap();
+
+        assert_eq!(
+            accumulate_last_observed_usage(&path, 7, 57, 64).unwrap(),
+            LastObservedUsage {
+                input_tokens: 7,
+                output_tokens: 57,
+                total_tokens: 64,
+            }
+        );
+        let cumulative = accumulate_last_observed_usage(&path, 3, 5, 8).unwrap();
+        assert_eq!(
+            cumulative,
+            LastObservedUsage {
+                input_tokens: 10,
+                output_tokens: 62,
+                total_tokens: 72,
+            }
+        );
+
+        let record = load_deal_record(&path).unwrap();
+        assert_eq!(record.last_observed_promotion, Some(promotion));
+        assert_eq!(record.last_observed_usage, Some(cumulative));
+        let json: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        assert_eq!(json["version"], DEAL_HANDLE_VERSION);
+        assert_eq!(json["last_observed_usage"]["input_tokens"], "10");
+        assert_eq!(json["last_observed_usage"]["output_tokens"], "62");
+        assert_eq!(json["last_observed_usage"]["total_tokens"], "72");
+
+        save_deal_handle(temp.path(), &buyer_handle()).unwrap();
+        let rewritten = load_deal_record(&path).unwrap();
+        assert_eq!(rewritten.last_observed_promotion, Some(promotion));
+        assert_eq!(rewritten.last_observed_usage, Some(cumulative));
+    }
+
+    #[test]
+    fn concurrent_promotion_and_usage_transactions_preserve_both_orders() {
+        #[derive(Clone, Copy)]
+        enum FirstUpdate {
+            Promotion,
+            Usage,
+        }
+
+        fn assert_transaction_lock_is_held(path: &Path) {
+            let probe = open_deal_record_lock(path).expect("open a second lock handle");
+            match fs2::FileExt::try_lock_exclusive(&probe) {
+                Ok(()) => {
+                    let _ = fs2::FileExt::unlock(&probe);
+                    panic!("a second writer acquired the deal-record lock mid-transaction");
+                }
+                Err(error) => assert_eq!(
+                    error.raw_os_error(),
+                    fs2::lock_contended_error().raw_os_error(),
+                    "the second lock attempt failed for an unexpected reason: {error}"
+                ),
+            }
+        }
+
+        fn run(first: FirstUpdate) {
+            let temp = tempfile::tempdir().unwrap();
+            let path = save_deal_handle(temp.path(), &buyer_handle()).unwrap();
+            let promotion = LastObservedPromotion {
+                tokens_final: dexdo_core::TICK_SIZE,
+                tokens_pending: 2 * dexdo_core::TICK_SIZE,
+                last_claim_time: 1_754_006_403,
+            };
+            let (loaded_tx, loaded_rx) = std::sync::mpsc::sync_channel(0);
+            let (release_tx, release_rx) = std::sync::mpsc::sync_channel(0);
+            let first_path = path.clone();
+            let first_writer = std::thread::spawn(move || {
+                update_deal_record(&first_path, |record| {
+                    loaded_tx
+                        .send(())
+                        .expect("announce the stale snapshot is loaded while locked");
+                    release_rx
+                        .recv()
+                        .expect("release the first synchronized writer");
+                    match first {
+                        FirstUpdate::Promotion => update_promotion(record, promotion),
+                        FirstUpdate::Usage => {
+                            let (_, changed) = update_usage(record, 7, 57, 64)?;
+                            Ok(((), changed))
+                        }
+                    }
+                })
+            });
+
+            loaded_rx
+                .recv()
+                .expect("the first writer loads inside the transaction");
+            assert_transaction_lock_is_held(&path);
+
+            let (started_tx, started_rx) = std::sync::mpsc::sync_channel(0);
+            let second_path = path.clone();
+            let second_writer = std::thread::spawn(move || {
+                started_tx.send(()).expect("announce the second writer");
+                match first {
+                    FirstUpdate::Promotion => {
+                        accumulate_last_observed_usage(&second_path, 7, 57, 64).map(|_| ())
+                    }
+                    FirstUpdate::Usage => persist_last_observed_promotion(&second_path, promotion),
+                }
+            });
+            started_rx.recv().expect("the second writer is concurrent");
+            release_tx
+                .send(())
+                .expect("let the first writer commit before releasing its lock");
+
+            first_writer
+                .join()
+                .expect("first writer thread did not panic")
+                .expect("first writer commits");
+            second_writer
+                .join()
+                .expect("second writer thread did not panic")
+                .expect("second writer commits after the lock handoff");
+
+            let record = load_deal_record(&path).unwrap();
+            assert_eq!(record.last_observed_promotion, Some(promotion));
+            assert_eq!(
+                record.last_observed_usage,
+                Some(LastObservedUsage {
+                    input_tokens: 7,
+                    output_tokens: 57,
+                    total_tokens: 64,
+                })
+            );
+        }
+
+        run(FirstUpdate::Promotion);
+        run(FirstUpdate::Usage);
+    }
+
+    #[test]
+    fn invalid_or_overflowing_usage_is_rejected_without_rewriting_the_record() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = save_deal_handle(temp.path(), &buyer_handle()).unwrap();
+        let original = std::fs::read(&path).unwrap();
+
+        let inconsistent = accumulate_last_observed_usage(&path, 2, 3, 6).unwrap_err();
+        assert!(inconsistent
+            .to_string()
+            .contains("total 6 != input 2 + output 3"));
+        assert_eq!(std::fs::read(&path).unwrap(), original);
+
+        accumulate_last_observed_usage(&path, u64::MAX, 0, u64::MAX).unwrap();
+        let before_overflow = std::fs::read(&path).unwrap();
+        let overflow = accumulate_last_observed_usage(&path, 1, 0, 1).unwrap_err();
+        assert!(overflow.to_string().contains("input usage overflows"));
+        assert_eq!(std::fs::read(&path).unwrap(), before_overflow);
     }
 }
 

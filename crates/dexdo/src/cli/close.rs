@@ -52,6 +52,7 @@ fn close_response(
         state_before: state_before.to_string(),
         state_after: state_after.to_string(),
         last_observed_promotion: None,
+        last_observed_usage: None,
         tx: None,
     })
 }
@@ -73,6 +74,28 @@ fn last_observed_promotion_text(
             observation.tokens_final, observation.tokens_pending, observation.last_claim_time
         ),
         None => "last_observed_promotion=unavailable".to_string(),
+    }
+}
+
+fn with_last_observed_usage(
+    mut response: machine::CloseResponse,
+    observation: Option<crate::cli::deals::LastObservedUsage>,
+) -> machine::CloseResponse {
+    response.last_observed_usage = observation;
+    response
+}
+
+fn last_observed_usage_text(observation: Option<crate::cli::deals::LastObservedUsage>) -> String {
+    match observation {
+        Some(observation) => format!(
+            "last_observed_usage=(input_tokens={} output_tokens={} total_tokens={} tick_fraction={}/{})",
+            observation.input_tokens,
+            observation.output_tokens,
+            observation.total_tokens,
+            observation.total_tokens,
+            dexdo_core::TICK_SIZE,
+        ),
+        None => "last_observed_usage=unavailable".to_string(),
     }
 }
 
@@ -643,6 +666,9 @@ pub(crate) async fn run_close(args: CloseArgs) -> Result<()> {
     let mut last_observed_promotion = close_record
         .as_ref()
         .and_then(|(_, record)| record.last_observed_promotion);
+    let last_observed_usage = close_record
+        .as_ref()
+        .and_then(|(_, record)| record.last_observed_usage);
     let contracts_path = deal_contracts_path(&target)?;
     chain_doctor_preflight_market(&contracts_path, target.market.as_ref()).await?;
     // The handle's own manifest, and nothing that could override it: the flag that used to sit
@@ -680,14 +706,15 @@ pub(crate) async fn run_close(args: CloseArgs) -> Result<()> {
                     "closed",
                 )?;
                 response.tx = Some(super::recover::prior_stop_receipt_json(&tc, &receipt));
-                machine::print_json(&with_last_observed_promotion(
-                    response,
-                    last_observed_promotion,
+                machine::print_json(&with_last_observed_usage(
+                    with_last_observed_promotion(response, last_observed_promotion),
+                    last_observed_usage,
                 ))?;
             } else {
                 println!(
-                    "{confirmation} {}",
-                    last_observed_promotion_text(last_observed_promotion)
+                    "{confirmation} {} {}",
+                    last_observed_promotion_text(last_observed_promotion),
+                    last_observed_usage_text(last_observed_usage),
                 );
             }
             apply_prior_stop_marker(&confirmation, || {
@@ -701,22 +728,30 @@ pub(crate) async fn run_close(args: CloseArgs) -> Result<()> {
     }
     let Some(snapshot) = chain.token_contract_deal_snapshot(&tc).await? else {
         if args.json {
-            return machine::print_json(&close_response(
-                chain.network(),
-                target.handle.as_ref().map(|h| h.handle.clone()),
-                role.as_str(),
-                target.token_contract,
-                "noop",
-                false,
-                true,
-                Some("already_closed"),
-                "closed",
-                "closed",
-            )?);
+            return machine::print_json(&with_last_observed_usage(
+                with_last_observed_promotion(
+                    close_response(
+                        chain.network(),
+                        target.handle.as_ref().map(|h| h.handle.clone()),
+                        role.as_str(),
+                        target.token_contract,
+                        "noop",
+                        false,
+                        true,
+                        Some("already_closed"),
+                        "closed",
+                        "closed",
+                    )?,
+                    last_observed_promotion,
+                ),
+                last_observed_usage,
+            ));
         }
         println!(
-            "close noop: TokenContract {} is inactive/closed",
-            tc_display
+            "close noop: TokenContract {} is inactive/closed {} {}",
+            tc_display,
+            last_observed_promotion_text(last_observed_promotion),
+            last_observed_usage_text(last_observed_usage),
         );
         return Ok(());
     };
@@ -858,28 +893,36 @@ pub(crate) async fn run_close(args: CloseArgs) -> Result<()> {
             if s.kind == deals::DealStateKind::Stopped {
                 super::buyer::mark_buyer_subscription_terminal(&note_addr, &tc.with_workchain())?;
                 if args.json {
-                    return machine::print_json(&close_response(
-                        chain.network(),
-                        target.handle.as_ref().map(|h| h.handle.clone()),
-                        role.as_str(),
-                        target.token_contract.clone(),
-                        "noop",
-                        false,
-                        true,
-                        Some("already_stopped"),
-                        "stopped",
-                        "stopped",
-                    )?);
+                    return machine::print_json(&with_last_observed_usage(
+                        with_last_observed_promotion(
+                            close_response(
+                                chain.network(),
+                                target.handle.as_ref().map(|h| h.handle.clone()),
+                                role.as_str(),
+                                target.token_contract.clone(),
+                                "noop",
+                                false,
+                                true,
+                                Some("already_stopped"),
+                                "stopped",
+                                "stopped",
+                            )?,
+                            last_observed_promotion,
+                        ),
+                        last_observed_usage,
+                    ));
                 }
                 println!(
-                    "close noop: buyer side already STOPped for {}. Next: the seller {}.",
+                    "close noop: buyer side already STOPped for {}. Next: the seller {}. {} {}",
                     tc_display,
                     close_guidance(
                         &target.token_contract,
                         Some("seller"),
                         "seller",
                         args.deals_dir.as_deref()
-                    )
+                    ),
+                    last_observed_promotion_text(last_observed_promotion),
+                    last_observed_usage_text(last_observed_usage),
                 );
                 return Ok(());
             }
@@ -918,24 +961,28 @@ pub(crate) async fn run_close(args: CloseArgs) -> Result<()> {
                     }
                 };
                 if args.json {
-                    machine::print_json(&with_last_observed_promotion(
-                        confirmed_buyer_stop_response(
-                            chain.network(),
-                            target.handle.as_ref().map(|h| h.handle.clone()),
-                            role.as_str(),
-                            target.token_contract.clone(),
-                            s.kind.as_str(),
-                            Some(&receipt),
-                        )?,
-                        last_observed_promotion,
+                    machine::print_json(&with_last_observed_usage(
+                        with_last_observed_promotion(
+                            confirmed_buyer_stop_response(
+                                chain.network(),
+                                target.handle.as_ref().map(|h| h.handle.clone()),
+                                role.as_str(),
+                                target.token_contract.clone(),
+                                s.kind.as_str(),
+                                Some(&receipt),
+                            )?,
+                            last_observed_promotion,
+                        ),
+                        last_observed_usage,
                     ))?;
                 } else {
                     println!(
                         "close confirmed role=buyer action=streamStop token_contract={} note={} \
-                         receipt={receipt} {}",
+                         receipt={receipt} {} {}",
                         tc_display,
                         note_display,
                         last_observed_promotion_text(last_observed_promotion),
+                        last_observed_usage_text(last_observed_usage),
                     );
                 }
 
@@ -1906,8 +1953,16 @@ mod tests {
             tokens_pending: 3 * dexdo_core::TICK_SIZE,
             last_claim_time: 1_754_006_400,
         };
+        let usage = crate::cli::deals::LastObservedUsage {
+            input_tokens: 7,
+            output_tokens: 57,
+            total_tokens: 64,
+        };
 
-        let report = super::with_last_observed_promotion(response, Some(observed));
+        let report = super::with_last_observed_usage(
+            super::with_last_observed_promotion(response, Some(observed)),
+            Some(usage),
+        );
         let json = serde_json::to_value(report).unwrap();
 
         assert_eq!(json["tx"]["toSeller"], "7000000000");
@@ -1923,6 +1978,9 @@ mod tests {
             json["last_observed_promotion"]["last_claim_time"],
             1_754_006_400_u64
         );
+        assert_eq!(json["last_observed_usage"]["input_tokens"], "7");
+        assert_eq!(json["last_observed_usage"]["output_tokens"], "57");
+        assert_eq!(json["last_observed_usage"]["total_tokens"], "64");
     }
 
     #[test]
@@ -1941,7 +1999,10 @@ mod tests {
         )
         .unwrap();
 
-        let report = super::with_last_observed_promotion(response, None);
+        let report = super::with_last_observed_usage(
+            super::with_last_observed_promotion(response, None),
+            None,
+        );
         let json = serde_json::to_value(report).unwrap();
 
         assert!(json["last_observed_promotion"].is_null());
@@ -1951,6 +2012,15 @@ mod tests {
                 "tokens_final": "0",
                 "tokens_pending": "0",
                 "last_claim_time": 0
+            })
+        );
+        assert!(json["last_observed_usage"].is_null());
+        assert_ne!(
+            json["last_observed_usage"],
+            serde_json::json!({
+                "input_tokens": "0",
+                "output_tokens": "0",
+                "total_tokens": "0"
             })
         );
     }

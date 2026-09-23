@@ -238,6 +238,11 @@ What the numbers mean:
 **This command holds the terminal.** Wait for `consumer API listening (loopback)` -- that line is
 how you know the endpoint is up. Close the terminal and the endpoint goes with it.
 
+The same local server accepts text-only OpenAI Responses requests at `POST /v1/responses`:
+`input` can be a string or text messages, and `stream:true` returns Responses SSE events.
+The endpoint does not support tool calls; requests with non-empty `tools` are rejected by name.
+Keep using `/v1/chat/completions` for Chat Completions clients.
+
 Two flags worth knowing before you meet them:
 
 - `--allow-unverified-model` exists and `--help` describes it. This document does not walk you
@@ -315,6 +320,8 @@ When the cause is not obvious, run `dexdo doctor` first.
 - **the first funding leg** turns SHELL into native gas permanently.
 - **`dexdo note withdraw`** is one-shot and irreversible; its canonical
   `--to <DAPP-ID>::<ACCOUNT-ID>` is always explicit and is never inferred from the pool or funding wallet.
+  The exact destination must already exist in that DApp and contain deployed code, or the client
+  refuses before submit.
 - **a committed buy** is committed; what is not delivered comes back to you, but the purchase is not
   cancelled by closing the terminal.
 

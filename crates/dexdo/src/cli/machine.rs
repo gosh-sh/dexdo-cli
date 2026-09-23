@@ -984,6 +984,7 @@ pub(crate) struct CloseResponse {
     pub(crate) state_before: String,
     pub(crate) state_after: String,
     pub(crate) last_observed_promotion: Option<super::deals::LastObservedPromotion>,
+    pub(crate) last_observed_usage: Option<super::deals::LastObservedUsage>,
     pub(crate) tx: Option<Value>,
 }
 

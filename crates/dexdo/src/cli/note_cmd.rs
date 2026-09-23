@@ -4909,6 +4909,20 @@ fn parse_note_withdraw_destination(
     dexdo_core::CanonicalAddress::parse(value).map_err(|error| anyhow::anyhow!("--to: {error}"))
 }
 
+fn assert_note_withdraw_recipient(
+    destination: &dexdo_core::CanonicalAddress,
+    account_exists: bool,
+    deployed_code_hash: Option<&str>,
+) -> Result<()> {
+    if !account_exists {
+        bail!("withdraw destination {destination} does not exist in the specified DApp");
+    }
+    if deployed_code_hash.is_none_or(|hash| hash.trim().is_empty()) {
+        bail!("withdraw destination {destination} does not contain deployed code");
+    }
+    Ok(())
+}
+
 pub(crate) async fn run_note_withdraw(args: NoteWithdrawArgs) -> Result<()> {
     use dexdo_core::{Address, KeyPair, RealChainBackend};
     let note_addr = args.identity.note_addr.clone().ok_or_else(|| {
@@ -4949,6 +4963,16 @@ pub(crate) async fn run_note_withdraw(args: NoteWithdrawArgs) -> Result<()> {
     let note_display = dexdo_core::address::display(&note_addr);
     let dest_addr =
         Address::parse(&dest_chain_address).map_err(|e| anyhow::anyhow!("--to {dest}: {e}"))?;
+    let dest_dapp = Address::parse(&format!("0:{}", dest.dapp_id()))
+        .map_err(|e| anyhow::anyhow!("--to {dest}: invalid destination DApp: {e}"))?;
+    let dest_account = chain
+        .get_account_in_dapp(&dest_addr, &dest_dapp)
+        .await
+        .map_err(|e| anyhow::anyhow!("check withdraw destination {dest}: {e}"))?;
+    let deployed_code_hash = dest_account
+        .as_ref()
+        .and_then(|account| account.code_hash.as_deref());
+    assert_note_withdraw_recipient(&dest, dest_account.is_some(), deployed_code_hash)?;
     chain
         .assert_note_owner_matches("note withdraw", &note, &keys)
         .await?;
@@ -11279,6 +11303,74 @@ mod tests {
         assert!(
             guard < submit,
             "note withdraw must check note owner key before submitting withdrawTokens"
+        );
+    }
+
+    #[test]
+    fn note_withdraw_recipient_preflight_accepts_deployed_non_self_dapp_account() {
+        let destination =
+            dexdo_core::CanonicalAddress::parse(&format!("{}::{}", "a".repeat(64), "b".repeat(64)))
+                .expect("canonical non-self-DApp destination");
+
+        super::assert_note_withdraw_recipient(&destination, true, Some("deployed-code"))
+            .expect("an existing account with code is a valid withdraw destination");
+    }
+
+    #[test]
+    fn note_withdraw_recipient_preflight_refuses_missing_or_codeless_exact_pair() {
+        let destination =
+            dexdo_core::CanonicalAddress::parse(&format!("{}::{}", "a".repeat(64), "b".repeat(64)))
+                .expect("canonical destination");
+        let canonical = destination.to_string();
+
+        let missing = super::assert_note_withdraw_recipient(&destination, false, None)
+            .expect_err("a missing exact account-in-DApp pair must be refused")
+            .to_string();
+        assert!(missing.contains(&canonical), "{missing}");
+        assert!(missing.contains("does not exist"), "{missing}");
+
+        for code_hash in [None, Some(""), Some("   ")] {
+            let codeless = super::assert_note_withdraw_recipient(&destination, true, code_hash)
+                .expect_err("an account without deployed code must be refused")
+                .to_string();
+            assert!(codeless.contains(&canonical), "{codeless}");
+            assert!(
+                codeless.contains("does not contain deployed code"),
+                "{codeless}"
+            );
+        }
+    }
+
+    #[test]
+    fn note_withdraw_exact_recipient_preflight_precedes_every_signed_guard_and_submit() {
+        let source = include_str!("note_cmd.rs");
+        let body =
+            crate::cli::source_probe::code_of(source, "pub(crate) async fn run_note_withdraw");
+        assert!(
+            body.contains(".get_account_in_dapp(&dest_addr, &dest_dapp)"),
+            "withdraw must query the exact supplied account-in-DApp pair: {body}"
+        );
+        let lookup = body
+            .find(".get_account_in_dapp(&dest_addr, &dest_dapp)")
+            .expect("exact recipient lookup present");
+        let recipient_guard = body
+            .find("assert_note_withdraw_recipient")
+            .expect("recipient code guard present");
+        let owner_guard = body
+            .find("assert_note_owner_matches")
+            .expect("owner guard present");
+        let generation_guard = body
+            .find("assert_note_withdraw_generation")
+            .expect("generation guard present");
+        let submit = body
+            .find("withdraw_note_tokens")
+            .expect("withdraw submit present");
+        assert!(
+            lookup < recipient_guard
+                && recipient_guard < owner_guard
+                && owner_guard < generation_guard
+                && generation_guard < submit,
+            "recipient refusal must return before every signed guard and withdrawTokens submit: {body}"
         );
     }
 

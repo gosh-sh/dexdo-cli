@@ -1,5 +1,5 @@
 //! Local consumer interface: an OpenAI-compatible HTTP endpoint
-//! (`/v1/chat/completions`, `/v1/models`) and an optional Anthropic-compatible transcode
+//! (`/v1/chat/completions`, `/v1/responses`, `/v1/models`) and an optional Anthropic-compatible transcode
 //! (`/v1/messages`). The endpoint listens on **loopback** by default.
 
 //! Request path (B19): receive -> build `CanonRequest` -> route to the (mock) seller ->
@@ -1242,7 +1242,7 @@ pub(crate) fn accounted_tokens(chunk: &CanonChunk) -> u64 {
 pub struct RequestDelivery {
     /// The deal this request was served on.
     pub token_contract: TokenContract,
-    /// Which consumer protocol rendered the answer: `openai` or `anthropic`.
+    /// Which consumer protocol rendered the answer: `openai`, `openai_responses`, or `anthropic`.
     pub protocol: &'static str,
     /// `true` for SSE, `false` for the aggregated single response.
     pub streamed: bool,
@@ -2948,6 +2948,7 @@ pub fn router(state: ApiState, anthropic_compat: bool) -> axum::Router {
     use axum::routing::{get, post};
     let mut app = axum::Router::new()
         .route("/v1/chat/completions", post(openai::chat_completions))
+        .route("/v1/responses", post(openai::responses))
         .route("/v1/models", get(openai::models));
     if anthropic_compat {
         app = app.route("/v1/messages", post(anthropic::messages));
@@ -5462,6 +5463,38 @@ mod tests {
             (status, response.text().await.expect("body"))
         }
 
+        async fn ask_openai_usage(
+            &self,
+            max_tokens: u64,
+            prompt: &str,
+            stream: bool,
+            include_usage: Option<bool>,
+        ) -> (reqwest::StatusCode, String) {
+            let mut body = serde_json::json!({
+                "model": "dexdo-mock",
+                "messages": [{"role": "user", "content": prompt}],
+                "max_tokens": max_tokens,
+                "stream": stream
+            });
+            if let Some(include_usage) = include_usage {
+                body.as_object_mut().unwrap().insert(
+                    "stream_options".to_string(),
+                    serde_json::json!({"include_usage": include_usage}),
+                );
+            }
+            let response = reqwest::Client::builder()
+                .timeout(Duration::from_secs(15))
+                .build()
+                .unwrap()
+                .post(format!("http://{}/v1/chat/completions", self.addr))
+                .json(&body)
+                .send()
+                .await
+                .expect("the local endpoint answers");
+            let status = response.status();
+            (status, response.text().await.expect("body"))
+        }
+
         /// What the LIVE route says it may still hand out - the production figure admission gates on.
         async fn remaining(&self) -> u64 {
             self.deals
@@ -5533,6 +5566,14 @@ mod tests {
             }
         }
         last
+    }
+
+    fn openai_stream_chunks(body: &str) -> Vec<serde_json::Value> {
+        body.lines()
+            .filter_map(|line| line.strip_prefix("data: "))
+            .filter(|payload| *payload != "[DONE]")
+            .map(|payload| serde_json::from_str(payload).expect("OpenAI SSE JSON payload"))
+            .collect()
     }
 
     /// The seller emits as many tokens as it is asked for: unconstrained, so that every refusal in
@@ -6447,6 +6488,57 @@ mod tests {
                 );
                 harness.shutdown().await;
             }
+        }
+    }
+
+    #[tokio::test]
+    async fn openai_responses_return_accepted_provider_usage_with_standard_stream_opt_in() {
+        let non_stream = weekly_route_harness(WEEK_QUOTA - 16, true).await;
+        let (status, body) = non_stream
+            .ask_openai_usage(4, "weekly quota", false, None)
+            .await;
+        assert_eq!(status, reqwest::StatusCode::OK, "{body}");
+        let json: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(json["usage"]["prompt_tokens"], 2);
+        assert_eq!(json["usage"]["completion_tokens"], 4);
+        assert_eq!(json["usage"]["total_tokens"], 6);
+        non_stream.shutdown().await;
+
+        let opted_in = weekly_route_harness(WEEK_QUOTA - 16, true).await;
+        let (status, body) = opted_in
+            .ask_openai_usage(4, "weekly quota", true, Some(true))
+            .await;
+        assert_eq!(status, reqwest::StatusCode::OK, "{body}");
+        let chunks = openai_stream_chunks(&body);
+        let usage_chunks: Vec<_> = chunks
+            .iter()
+            .filter(|chunk| chunk["usage"].is_object())
+            .collect();
+        assert_eq!(usage_chunks.len(), 1, "{body}");
+        assert_eq!(usage_chunks[0]["choices"], serde_json::json!([]));
+        assert_eq!(usage_chunks[0]["usage"]["prompt_tokens"], 2);
+        assert_eq!(usage_chunks[0]["usage"]["completion_tokens"], 4);
+        assert_eq!(usage_chunks[0]["usage"]["total_tokens"], 6);
+        assert!(chunks
+            .iter()
+            .filter(|chunk| !chunk["choices"].as_array().is_some_and(Vec::is_empty))
+            .all(|chunk| chunk.as_object().unwrap().contains_key("usage")
+                && chunk["usage"].is_null()));
+        opted_in.shutdown().await;
+
+        for include_usage in [None, Some(false)] {
+            let no_opt_in = weekly_route_harness(WEEK_QUOTA - 16, true).await;
+            let (status, body) = no_opt_in
+                .ask_openai_usage(4, "weekly quota", true, include_usage)
+                .await;
+            assert_eq!(status, reqwest::StatusCode::OK, "{body}");
+            assert!(
+                openai_stream_chunks(&body)
+                    .iter()
+                    .all(|chunk| !chunk.as_object().unwrap().contains_key("usage")),
+                "stream usage must be opt-in: {body}"
+            );
+            no_opt_in.shutdown().await;
         }
     }
 

@@ -1878,7 +1878,8 @@ pub(crate) struct NoteWithdrawArgs {
     /// Destination wallet address in canonical `<dapp_id>::<account_id>` form. REQUIRED, and
     /// deliberately never defaulted or inferred from the note pool/funding wallet: the transfer is
     /// irreversible. Account-only legacy `0:<account_id>` is refused because it carries no
-    /// destination DApp for withdrawal evidence.
+    /// destination DApp for withdrawal evidence. The exact account must already exist in that
+    /// DApp and contain deployed code, or the command refuses before withdrawal submission.
     #[arg(long)]
     pub(crate) to: String,
 }

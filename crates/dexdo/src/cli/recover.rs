@@ -33,6 +33,12 @@ fn display_dexdo_address(value: &dyn std::fmt::Display) -> String {
 #[async_trait::async_trait]
 trait RecoverChain: Sync {
     async fn state(&self, tc: &dexdo_core::Address) -> Result<Option<dexdo_core::DealChainState>>;
+    async fn touch_stale_deal(
+        &self,
+        note: &dexdo_core::Address,
+        keys: &dexdo_core::KeyPair,
+        tc: &dexdo_core::Address,
+    ) -> Result<Option<(usize, usize)>>;
     async fn buyer_note(&self, tc: &dexdo_core::Address) -> Result<Option<dexdo_core::Address>>;
     async fn buyer_pubkey(&self, tc: &dexdo_core::Address) -> Result<Option<[u8; 32]>>;
     async fn stop(
@@ -54,6 +60,15 @@ impl RecoverChain for dexdo_core::RealChainBackend {
             .token_contract_deal_snapshot(tc)
             .await?
             .map(|snapshot| snapshot.state))
+    }
+
+    async fn touch_stale_deal(
+        &self,
+        note: &dexdo_core::Address,
+        keys: &dexdo_core::KeyPair,
+        tc: &dexdo_core::Address,
+    ) -> Result<Option<(usize, usize)>> {
+        self.touch_stale_note_deal(note, keys, tc).await
     }
 
     async fn buyer_note(&self, tc: &dexdo_core::Address) -> Result<Option<dexdo_core::Address>> {
@@ -82,7 +97,10 @@ impl RecoverChain for dexdo_core::RealChainBackend {
         &self,
         tc: &dexdo_core::Address,
     ) -> Result<dexdo_core::TokenContractSettlementReceipts> {
-        Ok(self.token_contract_settlement_receipts(tc).await?)
+        Ok(self
+            .token_contract_settlement_receipts_if_present(tc)
+            .await?
+            .unwrap_or_default())
     }
 }
 
@@ -444,6 +462,17 @@ async fn run_recover_with_chain_and_marker(
     let tc_display = display_token_contract(&tc);
 
     let prior_receipts = chain.settlement_receipts(&tc).await?;
+    let state = chain.state(&tc).await;
+    if matches!(&state, Ok(None)) {
+        if let Some((before, after)) = chain.touch_stale_deal(&note, &keys, &tc).await? {
+            println!(
+                "recover confirmed: PrivateNote {} no longer records absent TokenContract \
+                 {tc_display} in getOutstanding().deals ({before} -> {after}); touchDeal does not restore escrow",
+                display_dexdo_address(&note)
+            );
+            return Ok(());
+        }
+    }
     if let Some(receipt) = exact_prior_stop_receipt(&prior_receipts, &note.with_workchain())? {
         let confirmation = prior_stop_confirmation("recover", &tc, &note, &receipt);
         println!("{confirmation}");
@@ -459,7 +488,7 @@ async fn run_recover_with_chain_and_marker(
         return Ok(());
     }
 
-    let state = chain.state(&tc).await?.ok_or_else(|| {
+    let state = state?.ok_or_else(|| {
         anyhow::anyhow!("recover: TokenContract {tc_display} is not active (undeployed/closed)")
     })?;
     let buyer_note = chain.buyer_note(&tc).await?;
@@ -1339,6 +1368,8 @@ pub(crate) async fn run_withdraw_shell(args: WithdrawShellArgs) -> Result<()> {
 mod tests {
     use crate::cli::args::{RecoverArgs, RecoveryIdentityArgs};
 
+    include!("recover/stale_deal_1520_test.rs");
+
     // `include!` rather than a `mod` declaration because the test drives the private
     // `recover_confirmation` and reuses this module's own `test_stop_receipt` fixture.
     include!("recover/destroy_advice_1523_test.rs");
@@ -1769,6 +1800,15 @@ mod tests {
         ) -> anyhow::Result<Option<dexdo_core::DealChainState>> {
             Ok((!self.terminal.load(std::sync::atomic::Ordering::SeqCst))
                 .then(|| chain_state(true, true, true, false, 100)))
+        }
+
+        async fn touch_stale_deal(
+            &self,
+            _note: &dexdo_core::Address,
+            _keys: &dexdo_core::KeyPair,
+            _tc: &dexdo_core::Address,
+        ) -> anyhow::Result<Option<(usize, usize)>> {
+            Ok(None)
         }
 
         async fn buyer_note(
@@ -3935,6 +3975,15 @@ mod tests {
             Ok(self
                 .deal(tc)?
                 .map(|deal| chain_state(true, deal.opened, true, false, 100)))
+        }
+
+        async fn touch_stale_deal(
+            &self,
+            _note: &dexdo_core::Address,
+            _keys: &dexdo_core::KeyPair,
+            _tc: &dexdo_core::Address,
+        ) -> anyhow::Result<Option<(usize, usize)>> {
+            Ok(None)
         }
 
         async fn buyer_note(

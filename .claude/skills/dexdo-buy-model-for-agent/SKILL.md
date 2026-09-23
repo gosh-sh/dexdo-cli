@@ -522,6 +522,10 @@ Escrow is computed automatically as `ticks x max-price-per-tick` plus the book f
 over-funding a resting buy can strand the surplus. Wait for the line
 `consumer API listening (loopback)` -- the endpoint is ready.
 
+The same server accepts text-only `POST /v1/responses` (JSON or streaming SSE). Non-empty
+`tools` and other unsupported Responses features are rejected explicitly; tool calling is
+not available through this route. `/v1/chat/completions` remains available.
+
 Two flags worth knowing:
 
 - `--allow-unverified-model`: named here only so a refusal that mentions it is recognisable. Do not
@@ -643,6 +647,8 @@ on-demand` -- when you are not actively sending requests.
 - Never re-run a timed-out buy verbatim -- reconnect with `--resume` (a fresh buy double-pays).
 - Never let a note withdrawal or sweep infer its destination: supply canonical
   `--to <DAPP-ID>::<ACCOUNT-ID>` explicitly every time.
+- Before `note withdraw`, make sure that exact destination already exists in the named DApp and
+  contains deployed code; the client refuses before submit if it does not.
 - Do not set `--escrow` by hand without a reason (risk of stranded surplus).
 - Buy against the deal `token_contract`, not an order-book address.
 - Your on-chain lock per open deal never exceeds 2 ticks.

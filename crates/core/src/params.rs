@@ -955,6 +955,15 @@ pub const DEAL_DESTROY_CONFIRM_MAX_READS: usize = 40;
 /// Interval between deal-destruct confirmation reads.
 pub const DEAL_DESTROY_CONFIRM_POLL_INTERVAL: Duration = Duration::from_secs(3);
 
+/// PrivateNote.sol DEAL_TOUCH_INTERVAL: minimum time between owner touchDeal calls on one note.
+pub const NOTE_DEAL_TOUCH_INTERVAL: Duration = Duration::from_secs(60);
+
+/// Maximum reads used to confirm that a touched stale deal leaves getOutstanding().deals.
+pub const NOTE_DEAL_TOUCH_CONFIRM_MAX_READS: usize = 40;
+
+/// Interval between stale-deal marker confirmation reads.
+pub const NOTE_DEAL_TOUCH_CONFIRM_POLL_INTERVAL: Duration = Duration::from_secs(3);
+
 /// Maximum reads used by the real backend to confirm a matched deal.
 pub const MATCH_CONFIRM_MAX_READS: usize = 40;
 

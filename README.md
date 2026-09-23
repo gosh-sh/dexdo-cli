@@ -177,6 +177,13 @@ the whole verdict:
 seller_ready token_contract=<addr> gateway=<host:port> gateway_listen=<addr> order_id=<n> readiness=exact_tc_offer_accepted
 ```
 
+## Guides: 
+
+* [DEX.DO glossary](docs/glossary.md),
+* [Registered AI models](docs/registered-models.md),
+* [Wallets and fund flows](docs/wallets-and-funds.md),
+* [Withdrawing PrivateNote funds to a wallet](docs/withdraw-private-note-to-wallet.md)
+
 ## License
 
 Released under the MIT License -- see [LICENSE](LICENSE).

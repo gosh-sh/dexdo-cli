@@ -9205,6 +9205,123 @@ impl RealChainBackend {
         Ok((placed, removed, history))
     }
 
+    /// Read only the addresses the note itself still records, without treating them as live deals.
+    async fn private_note_recorded_deals(&self, note: &Address) -> Result<Vec<Address>> {
+        let value = self
+            .client
+            .run_getter_retrying(note, PRIVATENOTE_ABI, "getOutstanding", json!({}))
+            .await?
+            .ok_or_else(|| anyhow!("PrivateNote {note} getOutstanding returned no data"))?;
+        Ok(decode_private_note_outstanding(&value)?.0)
+    }
+
+    /// Clear one note record only when its deal account is absent. A successful POST alone is not
+    /// proof: the note drops the record only after its bounced touch reaches onBounce.
+    pub async fn touch_stale_note_deal(
+        &self,
+        note: &Address,
+        keys: &KeyPair,
+        deal: &Address,
+    ) -> Result<Option<(usize, usize)>> {
+        let before = self.private_note_recorded_deals(note).await?;
+        let recorded = |deals: &[Address]| {
+            deals.iter().any(|candidate| {
+                candidate
+                    .with_workchain()
+                    .eq_ignore_ascii_case(&deal.with_workchain())
+            })
+        };
+        if !recorded(&before) {
+            return Ok(None);
+        }
+
+        let account = self
+            .client
+            .get_account_retrying(note)
+            .await?
+            .ok_or_else(|| anyhow!("PrivateNote {note} account is absent"))?;
+        let boc = account
+            .boc
+            .as_deref()
+            .ok_or_else(|| anyhow!("PrivateNote {note} account BOC is unavailable"))?;
+        let storage = account_storage_fields(boc, PRIVATENOTE_ABI, "PrivateNote")?;
+        let last_touch = storage
+            .get("_lastDealTouch")
+            .and_then(value_u64)
+            .ok_or_else(|| anyhow!("PrivateNote {note} storage has no _lastDealTouch"))?;
+        let now = self.observed_chain_timestamp().await?;
+        let interval = crate::params::NOTE_DEAL_TOUCH_INTERVAL.as_secs();
+        let wait_secs = last_touch.saturating_add(interval).saturating_sub(now);
+        if wait_secs > 0 {
+            eprintln!(
+                "PrivateNote touchDeal: last touch was {}s ago; waiting {wait_secs}s for its {interval}s \
+                 contract interval (ERR_NOTE_BUSY 121); waited 0s so far",
+                now.saturating_sub(last_touch)
+            );
+            let started = std::time::Instant::now();
+            tokio::time::sleep(std::time::Duration::from_secs(wait_secs)).await;
+            eprintln!(
+                "PrivateNote touchDeal: waited {}s for the contract interval",
+                started.elapsed().as_secs()
+            );
+            let current = self.private_note_recorded_deals(note).await?;
+            if !recorded(&current) {
+                return Ok(Some((before.len(), current.len())));
+            }
+        }
+
+        if self.token_contract_deal_snapshot(deal).await?.is_some() {
+            anyhow::bail!(
+                "TokenContract {} became active before touchDeal; no stale-record probe was submitted",
+                display_token_contract(deal)
+            );
+        }
+        self.submit_money_call_once(
+            note,
+            PRIVATENOTE_ABI,
+            "touchDeal",
+            json!({ "deal": deal.with_workchain() }),
+            keys,
+        )
+        .await
+        .map_err(|error| {
+            if error.to_string().contains("exit_code=121 (") {
+                anyhow!(
+                    "PrivateNote touchDeal was refused by its {interval}s contract interval \
+                     (ERR_NOTE_BUSY 121); check the note's last touch before retrying: {error:#}"
+                )
+            } else {
+                anyhow!(
+                    "PrivateNote touchDeal submit was not confirmed; check getOutstanding before \
+                     retrying: {error:#}"
+                )
+            }
+        })?;
+
+        let mut last_read_error = None;
+        for read in 0..crate::params::NOTE_DEAL_TOUCH_CONFIRM_MAX_READS {
+            if read > 0 {
+                tokio::time::sleep(crate::params::NOTE_DEAL_TOUCH_CONFIRM_POLL_INTERVAL).await;
+            }
+            match self.private_note_recorded_deals(note).await {
+                Ok(after) if !recorded(&after) => return Ok(Some((before.len(), after.len()))),
+                Ok(_) => last_read_error = None,
+                Err(error) => last_read_error = Some(error),
+            }
+        }
+        if let Some(error) = last_read_error {
+            anyhow::bail!(
+                "PrivateNote touchDeal was submitted, but clearing deal {} could not be confirmed: {error:#}",
+                display_token_contract(deal)
+            );
+        }
+        anyhow::bail!(
+            "PrivateNote touchDeal was submitted, but getOutstanding still records deal {}; \
+             no clearance was confirmed",
+            display_token_contract(deal)
+        )
+    }
+
     /// Read the note's best-effort outstanding mirror and independently check every deal address.
 
     /// The mirror has two opposite blind spots. Its `bounce:false` fill callback can fail before a
@@ -9665,7 +9782,7 @@ impl RealChainBackend {
     /// preflights: `None` is authoritative GraphQL absence (`account: null` or a complete first-page
     /// empty `info: null` account shell), while every transport, schema, decoding, and pagination
     /// failure remains an error.
-    pub(super) async fn token_contract_settlement_receipts_if_present(
+    pub async fn token_contract_settlement_receipts_if_present(
         &self,
         token_contract: &Address,
     ) -> Result<Option<TokenContractSettlementReceipts>> {
@@ -18992,6 +19109,22 @@ mod tests {
             );
         }
         assert_eq!(payload.as_object().expect("object").len(), inputs.len());
+    }
+
+    #[test]
+    fn stale_deal_touch_matches_the_compiled_private_note_abi() {
+        assert_eq!(
+            compiled_abi_inputs(PRIVATENOTE_ABI, "touchDeal").unwrap(),
+            owned(&[("deal", "address")])
+        );
+        let deal = "0:8282828282828282828282828282828282828282828282828282828282828282";
+        let (deals, orders) = decode_private_note_outstanding(&json!({
+            "deals": [deal],
+            "orders": [],
+        }))
+        .unwrap();
+        assert_eq!(deals[0].with_workchain(), deal);
+        assert!(orders.is_empty());
     }
 
     /// The refusals that can be seen for free are seen, and the ones that cannot are NOT claimed.
