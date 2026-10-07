@@ -153,6 +153,7 @@ fn context() -> ReceiptContext {
         expected_code_hash: Some("ab".repeat(32)),
         token_contract: DEAL.to_string(),
         season: None,
+        local_client_stop: None,
     }
 }
 

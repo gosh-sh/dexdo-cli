@@ -275,6 +275,12 @@ pub fn responses_response(
     finish_reason: &str,
     usage: Option<&BillingUsage>,
 ) -> Value {
+    let finish_reason = if content.is_empty() && matches!(finish_reason, "stop" | "capacity") {
+        "empty_output"
+    } else {
+        finish_reason
+    };
+    let usage = if content.is_empty() { None } else { usage };
     let (status, incomplete_details, error) = match finish_reason {
         "stop" => ("completed", Value::Null, Value::Null),
         // A clean terminal usage can spend the exact route grant while still completing
@@ -289,6 +295,14 @@ pub fn responses_response(
             "incomplete",
             serde_json::json!({"reason": "content_filter"}),
             Value::Null,
+        ),
+        "empty_output" => (
+            "failed",
+            Value::Null,
+            serde_json::json!({
+                "code": "empty_output",
+                "message": "upstream produced no assistant text"
+            }),
         ),
         other => (
             "failed",
@@ -700,6 +714,22 @@ mod tests {
             assert_eq!(response["status"], response_status, "{reason}");
             assert_eq!(response["output"][0]["status"], "incomplete", "{reason}");
             assert_eq!(response["output"][0]["content"][0]["text"], "partial");
+        }
+    }
+
+    #[test]
+    fn responses_empty_text_is_failed_without_usage() {
+        let usage = BillingUsage {
+            input_tokens: 1,
+            output_tokens: 8,
+            total_tokens: 9,
+        };
+        for reason in ["stop", "capacity"] {
+            let response = responses_response("resp_1", "dexdo-mock", 1, "", reason, Some(&usage));
+            assert_eq!(response["status"], "failed", "{reason}");
+            assert_eq!(response["output"][0]["status"], "incomplete", "{reason}");
+            assert_eq!(response["error"]["code"], "empty_output", "{reason}");
+            assert_eq!(response["usage"], Value::Null, "{reason}");
         }
     }
 

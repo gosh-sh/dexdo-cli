@@ -199,7 +199,7 @@ fn painted_overhead(palette: Palette, role: Role) -> usize {
 
 /// Both streams are asked, stderr first. Refusals, steps and the live line -- everything this
 /// wrapping is FOR -- go to stderr, and measuring only stdout got the width wrong in the ordinary
-/// case of `dexdo buyer --model X > run.log`: the ioctl on the redirected stdout fails, the width
+/// case of `dexdo buyer --model X --max-price-per-tick 1 > run.log`: the ioctl on the redirected stdout fails, the width
 /// falls back to 120, and the refusal is then folded at 80 by the terminal stderr still points at.
 /// That fold is the exact failure the wrapping was added to prevent.
 pub(crate) fn window_columns() -> usize {

@@ -3772,6 +3772,25 @@ struct BuyerQuoteSubmitOutcome {
     submit_reconciliation: Option<dexdo::buyer::api::BuyerSubmitReconciliation>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct BuyerFreshBuyBudget {
+    ticks: u128,
+    max_price_per_tick: u128,
+    escrow: u128,
+}
+
+fn buyer_fresh_buy_budget(
+    ticks: u128,
+    max_price_per_tick: Option<u128>,
+    escrow: Option<u128>,
+) -> Option<BuyerFreshBuyBudget> {
+    max_price_per_tick.map(|max_price_per_tick| BuyerFreshBuyBudget {
+        ticks,
+        max_price_per_tick,
+        escrow: escrow.unwrap_or_else(|| required_escrow_for_buy(ticks, max_price_per_tick)),
+    })
+}
+
 /// `recovery` is `--resume`, the one entry point whose job is getting out of a crash. It
 /// decides one thing and nothing else: whether a sentinel whose holder the kernel says is GONE may
 /// be taken over. Everything after this point is identical either way, and that is deliberate -- the
@@ -3784,9 +3803,7 @@ async fn raise_pending_buyer_money_before_fresh_reads(
     note_addr: Option<&str>,
     intent: &BuyerSubmitIntent,
     expected_token_contract: Option<&str>,
-    ticks: u128,
-    max_price_per_tick: u128,
-    escrow: u128,
+    requested_budget: Option<BuyerFreshBuyBudget>,
     recovery: bool,
 ) -> Result<Option<BuyerQuoteSubmitOutcome>> {
     let mut money_lock = buyer_money_lock_for_submit(false, note_addr)?.ok_or_else(|| {
@@ -3826,15 +3843,26 @@ async fn raise_pending_buyer_money_before_fresh_reads(
         resting_buy: pending.quoted_order.is_none(),
         quoted_order: pending.quoted_order.clone(),
     };
+    let budget = match requested_budget {
+        Some(budget) => budget,
+        None if recovery => BuyerFreshBuyBudget {
+            ticks: pending.ticks,
+            max_price_per_tick: pending.max_price_per_tick,
+            escrow: pending.escrow,
+        },
+        None => {
+            bail!("a fresh buyer submit requires an explicit --max-price-per-tick; no BOC was sent")
+        }
+    };
     match start_durable_buyer_submit(
         chain,
         buyer,
         intent,
         expected_token_contract,
         &selection,
-        ticks,
-        max_price_per_tick,
-        escrow,
+        budget.ticks,
+        budget.max_price_per_tick,
+        budget.escrow,
         &journal_note,
         &journal_path,
         None,
@@ -10010,14 +10038,18 @@ async fn emit_shared_buyer_event(
 /// One finished consumer request as JSONL fields.
 
 /// Token counts are decimal strings, like every other amount on this surface. Provider-native
-/// input/output/total are null unless a clean terminal usage record was accepted; visible output is
-/// kept separate from the monetary total.
+/// Answer input/output/total are null unless its clean terminal usage record was accepted; the
+/// whole-request totals also include accepted content-verification calls. Visible output remains
+/// separate from both monetary totals.
 fn request_delivery_fields(delivery: &dexdo::buyer::api::RequestDelivery) -> Value {
     json!({
         "token_contract": delivery.token_contract,
         "deal_handle": deals::make_handle_id(&delivery.token_contract, deals::DealHandleRole::Buyer),
+        "request_id": delivery.request_id,
         "protocol": delivery.protocol,
         "streamed": delivery.streamed,
+        "http_status": delivery.http_status,
+        "failure_stage": delivery.failure_stage,
         // Stable v2 output/delivery fields. Their names and meanings cannot change without v3.
         "grant_tokens": delivery.output_limit_tokens.to_string(),
         "rendered_tokens": delivery.rendered_tokens.to_string(),
@@ -10033,6 +10065,9 @@ fn request_delivery_fields(delivery: &dexdo::buyer::api::RequestDelivery) -> Val
         "input_tokens": delivery.input_tokens.map(|tokens| tokens.to_string()),
         "output_tokens": delivery.output_tokens.map(|tokens| tokens.to_string()),
         "billable_tokens": delivery.billable_tokens.map(|tokens| tokens.to_string()),
+        "request_input_tokens": delivery.request_input_tokens.to_string(),
+        "request_output_tokens": delivery.request_output_tokens.to_string(),
+        "request_billable_tokens": delivery.request_billable_tokens.to_string(),
         "route_billable_tokens": delivery
             .route_billable_tokens
             .map(|tokens| tokens.to_string()),
@@ -10084,6 +10119,48 @@ fn observe_request_delivery_usage(
     }
 }
 
+fn bind_confirmed_client_stop_audit(
+    session: &dexdo::buyer::api::SessionSettle,
+    deals_dir: Option<&std::path::Path>,
+    token_contract: &str,
+) -> Result<()> {
+    let dir = deals::resolve_deals_dir(deals_dir)?;
+    let Some((path, _handle)) = deals::resolve_deal_ref(
+        token_contract,
+        &dir,
+        Some(deals::DealHandleRole::Buyer),
+        None,
+    )?
+    else {
+        return Ok(());
+    };
+    let token_contract = token_contract.to_string();
+    session.bind_client_stop_recorder(Arc::new(move |stop| {
+        let persisted = deals::now_unix().and_then(|recorded_at_unix| {
+            deals::persist_last_client_stop(
+                &path,
+                deals::LastClientStop {
+                    reason: stop.reason,
+                    path: stop.path.to_string(),
+                    failure_class: stop.failure_class,
+                    policy_action: stop.policy_action,
+                    terminal_message_id: stop.terminal_message_id,
+                    terminal_created_at: stop.terminal_created_at,
+                    recorded_at_unix,
+                },
+            )
+        });
+        if let Err(error) = persisted {
+            tracing::error!(
+                token_contract = %display_token_contract(&token_contract),
+                %error,
+                "buyer could not persist confirmed client STOP attribution"
+            );
+        }
+    }));
+    Ok(())
+}
+
 fn request_delivery_text(
     delivery: &dexdo::buyer::api::RequestDelivery,
     cumulative: Option<deals::LastObservedUsage>,
@@ -10111,8 +10188,18 @@ fn request_delivery_text(
         None => "session_usage=unavailable".to_string(),
     };
     format!(
-        "buyer request_delivery protocol={} streamed={} {request} {session} finish_reason={}",
-        delivery.protocol, delivery.streamed, delivery.finish_reason
+        "buyer request_delivery request_id={} protocol={} streamed={} http_status={} {request} \
+         request_input_tokens={} request_output_tokens={} request_total_tokens={} {session} \
+         finish_reason={} failure_stage={}",
+        delivery.request_id,
+        delivery.protocol,
+        delivery.streamed,
+        delivery.http_status,
+        delivery.request_input_tokens,
+        delivery.request_output_tokens,
+        delivery.request_billable_tokens,
+        delivery.finish_reason,
+        delivery.failure_stage.unwrap_or("none")
     )
 }
 
@@ -10450,21 +10537,17 @@ async fn prepare_lazy_buyer_api_deal_once(
     raised_money: Option<BuyerQuoteSubmitOutcome>,
     chain_preflight: BuyerChainPreflight,
 ) -> Result<dexdo::buyer::api::ApiDeal> {
+    let requested_budget = buyer_fresh_buy_budget(args.ticks, args.max_price_per_tick, args.escrow);
     let raised_money = if args.mock.mock_chain {
         raised_money
     } else {
-        let escrow = args
-            .escrow
-            .unwrap_or_else(|| required_escrow_for_buy(args.ticks, args.max_price_per_tick));
         raise_pending_buyer_money_before_fresh_reads(
             chain.as_ref(),
             buyer.as_ref(),
             args.identity.note_addr.as_deref(),
             &BuyerSubmitIntent::on_demand(),
             explicit_tc.as_deref(),
-            args.ticks,
-            args.max_price_per_tick,
-            escrow,
+            requested_budget,
             args.resume,
         )
         .await?
@@ -10582,15 +10665,20 @@ async fn prepare_lazy_buyer_api_deal_once(
                     )
                     .await?;
                 } else {
+                    let budget = requested_budget.ok_or_else(|| {
+                        anyhow::anyhow!(
+                            "a fresh buyer continuation requires an explicit --max-price-per-tick"
+                        )
+                    })?;
                     let selection = buyer_quote_selection_for_submit(
                         chain.as_ref(),
                         args.mock.mock_chain,
                         args.identity.note_addr.as_deref(),
                         &BuyerSubmitIntent::on_demand(),
                         Some(&tc),
-                        args.ticks,
-                        args.max_price_per_tick,
-                        args.escrow,
+                        budget.ticks,
+                        budget.max_price_per_tick,
+                        Some(budget.escrow),
                         events
                             .is_none()
                             .then_some((args.as_ref(), frame_model.as_str())),
@@ -10604,12 +10692,12 @@ async fn prepare_lazy_buyer_api_deal_once(
                         quote_selected_fields(
                             &frame_model,
                             &selection,
-                            args.ticks,
-                            args.max_price_per_tick,
+                            budget.ticks,
+                            budget.max_price_per_tick,
                         ),
                     )
                     .await?;
-                    require_stream_buy_ticks(args.ticks)?;
+                    require_stream_buy_ticks(budget.ticks)?;
                     let submit_frame_model = frame_model.clone();
                     let outcome = execute_buyer_quote_submit(
                         chain.as_ref(),
@@ -10619,8 +10707,8 @@ async fn prepare_lazy_buyer_api_deal_once(
                         &BuyerSubmitIntent::on_demand(),
                         Some(&tc),
                         &selection,
-                        args.ticks,
-                        args.max_price_per_tick,
+                        budget.ticks,
+                        budget.max_price_per_tick,
                         selection.escrow,
                         events.is_none().then_some(frame_model.as_str()),
                         |progress| {
@@ -10631,8 +10719,8 @@ async fn prepare_lazy_buyer_api_deal_once(
                                 buyer_submit_event_fields(
                                     &submit_frame_model,
                                     "explicit_token_contract",
-                                    args.ticks,
-                                    args.max_price_per_tick,
+                                    budget.ticks,
+                                    budget.max_price_per_tick,
                                     selection.escrow,
                                     progress,
                                 ),
@@ -10732,11 +10820,14 @@ async fn prepare_lazy_buyer_api_deal_once(
                 }
             }
             None => {
-                let ticks = args.ticks;
-                let max_price = args.max_price_per_tick;
-                let escrow = args
-                    .escrow
-                    .unwrap_or_else(|| dexdo_core::required_escrow_for_buy(ticks, max_price));
+                let budget = requested_budget.ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "a fresh buyer continuation requires an explicit --max-price-per-tick"
+                    )
+                })?;
+                let ticks = budget.ticks;
+                let max_price = budget.max_price_per_tick;
+                let escrow = budget.escrow;
                 service_renewal = Some((ticks, max_price, escrow));
                 let selection = buyer_quote_selection_for_submit(
                     chain.as_ref(),
@@ -11069,6 +11160,13 @@ async fn prepare_lazy_buyer_api_deal_once(
             },
         ),
     );
+    if should_save_handle {
+        bind_confirmed_client_stop_audit(
+            session.as_ref(),
+            args.deals_dir.as_deref(),
+            &token_contract,
+        )?;
+    }
     let weekly = subscription_weekly_budget(&chain, &token_contract, subscription_route_budget);
     let deal = dexdo::buyer::api::ApiDeal::new(
         dexdo::buyer::api::Route {
@@ -11215,6 +11313,29 @@ fn model_only_on_demand_recovery_enabled(
     !has_explicit_token_contract && !has_market_manifest
 }
 
+fn model_only_on_demand_continuation_budget(
+    mock_chain: bool,
+    has_explicit_token_contract: bool,
+    has_market_manifest: bool,
+    budget: Option<BuyerFreshBuyBudget>,
+) -> Option<BuyerFreshBuyBudget> {
+    budget.filter(|_| {
+        model_only_on_demand_recovery_enabled(
+            mock_chain,
+            has_explicit_token_contract,
+            has_market_manifest,
+        )
+    })
+}
+
+fn use_on_demand_local_api(
+    has_local_listener: bool,
+    continuity_mode: ContinuityModeArg,
+    has_active_subscription: bool,
+) -> bool {
+    has_local_listener && continuity_mode == ContinuityModeArg::OnDemand && !has_active_subscription
+}
+
 /// What the operator does now that the model is theirs.
 
 /// This is the last thing a buy prints and the only reason the command was run, so it answers the
@@ -11266,20 +11387,22 @@ fn render_local_openai_handoff(
     addr: std::net::SocketAddr,
     frame_model: &str,
     continuity_mode: ContinuityModeArg,
+    fresh_continuation_enabled: bool,
 ) -> Option<String> {
     if !addr.ip().is_loopback() {
         return None;
     }
     // Named as spending or not spending, because that is what the choice does to an operator's
     // money -- "proactive" and "on-demand" are the flag's words, not an answer to "what will it do".
-    let idle = match continuity_mode {
-        ContinuityModeArg::Proactive => {
-            "keeps a deal warm and may spend while you are not asking; `--continuity on-demand` \
+    let idle = match (fresh_continuation_enabled, continuity_mode) {
+        (false, _) => "serves only the current deal; no replacement BUY is enabled",
+        (true, ContinuityModeArg::Proactive) => {
+            "may pre-buy a replacement while you are not asking; `--continuity-mode on-demand` \
              stops that"
         }
-        ContinuityModeArg::OnDemand => {
-            "spends nothing while you are not asking; the first request after a pause waits for a \
-             fresh deal"
+        (true, ContinuityModeArg::OnDemand) => {
+            "does not pre-buy a replacement while you are not asking; idle alone does not STOP \
+             the current deal"
         }
     };
     use crate::cli::style::{self, Palette, Role};
@@ -11376,11 +11499,13 @@ async fn run_buyer_on_demand_local_api(
     let bind = args
         .local_listen
         .ok_or_else(|| anyhow::anyhow!("on-demand local API requires --local-listen"))?;
-    let recover_terminal_model_deal = model_only_on_demand_recovery_enabled(
+    let continuation_budget = model_only_on_demand_continuation_budget(
         args.mock.mock_chain,
         explicit_tc.is_some(),
         args.market.is_some(),
+        buyer_fresh_buy_budget(args.ticks, args.max_price_per_tick, args.escrow),
     );
+    let recover_terminal_model_deal = continuation_budget.is_some();
     let buyer = Arc::new(buyer);
     let args = Arc::new(args);
     let pre_adopted_deal = if args.resume {
@@ -11465,18 +11590,15 @@ async fn run_buyer_on_demand_local_api(
     );
     state.delivery_events = Some(delivery_tx);
     let deals = state.deals.clone();
-    if recover_terminal_model_deal {
-        let escrow = args
-            .escrow
-            .unwrap_or_else(|| required_escrow_for_buy(args.ticks, args.max_price_per_tick));
+    if let Some(budget) = continuation_budget {
         spawn_buyer_service_renewal(
             chain.clone(),
             buyer,
             deals.clone(),
             args.identity.note_addr.clone(),
-            args.ticks,
-            args.max_price_per_tick,
-            escrow,
+            budget.ticks,
+            budget.max_price_per_tick,
+            budget.escrow,
             dexdo::buyer::continuity::ContinuityMode::OnDemand,
             content_check,
             models_cfg,
@@ -11568,8 +11690,12 @@ async fn run_buyer_on_demand_local_api(
     )
     .await?;
     if events.is_none() {
-        if let Some(handoff) = render_local_openai_handoff(addr, &frame_model, args.continuity_mode)
-        {
+        if let Some(handoff) = render_local_openai_handoff(
+            addr,
+            &frame_model,
+            args.continuity_mode,
+            continuation_budget.is_some(),
+        ) {
             // Everything the plan declared is behind, so the checklist ticks its last step and the
             // live line goes: what follows is the result, and a result is never printed under a line
             // that is still redrawing itself.
@@ -11816,7 +11942,11 @@ async fn run_buyer_inner(
     // this CLI path submits a limit BUY, so its max price must be a positive
     // whole multiple of PRICE_STEP (1 SHELL), rejected before any submit/escrow. The contract's
     // separate FLAG_MARKET path is the sole price-less exception; this command does not claim it.
-    super::support::validate_price_step(args.max_price_per_tick)?;
+    if let Some(max_price_per_tick) = args.max_price_per_tick {
+        super::support::validate_price_step(max_price_per_tick)?;
+    } else if !args.resume {
+        bail!("a fresh buyer invocation requires --max-price-per-tick");
+    }
     // Which note, settled ONCE -- and after the price check above, which refuses a ceiling that is
     // not a whole PRICE_STEP before any file is touched. Asking the operator to choose a note in
     // front of a refusal their own arguments had already earned is a question they should never see.
@@ -12189,29 +12319,26 @@ async fn run_buyer_inner(
     } else {
         BuyerSubmitIntent::foreground()
     };
+    let requested_budget = buyer_fresh_buy_budget(args.ticks, args.max_price_per_tick, args.escrow);
     let raised_money = if args.mock.mock_chain || subscription_resume.is_active() {
         None
     } else {
-        let escrow = args
-            .escrow
-            .unwrap_or_else(|| required_escrow_for_buy(args.ticks, args.max_price_per_tick));
         raise_pending_buyer_money_before_fresh_reads(
             chain.as_ref(),
             &buyer,
             args.identity.note_addr.as_deref(),
             &submit_intent,
             explicit_tc.as_deref(),
-            args.ticks,
-            args.max_price_per_tick,
-            escrow,
+            requested_budget,
             args.resume,
         )
         .await?
     };
-    if args.local_listen.is_some()
-        && args.continuity_mode == ContinuityModeArg::OnDemand
-        && !subscription_resume.is_active()
-    {
+    if use_on_demand_local_api(
+        args.local_listen.is_some(),
+        args.continuity_mode,
+        subscription_resume.is_active(),
+    ) {
         let events = machine_events
             .take()
             .map(|writer| Arc::new(tokio::sync::Mutex::new(writer)));
@@ -12378,6 +12505,9 @@ async fn run_buyer_inner(
                         );
                     }
                 } else {
+                    let budget = requested_budget.ok_or_else(|| {
+                        anyhow::anyhow!("a fresh buyer invocation requires --max-price-per-tick")
+                    })?;
                     require_stream_buy_ticks(args.ticks)?;
                     let selection = buyer_quote_selection_for_submit(
                         chain.as_ref(),
@@ -12385,9 +12515,9 @@ async fn run_buyer_inner(
                         args.identity.note_addr.as_deref(),
                         &submit_intent,
                         Some(&tc),
-                        args.ticks,
-                        args.max_price_per_tick,
-                        args.escrow,
+                        budget.ticks,
+                        budget.max_price_per_tick,
+                        Some(budget.escrow),
                         machine_events
                             .is_none()
                             .then_some((&args, frame_model.as_str())),
@@ -12398,8 +12528,8 @@ async fn run_buyer_inner(
                             events,
                             &frame_model,
                             &selection,
-                            args.ticks,
-                            args.max_price_per_tick,
+                            budget.ticks,
+                            budget.max_price_per_tick,
                             machine_context.fields(),
                         )?
                         .is_some()
@@ -12412,8 +12542,8 @@ async fn run_buyer_inner(
                             quote_selected_fields(
                                 &frame_model,
                                 &selection,
-                                args.ticks,
-                                args.max_price_per_tick,
+                                budget.ticks,
+                                budget.max_price_per_tick,
                             ),
                         )?;
                     } else {
@@ -12422,8 +12552,8 @@ async fn run_buyer_inner(
                     require_stream_buy_ticks(args.ticks)?;
                     let submitted_escrow = selection.escrow;
                     let submit_frame_model = frame_model.clone();
-                    let submit_ticks = args.ticks;
-                    let submit_max_price = args.max_price_per_tick;
+                    let submit_ticks = budget.ticks;
+                    let submit_max_price = budget.max_price_per_tick;
                     let outcome = execute_buyer_quote_submit(
                         chain.as_ref(),
                         &buyer,
@@ -12432,8 +12562,8 @@ async fn run_buyer_inner(
                         &submit_intent,
                         Some(&tc),
                         &selection,
-                        args.ticks,
-                        args.max_price_per_tick,
+                        budget.ticks,
+                        budget.max_price_per_tick,
                         submitted_escrow,
                         machine_events.is_none().then_some(frame_model.as_str()),
                         |progress| {
@@ -12573,13 +12703,17 @@ async fn run_buyer_inner(
                 }
             }
             None => {
+                let budget = requested_budget.ok_or_else(|| {
+                    anyhow::anyhow!("a fresh buyer invocation requires --max-price-per-tick")
+                })?;
                 // Show the book, THEN let the buyer choose how many ticks and the per-tick price ceiling
-                // (the flags `--ticks`/`--max-price-per-tick` are the defaults / the non-interactive value).
+                // (`--ticks` has a default; `--max-price-per-tick` is the explicit
+                // non-interactive value).
                 let (ticks, max_price) = if machine_events.is_none() {
                     render_inference_book(
                         chain.as_ref(),
                         &frame_model,
-                        args.max_price_per_tick,
+                        budget.max_price_per_tick,
                         args.ticks,
                     )
                     .await
@@ -12588,7 +12722,7 @@ async fn run_buyer_inner(
                             &args,
                             &frame_model,
                             args.ticks,
-                            args.max_price_per_tick,
+                            budget.max_price_per_tick,
                         );
                         human_buyer_quote_error(
                             error,
@@ -12596,7 +12730,7 @@ async fn run_buyer_inner(
                             BuyRequest {
                                 model: &frame_model,
                                 ticks: args.ticks,
-                                max_price_per_tick: args.max_price_per_tick,
+                                max_price_per_tick: budget.max_price_per_tick,
                             },
                         )
                     })?;
@@ -12610,16 +12744,16 @@ async fn run_buyer_inner(
                             prompt_u128("How many ticks to buy", args.ticks)
                         },
                         if crate::cli::command_line::was_answered("max_price_per_tick") {
-                            args.max_price_per_tick
+                            budget.max_price_per_tick
                         } else {
                             prompt_price_shell(
                                 "Maximum price per tick, in SHELL",
-                                args.max_price_per_tick,
+                                budget.max_price_per_tick,
                             )
                         },
                     )
                 } else {
-                    (args.ticks, args.max_price_per_tick)
+                    (budget.ticks, budget.max_price_per_tick)
                 };
                 super::support::validate_price_step(max_price)?;
                 // Escrow: an explicit `--escrow` wins (checked == required downstream); otherwise the exact
@@ -13003,6 +13137,13 @@ async fn run_buyer_inner(
                 api::SessionLifetimePolicy::SettleOnExit
             },
         ));
+        if should_save_handle {
+            bind_confirmed_client_stop_audit(
+                session.as_ref(),
+                args.deals_dir.as_deref(),
+                &token_contract,
+            )?;
+        }
         let (content_check, models_cfg) = buyer_content_policy
             .expect("local-listen buyer content policy is preflighted before buy");
         let renewal_content_check = content_check.clone();
@@ -13033,6 +13174,7 @@ async fn run_buyer_inner(
         );
         state.delivery_events = Some(delivery_tx);
         let deals = state.deals.clone();
+        let fresh_continuation_enabled = service_renewal.is_some();
         if let Some((ticks, max_price, escrow)) = service_renewal {
             spawn_buyer_service_renewal(
                 chain.clone(),
@@ -13101,9 +13243,12 @@ async fn run_buyer_inner(
                     "anthropic_compat": args.anthropic_compat
                 }),
             )?;
-        } else if let Some(handoff) =
-            render_local_openai_handoff(addr, &frame_model, args.continuity_mode)
-        {
+        } else if let Some(handoff) = render_local_openai_handoff(
+            addr,
+            &frame_model,
+            args.continuity_mode,
+            fresh_continuation_enabled,
+        ) {
             // The route the operator is on by default (`--continuity proactive`). The pair below
             // existed only on the on-demand route, so on the ordinary run the result was printed
             // straight onto the live line -- measured: `<spinner> [3/4]... 8sdeal_handle=deal-0-...`, and
@@ -13235,6 +13380,13 @@ async fn run_buyer_inner(
             dexdo::buyer::api::SessionLifetimePolicy::SettleOnExit
         },
     );
+    if should_save_handle {
+        bind_confirmed_client_stop_audit(
+            &oneshot_session,
+            args.deals_dir.as_deref(),
+            &token_contract,
+        )?;
+    }
     // the figure this refuses on is recomputed from the fresh resume snapshot against the clock,
     // never a cached scalar -- a stored `weekBaseTokens` that no boundary has booked yet cannot turn a
     // live subscription into a permanent one-shot refusal.
@@ -13375,8 +13527,11 @@ mod tests {
     fn request_delivery_fields_match_the_machine_contract() {
         let fields = super::request_delivery_fields(&dexdo::buyer::api::RequestDelivery {
             token_contract: "0:3333".to_string(),
+            request_id: "req-dexdo-test".to_string(),
             protocol: "openai",
             streamed: true,
+            http_status: 200,
+            failure_stage: None,
             billing_grant_tokens: 2_500_000,
             output_limit_tokens: 2_000_000,
             visible_output_tokens: 1_972_000,
@@ -13385,6 +13540,9 @@ mod tests {
             input_tokens: Some(500_000),
             output_tokens: Some(1_972_000),
             billable_tokens: Some(2_472_000),
+            request_input_tokens: 500_011,
+            request_output_tokens: 1_972_000,
+            request_billable_tokens: 2_472_011,
             route_billable_tokens: Some(3_472_000),
             finish_reason: "stop",
             truncated_by_output_limit: false,
@@ -13401,13 +13559,19 @@ mod tests {
                 "deal_handle",
                 "ended_before_grant",
                 "ended_before_output_limit",
+                "failure_stage",
                 "finish_reason",
                 "grant_tokens",
+                "http_status",
                 "input_tokens",
                 "output_limit_tokens",
                 "output_tokens",
                 "protocol",
                 "rendered_tokens",
+                "request_billable_tokens",
+                "request_id",
+                "request_input_tokens",
+                "request_output_tokens",
                 "route_billable_tokens",
                 "route_delivered_tokens",
                 "streamed",
@@ -13428,6 +13592,9 @@ mod tests {
         );
         assert_eq!(fields["protocol"], "openai");
         assert_eq!(fields["streamed"], serde_json::json!(true));
+        assert_eq!(fields["request_id"], "req-dexdo-test");
+        assert_eq!(fields["http_status"], 200);
+        assert_eq!(fields["failure_stage"], serde_json::Value::Null);
         // Strings, not numbers: an orchestrator that reads amounts as JSON floats loses precision
         // long before it reaches a week's worth of tokens.
         assert_eq!(fields["billing_grant_tokens"], "2500000");
@@ -13439,6 +13606,9 @@ mod tests {
         assert_eq!(fields["input_tokens"], "500000");
         assert_eq!(fields["output_tokens"], "1972000");
         assert_eq!(fields["billable_tokens"], "2472000");
+        assert_eq!(fields["request_input_tokens"], "500011");
+        assert_eq!(fields["request_output_tokens"], "1972000");
+        assert_eq!(fields["request_billable_tokens"], "2472011");
         assert_eq!(fields["route_billable_tokens"], "3472000");
         assert_eq!(fields["finish_reason"], "stop");
         assert_eq!(
@@ -13484,8 +13654,11 @@ mod tests {
         crate::cli::deals::save_deal_handle(dir.path(), &handle).unwrap();
         let delivery = dexdo::buyer::api::RequestDelivery {
             token_contract,
+            request_id: "req-dexdo-readable".to_string(),
             protocol: "openai",
             streamed: false,
+            http_status: 200,
+            failure_stage: None,
             billing_grant_tokens: 1_000_000,
             output_limit_tokens: 256,
             visible_output_tokens: 57,
@@ -13494,6 +13667,9 @@ mod tests {
             input_tokens: Some(7),
             output_tokens: Some(57),
             billable_tokens: Some(64),
+            request_input_tokens: 7,
+            request_output_tokens: 57,
+            request_billable_tokens: 64,
             route_billable_tokens: Some(64),
             finish_reason: "stop",
             truncated_by_output_limit: false,
@@ -13513,10 +13689,12 @@ mod tests {
 
         assert_eq!(
             super::request_delivery_text(&delivery, Some(cumulative)),
-            "buyer request_delivery protocol=openai streamed=false input_tokens=7 \
-             output_tokens=57 total_tokens=64 session_input_tokens=14 \
+            "buyer request_delivery request_id=req-dexdo-readable protocol=openai streamed=false \
+             http_status=200 input_tokens=7 output_tokens=57 total_tokens=64 \
+             request_input_tokens=7 request_output_tokens=57 request_total_tokens=64 \
+             session_input_tokens=14 \
              session_output_tokens=114 session_total_tokens=128 \
-             session_tick_fraction=128/1000000 finish_reason=stop"
+             session_tick_fraction=128/1000000 finish_reason=stop failure_stage=none"
         );
     }
 
@@ -13524,8 +13702,11 @@ mod tests {
     fn request_without_accepted_terminal_usage_is_not_persisted_as_zero() {
         let delivery = dexdo::buyer::api::RequestDelivery {
             token_contract: "0:3333".to_string(),
+            request_id: "req-dexdo-failed".to_string(),
             protocol: "openai",
             streamed: true,
+            http_status: 502,
+            failure_stage: Some("upstream_stream"),
             billing_grant_tokens: 1_000_000,
             output_limit_tokens: 256,
             visible_output_tokens: 1,
@@ -13534,6 +13715,9 @@ mod tests {
             input_tokens: None,
             output_tokens: None,
             billable_tokens: None,
+            request_input_tokens: 0,
+            request_output_tokens: 0,
+            request_billable_tokens: 0,
             route_billable_tokens: Some(0),
             finish_reason: "error",
             truncated_by_output_limit: false,
@@ -13545,8 +13729,49 @@ mod tests {
             .is_none());
         assert_eq!(
             super::request_delivery_text(&delivery, None),
-            "buyer request_delivery protocol=openai streamed=true usage=unavailable \
-             session_usage=unavailable finish_reason=error"
+            "buyer request_delivery request_id=req-dexdo-failed protocol=openai streamed=true \
+             http_status=502 usage=unavailable request_input_tokens=0 request_output_tokens=0 \
+             request_total_tokens=0 \
+             session_usage=unavailable finish_reason=error failure_stage=upstream_stream"
+        );
+    }
+
+    #[test]
+    fn paid_pre_answer_failure_exposes_request_usage_split_in_human_text() {
+        let delivery = dexdo::buyer::api::RequestDelivery {
+            token_contract: "0:3333".to_string(),
+            request_id: "req-dexdo-paid-502".to_string(),
+            protocol: "openai_responses",
+            streamed: false,
+            http_status: 502,
+            failure_stage: Some("content_verification"),
+            billing_grant_tokens: 1_000_000,
+            output_limit_tokens: 256,
+            visible_output_tokens: 0,
+            rendered_tokens: 0,
+            route_delivered_tokens: Some(64),
+            input_tokens: None,
+            output_tokens: None,
+            billable_tokens: None,
+            request_input_tokens: 2,
+            request_output_tokens: 64,
+            request_billable_tokens: 66,
+            route_billable_tokens: Some(66),
+            finish_reason: "error",
+            truncated_by_output_limit: false,
+            ended_before_output_limit: true,
+        };
+
+        assert!(super::persist_buyer_last_observed_usage(None, &delivery)
+            .unwrap()
+            .is_none());
+        assert_eq!(
+            super::request_delivery_text(&delivery, None),
+            "buyer request_delivery request_id=req-dexdo-paid-502 \
+             protocol=openai_responses streamed=false http_status=502 usage=unavailable \
+             request_input_tokens=2 request_output_tokens=64 request_total_tokens=66 \
+             session_usage=unavailable finish_reason=error \
+             failure_stage=content_verification"
         );
     }
 
@@ -13712,14 +13937,14 @@ mod tests {
         for (mode, idle) in [
             (
                 super::ContinuityModeArg::Proactive,
-                "may spend while you are not asking",
+                "may pre-buy a replacement while you are not asking",
             ),
             (
                 super::ContinuityModeArg::OnDemand,
-                "spends nothing while you are not asking",
+                "idle alone does not STOP the current deal",
             ),
         ] {
-            let output = super::render_local_openai_handoff(addr, "Qwen3-32B", mode)
+            let output = super::render_local_openai_handoff(addr, "Qwen3-32B", mode, true)
                 .expect("loopback handoff");
 
             // The machine half, unchanged and at the start of its own line: whatever reads this with
@@ -13760,10 +13985,28 @@ mod tests {
                 "192.0.2.1:8080".parse().unwrap(),
                 "Qwen3-32B",
                 super::ContinuityModeArg::Proactive,
+                true,
             )
             .is_none(),
             "the local placeholder block must not invent an external endpoint"
         );
+    }
+
+    #[test]
+    fn price_less_default_proactive_resume_handoff_never_promises_idle_spending() {
+        let output = super::render_local_openai_handoff(
+            "127.0.0.1:8080".parse().unwrap(),
+            "Qwen3-32B",
+            super::ContinuityModeArg::Proactive,
+            false,
+        )
+        .expect("loopback handoff");
+
+        assert!(
+            output.contains("serves only the current deal; no replacement BUY is enabled"),
+            "{output}"
+        );
+        assert!(!output.contains("may pre-buy"), "{output}");
     }
 
     #[tokio::test]
@@ -13828,7 +14071,10 @@ mod tests {
             hint.contains("next=seller_wait_delivery_then_accept_probe"),
             "{hint}"
         );
-        assert!(hint.contains("first delivered canonical tick"), "{hint}");
+        assert!(
+            hint.contains("first accepted billable input+output usage"),
+            "{hint}"
+        );
         assert!(hint.contains("after PROBE_WINDOW"), "{hint}");
         assert!(hint.contains("TokenContract.acceptProbe()"), "{hint}");
         assert!(hint.contains("TokenContract.sellerStop()"), "{hint}");
@@ -14260,7 +14506,8 @@ mod tests {
         let provider_secret_path = "/tmp/provider-secret-do-not-print.json";
         let argv = format!(
             "dexdo buyer --note-key {secret_key_path} --note-addr {note_addr} \
-             --endpoints-file {provider_secret_path} --models /tmp/models.json"
+             --endpoints-file {provider_secret_path} --models /tmp/models.json \
+             --max-price-per-tick 10"
         );
         let cli = crate::Cli::try_parse_from(argv.split_whitespace()).expect("parse buyer fixture");
         let crate::Command::Buyer(args) = cli.command else {
@@ -14312,7 +14559,8 @@ mod tests {
         // The same builder, with values a naive split would break on.
         let hostile = format!(
             "dexdo buyer --note-key {secret_key_path} --note-addr {note_addr} \
-             --endpoints-file {provider_secret_path} --models '/tmp/my models.json'"
+             --endpoints-file {provider_secret_path} --models '/tmp/my models.json' \
+             --max-price-per-tick 10"
         );
         let hostile_cli = crate::Cli::try_parse_from(
             crate::cli::support::printed_commands::shell_split(&hostile)
@@ -14479,7 +14727,7 @@ mod tests {
         }
         let line = format!(
             "dexdo buyer --mock-chain --mock-model --note-addr {note_addr} \
-             --endpoints-file {endpoints} --models {models}"
+             --endpoints-file {endpoints} --models {models} --max-price-per-tick 1"
         );
         let cli =
             crate::Cli::try_parse_from(line.split_whitespace()).expect("parse mock buyer fixture");
@@ -16375,7 +16623,7 @@ mod tests {
                     allow_unverified_model: true,
                     models: dir.join("models.json"),
                     ticks: 1,
-                    max_price_per_tick: dexdo_core::PRICE_STEP,
+                    max_price_per_tick: Some(dexdo_core::PRICE_STEP),
                     escrow: None,
                     policy: None,
                 },
@@ -17203,6 +17451,68 @@ mod tests {
         assert!(
             body.find("spawn_buyer_service_renewal").unwrap() < body.find("api::serve").unwrap(),
             "model-only recovery monitor must start before the local API serves requests"
+        );
+    }
+
+    #[test]
+    fn price_less_resume_disables_continuation_and_explicit_price_is_exact() {
+        let chosen = 7 * dexdo_core::PRICE_STEP;
+        let missing = super::model_only_on_demand_continuation_budget(
+            false,
+            false,
+            false,
+            super::buyer_fresh_buy_budget(4, None, None),
+        );
+        assert_eq!(missing, None, "no price means no fresh continuation");
+        let explicit = super::model_only_on_demand_continuation_budget(
+            false,
+            false,
+            false,
+            super::buyer_fresh_buy_budget(4, Some(chosen), None),
+        )
+        .expect("an explicit price authorizes continuation");
+        assert_eq!(
+            explicit.max_price_per_tick, chosen,
+            "continuation must preserve the operator's exact ceiling"
+        );
+        let explicit_target = super::model_only_on_demand_continuation_budget(
+            false,
+            true,
+            false,
+            super::buyer_fresh_buy_budget(4, Some(chosen), None),
+        );
+        assert_eq!(
+            explicit_target, None,
+            "an explicit TokenContract resume never installs continuation"
+        );
+        let market_target = super::model_only_on_demand_continuation_budget(
+            false,
+            false,
+            true,
+            super::buyer_fresh_buy_budget(4, Some(chosen), None),
+        );
+        assert_eq!(
+            market_target, None,
+            "a market-target resume never installs continuation"
+        );
+        assert!(
+            !super::use_on_demand_local_api(true, super::ContinuityModeArg::OnDemand, true),
+            "an active subscription must stay on its non-renewing adopted-deal path"
+        );
+
+        let source = include_str!("buyer.rs");
+        let start = source
+            .find("async fn run_buyer_on_demand_local_api")
+            .unwrap();
+        let end = source[start..]
+            .find("async fn run_buyer_inner")
+            .map(|offset| start + offset)
+            .unwrap();
+        let body = &source[start..end];
+        assert!(
+            body.contains("let recover_terminal_model_deal = continuation_budget.is_some()")
+                && body.contains("if let Some(budget) = continuation_budget"),
+            "both lazy replacement and the renewal monitor must require an explicit continuation budget"
         );
     }
 
@@ -24842,7 +25152,7 @@ mod tests {
             allow_unverified_model: true,
             models: dir.join("models.json"),
             ticks: 2,
-            max_price_per_tick: dexdo_core::PRICE_STEP,
+            max_price_per_tick: Some(dexdo_core::PRICE_STEP),
             escrow: None,
             policy: Some(policy_path),
         }
@@ -26543,7 +26853,7 @@ mod tests {
             allow_unverified_model: true,
             models: dir.join("models.json"),
             ticks: fixture.ticks,
-            max_price_per_tick: fixture.max_price_per_tick,
+            max_price_per_tick: Some(fixture.max_price_per_tick),
             escrow: Some(fixture.escrow),
             policy: None,
         });
@@ -26870,7 +27180,7 @@ mod tests {
             allow_unverified_model: true,
             models: dir.join("models.json"),
             ticks: fixture.ticks,
-            max_price_per_tick: fixture.max_price_per_tick,
+            max_price_per_tick: Some(fixture.max_price_per_tick),
             escrow: Some(fixture.escrow),
             policy: Some(policy_path),
         };
@@ -27246,7 +27556,7 @@ mod tests {
             allow_unverified_model: true,
             models: dir.join("models.json"),
             ticks: journal.ticks,
-            max_price_per_tick: journal.max_price_per_tick,
+            max_price_per_tick: Some(journal.max_price_per_tick),
             escrow: Some(journal.escrow),
             policy: Some(policy_path),
         };
@@ -28160,7 +28470,7 @@ mod tests {
             allow_unverified_model: true,
             models: dir.join("models.json"),
             ticks: SPOT_RESUME_TEST_TICKS,
-            max_price_per_tick: dexdo_core::PRICE_STEP,
+            max_price_per_tick: Some(dexdo_core::PRICE_STEP),
             escrow: Some(dexdo_core::required_escrow_for_buy(
                 SPOT_RESUME_TEST_TICKS,
                 dexdo_core::PRICE_STEP,
@@ -29609,7 +29919,7 @@ mod tests {
             allow_unverified_model: true,
             models: dir.join("models.json"),
             ticks: fixture.ticks,
-            max_price_per_tick: fixture.max_price_per_tick,
+            max_price_per_tick: Some(fixture.max_price_per_tick),
             escrow: Some(fixture.escrow),
             policy: Some(policy_path),
         };
@@ -29715,11 +30025,22 @@ mod tests {
     // This test must serialize process-global DEXDO_PN_POOL for the full async scenario.
     #[allow(clippy::await_holding_lock)]
     #[tokio::test]
-    async fn real_entry_raise_reconciles_before_fresh_reads_and_uses_journal_budget() {
+    async fn price_less_resume_reconciles_before_fresh_reads_and_uses_journal_budget() {
         let _env_lock = dexdo_pn_pool_env_lock().lock().unwrap();
         let (dir, _cleanup) = buyer_journal_test_dir("buyer-entry-raise");
         let pool_path = dir.join("pool.json");
-        let fixture = buyer_submit_test_journal();
+        let mut fixture = buyer_submit_test_journal();
+        fixture.max_price_per_tick = 7 * dexdo_core::PRICE_STEP;
+        fixture.escrow =
+            dexdo_core::required_escrow_for_buy(fixture.ticks, fixture.max_price_per_tick);
+        fixture
+            .quoted_order
+            .as_mut()
+            .expect("fixture has one quoted ask")
+            .price_per_tick = fixture.max_price_per_tick;
+        fixture.quote.total_with_fee = fixture.escrow;
+        fixture.quote.fills[0].price_per_tick = fixture.max_price_per_tick;
+        fixture.quote.fills[0].cost_with_fee = fixture.escrow;
         crate::cli::support::write_owner_only_key_fixture(
             &pool_path,
             &serde_json::to_string_pretty(&serde_json::json!({
@@ -29756,16 +30077,19 @@ mod tests {
             order_facts: Vec::new(),
         };
         let buyer = dexdo::buyer::Buyer::generate();
+        assert_ne!(
+            fixture.max_price_per_tick,
+            dexdo_core::PRICE_STEP,
+            "the regression must not accidentally pass on the removed 1-SHELL placeholder"
+        );
         let outcome = super::raise_pending_buyer_money_before_fresh_reads(
             &chain,
             &buyer,
             Some(&fixture.note_addr),
             &fixture.intent,
             fixture.expected_token_contract.as_deref(),
-            fixture.ticks,
-            fixture.max_price_per_tick,
-            fixture.escrow,
-            false,
+            None,
+            true,
         )
         .await
         .unwrap()
@@ -29780,6 +30104,8 @@ mod tests {
         );
         assert_eq!(outcome.token_contract, fill.token_contract);
         assert_eq!(outcome.ticks, fixture.ticks);
+        assert_eq!(outcome.max_price_per_tick, fixture.max_price_per_tick);
+        assert_eq!(outcome.escrow, fixture.escrow);
         assert_eq!(
             super::consumer_api_token_budget(outcome.ticks),
             super::consumer_api_token_budget(fixture.ticks),
@@ -29803,9 +30129,11 @@ mod tests {
             Some(&fixture.note_addr),
             &fixture.intent,
             fixture.expected_token_contract.as_deref(),
-            fixture.ticks + 6,
-            fixture.max_price_per_tick,
-            fixture.escrow,
+            Some(super::BuyerFreshBuyBudget {
+                ticks: fixture.ticks + 6,
+                max_price_per_tick: fixture.max_price_per_tick,
+                escrow: fixture.escrow,
+            }),
             false,
         )
         .await
@@ -29850,9 +30178,11 @@ mod tests {
                 Some(&fixture.note_addr),
                 &fixture.intent,
                 expected_tc,
-                ticks,
-                max_price,
-                escrow,
+                Some(super::BuyerFreshBuyBudget {
+                    ticks,
+                    max_price_per_tick: max_price,
+                    escrow,
+                }),
                 false,
             )
             .await
@@ -29994,9 +30324,11 @@ mod tests {
                 Some(&fixture.note_addr),
                 &intent,
                 fixture.expected_token_contract.as_deref(),
-                fixture.ticks,
-                fixture.max_price_per_tick,
-                fixture.escrow,
+                Some(super::BuyerFreshBuyBudget {
+                    ticks: fixture.ticks,
+                    max_price_per_tick: fixture.max_price_per_tick,
+                    escrow: fixture.escrow,
+                }),
                 false,
             )
             .await
@@ -30114,7 +30446,7 @@ mod tests {
             allow_unverified_model: true,
             models: dir.join("models.json"),
             ticks: fixture.ticks,
-            max_price_per_tick: fixture.max_price_per_tick,
+            max_price_per_tick: Some(fixture.max_price_per_tick),
             escrow: Some(fixture.escrow),
             policy: None,
         });

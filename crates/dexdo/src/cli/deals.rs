@@ -9,10 +9,12 @@ use std::path::{Path, PathBuf};
 
 /// Durable deal-record schema written by this runtime. An absent field is the understood
 /// pre-versioning schema 0; this value changes only when the record meaning changes.
-pub(crate) const DEAL_HANDLE_VERSION: u32 = 3;
+pub(crate) const DEAL_HANDLE_VERSION: u32 = 5;
 
 const LAST_OBSERVED_PROMOTION_FIELD: &str = "last_observed_promotion";
 const LAST_OBSERVED_USAGE_FIELD: &str = "last_observed_usage";
+const LAST_CLIENT_STOP_FIELD: &str = "last_client_stop";
+const PROVISION_PENDING_FIELD: &str = "provision_pending";
 
 #[derive(Debug, Deserialize)]
 struct DealHandleVersionProbe {
@@ -133,6 +135,21 @@ pub(crate) struct LastObservedUsage {
     pub(crate) total_tokens: u64,
 }
 
+/// A buyer STOP this client positively matched to the terminal transaction's inbound message.
+/// The message id is the join key used by `settlement-receipt`; an attempted or ambiguous submit is
+/// never stored as a confirmed cause.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct LastClientStop {
+    pub(crate) reason: String,
+    pub(crate) path: String,
+    pub(crate) failure_class: Option<String>,
+    pub(crate) policy_action: Option<String>,
+    pub(crate) terminal_message_id: String,
+    pub(crate) terminal_created_at: u64,
+    pub(crate) recorded_at_unix: u64,
+}
+
 impl LastObservedUsage {
     fn checked_after(
         self,
@@ -178,8 +195,10 @@ impl From<DealChainState> for LastObservedPromotion {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct DealRecord {
     pub(crate) handle: DealHandle,
+    pub(crate) provision_pending: bool,
     pub(crate) last_observed_promotion: Option<LastObservedPromotion>,
     pub(crate) last_observed_usage: Option<LastObservedUsage>,
+    pub(crate) last_client_stop: Option<LastClientStop>,
 }
 
 // `Placed`/`FundedButNeverOpened`/`Disputed` are produced only by the chain-state summariser.
@@ -347,17 +366,29 @@ pub(crate) fn save_deal_handle(dir: &Path, handle: &DealHandle) -> Result<PathBu
     let _lock = acquire_deal_record_lock(&path)?;
     // A runtime restart rewrites the same durable identity. Retain a valid observation already in
     // that record rather than erasing the only non-circular audit fact before a later settlement.
-    let (last_observed_promotion, last_observed_usage) = if path.exists() {
-        let record = load_deal_record(&path)?;
-        if same_deal_side(&record.handle, handle) {
-            (record.last_observed_promotion, record.last_observed_usage)
+    let (provision_pending, last_observed_promotion, last_observed_usage, last_client_stop) =
+        if path.exists() {
+            let record = load_deal_record(&path)?;
+            if same_deal_side(&record.handle, handle) {
+                (
+                    record.provision_pending,
+                    record.last_observed_promotion,
+                    record.last_observed_usage,
+                    record.last_client_stop,
+                )
+            } else {
+                (false, None, None, None)
+            }
         } else {
-            (None, None)
-        }
-    } else {
-        (None, None)
-    };
-    let bytes = serialize_deal_record(handle, last_observed_promotion, last_observed_usage)?;
+            (false, None, None, None)
+        };
+    let bytes = serialize_deal_record(
+        handle,
+        provision_pending,
+        last_observed_promotion,
+        last_observed_usage,
+        last_client_stop,
+    )?;
     write_private_atomic(&path, &bytes)?;
     Ok(path)
 }
@@ -406,13 +437,37 @@ pub(crate) fn load_deal_record(path: &Path) -> Result<DealRecord> {
             )
         })?
         .flatten();
+    let last_client_stop = object
+        .remove(LAST_CLIENT_STOP_FIELD)
+        .map(serde_json::from_value)
+        .transpose()
+        .map_err(|e| {
+            anyhow::anyhow!(
+                "parse deal handle {} field {LAST_CLIENT_STOP_FIELD}: {e}",
+                path.display()
+            )
+        })?
+        .flatten();
+    let provision_pending = object
+        .remove(PROVISION_PENDING_FIELD)
+        .map(serde_json::from_value)
+        .transpose()
+        .map_err(|e| {
+            anyhow::anyhow!(
+                "parse deal handle {} field {PROVISION_PENDING_FIELD}: {e}",
+                path.display()
+            )
+        })?
+        .unwrap_or(false);
     let h: DealHandle = serde_json::from_value(value)
         .map_err(|e| anyhow::anyhow!("parse deal handle {}: {e}", path.display()))?;
     validate_deal_handle(&h)?;
     Ok(DealRecord {
         handle: h,
+        provision_pending,
         last_observed_promotion,
         last_observed_usage,
+        last_client_stop,
     })
 }
 
@@ -450,6 +505,30 @@ pub(crate) fn accumulate_last_observed_usage(
     })
 }
 
+pub(crate) fn persist_last_client_stop(path: &Path, stop: LastClientStop) -> Result<()> {
+    update_deal_record(path, |record| {
+        let changed = record.handle.version != DEAL_HANDLE_VERSION
+            || record.last_client_stop.as_ref() != Some(&stop);
+        record.handle.version = DEAL_HANDLE_VERSION;
+        record.last_client_stop = Some(stop);
+        Ok(((), changed))
+    })
+}
+
+/// Mark the deterministic seller deal as reserved before its non-idempotent deploy POST.
+
+/// A true value survives a lost response or process exit and therefore occupies capacity until
+/// the expected TokenContract becomes readable. False is written only after the outcome is known.
+pub(crate) fn persist_provision_pending(path: &Path, pending: bool) -> Result<()> {
+    update_deal_record(path, |record| {
+        let changed =
+            record.handle.version != DEAL_HANDLE_VERSION || record.provision_pending != pending;
+        record.handle.version = DEAL_HANDLE_VERSION;
+        record.provision_pending = pending;
+        Ok(((), changed))
+    })
+}
+
 fn update_usage(
     record: &mut DealRecord,
     input_tokens: u64,
@@ -481,8 +560,10 @@ fn update_deal_record<T>(
     if changed {
         let bytes = serialize_deal_record(
             &record.handle,
+            record.provision_pending,
             record.last_observed_promotion,
             record.last_observed_usage,
+            record.last_client_stop,
         )?;
         write_private_atomic(path, &bytes)?;
     }
@@ -811,10 +892,19 @@ fn same_deal_side(left: &DealHandle, right: &DealHandle) -> bool {
 
 fn serialize_deal_record(
     handle: &DealHandle,
+    provision_pending: bool,
     last_observed_promotion: Option<LastObservedPromotion>,
     last_observed_usage: Option<LastObservedUsage>,
+    last_client_stop: Option<LastClientStop>,
 ) -> Result<Vec<u8>> {
     let mut value = serde_json::to_value(handle)?;
+    value
+        .as_object_mut()
+        .expect("DealHandle serializes as a JSON object")
+        .insert(
+            PROVISION_PENDING_FIELD.to_string(),
+            serde_json::to_value(provision_pending)?,
+        );
     value
         .as_object_mut()
         .expect("DealHandle serializes as a JSON object")
@@ -828,6 +918,13 @@ fn serialize_deal_record(
         .insert(
             LAST_OBSERVED_USAGE_FIELD.to_string(),
             serde_json::to_value(last_observed_usage)?,
+        );
+    value
+        .as_object_mut()
+        .expect("DealHandle serializes as a JSON object")
+        .insert(
+            LAST_CLIENT_STOP_FIELD.to_string(),
+            serde_json::to_value(last_client_stop)?,
         );
     Ok(serde_json::to_vec_pretty(&value)?)
 }
@@ -1512,6 +1609,38 @@ mod tests {
         let rewritten = load_deal_record(&path).unwrap();
         assert_eq!(rewritten.last_observed_promotion, Some(promotion));
         assert_eq!(rewritten.last_observed_usage, Some(cumulative));
+    }
+
+    #[test]
+    fn confirmed_client_stop_survives_other_deal_record_updates_and_restart_rewrite() {
+        let temp = tempfile::tempdir().unwrap();
+        let handle = buyer_handle();
+        let path = save_deal_handle(temp.path(), &handle).unwrap();
+        let stop = LastClientStop {
+            reason: "one-shot-complete".to_string(),
+            path: "session_settle".to_string(),
+            failure_class: None,
+            policy_action: None,
+            terminal_message_id: "terminal-message".to_string(),
+            terminal_created_at: 1_800_000_001,
+            recorded_at_unix: 1_800_000_002,
+        };
+
+        persist_last_client_stop(&path, stop.clone()).unwrap();
+        accumulate_last_observed_usage(&path, 3, 5, 8).unwrap();
+        save_deal_handle(temp.path(), &handle).unwrap();
+
+        let record = load_deal_record(&path).unwrap();
+        assert_eq!(record.handle.version, DEAL_HANDLE_VERSION);
+        assert_eq!(record.last_client_stop, Some(stop));
+        assert_eq!(
+            record.last_observed_usage,
+            Some(LastObservedUsage {
+                input_tokens: 3,
+                output_tokens: 5,
+                total_tokens: 8,
+            })
+        );
     }
 
     #[test]

@@ -7854,6 +7854,49 @@ impl RealChainBackend {
         }))
     }
 
+    /// Read the constructor-bound seller note from `TokenContract.getParties()`.
+    /// `None` means the TokenContract is inactive.
+    pub async fn token_contract_seller_note(&self, tc: &Address) -> Result<Option<String>> {
+        Ok(self
+            .token_contract_parties(tc)
+            .await?
+            .map(|parties| parties.seller_note))
+    }
+
+    /// Return true only when the target is active and its immutable constructor identity matches.
+    pub async fn exact_provision_target_is_active_and_matches(
+        &self,
+        token_contract: &Address,
+        expected: &crate::MarketManifest,
+    ) -> Result<bool> {
+        if self
+            .token_contract_deal_snapshot(token_contract)
+            .await?
+            .is_none()
+        {
+            return Ok(false);
+        }
+        let display = display_token_contract(token_contract);
+        let deal_terms = self
+            .token_contract_deal_terms(token_contract)
+            .await?
+            .ok_or_else(|| anyhow!("active TokenContract {display} exposes no getDeal data"))?;
+        let model_name = self
+            .token_contract_model_name(token_contract)
+            .await?
+            .ok_or_else(|| anyhow!("active TokenContract {display} exposes no model name"))?;
+        let model_hash = self
+            .token_contract_model_hash(token_contract)
+            .await?
+            .ok_or_else(|| anyhow!("active TokenContract {display} exposes no model hash"))?;
+        let seller_note = self
+            .token_contract_seller_note(token_contract)
+            .await?
+            .ok_or_else(|| anyhow!("active TokenContract {display} exposes no seller note"))?;
+        expected.ensure_live_identity(deal_terms, &model_name, &model_hash, &seller_note)?;
+        Ok(true)
+    }
+
     /// Read the buyer note address from `TokenContract.getParties()`. `None` means the TC is inactive
     /// or has not recorded a buyer yet.
     pub async fn token_contract_buyer_note(&self, tc: &Address) -> Result<Option<Address>> {
@@ -10295,7 +10338,7 @@ impl RealChainBackend {
         owner_keys: &KeyPair,
         request: NoteDeployDealRequest<'_>,
     ) -> Result<Value> {
-        let boc = Self::encode_signed_call_boc(
+        self.submit_money_call_once(
             note,
             PRIVATENOTE_ABI,
             "deployDeal",
@@ -10309,8 +10352,7 @@ impl RealChainBackend {
             ),
             owner_keys,
         )
-        .await?;
-        self.send_with_retry(&boc).await
+        .await
     }
 
     /// A deal's ECC[2] RESERVE -- the plane its charges come out of.
@@ -11460,6 +11502,38 @@ impl RealChainBackend {
         gas: u128,
         deal_gas_overhead_raw: u128,
     ) -> Result<crate::MarketManifest> {
+        self.provision_market_with_deal_gas_overhead_and_before_deploy(
+            seed_keys,
+            note,
+            frame_model,
+            nonce,
+            price_per_tick,
+            max_ticks,
+            gas,
+            deal_gas_overhead_raw,
+            |_| Ok(()),
+        )
+        .await
+    }
+
+    /// Provision with a durable caller-owned reservation written immediately before deployDeal.
+    /// Both standalone provisioning and automatic residual replacement use this exact boundary.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn provision_market_with_deal_gas_overhead_and_before_deploy<F>(
+        &self,
+        seed_keys: &KeyPair,
+        note: &Address,
+        frame_model: &str,
+        nonce: u64,
+        price_per_tick: u128,
+        max_ticks: u128,
+        gas: u128,
+        deal_gas_overhead_raw: u128,
+        before_deal_submit: F,
+    ) -> Result<crate::MarketManifest>
+    where
+        F: FnOnce(&crate::MarketManifest) -> Result<()>,
+    {
         // fail-closed up front if the seller note is orphaned by a contract redeploy -- a clear
         // "re-mint" error instead of a downstream bare TVM_ERROR (stale note) or "note is not active".
         self.assert_seller_note_current(note).await?;
@@ -11468,6 +11542,39 @@ impl RealChainBackend {
         let ob = self
             .inference_orderbook_address(note, &model_hash, TICK_SIZE)
             .await?;
+        // Derive and authenticate an already-active exact target before any idempotent surrounding
+        // deployment can send money. The TokenContract address excludes constructor arguments, so
+        // address equality alone never proves model, terms, or seller-note identity.
+        let seller_pubkey = json!(format!("0x{}", seed_keys.public_hex()));
+        let rm = self.root_model_address_for(&seller_pubkey).await?;
+        let tc = self
+            .token_contract_deploy_address(seed_keys, &rm, nonce)
+            .await?;
+        let market = crate::MarketManifest {
+            network: self.network().to_string(),
+            frame_model: frame_model.to_string(),
+            model_hash: model_hash.clone(),
+            inference_order_book: ob.with_workchain(),
+            root_model: rm.with_workchain(),
+            token_contract: tc.with_workchain(),
+            seller_note: note.with_workchain(),
+            nonce,
+            price_per_tick,
+            max_ticks,
+        };
+        let target_active = self
+            .wait_active(&tc, crate::params::ACCOUNT_ACTIVE_SINGLE_CHECK_ATTEMPTS)
+            .await;
+        if target_active
+            && !self
+                .exact_provision_target_is_active_and_matches(&tc, &market)
+                .await?
+        {
+            return Err(anyhow!(
+                "TokenContract {} disappeared during existing-deal identity validation; refusing a fresh deployDeal",
+                display_token_contract(&tc)
+            ));
+        }
         if !self
             .wait_active(&ob, crate::params::ACCOUNT_ACTIVE_SINGLE_CHECK_ATTEMPTS)
             .await
@@ -11503,11 +11610,6 @@ impl RealChainBackend {
         // stays derived **locally from the deploy INIT-DATA**, NOT
         // from the RootModel `getTokenContractAddress` getter, so a not-yet-`Active` RootModel cannot
         // abort the idempotency check; that getter is used only as a post-`Active` cross-check below.
-        let seller_pubkey = json!(format!("0x{}", seed_keys.public_hex()));
-        let rm = self.root_model_address_for(&seller_pubkey).await?;
-        let tc = self
-            .token_contract_deploy_address(seed_keys, &rm, nonce)
-            .await?;
         let rm_absent = !self
             .wait_active(&rm, crate::params::ACCOUNT_ACTIVE_SINGLE_CHECK_ATTEMPTS)
             .await;
@@ -11517,10 +11619,7 @@ impl RealChainBackend {
         // The per-deal TC address is derived from the deploy INIT-DATA (stateInit), NOT the RootModel
         // `getTokenContractAddress` network getter: on a fresh provision the RootModel deploy was just
         // sent (step above) but is not yet `Active`, so the getter would 404 and abort this idempotent check.
-        if self
-            .wait_active(&tc, crate::params::ACCOUNT_ACTIVE_SINGLE_CHECK_ATTEMPTS)
-            .await
-        {
+        if target_active {
             // Idempotent skip: the TC is already `Active` => the RootModel is guaranteed `Active`, so the getter
             // is safe here -- cross-check it agrees with the INIT-DATA derivation (catch a code-hash/derivation
             // divergence between the embedded TC image and the deployed RootModel).
@@ -11562,6 +11661,8 @@ impl RealChainBackend {
             // each entry burns its measured charge out of. It rides on this same message.
             self.log_deploy_prefund_snapshot("before deployDeal", note, &rm, &tc)
                 .await;
+            before_deal_submit(&market)
+                .map_err(|source| anyhow::Error::new(MoneySubmitError::Preparation { source }))?;
             self.note_deploy_deal(
                 note,
                 seed_keys,
@@ -11585,10 +11686,12 @@ impl RealChainBackend {
                 .wait_active(&tc, crate::params::ACCOUNT_ACTIVATION_MAX_ATTEMPTS)
                 .await
             {
-                return Err(anyhow!(
-                    "TokenContract {} did not activate after PrivateNote.deployDeal (nonce {nonce})",
-                    display_token_contract(&tc)
-                ));
+                return Err(anyhow::Error::new(MoneySubmitError::Ambiguous {
+                    source: anyhow!(
+                        "TokenContract {} did not activate after PrivateNote.deployDeal (nonce {nonce})",
+                        display_token_contract(&tc)
+                    ),
+                }));
             }
         }
         // The deal only. The RootModel used to be topped up here too; it mints its own gas now that
@@ -11601,18 +11704,7 @@ impl RealChainBackend {
             deal_gas_overhead_raw,
         )
         .await?;
-        Ok(crate::MarketManifest {
-            network: self.network().to_string(),
-            frame_model: frame_model.to_string(),
-            model_hash,
-            inference_order_book: ob.with_workchain(),
-            root_model: rm.with_workchain(),
-            token_contract: tc.with_workchain(),
-            seller_note: note.with_workchain(),
-            nonce,
-            price_per_tick,
-            max_ticks,
-        })
+        Ok(market)
     }
 
     pub async fn root_oracle_address(&self) -> Result<Address> {
@@ -16328,6 +16420,9 @@ mod tests {
         let history_check = compact
             .find("self.token_contract_settlement_receipts_if_present(&tc)")
             .expect("immutable address-history preflight");
+        let reservation = compact
+            .find("before_deal_submit(&market)")
+            .expect("durable provision reservation callback");
         let money_prepare = compact
             .find("self.note_deploy_deal(")
             .expect("PrivateNote.deployDeal money path");
@@ -16335,6 +16430,10 @@ mod tests {
         assert!(
             history_check < money_prepare,
             "immutable reuse evidence must be read before deployDeal is prepared or submitted"
+        );
+        assert!(
+            history_check < reservation && reservation < money_prepare,
+            "the durable reservation must be written after reuse checks and immediately before deployDeal"
         );
         assert!(
             compact[history_check..money_prepare]

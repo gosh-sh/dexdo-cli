@@ -17,7 +17,7 @@ use dexdo_proto::{CanonChunk, Challenge, ChallengeRequest, Gateway, GatewayServe
 use std::net::SocketAddr;
 use std::pin::Pin;
 use std::sync::Arc;
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, Semaphore};
 use tokio_stream::wrappers::{ReceiverStream, TcpListenerStream};
 use tokio_stream::Stream;
 use tonic::transport::{Identity, Server, ServerTlsConfig};
@@ -29,6 +29,7 @@ pub(super) struct RunningFixtureSeller {
     pub(super) server_task: tokio::task::JoinHandle<()>,
     pub(super) listen_addr: SocketAddr,
     pub(super) tls_fingerprint: String,
+    delayed_eof_release: Arc<Semaphore>,
 }
 
 impl RunningFixtureSeller {
@@ -50,11 +51,16 @@ impl RunningFixtureSeller {
         self.fixture_auth.register(token_contract, buyer_pubkey);
         Ok(())
     }
+
+    pub(super) fn release_delayed_eof(&self) {
+        self.delayed_eof_release.add_permits(1);
+    }
 }
 
 struct FixtureGateway {
     production: GatewayService,
     fixture_auth: Arc<AuthRegistry>,
+    delayed_eof_release: Arc<Semaphore>,
 }
 
 type ChunkStream = Pin<Box<dyn Stream<Item = Result<CanonChunk, Status>> + Send>>;
@@ -104,7 +110,14 @@ impl Gateway for FixtureGateway {
             .find(|message| message.role == "user")
             .map(|message| message.content.as_str())
             .unwrap_or("");
-        let chunks = if prompt.contains("DEXDO_FIXTURE_FATCHUNK_COMPLETE") {
+        let reasoning_only = prompt.contains("DEXDO_FIXTURE_REASONING_ONLY");
+        let mixed_reasoning = prompt.contains("DEXDO_FIXTURE_MIXED_REASONING");
+        let delayed_eof = prompt.contains("DEXDO_FIXTURE_DELAY_EOF");
+        let usage_then_error = prompt.contains("DEXDO_FIXTURE_USAGE_THEN_ERROR");
+        let hold_after_content = prompt.contains("DEXDO_FIXTURE_HOLD_AFTER_CONTENT");
+        let chunks = if reasoning_only {
+            wire_max
+        } else if prompt.contains("DEXDO_FIXTURE_FATCHUNK_COMPLETE") {
             wire_max / u64::from(mock::FAT_CHUNK_TOKENS)
         } else if prompt.contains("DEXDO_FIXTURE_FATCHUNK") {
             wire_max / u64::from(mock::FAT_CHUNK_TOKENS) + 1
@@ -114,15 +127,25 @@ impl Gateway for FixtureGateway {
 
         let (up_tx, mut up_rx) = mpsc::channel(GATEWAY_UPSTREAM_CHANNEL_CAPACITY);
         let (client_tx, client_rx) = mpsc::channel(GATEWAY_CLIENT_CHANNEL_CAPACITY);
+        let delayed_eof_release = self.delayed_eof_release.clone();
         tokio::spawn(async move {
             let upstream = tokio::spawn(async move {
                 mock::run(chunks, Some(&canon), up_tx, false, None).await;
             });
             while let Some(event) = up_rx.recv().await {
                 match event {
-                    Ok(UpstreamEvent::Chunk(chunk)) => {
+                    Ok(UpstreamEvent::Chunk(mut chunk)) => {
+                        if reasoning_only || mixed_reasoning && chunk.seq == 0 {
+                            chunk.reasoning = std::mem::take(&mut chunk.text);
+                        }
                         if client_tx.send(Ok(chunk)).await.is_err() {
                             break;
+                        }
+                        if hold_after_content {
+                            match delayed_eof_release.acquire().await {
+                                Ok(permit) => permit.forget(),
+                                Err(_) => break,
+                            }
                         }
                     }
                     Ok(UpstreamEvent::Usage(usage)) => {
@@ -133,6 +156,20 @@ impl Gateway for FixtureGateway {
                         };
                         if client_tx.send(Ok(terminal)).await.is_err() {
                             break;
+                        }
+                        if usage_then_error {
+                            let _ = client_tx
+                                .send(Err(Status::unavailable(
+                                    "fixture transport error after terminal usage",
+                                )))
+                                .await;
+                            break;
+                        }
+                        if delayed_eof {
+                            match delayed_eof_release.acquire().await {
+                                Ok(permit) => permit.forget(),
+                                Err(_) => break,
+                            }
                         }
                     }
                     Err(status) => {
@@ -163,6 +200,11 @@ fn is_adversarial_output_request(request: &StreamRequest) -> bool {
         .is_some_and(|message| {
             message.content.contains("DEXDO_FIXTURE_FATCHUNK")
                 || message.content.contains("DEXDO_FIXTURE_STRADDLE")
+                || message.content.contains("DEXDO_FIXTURE_REASONING_ONLY")
+                || message.content.contains("DEXDO_FIXTURE_MIXED_REASONING")
+                || message.content.contains("DEXDO_FIXTURE_DELAY_EOF")
+                || message.content.contains("DEXDO_FIXTURE_USAGE_THEN_ERROR")
+                || message.content.contains("DEXDO_FIXTURE_HOLD_AFTER_CONTENT")
         })
 }
 
@@ -193,9 +235,11 @@ pub(super) async fn start_gateway_with(
 ) -> Result<RunningFixtureSeller> {
     let state = Arc::new(GatewayState::with_upstream(upstream));
     let fixture_auth = Arc::new(AuthRegistry::new());
+    let delayed_eof_release = Arc::new(Semaphore::new(0));
     let service = GatewayServer::new(FixtureGateway {
         production: GatewayService::new(state.clone()),
         fixture_auth: fixture_auth.clone(),
+        delayed_eof_release: delayed_eof_release.clone(),
     });
     let tls = GatewayTls::generate()?;
 
@@ -229,5 +273,6 @@ pub(super) async fn start_gateway_with(
         server_task,
         listen_addr,
         tls_fingerprint,
+        delayed_eof_release,
     })
 }

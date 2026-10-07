@@ -84,7 +84,8 @@ pub use handover::Handover;
 pub use machine::{InvariantError, Settlement, StreamMachine, StreamState, Tick};
 pub use manifest::{
     model_hash_for, parse_canonical_model_id, resolve_model_name, validate_canonical_model_id,
-    AttestedModelPrecision, CanonicalModelFlags, CanonicalModelId, MarketManifest,
+    AttestedModelPrecision, CanonicalModelFlags, CanonicalModelId, MarketIdentityMismatch,
+    MarketManifest,
 };
 pub use market::flags as order_flags;
 pub use market::{

@@ -75,10 +75,8 @@ pub struct ModelConfig {
     /// The tokenizer family for `SignalManifest.tokenizer_family` -- instead of
     /// a substring hardcode. The buyer's profile matches by family.
     pub tokenizer_family: String,
-    /// Default tick price in whole SHELL: `3` is three SHELL a tick, the same figure
-    /// `--price-per-tick` takes. No runtime path reads it -- the price a seller offers at comes
-    /// from `--price-per-tick` or from the market manifest -- so it is a declaration in the file
-    /// and nothing more.
+    /// Declared tick price in whole SHELL. No runtime path reads it: the price a seller offers
+    /// comes from the deployed deal contract, so this is not a second price source.
     pub price_per_tick: u64,
     /// Upstream capabilities.
     #[serde(default)]

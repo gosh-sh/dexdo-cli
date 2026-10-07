@@ -195,7 +195,6 @@ operation posts, and it is one flag on the seller plus one rule about volume.
 dexdo seller --data-dir /srv/dexdo/seller1 --subscription \
   --market /srv/dexdo/seller1/market.json \
   --model <MODEL-NAME> --models /srv/dexdo/seller1/models.json \
-  --price-per-tick <PRICE> \
   --gateway-listen 0.0.0.0:8443 --gateway-advertise <PUBLIC-HOST>:8443 \
   --policy /srv/dexdo/seller1/policy.json
 ```
@@ -230,7 +229,7 @@ seller alone can cover the whole requested volume. A subscription offer sized be
 for is passed over at any price rather than partially filled -- volume is a business decision here,
 not a formality.
 
-`dexdo executable-book <MODEL-NAME>` shows what is takeable right now; `dexdo quote` prices a given
+`dexdo executable-book <MODEL-NAME> --ticks <VOLUME> --max-price-per-tick <PRICE-CEILING>` shows what is takeable right now; `dexdo quote` prices a given
 size against current depth. Use them to see whether the volume being offered is the volume being
 asked for.
 
@@ -244,7 +243,7 @@ Sell offer parameters worth naming:
 | Flag | What it decides |
 | --- | --- |
 | `--subscription` | offer to subscription buyers: a four-week term, taken whole by one of them |
-| `--price-per-tick` | the price of one tick (a million tokens) in raw units, a multiple of the price step |
+| `--price-per-tick` (on `provision`) | the price of one tick (a million tokens) in whole SHELL |
 | `--max-ticks` (on `provision`) | the volume for the whole term: divisible by four, no greater than 40 320 |
 | `--model`, `--models` | which model is sold, and where its provider key comes from |
 | `--gateway-listen` | what to bind locally |

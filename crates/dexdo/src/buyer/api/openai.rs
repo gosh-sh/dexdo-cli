@@ -4,9 +4,10 @@
 
 use crate::buyer::api::stream::{CanonStreamDriver, CanonStreamNext};
 use crate::buyer::api::{
-    accounted_tokens, cap_canon_to_grant, handle_stream_error_policy, is_capacity_backpressure,
-    report_request_delivery, ApiDeal, ApiState, ConsumerRequestGuard, DeadGatewayAction,
-    DealInitError, DeliveryEvents, RequestDelivery, RouteBudget, StreamErrorPolicyAction,
+    accounted_tokens, aggregate_body_response, attach_request_id, cap_canon_to_grant,
+    consumer_request_id, handle_stream_error_policy, is_capacity_backpressure,
+    report_pre_answer_failure, ApiDeal, ApiState, ConsumerRequestGuard, DeadGatewayAction,
+    DealInitError, RequestDelivery, RouteBudget, StreamErrorPolicyAction,
 };
 use crate::buyer::render::{self, OpenAiChatRequest};
 use axum::extract::State;
@@ -15,7 +16,7 @@ use axum::response::{IntoResponse, Response};
 use axum::Json;
 use dexdo_core::params::BUYER_UPSTREAM_OPEN_RETRIES;
 use dexdo_proto::{BillingUsage, CanonChunk, CanonRequest};
-use futures::Stream;
+use futures::{Stream, StreamExt};
 use http::StatusCode;
 use std::convert::Infallible;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -113,6 +114,16 @@ struct ConsumerInput {
 }
 
 async fn handle_text_request(state: ApiState, req: ConsumerInput) -> Response {
+    let request_id = consumer_request_id();
+    let response = handle_text_request_with_id(state, req, request_id.clone()).await;
+    attach_request_id(response, &request_id)
+}
+
+async fn handle_text_request_with_id(
+    state: ApiState,
+    req: ConsumerInput,
+    request_id: String,
+) -> Response {
     // The model is forced by the market (B2/B19): a request outside the frame -- reject BEFORE opening the stream.
     if let Err(reason) = state.check_model(req.model.as_deref()) {
         return reject(StatusCode::BAD_REQUEST, &reason);
@@ -148,6 +159,14 @@ async fn handle_text_request(state: ApiState, req: ConsumerInput) -> Response {
         }
         RouteBudget::Exhausted(reason) => return reject(StatusCode::SERVICE_UNAVAILABLE, &reason),
     }
+    request_guard.arm_delivery(
+        state.delivery_events.clone(),
+        &deal,
+        request_id.clone(),
+        req.wire.protocol(),
+        stream,
+        requested_max_tokens.map(u64::from).unwrap_or(0),
+    );
     // one-per-deal content-identity gate (B8 + B7-full), run ONCE before the first paid stream. The inline
     // StreamVerifier below only runs B5/B6 + the cheap declared-NAME B7; a seller declaring the correct model
     // NAME while serving a cheaper model is caught only here. On a bail the gate closes the deal and attempts
@@ -162,6 +181,16 @@ async fn handle_text_request(state: ApiState, req: ConsumerInput) -> Response {
         .ensure_verified(&state.buyer, &deal, &mut request_guard)
         .await;
     if let Err(reason) = verdict {
+        report_pre_answer_failure(
+            &deal,
+            &mut request_guard,
+            &request_id,
+            req.wire.protocol(),
+            stream,
+            requested_max_tokens.map(u64::from).unwrap_or(0),
+            StatusCode::BAD_GATEWAY.as_u16(),
+            "content_verification",
+        );
         return reject(
             StatusCode::BAD_GATEWAY,
             &format!("model identity verification failed (content check): {reason}"),
@@ -169,6 +198,16 @@ async fn handle_text_request(state: ApiState, req: ConsumerInput) -> Response {
     }
     let billing_grant_tokens = request_guard.remaining_grant();
     if billing_grant_tokens == 0 {
+        report_pre_answer_failure(
+            &deal,
+            &mut request_guard,
+            &request_id,
+            req.wire.protocol(),
+            stream,
+            requested_max_tokens.map(u64::from).unwrap_or(0),
+            StatusCode::SERVICE_UNAVAILABLE.as_u16(),
+            "content_verification_budget",
+        );
         return reject(
             StatusCode::SERVICE_UNAVAILABLE,
             "the identity verification this deal owed consumed the whole admitted grant; the \
@@ -179,6 +218,7 @@ async fn handle_text_request(state: ApiState, req: ConsumerInput) -> Response {
     // the grant may still hold what verification did not spend. The answer is bounded by what
     // was actually asked for, on the wire and on the way back alike.
     let max_tokens = cap_canon_to_grant(&mut canon, billing_grant_tokens);
+    request_guard.set_delivery_output_limit(max_tokens);
     let created = now_secs();
     let id = match req.wire {
         WireFormat::Chat => completion_id(),
@@ -225,6 +265,16 @@ async fn handle_text_request(state: ApiState, req: ConsumerInput) -> Response {
             // gateway. The local caller retries; the deal is left alone.
             if is_capacity_backpressure(&error) {
                 request_guard.complete();
+                report_pre_answer_failure(
+                    &deal,
+                    &mut request_guard,
+                    &request_id,
+                    req.wire.protocol(),
+                    stream,
+                    max_tokens,
+                    StatusCode::TOO_MANY_REQUESTS.as_u16(),
+                    "upstream_open",
+                );
                 return reject(
                     StatusCode::TOO_MANY_REQUESTS,
                     &format!(
@@ -258,6 +308,16 @@ async fn handle_text_request(state: ApiState, req: ConsumerInput) -> Response {
             } else {
                 format!("upstream open failed after {retries} retries: {detail}")
             };
+            report_pre_answer_failure(
+                &deal,
+                &mut request_guard,
+                &request_id,
+                req.wire.protocol(),
+                stream,
+                max_tokens,
+                StatusCode::BAD_GATEWAY.as_u16(),
+                "upstream_open",
+            );
             return reject(StatusCode::BAD_GATEWAY, &reason);
         }
     };
@@ -265,10 +325,12 @@ async fn handle_text_request(state: ApiState, req: ConsumerInput) -> Response {
     // Session-scoped: the deal is NOT STOPped at this request's end -- it lives for the next
     // request and is settled once at session end (graceful shutdown) or on a verification-bail. The handler
     // settles the shared session ONLY on a bail (the seller cheated -> end the session, bail off B3/B10).
-    let delivery_events = state.delivery_events.clone();
     let mock_model = state.mock_model;
     if stream {
-        sse_response(
+        #[cfg(test)]
+        let test_delivery_finalizer = request_guard.delivery_finalizer();
+        request_guard.mark_response_started();
+        let response = sse_response(
             upstream,
             id,
             model,
@@ -278,11 +340,18 @@ async fn handle_text_request(state: ApiState, req: ConsumerInput) -> Response {
             mock_model,
             deal,
             request_guard,
-            delivery_events,
             include_usage,
             req.wire,
+            request_id,
         )
-        .into_response()
+        .into_response();
+        #[cfg(test)]
+        let mut response = response;
+        #[cfg(test)]
+        if let Some(finalizer) = test_delivery_finalizer {
+            response.extensions_mut().insert(finalizer);
+        }
+        response
     } else {
         aggregate_response(
             upstream,
@@ -294,8 +363,8 @@ async fn handle_text_request(state: ApiState, req: ConsumerInput) -> Response {
             mock_model,
             deal,
             request_guard,
-            delivery_events,
             req.wire,
+            request_id,
         )
         .await
         .into_response()
@@ -317,10 +386,11 @@ fn sse_response(
     mock_model: bool,
     deal: ApiDeal,
     mut request_guard: ConsumerRequestGuard,
-    delivery_events: Option<DeliveryEvents>,
     include_usage: bool,
     wire: WireFormat,
+    request_id: String,
 ) -> Sse<impl Stream<Item = Result<Event, Infallible>>> {
+    let delivery_finalizer = request_guard.delivery_finalizer();
     let sse = async_stream::stream! {
         let mut driver = CanonStreamDriver::new(
             upstream,
@@ -335,29 +405,34 @@ fn sse_response(
         let mut stream_error = None;
         let mut billing_usage: Option<BillingUsage> = None;
         let mut content = String::new();
+        let mut visible_text_tokens = 0_u64;
         let message_id = format!("msg_{id}");
         if matches!(wire, WireFormat::Responses) {
-            yield Ok(responses_event("response.created", serde_json::json!({
+            yield Ok((responses_event("response.created", serde_json::json!({
                 "response": {"id": id, "object": "response", "created_at": created,
                     "status": "in_progress", "model": model, "output": [], "usage": null}
-            })));
-            yield Ok(responses_event("response.in_progress", serde_json::json!({
+            })), false));
+            yield Ok((responses_event("response.in_progress", serde_json::json!({
                 "response": {"id": id, "object": "response", "created_at": created,
                     "status": "in_progress", "model": model, "output": [], "usage": null}
-            })));
-            yield Ok(responses_event("response.output_item.added", serde_json::json!({
+            })), false));
+            yield Ok((responses_event("response.output_item.added", serde_json::json!({
                 "output_index": 0, "item": {"id": message_id, "type": "message",
                     "status": "in_progress", "role": "assistant", "content": []}
-            })));
-            yield Ok(responses_event("response.content_part.added", serde_json::json!({
+            })), false));
+            yield Ok((responses_event("response.content_part.added", serde_json::json!({
                 "item_id": message_id, "output_index": 0, "content_index": 0,
                 "part": {"type": "output_text", "text": "", "annotations": []}
-            })));
+            })), false));
         }
         loop {
             let chunk = match driver.next().await {
                 CanonStreamNext::Chunk(c) => c,
                 CanonStreamNext::Usage(usage) => {
+                    if let Err(error) = request_guard.observe_answer_usage(usage) {
+                        stream_error = Some(error.into());
+                        break;
+                    }
                     billing_usage = Some(usage);
                     continue;
                 }
@@ -374,26 +449,34 @@ fn sse_response(
                 capped = true;
                 break;
             }
-            // Track the visible output lower bound before its bytes leave so an immediate consumer
-            // disconnect cannot erase evidence of what was rendered. This is not a monetary update:
-            // the held billing reservation commits only after validated terminal usage and clean EOF.
-            if let Err(error) = deal.record_visible_output(accounted_tokens(&chunk)) {
+            // Preserve the stable v2 route witness for every accepted canonical content chunk,
+            // including hidden reasoning. The request-level visible lower bound remains text-only.
+            let chunk_tokens = accounted_tokens(&chunk);
+            if let Err(error) = deal.record_visible_output(chunk_tokens) {
                 stream_error = Some(error.into());
                 break;
+            }
+            if !chunk.text.is_empty() {
+                visible_text_tokens = visible_text_tokens.saturating_add(chunk_tokens);
             }
             let before = driver.received();
             driver.account_rendered(&chunk);
             debug_assert!(driver.received() >= before);
+            request_guard.record_delivery_progress(
+                driver.received(),
+                visible_text_tokens,
+                driver.legacy_received(),
+            );
             if !chunk.text.is_empty() {
                 if matches!(wire, WireFormat::Responses) {
                     deal.record_accepted_output(now_secs());
                     content.push_str(&chunk.text);
-                    yield Ok(responses_event("response.output_text.delta", serde_json::json!({
+                    yield Ok((responses_event("response.output_text.delta", serde_json::json!({
                         "item_id": message_id, "output_index": 0, "content_index": 0,
                         "delta": chunk.text
-                    })));
+                    })), false));
                 } else {
-                    yield Ok(openai_content_event(
+                    yield Ok((openai_content_event(
                         &deal,
                         &id,
                         &model,
@@ -401,7 +484,7 @@ fn sse_response(
                         &chunk.text,
                         first,
                         include_usage,
-                    ));
+                    ), false));
                 }
                 first = false;
             }
@@ -410,12 +493,13 @@ fn sse_response(
         // the next request and is settled once at session end. ONLY a verification-bail ends the session early
         // (the seller cheated -> STOP this deal + bail off, B3/B10). `errored` still drives the finish_reason below.
         let bailed = driver.bailed();
-        let received = driver.received();
+        let received = visible_text_tokens;
         let rendered_tokens = driver.legacy_received();
+        let provider_output_tokens = driver.received();
         drop(driver);
         if !bailed && stream_error.is_none() {
             if let Some(usage) = billing_usage.as_ref() {
-                if let Err(error) = request_guard.record_billing(&deal, usage.total_tokens) {
+                if let Err(error) = request_guard.record_billing(&deal, *usage) {
                     stream_error = Some(error.into());
                 }
             }
@@ -432,7 +516,7 @@ fn sse_response(
         } else if received == 0 && !capped {
             let heartbeat = deal.accepted_output_guard();
             deal.session
-                .settle_empty_stream("empty-stream", &heartbeat)
+                .settle_empty_stream("empty-output", &heartbeat)
                 .await;
         } else {
             request_guard.complete();
@@ -461,62 +545,89 @@ fn sse_response(
             || stream_error.as_ref().is_some_and(|error| error.is_capacity())
         {
             "capacity"
-        } else if stream_error.is_some() || received == 0 {
+        } else if stream_error.is_some() {
             "error"
+        } else if received == 0 {
+            "empty_output"
         } else {
             "stop"
         };
-        report_request_delivery(
-            delivery_events.as_ref(),
+        let visible_output_tokens = received;
+        let failure_stage = if bailed {
+            Some("inline_verification")
+        } else if stream_error.is_some() {
+            Some("upstream_stream")
+        } else if received == 0 && !capped {
+            Some("empty_output")
+        } else {
+            None
+        };
+        let request_usage = request_guard.request_usage();
+        request_guard.prepare_delivery(
             RequestDelivery {
                 token_contract: deal.route.token_contract.clone(),
+                request_id: request_id.clone(),
                 protocol: wire.protocol(),
                 streamed: true,
+                http_status: StatusCode::OK.as_u16(),
+                failure_stage,
                 billing_grant_tokens,
                 output_limit_tokens: max_tokens,
-                visible_output_tokens: received,
+                visible_output_tokens,
                 rendered_tokens,
                 route_delivered_tokens: Some(deal.route_visible_output_tokens()),
                 input_tokens: accepted_usage.map(|usage| usage.input_tokens),
                 output_tokens: accepted_usage.map(|usage| usage.output_tokens),
                 billable_tokens: accepted_usage.map(|usage| usage.total_tokens),
+                request_input_tokens: request_usage.input_tokens,
+                request_output_tokens: request_usage.output_tokens,
+                request_billable_tokens: request_usage.total_tokens,
                 route_billable_tokens: deal.session.route_billable_tokens(),
                 finish_reason,
                 truncated_by_output_limit: capped,
-                ended_before_output_limit: received < max_tokens,
+                ended_before_output_limit: provider_output_tokens < max_tokens,
             },
         );
         if matches!(wire, WireFormat::Responses) {
-            yield Ok(responses_event("response.output_text.done", serde_json::json!({
+            yield Ok((responses_event("response.output_text.done", serde_json::json!({
                 "item_id": message_id, "output_index": 0, "content_index": 0, "text": content
-            })));
-            yield Ok(responses_event("response.content_part.done", serde_json::json!({
+            })), false));
+            yield Ok((responses_event("response.content_part.done", serde_json::json!({
                 "item_id": message_id, "output_index": 0, "content_index": 0,
                 "part": {"type": "output_text", "text": content, "annotations": []}
-            })));
+            })), false));
             let response = render::responses_response(&id, &model, created, &content, finish_reason, accepted_usage);
-            yield Ok(responses_event("response.output_item.done", serde_json::json!({
+            yield Ok((responses_event("response.output_item.done", serde_json::json!({
                 "output_index": 0, "item": response["output"][0].clone()
-            })));
+            })), false));
             let terminal = match response["status"].as_str() {
                 Some("completed") => "response.completed",
                 Some("incomplete") => "response.incomplete",
                 _ => "response.failed",
             };
-            yield Ok(responses_event(terminal, serde_json::json!({"response": response})));
+            yield Ok((responses_event(terminal, serde_json::json!({"response": response})), false));
         } else {
-            yield Ok(Event::default().data(render::openai_final_chunk(
+            yield Ok((Event::default().data(render::openai_final_chunk(
                 &id, &model, created, finish_reason, include_usage,
-            )));
+            )), false));
             if include_usage {
                 if let Some(usage) = accepted_usage {
-                    yield Ok(Event::default().data(render::openai_usage_chunk(&id, &model, created, usage)));
+                    yield Ok((Event::default().data(render::openai_usage_chunk(&id, &model, created, usage)), false));
                 }
             }
         }
-        yield Ok(Event::default().data("[DONE]"));
+        yield Ok((Event::default().data("[DONE]"), true));
     };
-    Sse::new(sse)
+    Sse::new(sse.map(move |item| {
+        item.map(|(event, terminal)| {
+            if terminal {
+                if let Some(finalizer) = delivery_finalizer.as_ref() {
+                    finalizer.report_prepared();
+                }
+            }
+            event
+        })
+    }))
 }
 
 fn responses_event(kind: &'static str, mut body: serde_json::Value) -> Event {
@@ -563,8 +674,8 @@ async fn aggregate_response(
     mock_model: bool,
     deal: ApiDeal,
     mut request_guard: ConsumerRequestGuard,
-    delivery_events: Option<DeliveryEvents>,
     wire: WireFormat,
+    request_id: String,
 ) -> Response {
     let mut content = String::new();
     let mut capped = false;
@@ -578,10 +689,15 @@ async fn aggregate_response(
     );
     let mut stream_error = None;
     let mut billing_usage: Option<BillingUsage> = None;
+    let mut visible_text_tokens = 0_u64;
     loop {
         let chunk = match driver.next().await {
             CanonStreamNext::Chunk(c) => c,
             CanonStreamNext::Usage(usage) => {
+                if let Err(error) = request_guard.observe_answer_usage(usage) {
+                    stream_error = Some(error.into());
+                    break;
+                }
                 billing_usage = Some(usage);
                 continue;
             }
@@ -599,26 +715,32 @@ async fn aggregate_response(
             capped = true;
             break;
         }
-        // Track the visible output lower bound before it joins the answer. Money still waits for a
-        // validated terminal input-plus-output record and clean EOF.
-        if let Err(error) = deal.record_visible_output(accounted_tokens(&chunk)) {
+        // Preserve the stable v2 route witness for every accepted canonical content chunk,
+        // including hidden reasoning. The request-level visible lower bound remains text-only.
+        let chunk_tokens = accounted_tokens(&chunk);
+        if let Err(error) = deal.record_visible_output(chunk_tokens) {
             stream_error = Some(error.into());
             break;
+        }
+        if !chunk.text.is_empty() {
+            visible_text_tokens = visible_text_tokens.saturating_add(chunk_tokens);
         }
         let before = driver.received();
         driver.account_rendered(&chunk);
         debug_assert!(driver.received() >= before);
+        request_guard.record_delivery_progress(driver.received(), 0, driver.legacy_received());
         content.push_str(&chunk.text);
     }
     // Session-scoped: a clean completion / max_tokens does NOT STOP -- the deal lives for the next
     // request. ONLY a verification-bail ends the session early (STOP + bail off, B3/B10).
     let bailed = driver.bailed();
-    let received = driver.received();
+    let received = visible_text_tokens;
     let rendered_tokens = driver.legacy_received();
+    let provider_output_tokens = driver.received();
     drop(driver);
     if !bailed && stream_error.is_none() {
         if let Some(usage) = billing_usage.as_ref() {
-            if let Err(error) = request_guard.record_billing(&deal, usage.total_tokens) {
+            if let Err(error) = request_guard.record_billing(&deal, *usage) {
                 stream_error = Some(error.into());
             }
         }
@@ -632,34 +754,48 @@ async fn aggregate_response(
         accepted_usage.is_some_and(|usage| usage.total_tokens == billing_grant_tokens);
     // every terminal below records the same three figures, including the two that answer 502.
     // A request that failed after paying for output is exactly the one worth being able to attribute.
-    let report = |finish_reason: &'static str| {
-        report_request_delivery(
-            delivery_events.as_ref(),
-            RequestDelivery {
-                token_contract: deal.route.token_contract.clone(),
-                protocol: wire.protocol(),
-                streamed: false,
-                billing_grant_tokens,
-                output_limit_tokens: max_tokens,
-                visible_output_tokens: received,
-                rendered_tokens,
-                route_delivered_tokens: Some(deal.route_visible_output_tokens()),
-                input_tokens: accepted_usage.map(|usage| usage.input_tokens),
-                output_tokens: accepted_usage.map(|usage| usage.output_tokens),
-                billable_tokens: accepted_usage.map(|usage| usage.total_tokens),
-                route_billable_tokens: deal.session.route_billable_tokens(),
-                finish_reason,
-                truncated_by_output_limit: capped,
-                ended_before_output_limit: received < max_tokens,
-            },
-        );
+    let delivery = |request_guard: &ConsumerRequestGuard,
+                    finish_reason: &'static str,
+                    http_status: StatusCode,
+                    failure_stage: Option<&'static str>,
+                    visible_output_tokens: u64| {
+        let request_usage = request_guard.request_usage();
+        RequestDelivery {
+            token_contract: deal.route.token_contract.clone(),
+            request_id: request_id.clone(),
+            protocol: wire.protocol(),
+            streamed: false,
+            http_status: http_status.as_u16(),
+            failure_stage,
+            billing_grant_tokens,
+            output_limit_tokens: max_tokens,
+            visible_output_tokens,
+            rendered_tokens,
+            route_delivered_tokens: Some(deal.route_visible_output_tokens()),
+            input_tokens: accepted_usage.map(|usage| usage.input_tokens),
+            output_tokens: accepted_usage.map(|usage| usage.output_tokens),
+            billable_tokens: accepted_usage.map(|usage| usage.total_tokens),
+            request_input_tokens: request_usage.input_tokens,
+            request_output_tokens: request_usage.output_tokens,
+            request_billable_tokens: request_usage.total_tokens,
+            route_billable_tokens: deal.session.route_billable_tokens(),
+            finish_reason,
+            truncated_by_output_limit: capped,
+            ended_before_output_limit: provider_output_tokens < max_tokens,
+        }
     };
     if bailed {
         deal.session.settle_verification_bail("verify-bail").await;
     } else if let Some(e) = stream_error {
         if e.is_capacity() {
             request_guard.complete();
-            report("capacity");
+            let terminal = delivery(
+                &request_guard,
+                "capacity",
+                StatusCode::OK,
+                Some("upstream_capacity"),
+                received,
+            );
             let body = match wire {
                 WireFormat::Chat => render::openai_completion(
                     &id,
@@ -679,22 +815,39 @@ async fn aggregate_response(
                 )
                 .to_string(),
             };
-            return ([(http::header::CONTENT_TYPE, "application/json")], body).into_response();
+            return aggregate_body_response(request_guard, terminal, body);
         }
         if handle_stream_error_policy(&deal, received, e.policy_message()).await
             == StreamErrorPolicyAction::RequestScoped
         {
             request_guard.complete();
         }
-        report("error");
+        let terminal = delivery(
+            &request_guard,
+            "error",
+            StatusCode::BAD_GATEWAY,
+            Some("upstream_stream"),
+            0,
+        );
+        request_guard.report_delivery(terminal);
         return reject(StatusCode::BAD_GATEWAY, &format!("stream error: {e}"));
     } else if received == 0 && !capped {
         let heartbeat = deal.accepted_output_guard();
         deal.session
-            .settle_empty_stream("empty-stream", &heartbeat)
+            .settle_empty_stream("empty-output", &heartbeat)
             .await;
-        report("error");
-        return reject(StatusCode::BAD_GATEWAY, "upstream produced an empty stream");
+        let terminal = delivery(
+            &request_guard,
+            "empty_output",
+            StatusCode::BAD_GATEWAY,
+            Some("empty_output"),
+            0,
+        );
+        request_guard.report_delivery(terminal);
+        return reject(
+            StatusCode::BAD_GATEWAY,
+            "upstream produced no assistant text",
+        );
     }
     request_guard.complete();
     // verification bail -> `content_filter`; capacity refusal returned above ->
@@ -710,7 +863,13 @@ async fn aggregate_response(
     } else {
         "stop"
     };
-    report(finish_reason);
+    let terminal = delivery(
+        &request_guard,
+        finish_reason,
+        StatusCode::OK,
+        bailed.then_some("inline_verification"),
+        received,
+    );
     let body = match wire {
         WireFormat::Chat => render::openai_completion(
             &id,
@@ -730,7 +889,7 @@ async fn aggregate_response(
         )
         .to_string(),
     };
-    ([(http::header::CONTENT_TYPE, "application/json")], body).into_response()
+    aggregate_body_response(request_guard, terminal, body)
 }
 
 fn reject(status: StatusCode, message: &str) -> Response {

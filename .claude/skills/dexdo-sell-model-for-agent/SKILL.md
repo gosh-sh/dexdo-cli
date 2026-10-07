@@ -35,7 +35,9 @@ bond.
 
 **Flags:** The seller uses `seller --model A --subscription`. The buyer counterpart must place with
 `subscription --model A place --max-price-per-tick L --ticks N`, then use the matched deal with
-`buyer --resume --frame-model A` and optional `--local-listen ADDR`. For an explicit due-week
+`buyer --resume --frame-model A` and optional `--local-listen ADDR`. Without a new price the buyer
+serves only that adopted subscription; a price on `buyer --resume` does not start a fresh
+continuation BUY for a subscription. For an explicit due-week
 booking, the buyer adds `--settle` to `subscription ... status ID`; plain status is read-only. Both
 orders carry `AON|SUBSCRIPTION`.
 
@@ -464,9 +466,9 @@ dexdo seller \
 The note is chosen the same way `provision` chose it, from the same list and with the same key
 lookup, and refused the same way off a terminal.
 
-The offer price and volume come from the provisioned deal in `market.json` (set in Phase 6). The
-seller's own `--price-per-tick` flag is **ignored on the `--market` path** -- to re-price, run a new
-`dexdo provision` with a fresh `--nonce` and serve that manifest. `--gateway-listen` is the local
+The offer price and volume come from the provisioned deal in `market.json` (set in Phase 6).
+`dexdo seller` has no price flag; to re-price, run a new `dexdo provision` with a fresh `--nonce`
+and serve that manifest. `--gateway-listen` is the local
 bind address; `--gateway-advertise` is the address a REMOTE buyer dials (the public address written
 into the handover -- never `127.0.0.1`). It must be publicly reachable: startup rejects a bind-all
 (`0.0.0.0`/`::`), loopback, RFC1918, link-local or CGNAT advertise -- and equally a reserved range
@@ -554,13 +556,19 @@ dexdo destroy --market market.json
 Move the note's remaining token balance back to a wallet:
 
 ```sh
-dexdo note withdraw --note-addr "$NOTE_ADDR" --to <DAPP-ID>::<ACCOUNT-ID>
+dexdo note withdraw --note-addr "$NOTE_ADDR" --to <DAPP-ID>::<ACCOUNT-ID> \
+  --acknowledge-note-retirement
 ```
 
 `note withdraw` still names its note -- it is one-shot and it will not choose which note to end --
 but not its key. Its canonical `--to` is required every time and is never inferred from the pool,
 the funding wallet or a previous command. That exact destination must already exist in the named
 DApp and contain deployed code, or the client refuses before submit.
+
+Before running it, tell the user exactly: withdrawal links this PrivateNote to the destination
+wallet and deanonymizes it; it permanently prevents this note from posting another sell offer; to
+keep selling, deploy a new note. Obtain explicit approval of those consequences. An agent run cannot
+answer the terminal prompt, so add `--acknowledge-note-retirement` only after that approval.
 
 ---
 

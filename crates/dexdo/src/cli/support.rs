@@ -7,6 +7,7 @@ use dexdo_core::{
     deal_anomalies, per_model_breakdown, ChainBackend, DealAnomaly, DealRole, DobParams, LocalNote,
     MockChainBackend, ModelBreakdown, Note, NoteTree, ProtocolConsts, TreeSnapshot,
 };
+use std::future::Future;
 use std::path::PathBuf;
 use std::sync::Arc;
 
@@ -1604,6 +1605,105 @@ pub(crate) fn seller_real_backend_with_deal_gas_overhead(
     Ok((chain, note))
 }
 
+pub(crate) fn persist_provision_deal_handle(
+    deals_dir: Option<&std::path::Path>,
+    market: &dexdo_core::MarketManifest,
+    contracts: &std::path::Path,
+    provision_pending: bool,
+) -> Result<std::path::PathBuf> {
+    let handle = crate::cli::commands::save_runtime_deal_handle_for_network(
+        crate::cli::commands::RuntimeDealHandleInput {
+            role: crate::cli::deals::DealHandleRole::Seller,
+            deals_dir,
+            token_contract: &market.token_contract,
+            note_addr: &market.seller_note,
+            frame_model: &market.frame_model,
+            market: Some(market),
+            market_path: None,
+            contracts,
+            endpoint: None,
+            created_order_ids: Vec::new(),
+        },
+        &market.network,
+        false,
+    )?;
+    let path = crate::cli::deals::handle_path(
+        &crate::cli::deals::resolve_deals_dir(deals_dir)?,
+        &handle.handle,
+    );
+    crate::cli::deals::persist_provision_pending(&path, provision_pending)?;
+    Ok(path)
+}
+
+pub(crate) fn clear_provision_pending_if_present(
+    deals_dir: Option<&std::path::Path>,
+    market: &dexdo_core::MarketManifest,
+) -> Result<()> {
+    let path = crate::cli::deals::handle_path(
+        &crate::cli::deals::resolve_deals_dir(deals_dir)?,
+        &crate::cli::deals::make_handle_id(
+            &market.token_contract,
+            crate::cli::deals::DealHandleRole::Seller,
+        ),
+    );
+    if path.exists() {
+        crate::cli::deals::persist_provision_pending(&path, false)?;
+    }
+    Ok(())
+}
+
+pub(crate) fn provision_failure_clears_pending(error: &anyhow::Error, activated: bool) -> bool {
+    activated
+        || error
+            .chain()
+            .find_map(|cause| cause.downcast_ref::<dexdo_core::MoneySubmitError>())
+            .is_some_and(dexdo_core::MoneySubmitError::clears_journal)
+}
+
+pub(crate) async fn prepare_fresh_provision_deposit<Prepare, PrepareFuture>(
+    target_active: bool,
+    prepare: Prepare,
+) -> Result<u128>
+where
+    Prepare: FnOnce() -> PrepareFuture,
+    PrepareFuture: Future<Output = Result<u128>>,
+{
+    if target_active {
+        return Ok(0);
+    }
+    prepare().await
+}
+
+/// Refuse to repeat a residual deploy whose earlier process may already have submitted it.
+pub(crate) async fn ensure_no_unresolved_provision_reservation<F>(
+    deals_dir: Option<&std::path::Path>,
+    token_contract: &str,
+    activated: F,
+) -> Result<()>
+where
+    F: Future<Output = Result<bool>>,
+{
+    let path = crate::cli::deals::handle_path(
+        &crate::cli::deals::resolve_deals_dir(deals_dir)?,
+        &crate::cli::deals::make_handle_id(
+            token_contract,
+            crate::cli::deals::DealHandleRole::Seller,
+        ),
+    );
+    if !path.exists() || !crate::cli::deals::load_deal_record(&path)?.provision_pending {
+        return Ok(());
+    }
+    if !activated.await? {
+        return Err(anyhow::Error::new(dexdo_core::MoneySubmitError::Ambiguous {
+            source: anyhow::anyhow!(
+                "residual provision for TokenContract {} is still pending after an ambiguous deployDeal; refusing to submit it again",
+                dexdo_core::address::display_self_dapp(token_contract)
+            ),
+        }));
+    }
+    Ok(())
+}
+
 pub(crate) async fn provision_replacement_seller_with_deal_gas_overhead(
     args: &SellerArgs,
     frame_model: &str,
@@ -1651,60 +1751,176 @@ pub(crate) async fn provision_replacement_seller_with_deal_gas_overhead(
     let note = dexdo_core::address::parse_chain_address(note_addr)
         .map_err(|e| anyhow::anyhow!("--note-addr {note_addr}: {e}"))?;
     let max_ticks = u128::from(max_ticks);
-    let deposit_shells = if supplied_deal_gas_overhead_raw.is_none() {
-        default_deposit_shells(max_ticks)
-    } else {
-        dexdo_core::params::min_deploy_shells_with_overhead(max_ticks, deal_gas_overhead_raw)
-    };
-    let per_deploy = if supplied_deal_gas_overhead_raw.is_none() {
-        deposit_per_deploy(deposit_shells, max_ticks)?
-    } else {
-        deposit_per_deploy_with_overhead(deposit_shells, max_ticks, Some(deal_gas_overhead_raw))?
-    };
-    chain.assert_seller_note_current(&note).await?;
-    let note_ecc = chain
-        .client()
-        .get_account(&note)
+    let seller_pubkey = serde_json::json!(format!("0x{}", keys.public_hex()));
+    let root_model = chain.root_model_address_for(&seller_pubkey).await?;
+    let token_contract = chain
+        .token_contract_deploy_address(&keys, &root_model, nonce)
+        .await?;
+    let token_contract_display = token_contract.with_workchain();
+    let model_hash = dexdo_core::model_hash_for(frame_model);
+    let expected_order_book = chain
+        .inference_orderbook_address(&note, &model_hash, TICK_SIZE)
         .await?
-        .ok_or_else(|| {
-            anyhow::anyhow!(
-                "seller note {} disappeared before residual provision",
-                dexdo_core::address::display(&note.with_workchain())
-            )
-        })?
-        .ecc_balance(2);
-    let note_spendable = chain.private_note_shell_balance(&note).await?;
-    ensure_provision_deposit_covered(
-        note_ecc,
-        note_spendable,
-        deposit_shells,
-        u128::from(price_per_tick),
-    )?;
-    let market = if supplied_deal_gas_overhead_raw.is_none() {
-        chain
-            .provision_market(
-                &keys,
-                &note,
-                frame_model,
-                nonce,
-                u128::from(price_per_tick),
+        .with_workchain();
+    let expected_market = dexdo_core::MarketManifest {
+        network: chain.network().to_string(),
+        frame_model: frame_model.to_string(),
+        model_hash,
+        inference_order_book: expected_order_book,
+        root_model: root_model.with_workchain(),
+        token_contract: token_contract_display.clone(),
+        seller_note: note.with_workchain(),
+        nonce,
+        price_per_tick: u128::from(price_per_tick),
+        max_ticks,
+    };
+    let target_active = chain
+        .exact_provision_target_is_active_and_matches(&token_contract, &expected_market)
+        .await?;
+    ensure_no_unresolved_provision_reservation(
+        args.deals_dir.as_deref(),
+        &token_contract_display,
+        async { Ok(target_active) },
+    )
+    .await?;
+    let per_deploy = prepare_fresh_provision_deposit(target_active, || async {
+        let deposit_shells = if supplied_deal_gas_overhead_raw.is_none() {
+            default_deposit_shells(max_ticks)
+        } else {
+            dexdo_core::params::min_deploy_shells_with_overhead(max_ticks, deal_gas_overhead_raw)
+        };
+        let per_deploy = if supplied_deal_gas_overhead_raw.is_none() {
+            deposit_per_deploy(deposit_shells, max_ticks)?
+        } else {
+            deposit_per_deploy_with_overhead(
+                deposit_shells,
                 max_ticks,
-                per_deploy,
-            )
+                Some(deal_gas_overhead_raw),
+            )?
+        };
+        chain.assert_seller_note_current(&note).await?;
+        let note_ecc = chain
+            .client()
+            .get_account(&note)
             .await?
-    } else {
-        chain
-            .provision_market_with_deal_gas_overhead(
-                &keys,
-                &note,
-                frame_model,
-                nonce,
-                u128::from(price_per_tick),
-                max_ticks,
-                per_deploy,
-                deal_gas_overhead_raw,
-            )
-            .await?
+            .ok_or_else(|| {
+                anyhow::anyhow!(
+                    "seller note {} disappeared before residual provision",
+                    dexdo_core::address::display(&note.with_workchain())
+                )
+            })?
+            .ecc_balance(2);
+        let note_spendable = chain.private_note_shell_balance(&note).await?;
+        ensure_provision_deposit_covered(
+            note_ecc,
+            note_spendable,
+            deposit_shells,
+            u128::from(price_per_tick),
+        )?;
+        Ok(per_deploy)
+    })
+    .await?;
+
+    let mut reservation_path = None;
+    let provision = chain
+        .provision_market_with_deal_gas_overhead_and_before_deploy(
+            &keys,
+            &note,
+            frame_model,
+            nonce,
+            u128::from(price_per_tick),
+            max_ticks,
+            per_deploy,
+            deal_gas_overhead_raw,
+            |market| {
+                if target_active {
+                    bail!(
+                        "matching active TokenContract {} became inactive during residual recovery; refusing a fresh deployDeal",
+                        dexdo_core::address::display_self_dapp(&market.token_contract)
+                    )
+                }
+                if market != &expected_market {
+                    bail!("residual provision reservation identity diverged from the derived market")
+                }
+                reservation_path = Some(persist_provision_deal_handle(
+                    args.deals_dir.as_deref(),
+                    market,
+                    &manifest_path_path,
+                    true,
+                )?);
+                Ok(())
+            },
+        )
+        .await;
+    let market = match provision {
+        Ok(market) => {
+            // Residual provisioning is not complete when the TokenContract merely activates.
+            // Keep the durable reservation until the pool has linked the parent, registered the
+            // child for capacity, and installed its watcher.
+            persist_provision_deal_handle(
+                args.deals_dir.as_deref(),
+                &market,
+                &manifest_path_path,
+                true,
+            )?;
+            market
+        }
+        Err(error) => {
+            let ambiguous = error
+                .chain()
+                .find_map(|cause| cause.downcast_ref::<dexdo_core::MoneySubmitError>())
+                .is_some_and(dexdo_core::MoneySubmitError::is_ambiguous);
+            if ambiguous
+                && chain
+                    .exact_provision_target_is_active_and_matches(&token_contract, &expected_market)
+                    .await?
+            {
+                // The POST outcome was lost, but its exact child activated before cleanup. Finish
+                // the core active path now so its measured existing-deal gas check/top-up still
+                // runs, while a disappearance can only hit the callback and never submit again.
+                let recovered = chain
+                    .provision_market_with_deal_gas_overhead_and_before_deploy(
+                        &keys,
+                        &note,
+                        frame_model,
+                        nonce,
+                        u128::from(price_per_tick),
+                        max_ticks,
+                        0,
+                        deal_gas_overhead_raw,
+                        |market| {
+                            bail!(
+                                "active residual TokenContract {} disappeared during ambiguous-submit recovery; refusing a second deployDeal",
+                                dexdo_core::address::display_self_dapp(&market.token_contract)
+                            )
+                        },
+                    )
+                    .await?;
+                if recovered != expected_market {
+                    bail!("ambiguous residual recovery returned a different market identity")
+                }
+                persist_provision_deal_handle(
+                    args.deals_dir.as_deref(),
+                    &recovered,
+                    &manifest_path_path,
+                    true,
+                )?;
+                recovered
+            } else {
+                if !ambiguous {
+                    let Some(path) = reservation_path.as_deref() else {
+                        return Err(error);
+                    };
+                    // Activation alone does not complete residual adoption. Only a failure proven
+                    // to have happened before submission may release this reservation here; every
+                    // post-submit/active failure stays owned by the pool's no-submit recovery.
+                    if provision_failure_clears_pending(&error, false) {
+                        crate::cli::deals::persist_provision_pending(path, false)?;
+                    }
+                }
+                return Err(error);
+            }
+        }
     };
     let backend: Arc<dyn ChainBackend> = Arc::new(RealSellerBackend::new_with_deal_gas_overhead(
         chain,
@@ -1719,6 +1935,96 @@ pub(crate) async fn provision_replacement_seller_with_deal_gas_overhead(
         supplied_deal_gas_overhead_raw,
     ));
     Ok((market, backend))
+}
+
+#[cfg(test)]
+mod issue_2039_residual_recovery_tests {
+    use super::*;
+
+    #[test]
+    fn residual_recovery_proves_identity_before_fresh_deploy_funding() {
+        let source = include_str!("support.rs");
+        let body = source
+            .split_once("pub(crate) async fn provision_replacement_seller_with_deal_gas_overhead")
+            .expect("residual provisioner exists")
+            .1
+            .split_once("/// Real buyer backend")
+            .expect("residual provisioner body ends before buyer setup")
+            .0;
+        let identity = body
+            .find("exact_provision_target_is_active_and_matches")
+            .expect("the exact active child identity is authoritative");
+        let funding = body
+            .find("prepare_fresh_provision_deposit(target_active")
+            .expect("fresh funding is conditional on the exact target state");
+        let provision = body
+            .find("provision_market_with_deal_gas_overhead_and_before_deploy")
+            .expect("shared money primitive is used");
+        assert!(identity < funding && funding < provision);
+        assert!(
+            body[provision..].contains("if target_active"),
+            "an active recovery that disappears must not fall through to deployDeal"
+        );
+    }
+
+    #[test]
+    fn active_during_ambiguous_cleanup_keeps_pending_for_pool_adoption() {
+        let source = include_str!("support.rs");
+        let cleanup = source
+            .split_once("pub(crate) async fn provision_replacement_seller_with_deal_gas_overhead")
+            .expect("residual provisioner exists")
+            .1
+            .split_once("Err(error) => {")
+            .expect("residual provisioner handles its money error")
+            .1
+            .split_once("/// Real buyer backend")
+            .expect("residual provisioner body ends before buyer setup")
+            .0;
+        let active = cleanup
+            .find("if ambiguous")
+            .expect("ambiguous cleanup has an active-child branch");
+        let recovery = cleanup
+            .find("provision_market_with_deal_gas_overhead_and_before_deploy")
+            .expect("active child completes the shared idempotent path");
+        let retained = cleanup[recovery..]
+            .find("persist_provision_deal_handle(")
+            .map(|offset| recovery + offset)
+            .expect("active-path recovery retains the durable handle");
+        let fallback = cleanup
+            .find("return Err(error)")
+            .expect("unreconciled ambiguity remains an error");
+        assert!(active < recovery && recovery < retained && retained < fallback);
+        assert!(cleanup[recovery..retained].contains("refusing a second deployDeal"));
+        let retained_body = cleanup[retained..fallback]
+            .split_whitespace()
+            .collect::<String>();
+        assert!(retained_body.contains("&manifest_path_path,true"));
+    }
+
+    #[tokio::test]
+    async fn residual_active_recovery_skips_low_note_preflight_but_inactive_does_not() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let balance_reads = AtomicUsize::new(0);
+        let recovered = prepare_fresh_provision_deposit(true, || async {
+            balance_reads.fetch_add(1, Ordering::Relaxed);
+            ensure_provision_deposit_covered(0, 0, 1, dexdo_core::PRICE_STEP)?;
+            Ok(1)
+        })
+        .await
+        .expect("a proven active residual child needs no second deploy deposit");
+        assert_eq!(recovered, 0);
+        assert_eq!(balance_reads.load(Ordering::Relaxed), 0);
+
+        prepare_fresh_provision_deposit(false, || async {
+            balance_reads.fetch_add(1, Ordering::Relaxed);
+            ensure_provision_deposit_covered(0, 0, 1, dexdo_core::PRICE_STEP)?;
+            Ok(1)
+        })
+        .await
+        .expect_err("an inactive child with the same low note must fail before spending");
+        assert_eq!(balance_reads.load(Ordering::Relaxed), 1);
+    }
 }
 
 /// Real buyer backend + the buyer's `RealNote`: from a provisioned note (`--note-key`/`--note-addr`)
@@ -1750,19 +2056,28 @@ pub(crate) fn buyer_real_backend(args: &BuyerArgs, frame_model: &str) -> Result<
             manifest_path.display()
         )
     })?;
-    let max_price_per_tick = args.max_price_per_tick;
-    let (backend, rn) = dexdo_core::RealBuyerBackend::from_provisioned(
-        manifest,
-        &note_addr,
-        &note_secret,
-        frame_model,
-        max_price_per_tick,
-        args.ticks,
-        // default to EXACTLY the required escrow (no over-funding); an explicit value is checked
-        // == required by `check_buy_deposit_headroom` in `from_provisioned`.
-        args.escrow
-            .unwrap_or_else(|| dexdo_core::required_escrow_for_buy(args.ticks, max_price_per_tick)),
-    )?;
+    let (backend, rn) = match args.max_price_per_tick {
+        Some(max_price_per_tick) => dexdo_core::RealBuyerBackend::from_provisioned(
+            manifest,
+            &note_addr,
+            &note_secret,
+            frame_model,
+            max_price_per_tick,
+            args.ticks,
+            // default to EXACTLY the required escrow (no over-funding); an explicit value is checked
+            // == required by `check_buy_deposit_headroom` in `from_provisioned`.
+            args.escrow.unwrap_or_else(|| {
+                dexdo_core::required_escrow_for_buy(args.ticks, max_price_per_tick)
+            }),
+        )?,
+        None if args.resume => dexdo_core::RealBuyerBackend::from_provisioned_resume(
+            manifest,
+            &note_addr,
+            &note_secret,
+            frame_model,
+        )?,
+        None => bail!("a fresh buyer invocation requires --max-price-per-tick"),
+    };
     let backend = backend.with_wait_for_seller(args.wait_for_seller);
     let chain: Arc<dyn ChainBackend> = Arc::new(backend);
     let note: Arc<dyn Note> = Arc::new(rn);
@@ -1931,6 +2246,8 @@ mod provision_nonce_tests {
             "provision",
             "--frame-model",
             "qwen--qwen3--32b",
+            "--price-per-tick",
+            "1",
             "--nonce",
             value,
         ])
@@ -2560,7 +2877,7 @@ mod buyer_backend_settle_week_tests {
             allow_unverified_model: true,
             models: dir.path().join("models.json"),
             ticks: 1,
-            max_price_per_tick: dexdo_core::PRICE_STEP,
+            max_price_per_tick: Some(dexdo_core::PRICE_STEP),
             // `None` => EXACTLY the required escrow, so the headroom preflight passes offline.
             escrow: None,
             policy: None,

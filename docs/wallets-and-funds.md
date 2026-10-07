@@ -216,9 +216,14 @@ dexdo note withdraw \
 `note withdraw` is owner-signed. A successful withdrawal is one-shot and
 irreversible: when all contract gates are clear, it drains both the trading
 record and the physical ECC[2] pocket to the canonical destination wallet. It
-does not withdraw the note's native vmshell. The exact canonical destination
-must already exist in its named DApp and contain deployed code; otherwise the
-client refuses before submitting the withdrawal. Outstanding orders, live deals,
+does not withdraw the note's native vmshell. Withdrawal links the note to that
+wallet, deanonymizes it, and permanently prevents the note from posting another
+sell offer; continuing to sell requires a new note. An interactive run requires
+an explicit `YES`. A non-interactive run refuses unless the operator has accepted
+those consequences and the command carries `--acknowledge-note-retirement`. The
+exact canonical destination must already exist in its named DApp and contain
+deployed code; otherwise the client refuses before submitting the withdrawal.
+Outstanding orders, live deals,
 pending operations, stakes, or debt must be cleared first; `note balance`
 reports the withdrawal gate it can read. If `RootPN` lacks the required
 liquidity, `PrivateNote.revertWithdraw` restores the trading balance and

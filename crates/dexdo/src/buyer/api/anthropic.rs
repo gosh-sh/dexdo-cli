@@ -5,9 +5,10 @@
 
 use crate::buyer::api::stream::{CanonStreamDriver, CanonStreamNext};
 use crate::buyer::api::{
-    accounted_tokens, cap_canon_to_grant, handle_stream_error_policy, is_capacity_backpressure,
-    report_request_delivery, ApiDeal, ApiState, ConsumerRequestGuard, DeadGatewayAction,
-    DealInitError, DeliveryEvents, RequestDelivery, RouteBudget, StreamErrorPolicyAction,
+    accounted_tokens, aggregate_body_response, attach_request_id, cap_canon_to_grant,
+    consumer_request_id, handle_stream_error_policy, is_capacity_backpressure,
+    report_pre_answer_failure, ApiDeal, ApiState, ConsumerRequestGuard, DeadGatewayAction,
+    DealInitError, RequestDelivery, RouteBudget, StreamErrorPolicyAction,
 };
 use crate::buyer::render::{self, AnthropicRequest};
 use axum::extract::State;
@@ -16,7 +17,7 @@ use axum::response::{IntoResponse, Response};
 use axum::Json;
 use dexdo_core::params::BUYER_UPSTREAM_OPEN_RETRIES;
 use dexdo_proto::{BillingUsage, CanonChunk};
-use futures::Stream;
+use futures::{Stream, StreamExt};
 use http::StatusCode;
 use std::convert::Infallible;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -28,6 +29,12 @@ pub async fn messages(
     State(state): State<ApiState>,
     Json(req): Json<AnthropicRequest>,
 ) -> Response {
+    let request_id = consumer_request_id();
+    let response = messages_with_id(state, req, request_id.clone()).await;
+    attach_request_id(response, &request_id)
+}
+
+async fn messages_with_id(state: ApiState, req: AnthropicRequest, request_id: String) -> Response {
     // The model is forced by the market (B2/B19) -- the same check as for the OpenAI path.
     if let Err(reason) = state.check_model(req.model.as_deref()) {
         return reject(StatusCode::BAD_REQUEST, &reason);
@@ -61,6 +68,14 @@ pub async fn messages(
         }
         RouteBudget::Exhausted(reason) => return reject(StatusCode::SERVICE_UNAVAILABLE, &reason),
     }
+    request_guard.arm_delivery(
+        state.delivery_events.clone(),
+        &deal,
+        request_id.clone(),
+        "anthropic",
+        stream,
+        requested_max_tokens.map(u64::from).unwrap_or(0),
+    );
     // one-per-deal content-identity gate (B8 + B7-full), run ONCE before the first paid stream -- the same
     // gate as the OpenAI path. The inline StreamVerifier only runs B5/B6 + the cheap declared-NAME B7; a seller
     // serving a cheaper model under the correct NAME is caught only here. On a bail the gate closes the deal and
@@ -74,6 +89,16 @@ pub async fn messages(
         .ensure_verified(&state.buyer, &deal, &mut request_guard)
         .await;
     if let Err(reason) = verdict {
+        report_pre_answer_failure(
+            &deal,
+            &mut request_guard,
+            &request_id,
+            "anthropic",
+            stream,
+            requested_max_tokens.map(u64::from).unwrap_or(0),
+            StatusCode::BAD_GATEWAY.as_u16(),
+            "content_verification",
+        );
         return reject(
             StatusCode::BAD_GATEWAY,
             &format!("model identity verification failed (content check): {reason}"),
@@ -81,6 +106,16 @@ pub async fn messages(
     }
     let billing_grant_tokens = request_guard.remaining_grant();
     if billing_grant_tokens == 0 {
+        report_pre_answer_failure(
+            &deal,
+            &mut request_guard,
+            &request_id,
+            "anthropic",
+            stream,
+            requested_max_tokens.map(u64::from).unwrap_or(0),
+            StatusCode::SERVICE_UNAVAILABLE.as_u16(),
+            "content_verification_budget",
+        );
         return reject(
             StatusCode::SERVICE_UNAVAILABLE,
             "the identity verification this deal owed consumed the whole admitted grant; the \
@@ -91,6 +126,7 @@ pub async fn messages(
     // the grant may still hold what verification did not spend. The answer is bounded by what
     // was actually asked for, on the wire and on the way back alike.
     let max_tokens = cap_canon_to_grant(&mut canon, billing_grant_tokens);
+    request_guard.set_delivery_output_limit(max_tokens);
     let id = message_id();
     let model = state.frame_model.clone();
     let reclaim_heartbeat = deal.accepted_output_guard();
@@ -132,6 +168,16 @@ pub async fn messages(
             // gateway. The local caller retries; the deal is left alone.
             if is_capacity_backpressure(&error) {
                 request_guard.complete();
+                report_pre_answer_failure(
+                    &deal,
+                    &mut request_guard,
+                    &request_id,
+                    "anthropic",
+                    stream,
+                    max_tokens,
+                    StatusCode::TOO_MANY_REQUESTS.as_u16(),
+                    "upstream_open",
+                );
                 return reject(
                     StatusCode::TOO_MANY_REQUESTS,
                     &format!(
@@ -165,16 +211,28 @@ pub async fn messages(
             } else {
                 format!("upstream open failed after {retries} retries: {detail}")
             };
+            report_pre_answer_failure(
+                &deal,
+                &mut request_guard,
+                &request_id,
+                "anthropic",
+                stream,
+                max_tokens,
+                StatusCode::BAD_GATEWAY.as_u16(),
+                "upstream_open",
+            );
             return reject(StatusCode::BAD_GATEWAY, &reason);
         }
     };
 
     // Session-scoped: no per-request STOP -- the shared session settles once at session end / on a
     // verification-bail (as in the OpenAI path).
-    let delivery_events = state.delivery_events.clone();
     let mock_model = state.mock_model;
     if stream {
-        sse_response(
+        #[cfg(test)]
+        let test_delivery_finalizer = request_guard.delivery_finalizer();
+        request_guard.mark_response_started();
+        let response = sse_response(
             upstream,
             id,
             model,
@@ -183,9 +241,16 @@ pub async fn messages(
             mock_model,
             deal,
             request_guard,
-            delivery_events,
+            request_id,
         )
-        .into_response()
+        .into_response();
+        #[cfg(test)]
+        let mut response = response;
+        #[cfg(test)]
+        if let Some(finalizer) = test_delivery_finalizer {
+            response.extensions_mut().insert(finalizer);
+        }
+        response
     } else {
         aggregate_response(
             upstream,
@@ -196,7 +261,7 @@ pub async fn messages(
             mock_model,
             deal,
             request_guard,
-            delivery_events,
+            request_id,
         )
         .await
         .into_response()
@@ -215,8 +280,9 @@ fn sse_response(
     mock_model: bool,
     deal: ApiDeal,
     mut request_guard: ConsumerRequestGuard,
-    delivery_events: Option<DeliveryEvents>,
+    request_id: String,
 ) -> Sse<impl Stream<Item = Result<Event, Infallible>>> {
+    let delivery_finalizer = request_guard.delivery_finalizer();
     let sse = async_stream::stream! {
         let mut driver = CanonStreamDriver::new(
             upstream,
@@ -229,12 +295,17 @@ fn sse_response(
         let mut capped = false;
         let mut stream_error = None;
         let mut billing_usage: Option<BillingUsage> = None;
-        yield Ok(event(render::anthropic_message_start(&id, &model)));
-        yield Ok(event(render::anthropic_content_block_start()));
+        let mut visible_text_tokens = 0_u64;
+        yield Ok((event(render::anthropic_message_start(&id, &model)), false));
+        yield Ok((event(render::anthropic_content_block_start()), false));
         loop {
             let chunk = match driver.next().await {
                 CanonStreamNext::Chunk(c) => c,
                 CanonStreamNext::Usage(usage) => {
+                    if let Err(error) = request_guard.observe_answer_usage(usage) {
+                        stream_error = Some(error.into());
+                        break;
+                    }
                     billing_usage = Some(usage);
                     continue;
                 }
@@ -251,29 +322,38 @@ fn sse_response(
                 capped = true;
                 break;
             }
-            // Track the visible output lower bound before its bytes leave so an immediate consumer
-            // disconnect cannot erase evidence of what was rendered. This is not a monetary update:
-            // the held billing reservation commits only after validated terminal usage and clean EOF.
-            if let Err(error) = deal.record_visible_output(accounted_tokens(&chunk)) {
+            // Preserve the stable v2 route witness for every accepted canonical content chunk,
+            // including hidden reasoning. The request-level visible lower bound remains text-only.
+            let chunk_tokens = accounted_tokens(&chunk);
+            if let Err(error) = deal.record_visible_output(chunk_tokens) {
                 stream_error = Some(error.into());
                 break;
+            }
+            if !chunk.text.is_empty() {
+                visible_text_tokens = visible_text_tokens.saturating_add(chunk_tokens);
             }
             let before = driver.received();
             driver.account_rendered(&chunk);
             debug_assert!(driver.received() >= before);
+            request_guard.record_delivery_progress(
+                driver.received(),
+                visible_text_tokens,
+                driver.legacy_received(),
+            );
             if !chunk.text.is_empty() {
-                yield Ok(anthropic_content_event(&deal, &chunk.text));
+                yield Ok((anthropic_content_event(&deal, &chunk.text), false));
             }
         }
         // Session-scoped: completion / max_tokens / upstream-error do NOT STOP -- only a
         // verification-bail ends the session early (STOP + bail off). `errored` still drives stop_reason below.
         let bailed = driver.bailed();
-        let received = driver.received();
+        let received = visible_text_tokens;
         let rendered_tokens = driver.legacy_received();
+        let provider_output_tokens = driver.received();
         drop(driver);
         if !bailed && stream_error.is_none() {
             if let Some(usage) = billing_usage.as_ref() {
-                if let Err(error) = request_guard.record_billing(&deal, usage.total_tokens) {
+                if let Err(error) = request_guard.record_billing(&deal, *usage) {
                     stream_error = Some(error.into());
                 }
             }
@@ -316,12 +396,24 @@ fn sse_response(
         } else {
             "end_turn"
         };
-        report_request_delivery(
-            delivery_events.as_ref(),
+        let failure_stage = if bailed {
+            Some("inline_verification")
+        } else if stream_error.is_some() {
+            Some("upstream_stream")
+        } else if received == 0 && !capped {
+            Some("empty_output")
+        } else {
+            None
+        };
+        let request_usage = request_guard.request_usage();
+        request_guard.prepare_delivery(
             RequestDelivery {
                 token_contract: deal.route.token_contract.clone(),
+                request_id: request_id.clone(),
                 protocol: "anthropic",
                 streamed: true,
+                http_status: StatusCode::OK.as_u16(),
+                failure_stage,
                 billing_grant_tokens,
                 output_limit_tokens: max_tokens,
                 visible_output_tokens: received,
@@ -330,17 +422,29 @@ fn sse_response(
                 input_tokens: accepted_usage.map(|usage| usage.input_tokens),
                 output_tokens: accepted_usage.map(|usage| usage.output_tokens),
                 billable_tokens: accepted_usage.map(|usage| usage.total_tokens),
+                request_input_tokens: request_usage.input_tokens,
+                request_output_tokens: request_usage.output_tokens,
+                request_billable_tokens: request_usage.total_tokens,
                 route_billable_tokens: deal.session.route_billable_tokens(),
                 finish_reason: stop_reason,
                 truncated_by_output_limit: capped,
-                ended_before_output_limit: received < max_tokens,
+                ended_before_output_limit: provider_output_tokens < max_tokens,
             },
         );
-        yield Ok(event(render::anthropic_content_block_stop()));
-        yield Ok(event(render::anthropic_message_delta(stop_reason)));
-        yield Ok(event(render::anthropic_message_stop()));
+        yield Ok((event(render::anthropic_content_block_stop()), false));
+        yield Ok((event(render::anthropic_message_delta(stop_reason)), false));
+        yield Ok((event(render::anthropic_message_stop()), true));
     };
-    Sse::new(sse)
+    Sse::new(sse.map(move |item| {
+        item.map(|(event, terminal)| {
+            if terminal {
+                if let Some(finalizer) = delivery_finalizer.as_ref() {
+                    finalizer.report_prepared();
+                }
+            }
+            event
+        })
+    }))
 }
 
 fn anthropic_content_event(deal: &ApiDeal, text: &str) -> Event {
@@ -372,7 +476,7 @@ async fn aggregate_response(
     mock_model: bool,
     deal: ApiDeal,
     mut request_guard: ConsumerRequestGuard,
-    delivery_events: Option<DeliveryEvents>,
+    request_id: String,
 ) -> Response {
     let mut content = String::new();
     let mut capped = false;
@@ -386,10 +490,15 @@ async fn aggregate_response(
     );
     let mut stream_error = None;
     let mut billing_usage: Option<BillingUsage> = None;
+    let mut visible_text_tokens = 0_u64;
     loop {
         let chunk = match driver.next().await {
             CanonStreamNext::Chunk(c) => c,
             CanonStreamNext::Usage(usage) => {
+                if let Err(error) = request_guard.observe_answer_usage(usage) {
+                    stream_error = Some(error.into());
+                    break;
+                }
                 billing_usage = Some(usage);
                 continue;
             }
@@ -407,26 +516,32 @@ async fn aggregate_response(
             capped = true;
             break;
         }
-        // Track the visible output lower bound before it joins the answer. Money still waits for a
-        // validated terminal input-plus-output record and clean EOF.
-        if let Err(error) = deal.record_visible_output(accounted_tokens(&chunk)) {
+        // Preserve the stable v2 route witness for every accepted canonical content chunk,
+        // including hidden reasoning. The request-level visible lower bound remains text-only.
+        let chunk_tokens = accounted_tokens(&chunk);
+        if let Err(error) = deal.record_visible_output(chunk_tokens) {
             stream_error = Some(error.into());
             break;
+        }
+        if !chunk.text.is_empty() {
+            visible_text_tokens = visible_text_tokens.saturating_add(chunk_tokens);
         }
         let before = driver.received();
         driver.account_rendered(&chunk);
         debug_assert!(driver.received() >= before);
+        request_guard.record_delivery_progress(driver.received(), 0, driver.legacy_received());
         content.push_str(&chunk.text);
     }
     // Session-scoped: a clean completion / max_tokens does NOT STOP -- only a verification-bail ends
     // the session early (STOP + bail off).
     let bailed = driver.bailed();
-    let received = driver.received();
+    let received = visible_text_tokens;
     let rendered_tokens = driver.legacy_received();
+    let provider_output_tokens = driver.received();
     drop(driver);
     if !bailed && stream_error.is_none() {
         if let Some(usage) = billing_usage.as_ref() {
-            if let Err(error) = request_guard.record_billing(&deal, usage.total_tokens) {
+            if let Err(error) = request_guard.record_billing(&deal, *usage) {
                 stream_error = Some(error.into());
             }
         }
@@ -439,27 +554,35 @@ async fn aggregate_response(
     let billing_exhausted =
         accepted_usage.is_some_and(|usage| usage.total_tokens == billing_grant_tokens);
     // every terminal below records the same three figures, including the two that answer 502.
-    let report = |stop_reason: &'static str| {
-        report_request_delivery(
-            delivery_events.as_ref(),
-            RequestDelivery {
-                token_contract: deal.route.token_contract.clone(),
-                protocol: "anthropic",
-                streamed: false,
-                billing_grant_tokens,
-                output_limit_tokens: max_tokens,
-                visible_output_tokens: received,
-                rendered_tokens,
-                route_delivered_tokens: Some(deal.route_visible_output_tokens()),
-                input_tokens: accepted_usage.map(|usage| usage.input_tokens),
-                output_tokens: accepted_usage.map(|usage| usage.output_tokens),
-                billable_tokens: accepted_usage.map(|usage| usage.total_tokens),
-                route_billable_tokens: deal.session.route_billable_tokens(),
-                finish_reason: stop_reason,
-                truncated_by_output_limit: capped,
-                ended_before_output_limit: received < max_tokens,
-            },
-        );
+    let delivery = |request_guard: &ConsumerRequestGuard,
+                    stop_reason: &'static str,
+                    http_status: StatusCode,
+                    failure_stage: Option<&'static str>,
+                    visible_output_tokens: u64| {
+        let request_usage = request_guard.request_usage();
+        RequestDelivery {
+            token_contract: deal.route.token_contract.clone(),
+            request_id: request_id.clone(),
+            protocol: "anthropic",
+            streamed: false,
+            http_status: http_status.as_u16(),
+            failure_stage,
+            billing_grant_tokens,
+            output_limit_tokens: max_tokens,
+            visible_output_tokens,
+            rendered_tokens,
+            route_delivered_tokens: Some(deal.route_visible_output_tokens()),
+            input_tokens: accepted_usage.map(|usage| usage.input_tokens),
+            output_tokens: accepted_usage.map(|usage| usage.output_tokens),
+            billable_tokens: accepted_usage.map(|usage| usage.total_tokens),
+            request_input_tokens: request_usage.input_tokens,
+            request_output_tokens: request_usage.output_tokens,
+            request_billable_tokens: request_usage.total_tokens,
+            route_billable_tokens: deal.session.route_billable_tokens(),
+            finish_reason: stop_reason,
+            truncated_by_output_limit: capped,
+            ended_before_output_limit: provider_output_tokens < max_tokens,
+        }
     };
     if bailed {
         deal.session.settle_verification_bail("verify-bail").await;
@@ -469,14 +592,28 @@ async fn aggregate_response(
         {
             request_guard.complete();
         }
-        report("error");
+        let terminal = delivery(
+            &request_guard,
+            "error",
+            StatusCode::BAD_GATEWAY,
+            Some("upstream_stream"),
+            0,
+        );
+        request_guard.report_delivery(terminal);
         return reject(StatusCode::BAD_GATEWAY, &format!("stream error: {e}"));
     } else if received == 0 && !capped {
         let heartbeat = deal.accepted_output_guard();
         deal.session
             .settle_empty_stream("empty-stream", &heartbeat)
             .await;
-        report("error");
+        let terminal = delivery(
+            &request_guard,
+            "error",
+            StatusCode::BAD_GATEWAY,
+            Some("empty_output"),
+            0,
+        );
+        request_guard.report_delivery(terminal);
         return reject(StatusCode::BAD_GATEWAY, "upstream produced an empty stream");
     }
     request_guard.complete();
@@ -490,7 +627,13 @@ async fn aggregate_response(
     } else {
         "end_turn"
     };
-    report(stop_reason);
+    let terminal = delivery(
+        &request_guard,
+        stop_reason,
+        StatusCode::OK,
+        bailed.then_some("inline_verification"),
+        received,
+    );
     let body = serde_json::json!({
         "id": id,
         "type": "message",
@@ -500,11 +643,11 @@ async fn aggregate_response(
         "stop_reason": stop_reason,
         "stop_sequence": null
     });
-    (
-        [(http::header::CONTENT_TYPE, "application/json")],
+    aggregate_body_response(
+        request_guard,
+        terminal,
         serde_json::to_string(&body).unwrap(),
     )
-        .into_response()
 }
 
 fn reject(status: StatusCode, message: &str) -> Response {

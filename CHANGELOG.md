@@ -1,3 +1,40 @@
+## v0.6.0
+
+### Breaking Changes
+
+- `dexdo seller` no longer accepts `--price-per-tick`; it always uses the terms stored in the
+  deployed TokenContract. `dexdo buyer`, `dexdo provision`, and `dexdo executable-book` now require
+  their price option explicitly instead of supplying an implicit price.
+
+### Fixes
+
+- Allow `dexdo buyer --resume` to reconnect to an already-priced deal without a new-buy ceiling.
+  A price-less resume cannot place a fresh continuation BUY. Only a model-only resume with
+  `--continuity-mode on-demand` can opt into later continuation by passing
+  `--max-price-per-tick`, using exactly that ceiling; subscription, market, and explicit-contract
+  resumes do not renew.
+- `dexdo settlement-receipt --json` now explains the service charge, platform fee, forfeited bond,
+  and total buyer cost for probe-only deals closed on contracts 4.0.36. Pass `--deals-dir` to also
+  include a buyer client's recorded STOP reason when it matches the exact on-chain terminal message.
+- Enforce `seller.max_open_deals` before provisioning spends money. Seller startup now warns when
+  already deployed deals exceed the limit, continues serving every paid deal, and leaves residual
+  provisioning queued until capacity is available.
+- `dexdo note withdraw` now warns that withdrawal links the note to its destination wallet and
+  permanently prevents future sell offers. Interactive use requires typing `YES`; non-interactive
+  callers must pass `--acknowledge-note-retirement` after accepting the warning. Deploy a new note
+  to continue selling.
+- Return an explicit local error when text-only OpenAI or Anthropic endpoints receive reasoning
+  without assistant text, while retaining the provider's clean terminal usage as billable and
+  keeping the hidden reasoning out of visible output.
+- Correlate local OpenAI and Anthropic responses with `request_delivery` through
+  `x-dexdo-request-id`, and report the whole request's input, output, billable usage, HTTP status,
+  and failure stage even when paid verification is followed by HTTP 502 or a client disconnect.
+  Visible output excludes hidden reasoning; disconnect records preserve partial visible output and
+  terminal usage observed before delayed EOF. Aggregated responses distinguish accepted buffered
+  output from text that actually crossed the response-body boundary, and output-cap status follows
+  provider usage rather than text visibility. Human output now shows the whole-request input/output
+  split as well as its total.
+
 ## v0.5.0
 
 ### New / Improvements

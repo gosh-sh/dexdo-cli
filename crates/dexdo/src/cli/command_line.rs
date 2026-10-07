@@ -89,10 +89,26 @@ mod tests {
     /// The pair the whole rule rests on: a typed argument is an answer, a defaulted one is not.
     #[test]
     fn a_typed_value_is_an_answer_and_a_default_is_not() {
-        let typed = parse(&["dexdo", "buyer", "--model", "qwen", "--ticks", "5"]);
+        let typed = parse(&[
+            "dexdo",
+            "buyer",
+            "--model",
+            "qwen",
+            "--ticks",
+            "5",
+            "--max-price-per-tick",
+            "1",
+        ]);
         assert!(answered_in(&typed, "ticks"), "--ticks 5 is an answer");
 
-        let defaulted = parse(&["dexdo", "buyer", "--model", "qwen"]);
+        let defaulted = parse(&[
+            "dexdo",
+            "buyer",
+            "--model",
+            "qwen",
+            "--max-price-per-tick",
+            "1",
+        ]);
         assert!(
             !answered_in(&defaulted, "ticks"),
             "clap's own default is not something the operator said"
@@ -103,7 +119,13 @@ mod tests {
     /// here, and an argv scan cannot tell a flag from something that merely looks like one.
     #[test]
     fn a_value_that_looks_like_the_flag_is_not_the_flag() {
-        let argv = ["dexdo", "buyer", "--model=--ticks"];
+        let argv = [
+            "dexdo",
+            "buyer",
+            "--model=--ticks",
+            "--max-price-per-tick",
+            "1",
+        ];
         let matches = parse(&argv);
 
         assert!(

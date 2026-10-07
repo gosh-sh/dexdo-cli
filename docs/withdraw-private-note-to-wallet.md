@@ -4,6 +4,10 @@ The command `dexdo note withdraw` moves the PrivateNote's complete spendable tok
 `ECC[2]` pocket to the wallet specified by the required `--to` option. It does not move the PN's
 native `vmshell` gas. A successful operation is irreversible and `withdrawTokens` can be executed only once for that PN.
 
+Withdrawal links the PrivateNote to the destination wallet and therefore deanonymizes it. It also
+permanently prevents that note from posting another sell offer. To continue selling after a
+withdrawal, deploy and use a new PrivateNote.
+
 > **Points & Rewards Program participants**
 >
 > **A mandatory requirement for receiving a reward** under the
@@ -179,6 +183,10 @@ procedure, but never send the owner key or its contents to the chat. A current-g
 for new activity does not recover the old balance.
 
 ### H4. Submit exactly once
+
+The CLI repeats the deanonymization and permanent selling consequences before submission. Type
+`YES` only after checking the complete note and destination above. Any other answer cancels before
+the transaction and leaves local state unchanged.
 
 When the PN owner key is in the current pool:
 
@@ -500,6 +508,9 @@ After every pre-submit predicate passes, show the user all of the following toge
 - `expected_SHELL_raw`;
 - `verification_timeout`;
 - the exact expanded `note withdraw` command proposed for execution, without key contents.
+- the fact that withdrawal links the note to the destination wallet, deanonymizes it, and
+  permanently prevents that note from posting another sell offer; continuing to sell requires a
+  new note.
 
 Receive explicit confirmation of those exact values and that exact command. A prior request to
 inspect, explain, or prepare the withdrawal is not confirmation to submit it. If any value or
@@ -512,7 +523,8 @@ When the PN owner key is in the current pool:
 ```bash
 dexdo --data-dir "$DATA_DIR" note withdraw \
   --note-addr "$PN" \
-  --to "$DEST"
+  --to "$DEST" \
+  --acknowledge-note-retirement
 ```
 
 When the owner key is stored separately:
@@ -530,11 +542,16 @@ resulting mode. Set `NOTE_KEY` to that file's absolute path; never set it to the
 dexdo --data-dir "$DATA_DIR" note withdraw \
   --note-addr "$PN" \
   --note-key "$NOTE_KEY" \
-  --to "$DEST"
+  --to "$DEST" \
+  --acknowledge-note-retirement
 ```
 
 Keep the owner key private. Never print its contents, paste them on the command line, include them in
 logs or messages, or commit them.
+
+The acknowledgement flag is mandatory here because an agent or automation run cannot answer the
+terminal prompt. Add it only after the explicit confirmation in A4; it is not a way to infer or
+bypass the operator's consent.
 
 Capture the command's complete stdout and stderr and its start and finish times. The current command
 has no JSON result surface and may provide no message or transaction identity. Preserve such an

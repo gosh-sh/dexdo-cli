@@ -330,7 +330,11 @@ A PrivateNote exposes three separate balance planes:
 
 `dexdo note withdraw` drains the trading record and ECC[2] pocket separately;
 it does not withdraw native vmshell. A balance in one plane says nothing about
-the other two.
+the other two. Withdrawal links the note to the destination wallet, deanonymizes
+it, and permanently prevents it from posting another sell offer. Continuing to
+sell requires a new note. Interactive use requires an explicit `YES`; headless
+use requires `--acknowledge-note-retirement` after the operator accepts those
+consequences.
 
 ### PrivateNote deployment recovery
 

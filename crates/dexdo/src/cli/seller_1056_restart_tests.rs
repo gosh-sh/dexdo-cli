@@ -160,7 +160,6 @@ fn issue_1056_seller_args(
         market: None,
         nonce: Some(8),
         subscription: false,
-        price_per_tick: dexdo_core::PRICE_STEP as u64,
         mock_token_count: 98,
         model: None,
         allow_unverified_model: false,
@@ -346,7 +345,8 @@ fn issue_1056_restart_after_terminal_settlement_queues_exact_residual_and_names_
 #[tokio::test]
 async fn issue_1056_in_process_residual_relist_is_unchanged() {
     let root = tempfile::tempdir().expect(" in-process directory");
-    let relisted = pool_run_after_parent_settled(root.path(), 2).await;
+    let relisted =
+        pool_run_after_parent_settled(root.path(), 2, None, false, false, false, false, false).await;
     relisted
         .outcome
         .expect("PR1055's in-process relist must remain healthy");

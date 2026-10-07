@@ -1,4 +1,4 @@
-// a refusal must not spend.
+// an already deployed deal must not be refused at seller startup.
 
 // Mainnet, 2026-08-16, contracts 4.0.35. `dexdo provision` deployed and funded the per-deal
 // `TokenContract` `0ba5349a...` and wrote it into `market.json`. The very next command, `dexdo seller`
@@ -8,10 +8,11 @@
 // instead. The seller's note paid 32 000 000 000 raw ECC[2] -- two 16-SHELL deposits -- for one
 // deal, and the buyer was handed a manifest pointing at the contract nobody serves.
 
-// The refusal and the spend are one defect, not two symptoms: capacity the run had just told the
-// operator it did not have was spent on a contract the operator never asked for. This regression
-// drives the production entry (`run_seller`) over exactly that pre-state and asserts BOTH halves --
-// the handed deal is not served AND nothing is funded in its place.
+// correctly stopped a refusal from spending, but the refusal itself abandoned a funded
+// TokenContract. Capacity is now enforced before `provision`; startup serves every contract that
+// already exists. This regression drives the production entry (`run_seller`) over the old pre-state
+// and asserts both halves: the handed deal is served, and the queued residual does not leap over the
+// runtime capacity while that deal holds it.
 
 /// The seller args this regression needs, in the shape `run_seller` reads them. Deliberately its
 /// own builder rather than a shared one: the sibling mock-pool tests build theirs behind
@@ -45,7 +46,6 @@ fn refusal_seller_args(
         market: None,
         nonce: Some(nonce),
         subscription: false,
-        price_per_tick: dexdo_core::PRICE_STEP as u64,
         mock_token_count: 4,
         model: None,
         allow_unverified_model: false,
@@ -54,19 +54,11 @@ fn refusal_seller_args(
     }
 }
 
-/// What the run did before the window closed. The seller keeps serving forever when it is healthy,
-/// so "it never returned" is an outcome in its own right and must not be read as success.
-enum RefusedStartupOutcome {
-    /// A successor `TokenContract` was funded and its ask reached the book.
-    FundedAReplacement,
-    /// `run_seller` reached a decision and returned it.
-    Returned(Result<()>),
-}
-
-/// A money-safety regression for. It carries no requirement-matrix row: the matrix is the
-/// lead's, and this asserts a spend that must not happen rather than a specification layer.
+/// The exact mainnet pre-state from: one settled parent has a queued residual, while a second
+/// paid TokenContract is vacant. `max_open_deals=1` must not choose by directory order and abandon
+/// either existing contract.
 #[tokio::test]
-async fn a_startup_refused_at_max_open_deals_funds_no_replacement_token_contract() {
+async fn startup_above_max_serves_the_paid_candidate_before_funding_any_residual() {
     let root = tempfile::tempdir().expect(" regression directory");
     let seller_seed = [0x14; 32];
     crate::cli::support::write_owner_only_key_fixture(&root.path().join("seller.key"), &hex::encode(seller_seed));
@@ -196,56 +188,32 @@ async fn a_startup_refused_at_max_open_deals_funds_no_replacement_token_contract
         policy_path,
     ));
     tokio::pin!(seller);
-    let funded_a_replacement = async {
-        loop {
-            if matches!(
-                chain.confirm_offer_outcome(&successor_tc).await,
-                Ok(Some(_))
-            ) {
-                break;
-            }
-            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
-        }
-    };
-    tokio::pin!(funded_a_replacement);
-    let outcome = tokio::time::timeout(std::time::Duration::from_secs(45), async {
+    tokio::time::timeout(std::time::Duration::from_secs(45), async {
         tokio::select! {
-            result = &mut seller => RefusedStartupOutcome::Returned(result),
-            () = &mut funded_a_replacement => RefusedStartupOutcome::FundedAReplacement,
+            result = &mut seller => {
+                panic!("seller returned before serving the paid candidate: {result:?}");
+            }
+            () = async {
+                loop {
+                    if matches!(
+                        chain.confirm_offer_outcome(&provisioned_tc).await,
+                        Ok(Some(_))
+                    ) {
+                        break;
+                    }
+                    tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+                }
+            } => {}
         }
     })
     .await
-    .expect("a seller that can take no deal must reach a decision, not idle out the window");
+    .expect("the already paid candidate must be served instead of refused");
 
-    let error = match outcome {
-        RefusedStartupOutcome::FundedAReplacement => panic!(
-            ": the seller refused {} at seller.max_open_deals=1 and then funded a replacement \
-             TokenContract {} anyway -- a refusal must not spend",
-            super::display_token_contract(&provisioned_tc),
-            super::display_token_contract(&successor_tc)
-        ),
-        RefusedStartupOutcome::Returned(result) => result.expect_err(
-            "a seller that took no deal and served nothing must fail closed, not exit successfully",
-        ),
-    };
-    let message = error.to_string();
-    assert!(
-        message.contains(&super::display_token_contract(&provisioned_tc))
-            && message.contains("max_open_deals"),
-        "the refusal must name the TokenContract it declined and the limit that declined it: \
-         {message}"
-    );
-
-    // The money, read from the chain rather than from the log: nothing was bought, and the contract
-    // `provision` already paid for is untouched and still serviceable.
+    // The runtime cap still orders NEW spending: while the paid candidate holds the sole slot, the
+    // settled parent's residual stays queued instead of buying a successor around it.
     assert_eq!(
         chain.confirm_offer_outcome(&successor_tc).await.unwrap(),
         None,
-        "a refusal must fund no successor TokenContract: {message}"
-    );
-    assert_eq!(
-        chain.confirm_offer_outcome(&provisioned_tc).await.unwrap(),
-        None,
-        "the refused TokenContract must be left exactly as provision funded it: {message}"
+        "the queued residual must wait until runtime capacity is free"
     );
 }

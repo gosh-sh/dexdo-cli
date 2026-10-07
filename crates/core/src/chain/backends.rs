@@ -4934,6 +4934,42 @@ mod expired_ask_selection_wiring_tests {
         server.abort();
     }
 
+    /// A resume-only adapter has no operator-selected buy ceiling. That absence must remain data,
+    /// not be replaced with a cheap synthetic order: even the legacy direct-buy entry point refuses
+    /// before its first chain read, so it cannot reach a money POST.
+    #[tokio::test]
+    async fn resume_only_buyer_backend_cannot_place_a_fresh_direct_buy() {
+        let (endpoint, hits, server) = counting_endpoint().await;
+        let chain = RealChainBackend::connect_with_endpoint(manifest(), Some(&endpoint))
+            .expect("backend against the counting endpoint");
+        let backend = RealBuyerBackend::new_with_direct_buy_budget(
+            chain,
+            Address::parse(&format!("0:{}", "c".repeat(64))).expect("buyer note address"),
+            KeyPair::generate(),
+            "0".repeat(64),
+            crate::params::TICK_SIZE,
+            None,
+        );
+
+        let error = backend
+            .place_buy(&format!("0:{}", "d".repeat(64)), &LocalNote::generate())
+            .await
+            .expect_err("a resume-only backend must refuse a fresh BUY");
+        let rendered = format!("{error:#}");
+
+        assert!(
+            rendered.contains("without an explicit price"),
+            "the refusal must identify the missing operator ceiling: {rendered}"
+        );
+        assert_eq!(
+            hits.load(Ordering::SeqCst),
+            0,
+            "a missing price must be refused before any chain read or money POST"
+        );
+
+        server.abort();
+    }
+
     /// E2E-ROW: E2E-GUARD-11/LS
 
     /// The set of buy-submit paths is CLOSED. The behavioural row above proves two paths refuse a
@@ -9555,11 +9591,16 @@ pub struct RealBuyerBackend {
     keys: KeyPair,
     model_hash: String,
     tick_size: u128,
+    direct_buy_budget: Option<DirectBuyBudget>,
+    wait_for_seller: bool,
+    pending_fill: std::sync::Mutex<Option<PendingBuyerFill>>,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct DirectBuyBudget {
     max_price_per_tick: u128,
     ticks: u128,
     escrow: u128,
-    wait_for_seller: bool,
-    pending_fill: std::sync::Mutex<Option<PendingBuyerFill>>,
 }
 
 #[derive(Debug, Clone)]
@@ -9606,15 +9647,35 @@ impl RealBuyerBackend {
         ticks: u128,
         escrow: u128,
     ) -> Self {
+        Self::new_with_direct_buy_budget(
+            chain,
+            note,
+            keys,
+            model_hash,
+            tick_size,
+            Some(DirectBuyBudget {
+                max_price_per_tick,
+                ticks,
+                escrow,
+            }),
+        )
+    }
+
+    fn new_with_direct_buy_budget(
+        chain: RealChainBackend,
+        note: Address,
+        keys: KeyPair,
+        model_hash: String,
+        tick_size: u128,
+        direct_buy_budget: Option<DirectBuyBudget>,
+    ) -> Self {
         Self {
             chain,
             note,
             keys,
             model_hash,
             tick_size,
-            max_price_per_tick,
-            ticks,
-            escrow,
+            direct_buy_budget,
             wait_for_seller: false,
             pending_fill: std::sync::Mutex::new(None),
         }
@@ -9646,6 +9707,44 @@ impl RealBuyerBackend {
         // accepts the SHELL and orphans it (no match, no bid, no refund). Fail-fast instead of a silent loss.
         check_buy_deposit_headroom(escrow, ticks, max_price_per_tick)
             .map_err(|e| anyhow!("{e}"))?;
+        Self::from_provisioned_with_direct_buy_budget(
+            manifest_path,
+            note_addr,
+            note_secret_hex,
+            frame_model,
+            Some(DirectBuyBudget {
+                max_price_per_tick,
+                ticks,
+                escrow,
+            }),
+        )
+    }
+
+    /// Build the same real buyer adapter for an invocation that may only adopt an existing deal.
+    /// No synthetic purchase terms are installed: the legacy direct-buy entry point fails closed,
+    /// while explicit-budget model-book methods remain available to callers that actually have one.
+    pub fn from_provisioned_resume(
+        manifest_path: &str,
+        note_addr: &str,
+        note_secret_hex: &str,
+        frame_model: &str,
+    ) -> Result<(Self, RealNote)> {
+        Self::from_provisioned_with_direct_buy_budget(
+            manifest_path,
+            note_addr,
+            note_secret_hex,
+            frame_model,
+            None,
+        )
+    }
+
+    fn from_provisioned_with_direct_buy_budget(
+        manifest_path: &str,
+        note_addr: &str,
+        note_secret_hex: &str,
+        frame_model: &str,
+        direct_buy_budget: Option<DirectBuyBudget>,
+    ) -> Result<(Self, RealNote)> {
         let chain = RealChainBackend::connect(manifest_path)?;
         // `--note-addr` is typed by an OPERATOR, who copies it out of their own `pn_pool.json`.
         // `note deploy` writes that file in the canonical `<dapp_id>::<account_id>` form, and the
@@ -9661,15 +9760,13 @@ impl RealBuyerBackend {
             .map_err(|e| anyhow!("--note-key (SDK secret hex): {e:?}"))?;
         let rn = RealNote::from_secret_hex(note_secret_hex)
             .map_err(|e| anyhow!("--note-key invalid ed25519 seed: {e}"))?;
-        let backend = Self::new(
+        let backend = Self::new_with_direct_buy_budget(
             chain,
             note,
             keys,
             model_hash_for(frame_model),
             TICK_SIZE,
-            max_price_per_tick,
-            ticks,
-            escrow,
+            direct_buy_budget,
         );
         Ok((backend, rn))
     }
@@ -9855,6 +9952,12 @@ impl ChainBackend for RealBuyerBackend {
         token_contract: &TokenContract,
         _note: &dyn Note,
     ) -> Result<(), ChainError> {
+        let budget = self.direct_buy_budget.ok_or_else(|| {
+            ChainError::Chain(
+                "resume-only buyer backend cannot place a fresh BUY without an explicit price"
+                    .to_string(),
+            )
+        })?;
         let expected = parse_tc(token_contract)?;
         self.require_tc_gas(&expected).await?;
         // (branch-3 guard): fail closed if this note's on-chain owner key (`getDetails().ephemeralPubkey`)
@@ -9871,7 +9974,7 @@ impl ChainBackend for RealBuyerBackend {
         // `placeInferenceBuy` is model-book-wide and cannot name a target TC. Fail before moving escrow
         // unless the book's price->time matcher would fund the TC from this market manifest.
         let order_book = self
-            .assert_expected_buy_target(&expected, self.ticks, self.max_price_per_tick)
+            .assert_expected_buy_target(&expected, budget.ticks, budget.max_price_per_tick)
             .await?;
         let expected_tc = expected.with_workchain();
         self.assert_selected_tc_unused(&expected_tc, &order_book)
@@ -9884,9 +9987,9 @@ impl ChainBackend for RealBuyerBackend {
                 &self.note,
                 &self.keys,
                 &self.model_hash,
-                self.max_price_per_tick,
-                self.ticks,
-                self.escrow,
+                budget.max_price_per_tick,
+                budget.ticks,
+                budget.escrow,
                 self.buy_flags(),
                 deadline,
             )

@@ -98,6 +98,12 @@ The single exception is `dexdo note withdraw --to`, which requires the
 DApp-qualified form: the destination DApp is evidence in `TokensWithdrawn`, and
 account-only input cannot supply it.
 
+Withdrawal links the note to that wallet, deanonymizes it, and permanently
+prevents the note from posting another sell offer. The interactive command asks
+for an explicit `YES`; a non-interactive caller must pass
+`--acknowledge-note-retirement` after accepting those consequences. Continuing
+to sell requires a new note.
+
 ## Commands
 
 | Command | What it does |

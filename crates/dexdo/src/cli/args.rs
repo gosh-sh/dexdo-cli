@@ -266,10 +266,6 @@ pub(crate) struct SellerArgs {
     /// Offer this seller only to subscription BUYs. Ordinary sellers leave this off.
     #[arg(long)]
     pub(crate) subscription: bool,
-    /// Tick price P in whole SHELL: `3` is three SHELL a tick. One SHELL is the book's price step,
-    /// and a price that is not a whole multiple of it the book refuses.
-    #[arg(long, default_value = "1", value_parser = crate::cli::args::parse_price_shell_u64)]
-    pub(crate) price_per_tick: u64,
     /// How many fake tokens to serve in `--mock-model` mode. Real upstreams follow the request's
     /// `max_tokens`, capped by the market's `max_ticks * TICK_SIZE`.
     #[arg(long, default_value_t = DEFAULT_SELLER_MOCK_TOKEN_COUNT)]
@@ -432,10 +428,17 @@ pub(crate) struct BuyerArgs {
     /// `--mock-model` seller -- and a parser default would leave nothing able to say it.
     #[arg(long)]
     pub(crate) local_listen: Option<SocketAddr>,
-    /// Continuity mode for --local-listen. proactive keeps a warm next deal ready after idle close,
-    /// low remaining budget, or no current deal; it may pre-buy while idle and spend the documented probe/idle
-    /// cost. on-demand buys only after active/recent consumer traffic; it avoids idle spend, but the first
-    /// request after idle may wait for a fresh deal.
+    /// Continuity mode for --local-listen. proactive keeps a warm next deal ready after the current
+    /// deal closes, reaches low remaining budget, or is absent; it may pre-buy while idle and spend
+    /// the documented probe/idle cost. on-demand buys only after active/recent consumer traffic; it
+    /// avoids idle pre-buy, but the first request that needs a replacement may wait for a fresh deal.
+
+    /// For a few short requests per hour, use on-demand, start with --ticks 2 when one streaming tick
+    /// is enough, and keep the endpoint/deal running; idle alone does not STOP it. Raise --ticks only
+    /// for the cumulative volume you expect. If this client STOPs after only the probe, the buyer
+    /// pays the probe tick P + its platform fee + one forfeited buyer-bond tick P: 222.75 SHELL at
+    /// P=110. A later request then needs a fresh buy. For a planned process restart, combine
+    /// --preserve-deal-on-exit with --resume instead of ending the deal.
     #[arg(long, value_enum, default_value = DEFAULT_CONTINUITY_MODE, value_name = "MODE")]
     pub(crate) continuity_mode: ContinuityModeArg,
     /// Emit machine-readable JSONL lifecycle events on stdout.
@@ -470,9 +473,14 @@ pub(crate) struct BuyerArgs {
     /// is three SHELL a tick -- crossing with an ask at or below it.
     /// Must be >= ask. Book deposit check: `escrow >= ticks x maxPricePerTick x (1 + 2.5 %
     /// fee)` -- the fee is charged ON TOP of the limit, so `escrow = limit x ticks` (without headroom) does
-    /// not pass; keep the limit noticeably below `escrow / (ticks x 1.025)`.
-    #[arg(long, default_value = "1", value_parser = crate::cli::args::parse_price_shell)]
-    pub(crate) max_price_per_tick: u128,
+    /// not pass; keep the limit noticeably below `escrow / (ticks x 1.025)`. Optional only with
+    /// `--resume`: absence authorizes adoption of the existing deal, but no later continuation BUY.
+    #[arg(
+        long,
+        required_unless_present = "resume",
+        value_parser = crate::cli::args::parse_price_shell
+    )]
+    pub(crate) max_price_per_tick: Option<u128>,
     /// **Real chain:** escrow (the note's `getDetails().balance[2]` SHELL) for `placeInferenceBuy`. Omit it to use EXACTLY
     /// the required `ticks x max_price_per_tick x (1 + 2.5 % book fee)`. An
     /// explicit value must equal `required`: under-funding orphans the escrow; over-funding strands the
@@ -663,7 +671,7 @@ pub(crate) struct ProvisionArgs {
     pub(crate) nonce: Option<ProvisionNonceArg>,
     /// Tick price P in whole SHELL: `3` is three SHELL a tick. One SHELL is the book's price step,
     /// and a price that is not a whole multiple of it the book refuses.
-    #[arg(long, default_value = "1", value_parser = crate::cli::args::parse_price_shell)]
+    #[arg(long, value_parser = crate::cli::args::parse_price_shell)]
     pub(crate) price_per_tick: u128,
     /// Max ticks the deal `TokenContract` bounds to.
     #[arg(long, default_value_t = DEFAULT_PROVISION_MAX_TICKS)]
@@ -683,6 +691,10 @@ pub(crate) struct ProvisionArgs {
     /// seller`/`buyer` load it via `--market`.
     #[arg(long, default_value = DEFAULT_MARKET_MANIFEST_OUTPUT_PATH)]
     pub(crate) output: PathBuf,
+    /// Local deal-handle directory. Pass the same directory to `provision` and `seller` so they
+    /// share the note-wide capacity lock and durable provision reservations.
+    #[arg(long)]
+    pub(crate) deals_dir: Option<PathBuf>,
     /// Persistent seller failure policy JSON. Defaults to the same platform path as `dexdo seller`.
     /// Provisioning fails locally before reading secrets or connecting to the chain if it is unsupported.
     #[arg(long)]
@@ -812,6 +824,9 @@ pub(crate) struct SettlementReceiptArgs {
     /// TokenContract whose chain getters and ext-out history are read.
     #[arg(value_name = "TOKEN_CONTRACT", value_parser = dexdo_core::address::arg_to_chain_param)]
     pub(crate) token_contract: String,
+    /// Durable deal-record directory used to join a confirmed local buyer STOP reason.
+    #[arg(long)]
+    pub(crate) deals_dir: Option<PathBuf>,
     /// Rewards season to include in the independent note-aggregate join instructions.
     #[arg(long, value_name = "N")]
     pub(crate) season: Option<u32>,
@@ -1018,7 +1033,7 @@ pub(crate) struct ExecutableBookArgs {
     pub(crate) ticks: u128,
     /// Buyer price ceiling in whole SHELL, the same figure `--max-price-per-tick` takes on
     /// `dexdo buyer`.
-    #[arg(long, default_value = "1", value_parser = crate::cli::args::parse_price_shell)]
+    #[arg(long, value_parser = crate::cli::args::parse_price_shell)]
     pub(crate) max_price_per_tick: u128,
 }
 
@@ -1597,21 +1612,6 @@ pub(crate) fn parse_price_shell(raw: &str) -> Result<u128, String> {
         .ok_or_else(|| format!("price {shell} SHELL per tick is beyond the range of a price"))
 }
 
-/// The same price for the one argument whose field is still 64-bit: the seller's own offer price
-/// (`SellerConfig::price_per_tick` is `Shell`, a `u64`). The ceiling differs from the other four
-/// price arguments, and it is named when it is hit rather than left to a silent conversion later.
-pub(crate) fn parse_price_shell_u64(raw: &str) -> Result<u64, String> {
-    let value = parse_price_shell(raw)?;
-    u64::try_from(value).map_err(|_| {
-        format!(
-            "price {} SHELL per tick is beyond what a seller offer can hold; the largest it takes \
-             is {} SHELL",
-            value / dexdo_core::PRICE_STEP,
-            u128::from(u64::MAX) / dexdo_core::PRICE_STEP
-        )
-    })
-}
-
 /// Parse a `--activation-timeout` such as `600`, `10m` or `1h`.
 pub(crate) fn parse_activation_timeout(raw: &str) -> Result<std::time::Duration, String> {
     parse_duration_flag("--activation-timeout", raw)
@@ -1882,6 +1882,11 @@ pub(crate) struct NoteWithdrawArgs {
     /// DApp and contain deployed code, or the command refuses before withdrawal submission.
     #[arg(long)]
     pub(crate) to: String,
+    /// Acknowledge that withdrawal links this PrivateNote to the destination wallet, deanonymizes
+    /// it, and permanently prevents it from posting another sell offer. Without this flag an
+    /// interactive terminal asks for confirmation; a non-interactive run refuses.
+    #[arg(long)]
+    pub(crate) acknowledge_note_retirement: bool,
 }
 
 /// Args for `dexdo note sweep`: `PrivateNote.sweepShell(destWalletAddr, dapp_id)`.

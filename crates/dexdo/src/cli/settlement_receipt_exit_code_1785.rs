@@ -55,6 +55,7 @@ fn context() -> ReceiptContext {
         expected_code_hash: None,
         token_contract: DEAL.to_string(),
         season: None,
+        local_client_stop: None,
     }
 }
 

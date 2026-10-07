@@ -431,7 +431,7 @@ fn build_actions(
         }
         Some(DealHandleRole::Seller) if s.opened && !s.probe_accepted => {
             next.push(
-                "keep `dexdo seller` running: after the first delivered canonical tick it calls TokenContract.acceptProbe() after PROBE_WINDOW"
+                "keep `dexdo seller` running: after the first accepted billable input+output usage it calls TokenContract.acceptProbe() after PROBE_WINDOW"
                     .into(),
             );
             next.push(format!(
@@ -440,7 +440,7 @@ fn build_actions(
         }
         Some(DealHandleRole::Seller) if s.opened => {
             next.push(
-                "keep `dexdo seller` running: it calls TokenContract.claimTokens(cumulativeTokens) for delivered output and TokenContract.finalize() for mature claims; the subscription keeper also calls TokenContract.settleWeek() at crossed week boundaries"
+                "keep `dexdo seller` running: it calls TokenContract.claimTokens(cumulativeTokens) for accepted billable input+output usage and TokenContract.finalize() for mature claims; the subscription keeper also calls TokenContract.settleWeek() at crossed week boundaries"
                     .into(),
             );
             next.push(format!(
@@ -1035,6 +1035,10 @@ mod tests {
         .available_next_commands
         .join("\n");
         assert!(probe.contains("TokenContract.acceptProbe()"), "{probe}");
+        assert!(
+            probe.contains("first accepted billable input+output usage"),
+            "{probe}"
+        );
         assert!(probe.contains("TokenContract.sellerStop()"), "{probe}");
         assert!(!probe.contains("advance"), "{probe}");
 

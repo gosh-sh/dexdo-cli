@@ -558,7 +558,7 @@ impl ChainBackend for Issue1057YieldingRetiredBackend {
         self.inner
             .open_stream(token_contract, enc_endpoint, note)
             .await?;
-        self.inner.exists.store(false, Ordering::Relaxed);
+        self.inner.settle_and_lose_getdeal();
         Ok(())
     }
 
@@ -627,7 +627,10 @@ impl ChainBackend for Issue1057YieldingRetiredBackend {
 
 #[tokio::test]
 async fn issue_1057_consumed_shutdown_between_two_residuals_provisions_once() {
-    let pool = issue_1057_pool(2).await;
+    let mut pool = issue_1057_pool(2).await;
+    pool.deal.chain = Arc::new(Issue1057YieldingRetiredBackend {
+        inner: pool.parent.clone(),
+    });
     let second_parent = Arc::new(PoolTestBackend::new(
         pool.parent.owner_fills.clone(),
         format!("0:{}", "3".repeat(64)),

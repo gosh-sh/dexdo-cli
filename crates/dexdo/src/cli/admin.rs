@@ -10,11 +10,13 @@ use crate::cli::commands::{
 };
 use crate::cli::policy;
 use crate::cli::support::{
-    default_deposit_shells, deposit_per_deploy, deposit_per_deploy_with_overhead,
-    ensure_provision_deposit_covered, prompt_deposit_shells, require_model_name,
-    require_provision_nonce, resolve_market_fields, validate_price_step, SHELL_UNIT,
+    clear_provision_pending_if_present, default_deposit_shells, deposit_per_deploy,
+    deposit_per_deploy_with_overhead, ensure_provision_deposit_covered,
+    persist_provision_deal_handle, prepare_fresh_provision_deposit, prompt_deposit_shells,
+    provision_failure_clears_pending, require_model_name, require_provision_nonce,
+    resolve_market_fields, validate_price_step, SHELL_UNIT,
 };
-use anyhow::Result;
+use anyhow::{bail, Result};
 use dexdo::registry::{BuyerMissingBookPolicy, RegistryRole, RegistrySuggestions};
 use dexdo_core::params::{
     MARKET_DEPLOY_ACTIVATION_MAX_READS, MARKET_DEPLOY_ACTIVATION_POLL_INTERVAL,
@@ -364,7 +366,7 @@ pub(crate) async fn run_provision_with_deal_gas_overhead(
     use dexdo_core::{KeyPair, RealChainBackend};
     // A3: reject an invalid limit price at the command boundary, before any key/file/network read or write.
     validate_price_step(args.price_per_tick)?;
-    policy::load_seller_runtime_policy(args.policy.as_deref())?;
+    let seller_policy = policy::load_seller_runtime_policy(args.policy.as_deref())?;
     // The manifest path comes from the environment now. The flag it used to come from is
     // gone, and with it the case where an operator typed something unprintable -- what is left is a
     // path this process was handed, which still has to be text before it can be passed on as one.
@@ -475,11 +477,72 @@ pub(crate) async fn run_provision_with_deal_gas_overhead(
         .map_err(|e| anyhow::anyhow!("--note-key (SDK secret hex): {e:?}"))?;
     let note = dexdo_core::address::parse_chain_address(&note_addr)
         .map_err(|e| anyhow::anyhow!("--note-addr {note_addr}: {e}"))?;
-    if let Some(policy) = registry_policy.as_ref() {
-        let expected_order_book = chain
-            .inference_orderbook_address(&note, &target.model_hash, dexdo_core::TICK_SIZE)
+    // One note has one seller pool and one money boundary. Hold the same lock as the long-running
+    // seller from the capacity snapshot until deployDeal returns: another provision cannot observe
+    // the old count and spend concurrently, and seller startup cannot snapshot the pool between
+    // this reservation and the new TokenContract becoming readable. Replacement provisioning is
+    // already inside the seller's lifetime hold of this lock.
+    let seller_pool_dir =
+        crate::cli::seller::seller_pool_dir(args.deals_dir.as_deref(), &note_addr)?;
+    let seller_pool_lock = crate::cli::seller::acquire_seller_pool_lock(&seller_pool_dir)?;
+    // A numeric nonce remains deterministic. `auto` draws from the OS CSPRNG and rejects a candidate
+    // read-only when its deterministic address is active or has immutable history. The provisioning
+    // path checks again before deployDeal, so this selection cannot weaken the money guard.
+    let requested_nonce = require_provision_nonce(args.nonce)?;
+    let mut rng = rand::rngs::OsRng;
+    let nonce = choose_provision_nonce(
+        requested_nonce,
+        || rng.next_u64(),
+        |candidate| chain.token_contract_nonce_is_available(&keys, candidate),
+    )
+    .await?;
+    if requested_nonce == ProvisionNonceArg::Auto {
+        eprintln!("selected random deal nonce: {nonce}");
+    }
+    let seller_pubkey = serde_json::json!(format!("0x{}", keys.public_hex()));
+    let root_model = chain.root_model_address_for(&seller_pubkey).await?;
+    let token_contract = chain
+        .token_contract_deploy_address(&keys, &root_model, nonce)
+        .await?;
+    let expected_order_book = chain
+        .inference_orderbook_address(&note, &target.model_hash, dexdo_core::TICK_SIZE)
+        .await?
+        .with_workchain();
+    let expected_market = dexdo_core::MarketManifest {
+        network: chain.network().to_string(),
+        frame_model: frame_model.clone(),
+        model_hash: target.model_hash.clone(),
+        inference_order_book: expected_order_book.clone(),
+        root_model: root_model.with_workchain(),
+        token_contract: token_contract.with_workchain(),
+        seller_note: note.with_workchain(),
+        nonce,
+        price_per_tick: args.price_per_tick,
+        max_ticks: args.max_ticks,
+    };
+    let target_active = if matches!(requested_nonce, ProvisionNonceArg::Explicit(_)) {
+        chain
+            .exact_provision_target_is_active_and_matches(&token_contract, &expected_market)
             .await?
-            .with_workchain();
+    } else {
+        false
+    };
+    let capacity =
+        crate::cli::seller::seller_deal_capacity(args.deals_dir.as_deref(), &note_addr, |market| {
+            let (backend, _) =
+                dexdo_core::RealSellerBackend::from_provisioned_with_deal_gas_overhead(
+                    manifest,
+                    &note_addr,
+                    seed.trim(),
+                    &market.frame_model,
+                    market.nonce,
+                    supplied_deal_gas_overhead_raw,
+                )?;
+            Ok(std::sync::Arc::new(backend) as std::sync::Arc<dyn dexdo_core::ChainBackend>)
+        })
+        .await?;
+    ensure_provision_capacity_for_target(capacity, seller_policy.max_open_deals, target_active)?;
+    if let Some(policy) = registry_policy.as_ref() {
         let order_book_active = order_book_active(&chain, &expected_order_book).await?;
         enforce_model_registry_policy_with_endpoint(
             RegistryRole::Seller,
@@ -495,117 +558,173 @@ pub(crate) async fn run_provision_with_deal_gas_overhead(
         )
         .await?;
     }
-    // A numeric nonce remains deterministic. `auto` draws from the OS CSPRNG and rejects a candidate
-    // read-only when its deterministic address is active or has immutable history. The provisioning
-    // path checks again before deployDeal, so this selection cannot weaken the money guard.
-    let requested_nonce = require_provision_nonce(args.nonce)?;
-    let mut rng = rand::rngs::OsRng;
-    let nonce = choose_provision_nonce(
-        requested_nonce,
-        || rng.next_u64(),
-        |candidate| chain.token_contract_nonce_is_available(&keys, candidate),
-    )
-    .await?;
-    if requested_nonce == ProvisionNonceArg::Auto {
-        eprintln!("selected random deal nonce: {nonce}");
-    }
     // the note deposit is a user-chosen provision parameter (default >=100 SHELL), framed by deal volume --
     // NOT a MIN_BALANCE-anchored per-op gas knob. 1 SHELL = 1e9 raw ECC[2]. The deposit is split across the
     // RootModel + per-deal `TokenContract` deploys, funded from the note's own ECC[2].
     // the deposit follows THIS deal. `max_ticks` is what sets it -- the deal's `TokenContract`
     // pays its own compute and `MAX_CLAIM_DELTA = TICK_SIZE` caps a claim at one tick, so a deal of
     // `max_ticks` ticks takes `max_ticks` claims and its lifetime gas is linear in them.
-    let default_deposit_shells = if supplied_deal_gas_overhead_raw.is_none() {
-        default_deposit_shells(args.max_ticks)
-    } else {
-        dexdo_core::params::min_deploy_shells_with_overhead(args.max_ticks, deal_gas_overhead_raw)
-    };
-    let deposit_shells = match args.deposit_shells {
-        Some(n) => n,
-        None => prompt_deposit_shells()?.unwrap_or(default_deposit_shells),
-    };
-    // Fail-closed: overflow and a below-floor deposit are explicit errors, not a silent clamp/warn.
-    let per_deploy = if supplied_deal_gas_overhead_raw.is_none() {
-        deposit_per_deploy(deposit_shells, args.max_ticks)?
-    } else {
-        deposit_per_deploy_with_overhead(
-            deposit_shells,
-            args.max_ticks,
-            Some(deal_gas_overhead_raw),
-        )?
-    };
-    eprintln!(
-        "note deposit: {deposit_shells} SHELL; ~{} SHELL for the per-deal TokenContract \
-         deploy after fundDeployShell (the RootModel is deployed by SuperRoot and needs no note funding). This \
-         {}-tick deal needs {} raw nanovmshell over its whole life, so its floor is {} SHELL. Unused deploy \
-         remainder burns at destroy.",
-        per_deploy / SHELL_UNIT,
-        args.max_ticks,
-        dexdo_core::params::deal_gas_requirement_raw_with_overhead(
-            args.max_ticks,
-            deal_gas_overhead_raw,
-        ),
-        dexdo_core::params::min_deploy_shells_with_overhead(
-            args.max_ticks,
-            deal_gas_overhead_raw,
-        ),
-    );
-    // Run the stale/orphaned-note check BEFORE reading ECC balance. After a redeploy, old notes may be
-    // absent/inactive/stale-code; reporting that as "0 SHELL" would mask the actionable re-mint reason.
-    chain.assert_seller_note_current(&note).await?;
-    // Fail-LOUD if the note's ECC[2] SHELL cannot cover the exact deploy deposit. Do not add guessed runtime
-    // headroom here: section 6 requires any gas/SHELL threshold beyond the deploy amount to come from
-    // contract constants/receipts, not a drifting reserve.
-    let note_ecc = chain
-        .client()
-        .get_account(&note)
-        .await?
-        .ok_or_else(|| {
-            anyhow::anyhow!(
-                "seller note {} disappeared after current-note preflight",
-                dexdo_core::address::display(&note.with_workchain())
-            )
-        })?
-        .ecc_balance(2);
-    let note_spendable = chain.private_note_shell_balance(&note).await?;
-    ensure_provision_deposit_covered(
-        note_ecc,
-        note_spendable,
-        deposit_shells,
-        args.price_per_tick,
-    )?;
-    let m = if supplied_deal_gas_overhead_raw.is_none() {
-        chain
-            .provision_market(
-                &keys,
-                &note,
-                &frame_model,
-                nonce,
-                args.price_per_tick,
+    let per_deploy = prepare_fresh_provision_deposit(target_active, || async {
+        let default_deposit_shells = if supplied_deal_gas_overhead_raw.is_none() {
+            default_deposit_shells(args.max_ticks)
+        } else {
+            dexdo_core::params::min_deploy_shells_with_overhead(
                 args.max_ticks,
-                per_deploy,
-            )
-            .await?
-    } else {
-        chain
-            .provision_market_with_deal_gas_overhead(
-                &keys,
-                &note,
-                &frame_model,
-                nonce,
-                args.price_per_tick,
-                args.max_ticks,
-                per_deploy,
                 deal_gas_overhead_raw,
             )
-            .await?
+        };
+        let deposit_shells = match args.deposit_shells {
+            Some(n) => n,
+            None => prompt_deposit_shells()?.unwrap_or(default_deposit_shells),
+        };
+        // Fail-closed: overflow and a below-floor deposit are explicit errors, not a
+        // silent clamp/warn.
+        let per_deploy = if supplied_deal_gas_overhead_raw.is_none() {
+            deposit_per_deploy(deposit_shells, args.max_ticks)?
+        } else {
+            deposit_per_deploy_with_overhead(
+                deposit_shells,
+                args.max_ticks,
+                Some(deal_gas_overhead_raw),
+            )?
+        };
+        eprintln!(
+            "note deposit: {deposit_shells} SHELL; ~{} SHELL for the per-deal TokenContract \
+             deploy after fundDeployShell (the RootModel is deployed by SuperRoot and needs no note funding). This \
+             {}-tick deal needs {} raw nanovmshell over its whole life, so its floor is {} SHELL. Unused deploy \
+             remainder burns at destroy.",
+            per_deploy / SHELL_UNIT,
+            args.max_ticks,
+            dexdo_core::params::deal_gas_requirement_raw_with_overhead(
+                args.max_ticks,
+                deal_gas_overhead_raw,
+            ),
+            dexdo_core::params::min_deploy_shells_with_overhead(
+                args.max_ticks,
+                deal_gas_overhead_raw,
+            ),
+        );
+        // Fail-LOUD if the note's ECC[2] SHELL cannot cover the exact deploy deposit. Do not add
+        // guessed runtime headroom here: section 6 requires any threshold beyond the
+        // deploy amount to come from contract constants/receipts, not a drifting reserve.
+        {
+            // Run the stale/orphaned-note check BEFORE reading ECC balance. After a redeploy, old
+            // notes may be absent/inactive/stale-code; reporting that as "0 SHELL" would mask the
+            // actionable re-mint reason.
+            chain.assert_seller_note_current(&note).await?;
+            let note_ecc = chain
+                .client()
+                .get_account(&note)
+                .await?
+                .ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "seller note {} disappeared after current-note preflight",
+                        dexdo_core::address::display(&note.with_workchain())
+                    )
+                })?
+                .ecc_balance(2);
+            let note_spendable = chain.private_note_shell_balance(&note).await?;
+            ensure_provision_deposit_covered(
+                note_ecc,
+                note_spendable,
+                deposit_shells,
+                args.price_per_tick,
+            )?;
+        }
+        Ok(per_deploy)
+    })
+    .await?;
+    // The callback below persists the already-derived identity at the last safe point before
+    // deployDeal. That pending bit remains countable if the POST response is lost or this process
+    // exits, even while the TokenContract is still activating.
+    let provision = chain
+        .provision_market_with_deal_gas_overhead_and_before_deploy(
+            &keys,
+            &note,
+            &frame_model,
+            nonce,
+            args.price_per_tick,
+            args.max_ticks,
+            per_deploy,
+            deal_gas_overhead_raw,
+            |market| {
+                if target_active {
+                    bail!(
+                        "matching active TokenContract {} became inactive during recovery; \
+                         refusing a fresh deployDeal",
+                        dexdo_core::address::display_self_dapp(&market.token_contract)
+                    )
+                }
+                if market != &expected_market {
+                    bail!("provision reservation identity diverged from the derived market")
+                }
+                persist_provision_deal_handle(
+                    args.deals_dir.as_deref(),
+                    market,
+                    &manifest_path,
+                    true,
+                )
+                .map(drop)
+            },
+        )
+        .await;
+    let m = match provision {
+        Ok(market) => {
+            persist_provision_deal_handle(
+                args.deals_dir.as_deref(),
+                &market,
+                &manifest_path,
+                false,
+            )?;
+            market
+        }
+        Err(error) => {
+            let activated = matches!(
+                chain.token_contract_deal_snapshot(&token_contract).await,
+                Ok(Some(_))
+            );
+            if provision_failure_clears_pending(&error, activated) {
+                clear_provision_pending_if_present(args.deals_dir.as_deref(), &expected_market)?;
+            }
+            return Err(error);
+        }
     };
+    drop(seller_pool_lock);
     let json = m.to_json()?;
     std::fs::write(&args.output, &json)
         .map_err(|e| anyhow::anyhow!("write --output {}: {e}", args.output.display()))?;
     println!("provisioned market -> {}", args.output.display());
     println!("{json}");
     Ok(())
+}
+
+fn ensure_provision_capacity(
+    capacity: crate::cli::seller::SellerDealCapacity,
+    max_open_deals: u64,
+) -> Result<()> {
+    if u64::try_from(capacity.total()).unwrap_or(u64::MAX) >= max_open_deals {
+        bail!(
+            "provision refuses before deploying anything: working_deals={} candidates={} \
+             pending_provisions={} \
+             seller.max_open_deals={max_open_deals}; finish or retire a deal before provisioning \
+             another TokenContract. Nothing was sent",
+            capacity.working,
+            capacity.candidates,
+            capacity.pending,
+        );
+    }
+    Ok(())
+}
+
+fn ensure_provision_capacity_for_target(
+    capacity: crate::cli::seller::SellerDealCapacity,
+    max_open_deals: u64,
+    target_active: bool,
+) -> Result<()> {
+    if target_active {
+        return Ok(());
+    }
+    ensure_provision_capacity(capacity, max_open_deals)
 }
 
 /// the seller lists only a confirmed name, and only flags the grammar can spell. Its own
@@ -615,9 +734,364 @@ pub(crate) async fn run_provision_with_deal_gas_overhead(
 mod admin_1855_registry_gate_tests;
 
 #[cfg(test)]
+#[path = "admin_2039_capacity_lock_tests.rs"]
+mod admin_2039_capacity_lock_tests;
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use crate::cli::args::{IdentityArgs, ModelRegistryValidationArgs};
+
+    #[test]
+    fn provision_capacity_refusal_names_counts_and_happens_at_the_limit() {
+        let error = ensure_provision_capacity(
+            crate::cli::seller::SellerDealCapacity {
+                working: 1,
+                candidates: 0,
+                pending: 0,
+            },
+            1,
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(error.contains("before deploying anything"), "{error}");
+        assert!(error.contains("working_deals=1"), "{error}");
+        assert!(error.contains("candidates=0"), "{error}");
+        assert!(error.contains("pending_provisions=0"), "{error}");
+        assert!(error.contains("seller.max_open_deals=1"), "{error}");
+        assert!(error.contains("Nothing was sent"), "{error}");
+
+        ensure_provision_capacity(
+            crate::cli::seller::SellerDealCapacity {
+                working: 0,
+                candidates: 0,
+                pending: 0,
+            },
+            1,
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn ambiguous_provision_keeps_its_reservation_until_the_contract_is_readable() {
+        let preparation = anyhow::Error::new(dexdo_core::MoneySubmitError::Preparation {
+            source: anyhow::anyhow!("encoding failed"),
+        });
+        assert!(provision_failure_clears_pending(&preparation, false));
+
+        let ambiguous = anyhow::Error::new(dexdo_core::MoneySubmitError::Ambiguous {
+            source: anyhow::anyhow!("POST response lost"),
+        });
+        assert!(!provision_failure_clears_pending(&ambiguous, false));
+        assert!(provision_failure_clears_pending(&ambiguous, true));
+    }
+
+    proptest::proptest! {
+        #[test]
+        fn provision_capacity_refuses_exactly_when_the_limit_is_reached(
+            working in 0_u16..100,
+            candidates in 0_u16..100,
+            pending in 0_u16..100,
+            max_open_deals in 0_u16..100,
+        ) {
+            let capacity = crate::cli::seller::SellerDealCapacity {
+                working: usize::from(working),
+                candidates: usize::from(candidates),
+                pending: usize::from(pending),
+            };
+            let result = ensure_provision_capacity(capacity, u64::from(max_open_deals));
+            proptest::prop_assert_eq!(
+                result.is_err(),
+                u32::from(working) + u32::from(candidates) + u32::from(pending)
+                    >= u32::from(max_open_deals),
+            );
+        }
+    }
+
+    #[test]
+    fn provision_checks_capacity_before_any_token_contract_deploy() {
+        let source = include_str!("admin.rs");
+        let body = source
+            .split_once("fn run_provision_with_deal_gas_overhead")
+            .expect("provision implementation present")
+            .1
+            .split_once("#[cfg(test)]")
+            .expect("provision implementation ends before its tests")
+            .0;
+        let count = body
+            .find("seller_deal_capacity(")
+            .expect("provision must count working deals and candidates");
+        let lock = body
+            .find("acquire_seller_pool_lock(")
+            .expect("provision must serialize the note's capacity boundary");
+        let target = body
+            .find("exact_provision_target_is_active_and_matches(")
+            .expect("provision validates the exact target identity before applying capacity");
+        let gate = body
+            .find("ensure_provision_capacity_for_target(")
+            .expect("provision must enforce the configured capacity");
+        assert!(
+            lock < count,
+            "the seller-note lock must be held before capacity is counted"
+        );
+        assert!(target < count && count < gate);
+        let unlock = body
+            .find("drop(seller_pool_lock)")
+            .expect("provision must release the seller-note lock after deployDeal");
+        let spend = "provision_market_with_deal_gas_overhead_and_before_deploy(";
+        let at = body
+            .find(spend)
+            .unwrap_or_else(|| panic!("run_provision still calls {spend}"));
+        let deposit = body
+            .find("prepare_fresh_provision_deposit(target_active")
+            .expect("the command separates active recovery from fresh-deploy funding");
+        assert!(
+            gate < at,
+            "`{spend}` runs before seller.max_open_deals is enforced"
+        );
+        assert!(
+            gate < deposit && deposit < at,
+            "fresh-deploy funding must be decided after identity/capacity and before provisioning"
+        );
+        assert!(
+            at < unlock,
+            "the seller-note lock is released before `{spend}` returns"
+        );
+        let durable = body
+            .find("persist_provision_deal_handle(")
+            .expect("the before-deploy callback must persist a pending reservation");
+        let output = body
+            .find("std::fs::write(&args.output")
+            .expect("market output write present");
+        assert!(
+            durable < output,
+            "deal identity must survive a failed --output write"
+        );
+    }
+
+    #[test]
+    fn failed_output_retry_of_the_active_exact_target_is_allowed_at_capacity() {
+        ensure_provision_capacity_for_target(
+            crate::cli::seller::SellerDealCapacity {
+                working: 0,
+                candidates: 1,
+                pending: 0,
+            },
+            1,
+            true,
+        )
+        .expect("rewriting the manifest for the already-active target spends no new slot");
+    }
+
+    #[test]
+    fn active_after_ambiguous_retry_is_allowed_but_inactive_pending_stays_blocked() {
+        let occupied = crate::cli::seller::SellerDealCapacity {
+            working: 0,
+            candidates: 0,
+            pending: 1,
+        };
+        ensure_provision_capacity_for_target(occupied, 1, true)
+            .expect("the exact target activated after the ambiguous response");
+        ensure_provision_capacity_for_target(occupied, 1, false)
+            .expect_err("an inactive unresolved target must remain fail-closed");
+    }
+
+    #[tokio::test]
+    async fn active_exact_target_recovery_does_not_require_a_second_deploy_deposit() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        ensure_provision_capacity_for_target(
+            crate::cli::seller::SellerDealCapacity {
+                working: 0,
+                candidates: 1,
+                pending: 0,
+            },
+            1,
+            true,
+        )
+        .expect("the proven exact target may recover while occupying the only slot");
+        let balance_reads = AtomicUsize::new(0);
+        let per_deploy = prepare_fresh_provision_deposit(true, || async {
+            balance_reads.fetch_add(1, Ordering::Relaxed);
+            Ok(default_deposit_shells(4) * SHELL_UNIT)
+        })
+        .await
+        .expect("a proven active target submits no second deployDeal deposit");
+        assert_eq!(per_deploy, 0);
+        assert_eq!(
+            balance_reads.load(Ordering::Relaxed),
+            0,
+            "active-target recovery must not prepare or read balances for a fresh deployment"
+        );
+    }
+
+    #[tokio::test]
+    async fn inactive_target_with_the_same_low_note_balance_still_fails_before_spending() {
+        let error = prepare_fresh_provision_deposit(false, || async {
+            let deposit_shells = default_deposit_shells(4);
+            ensure_provision_deposit_covered(0, 0, deposit_shells, dexdo_core::PRICE_STEP)?;
+            Ok(deposit_shells * SHELL_UNIT)
+        })
+        .await
+        .expect_err("a new deployment must retain the full deposit preflight")
+        .to_string();
+        assert!(error.contains("deposit"), "{error}");
+    }
+
+    fn existing_market() -> dexdo_core::MarketManifest {
+        dexdo_core::MarketManifest {
+            network: "mock".to_string(),
+            frame_model: "model-a".to_string(),
+            model_hash: dexdo_core::model_hash_for("model-a"),
+            inference_order_book: format!("0:{}", "b".repeat(64)),
+            root_model: format!("0:{}", "c".repeat(64)),
+            token_contract: format!("0:{}", "d".repeat(64)),
+            seller_note: format!("0:{}", "e".repeat(64)),
+            nonce: 7,
+            price_per_tick: dexdo_core::PRICE_STEP,
+            max_ticks: 4,
+        }
+    }
+
+    #[test]
+    fn unchanged_active_exact_target_is_the_only_identity_allowed_to_bypass_capacity() {
+        let market = existing_market();
+        market
+            .ensure_live_identity(
+                (
+                    dexdo_core::TICK_SIZE,
+                    market.price_per_tick,
+                    market.max_ticks,
+                ),
+                &market.frame_model,
+                &market.model_hash,
+                &market.seller_note,
+            )
+            .expect("the authoritative live identity is exactly the requested existing deal");
+    }
+
+    #[test]
+    fn changed_model_terms_or_note_cannot_rewrite_an_active_exact_nonce() {
+        let market = existing_market();
+        let terms = (
+            dexdo_core::TICK_SIZE,
+            market.price_per_tick,
+            market.max_ticks,
+        );
+        let changed = [
+            market.ensure_live_identity(
+                terms,
+                "model-b",
+                &dexdo_core::model_hash_for("model-b"),
+                &market.seller_note,
+            ),
+            market.ensure_live_identity(
+                (terms.0, terms.1 + dexdo_core::PRICE_STEP, terms.2),
+                &market.frame_model,
+                &market.model_hash,
+                &market.seller_note,
+            ),
+            market.ensure_live_identity(
+                (terms.0, terms.1, terms.2 + 1),
+                &market.frame_model,
+                &market.model_hash,
+                &market.seller_note,
+            ),
+            market.ensure_live_identity(
+                terms,
+                &market.frame_model,
+                &market.model_hash,
+                &format!("0:{}", "f".repeat(64)),
+            ),
+        ];
+        for error in changed.map(Result::unwrap_err) {
+            let message = error.to_string();
+            assert!(message.contains("does not match"), "{message}");
+            assert!(message.contains("refusing to reuse"), "{message}");
+        }
+    }
+
+    #[tokio::test]
+    async fn sequential_provision_without_seller_start_counts_the_first_paid_deal() {
+        use dexdo_core::{
+            ChainBackend as _, DobParams, LocalNote, MockChainBackend, ProtocolConsts, SellOffer,
+        };
+
+        let root = tempfile::tempdir().expect("provision capacity directory");
+        let deals_dir = root.path().join("deals");
+        let note_addr = format!("0:{}", "a".repeat(64));
+        let token_contract = format!("0:{}", "b".repeat(64));
+        let market = dexdo_core::MarketManifest {
+            network: "mock".to_string(),
+            frame_model: "model-a".to_string(),
+            model_hash: dexdo_core::model_hash_for("model-a"),
+            inference_order_book: format!("0:{}", "c".repeat(64)),
+            root_model: format!("0:{}", "d".repeat(64)),
+            token_contract: token_contract.clone(),
+            seller_note: note_addr.clone(),
+            nonce: 1,
+            price_per_tick: dexdo_core::PRICE_STEP,
+            max_ticks: 4,
+        };
+        persist_provision_deal_handle(
+            Some(&deals_dir),
+            &market,
+            &root.path().join("contracts.json"),
+            false,
+        )
+        .expect("first provision persists its deal before seller starts");
+
+        let chain = MockChainBackend::new(
+            root.path().join("endpoints.json"),
+            ProtocolConsts::canonical(),
+            DobParams::canonical(),
+        );
+        let seller = LocalNote::from_seed(&[0x20; 32]);
+        chain
+            .post_offer(
+                SellOffer {
+                    price_per_tick: dexdo_core::PRICE_STEP as u64,
+                    max_ticks: 4,
+                    token_contract: token_contract.clone(),
+                    flags: 0,
+                },
+                &seller,
+            )
+            .await
+            .expect("seed constructor-bound mock deal terms");
+        let order_id = chain
+            .raw_resting_sell_orders_for_tc(&token_contract)
+            .await
+            .expect("read first provision")
+            .first()
+            .expect("seeded offer")
+            .order_id;
+        chain
+            .cancel_resting_sell_order(&token_contract, order_id)
+            .await
+            .expect("leave a vacant paid candidate before seller start");
+        let chain = std::sync::Arc::new(chain);
+        let capacity =
+            crate::cli::seller::seller_deal_capacity(Some(&deals_dir), &note_addr, |_| {
+                Ok(chain.clone() as std::sync::Arc<dyn dexdo_core::ChainBackend>)
+            })
+            .await
+            .expect("second provision reads the first provision's durable handle");
+
+        assert_eq!(
+            capacity,
+            crate::cli::seller::SellerDealCapacity {
+                working: 0,
+                candidates: 1,
+                pending: 0,
+            }
+        );
+        let error = ensure_provision_capacity(capacity, 1)
+            .expect_err("the second sequential provision must stop before spending")
+            .to_string();
+        assert!(error.contains("candidates=1"), "{error}");
+        assert!(error.contains("Nothing was sent"), "{error}");
+    }
 
     #[tokio::test]
     async fn auto_nonce_retries_collisions_while_explicit_nonce_is_unchanged() {
@@ -676,7 +1150,7 @@ mod tests {
             .expect("provision must resolve the model name");
         for spend in [
             // the money: every deploy the provision pays for, and the note reads that precede them
-            "provision_market(",
+            "provision_market_with_deal_gas_overhead_and_before_deploy(",
             "deposit_per_deploy(",
             "ensure_provision_deposit_covered(",
         ] {
@@ -1081,6 +1555,7 @@ mod tests {
             max_ticks: 1,
             deposit_shells: None,
             output: "must-not-be-written.json".into(),
+            deals_dir: None,
             policy: None,
         };
 

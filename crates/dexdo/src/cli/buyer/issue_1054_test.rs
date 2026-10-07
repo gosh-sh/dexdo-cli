@@ -195,7 +195,7 @@ async fn issue_1054_default_proactive_model_only_refusal_is_framed_before_money_
         allow_unverified_model: true,
         models: models.clone(),
         ticks: 2,
-        max_price_per_tick: dexdo_core::PRICE_STEP,
+        max_price_per_tick: Some(dexdo_core::PRICE_STEP),
         escrow: None,
         policy: Some(policy),
     };

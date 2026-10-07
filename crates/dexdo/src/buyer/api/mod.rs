@@ -20,6 +20,8 @@ use crate::buyer::verify::Verdict;
 use crate::buyer::Buyer;
 use crate::seller::ModelsConfig;
 use anyhow::Result;
+use axum::body::{Body, Bytes};
+use axum::response::Response;
 use dexdo_core::{
     params::{
         CONTENT_PROBE_MAX_TOKENS, DEFAULT_BUYER_DEAD_GATEWAY_ACTION,
@@ -28,18 +30,37 @@ use dexdo_core::{
     },
     ChainBackend, Handover, Note, TokenContract, MATCH_OPEN_TIMEOUT_SECS,
 };
-use dexdo_proto::CanonChunk;
+use dexdo_proto::{BillingUsage, CanonChunk};
+use futures::StreamExt;
 use std::fmt;
 use std::future::Future;
 use std::net::SocketAddr;
 use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicU8, Ordering};
-use std::sync::{Arc, OnceLock};
+use std::sync::{Arc, Mutex as StdMutex, OnceLock};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tokio::sync::{watch, Mutex, OnceCell, RwLock};
 
 fn display_token_contract(token_contract: &str) -> String {
     dexdo_core::address::display_self_dapp(token_contract)
+}
+
+pub(crate) const REQUEST_ID_HEADER: &str = "x-dexdo-request-id";
+
+pub(crate) fn consumer_request_id() -> String {
+    format!(
+        "req-dexdo-{}-{:032x}",
+        unix_now_secs(),
+        rand::random::<u128>()
+    )
+}
+
+pub(crate) fn attach_request_id(mut response: Response, request_id: &str) -> Response {
+    response.headers_mut().insert(
+        http::HeaderName::from_static(REQUEST_ID_HEADER),
+        http::HeaderValue::from_str(request_id).expect("internal request id is a valid HTTP value"),
+    );
+    response
 }
 
 pub type DealInitFuture = Pin<Box<dyn Future<Output = Result<ApiDeal, DealInitError>> + Send>>;
@@ -722,9 +743,9 @@ pub struct ApiDeal {
     pub session: Arc<SessionSettle>,
     pub content_gate: Arc<ContentGate>,
     billable_tokens: Arc<AtomicU64>,
-    /// Cumulative accepted output delivery kept separately with the legacy v2 accounting rule
-    /// (`max(token_ids.len(), 1)` per accepted content chunk). It is observational only; monetary
-    /// accounting uses `billable_tokens`.
+    /// Cumulative accepted content kept with the stable v2 accounting rule
+    /// (`max(token_ids.len(), 1)` per accepted chunk). It remains the implicit-terminal
+    /// delivery witness; monetary accounting uses `billable_tokens` instead.
     route_visible_output_tokens: Arc<AtomicU64>,
     /// Billable tokens handed out to admitted requests, used or still in flight. Admission moves this and
     /// nothing else, so two requests can never be handed the same remainder.
@@ -788,7 +809,7 @@ impl ApiDeal {
                 visible.checked_add(tokens)
             })
             .map(|_| ())
-            .map_err(|_| "cumulative visible-output accounting overflow".to_string())
+            .map_err(|_| "cumulative route-delivery accounting overflow".to_string())
     }
 
     pub(crate) fn route_visible_output_tokens(&self) -> u64 {
@@ -1006,6 +1027,12 @@ impl ApiDeal {
             session: self.session.clone(),
             failure_heartbeat: None,
             reservation: None,
+            request_usage: BillingUsage {
+                input_tokens: 0,
+                output_tokens: 0,
+                total_tokens: 0,
+            },
+            delivery_finalizer: None,
         }
     }
 
@@ -1022,6 +1049,151 @@ impl ApiDeal {
     }
 }
 
+const CLIENT_CLOSED_REQUEST_STATUS: u16 = 499;
+
+struct PendingRequestDelivery {
+    events: Option<DeliveryEvents>,
+    token_contract: TokenContract,
+    request_id: String,
+    protocol: &'static str,
+    streamed: bool,
+    http_status: u16,
+    billing_grant_tokens: u64,
+    output_limit_tokens: u64,
+    provider_output_tokens: u64,
+    visible_output_tokens: u64,
+    rendered_tokens: u64,
+    observed_answer_usage: Option<BillingUsage>,
+    answer_usage_committed: bool,
+    observed_request_usage: Option<BillingUsage>,
+    prepared_delivery: Option<RequestDelivery>,
+}
+
+#[derive(Clone)]
+pub(crate) struct RequestDeliveryFinalizer {
+    pending: Arc<StdMutex<Option<PendingRequestDelivery>>>,
+}
+
+impl RequestDeliveryFinalizer {
+    fn new(pending: PendingRequestDelivery) -> Self {
+        Self {
+            pending: Arc::new(StdMutex::new(Some(pending))),
+        }
+    }
+
+    fn with_pending<R>(&self, update: impl FnOnce(&mut PendingRequestDelivery) -> R) -> Option<R> {
+        let mut slot = self
+            .pending
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        slot.as_mut().map(update)
+    }
+
+    fn observed_request_usage(&self) -> Option<BillingUsage> {
+        self.with_pending(|pending| pending.observed_request_usage)
+            .flatten()
+    }
+
+    fn report(&self, delivery: RequestDelivery) {
+        let pending = self
+            .pending
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take();
+        let Some(pending) = pending else {
+            debug_assert!(false, "request delivery finalizer was not armed");
+            return;
+        };
+        debug_assert_eq!(pending.token_contract, delivery.token_contract);
+        debug_assert_eq!(pending.request_id, delivery.request_id);
+        debug_assert_eq!(pending.protocol, delivery.protocol);
+        debug_assert_eq!(pending.streamed, delivery.streamed);
+        report_request_delivery(pending.events.as_ref(), delivery);
+    }
+
+    pub(crate) fn report_prepared(&self) {
+        let prepared = {
+            let mut slot = self
+                .pending
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let Some(pending) = slot.as_mut() else {
+                return;
+            };
+            let Some(delivery) = pending.prepared_delivery.take() else {
+                debug_assert!(
+                    false,
+                    "request delivery was not prepared before its terminal frame"
+                );
+                return;
+            };
+            let events = pending.events.clone();
+            *slot = None;
+            (events, delivery)
+        };
+        report_request_delivery(prepared.0.as_ref(), prepared.1);
+    }
+
+    fn report_cancelled(
+        &self,
+        request_usage: BillingUsage,
+        route_delivered_tokens: Option<u64>,
+        route_billable_tokens: Option<u64>,
+    ) {
+        let pending = self
+            .pending
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take();
+        let Some(pending) = pending else {
+            return;
+        };
+        let answer_usage = pending
+            .answer_usage_committed
+            .then_some(pending.observed_answer_usage)
+            .flatten();
+        let (truncated_by_output_limit, ended_before_output_limit) = pending
+            .prepared_delivery
+            .as_ref()
+            .map(|delivery| {
+                (
+                    delivery.truncated_by_output_limit,
+                    delivery.ended_before_output_limit,
+                )
+            })
+            .unwrap_or((
+                false,
+                pending.provider_output_tokens < pending.output_limit_tokens,
+            ));
+        report_request_delivery(
+            pending.events.as_ref(),
+            RequestDelivery {
+                token_contract: pending.token_contract,
+                request_id: pending.request_id,
+                protocol: pending.protocol,
+                streamed: pending.streamed,
+                http_status: pending.http_status,
+                failure_stage: Some("consumer_disconnect"),
+                billing_grant_tokens: pending.billing_grant_tokens,
+                output_limit_tokens: pending.output_limit_tokens,
+                visible_output_tokens: pending.visible_output_tokens,
+                rendered_tokens: pending.rendered_tokens,
+                route_delivered_tokens,
+                input_tokens: answer_usage.map(|usage| usage.input_tokens),
+                output_tokens: answer_usage.map(|usage| usage.output_tokens),
+                billable_tokens: answer_usage.map(|usage| usage.total_tokens),
+                request_input_tokens: request_usage.input_tokens,
+                request_output_tokens: request_usage.output_tokens,
+                request_billable_tokens: request_usage.total_tokens,
+                route_billable_tokens,
+                finish_reason: "cancelled",
+                truncated_by_output_limit,
+                ended_before_output_limit,
+            },
+        );
+    }
+}
+
 pub(crate) struct ConsumerRequestGuard {
     active_requests: Arc<AtomicU64>,
     accepted_output_generation: Arc<AtomicU64>,
@@ -1030,6 +1202,12 @@ pub(crate) struct ConsumerRequestGuard {
     /// This request's whole free billing remainder. Dropped with the guard, which returns whatever
     /// terminal input+output usage did not consume.
     reservation: Option<RouteReservation>,
+    /// Every accepted provider terminal charged to this top-level consumer request, including the
+    /// one-per-deal content-verification calls that can complete before the answer stream opens.
+    request_usage: BillingUsage,
+    /// Armed after admission. Normal terminal paths consume it; `Drop` emits the cancellation
+    /// terminal when a handler future or streaming response body disappears first.
+    delivery_finalizer: Option<RequestDeliveryFinalizer>,
 }
 
 impl ConsumerRequestGuard {
@@ -1044,9 +1222,154 @@ impl ConsumerRequestGuard {
             .unwrap_or(0)
     }
 
+    fn granted(&self) -> u64 {
+        self.reservation
+            .as_ref()
+            .map(|reservation| reservation.granted)
+            .unwrap_or(0)
+    }
+
+    fn request_usage(&self) -> BillingUsage {
+        self.delivery_finalizer
+            .as_ref()
+            .and_then(RequestDeliveryFinalizer::observed_request_usage)
+            .unwrap_or(self.request_usage)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn arm_delivery(
+        &mut self,
+        events: Option<DeliveryEvents>,
+        deal: &ApiDeal,
+        request_id: String,
+        protocol: &'static str,
+        streamed: bool,
+        output_limit_tokens: u64,
+    ) {
+        debug_assert!(self.delivery_finalizer.is_none());
+        self.delivery_finalizer = Some(RequestDeliveryFinalizer::new(PendingRequestDelivery {
+            events,
+            token_contract: deal.route.token_contract.clone(),
+            request_id,
+            protocol,
+            streamed,
+            http_status: CLIENT_CLOSED_REQUEST_STATUS,
+            billing_grant_tokens: self.granted(),
+            output_limit_tokens,
+            provider_output_tokens: 0,
+            visible_output_tokens: 0,
+            rendered_tokens: 0,
+            observed_answer_usage: None,
+            answer_usage_committed: false,
+            observed_request_usage: None,
+            prepared_delivery: None,
+        }));
+    }
+
+    fn set_delivery_output_limit(&mut self, output_limit_tokens: u64) {
+        if let Some(finalizer) = self.delivery_finalizer.as_ref() {
+            finalizer.with_pending(|pending| {
+                pending.output_limit_tokens = output_limit_tokens;
+            });
+        }
+    }
+
+    fn mark_response_started(&mut self) {
+        if let Some(finalizer) = self.delivery_finalizer.as_ref() {
+            finalizer.with_pending(|pending| {
+                pending.http_status = http::StatusCode::OK.as_u16();
+            });
+        }
+    }
+
+    fn delivery_finalizer(&self) -> Option<RequestDeliveryFinalizer> {
+        self.delivery_finalizer.clone()
+    }
+
+    fn record_delivery_progress(
+        &mut self,
+        provider_output_tokens: u64,
+        visible_output_tokens: u64,
+        rendered_tokens: u64,
+    ) {
+        if let Some(finalizer) = self.delivery_finalizer.as_ref() {
+            finalizer.with_pending(|pending| {
+                pending.provider_output_tokens =
+                    pending.provider_output_tokens.max(provider_output_tokens);
+                pending.visible_output_tokens =
+                    pending.visible_output_tokens.max(visible_output_tokens);
+                pending.rendered_tokens = pending.rendered_tokens.max(rendered_tokens);
+            });
+        }
+    }
+
+    fn observe_answer_usage(&mut self, usage: BillingUsage) -> Result<(), String> {
+        usage.validate().map_err(str::to_string)?;
+        let input_tokens = self
+            .request_usage
+            .input_tokens
+            .checked_add(usage.input_tokens)
+            .ok_or_else(|| "consumer request input-token accounting overflow".to_string())?;
+        let output_tokens = self
+            .request_usage
+            .output_tokens
+            .checked_add(usage.output_tokens)
+            .ok_or_else(|| "consumer request output-token accounting overflow".to_string())?;
+        let observed =
+            BillingUsage::new(input_tokens, output_tokens, None).map_err(str::to_string)?;
+        let finalizer = self
+            .delivery_finalizer
+            .as_ref()
+            .ok_or_else(|| "request delivery finalizer is not armed".to_string())?;
+        finalizer
+            .with_pending(|pending| {
+                if pending.observed_request_usage.is_some() {
+                    return Err("duplicate terminal billing usage".to_string());
+                }
+                pending.observed_answer_usage = Some(usage);
+                pending.observed_request_usage = Some(observed);
+                pending.provider_output_tokens =
+                    pending.provider_output_tokens.max(usage.output_tokens);
+                Ok(())
+            })
+            .unwrap_or_else(|| Err("request delivery finalizer is no longer armed".to_string()))
+    }
+
+    fn prepare_delivery(&mut self, delivery: RequestDelivery) {
+        let Some(finalizer) = self.delivery_finalizer.as_ref() else {
+            debug_assert!(false, "request delivery finalizer was not armed");
+            return;
+        };
+        finalizer.with_pending(|pending| {
+            debug_assert!(pending.prepared_delivery.is_none());
+            pending.prepared_delivery = Some(delivery);
+        });
+    }
+
+    fn report_delivery(&mut self, delivery: RequestDelivery) {
+        let Some(finalizer) = self.delivery_finalizer.take() else {
+            debug_assert!(false, "request delivery finalizer was not armed");
+            return;
+        };
+        finalizer.report(delivery);
+    }
+
     /// Account one validated terminal input+output total against both the route and this request's
     /// held billing reservation. Content chunks never call this money transition.
-    fn record_billing(&mut self, deal: &ApiDeal, billable: u64) -> Result<(), String> {
+    fn record_billing(&mut self, deal: &ApiDeal, usage: BillingUsage) -> Result<(), String> {
+        usage.validate().map_err(str::to_string)?;
+        let request_input = self
+            .request_usage
+            .input_tokens
+            .checked_add(usage.input_tokens)
+            .ok_or_else(|| "consumer request input-token accounting overflow".to_string())?;
+        let request_output = self
+            .request_usage
+            .output_tokens
+            .checked_add(usage.output_tokens)
+            .ok_or_else(|| "consumer request output-token accounting overflow".to_string())?;
+        let request_usage =
+            BillingUsage::new(request_input, request_output, None).map_err(str::to_string)?;
         // The existing anchor mutex is the acceptance cutover mutex. Every subscription chunk takes
         // it, including chunks from old reservations after the pre-probe flag has been cleared: a
         // chunk either commits before the cutover samples delivery, or validates the new ceiling.
@@ -1062,9 +1385,18 @@ impl ConsumerRequestGuard {
         let reservation = self.reservation.as_mut().ok_or_else(|| {
             "accepted billing usage has no admitted route reservation".to_string()
         })?;
-        let next_used = reservation.checked_used_after(billable)?;
-        deal.record_billable(billable)?;
+        let next_used = reservation.checked_used_after(usage.total_tokens)?;
+        deal.record_billable(usage.total_tokens)?;
         reservation.used = next_used;
+        self.request_usage = request_usage;
+        if let Some(finalizer) = self.delivery_finalizer.as_ref() {
+            finalizer.with_pending(|pending| {
+                if pending.observed_answer_usage.is_some() {
+                    pending.answer_usage_committed = true;
+                }
+                pending.observed_request_usage = None;
+            });
+        }
         Ok(())
     }
 
@@ -1079,9 +1411,48 @@ impl ConsumerRequestGuard {
     }
 }
 
+/// Keep an aggregated request armed until its single JSON body crosses the response-body boundary.
+/// Dropping the body before its first frame drops the guard and records a consumer disconnect;
+/// yielding the frame reports the prepared terminal before releasing the guard.
+pub(crate) fn aggregate_body_response(
+    mut request_guard: ConsumerRequestGuard,
+    delivery: RequestDelivery,
+    body: String,
+) -> Response {
+    let status = http::StatusCode::from_u16(delivery.http_status)
+        .expect("request delivery carries a valid HTTP status");
+    request_guard.mark_response_started();
+    request_guard.prepare_delivery(delivery);
+    let finalizer = request_guard.delivery_finalizer();
+    let content_length = body.len();
+    let body = futures::stream::once(async move { (Bytes::from(body), request_guard) }).map(
+        move |(body, request_guard)| {
+            if let Some(finalizer) = finalizer.as_ref() {
+                finalizer.report_prepared();
+            }
+            drop(request_guard);
+            Ok::<Bytes, std::convert::Infallible>(body)
+        },
+    );
+    Response::builder()
+        .status(status)
+        .header(http::header::CONTENT_TYPE, "application/json")
+        .header(http::header::CONTENT_LENGTH, content_length)
+        .body(Body::from_stream(body))
+        .expect("aggregated response is valid")
+}
+
 impl Drop for ConsumerRequestGuard {
     fn drop(&mut self) {
         self.active_requests.fetch_sub(1, Ordering::SeqCst);
+        let request_usage = self.request_usage();
+        if let Some(finalizer) = self.delivery_finalizer.take() {
+            finalizer.report_cancelled(
+                request_usage,
+                self.session.route_delivered_tokens(),
+                self.session.route_billable_tokens(),
+            );
+        }
         if self
             .failure_heartbeat
             .as_ref()
@@ -1237,39 +1608,55 @@ pub(crate) fn accounted_tokens(chunk: &CanonChunk) -> u64 {
     (chunk.token_ids.len() as u64).max(1)
 }
 
-/// What one finished consumer request rendered and, on clean protocol completion, was billed.
+/// What one finished or cancelled consumer request rendered and, on clean protocol completion,
+/// was billed.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RequestDelivery {
     /// The deal this request was served on.
     pub token_contract: TokenContract,
+    /// Correlates this terminal record with the `x-dexdo-request-id` HTTP response header.
+    pub request_id: String,
     /// Which consumer protocol rendered the answer: `openai`, `openai_responses`, or `anthropic`.
     pub protocol: &'static str,
     /// `true` for SSE, `false` for the aggregated single response.
     pub streamed: bool,
+    /// HTTP status returned by the local consumer endpoint. Streaming responses remain `200` even
+    /// when their later protocol terminal reports an error or the caller disconnects. A cancelled
+    /// handler that never produced response headers uses the local `499` sentinel.
+    pub http_status: u16,
+    /// The stage that failed, or `None` for a clean protocol terminal.
+    pub failure_stage: Option<&'static str>,
     /// Total input+output capacity held for the request and sent on the wire.
     pub billing_grant_tokens: u64,
     /// Provider output cap sent independently in `CanonRequest.params.max_tokens`.
     pub output_limit_tokens: u64,
     /// Visible output-token lower bound rendered to the local caller.
     pub visible_output_tokens: u64,
-    /// The request's stable v2 output-delivery count (`max(token_ids.len(), 1)` per accepted
-    /// content chunk), retained independently of provider-native billing usage.
+    /// The request's stable v2 accepted-content count (`max(token_ids.len(), 1)` per chunk),
+    /// retained independently of provider-native billing usage and visibility.
     pub rendered_tokens: u64,
-    /// The deal's cumulative stable v2 output-delivery count after this request. Like
-    /// `rendered_tokens`, it adds `max(token_ids.len(), 1)` for every accepted content chunk,
-    /// including metadata-only chunks, and remains independent of provider-native billing usage.
+    /// The deal's cumulative stable v2 accepted-content witness: every verification or answer chunk
+    /// contributes `max(token_ids.len(), 1)`, including hidden reasoning and metadata-only chunks.
     pub route_delivered_tokens: Option<u64>,
-    /// Provider-native input usage, present only after a clean accepted terminal record.
+    /// Provider-native input usage of the answer stream, present only after its clean terminal.
     pub input_tokens: Option<u64>,
-    /// Provider-native output usage, present only after a clean accepted terminal record.
+    /// Provider-native output usage of the answer stream, present only after its clean terminal.
     pub output_tokens: Option<u64>,
-    /// Provider-native checked input+output usage charged for this request.
+    /// Provider-native checked input+output usage charged for the answer stream.
     pub billable_tokens: Option<u64>,
-    /// The deal's cumulative accepted billable usage after this request.
+    /// Provider-native input attributed to the whole top-level request, including completed
+    /// verification and seller-claimable terminal usage observed before a cancelled clean EOF.
+    pub request_input_tokens: u64,
+    /// Provider-native output attributed across the whole top-level request on the same basis.
+    pub request_output_tokens: u64,
+    /// Checked sum of [`Self::request_input_tokens`] and [`Self::request_output_tokens`].
+    pub request_billable_tokens: u64,
+    /// The deal's cumulative buyer-committed billable usage after clean EOF.
     pub route_billable_tokens: Option<u64>,
     /// The terminal value that went out on the wire
-    /// (`stop`/`length`/`capacity`/`error`/`content_filter`, or
-    /// `end_turn`/`max_tokens`/`error`/`refusal` on the Anthropic transcode).
+    /// (`stop`/`length`/`capacity`/`error`/`empty_output`/`content_filter`, or
+    /// `end_turn`/`max_tokens`/`error`/`refusal` on the Anthropic transcode). `cancelled` means the
+    /// handler or streaming response body disappeared before such a terminal.
     pub finish_reason: &'static str,
     /// The render stopped because the next content chunk did not fit the remaining output cap. Reaching
     /// the cap exactly while the seller then ends cleanly does not by itself mark the answer truncated.
@@ -1381,14 +1768,17 @@ impl BuyerClaimObservationCursor {
 /// travel to it rather than the library learning to print.
 pub type DeliveryEvents = tokio::sync::mpsc::UnboundedSender<RequestDelivery>;
 
-/// Publish one finished request's delivery record. Always traced; forwarded to the machine
-/// surface when one is attached. A closed receiver is not an error - the operator simply stopped
-/// listening, and a paid stream must not fail because of it.
+/// Publish one finished or cancelled request's delivery record. Always traced; forwarded
+/// to the machine surface when one is attached. A closed receiver is not an error - the operator
+/// simply stopped listening, and a paid stream must not fail because of it.
 pub(crate) fn report_request_delivery(events: Option<&DeliveryEvents>, delivery: RequestDelivery) {
     tracing::info!(
         token_contract = %display_token_contract(&delivery.token_contract),
+        request_id = %delivery.request_id,
         protocol = delivery.protocol,
         streamed = delivery.streamed,
+        http_status = delivery.http_status,
+        failure_stage = delivery.failure_stage,
         grant_tokens = delivery.output_limit_tokens,
         rendered_tokens = delivery.rendered_tokens,
         route_delivered_tokens = delivery.route_delivered_tokens,
@@ -1400,6 +1790,9 @@ pub(crate) fn report_request_delivery(events: Option<&DeliveryEvents>, delivery:
         input_tokens = delivery.input_tokens,
         output_tokens = delivery.output_tokens,
         billable_tokens = delivery.billable_tokens,
+        request_input_tokens = delivery.request_input_tokens,
+        request_output_tokens = delivery.request_output_tokens,
+        request_billable_tokens = delivery.request_billable_tokens,
         route_billable_tokens = delivery.route_billable_tokens,
         finish_reason = delivery.finish_reason,
         truncated_by_output_limit = delivery.truncated_by_output_limit,
@@ -1409,6 +1802,46 @@ pub(crate) fn report_request_delivery(events: Option<&DeliveryEvents>, delivery:
     if let Some(events) = events {
         let _ = events.send(delivery);
     }
+}
+
+/// Publish the terminal accounting of a request that ended after admission but before its answer
+/// stream opened. This is the paid-502 gap: content verification may already have committed valid
+/// provider usage even though there is no answer-specific usage or visible client output.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn report_pre_answer_failure(
+    deal: &ApiDeal,
+    request_guard: &mut ConsumerRequestGuard,
+    request_id: &str,
+    protocol: &'static str,
+    streamed: bool,
+    output_limit_tokens: u64,
+    http_status: u16,
+    failure_stage: &'static str,
+) {
+    let request_usage = request_guard.request_usage();
+    request_guard.report_delivery(RequestDelivery {
+        token_contract: deal.route.token_contract.clone(),
+        request_id: request_id.to_string(),
+        protocol,
+        streamed,
+        http_status,
+        failure_stage: Some(failure_stage),
+        billing_grant_tokens: request_guard.granted(),
+        output_limit_tokens,
+        visible_output_tokens: 0,
+        rendered_tokens: 0,
+        route_delivered_tokens: Some(deal.route_visible_output_tokens()),
+        input_tokens: None,
+        output_tokens: None,
+        billable_tokens: None,
+        request_input_tokens: request_usage.input_tokens,
+        request_output_tokens: request_usage.output_tokens,
+        request_billable_tokens: request_usage.total_tokens,
+        route_billable_tokens: deal.session.route_billable_tokens(),
+        finish_reason: "error",
+        truncated_by_output_limit: false,
+        ended_before_output_limit: output_limit_tokens > 0,
+    });
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1638,7 +2071,7 @@ impl ContentGate {
                         let (b8_output_limit, b8_grant) =
                             verification_stream_limits(request_guard.remaining_grant());
                         let v8 = {
-                            let mut charge = |tokens| request_guard.record_billing(deal, tokens);
+                            let mut charge = |usage| request_guard.record_billing(deal, usage);
                             let mut record_output = |tokens| deal.record_visible_output(tokens);
                             buyer
                                 .behavioral_probe(
@@ -1664,7 +2097,7 @@ impl ContentGate {
                         let (b7_output_limit, b7_grant) =
                             verification_stream_limits(request_guard.remaining_grant());
                         let v7 = {
-                            let mut charge = |tokens| request_guard.record_billing(deal, tokens);
+                            let mut charge = |usage| request_guard.record_billing(deal, usage);
                             let mut record_output = |tokens| deal.record_visible_output(tokens);
                             buyer
                                 .reference_spotcheck(
@@ -1707,9 +2140,9 @@ pub struct ApiState {
     /// Active deal slot. A one-shot service never replaces it; continuous service mode may publish the next
     /// already-opened handover here while keeping the local HTTP listener alive.
     pub deals: Arc<RouteManager>,
-    /// Where each finished request's [`RequestDelivery`] goes. `None` leaves the record on
-    /// the tracing surface only, which is what a test or an embedder that has no machine output
-    /// wants; the CLI attaches its JSONL writer here.
+    /// Where each finished or cancelled request's [`RequestDelivery`] goes. `None` leaves
+    /// the record on the tracing surface only, which is what a test or an embedder that has no
+    /// machine output wants; the CLI attaches its JSONL writer here.
     pub delivery_events: Option<DeliveryEvents>,
 }
 
@@ -1736,9 +2169,11 @@ pub struct SessionSettle {
     failure_policy: BuyerApiFailurePolicy,
     lifetime: SessionLifetimePolicy,
     terminal_action: AtomicU8,
-    /// The consumer route's cumulative stable v2 output-delivery witness: each accepted content
-    /// chunk adds `max(token_ids.len(), 1)`, including metadata-only chunks. This retains the
-    /// implicit-terminal veto and the buyer-event v2 `route_delivered_tokens` meaning.
+    client_stop_recorder: OnceLock<ClientStopRecorder>,
+    /// The consumer route's cumulative stable v2 delivery witness. Every accepted verification or
+    /// answer content chunk contributes its legacy count, including hidden reasoning and
+    /// metadata-only chunks. This retains the implicit-terminal veto and the buyer-event v2
+    /// `route_delivered_tokens` meaning.
     route_delivery: OnceLock<Arc<AtomicU64>>,
     /// The consumer route's own cumulative accepted billable-usage counter, shared by
     /// [`ApiDeal::new`].
@@ -1761,6 +2196,49 @@ pub enum SessionTerminalAction {
     StreamCleanup,
     ObservedTerminal,
     UnknownCloser,
+}
+
+/// Process-local reason joined to an exact authoritative buyer STOP terminal event.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ConfirmedClientStop {
+    pub reason: String,
+    pub path: &'static str,
+    pub failure_class: Option<String>,
+    pub policy_action: Option<String>,
+    pub terminal_message_id: String,
+    pub terminal_created_at: u64,
+}
+
+pub type ClientStopRecorder = Arc<dyn Fn(ConfirmedClientStop) + Send + Sync>;
+
+fn confirmed_client_stop(
+    settlement: &dexdo_core::Settlement,
+    path: &'static str,
+    reason: &str,
+    failure_class: Option<&str>,
+    policy_action: Option<&str>,
+) -> Option<ConfirmedClientStop> {
+    let (terminal_message_id, terminal_created_at) = match settlement {
+        dexdo_core::Settlement::AuthoritativeReceipt(receipt)
+            if receipt.action == dexdo_core::SettlementAction::BuyerStop =>
+        {
+            (receipt.message_id.clone(), receipt.created_at)
+        }
+        dexdo_core::Settlement::BuyerStopTerminal(receipt)
+            if receipt.fact == dexdo_core::BuyerStopTerminalFact::SubmittedStop =>
+        {
+            (receipt.message_id.clone(), receipt.created_at)
+        }
+        _ => return None,
+    };
+    Some(ConfirmedClientStop {
+        reason: reason.to_string(),
+        path,
+        failure_class: failure_class.map(str::to_string),
+        policy_action: policy_action.map(str::to_string),
+        terminal_message_id,
+        terminal_created_at,
+    })
 }
 
 impl SessionTerminalAction {
@@ -1891,9 +2369,34 @@ impl SessionSettle {
             failure_policy,
             lifetime,
             terminal_action: AtomicU8::new(0),
+            client_stop_recorder: OnceLock::new(),
             route_delivery: OnceLock::new(),
             route_billing: OnceLock::new(),
         }
+    }
+
+    /// Attach the CLI-owned durable sink for confirmed buyer STOP attribution.
+    pub fn bind_client_stop_recorder(&self, recorder: ClientStopRecorder) {
+        let _ = self.client_stop_recorder.set(recorder);
+    }
+
+    fn record_confirmed_client_stop(
+        &self,
+        settlement: &dexdo_core::Settlement,
+        path: &'static str,
+        reason: &str,
+        failure_class: Option<&str>,
+        policy_action: Option<&str>,
+    ) {
+        let Some(recorder) = self.client_stop_recorder.get() else {
+            return;
+        };
+        let Some(stop) =
+            confirmed_client_stop(settlement, path, reason, failure_class, policy_action)
+        else {
+            return;
+        };
+        recorder(stop);
     }
 
     /// Bind this session to the billable-token counter of the consumer route it settles.
@@ -2403,6 +2906,7 @@ impl SessionSettle {
                     .store(false, Ordering::SeqCst);
                 self.recovery_submit_may_have_landed
                     .store(false, Ordering::SeqCst);
+                self.record_confirmed_client_stop(&s, "session_settle", reason, None, None);
                 tracing::info!(
                     %reason,
                     settlement = ?s,
@@ -2475,6 +2979,13 @@ impl SessionSettle {
     ) -> bool {
         match self.recover_reclaim_opened(heartbeat, true).await {
             Ok(Some(s)) => {
+                self.record_confirmed_client_stop(
+                    &s,
+                    "seller_timeout_policy",
+                    reason,
+                    Some(failure_class),
+                    Some(action),
+                );
                 tracing::warn!(
                     %reason,
                     policy_failure_class = failure_class,
@@ -2587,6 +3098,13 @@ impl SessionSettle {
                     let terminal_action = SessionTerminalAction::from_stop_settlement(&s);
                     self.record_terminal_action(terminal_action);
                     self.settled.store(true, Ordering::SeqCst);
+                    self.record_confirmed_client_stop(
+                        &s,
+                        "verification_bail",
+                        reason,
+                        Some("bad_output_scam"),
+                        Some(action.as_str()),
+                    );
                     tracing::info!(
                         %reason,
                         policy_failure_class = "bad_output_scam",
@@ -2822,10 +3340,27 @@ impl Drop for SessionSettle {
             self.token_contract.clone(),
             self.note.clone(),
         );
+        let client_stop_recorder = self.client_stop_recorder.get().cloned();
         if let Ok(h) = tokio::runtime::Handle::try_current() {
             h.spawn(async move {
-                if let Err(e) = chain.stop(&tc, note.as_ref()).await {
-                    tracing::error!(error = %e, "consumer API: Drop-path backup STOP failed");
+                match chain.stop(&tc, note.as_ref()).await {
+                    Ok(settlement) => {
+                        if let (Some(recorder), Some(stop)) = (
+                            client_stop_recorder,
+                            confirmed_client_stop(
+                                &settlement,
+                                "drop_backup",
+                                "drop-backup",
+                                None,
+                                None,
+                            ),
+                        ) {
+                            recorder(stop);
+                        }
+                    }
+                    Err(e) => {
+                        tracing::error!(error = %e, "consumer API: Drop-path backup STOP failed");
+                    }
                 }
             });
         } else {
@@ -2967,7 +3502,8 @@ pub async fn serve(
     anthropic_compat: bool,
     shutdown: impl std::future::Future<Output = ()> + Send + 'static,
 ) -> Result<(SocketAddr, tokio::task::JoinHandle<()>)> {
-    // same reason as the seller gateway. `dexdo buyer --local-listen 127.0.0.1:0` serves an
+    // same reason as the seller gateway. `dexdo buyer --local-listen 127.0.0.1:0
+    // --max-price-per-tick 1` serves an
     // OpenAI-compatible endpoint, and a consumer that closes the connection part-way through an
     // answer is ordinary. Under the entry policy that a one-shot printer wants, that hangup would
     // end this process instead of this request. Not a duplicate of `main` -- the opposite decision.
@@ -3379,6 +3915,78 @@ mod tests {
         assert_eq!(deal.last_accepted_output_unix_secs(), 200);
     }
 
+    fn buyer_stop_action_receipt() -> dexdo_core::SettlementActionReceipt {
+        dexdo_core::SettlementActionReceipt {
+            token_contract: "0:tc".to_string(),
+            action: dexdo_core::SettlementAction::BuyerStop,
+            message_id: "terminal-message".to_string(),
+            created_at: 1_800_000_000,
+            event: dexdo_core::SettlementActionEvent::StreamStopped {
+                buyer: "0:buyer".to_string(),
+                to_seller: 1u128.into(),
+                refund_to_buyer: 2u128.into(),
+            },
+            pre_bonds: dexdo_core::SettlementActionBondState {
+                seller_bond_held: 3u128.into(),
+                seller_bond_required: 3u128.into(),
+                buyer_bond_held: 4u128.into(),
+                buyer_bond_required: 4u128.into(),
+            },
+            post_state: None,
+        }
+    }
+
+    #[test]
+    fn client_stop_attribution_requires_exact_proof_that_this_buyer_stop_closed() {
+        let confirmed =
+            dexdo_core::Settlement::AuthoritativeReceipt(Box::new(buyer_stop_action_receipt()));
+        let recorded = confirmed_client_stop(
+            &confirmed,
+            "session_settle",
+            "one-shot-complete",
+            None,
+            None,
+        )
+        .expect("an authoritative own buyer STOP is attributable");
+        assert_eq!(recorded.reason, "one-shot-complete");
+        assert_eq!(recorded.path, "session_settle");
+        assert_eq!(recorded.terminal_message_id, "terminal-message");
+        assert_eq!(recorded.terminal_created_at, 1_800_000_000);
+
+        let ambiguous = dexdo_core::Settlement::BuyerStopTerminal(Box::new(
+            dexdo_core::BuyerStopTerminalReceipt::unknown_closer(buyer_stop_action_receipt()),
+        ));
+        assert!(
+            confirmed_client_stop(&ambiguous, "session_settle", "shutdown", None, None,).is_none()
+        );
+    }
+
+    #[tokio::test]
+    async fn confirmed_buyer_stop_is_delivered_to_the_bound_audit_recorder() {
+        let chain = Arc::new(RecordingSettleChain::default());
+        chain
+            .authoritative_stop
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        let session = SessionSettle::new(
+            chain,
+            "0:tc".to_string(),
+            Arc::new(dexdo_core::LocalNote::generate()),
+        );
+        let recorded = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let recorded_for_sink = recorded.clone();
+        session.bind_client_stop_recorder(Arc::new(move |stop| {
+            recorded_for_sink.lock().unwrap().push(stop);
+        }));
+
+        assert!(session.settle("explicit-user-stop").await.unwrap());
+
+        let recorded = recorded.lock().unwrap();
+        assert_eq!(recorded.len(), 1);
+        assert_eq!(recorded[0].reason, "explicit-user-stop");
+        assert_eq!(recorded[0].path, "session_settle");
+        assert_eq!(recorded[0].terminal_message_id, "terminal-message");
+    }
+
     #[derive(Default)]
     struct RecordingSettleChain {
         stop_calls: std::sync::atomic::AtomicUsize,
@@ -3389,6 +3997,7 @@ mod tests {
         fail_dispute: std::sync::atomic::AtomicBool,
         fail_recovery_stop: std::sync::atomic::AtomicBool,
         ambiguous_stop: std::sync::atomic::AtomicBool,
+        authoritative_stop: std::sync::atomic::AtomicBool,
         ambiguous_recovery_stop: std::sync::atomic::AtomicBool,
         fail_cleanup_unopened: std::sync::atomic::AtomicBool,
         fail_deal_state: std::sync::atomic::AtomicBool,
@@ -3568,6 +4177,14 @@ mod tests {
                 return Err(dexdo_core::ChainError::Chain(
                     "injected stop failure".to_string(),
                 ));
+            }
+            if self
+                .authoritative_stop
+                .load(std::sync::atomic::Ordering::SeqCst)
+            {
+                return Ok(dexdo_core::Settlement::AuthoritativeReceipt(Box::new(
+                    buyer_stop_action_receipt(),
+                )));
             }
             Ok(dexdo_core::Settlement::SellerNoShow {
                 to_buyer_refund: 0,
@@ -3850,7 +4467,10 @@ mod tests {
             RouteBudget::Exhausted(reason) => panic!("route refused admission: {reason}"),
         }
         request
-            .record_billing(&deal, tokens)
+            .record_billing(
+                &deal,
+                BillingUsage::new(0, tokens, None).expect("test usage is valid"),
+            )
             .expect("terminal billing usage charges against the held reservation");
         deal.record_visible_output(tokens)
             .expect("accepted output updates the separate delivery witness");
@@ -4660,7 +5280,10 @@ mod tests {
         assert_eq!(first.granted, tick, "pre-probe grant is exactly one tick");
         first_request.hold(first);
         first_request
-            .record_billing(&deal, 3)
+            .record_billing(
+                &deal,
+                BillingUsage::new(0, 3, None).expect("test usage is valid"),
+            )
             .expect("complete trial usage fits the one-tick grant");
         drop(first_request);
 
@@ -5444,13 +6067,54 @@ mod tests {
             prompt: &str,
             stream: bool,
         ) -> (reqwest::StatusCode, String) {
-            let body = serde_json::json!({
-                "model": "dexdo-mock",
-                "messages": [{"role": "user", "content": prompt}],
-                "max_tokens": max_tokens,
-                "stream": stream
-            });
-            let response = reqwest::Client::builder()
+            let response = self.send_full(path, max_tokens, prompt, stream).await;
+            let status = response.status();
+            (status, response.text().await.expect("body"))
+        }
+
+        async fn ask_full_with_request_id(
+            &self,
+            path: &str,
+            max_tokens: u64,
+            prompt: &str,
+            stream: bool,
+        ) -> (reqwest::StatusCode, String, String) {
+            let response = self.send_full(path, max_tokens, prompt, stream).await;
+            let status = response.status();
+            let request_id = response
+                .headers()
+                .get(REQUEST_ID_HEADER)
+                .expect("consumer response carries its request correlation id")
+                .to_str()
+                .expect("request id header is ASCII")
+                .to_string();
+            let body = response.text().await.expect("body");
+            (status, body, request_id)
+        }
+
+        async fn send_full(
+            &self,
+            path: &str,
+            max_tokens: u64,
+            prompt: &str,
+            stream: bool,
+        ) -> reqwest::Response {
+            let body = if path == "/v1/responses" {
+                serde_json::json!({
+                    "model": "dexdo-mock",
+                    "input": prompt,
+                    "max_output_tokens": max_tokens,
+                    "stream": stream
+                })
+            } else {
+                serde_json::json!({
+                    "model": "dexdo-mock",
+                    "messages": [{"role": "user", "content": prompt}],
+                    "max_tokens": max_tokens,
+                    "stream": stream
+                })
+            };
+            reqwest::Client::builder()
                 .timeout(Duration::from_secs(15))
                 .build()
                 .unwrap()
@@ -5458,9 +6122,7 @@ mod tests {
                 .json(&body)
                 .send()
                 .await
-                .expect("the local endpoint answers");
-            let status = response.status();
-            (status, response.text().await.expect("body"))
+                .expect("the local endpoint answers")
         }
 
         async fn ask_openai_usage(
@@ -5541,6 +6203,98 @@ mod tests {
             }
             self.seller.server_task.abort();
         }
+    }
+
+    fn direct_state_with_deliveries(
+        harness: &WeeklyRouteHarness,
+        delivery_events: DeliveryEvents,
+    ) -> ApiState {
+        ApiState {
+            buyer: harness.buyer.clone(),
+            frame_model: "dexdo-mock".to_string(),
+            mock_model: true,
+            deals: harness.deals.clone(),
+            delivery_events: Some(delivery_events),
+        }
+    }
+
+    async fn direct_consumer_response(
+        state: ApiState,
+        path: &str,
+        max_tokens: u64,
+        prompt: &str,
+        stream: bool,
+    ) -> Response {
+        let body = serde_json::json!({
+            "model": "dexdo-mock",
+            "messages": [{"role": "user", "content": prompt}],
+            "max_tokens": max_tokens,
+            "stream": stream
+        });
+        match path {
+            "/v1/chat/completions" => {
+                let request = serde_json::from_value(body).expect("valid Chat Completions request");
+                openai::chat_completions(axum::extract::State(state), axum::Json(request)).await
+            }
+            "/v1/responses" => {
+                let body = serde_json::json!({
+                    "model": "dexdo-mock",
+                    "input": prompt,
+                    "max_output_tokens": max_tokens,
+                    "stream": stream
+                });
+                openai::responses(axum::extract::State(state), axum::Json(body)).await
+            }
+            "/v1/messages" => {
+                let request = serde_json::from_value(body).expect("valid Anthropic request");
+                anthropic::messages(axum::extract::State(state), axum::Json(request)).await
+            }
+            other => panic!("unsupported direct consumer path {other}"),
+        }
+    }
+
+    async fn wait_for_route_delivery(harness: &WeeklyRouteHarness) {
+        for _ in 0..200 {
+            let delivered = harness
+                .deals
+                .current()
+                .await
+                .expect("the harness route is published")
+                .route_visible_output_tokens();
+            if delivered > 0 {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        panic!("the aggregate handler accepted no fixture content");
+    }
+
+    async fn drop_sse_body_after(response: Response, marker: &str, content_marker: &str) -> String {
+        use futures::StreamExt as _;
+
+        let request_id = response
+            .headers()
+            .get(REQUEST_ID_HEADER)
+            .expect("streaming response carries its request correlation id")
+            .to_str()
+            .expect("request id header is ASCII")
+            .to_string();
+        let mut body = response.into_body().into_data_stream();
+        let mut saw_content = false;
+        while let Some(frame) = body.next().await {
+            let frame = frame.expect("SSE body frame");
+            let frame = std::str::from_utf8(&frame).expect("SSE is UTF-8");
+            saw_content |= frame.contains(content_marker);
+            if frame.contains(marker) {
+                assert!(
+                    saw_content,
+                    "the terminal cutover must follow at least one visible content delta"
+                );
+                drop(body);
+                return request_id;
+            }
+        }
+        panic!("SSE body ended before marker {marker}");
     }
 
     /// The terminal reason the consumer was actually shown, read off the wire for either protocol
@@ -6542,6 +7296,393 @@ mod tests {
         }
     }
 
+    #[tokio::test]
+    async fn reasoning_only_output_fails_locally_but_keeps_clean_terminal_billing() {
+        for path in ["/v1/chat/completions", "/v1/responses", "/v1/messages"] {
+            for stream in [false, true] {
+                let harness = weekly_route_harness_gated_with_policy(WeeklyRouteScenario {
+                    claimed: 0,
+                    subscription: true,
+                    expires_in: SUB_WEEK_LEN.as_secs(),
+                    upstream_tokens: UNCONSTRAINED_UPSTREAM,
+                    content_gate: ContentGate::skip(),
+                    upstream: crate::seller::UpstreamConfig::Mock,
+                    failure_policy: BuyerApiFailurePolicy {
+                        empty_stream: EmptyStreamAction::FailClosed,
+                        ..BuyerApiFailurePolicy::default()
+                    },
+                    lifetime: SessionLifetimePolicy::SettleOnExit,
+                })
+                .await;
+                let remaining_before = harness.remaining().await;
+                let session = harness
+                    .deals
+                    .current()
+                    .await
+                    .expect("the reasoning-only harness publishes one route")
+                    .session
+                    .clone();
+                let chain = harness.chain.clone();
+                let (status, body) = harness
+                    .ask_full(path, 8, "DEXDO_FIXTURE_REASONING_ONLY", stream)
+                    .await;
+
+                if stream {
+                    assert_eq!(status, reqwest::StatusCode::OK, "{path}: {body}");
+                    if path == "/v1/responses" {
+                        assert!(body.contains("event: response.failed"), "{body}");
+                        assert!(body.contains("\"code\":\"empty_output\""), "{body}");
+                    } else {
+                        assert_eq!(
+                            terminal_reason(&body).as_deref(),
+                            Some(if path == "/v1/messages" {
+                                "error"
+                            } else {
+                                "empty_output"
+                            }),
+                            "{body}"
+                        );
+                    }
+                } else {
+                    assert_eq!(status, reqwest::StatusCode::BAD_GATEWAY, "{path}: {body}");
+                    assert!(
+                        body.contains(if path == "/v1/messages" {
+                            "empty stream"
+                        } else {
+                            "no assistant text"
+                        }),
+                        "{body}"
+                    );
+                }
+
+                assert!(
+                    !body.contains("DEXDO_FIXTURE_REASONING_ONLY"),
+                    "provider reasoning must not leak through the text-only API: {body}"
+                );
+                let delivery = harness.last_delivery().await;
+                assert_eq!(delivery.visible_output_tokens, 0, "{path} stream={stream}");
+                assert_eq!(delivery.rendered_tokens, 8, "{path} stream={stream}");
+                let input_tokens = delivery
+                    .input_tokens
+                    .expect("clean terminal input usage must remain attributable");
+                let billable_tokens = input_tokens.checked_add(8).expect("fixture usage fits u64");
+                assert_eq!(delivery.output_tokens, Some(8), "{path} stream={stream}");
+                assert!(
+                    !delivery.truncated_by_output_limit,
+                    "an exact provider-output fit is not a truncation: {path} stream={stream}"
+                );
+                assert!(
+                    !delivery.ended_before_output_limit,
+                    "authoritative provider output consumed the exact cap: {path} stream={stream}"
+                );
+                assert_eq!(
+                    delivery.billable_tokens,
+                    Some(billable_tokens),
+                    "{path} stream={stream}"
+                );
+                assert_eq!(
+                    delivery.request_input_tokens, input_tokens,
+                    "{path} stream={stream}"
+                );
+                assert_eq!(delivery.request_output_tokens, 8, "{path} stream={stream}");
+                assert_eq!(
+                    delivery.request_billable_tokens, billable_tokens,
+                    "{path} stream={stream}"
+                );
+                assert_eq!(
+                    delivery.route_billable_tokens,
+                    Some(billable_tokens),
+                    "{path} stream={stream}"
+                );
+                assert_eq!(
+                    delivery.route_delivered_tokens,
+                    Some(8),
+                    "the stable route witness keeps every accepted content chunk: {path} stream={stream}"
+                );
+                assert_eq!(
+                    session.route_delivered_tokens(),
+                    Some(8),
+                    "hidden reasoning must not change the stable implicit-terminal contract: {path} stream={stream}"
+                );
+                assert_eq!(
+                    delivery.finish_reason,
+                    if path == "/v1/messages" {
+                        "error"
+                    } else {
+                        "empty_output"
+                    },
+                    "{path} stream={stream}"
+                );
+                assert_eq!(
+                    harness.delivered().await,
+                    billable_tokens,
+                    "{path} stream={stream}"
+                );
+                assert_eq!(
+                    harness.remaining().await,
+                    remaining_before - billable_tokens,
+                    "{path} stream={stream}"
+                );
+                harness.shutdown().await;
+                assert_eq!(
+                    session.terminal_action(),
+                    Some(SessionTerminalAction::StreamStop),
+                    "the legacy accepted-content witness must still permit implicit STOP: {path} stream={stream}"
+                );
+                assert_eq!(
+                    chain.foreign_money_calls(),
+                    1,
+                    "preserving the legacy witness also preserves the existing STOP write: {path} stream={stream}"
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn mixed_reasoning_and_text_separates_visible_from_provider_output() {
+        for path in ["/v1/chat/completions", "/v1/responses", "/v1/messages"] {
+            for stream in [false, true] {
+                let harness = weekly_route_harness_gated_with_policy(WeeklyRouteScenario {
+                    claimed: 0,
+                    subscription: true,
+                    expires_in: SUB_WEEK_LEN.as_secs(),
+                    upstream_tokens: UNCONSTRAINED_UPSTREAM,
+                    content_gate: ContentGate::skip(),
+                    upstream: crate::seller::UpstreamConfig::Mock,
+                    failure_policy: BuyerApiFailurePolicy::default(),
+                    lifetime: SessionLifetimePolicy::SettleOnExit,
+                })
+                .await;
+
+                let (status, body) = harness
+                    .ask_full(path, 8, "DEXDO_FIXTURE_MIXED_REASONING", stream)
+                    .await;
+                assert_eq!(
+                    status,
+                    reqwest::StatusCode::OK,
+                    "{path} stream={stream}: {body}"
+                );
+                assert!(
+                    !body.contains("mock-reply"),
+                    "the hidden first chunk must not cross the consumer surface: {body}"
+                );
+                assert!(
+                    body.contains("DEXDO_FIXTURE_MIXED_REASONING"),
+                    "the visible second chunk must reach the consumer: {body}"
+                );
+
+                let delivery = harness.last_delivery().await;
+                assert_eq!(delivery.visible_output_tokens, 1, "{path} stream={stream}");
+                assert_eq!(delivery.rendered_tokens, 2, "{path} stream={stream}");
+                assert_eq!(delivery.output_tokens, Some(2), "{path} stream={stream}");
+                assert_eq!(delivery.request_output_tokens, 2, "{path} stream={stream}");
+                assert_eq!(
+                    delivery.route_delivered_tokens,
+                    Some(2),
+                    "both accepted chunks remain in the stable route witness: {path} stream={stream}"
+                );
+                assert!(
+                    delivery.billable_tokens.is_some(),
+                    "the complete provider usage remains billable: {path} stream={stream}"
+                );
+                harness.shutdown().await;
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn upstream_error_after_observed_usage_separates_buffered_and_streamed_visibility() {
+        for path in ["/v1/chat/completions", "/v1/responses", "/v1/messages"] {
+            for stream in [false, true] {
+                let harness = weekly_route_harness(PROBE_CLAIM, false).await;
+                let (status, body) = harness
+                    .ask_full(path, 8, "DEXDO_FIXTURE_USAGE_THEN_ERROR", stream)
+                    .await;
+
+                assert_eq!(
+                    status,
+                    if stream {
+                        reqwest::StatusCode::OK
+                    } else {
+                        reqwest::StatusCode::BAD_GATEWAY
+                    },
+                    "{path} stream={stream}: {body}"
+                );
+                assert_eq!(
+                    body.contains("DEXDO_FIXTURE_USAGE_THEN_ERROR"),
+                    stream,
+                    "only streamed content crosses the consumer boundary: {path} stream={stream}: {body}"
+                );
+
+                let delivery = harness.last_delivery().await;
+                assert_eq!(
+                    delivery.visible_output_tokens,
+                    if stream { 2 } else { 0 },
+                    "{path} stream={stream}"
+                );
+                assert_eq!(delivery.rendered_tokens, 2, "{path} stream={stream}");
+                assert_eq!(
+                    delivery.route_delivered_tokens,
+                    Some(2),
+                    "{path} stream={stream}"
+                );
+                assert_eq!(delivery.input_tokens, None, "clean EOF was not observed");
+                assert_eq!(delivery.output_tokens, None, "clean EOF was not observed");
+                assert_eq!(delivery.billable_tokens, None, "clean EOF was not observed");
+                assert!(delivery.request_input_tokens > 0, "{path} stream={stream}");
+                assert_eq!(delivery.request_output_tokens, 2, "{path} stream={stream}");
+                assert!(
+                    delivery.request_billable_tokens > 2,
+                    "{path} stream={stream}"
+                );
+                assert_eq!(
+                    delivery.route_billable_tokens,
+                    Some(0),
+                    "observed usage without clean EOF is not buyer-committed: {path} stream={stream}"
+                );
+                harness.shutdown().await;
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn aggregate_handler_cancellation_keeps_buffered_progress_hidden() {
+        for path in ["/v1/chat/completions", "/v1/responses", "/v1/messages"] {
+            let harness = weekly_route_harness(PROBE_CLAIM, false).await;
+            let (delivery_tx, mut delivery_rx) = tokio::sync::mpsc::unbounded_channel();
+            let state = direct_state_with_deliveries(&harness, delivery_tx);
+            let handler = tokio::spawn(async move {
+                direct_consumer_response(state, path, 8, "DEXDO_FIXTURE_HOLD_AFTER_CONTENT", false)
+                    .await
+            });
+
+            wait_for_route_delivery(&harness).await;
+            tokio::time::sleep(Duration::from_millis(20)).await;
+            assert!(
+                matches!(
+                    delivery_rx.try_recv(),
+                    Err(tokio::sync::mpsc::error::TryRecvError::Empty)
+                ),
+                "{path}: an in-flight aggregate must remain armed"
+            );
+            handler.abort();
+            let _ = handler.await;
+            harness.seller.release_delayed_eof();
+
+            let delivery = delivery_rx
+                .recv()
+                .await
+                .expect("cancelling the aggregate handler publishes one record");
+            assert_eq!(
+                delivery.protocol,
+                match path {
+                    "/v1/chat/completions" => "openai",
+                    "/v1/responses" => "openai_responses",
+                    "/v1/messages" => "anthropic",
+                    _ => unreachable!(),
+                }
+            );
+            assert_eq!(delivery.http_status, CLIENT_CLOSED_REQUEST_STATUS);
+            assert_eq!(delivery.failure_stage, Some("consumer_disconnect"));
+            assert_eq!(delivery.finish_reason, "cancelled");
+            assert_eq!(delivery.visible_output_tokens, 0);
+            assert!(delivery.rendered_tokens > 0);
+            assert!(delivery
+                .route_delivered_tokens
+                .is_some_and(|tokens| tokens > 0));
+            assert_eq!(delivery.input_tokens, None);
+            assert_eq!(delivery.output_tokens, None);
+            assert_eq!(delivery.billable_tokens, None);
+            assert!(matches!(
+                delivery_rx.try_recv(),
+                Err(tokio::sync::mpsc::error::TryRecvError::Disconnected)
+            ));
+            harness.shutdown().await;
+        }
+    }
+
+    #[tokio::test]
+    async fn aggregate_body_boundary_reports_cancelled_or_delivered_once() {
+        use futures::StreamExt as _;
+
+        for path in ["/v1/chat/completions", "/v1/responses", "/v1/messages"] {
+            let cancelled = weekly_route_harness(PROBE_CLAIM, false).await;
+            let (delivery_tx, mut delivery_rx) = tokio::sync::mpsc::unbounded_channel();
+            let response = direct_consumer_response(
+                direct_state_with_deliveries(&cancelled, delivery_tx),
+                path,
+                8,
+                "aggregate body boundary",
+                false,
+            )
+            .await;
+            assert_eq!(response.status(), http::StatusCode::OK);
+            assert!(matches!(
+                delivery_rx.try_recv(),
+                Err(tokio::sync::mpsc::error::TryRecvError::Empty)
+            ));
+            drop(response.into_body());
+            let delivery = delivery_rx
+                .recv()
+                .await
+                .expect("dropping the aggregate body publishes cancellation");
+            assert_eq!(delivery.http_status, http::StatusCode::OK.as_u16());
+            assert_eq!(delivery.failure_stage, Some("consumer_disconnect"));
+            assert_eq!(delivery.finish_reason, "cancelled");
+            assert_eq!(delivery.visible_output_tokens, 0);
+            assert!(delivery.rendered_tokens > 0);
+            assert!(delivery
+                .route_delivered_tokens
+                .is_some_and(|tokens| tokens > 0));
+            assert!(delivery.input_tokens.is_some());
+            assert!(delivery.output_tokens.is_some());
+            assert!(delivery.billable_tokens.is_some());
+            assert!(delivery.request_billable_tokens > 0);
+            assert!(matches!(
+                delivery_rx.try_recv(),
+                Err(tokio::sync::mpsc::error::TryRecvError::Disconnected)
+            ));
+            cancelled.shutdown().await;
+
+            let delivered = weekly_route_harness(PROBE_CLAIM, false).await;
+            let (delivery_tx, mut delivery_rx) = tokio::sync::mpsc::unbounded_channel();
+            let response = direct_consumer_response(
+                direct_state_with_deliveries(&delivered, delivery_tx),
+                path,
+                8,
+                "aggregate body boundary",
+                false,
+            )
+            .await;
+            assert_eq!(response.status(), http::StatusCode::OK);
+            let mut body = response.into_body().into_data_stream();
+            let mut bytes = Vec::new();
+            while let Some(frame) = body.next().await {
+                bytes.extend_from_slice(&frame.expect("aggregate body frame"));
+            }
+            let body = String::from_utf8(bytes).expect("aggregate body is UTF-8 JSON");
+            assert!(body.contains("aggregate body boundary"), "{path}: {body}");
+            let delivery = delivery_rx
+                .recv()
+                .await
+                .expect("reading the aggregate body publishes its terminal");
+            assert_eq!(delivery.http_status, http::StatusCode::OK.as_u16());
+            assert_eq!(delivery.failure_stage, None);
+            assert_ne!(delivery.finish_reason, "cancelled");
+            assert!(delivery.visible_output_tokens > 0);
+            assert!(delivery.rendered_tokens > 0);
+            assert!(delivery.input_tokens.is_some());
+            assert!(delivery.output_tokens.is_some());
+            assert!(delivery.billable_tokens.is_some());
+            assert!(delivery.request_billable_tokens > 0);
+            assert!(matches!(
+                delivery_rx.try_recv(),
+                Err(tokio::sync::mpsc::error::TryRecvError::Disconnected)
+            ));
+            delivered.shutdown().await;
+        }
+    }
+
     /// Accounted tokens and rendered frames are DIFFERENT quantities, and only the first one is
     /// money.
 
@@ -6895,7 +8036,10 @@ mod tests {
         let delivery_deal = deal.clone();
         let delivery = tokio::spawn(async move {
             delivery_started.wait();
-            in_flight.record_billing(&delivery_deal, 1)?;
+            in_flight.record_billing(
+                &delivery_deal,
+                BillingUsage::new(0, 1, None).expect("test usage is valid"),
+            )?;
             Ok::<_, String>(in_flight)
         });
         delivery_barrier.wait();
@@ -6967,7 +8111,10 @@ mod tests {
         let delivery_deal = deal.clone();
         let delivery = tokio::spawn(async move {
             delivery_started.wait();
-            let result = old_request.record_billing(&delivery_deal, 1);
+            let result = old_request.record_billing(
+                &delivery_deal,
+                BillingUsage::new(0, 1, None).expect("test usage is valid"),
+            );
             (result, old_request)
         });
         delivery_barrier.wait();
@@ -7023,6 +8170,15 @@ mod tests {
     /// pass without spending when it is missing, which keeps these tests to one probe exactly. The
     /// fixture opts into `SEED` explicitly because the production default is conservatively `NONE`.
     fn probe_models(probe_prompt: &str, base_url: &str, api_key_env: &str) -> Arc<ModelsConfig> {
+        probe_models_expecting(probe_prompt, "mock-reply", base_url, api_key_env)
+    }
+
+    fn probe_models_expecting(
+        probe_prompt: &str,
+        expected_contains: &str,
+        base_url: &str,
+        api_key_env: &str,
+    ) -> Arc<ModelsConfig> {
         Arc::new(
             ModelsConfig::from_json(
                 &serde_json::json!({
@@ -7036,7 +8192,7 @@ mod tests {
                         "capabilities": { "sample_algorithm": "SEED" },
                         "fingerprints": [ {
                             "probe_prompt": probe_prompt,
-                            "expected_contains": "mock-reply"
+                            "expected_contains": expected_contains
                         } ]
                     } }
                 })
@@ -7891,6 +9047,11 @@ mod tests {
         let first_delivery = harness.last_delivery().await;
         assert_eq!(first_delivery.rendered_tokens, 2);
         assert_eq!(
+            first_delivery.request_billable_tokens,
+            verification + 5,
+            "the top-level request total includes both verification calls and its answer"
+        );
+        assert_eq!(
             first_delivery.route_delivered_tokens,
             Some(2 * CONTENT_PROBE_MAX_TOKENS + 2),
             "the stable route-delivery witness includes both verification probes and the answer"
@@ -7916,6 +9077,402 @@ mod tests {
         reference_task.abort();
         let _ = reference_task.await;
         std::env::remove_var(REFERENCE_KEY);
+        harness.shutdown().await;
+    }
+
+    /// a content-verification call can commit valid provider usage and then reject the
+    /// top-level Responses request with HTTP 502. The response header and the one terminal machine
+    /// record must identify the same request and state its complete cost without pretending that an
+    /// answer was delivered.
+    #[tokio::test]
+    async fn paid_content_verification_502_reports_the_exact_request_cost() {
+        let harness = weekly_route_harness_gated(
+            PROBE_CLAIM,
+            false,
+            SUB_WEEK_LEN.as_secs(),
+            UNCONSTRAINED_UPSTREAM,
+            ContentGate::probe(
+                "dexdo-mock".to_string(),
+                probe_models_expecting(
+                    "identity probe",
+                    "this fingerprint cannot match the mock",
+                    "https://reference.invalid/v1",
+                    "DEXDO_FIXTURE_ABSENT_KEY",
+                ),
+            ),
+            crate::seller::UpstreamConfig::Mock,
+        )
+        .await;
+
+        let (status, body, request_id) = harness
+            .ask_full_with_request_id("/v1/responses", 2, "top level request", false)
+            .await;
+        assert_eq!(status, reqwest::StatusCode::BAD_GATEWAY, "{body}");
+        assert!(
+            body.contains("model identity verification failed"),
+            "{body}"
+        );
+
+        let delivery = harness.last_delivery().await;
+        assert_eq!(delivery.request_id, request_id);
+        assert_eq!(delivery.protocol, "openai_responses");
+        assert!(!delivery.streamed);
+        assert_eq!(delivery.http_status, 502);
+        assert_eq!(delivery.failure_stage, Some("content_verification"));
+        assert_eq!(delivery.visible_output_tokens, 0);
+        assert_eq!(delivery.input_tokens, None, "the answer never opened");
+        assert_eq!(delivery.output_tokens, None, "the answer never opened");
+        assert_eq!(delivery.billable_tokens, None, "the answer never opened");
+        assert_eq!(delivery.request_input_tokens, 2);
+        assert_eq!(delivery.request_output_tokens, CONTENT_PROBE_MAX_TOKENS);
+        assert_eq!(
+            delivery.request_billable_tokens,
+            2 + CONTENT_PROBE_MAX_TOKENS
+        );
+        assert_eq!(
+            delivery.route_billable_tokens,
+            Some(2 + CONTENT_PROBE_MAX_TOKENS)
+        );
+        assert_eq!(delivery.finish_reason, "error");
+        harness.shutdown().await;
+    }
+
+    /// review: the response body owns the request guard after paid verification. Dropping
+    /// that body before the answer stream reaches its normal terminal must still publish exactly
+    /// one correlated record for the accepted verification usage.
+    #[tokio::test]
+    async fn paid_verification_stream_disconnect_reports_once() {
+        const LONG_ANSWER_TOKENS: u64 = 100_000;
+        let harness = weekly_route_harness_gated(
+            PROBE_CLAIM,
+            false,
+            SUB_WEEK_LEN.as_secs(),
+            UNCONSTRAINED_UPSTREAM,
+            ContentGate::probe(
+                "dexdo-mock".to_string(),
+                probe_models(
+                    "identity probe",
+                    "https://reference.invalid/v1",
+                    "DEXDO_FIXTURE_ABSENT_KEY",
+                ),
+            ),
+            crate::seller::UpstreamConfig::Mock,
+        )
+        .await;
+
+        let response = harness
+            .send_full(
+                "/v1/responses",
+                LONG_ANSWER_TOKENS,
+                "disconnect after verification",
+                true,
+            )
+            .await;
+        assert_eq!(response.status(), reqwest::StatusCode::OK);
+        let request_id = response
+            .headers()
+            .get(REQUEST_ID_HEADER)
+            .expect("streaming response carries its request correlation id")
+            .to_str()
+            .expect("request id header is ASCII")
+            .to_string();
+        drop(response);
+
+        let delivery = harness.last_delivery().await;
+        assert_eq!(delivery.request_id, request_id);
+        assert_eq!(delivery.protocol, "openai_responses");
+        assert!(delivery.streamed);
+        assert_eq!(delivery.http_status, 200);
+        assert_eq!(delivery.failure_stage, Some("consumer_disconnect"));
+        assert_eq!(delivery.finish_reason, "cancelled");
+        assert_eq!(delivery.input_tokens, None);
+        assert_eq!(delivery.output_tokens, None);
+        assert_eq!(delivery.billable_tokens, None);
+        assert_eq!(delivery.request_input_tokens, 2);
+        assert_eq!(delivery.request_output_tokens, CONTENT_PROBE_MAX_TOKENS);
+        assert_eq!(
+            delivery.request_billable_tokens,
+            2 + CONTENT_PROBE_MAX_TOKENS
+        );
+        assert_eq!(
+            delivery.route_billable_tokens,
+            Some(2 + CONTENT_PROBE_MAX_TOKENS)
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert_eq!(
+            harness.deliveries().len(),
+            1,
+            "the drop fallback and ordinary terminal must not both publish"
+        );
+        harness.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn responses_terminal_cancellation_preserves_partial_output_and_truncation() {
+        let harness = weekly_route_harness(WEEK_QUOTA - 2, true).await;
+        let (delivery_tx, mut delivery_rx) = tokio::sync::mpsc::unbounded_channel();
+        let response = openai::responses(
+            axum::extract::State(direct_state_with_deliveries(&harness, delivery_tx)),
+            axum::Json(serde_json::json!({
+                "model": "dexdo-mock",
+                "input": "DEXDO_FIXTURE_STRADDLE DEXDO_FIXTURE_ECHOLIMIT terminal cutover",
+                "max_output_tokens": 8,
+                "stream": true
+            })),
+        )
+        .await;
+        assert_eq!(response.status(), http::StatusCode::OK);
+
+        let request_id = drop_sse_body_after(
+            response,
+            "response.output_item.done",
+            "response.output_text.delta",
+        )
+        .await;
+        let delivery = delivery_rx
+            .recv()
+            .await
+            .expect("dropping before the Responses terminal publishes cancellation");
+        assert_eq!(delivery.request_id, request_id);
+        assert_eq!(delivery.protocol, "openai_responses");
+        assert_eq!(delivery.failure_stage, Some("consumer_disconnect"));
+        assert_eq!(delivery.finish_reason, "cancelled");
+        assert_eq!(delivery.visible_output_tokens, 1);
+        assert_eq!(delivery.rendered_tokens, 1);
+        assert_eq!(delivery.input_tokens, None);
+        assert_eq!(delivery.output_tokens, None);
+        assert_eq!(delivery.billable_tokens, None);
+        assert_eq!(delivery.request_billable_tokens, 0);
+        assert!(
+            delivery.truncated_by_output_limit,
+            "cancellation after a known output-cap cut must preserve the prepared truncation fact"
+        );
+        assert!(matches!(
+            delivery_rx.try_recv(),
+            Err(tokio::sync::mpsc::error::TryRecvError::Disconnected)
+        ));
+        harness.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn anthropic_terminal_sequence_stays_armed_and_preserves_partial_output() {
+        let harness = weekly_route_harness(PROBE_CLAIM, false).await;
+        let (delivery_tx, mut delivery_rx) = tokio::sync::mpsc::unbounded_channel();
+        let request = serde_json::from_value(serde_json::json!({
+            "model": "dexdo-mock",
+            "messages": [{"role": "user", "content": "terminal cutover"}],
+            "max_tokens": 4,
+            "stream": true
+        }))
+        .expect("valid Anthropic request");
+        let response = anthropic::messages(
+            axum::extract::State(direct_state_with_deliveries(&harness, delivery_tx)),
+            axum::Json(request),
+        )
+        .await;
+        assert_eq!(response.status(), http::StatusCode::OK);
+
+        let request_id = drop_sse_body_after(
+            response,
+            "event: message_delta",
+            "event: content_block_delta",
+        )
+        .await;
+        let delivery = delivery_rx
+            .recv()
+            .await
+            .expect("dropping before message_stop publishes cancellation");
+        assert_eq!(delivery.request_id, request_id);
+        assert_eq!(delivery.protocol, "anthropic");
+        assert_eq!(delivery.failure_stage, Some("consumer_disconnect"));
+        assert_eq!(delivery.finish_reason, "cancelled");
+        assert!(delivery.visible_output_tokens > 0);
+        assert!(delivery.rendered_tokens > 0);
+        assert!(delivery.input_tokens.is_some());
+        assert!(delivery.output_tokens.is_some());
+        assert!(delivery.request_billable_tokens > 0);
+        assert!(matches!(
+            delivery_rx.try_recv(),
+            Err(tokio::sync::mpsc::error::TryRecvError::Disconnected)
+        ));
+        harness.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn terminal_usage_pending_eof_survives_stream_cancellation() {
+        use futures::StreamExt as _;
+
+        let harness = weekly_route_harness(PROBE_CLAIM, false).await;
+        let (delivery_tx, mut delivery_rx) = tokio::sync::mpsc::unbounded_channel();
+        let response = openai::responses(
+            axum::extract::State(direct_state_with_deliveries(&harness, delivery_tx)),
+            axum::Json(serde_json::json!({
+                "model": "dexdo-mock",
+                "input": "DEXDO_FIXTURE_DELAY_EOF",
+                "max_output_tokens": 4,
+                "stream": true
+            })),
+        )
+        .await;
+        assert_eq!(response.status(), http::StatusCode::OK);
+        let request_id = response
+            .headers()
+            .get(REQUEST_ID_HEADER)
+            .expect("streaming response carries its request correlation id")
+            .to_str()
+            .expect("request id header is ASCII")
+            .to_string();
+        let finalizer = response
+            .extensions()
+            .get::<RequestDeliveryFinalizer>()
+            .expect("unit-test response exposes its delivery finalizer")
+            .clone();
+        let mut body = response.into_body().into_data_stream();
+        let mut saw_content = false;
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                let next_frame = body.next();
+                tokio::pin!(next_frame);
+                let usage_observed = async {
+                    loop {
+                        if finalizer.observed_request_usage().is_some() {
+                            break;
+                        }
+                        tokio::task::yield_now().await;
+                    }
+                };
+                tokio::pin!(usage_observed);
+                tokio::select! {
+                    () = &mut usage_observed => break,
+                    frame = &mut next_frame => {
+                        let frame = frame
+                            .expect("Responses stream reaches terminal usage")
+                            .expect("SSE body frame");
+                        let frame = std::str::from_utf8(&frame).expect("SSE is UTF-8");
+                        saw_content |= frame.contains("response.output_text.delta");
+                        assert!(
+                            !frame.contains("response.output_text.done"),
+                            "delayed EOF must hold the protocol terminal"
+                        );
+                    }
+                }
+            }
+        })
+        .await
+        .expect("buyer observes terminal usage while EOF remains held");
+        assert!(saw_content, "usage must follow visible model output");
+
+        drop(body);
+        harness.seller.release_delayed_eof();
+        let delivery = delivery_rx
+            .recv()
+            .await
+            .expect("dropping during the usage-to-EOF window publishes cancellation");
+        assert_eq!(delivery.request_id, request_id);
+        assert_eq!(delivery.failure_stage, Some("consumer_disconnect"));
+        assert_eq!(delivery.finish_reason, "cancelled");
+        assert!(delivery.visible_output_tokens > 0);
+        assert!(delivery.rendered_tokens > 0);
+        assert_eq!(delivery.input_tokens, None, "clean EOF was not observed");
+        assert_eq!(delivery.output_tokens, None, "clean EOF was not observed");
+        assert!(delivery.request_input_tokens > 0);
+        assert!(delivery.request_output_tokens > 0);
+        assert!(delivery.request_billable_tokens > 0);
+        assert!(matches!(
+            delivery_rx.try_recv(),
+            Err(tokio::sync::mpsc::error::TryRecvError::Disconnected)
+        ));
+        harness.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn anthropic_reasoning_only_cancellation_reports_no_visible_output() {
+        use futures::StreamExt as _;
+
+        let harness = weekly_route_harness(PROBE_CLAIM, false).await;
+        let (delivery_tx, mut delivery_rx) = tokio::sync::mpsc::unbounded_channel();
+        let request = serde_json::from_value(serde_json::json!({
+            "model": "dexdo-mock",
+            "messages": [{
+                "role": "user",
+                "content": "DEXDO_FIXTURE_REASONING_ONLY DEXDO_FIXTURE_DELAY_EOF"
+            }],
+            "max_tokens": 8,
+            "stream": true
+        }))
+        .expect("valid Anthropic request");
+        let response = anthropic::messages(
+            axum::extract::State(direct_state_with_deliveries(&harness, delivery_tx)),
+            axum::Json(request),
+        )
+        .await;
+        assert_eq!(response.status(), http::StatusCode::OK);
+        let finalizer = response
+            .extensions()
+            .get::<RequestDeliveryFinalizer>()
+            .expect("unit-test response exposes its delivery finalizer")
+            .clone();
+        let mut body = response.into_body().into_data_stream();
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                let next_frame = body.next();
+                tokio::pin!(next_frame);
+                let usage_observed = async {
+                    loop {
+                        if finalizer.observed_request_usage().is_some() {
+                            break;
+                        }
+                        tokio::task::yield_now().await;
+                    }
+                };
+                tokio::pin!(usage_observed);
+                tokio::select! {
+                    () = &mut usage_observed => break,
+                    frame = &mut next_frame => {
+                        let frame = frame
+                            .expect("Anthropic stream reaches terminal usage")
+                            .expect("SSE body frame");
+                        let frame = std::str::from_utf8(&frame).expect("SSE is UTF-8");
+                        assert!(
+                            !frame.contains("event: content_block_delta"),
+                            "hidden reasoning must not cross the text-only response: {frame}"
+                        );
+                    }
+                }
+            }
+        })
+        .await
+        .expect("buyer observes reasoning-only usage while EOF remains held");
+
+        drop(body);
+        harness.seller.release_delayed_eof();
+        let delivery = delivery_rx
+            .recv()
+            .await
+            .expect("reasoning-only cancellation publishes one terminal record");
+        assert_eq!(delivery.protocol, "anthropic");
+        assert_eq!(delivery.failure_stage, Some("consumer_disconnect"));
+        assert_eq!(delivery.finish_reason, "cancelled");
+        assert_eq!(delivery.visible_output_tokens, 0);
+        assert_eq!(delivery.rendered_tokens, 8);
+        assert_eq!(
+            delivery.route_delivered_tokens,
+            Some(8),
+            "the stable route witness includes hidden accepted chunks"
+        );
+        assert_eq!(delivery.input_tokens, None, "clean EOF was not observed");
+        assert_eq!(delivery.output_tokens, None, "clean EOF was not observed");
+        assert_eq!(delivery.request_output_tokens, 8);
+        assert!(delivery.request_billable_tokens > 8);
+        assert!(!delivery.truncated_by_output_limit);
+        assert!(
+            !delivery.ended_before_output_limit,
+            "observed provider usage consumed the exact output cap"
+        );
+        assert!(matches!(
+            delivery_rx.try_recv(),
+            Err(tokio::sync::mpsc::error::TryRecvError::Disconnected)
+        ));
         harness.shutdown().await;
     }
 
@@ -8483,12 +10040,13 @@ mod tests {
             .current()
             .await
             .expect("the harness route is published");
+        let (delivery_tx, mut delivery_rx) = tokio::sync::mpsc::unbounded_channel();
         let state = ApiState {
             buyer: harness.buyer.clone(),
             frame_model: "dexdo-mock".to_string(),
             mock_model: true,
             deals: harness.deals.clone(),
-            delivery_events: None,
+            delivery_events: Some(delivery_tx),
         };
         let request =
             serde_json::from_value::<crate::buyer::render::OpenAiChatRequest>(serde_json::json!({
@@ -8552,6 +10110,27 @@ mod tests {
 
         handler.abort();
         let _ = handler.await;
+        let delivery = delivery_rx
+            .recv()
+            .await
+            .expect("pre-response cancellation publishes one terminal record");
+        assert_eq!(delivery.protocol, "openai");
+        assert!(!delivery.streamed);
+        assert_eq!(delivery.http_status, CLIENT_CLOSED_REQUEST_STATUS);
+        assert_eq!(delivery.failure_stage, Some("consumer_disconnect"));
+        assert_eq!(delivery.finish_reason, "cancelled");
+        assert_eq!(delivery.visible_output_tokens, 0);
+        assert_eq!(delivery.input_tokens, None);
+        assert_eq!(delivery.output_tokens, None);
+        assert_eq!(delivery.billable_tokens, None);
+        assert_eq!(delivery.request_input_tokens, 11);
+        assert_eq!(delivery.request_output_tokens, 2);
+        assert_eq!(delivery.request_billable_tokens, 13);
+        assert_eq!(delivery.route_billable_tokens, Some(13));
+        assert!(matches!(
+            delivery_rx.try_recv(),
+            Err(tokio::sync::mpsc::error::TryRecvError::Disconnected)
+        ));
         assert_eq!(deal.billable_tokens(), 13);
         assert_eq!(
             deal.remaining_tokens(),

@@ -1,10 +1,12 @@
 use super::args::SettlementReceiptArgs;
+use super::deals;
 use anyhow::Result;
 
 use anyhow::Context;
 use dexdo_core::{
-    buyer_net_result, buyer_total_debit, Deployed, RealChainBackend, TokenContractCurrentFacts,
-    TokenContractReceiptChainData, TokenContractSettlementEvent, TokenContractSettlementReceipt,
+    buyer_net_result, buyer_total_debit, fee, rebate, Deployed, ProtocolConsts, RealChainBackend,
+    TokenContractCurrentFacts, TokenContractReceiptChainData, TokenContractSettlementEvent,
+    TokenContractSettlementReceipt,
 };
 use serde::Serialize;
 use serde_json::{json, Value};
@@ -211,6 +213,47 @@ struct TerminalReceipt {
     message_id: Option<String>,
     created_at: Option<u64>,
     indexer_order: Option<IndexerOrderReceipt>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    accounting: Option<TerminalAccountingReceipt>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    client_stop: Option<ClientStopReceipt>,
+}
+
+/// The only terminal attribution that contracts 4.0.36 can prove from their events alone.
+
+/// `StreamStopped` does not name its caller, but the buyer and seller exits burn different bonds.
+/// On the accepted-probe-only path those two exact payout equations are therefore distinguishable.
+/// This block is omitted unless exactly one equation matches; it never guesses from process state.
+#[derive(Debug, Serialize)]
+struct TerminalAccountingReceipt {
+    basis: &'static str,
+    action: &'static str,
+    closer: &'static str,
+    funded_ticks: String,
+    finalized_ticks: String,
+    unused_ticks: String,
+    service_charge: String,
+    platform_fee: String,
+    buyer_bond_forfeited: String,
+    seller_bond_forfeited: String,
+    total_buyer_cost: String,
+}
+
+/// Client-internal cause retained only after this process proved that its own STOP message closed
+/// the deal, then joined back to that exact immutable terminal message.
+#[derive(Debug, Serialize)]
+struct ClientStopReceipt {
+    action: &'static str,
+    reason: String,
+    path: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    failure_class: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    policy_action: Option<String>,
+    terminal_message_id: String,
+    terminal_created_at: u64,
+    recorded_at_unix: u64,
+    source: &'static str,
 }
 
 /// WHAT HAPPENED TO THE MONEY, and from whose statement.
@@ -376,6 +419,7 @@ struct ReceiptContext {
     expected_code_hash: Option<String>,
     token_contract: String,
     season: Option<u32>,
+    local_client_stop: Option<deals::LastClientStop>,
 }
 
 fn normalized_code_hash(value: &str) -> Option<String> {
@@ -662,6 +706,160 @@ fn terminal_refund_to_buyer(event: &TokenContractSettlementEvent) -> Option<u128
     }
 }
 
+fn probe_only_terminal_accounting(
+    contracts_generation: Option<&str>,
+    events: &[TokenContractSettlementReceipt],
+    terminal: Option<&TokenContractSettlementEvent>,
+) -> Option<TerminalAccountingReceipt> {
+    if contracts_generation != Some("4.0.36") {
+        return None;
+    }
+    let TokenContractSettlementEvent::StreamStopped {
+        to_seller,
+        refund_to_buyer,
+        ..
+    } = terminal?
+    else {
+        return None;
+    };
+
+    let mut deposit = None;
+    let mut seller_bond = None;
+    let mut buyer_bond = None;
+    let mut price = None;
+    let mut probe = None;
+    for receipt in events {
+        let slot = match &receipt.event {
+            TokenContractSettlementEvent::StreamFunded {
+                deposit: amount, ..
+            } => Some((&mut deposit, *amount)),
+            TokenContractSettlementEvent::SellerBondFunded { amount } => {
+                Some((&mut seller_bond, *amount))
+            }
+            TokenContractSettlementEvent::BuyerBondFunded { amount } => {
+                Some((&mut buyer_bond, *amount))
+            }
+            TokenContractSettlementEvent::StreamOpened { price_per_tick, .. } => {
+                Some((&mut price, *price_per_tick))
+            }
+            TokenContractSettlementEvent::ProbeAccepted {
+                to_seller,
+                bond_returned,
+                ..
+            } => {
+                if probe.replace((*to_seller, *bond_returned)).is_some() {
+                    return None;
+                }
+                None
+            }
+            TokenContractSettlementEvent::TickFinalized { .. }
+            | TokenContractSettlementEvent::TicksClaimed { .. }
+            | TokenContractSettlementEvent::StreamDisputed { .. }
+            | TokenContractSettlementEvent::DisputeResolved { .. } => return None,
+            _ => None,
+        };
+        if let Some((slot, amount)) = slot {
+            if slot.replace(amount).is_some() {
+                return None;
+            }
+        }
+    }
+
+    let deposit = deposit?;
+    let seller_bond = seller_bond?;
+    let buyer_bond = buyer_bond?;
+    let price = price?;
+    let (probe_to_seller, probe_bond_returned) = probe?;
+    let price_shell = u64::try_from(price).ok()?;
+    if price_shell == 0
+        || probe_to_seller != price
+        || probe_bond_returned != 0
+        || buyer_bond != price.checked_mul(2)?
+        || seller_bond != price.checked_mul(2)?
+    {
+        return None;
+    }
+
+    let protocol = ProtocolConsts::canonical();
+    let platform_fee = u128::from(fee(1, price_shell, &protocol));
+    let seller_rebate = u128::from(rebate(1, price_shell, &protocol));
+    let tick_cost = price.checked_add(platform_fee)?;
+    if tick_cost == 0 || deposit % tick_cost != 0 {
+        return None;
+    }
+    let funded_ticks = deposit / tick_cost;
+    if funded_ticks == 0 {
+        return None;
+    }
+
+    let unspent_deposit = deposit.checked_sub(tick_cost)?;
+    let buyer_stop_refund = unspent_deposit
+        .checked_add(buyer_bond)?
+        .checked_sub(price)?;
+    let buyer_stop_to_seller = price.checked_add(seller_bond)?.checked_add(seller_rebate)?;
+    let seller_stop_refund = unspent_deposit.checked_add(buyer_bond)?;
+    let seller_stop_to_seller = price
+        .checked_add(seller_bond.checked_sub(price)?)?
+        .checked_add(seller_rebate)?;
+
+    let buyer_stop_matches =
+        *refund_to_buyer == buyer_stop_refund && *to_seller == buyer_stop_to_seller;
+    let seller_stop_matches =
+        *refund_to_buyer == seller_stop_refund && *to_seller == seller_stop_to_seller;
+    let (action, closer, buyer_bond_forfeited, seller_bond_forfeited) =
+        match (buyer_stop_matches, seller_stop_matches) {
+            (true, false) => ("buyer_stop", "buyer", price, 0),
+            (false, true) => ("seller_stop", "seller", 0, price),
+            _ => return None,
+        };
+    let total_buyer_cost = tick_cost.checked_add(buyer_bond_forfeited)?;
+
+    Some(TerminalAccountingReceipt {
+        basis: "probe_only_4_0_36_event_arithmetic",
+        action,
+        closer,
+        funded_ticks: funded_ticks.to_string(),
+        finalized_ticks: "1".to_string(),
+        unused_ticks: funded_ticks.checked_sub(1)?.to_string(),
+        service_charge: price.to_string(),
+        platform_fee: platform_fee.to_string(),
+        buyer_bond_forfeited: buyer_bond_forfeited.to_string(),
+        seller_bond_forfeited: seller_bond_forfeited.to_string(),
+        total_buyer_cost: total_buyer_cost.to_string(),
+    })
+}
+
+fn exact_client_stop_attribution(
+    terminal: Option<&TokenContractSettlementReceipt>,
+    local: Option<&deals::LastClientStop>,
+) -> Option<ClientStopReceipt> {
+    let terminal = terminal?;
+    if !matches!(
+        &terminal.event,
+        TokenContractSettlementEvent::StreamStopped { .. }
+            | TokenContractSettlementEvent::ProbeBurned { .. }
+    ) {
+        return None;
+    }
+    let local = local?;
+    if local.terminal_message_id != terminal.message_id
+        || local.terminal_created_at != terminal.created_at
+    {
+        return None;
+    }
+    Some(ClientStopReceipt {
+        action: "buyer_stop",
+        reason: local.reason.clone(),
+        path: local.path.clone(),
+        failure_class: local.failure_class.clone(),
+        policy_action: local.policy_action.clone(),
+        terminal_message_id: local.terminal_message_id.clone(),
+        terminal_created_at: local.terminal_created_at,
+        recorded_at_unix: local.recorded_at_unix,
+        source: "local_deal_record_exact_terminal_message",
+    })
+}
+
 fn event_buyer(event: &TokenContractSettlementEvent) -> Option<&str> {
     match event {
         TokenContractSettlementEvent::StreamFunded { buyer, .. }
@@ -765,6 +963,8 @@ fn unavailable_receipt(context: ReceiptContext) -> SettlementReceiptV1 {
             message_id: None,
             created_at: None,
             indexer_order: None,
+            accounting: None,
+            client_stop: None,
         },
         outcome,
         settlement_sequence: Vec::new(),
@@ -1235,6 +1435,23 @@ fn build_receipt(
         "unavailable"
     };
     let terminal = terminal_events.first().map(|event| rendered_event(event));
+    let accounting = (terminal_events.len() == 1)
+        .then(|| {
+            probe_only_terminal_accounting(
+                context.contracts_generation.as_deref(),
+                events,
+                terminal_events.first().map(|receipt| &receipt.event),
+            )
+        })
+        .flatten();
+    let client_stop = (terminal_events.len() == 1)
+        .then(|| {
+            exact_client_stop_attribution(
+                terminal_events.first().copied(),
+                context.local_client_stop.as_ref(),
+            )
+        })
+        .flatten();
     let terminal_receipt = TerminalReceipt {
         status: terminal_status,
         kind: terminal.as_ref().map(|event| event.kind),
@@ -1242,6 +1459,8 @@ fn build_receipt(
         message_id: terminal.as_ref().map(|event| event.message_id.clone()),
         created_at: terminal.as_ref().map(|event| event.created_at),
         indexer_order: terminal.as_ref().map(|event| event.indexer_order.clone()),
+        accounting,
+        client_stop,
     };
 
     let withdrawal_status = if !issues.is_empty() {
@@ -1598,6 +1817,18 @@ pub(crate) async fn run_settlement_receipt(args: SettlementReceiptArgs) -> Resul
         .duration_since(UNIX_EPOCH)
         .context("system clock is before Unix epoch")?
         .as_secs();
+    let local_client_stop = match local_client_stop(args.deals_dir.as_deref(), &token_contract_text)
+    {
+        Ok(stop) => stop,
+        Err(error) => {
+            tracing::warn!(
+                token_contract = %token_contract_text,
+                %error,
+                "settlement receipt could not read local buyer STOP attribution"
+            );
+            None
+        }
+    };
     let context = ReceiptContext {
         generated_at,
         network: deployed.network,
@@ -1606,6 +1837,7 @@ pub(crate) async fn run_settlement_receipt(args: SettlementReceiptArgs) -> Resul
         expected_code_hash,
         token_contract: token_contract_text,
         season: args.season,
+        local_client_stop,
     };
     let receipt = receipt_from_chain_result(
         context,
@@ -1618,6 +1850,26 @@ pub(crate) async fn run_settlement_receipt(args: SettlementReceiptArgs) -> Resul
     // `doctor` already uses, where the report is rendered before the run fails on its summary. A
     // caller that asked for the gate still gets the data it came for..
     receipt_exit_status(&receipt, args.require_conserved)
+}
+
+fn local_client_stop(
+    explicit_deals_dir: Option<&std::path::Path>,
+    token_contract: &str,
+) -> Result<Option<deals::LastClientStop>> {
+    let dir = deals::resolve_deals_dir(explicit_deals_dir)?;
+    let handle = deals::make_handle_id(token_contract, deals::DealHandleRole::Buyer);
+    let path = deals::handle_path(&dir, &handle);
+    if !path.exists() {
+        return Ok(None);
+    }
+    let record = deals::load_deal_record(&path)?;
+    if record.handle.role != deals::DealHandleRole::Buyer
+        || deals::normalize_addr(&record.handle.token_contract)
+            != deals::normalize_addr(token_contract)
+    {
+        return Ok(None);
+    }
+    Ok(record.last_client_stop)
 }
 
 #[cfg(test)]
@@ -1638,6 +1890,7 @@ mod tests {
             expected_code_hash: Some("ab".repeat(32)),
             token_contract: token_contract.to_string(),
             season: Some(7),
+            local_client_stop: None,
         }
     }
 
@@ -2091,6 +2344,220 @@ mod tests {
         assert_eq!(receipt.terminal.kind, None);
         assert_eq!(receipt.withdrawal.status, "not_applicable");
         assert!(receipt.current.is_none());
+    }
+
+    fn issue_2028_receipt(
+        to_seller: u128,
+        refund_to_buyer: u128,
+        include_claim: bool,
+        local_client_stop: Option<deals::LastClientStop>,
+    ) -> Value {
+        let token_contract = address('a');
+        let buyer = address('b');
+        let price = 110_000_000_000_u128;
+        let fee = 2_750_000_000_u128;
+        let buyer_bond = 220_000_000_000_u128;
+        let seller_bond = 220_000_000_000_u128;
+        let deposit = 2 * (price + fee);
+        let mut receipt_context = context(&token_contract);
+        receipt_context.contracts_generation = Some("4.0.36".to_string());
+        receipt_context.local_client_stop = local_client_stop;
+        let mut events = vec![
+            event(
+                "funded",
+                1,
+                StreamFunded {
+                    buyer: buyer.clone(),
+                    deposit,
+                },
+            ),
+            event(
+                "seller-bond",
+                2,
+                SellerBondFunded {
+                    amount: seller_bond,
+                },
+            ),
+            event("buyer-bond", 3, BuyerBondFunded { amount: buyer_bond }),
+            event(
+                "opened",
+                4,
+                StreamOpened {
+                    buyer: buyer.clone(),
+                    price_per_tick: price,
+                },
+            ),
+            event(
+                "probe",
+                5,
+                ProbeAccepted {
+                    buyer: buyer.clone(),
+                    to_seller: price,
+                    bond_returned: 0,
+                },
+            ),
+        ];
+        let terminal_at = if include_claim {
+            events.push(event(
+                "claimed",
+                6,
+                TicksClaimed {
+                    trusted: 1_000_000,
+                    claimed: 2_000_000,
+                },
+            ));
+            7
+        } else {
+            6
+        };
+        events.push(event(
+            "stopped",
+            terminal_at,
+            StreamStopped {
+                buyer,
+                to_seller,
+                refund_to_buyer,
+            },
+        ));
+        events.push(event(
+            "destroyed",
+            terminal_at + 1,
+            ContractDestroyed {
+                token_contract: token_contract.clone(),
+            },
+        ));
+
+        as_value(&build_receipt(
+            receipt_context,
+            &chain(&token_contract, None, events),
+        ))
+    }
+
+    #[test]
+    fn issue_2028_probe_only_buyer_stop_names_every_buyer_cost_component() {
+        let price = 110_000_000_000_u128;
+        let fee = 2_750_000_000_u128;
+        let receipt = issue_2028_receipt(330_044_000_000, 222_750_000_000, false, None);
+
+        assert_eq!(
+            receipt["terminal"]["accounting"]["basis"],
+            "probe_only_4_0_36_event_arithmetic"
+        );
+        assert_eq!(receipt["terminal"]["accounting"]["action"], "buyer_stop");
+        assert_eq!(receipt["terminal"]["accounting"]["closer"], "buyer");
+        assert_eq!(receipt["terminal"]["accounting"]["funded_ticks"], "2");
+        assert_eq!(receipt["terminal"]["accounting"]["finalized_ticks"], "1");
+        assert_eq!(receipt["terminal"]["accounting"]["unused_ticks"], "1");
+        assert_eq!(
+            receipt["terminal"]["accounting"]["service_charge"],
+            price.to_string()
+        );
+        assert_eq!(
+            receipt["terminal"]["accounting"]["platform_fee"],
+            fee.to_string()
+        );
+        assert_eq!(
+            receipt["terminal"]["accounting"]["buyer_bond_forfeited"],
+            price.to_string()
+        );
+        assert_eq!(
+            receipt["terminal"]["accounting"]["seller_bond_forfeited"],
+            "0"
+        );
+        assert_eq!(
+            receipt["terminal"]["accounting"]["total_buyer_cost"],
+            (price + fee + price).to_string()
+        );
+    }
+
+    #[test]
+    fn issue_2028_probe_only_seller_stop_is_distinguished_from_buyer_stop() {
+        let receipt = issue_2028_receipt(220_044_000_000, 332_750_000_000, false, None);
+
+        assert_eq!(receipt["terminal"]["accounting"]["action"], "seller_stop");
+        assert_eq!(receipt["terminal"]["accounting"]["closer"], "seller");
+        assert_eq!(
+            receipt["terminal"]["accounting"]["buyer_bond_forfeited"],
+            "0"
+        );
+        assert_eq!(
+            receipt["terminal"]["accounting"]["seller_bond_forfeited"],
+            "110000000000"
+        );
+        assert_eq!(
+            receipt["terminal"]["accounting"]["total_buyer_cost"],
+            "112750000000"
+        );
+    }
+
+    #[test]
+    fn issue_2028_attribution_is_omitted_when_terminal_arithmetic_does_not_match() {
+        let receipt = issue_2028_receipt(330_044_000_001, 222_750_000_000, false, None);
+
+        assert!(receipt["terminal"].get("accounting").is_none());
+    }
+
+    #[test]
+    fn issue_2028_attribution_is_omitted_once_normal_claims_exist() {
+        let receipt = issue_2028_receipt(330_044_000_000, 222_750_000_000, true, None);
+
+        assert!(receipt["terminal"].get("accounting").is_none());
+    }
+
+    #[test]
+    fn issue_2028_exact_terminal_message_joins_the_internal_client_stop_reason() {
+        let receipt = issue_2028_receipt(
+            330_044_000_000,
+            222_750_000_000,
+            false,
+            Some(deals::LastClientStop {
+                reason: "dead-gateway-timeout".to_string(),
+                path: "seller_timeout_policy".to_string(),
+                failure_class: Some("dead_gateway".to_string()),
+                policy_action: Some("reclaim".to_string()),
+                terminal_message_id: "stopped".to_string(),
+                terminal_created_at: 6,
+                recorded_at_unix: 1_800_000_000,
+            }),
+        );
+
+        assert_eq!(receipt["terminal"]["client_stop"]["action"], "buyer_stop");
+        assert_eq!(
+            receipt["terminal"]["client_stop"]["reason"],
+            "dead-gateway-timeout"
+        );
+        assert_eq!(
+            receipt["terminal"]["client_stop"]["path"],
+            "seller_timeout_policy"
+        );
+        assert_eq!(
+            receipt["terminal"]["client_stop"]["failure_class"],
+            "dead_gateway"
+        );
+        assert_eq!(
+            receipt["terminal"]["client_stop"]["source"],
+            "local_deal_record_exact_terminal_message"
+        );
+    }
+
+    #[test]
+    fn issue_2028_stale_local_reason_is_omitted_without_an_exact_terminal_message_join() {
+        let receipt = issue_2028_receipt(
+            330_044_000_000,
+            222_750_000_000,
+            false,
+            Some(deals::LastClientStop {
+                reason: "shutdown".to_string(),
+                path: "session_settle".to_string(),
+                failure_class: None,
+                policy_action: None,
+                terminal_message_id: "another-terminal-message".to_string(),
+                terminal_created_at: 6,
+                recorded_at_unix: 1_800_000_000,
+            }),
+        );
+
+        assert!(receipt["terminal"].get("client_stop").is_none());
     }
 
     /// the receipt reads the side that reports the money.

@@ -52,8 +52,7 @@ fn display_token_contract(token_contract: &str) -> String {
 pub struct SellerConfig {
     /// Contract -- the deal's handover point.
     pub token_contract: TokenContract,
-    /// Tick price `P` in raw ECC[2] units. Stated on the command line in whole SHELL
-    /// (`--price-per-tick 3`) and converted once, at the argument.
+    /// Tick price `P` in raw ECC[2] units, read from the TokenContract for real seller runs.
     pub price_per_tick: u64,
     /// Maximum ticks in the offer.
     pub max_ticks: u64,

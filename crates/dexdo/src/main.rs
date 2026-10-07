@@ -140,7 +140,14 @@ mod wallet_onboard_cli_tests {
                 "--model",
                 "qwen",
             ],
-            vec!["dexdo", "buyer", "--frame-model", "qwen"],
+            vec![
+                "dexdo",
+                "buyer",
+                "--frame-model",
+                "qwen",
+                "--max-price-per-tick",
+                "1",
+            ],
             vec!["dexdo", "doctor"],
             vec!["dexdo", "note", "deploy", "--nominal", "10"],
         ] {
@@ -919,7 +926,7 @@ mod note_cli_tests {
     use super::{Cli, Command};
     use crate::cli::args::NoteCommand;
     use crate::cli::args::{IdentityArgs, NoteWithdrawArgs};
-    use clap::Parser;
+    use clap::{CommandFactory, Parser};
     use std::path::PathBuf;
 
     const NOTE: &str = "0:2222222222222222222222222222222222222222222222222222222222222222";
@@ -1229,6 +1236,40 @@ mod note_cli_tests {
         assert_eq!(w.identity.note_addr.as_deref(), Some(NOTE));
         assert_eq!(w.identity.note_key, Some(PathBuf::from("note.key")));
         assert_eq!(w.to, to);
+        assert!(!w.acknowledge_note_retirement);
+
+        let acknowledged = Cli::try_parse_from([
+            "dexdo",
+            "note",
+            "withdraw",
+            "--note-addr",
+            NOTE,
+            "--note-key",
+            "note.key",
+            "--to",
+            &format!("{DEST_HALF_1}::{DEST_HALF_2}"),
+            "--acknowledge-note-retirement",
+        ])
+        .expect("note withdraw accepts an explicit non-interactive acknowledgement");
+        let Command::Note(n) = acknowledged.command else {
+            panic!("expected Command::Note");
+        };
+        let NoteCommand::Withdraw(w) = n.command else {
+            panic!("expected NoteCommand::Withdraw");
+        };
+        assert!(w.acknowledge_note_retirement);
+        let mut command = Cli::command();
+        let help = command
+            .find_subcommand_mut("note")
+            .expect("note subcommand")
+            .find_subcommand_mut("withdraw")
+            .expect("note withdraw subcommand")
+            .render_long_help()
+            .to_string();
+        assert!(help.contains("--acknowledge-note-retirement"), "{help}");
+        assert!(help.contains("deanonymizes"), "{help}");
+        assert!(help.contains("another sell offer"), "{help}");
+
         assert!(Cli::try_parse_from([
             "dexdo",
             "note",
@@ -1293,6 +1334,7 @@ mod note_cli_tests {
                 note_addr: None,
             },
             to: format!("{DEST_HALF_1}::{DEST_HALF_2}"),
+            acknowledge_note_retirement: false,
         })
         .await
         .unwrap_err();
@@ -1317,6 +1359,7 @@ mod note_cli_tests {
                 note_addr: Some(NOTE.to_string()),
             },
             to: "not-a-wallet".to_string(),
+            acknowledge_note_retirement: false,
         })
         .await
         .unwrap_err();
@@ -1412,7 +1455,6 @@ mod market_orders_cli_tests {
         let max = u128::MAX.to_string();
         let above = "340282366920938463463374607431768211456";
         let command_lines = [
-            vec!["dexdo", "seller", "--price-per-tick", "VALUE"],
             vec!["dexdo", "buyer", "--max-price-per-tick", "VALUE"],
             vec![
                 "dexdo",
@@ -2166,13 +2208,52 @@ mod deal_handle_cli_tests {
             "--frame-model",
             "qwen--qwen3--32b",
         ])
-        .expect("buyer --resume parses with an explicit deal");
+        .expect("buyer --resume parses with an explicit deal and no new-buy price");
         let Command::Buyer(buyer) = c.command else {
             panic!("expected Command::Buyer");
         };
         assert!(buyer.resume);
         assert_eq!(buyer.token_contract.as_deref(), Some("0:tc"));
         assert_eq!(buyer.frame_model.as_deref(), Some("qwen--qwen3--32b"));
+        assert_eq!(buyer.max_price_per_tick, None);
+    }
+
+    /// Smoke 406: model-only subscription resume adopts an already-priced deal, so requiring a new
+    /// BUY ceiling rejects the recovery command before it can inspect the buyer note's fill event.
+    #[test]
+    fn buyer_model_only_resume_parses_without_a_new_buy_price() {
+        let c = Cli::try_parse_from([
+            "dexdo",
+            "buyer",
+            "--json",
+            "--policy",
+            "policy.json",
+            "--resume",
+            "--frame-model",
+            "qwen--qwen3--32b",
+            "--note-addr",
+            "0:note",
+            "--note-key",
+            "note.secret.hex",
+            "--models",
+            "models.json",
+            "--local-listen",
+            "127.0.0.1:8101",
+            "--continuity-mode",
+            "on-demand",
+            "--deals-dir",
+            "deals",
+            "--model-registry-validation",
+            "registry-validation.json",
+        ])
+        .expect("model-only buyer --resume parses without a new-buy price");
+        let Command::Buyer(buyer) = c.command else {
+            panic!("expected Command::Buyer");
+        };
+        assert!(buyer.resume);
+        assert!(buyer.token_contract.is_none());
+        assert_eq!(buyer.continuity_mode, ContinuityModeArg::OnDemand);
+        assert_eq!(buyer.max_price_per_tick, None);
     }
 
     #[test]
@@ -2188,6 +2269,8 @@ mod deal_handle_cli_tests {
             "qwen--qwen3--32b",
             "--models",
             "custom-models.json",
+            "--max-price-per-tick",
+            "1",
         ])
         .expect("buyer accepts --model alias plus --models config path");
         let Command::Buyer(buyer) = c.command else {
@@ -2207,6 +2290,8 @@ mod deal_handle_cli_tests {
             "0:tc",
             "--frame-model",
             "qwen--qwen3--32b",
+            "--max-price-per-tick",
+            "1",
         ])
         .expect("buyer default continuity mode parses");
         let Command::Buyer(buyer) = c.command else {
@@ -2224,6 +2309,8 @@ mod deal_handle_cli_tests {
             "qwen--qwen3--32b",
             "--continuity-mode",
             "on-demand",
+            "--max-price-per-tick",
+            "1",
         ])
         .expect("buyer on-demand continuity mode parses");
         let Command::Buyer(buyer) = c.command else {
@@ -2241,6 +2328,8 @@ mod deal_handle_cli_tests {
             "qwen--qwen3--32b",
             "--continuity-mode",
             "proactive",
+            "--max-price-per-tick",
+            "1",
         ])
         .expect("buyer proactive continuity mode parses");
         let Command::Buyer(buyer) = c.command else {
@@ -2258,6 +2347,8 @@ mod deal_handle_cli_tests {
             "qwen--qwen3--32b",
             "--continuity-mode",
             "automatic",
+            "--max-price-per-tick",
+            "1",
         ])
         .is_err());
     }
@@ -2811,15 +2902,19 @@ mod tests {
     fn deal_gas_overhead_override_is_one_flag_for_every_deal_funding_command() {
         let measured_raw = dexdo_core::params::DEAL_GAS_OVERHEAD_RAW.value.to_string();
         for (command, model_flag) in [("provision", "--frame-model"), ("seller", "--model")] {
-            let cli = Cli::try_parse_from([
+            let mut argv = vec![
                 "dexdo",
                 command,
                 "--deal-gas-overhead-raw",
                 measured_raw.as_str(),
                 model_flag,
                 "qwen--qwen3--32b",
-            ])
-            .expect("deal-funding command accepts the measured raw overhead");
+            ];
+            if command == "provision" {
+                argv.extend(["--price-per-tick", "1"]);
+            }
+            let cli = Cli::try_parse_from(argv)
+                .expect("deal-funding command accepts the measured raw overhead");
             assert_eq!(
                 cli.deal_gas_overhead_raw,
                 Some(dexdo_core::params::DEAL_GAS_OVERHEAD_RAW.value)
@@ -2986,7 +3081,8 @@ mod tests {
         assert_eq!(seller.mock_token_count, p::DEFAULT_SELLER_MOCK_TOKEN_COUNT);
         assert_eq!(seller.models, Path::new(p::DEFAULT_MODELS_PATH));
 
-        let buyer = Cli::try_parse_from(["dexdo", "buyer"]).expect("buyer defaults parse");
+        let buyer = Cli::try_parse_from(["dexdo", "buyer", "--max-price-per-tick", "1"])
+            .expect("buyer defaults parse");
         let Command::Buyer(buyer) = buyer.command else {
             panic!("buyer command")
         };
@@ -3020,9 +3116,15 @@ mod tests {
             p::DEFAULT_POLICY_ROLE
         );
 
-        let provision =
-            Cli::try_parse_from(["dexdo", "provision", "--frame-model", "qwen--qwen3--32b"])
-                .expect("provision defaults parse");
+        let provision = Cli::try_parse_from([
+            "dexdo",
+            "provision",
+            "--frame-model",
+            "qwen--qwen3--32b",
+            "--price-per-tick",
+            "1",
+        ])
+        .expect("provision defaults parse");
         let Command::Provision(provision) = provision.command else {
             panic!("provision command")
         };
@@ -3043,8 +3145,14 @@ mod tests {
             p::DEFAULT_CHAIN_READ_TIMEOUT_SECS
         );
 
-        let executable = Cli::try_parse_from(["dexdo", "executable-book", "qwen--qwen3--32b"])
-            .expect("executable-book defaults parse");
+        let executable = Cli::try_parse_from([
+            "dexdo",
+            "executable-book",
+            "qwen--qwen3--32b",
+            "--max-price-per-tick",
+            "1",
+        ])
+        .expect("executable-book defaults parse");
         let Command::ExecutableBook(executable) = executable.command else {
             panic!("executable-book command")
         };
@@ -3145,6 +3253,8 @@ mod tests {
             "--wait-for-seller",
             "--frame-model",
             "qwen--qwen3--32b",
+            "--max-price-per-tick",
+            "1",
         ])
         .expect("buyer --wait-for-seller parses");
         let Command::Buyer(buyer) = parsed.command else {
@@ -3154,33 +3264,36 @@ mod tests {
     }
 
     #[test]
-    fn active_limit_price_defaults_use_the_canonical_price_step() {
-        let seller = Cli::try_parse_from(["dexdo", "seller"]).expect("seller defaults parse");
-        let Command::Seller(seller) = seller.command else {
-            panic!("seller command")
-        };
-        assert_eq!(
-            seller.price_per_tick as u128,
-            dexdo_core::PRICE_STEP,
-            "seller default must be one exact PRICE_STEP"
-        );
-
-        let buyer = Cli::try_parse_from(["dexdo", "buyer"]).expect("buyer defaults parse");
+    fn explicit_limit_prices_use_the_canonical_price_step() {
+        let buyer = Cli::try_parse_from(["dexdo", "buyer", "--max-price-per-tick", "1"])
+            .expect("buyer explicit price parses");
         let Command::Buyer(buyer) = buyer.command else {
             panic!("buyer command")
         };
-        assert_eq!(buyer.max_price_per_tick, dexdo_core::PRICE_STEP);
+        assert_eq!(buyer.max_price_per_tick, Some(dexdo_core::PRICE_STEP));
 
-        let provision =
-            Cli::try_parse_from(["dexdo", "provision", "--frame-model", "qwen--qwen3--32b"])
-                .expect("provision defaults parse");
+        let provision = Cli::try_parse_from([
+            "dexdo",
+            "provision",
+            "--frame-model",
+            "qwen--qwen3--32b",
+            "--price-per-tick",
+            "1",
+        ])
+        .expect("provision explicit price parses");
         let Command::Provision(provision) = provision.command else {
             panic!("provision command")
         };
         assert_eq!(provision.price_per_tick, dexdo_core::PRICE_STEP);
 
-        let book = Cli::try_parse_from(["dexdo", "executable-book", "qwen--qwen3--32b"])
-            .expect("executable-book defaults parse");
+        let book = Cli::try_parse_from([
+            "dexdo",
+            "executable-book",
+            "qwen--qwen3--32b",
+            "--max-price-per-tick",
+            "1",
+        ])
+        .expect("executable-book explicit price parses");
         let Command::ExecutableBook(book) = book.command else {
             panic!("executable-book command")
         };
@@ -3347,14 +3460,43 @@ mod tests {
     }
 
     #[test]
-    fn seller_help_has_no_obsolete_probe_shell_surface() {
+    fn seller_help_has_no_price_or_obsolete_probe_shell_surface() {
         let help = subcommand_long_help("seller");
         assert!(!help.contains("--probe-shell"), "{help}");
-        // The price is stated in whole SHELL, so the default reads `1`, not the billion raw units
-        // it used to print at an operator who then typed a billion SHELL.
-        assert!(help.contains("[default: 1]"), "{help}");
-        assert!(help.contains("Tick price P in whole SHELL"), "{help}");
+        assert!(!help.contains("--price-per-tick"), "{help}");
         assert!(!help.contains("raw ECC[2] units"), "{help}");
+    }
+
+    #[test]
+    fn every_cli_price_is_explicit_and_seller_accepts_no_price_override() {
+        let seller = Cli::try_parse_from([
+            "dexdo",
+            "seller",
+            "--mock-chain",
+            "--mock-model",
+            "--token-contract",
+            "0:tc",
+            "--price-per-tick",
+            "1",
+        ])
+        .err()
+        .expect("seller price belongs to the deployed TokenContract");
+        assert!(seller.to_string().contains("--price-per-tick"), "{seller}");
+
+        for argv in [
+            vec!["dexdo", "buyer", "--mock-chain", "--mock-model"],
+            vec!["dexdo", "provision", "--frame-model", "model"],
+            vec!["dexdo", "executable-book", "model"],
+        ] {
+            let error = Cli::try_parse_from(argv.clone())
+                .err()
+                .expect("a price-bearing command must require its price")
+                .to_string();
+            assert!(
+                error.contains("--max-price-per-tick") || error.contains("--price-per-tick"),
+                "{argv:?}: {error}"
+            );
+        }
     }
 
     /// A command line written before prices were quoted in SHELL is refused, and refused at the
@@ -3369,10 +3511,7 @@ mod tests {
     /// is above that bound, and every price a market can execute is below it.
     #[test]
     fn a_price_from_before_the_unit_change_is_refused_before_any_money_path() {
-        for command in [
-            vec!["dexdo", "seller", "--price-per-tick"],
-            vec!["dexdo", "buyer", "--max-price-per-tick"],
-        ] {
+        for command in [vec!["dexdo", "buyer", "--max-price-per-tick"]] {
             // The band the reviewer measured: every price an operator could have had on a working
             // command line before this change, stated the way it was stated then.
             for stale in ["1000000000", "3000000000", "5000000000", "18000000000"] {
@@ -3412,10 +3551,7 @@ mod tests {
     /// number.
     #[test]
     fn a_price_that_is_not_whole_shell_is_refused_at_the_argument() {
-        for command in [
-            vec!["dexdo", "seller", "--price-per-tick"],
-            vec!["dexdo", "buyer", "--max-price-per-tick"],
-        ] {
+        for command in [vec!["dexdo", "buyer", "--max-price-per-tick"]] {
             // `-1` is not in this list: the command line reads a leading dash as another flag, so
             // it is refused as an unexpected argument rather than as a price, and asserting the
             // price wording on it would be asserting clap's parser instead of ours.
@@ -3486,6 +3622,8 @@ mod tests {
             "provision",
             "--frame-model",
             "qwen--qwen3--32b",
+            "--price-per-tick",
+            "1",
             "--policy",
             "policy.json",
         ])
@@ -3751,6 +3889,77 @@ mod tests {
         commands
     }
 
+    /// Every complete price-bearing command in the root README, with continuations joined and the
+    /// documented binary path normalized to argv[0]. Templates remain ordinary argument strings:
+    /// this guard is about the shipped clap contract, while their substitution is the reader's
+    /// explicit step.
+    fn readme_price_commands() -> Vec<Vec<String>> {
+        let readme = include_str!("../../../README.md");
+        let lines: Vec<&str> = readme.lines().collect();
+        let mut commands = Vec::new();
+        let mut index = 0;
+        while index < lines.len() {
+            let first = lines[index].trim_start();
+            if !first.starts_with("dexdo ") && !first.starts_with("./target/release/dexdo ") {
+                index += 1;
+                continue;
+            }
+            let mut joined = String::new();
+            loop {
+                let line = lines[index].trim();
+                let continued = line.ends_with('\\');
+                joined.push_str(line.trim_end_matches('\\').trim_end());
+                joined.push(' ');
+                index += 1;
+                if !continued || index >= lines.len() {
+                    break;
+                }
+            }
+            let mut argv: Vec<String> = joined
+                .split_whitespace()
+                .take_while(|token| !token.starts_with('#'))
+                .map(|token| token.trim_matches(['\'', '"']).to_string())
+                .collect();
+            let price_bearing = argv
+                .iter()
+                .any(|word| matches!(word.as_str(), "buyer" | "executable-book" | "provision"))
+                || argv
+                    .windows(2)
+                    .any(|pair| pair == ["subscription", "place"]);
+            if price_bearing {
+                argv[0] = "dexdo".to_string();
+                commands.push(argv);
+            }
+        }
+        commands
+    }
+
+    #[test]
+    fn every_runnable_price_command_in_the_root_readme_parses_in_full() {
+        let commands = readme_price_commands();
+        let readme = include_str!("../../../README.md");
+        if readme.contains("## 1. Quick start -- mock e2e") {
+            assert_eq!(
+                commands.len(),
+                5,
+                "the private README price-command inventory changed; keep this guard on every runnable example"
+            );
+        } else {
+            assert!(
+                commands.is_empty(),
+                "the exported README gained price-bearing examples; they must be added to this parser guard"
+            );
+        }
+        for argv in commands {
+            if let Err(error) = Cli::try_parse_from(&argv) {
+                panic!(
+                    "README documents a price-bearing command the CLI rejects:\n  {}\n{error}",
+                    argv.join(" ")
+                );
+            }
+        }
+    }
+
     /// The value set the shipped parser itself enforces for a `note deploy` flag -- read off the
     /// clap command, never a second copy of the list that could drift from the `value_parser`.
     fn note_deploy_possible_values(command: &clap::Command, arg_id: &str) -> Vec<String> {
@@ -3863,7 +4072,7 @@ mod tests {
         // A line whose only argument is a positional is still a line to run: it is parsed, and a
         // truncation that drops the positional is caught.
         assert_eq!(
-            classify("dexdo executable-book qwen--qwen3--32b"),
+            classify("dexdo executable-book qwen--qwen3--32b --max-price-per-tick 1"),
             Ok(PrintedRun::Invocation)
         );
         let err = classify("dexdo close --note-key k.json")
@@ -4236,7 +4445,20 @@ mod tests {
             help.contains("on-demand buys only after active/recent consumer traffic"),
             "{help}"
         );
-        assert!(help.contains("first request after idle may wait"), "{help}");
+        assert!(
+            help.contains("first request that needs a replacement may wait"),
+            "{help}"
+        );
+        assert!(
+            help.contains("For a few short requests per hour, use on-demand"),
+            "{help}"
+        );
+        assert!(help.contains("start with --ticks 2"), "{help}");
+        assert!(help.contains("idle alone does not STOP it"), "{help}");
+        assert!(help.contains("one forfeited buyer-bond tick P"), "{help}");
+        assert!(help.contains("222.75 SHELL at P=110"), "{help}");
+        assert!(help.contains("--preserve-deal-on-exit"), "{help}");
+        assert!(help.contains("--resume"), "{help}");
     }
 
     #[test]

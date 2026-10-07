@@ -4146,12 +4146,12 @@ pub(crate) fn close_hint(
         }
         Some(deals::DealHandleRole::Seller) if s.opened && !s.probe_accepted => {
             format!(
-                "next=seller_wait_delivery_then_accept_probe action=keep the seller gateway running for {deal} detail=it waits for the first delivered canonical tick, then calls TokenContract.acceptProbe() after PROBE_WINDOW stop_action={close_as_seller} stop_effect=TokenContract.sellerStop() reason=awaiting_delivery_then_probe_window"
+                "next=seller_wait_delivery_then_accept_probe action=keep the seller gateway running for {deal} detail=it waits for the first accepted billable input+output usage, then calls TokenContract.acceptProbe() after PROBE_WINDOW stop_action={close_as_seller} stop_effect=TokenContract.sellerStop() reason=awaiting_delivery_then_probe_window"
             )
         }
         Some(deals::DealHandleRole::Seller) if s.opened => {
             format!(
-                "next=seller_claim_finalize_or_settle_week_or_seller_stop action=keep the seller gateway running for {deal} detail=it calls TokenContract.claimTokens(cumulativeTokens) for delivered output and TokenContract.finalize() for mature claims, while the subscription keeper also calls TokenContract.settleWeek() at crossed week boundaries stop_action={close_as_seller} stop_effect=TokenContract.sellerStop(); buyer may STOP when done"
+                "next=seller_claim_finalize_or_settle_week_or_seller_stop action=keep the seller gateway running for {deal} detail=it calls TokenContract.claimTokens(cumulativeTokens) for accepted billable input+output usage and TokenContract.finalize() for mature claims, while the subscription keeper also calls TokenContract.settleWeek() at crossed week boundaries stop_action={close_as_seller} stop_effect=TokenContract.sellerStop(); buyer may STOP when done"
             )
         }
         Some(deals::DealHandleRole::Seller) if s.funded && !s.probe_accepted => {

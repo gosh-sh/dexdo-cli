@@ -4923,6 +4923,50 @@ fn assert_note_withdraw_recipient(
     Ok(())
 }
 
+const NOTE_WITHDRAW_RETIREMENT_ACK_FLAG: &str = "--acknowledge-note-retirement";
+const NOTE_WITHDRAW_RETIREMENT_WARNING: &str = "WARNING: `note withdraw` links this PrivateNote to the destination wallet, deanonymizing it. It permanently prevents this note from posting another sell offer. To keep selling, deploy a new note.";
+
+fn read_note_withdraw_retirement_confirmation(
+    input: &mut dyn std::io::BufRead,
+    output: &mut dyn std::io::Write,
+) -> Result<bool> {
+    writeln!(output, "{NOTE_WITHDRAW_RETIREMENT_WARNING}")?;
+    write!(output, "Type YES to withdraw and retire this note: ")?;
+    output.flush()?;
+
+    let mut answer = String::new();
+    input.read_line(&mut answer)?;
+    Ok(answer.trim() == "YES")
+}
+
+fn prompt_note_withdraw_retirement_confirmation() -> Result<bool> {
+    let stdin = std::io::stdin();
+    let stderr = std::io::stderr();
+    read_note_withdraw_retirement_confirmation(&mut stdin.lock(), &mut stderr.lock())
+}
+
+fn require_note_withdraw_retirement_acknowledgement(
+    acknowledged: bool,
+    may_ask: bool,
+    prompt: impl FnOnce() -> Result<bool>,
+) -> Result<()> {
+    if may_ask {
+        if prompt()? {
+            return Ok(());
+        }
+        bail!(
+            "note withdrawal cancelled before submission; no transaction or local state was written"
+        );
+    }
+    if acknowledged {
+        return Ok(());
+    }
+    bail!(
+        "{NOTE_WITHDRAW_RETIREMENT_WARNING}\nThis run cannot ask for confirmation; pass \
+         {NOTE_WITHDRAW_RETIREMENT_ACK_FLAG} only after accepting these consequences."
+    )
+}
+
 pub(crate) async fn run_note_withdraw(args: NoteWithdrawArgs) -> Result<()> {
     use dexdo_core::{Address, KeyPair, RealChainBackend};
     let note_addr = args.identity.note_addr.clone().ok_or_else(|| {
@@ -4980,6 +5024,11 @@ pub(crate) async fn run_note_withdraw(args: NoteWithdrawArgs) -> Result<()> {
     // zeroes its balance, but never credits the destination -- the SHELL is lost. Fail closed before
     // any on-chain write when the note's code_hash is not the current generation.
     chain.assert_note_withdraw_generation(&note).await?;
+    require_note_withdraw_retirement_acknowledgement(
+        args.acknowledge_note_retirement,
+        crate::cli::interaction::may_ask(),
+        prompt_note_withdraw_retirement_confirmation,
+    )?;
     // The destination in the client's one spelling too: an operator reading this line compares it
     // with the wallet they meant, and two spellings of the same address is the comparison failing.
     let dest_display = dexdo_core::address::display_self_dapp(&dest.to_string());
@@ -11306,6 +11355,108 @@ mod tests {
         );
     }
 
+    /// regression: headless withdrawal used to submit without ever telling the operator that
+    /// it permanently retires the note from selling. The explicit flag is the only headless
+    /// answer, and supplying it must not try to read stdin.
+    #[test]
+    fn note_withdraw_retirement_acknowledgement_is_fail_closed_without_a_terminal() {
+        let prompted = std::cell::Cell::new(false);
+        let error = super::require_note_withdraw_retirement_acknowledgement(false, false, || {
+            prompted.set(true);
+            Ok(true)
+        })
+        .expect_err("a headless run without the acknowledgement must refuse")
+        .to_string();
+        assert!(!prompted.get(), "a headless run must never read stdin");
+        for required in [
+            "deanonymizing",
+            "prevents this note from posting another sell offer",
+            "deploy a new note",
+            "--acknowledge-note-retirement",
+        ] {
+            assert!(error.contains(required), "missing {required:?} in {error}");
+        }
+
+        super::require_note_withdraw_retirement_acknowledgement(true, false, || {
+            prompted.set(true);
+            Ok(false)
+        })
+        .expect("the explicit flag answers the question in a headless run");
+        assert!(
+            !prompted.get(),
+            "an explicit acknowledgement must not read stdin"
+        );
+    }
+
+    /// negative path: anything except the exact deliberate answer cancels before submission.
+    #[test]
+    fn note_withdraw_retirement_prompt_requires_exact_yes() {
+        for answer in ["", "\n", "y\n", "yes\n", "NO\n"] {
+            let mut output = Vec::new();
+            let accepted = super::read_note_withdraw_retirement_confirmation(
+                &mut std::io::Cursor::new(answer.as_bytes()),
+                &mut output,
+            )
+            .expect("scripted prompt");
+            assert!(!accepted, "{answer:?} must not authorize withdrawal");
+            let output = String::from_utf8(output).expect("prompt is utf-8");
+            assert!(output.contains("deanonymizing"), "{output}");
+            assert!(output.contains("another sell offer"), "{output}");
+            assert!(output.contains("deploy a new note"), "{output}");
+            assert!(output.contains("Type YES"), "{output}");
+        }
+
+        let mut output = Vec::new();
+        assert!(super::read_note_withdraw_retirement_confirmation(
+            &mut std::io::Cursor::new(b"YES\n"),
+            &mut output,
+        )
+        .expect("scripted prompt"));
+
+        let error =
+            super::require_note_withdraw_retirement_acknowledgement(false, true, || Ok(false))
+                .expect_err("a declined prompt must cancel")
+                .to_string();
+        assert!(error.contains("before submission"), "{error}");
+        assert!(
+            error.contains("no transaction or local state was written"),
+            "{error}"
+        );
+
+        let prompted = std::cell::Cell::new(false);
+        let error = super::require_note_withdraw_retirement_acknowledgement(true, true, || {
+            prompted.set(true);
+            Ok(false)
+        })
+        .expect_err("the headless flag must not bypass an interactive YES")
+        .to_string();
+        assert!(prompted.get(), "an interactive run must always prompt");
+        assert!(error.contains("before submission"), "{error}");
+    }
+
+    /// ordering: every validation remains read-only, and the irreversible submit stays on
+    /// the far side of the acknowledgement. Declining therefore leaves no transaction or local
+    /// state behind.
+    #[test]
+    fn note_withdraw_retirement_acknowledgement_precedes_submit() {
+        let source = include_str!("note_cmd.rs");
+        let body =
+            crate::cli::source_probe::code_of(source, "pub(crate) async fn run_note_withdraw");
+        let generation_guard = body
+            .find("assert_note_withdraw_generation")
+            .expect("generation guard present");
+        let acknowledgement = body
+            .find("require_note_withdraw_retirement_acknowledgement")
+            .expect("retirement acknowledgement present");
+        let submit = body
+            .find("withdraw_note_tokens")
+            .expect("withdraw submit present");
+        assert!(
+            generation_guard < acknowledgement && acknowledgement < submit,
+            "the acknowledgement must be the last gate before withdrawTokens: {body}"
+        );
+    }
+
     #[test]
     fn note_withdraw_recipient_preflight_accepts_deployed_non_self_dapp_account() {
         let destination =
@@ -11387,6 +11538,7 @@ mod tests {
                 note_addr: Some(format!("0:{}", "b".repeat(64))),
             },
             to: format!("0:{}", "a".repeat(64)),
+            acknowledge_note_retirement: false,
         };
 
         let error = super::run_note_withdraw(args)

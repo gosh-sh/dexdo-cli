@@ -266,8 +266,8 @@ CGNAT, the documentation and benchmarking ranges, multicast -- with
 ask never points somewhere unreachable. For testing on one machine or a LAN, and only for that, add
 `--allow-private-advertise`.
 
-Price and volume come from `market.json`. The seller's own `--price-per-tick` is ignored on the
-`--market` path. To re-price, provision a new deal with a fresh `--nonce` and serve that file.
+Price and volume come from `market.json`. `dexdo seller` has no price flag. To re-price, provision
+a new deal with a fresh `--nonce` and serve that file.
 
 ---
 
@@ -328,7 +328,10 @@ Know these before you type them:
 - **`dexdo note withdraw`** is one-shot and irreversible; its canonical
   `--to <DAPP-ID>::<ACCOUNT-ID>` is always explicit and is never inferred from the pool or funding wallet.
   The exact destination must already exist in that DApp and contain deployed code, or the client
-  refuses before submit.
+  refuses before submit. Withdrawal links this PrivateNote to the destination wallet and
+  deanonymizes it; it permanently prevents this note from posting another sell offer. To keep
+  selling, deploy a new note. The interactive command requires an explicit `YES`; a headless run
+  requires `--acknowledge-note-retirement` after those consequences are accepted.
 - **the first funding leg** converts SHELL into native gas permanently.
 - **a spent `--nonce`** cannot be reused; the deal address is derived from it.
 

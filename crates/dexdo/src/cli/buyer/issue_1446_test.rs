@@ -314,7 +314,7 @@ fn issue_1446_on_demand_first_request_updates_command_progress_across_thread() {
         allow_unverified_model: true,
         models: std::path::PathBuf::from("unused-models.json"),
         ticks: 2,
-        max_price_per_tick: 1,
+        max_price_per_tick: Some(1),
         escrow: Some(dexdo_core::required_escrow_for_buy(2, 1)),
         policy: None,
     });

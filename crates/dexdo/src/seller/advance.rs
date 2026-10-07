@@ -234,16 +234,18 @@ fn delivery_target_from_probe_anchor(
         .min(token_budget)
 }
 
-/// Drive one deal's claim loop: repeatedly claim the CUMULATIVE tokens actually delivered, then `finalize()`
-/// so the final claim becomes payable. Returns the cumulative tokens successfully claimed.
+/// Drive one deal's claim loop: repeatedly claim the CUMULATIVE accepted provider-native billable
+/// usage, then `finalize()` so the final claim becomes payable. Returns the cumulative tokens
+/// successfully claimed.
 
-/// After the paid probe seeds the first full tick, later claims never exceed delivered output: a
-/// timer firing does not entitle the seller to consumption the buyer never received. They are additionally
-/// clamped to the on-chain rate bound, because the contract rejects an over-rate claim outright -- an
-/// unclamped driver would lose the whole batch instead of claiming the permitted part of it.
+/// After the paid probe seeds the first full tick, later claims never exceed accepted checked
+/// input-plus-output usage: a timer firing does not manufacture billable usage. They
+/// are additionally clamped to the on-chain rate bound, because the contract rejects an over-rate
+/// claim outright -- an unclamped driver would lose the whole batch instead of claiming the permitted
+/// part of it.
 
 /// The loop ends on a clean external close (buyer STOP / self-destruct), on the deal's ceiling
-/// (`ChainError::Limit`), or once delivery is complete and everything delivered has been claimed and
+/// (`ChainError::Limit`), or once the usage stream is complete and all accepted usage has been claimed and
 /// promoted. Any other failure is a genuine fault and MUST propagate -- never report success.
 
 /// Seller-only: `seller_note` authorizes the on-chain `claimTokens()`.
@@ -322,10 +324,11 @@ pub async fn drive_advance_with_observer(
             return Ok(0);
         }
         // the probe tick is PAID on acceptance, so an elapsed window alone must never take it.
-        // Buyer silence accepts DELIVERED output; it does not create delivery from nothing
-        // . Wait here for the first delivered token; a TRUE
-        // zero-delivery terminal -- the session finished, or the deal closed, before any output -- accepts no
-        // probe and finalizes nothing. Any non-empty partial tick counts, so `delivered > 0` is the gate.
+        // Buyer silence accepts recorded billable usage; it does not create usage from nothing
+        // . Wait here for the first accepted
+        // provider terminal; a TRUE zero-usage terminal -- the session finished, or the deal closed,
+        // before any terminal usage -- accepts no probe and finalizes nothing. Any non-empty partial
+        // tick counts, so `delivered > 0` is the gate.
         let mut first_tick_wait_emitted = false;
         loop {
             let delivered_tokens = delivered.load(Ordering::Acquire);
@@ -343,21 +346,21 @@ pub async fn drive_advance_with_observer(
             }
             if !first_tick_wait_emitted {
                 tracing::info!(
-                    event = "seller_waiting_for_first_delivered_tick",
+                    event = "seller_waiting_for_first_billable_usage",
                     token_contract = %token_contract_display,
                     delivered_tokens,
                     finalized_ticks = 0u128,
-                    "seller waiting for first delivered canonical tick"
+                    "seller waiting for first accepted billable input+output usage"
                 );
                 first_tick_wait_emitted = true;
             }
-            // Poll for the first delivered token, but stay responsive to an external close.
+            // Poll for the first accepted billable token, but stay responsive to an external close.
             if wait_claim_or_closed(chain, token_contract, windows.claim_interval).await {
                 return Ok(0);
             }
         }
-        // This is the seller's probe decision boundary. Output already delivered is absorbed by the
-        // full protocol probe tick; output delivered after this decision extends its cumulative high-water.
+        // This is the seller's probe decision boundary. Usage already accepted is absorbed by the
+        // full protocol probe tick; later accepted usage extends its cumulative high-water.
         let deal_delivery_count = delivered.load(Ordering::Acquire);
         let delivery_at_probe = u128::from(deal_delivery_count).min(TICK_SIZE);
         observer.observe_probe_decision(
@@ -435,7 +438,7 @@ pub async fn drive_advance_with_observer(
                         event = "seller_waiting_for_delivered_tokens",
                         token_contract = %token_contract_display,
                         claimed_tokens = claimed,
-                        "seller waiting for delivered tokens to claim"
+                        "seller waiting for accepted billable tokens to claim"
                     );
                     waiting_event_emitted = true;
                 }
@@ -1057,11 +1060,11 @@ mod tests {
     }
 
     /// money path: an elapsed `PROBE_WINDOW` alone must NEVER take the paid probe tick. With the
-    /// deal open and ZERO delivered output the driver keeps waiting -- `acceptProbe` is not called, nothing is
+    /// deal open and ZERO accepted billable usage the driver keeps waiting -- `acceptProbe` is not called, nothing is
     /// claimed or finalized -- and it reports the wait exactly once through its structured event, so a live
     /// seller is visibly waiting rather than silently hung.
     #[test]
-    fn zero_delivery_waits_for_first_token_instead_of_accepting_the_probe() {
+    fn zero_billable_usage_waits_instead_of_accepting_the_probe() {
         struct SharedWriter(Arc<std::sync::Mutex<Vec<u8>>>);
         impl std::io::Write for SharedWriter {
             fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
@@ -1116,26 +1119,23 @@ mod tests {
                     let seen = String::from_utf8_lossy(
                         &wait_logs.lock().expect("read in-flight tracing output"),
                     )
-                    .contains("seller_waiting_for_first_delivered_tick");
+                    .contains("seller_waiting_for_first_billable_usage");
                     if seen {
                         break;
                     }
                     assert!(
                         !task.is_finished(),
-                        "zero delivery must keep the seller waiting, not return"
+                        "zero billable usage must keep the seller waiting, not return"
                     );
                     assert!(
                         std::time::Instant::now() < deadline,
-                        "driver never reported that it is waiting for the first delivered tick"
+                        "driver never reported that it is waiting for the first billable usage"
                     );
                     tokio::time::sleep(Duration::from_millis(5)).await;
                 }
                 // Several further poll rounds: the wait stays silent and stays off the money path.
                 tokio::time::sleep(Duration::from_millis(60)).await;
-                assert!(
-                    !task.is_finished(),
-                    "the open zero-delivery deal is not done"
-                );
+                assert!(!task.is_finished(), "the open zero-usage deal is not done");
                 task.abort();
                 let _ = task.await;
                 String::from_utf8_lossy(&wait_logs.lock().expect("read tracing output"))
@@ -1145,7 +1145,7 @@ mod tests {
 
         assert_eq!(
             outcome
-                .matches("seller_waiting_for_first_delivered_tick")
+                .matches("seller_waiting_for_first_billable_usage")
                 .count(),
             1,
             "the waiting event is emitted once per invocation, not once per poll: {outcome}"
@@ -1157,7 +1157,7 @@ mod tests {
         assert_eq!(
             backend.accepts.load(Ordering::Relaxed),
             0,
-            "an elapsed probe window with zero delivered output must not take the paid probe tick"
+            "an elapsed probe window with zero accepted billable usage must not take the paid probe tick"
         );
         assert!(
             backend.claims().is_empty(),
@@ -1821,7 +1821,7 @@ mod tests {
             Arc::new(AtomicBool::new(true)),
         )
         .await
-        .expect_err("an on-chain cursor beyond delivered tokens must fail closed");
+        .expect_err("an on-chain cursor beyond accepted billable usage must fail closed");
 
         assert!(
             error.to_string().contains("invalid claim resync"),

@@ -35,7 +35,9 @@ bond.
 
 **Flags:** Place it with
 `subscription --model A place --max-price-per-tick L --ticks N`, then use the matched deal with
-`buyer --resume --frame-model A` and optional `--local-listen ADDR`. For an explicit due-week
+`buyer --resume --frame-model A` and optional `--local-listen ADDR`. Without a new price the endpoint
+serves only that adopted subscription; a price on `buyer --resume` does not start a fresh
+continuation BUY for a subscription. For an explicit due-week
 booking, add `--settle` to `subscription ... status ID`; plain status is read-only. The seller must
 run `seller --model A --subscription`. Both orders carry `AON|SUBSCRIPTION`.
 
@@ -636,6 +638,11 @@ on-demand` -- when you are not actively sending requests.
     --local-listen 127.0.0.1:8080
   ```
 
+  This price-less form cannot place a fresh continuation BUY after the adopted deal ends. Only a
+  model-only resume with `--continuity-mode on-demand` can opt into that later purchase by adding an
+  explicit `--max-price-per-tick`; subscription, `--market`, and `--token-contract` resumes never
+  renew through this flag.
+
   (`--resume` also accepts `--market`/`--token-contract`.) If no match happened at all, check the
   seller is up on the same manifest and that your `--max-price-per-tick` was >= the ask (Phase 6).
 - request rejected as `outside the configured frame` -- send `model` as `Qwen3.8-27B` (or omit it).
@@ -649,6 +656,10 @@ on-demand` -- when you are not actively sending requests.
   `--to <DAPP-ID>::<ACCOUNT-ID>` explicitly every time.
 - Before `note withdraw`, make sure that exact destination already exists in the named DApp and
   contains deployed code; the client refuses before submit if it does not.
+- Before `note withdraw`, tell the user exactly: withdrawal links this PrivateNote to the
+  destination wallet and deanonymizes it; it permanently prevents this note from posting another
+  sell offer; to keep selling, deploy a new note. Obtain explicit approval. Only then may a
+  headless agent run pass `--acknowledge-note-retirement` instead of the terminal prompt.
 - Do not set `--escrow` by hand without a reason (risk of stranded surplus).
 - Buy against the deal `token_contract`, not an order-book address.
 - Your on-chain lock per open deal never exceeds 2 ticks.

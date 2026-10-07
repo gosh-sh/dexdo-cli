@@ -279,7 +279,64 @@ pub struct MarketManifest {
     pub max_ticks: u128,
 }
 
+/// A live or durable market identity was read successfully and proved not to be the requested one.
+/// Unlike an RPC/read failure, retrying cannot make this immutable mismatch converge.
+#[derive(Debug, thiserror::Error, PartialEq, Eq)]
+#[error("{message}")]
+pub struct MarketIdentityMismatch {
+    message: String,
+}
+
+impl MarketIdentityMismatch {
+    pub fn new(message: impl Into<String>) -> Self {
+        Self {
+            message: message.into(),
+        }
+    }
+}
+
 impl MarketManifest {
+    /// Prove that an already-active TokenContract is the exact deal described by this manifest.
+    pub fn ensure_live_identity(
+        &self,
+        deal_terms: (u128, u128, u128),
+        model_name: &str,
+        model_hash: &str,
+        seller_note: &str,
+    ) -> Result<(), MarketIdentityMismatch> {
+        let expected_terms = (crate::TICK_SIZE, self.price_per_tick, self.max_ticks);
+        let same_note = crate::normalize_wallet_address(seller_note)
+            .map_err(MarketIdentityMismatch::new)?
+            == crate::normalize_wallet_address(&self.seller_note)
+                .map_err(MarketIdentityMismatch::new)?;
+        if deal_terms != expected_terms
+            || model_name != self.frame_model
+            || !model_hash.eq_ignore_ascii_case(&self.model_hash)
+            || !same_note
+        {
+            return Err(MarketIdentityMismatch::new(format!(
+                "active TokenContract {} does not match the requested existing deal: expected \
+                 model={} model_hash={} tick_size={} price_per_tick={} max_ticks={} seller_note={}, \
+                 got model={} model_hash={} tick_size={} price_per_tick={} max_ticks={} seller_note={}; \
+                 refusing to reuse its manifest",
+                crate::address::display_self_dapp(&self.token_contract),
+                self.frame_model,
+                self.model_hash,
+                crate::TICK_SIZE,
+                self.price_per_tick,
+                self.max_ticks,
+                self.seller_note,
+                model_name,
+                model_hash,
+                deal_terms.0,
+                deal_terms.1,
+                deal_terms.2,
+                seller_note,
+            )));
+        }
+        Ok(())
+    }
+
     /// Serialize to pretty JSON (the on-disk `--output` format).
     pub fn to_json(&self) -> Result<String, serde_json::Error> {
         serde_json::to_string_pretty(self)

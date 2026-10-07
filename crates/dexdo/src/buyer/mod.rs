@@ -159,7 +159,7 @@ impl Buyer {
         output_limit_tokens: u64,
         billing_grant_tokens: u64,
         request: Option<CanonRequest>,
-        mut account_tokens: Option<&mut (dyn FnMut(u64) -> Result<(), String> + Send)>,
+        mut account_tokens: Option<&mut (dyn FnMut(BillingUsage) -> Result<(), String> + Send)>,
         mut account_output: Option<&mut (dyn FnMut(u64) -> Result<(), String> + Send)>,
         exact_mock_output: bool,
     ) -> Result<StreamOutcome> {
@@ -272,7 +272,7 @@ impl Buyer {
         let usage = terminal_usage
             .ok_or_else(|| anyhow!("canonical stream ended without terminal billing usage"))?;
         if let Some(charge) = account_tokens.as_mut() {
-            (*charge)(usage.total_tokens).map_err(anyhow::Error::msg)?;
+            (*charge)(usage).map_err(anyhow::Error::msg)?;
         }
         Ok(StreamOutcome {
             tokens,
@@ -320,7 +320,7 @@ impl Buyer {
         output_limit_tokens: u64,
         billing_grant_tokens: u64,
         models: &crate::seller::ModelsConfig,
-        account_tokens: Option<&mut (dyn FnMut(u64) -> Result<(), String> + Send)>,
+        account_tokens: Option<&mut (dyn FnMut(BillingUsage) -> Result<(), String> + Send)>,
         account_output: Option<&mut (dyn FnMut(u64) -> Result<(), String> + Send)>,
     ) -> Result<crate::buyer::verify::Verdict> {
         use crate::buyer::verify;
@@ -405,7 +405,7 @@ impl Buyer {
         output_limit_tokens: u64,
         billing_grant_tokens: u64,
         models: &crate::seller::ModelsConfig,
-        account_tokens: Option<&mut (dyn FnMut(u64) -> Result<(), String> + Send)>,
+        account_tokens: Option<&mut (dyn FnMut(BillingUsage) -> Result<(), String> + Send)>,
         account_output: Option<&mut (dyn FnMut(u64) -> Result<(), String> + Send)>,
     ) -> Result<crate::buyer::verify::Verdict> {
         use crate::buyer::verify::{

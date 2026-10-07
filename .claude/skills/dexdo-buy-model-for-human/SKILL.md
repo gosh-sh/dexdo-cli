@@ -321,7 +321,10 @@ When the cause is not obvious, run `dexdo doctor` first.
 - **`dexdo note withdraw`** is one-shot and irreversible; its canonical
   `--to <DAPP-ID>::<ACCOUNT-ID>` is always explicit and is never inferred from the pool or funding wallet.
   The exact destination must already exist in that DApp and contain deployed code, or the client
-  refuses before submit.
+  refuses before submit. Withdrawal links this PrivateNote to the destination wallet and
+  deanonymizes it; it permanently prevents this note from posting another sell offer. To keep
+  selling, deploy a new note. The interactive command requires an explicit `YES`; a headless run
+  requires `--acknowledge-note-retirement` after those consequences are accepted.
 - **a committed buy** is committed; what is not delivered comes back to you, but the purchase is not
   cancelled by closing the terminal.
 
