@@ -52,6 +52,9 @@ struct DurableCapacityRecord {
     local_delivered_after_anchor: u128,
     #[serde(with = "decimal_u128")]
     outstanding_reservation: u128,
+    /// Exact delivered prefix absorbed by acceptProbe, saved before submitting it. Bounded by one tick.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    probe_delivery_at_decision: Option<u64>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -210,6 +213,7 @@ impl CapacityManager {
                         tokens_pending_anchor: state.tokens_pending,
                         local_delivered_after_anchor: 0,
                         outstanding_reservation: 0,
+                        probe_delivery_at_decision: None,
                     },
                 };
                 let entry = Arc::new(CapacityEntry {
@@ -271,16 +275,27 @@ impl CapacityManager {
             0
         };
         let backed_by_delivery = acknowledged - probe_seed;
-        if backed_by_delivery > old.local_delivered_after_anchor && !subscription_term_ended {
+        // The protocol credits a full tick, but absorbs only the prefix at the decision boundary.
+        // Delivery arriving while acceptProbe awaits its response belongs to subsequent claims.
+        // Records predating the boundary field retain their original seed reconciliation.
+        let probe_delivery = if probe_seed > 0 {
+            old.probe_delivery_at_decision
+                .map(u128::from)
+                .unwrap_or_else(|| probe_seed.min(old.local_delivered_after_anchor))
+        } else {
+            0
+        };
+        let claimable_delivery = old.local_delivered_after_anchor - probe_delivery;
+        if backed_by_delivery > claimable_delivery && !subscription_term_ended {
             bail!(
                 "TokenContract {token_contract_display} tokensPending advanced by {acknowledged} \
                  ({backed_by_delivery} beyond the protocol probe seed), beyond durable local delivery {}",
-                old.local_delivered_after_anchor
+                claimable_delivery
             );
         }
         let local_delivered_after_anchor = old
             .local_delivered_after_anchor
-            .saturating_sub(acknowledged);
+            .saturating_sub(probe_delivery + backed_by_delivery);
         if subscription_term_ended {
             // The final claim grace keeps the deal open but must not expose a fifth weekly quota. Keep
             // every amount already durably committed before the boundary, then make new availability zero.
@@ -298,6 +313,11 @@ impl CapacityManager {
             tokens_pending_anchor: state.tokens_pending,
             local_delivered_after_anchor,
             outstanding_reservation: old.outstanding_reservation,
+            probe_delivery_at_decision: if probe_seed > 0 {
+                None
+            } else {
+                old.probe_delivery_at_decision
+            },
         };
         validate_record(&candidate)?;
         if candidate != locked.record {
@@ -305,6 +325,40 @@ impl CapacityManager {
             locked.record = candidate;
         }
         Ok(Some(CapacitySnapshot::from(&locked.record)))
+    }
+
+    /// Persist the exact probe prefix before acceptProbe can change the chain. A retry or restart
+    /// reuses the saved boundary, so newly delivered usage is never absorbed into the probe twice.
+    pub fn prepare_probe(&self, token_contract: &TokenContract, delivered: u64) -> Result<u64> {
+        let entry = self
+            .entries
+            .lock()
+            .map_err(|_| anyhow!("{POISONED_LOCK_MESSAGE}: {CAPACITY_ENTRIES_LOCK}"))?
+            .get(token_contract)
+            .cloned()
+            .ok_or_else(|| anyhow!("deal capacity is not registered"))?;
+        let mut locked = entry
+            .state
+            .lock()
+            .map_err(|_| anyhow!("{POISONED_LOCK_MESSAGE}: {CAPACITY_ENTRY_STATE_LOCK}"))?;
+        if locked.terminal || locked.record.tokens_pending_anchor != 0 {
+            bail!("probe decision requires live pre-probe capacity");
+        }
+        if delivered == 0
+            || u128::from(delivered) > TICK_SIZE
+            || u128::from(delivered) > locked.record.local_delivered_after_anchor
+        {
+            bail!("probe decision prefix {delivered} is not backed by durable delivery within one tick");
+        }
+        if let Some(saved) = locked.record.probe_delivery_at_decision {
+            return Ok(saved);
+        }
+        let mut candidate = locked.record.clone();
+        candidate.probe_delivery_at_decision = Some(delivered);
+        validate_record(&candidate)?;
+        persist_candidate(entry.path.as_deref(), &candidate)?;
+        locked.record = candidate;
+        Ok(delivered)
     }
 
     pub fn reserve(
@@ -742,6 +796,15 @@ fn validate_record(record: &DurableCapacityRecord) -> Result<()> {
     }
     if record.token_contract.trim().is_empty() {
         bail!("seller capacity record has empty token_contract");
+    }
+    if let Some(delivered) = record.probe_delivery_at_decision {
+        if record.tokens_pending_anchor != 0
+            || delivered == 0
+            || u128::from(delivered) > TICK_SIZE
+            || u128::from(delivered) > record.local_delivered_after_anchor
+        {
+            bail!("seller capacity record has an invalid probe decision prefix");
+        }
     }
     let snapshot = CapacitySnapshot::from(record);
     let committed = snapshot.committed()?;
@@ -1303,6 +1366,146 @@ mod tests {
             ("ordinary", ordinary(ORDINARY_FUNDED), ORDINARY_FUNDED),
             ("subscription", subscription(0, 0), WEEK_QUOTA),
         ]
+    }
+
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(32))]
+
+        #[test]
+        fn probe_decision_preserves_later_delivery_across_restarts_2046(
+            prefix in 1_u64..=TICK_SIZE as u64,
+            later in 0_u64..10_000,
+            acknowledged in 0_u64..10_000,
+        ) {
+            let later = later.min(TICK_SIZE as u64 - prefix);
+            let acknowledged = acknowledged.min(later);
+            for (label, deal, cap) in probe_shapes() {
+                let directory = tempfile::tempdir().unwrap();
+                let tc = format!("0:probe-boundary-2046-{label}");
+                let manager = CapacityManager::in_deals_dir(directory.path().to_path_buf());
+                manager.reconcile_deal(&tc, state(false, 0), deal).unwrap();
+                manager.reserve(&tc, prefix).unwrap().finish_with_delivery(prefix).unwrap();
+                prop_assert_eq!(manager.prepare_probe(&tc, prefix).unwrap(), prefix);
+                if later > 0 {
+                    manager.reserve(&tc, later).unwrap().finish_with_delivery(later).unwrap();
+                }
+                drop(manager);
+
+                let manager = CapacityManager::in_deals_dir(directory.path().to_path_buf());
+                manager.reconcile_deal(&tc, state(false, 0), deal).unwrap();
+                prop_assert_eq!(manager.prepare_probe(&tc, prefix + later).unwrap(), prefix);
+                let before = manager.snapshot(&tc).unwrap().unwrap();
+                // A credited probe must never conceal even one unbacked post-probe token.
+                prop_assert!(manager.reconcile_deal(
+                    &tc, state(true, TICK_SIZE + u128::from(later) + 1), deal,
+                ).is_err());
+                prop_assert_eq!(manager.snapshot(&tc).unwrap().unwrap(), before);
+
+                let pending = TICK_SIZE + u128::from(acknowledged);
+                let accepted = manager.reconcile_deal(&tc, state(true, pending), deal).unwrap().unwrap();
+                prop_assert_eq!(accepted.local_delivered_after_anchor, u128::from(later - acknowledged));
+                prop_assert_eq!(accepted.available().unwrap(), cap - TICK_SIZE - u128::from(later));
+                prop_assert_eq!(manager.reconcile_deal(&tc, state(true, pending), deal).unwrap().unwrap(), accepted);
+                drop(manager);
+
+                let manager = CapacityManager::in_deals_dir(directory.path().to_path_buf());
+                prop_assert_eq!(manager.reconcile_deal(&tc, state(true, pending), deal).unwrap().unwrap(), accepted);
+                let claimed = manager.reconcile_deal(
+                    &tc, state(true, TICK_SIZE + u128::from(later)), deal,
+                ).unwrap().unwrap();
+                prop_assert_eq!(claimed.local_delivered_after_anchor, 0);
+                assert_invariant(claimed);
+            }
+        }
+    }
+
+    #[test]
+    fn probe_decision_requires_durable_delivery_and_a_live_probe_2046() {
+        let manager = CapacityManager::in_memory();
+        let tc = "0:invalid-probe-boundary-2046".to_string();
+        assert!(manager.prepare_probe(&tc, 1).is_err());
+        let deal = ordinary(ORDINARY_FUNDED);
+        manager.reconcile_deal(&tc, state(false, 0), deal).unwrap();
+        assert!(manager.prepare_probe(&tc, 1).is_err());
+        manager
+            .reserve(&tc, 57)
+            .unwrap()
+            .finish_with_delivery(57)
+            .unwrap();
+        let before = manager.snapshot(&tc).unwrap().unwrap();
+        for invalid in [0, 58, TICK_SIZE as u64 + 1] {
+            assert!(manager.prepare_probe(&tc, invalid).is_err());
+            assert_eq!(manager.snapshot(&tc).unwrap().unwrap(), before);
+        }
+        assert_eq!(manager.prepare_probe(&tc, 57).unwrap(), 57);
+        manager
+            .reconcile_deal(&tc, state(true, TICK_SIZE), deal)
+            .unwrap();
+        assert!(manager.prepare_probe(&tc, 57).is_err());
+        manager.mark_terminal(&tc).unwrap();
+        assert!(manager.prepare_probe(&tc, 57).is_err());
+    }
+
+    #[test]
+    fn forged_durable_probe_decision_is_rejected_2046() {
+        let directory = tempfile::tempdir().unwrap();
+        let tc = "0:forged-probe-boundary-2046".to_string();
+        let deal = ordinary(ORDINARY_FUNDED);
+        let manager = CapacityManager::in_deals_dir(directory.path().to_path_buf());
+        manager.reconcile_deal(&tc, state(false, 0), deal).unwrap();
+        manager
+            .reserve(&tc, 57)
+            .unwrap()
+            .finish_with_delivery(57)
+            .unwrap();
+        let path = capacity_path(&directory.path().join("seller-capacity"), &tc);
+        let mut record = load_record(&path).unwrap().unwrap();
+        drop(manager);
+        for invalid in [0, 58, TICK_SIZE as u64 + 1] {
+            record.probe_delivery_at_decision = Some(invalid);
+            std::fs::write(&path, serde_json::to_vec(&record).unwrap()).unwrap();
+            let manager = CapacityManager::in_deals_dir(directory.path().to_path_buf());
+            let error = manager
+                .reconcile_deal(&tc, state(true, TICK_SIZE), deal)
+                .unwrap_err();
+            assert!(error.to_string().contains("invalid probe decision prefix"));
+        }
+    }
+
+    #[test]
+    fn probe_decision_write_failure_keeps_the_previous_record_2046() {
+        let directory = tempfile::tempdir().unwrap();
+        let manager = CapacityManager::in_deals_dir(directory.path().to_path_buf());
+        let tc = "0:probe-boundary-write-failure-2046".to_string();
+        manager
+            .reconcile_deal(&tc, state(false, 0), ordinary(ORDINARY_FUNDED))
+            .unwrap();
+        manager
+            .reserve(&tc, 57)
+            .unwrap()
+            .finish_with_delivery(57)
+            .unwrap();
+        let capacity_dir = directory.path().join("seller-capacity");
+        let saved_dir = directory.path().join("saved-capacity");
+        let before = manager.snapshot(&tc).unwrap().unwrap();
+        std::fs::rename(&capacity_dir, &saved_dir).unwrap();
+        std::fs::write(&capacity_dir, b"block directory creation").unwrap();
+        assert!(manager.prepare_probe(&tc, 57).is_err());
+        assert_eq!(manager.snapshot(&tc).unwrap().unwrap(), before);
+        let saved = load_record(&capacity_path(&saved_dir, &tc))
+            .unwrap()
+            .unwrap();
+        assert_eq!(saved.probe_delivery_at_decision, None);
+        std::fs::remove_file(&capacity_dir).unwrap();
+        std::fs::rename(&saved_dir, &capacity_dir).unwrap();
+        assert_eq!(manager.prepare_probe(&tc, 57).unwrap(), 57);
+        assert_eq!(
+            load_record(&capacity_path(&capacity_dir, &tc))
+                .unwrap()
+                .unwrap()
+                .probe_delivery_at_decision,
+            Some(57)
+        );
     }
 
     #[test]

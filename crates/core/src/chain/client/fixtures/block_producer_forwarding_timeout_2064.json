@@ -1,0 +1,1 @@
+{"error":{"code":"INTERNAL_ERROR","message":"The message redirection to the Block Producer has failed: error sending request for url (http://w2e42c1.mainbk.ackinacki.org/v2/messages) (source: operation timed out)","data":{"producers":["w2e42c1.mainbk.ackinacki.org"],"message_hash":"","exit_code":null}}}

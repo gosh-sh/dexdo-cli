@@ -153,6 +153,12 @@ pub trait ChainBackend: Send + Sync {
     ) -> Result<(), ChainError> {
         Ok(())
     }
+    /// Read-only residual preflight: an inactive address with immutable lifecycle history cannot
+    /// be redeployed under this seller's nonce. Active targets remain the provisioner's identity
+    /// check/recovery responsibility. Offline backends have no retired on-chain addresses.
+    async fn seller_nonce_is_retired(&self, _nonce: u64) -> Result<bool, ChainError> {
+        Ok(false)
+    }
     /// After `post_offer`, confirm the seller-visible on-chain outcome. Backends without a live IOB return `None`.
     async fn confirm_offer_outcome(
         &self,

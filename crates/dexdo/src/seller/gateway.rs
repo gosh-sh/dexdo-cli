@@ -449,6 +449,11 @@ impl GatewayState {
             .reconcile_deal(&token_contract.to_string(), state, deal)
     }
 
+    pub fn prepare_probe_capacity(&self, token_contract: &str, delivered: u64) -> AnyResult<u64> {
+        self.capacity
+            .prepare_probe(&token_contract.to_string(), delivered)
+    }
+
     pub fn reconcile_ordinary_capacity(
         &self,
         token_contract: &str,
@@ -1520,6 +1525,59 @@ mod tests {
             "two ticks served after the probe must reach the counter the claim driver reads, or \
              the seller delivers them and never bills them"
         );
+    }
+
+    #[test]
+    fn probe_acceptance_preserves_delivery_after_the_decision_2046() {
+        let directory = tempfile::tempdir().unwrap();
+        let state = GatewayState::with_upstream_and_deals_dir(
+            UpstreamConfig::Mock,
+            directory.path().to_path_buf(),
+        );
+        let tc = "0:probe-decision-race-2046";
+        let mut pre_probe = subscription_state(0);
+        pre_probe.probe_accepted = false;
+        state
+            .register_stream(
+                tc,
+                buyer_pubkey(),
+                u64::MAX,
+                pre_probe,
+                ordinary_shape(2 * TICK_SIZE),
+            )
+            .unwrap();
+        let deliver = |tokens| {
+            CapacityDeliveryRecorder {
+                reservation: state.capacity.reserve(&tc.to_string(), u64::MAX).unwrap(),
+                delivery: state.delivery(tc),
+            }
+            .record_authoritative_delivery(AuthoritativeDeliveryEvent::Completed(
+                NonZeroU64::new(tokens).unwrap(),
+            ))
+            .unwrap();
+        };
+        deliver(57);
+        let delivery_at_probe = state.delivery(tc).count.load(Ordering::Acquire);
+        assert_eq!(delivery_at_probe, 57);
+        assert_eq!(
+            state.prepare_probe_capacity(tc, delivery_at_probe).unwrap(),
+            57
+        );
+        // Another request finishes while acceptProbe is awaiting its chain response.
+        deliver(196);
+        let accepted = state
+            .reconcile_ordinary_capacity(tc, subscription_state(TICK_SIZE))
+            .unwrap()
+            .unwrap();
+        assert_eq!(accepted.local_delivered_after_anchor, 196);
+        let claim = TICK_SIZE
+            + u128::from(state.delivery(tc).count.load(Ordering::Acquire) - delivery_at_probe);
+        let reconciled = state
+            .reconcile_ordinary_capacity(tc, subscription_state(claim))
+            .unwrap()
+            .unwrap();
+        assert_eq!(reconciled.tokens_pending_anchor, TICK_SIZE + 196);
+        assert_eq!(reconciled.local_delivered_after_anchor, 0);
     }
 
     #[test]

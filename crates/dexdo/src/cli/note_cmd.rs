@@ -2017,6 +2017,12 @@ fn is_note_deploy_wallet_submit_busy_error(error: &anyhow::Error) -> bool {
 }
 
 fn note_deploy_resume_error(funding_multisig_address: &str, error: anyhow::Error) -> anyhow::Error {
+    if error.downcast_ref::<NoteDeployUnconfirmed>().is_some() {
+        return error.context(format!(
+            "deploy PrivateNote from wallet {}",
+            dexdo_core::address::display_self_dapp(funding_multisig_address),
+        ));
+    }
     note_deploy_error(funding_multisig_address, error)
 }
 
@@ -2478,6 +2484,226 @@ async fn note_deploy_mint_voucher_recoverable(
 }
 
 #[derive(Debug)]
+pub(crate) struct NoteDeployUnconfirmed {
+    message: String,
+    may_resubmit: bool,
+}
+
+impl NoteDeployUnconfirmed {
+    fn new(message: String, may_resubmit: bool) -> Self {
+        Self {
+            message,
+            may_resubmit,
+        }
+    }
+}
+impl std::fmt::Display for NoteDeployUnconfirmed {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.message)
+    }
+}
+impl std::error::Error for NoteDeployUnconfirmed {}
+
+fn note_deploy_submission_from_boc(
+    boc: &str,
+    root: &dexdo_core::Address,
+    dapp_id: &str,
+    expected_note: &str,
+) -> Result<crate::cli::note::NoteDeploySubmission> {
+    use anyhow::Context;
+    let decoded = tvm_client::abi::decode_message(
+        dexdo_core::airegistry::deploy::local_context()?,
+        tvm_client::abi::ParamsOfDecodeMessage {
+            abi: tvm_client::abi::Abi::Json(
+                dexdo_core::private_note::artifacts::ROOT_PN_ABI_JSON.to_owned(),
+            ),
+            message: boc.to_owned(),
+            allow_partial: false,
+            function_name: Some("deployPrivateNote".to_owned()),
+            data_layout: None,
+        },
+    )?;
+    let header = decoded
+        .header
+        .context("deployPrivateNote signed header is missing")?;
+    let submission = crate::cli::note::NoteDeploySubmission {
+        message_hash: dexdo_core::chain::external_message_hash(boc)?,
+        root_pn_address: format!("{dapp_id}::{}", root.bare()),
+        expected_note_address: dexdo_core::CanonicalAddress::parse(expected_note)
+            .map_err(|error| anyhow::anyhow!(error))?
+            .to_string(),
+        time_ms: header
+            .time
+            .context("deployPrivateNote time header is missing")?,
+        expire_at_unix: header
+            .expire
+            .context("deployPrivateNote expiry header is missing")?,
+        last_submit_error: None,
+    };
+    submission.validate()?;
+    Ok(submission)
+}
+
+async fn note_deploy_wait_confirmation(
+    client: &dexdo_core::ChainClient,
+    expected_note: &str,
+    recovery_path: &std::path::Path,
+    submission: Option<&crate::cli::note::NoteDeploySubmission>,
+) -> Result<()> {
+    let identity = dexdo_core::CanonicalAddress::parse(expected_note)
+        .map_err(|error| anyhow::anyhow!(error))?;
+    let note = dexdo_core::Address::parse(&identity.legacy())?;
+    if let Some(saved) = submission {
+        if dexdo_core::CanonicalAddress::parse(&saved.expected_note_address)
+            .map_err(|error| anyhow::anyhow!(error))?
+            != dexdo_core::CanonicalAddress::parse(expected_note)
+                .map_err(|error| anyhow::anyhow!(error))?
+        {
+            anyhow::bail!(
+                "deploy submission expected note differs from the current paid proof; refusing to submit"
+            );
+        }
+    }
+    let http = dexdo_core::chain_http_client()?;
+    note_deploy_wait_confirmation_with(
+        expected_note,
+        recovery_path,
+        submission,
+        async || {
+            match submission {
+                Some(saved) => {
+                    let root = dexdo_core::CanonicalAddress::parse(&saved.root_pn_address)
+                        .map_err(|error| anyhow::anyhow!(error))?;
+                    dexdo_core::chain::read_note_deploy_rootpn_action_by_hash(
+                        &http,
+                        client.endpoint(),
+                        &saved.message_hash,
+                        root.account_id(),
+                        root.dapp_id(),
+                    )
+                    .await
+                }
+                None => Ok(None), // Legacy recovery has no message hash; the proof still derives the note.
+            }
+        },
+        async || {
+            Ok(client
+                .get_account_retrying(&note)
+                .await?
+                .is_some_and(|account| account.is_active()))
+        },
+    )
+    .await
+}
+
+/// Both read paths share one deadline, including read retries. Neither closure can submit money.
+async fn note_deploy_wait_confirmation_with<Receipt, Active>(
+    expected_note: &str,
+    recovery_path: &std::path::Path,
+    submission: Option<&crate::cli::note::NoteDeploySubmission>,
+    mut receipt: Receipt,
+    mut active: Active,
+) -> Result<()>
+where
+    Receipt: AsyncFnMut() -> Result<Option<dexdo_core::chain::NoteDeployRootPnActionObservation>>,
+    Active: AsyncFnMut() -> Result<bool>,
+{
+    let deadline = tokio::time::Instant::now() + NOTE_DEPLOY_ACTIVE_TIMEOUT;
+    let node_result = submission
+        .and_then(|saved| saved.last_submit_error.as_deref())
+        .unwrap_or("no node rejection was recorded");
+    let mut last_result = "no finalized receipt; expected note is not active".to_owned();
+    let mut saw_successful_receipt = false;
+    let mut may_resubmit = false;
+    while tokio::time::Instant::now() < deadline {
+        let reads = tokio::time::timeout_at(deadline, async {
+            let receipt = receipt();
+            tokio::pin!(receipt);
+            while tokio::time::Instant::now() < deadline {
+                let active = active();
+                tokio::pin!(active);
+                let account = tokio::select! {
+                    result = &mut active => result,
+                    result = &mut receipt => return (result, active.await),
+                };
+                if matches!(account, Ok(true)) {
+                    return (Ok(None), account);
+                }
+                last_result = match &account {
+                    Ok(false) => "RootPN receipt read is pending; expected note is not active".to_owned(),
+                    Err(error) => format!("RootPN receipt read is pending; note read: {error:#}"),
+                    Ok(true) => unreachable!("active note returned above"),
+                };
+                // Keep this receipt request in flight while polling the account independently.
+                tokio::select! {
+                    result = &mut receipt => return (result, account),
+                    _ = tokio::time::sleep_until(
+                        (tokio::time::Instant::now() + NOTE_DEPLOY_ACTIVE_POLL_INTERVAL).min(deadline),
+                    ) => {}
+                }
+            }
+            // Let the shared timeout report expiry without starting another account read.
+            std::future::pending().await
+        })
+        .await;
+        let (receipt, active) = match reads {
+            Ok(reads) => reads,
+            Err(_) => {
+                last_result = format!("{last_result}; confirmation read exceeded the deadline");
+                may_resubmit = false;
+                break;
+            }
+        };
+        if matches!(active, Ok(true)) {
+            return Ok(());
+        }
+        let absent = matches!(active, Ok(false));
+        may_resubmit = absent && matches!(receipt, Ok(None)) && !saw_successful_receipt;
+        match receipt {
+            Ok(Some(receipt)) => {
+                let result =
+                    note_deploy_rootpn_action_result("deployPrivateNote", None, Some(receipt));
+                match result {
+                    Ok(()) => {
+                        saw_successful_receipt = true;
+                        may_resubmit = false;
+                        last_result = "RootPN executed successfully, but the expected note is not confirmed active".to_owned();
+                    }
+                    Err(error) if absent => return Err(error),
+                    Err(error) => last_result = format!("{error:#}"),
+                }
+            }
+            Err(error) => last_result = format!("receipt read: {error:#}"),
+            Ok(None) => {
+                last_result = "no finalized receipt; expected note is not active".to_owned()
+            }
+        }
+        if let Err(error) = active {
+            last_result = format!("{last_result}; note read: {error:#}");
+        }
+        tokio::time::sleep_until(
+            (tokio::time::Instant::now() + NOTE_DEPLOY_ACTIVE_POLL_INTERVAL).min(deadline),
+        )
+        .await;
+    }
+    let message_hash = submission.map_or("not recorded by the older CLI", |saved| {
+        saved.message_hash.as_str()
+    });
+    Err(anyhow::Error::new(NoteDeployUnconfirmed::new(
+        format!(
+            "PrivateNote creation was not confirmed within {} seconds. The deposit voucher is already paid; \
+         no additional wallet payment was submitted. Expected note: {expected_note}. \
+         RootPN message hash: {message_hash}. Last node response: {node_result}. Last confirmation result: {last_result}. \
+         Recovery state is preserved at {}. Re-run the original `dexdo note deploy` command unchanged \
+         with this same recovery file; it checks the previous submit and expected note before any further deploy submit.",
+            NOTE_DEPLOY_ACTIVE_TIMEOUT.as_secs(),
+            recovery_path.display(),
+        ),
+        may_resubmit,
+    )))
+}
+
+#[derive(Debug)]
 struct NoteDeployFinalizedRootPnExitCode(i64);
 
 impl std::fmt::Display for NoteDeployFinalizedRootPnExitCode {
@@ -2559,6 +2785,7 @@ fn note_deploy_persist_rejected_proof(
         );
     }
     let rejected_layer = checkpoint.reject_current_proof()?;
+    recovery.deploy_submission = None;
     note_deploy_persist_voucher_checkpoint(recovery_path, recovery, kind, checkpoint)?;
     eprintln!(
         "note deploy recovery: {} proof layer {rejected_layer} rejected with exact 403 and \
@@ -2575,12 +2802,13 @@ fn note_deploy_rootpn_action_result(
     receipt: Option<dexdo_core::chain::NoteDeployRootPnActionObservation>,
 ) -> Result<()> {
     let Some(receipt) = receipt else {
-        if let Some(error) = submit_error {
-            return Err(anyhow::anyhow!(
-                "RootPN.{method}: {error}; no bounded finalized receipt"
-            ));
-        }
-        bail!("RootPN.{method}: no bounded finalized receipt");
+        let result = submit_error.map_or_else(
+            || format!("RootPN.{method}: no bounded finalized receipt"),
+            |error| format!("RootPN.{method}: {error}; no bounded finalized receipt"),
+        );
+        return Err(anyhow::Error::new(NoteDeployUnconfirmed::new(
+            result, false,
+        )));
     };
     if receipt.aborted
         || receipt.compute_exit_code != 0
@@ -2604,12 +2832,16 @@ fn note_deploy_rootpn_action_result(
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn note_deploy_submit_rootpn_call(
     client: &dexdo_core::ChainClient,
     root_pn: &dexdo_core::Address,
     method: &str,
     args: serde_json::Value,
     pn_keys: &dexdo_core::KeyPair,
+    recovery_path: &std::path::Path,
+    recovery: &mut crate::cli::note::NoteDeployRecoveryState,
+    expected_note: &str,
 ) -> Result<()> {
     use dexdo_core::{
         ackinacki_wallet::query::{fetch_dapp_id, send_message_routed},
@@ -2631,6 +2863,13 @@ async fn note_deploy_submit_rootpn_call(
     .map_err(|error| anyhow::anyhow!("encode RootPN.{method}: {error}"))?;
     let http = dexdo_core::chain_http_client()?;
     let dapp_id = fetch_dapp_id(&http, client.endpoint(), root_pn.bare()).await?;
+    recovery.deploy_submission = Some(note_deploy_submission_from_boc(
+        &boc,
+        root_pn,
+        &dapp_id,
+        expected_note,
+    )?);
+    crate::cli::note::write_note_deploy_recovery(recovery_path, recovery)?;
     let submit_error = send_message_routed(
         &http,
         client.endpoint(),
@@ -2642,27 +2881,19 @@ async fn note_deploy_submit_rootpn_call(
     .await
     .err()
     .map(|error| anyhow::anyhow!(error));
-    let receipt = match dexdo_core::chain::observe_note_deploy_rootpn_action(
-        &http,
-        client.endpoint(),
-        &boc,
-        root_pn.bare(),
-        &dapp_id,
+    recovery
+        .deploy_submission
+        .as_mut()
+        .expect("persisted before POST")
+        .last_submit_error = submit_error.as_ref().map(|error| format!("{error:#}"));
+    crate::cli::note::write_note_deploy_recovery(recovery_path, recovery)?;
+    note_deploy_wait_confirmation(
+        client,
+        expected_note,
+        recovery_path,
+        recovery.deploy_submission.as_ref(),
     )
     .await
-    {
-        Ok(receipt) => receipt,
-        Err(observe_error) => {
-            let submit_context = submit_error.as_ref().map_or_else(
-                || "POST returned success".to_string(),
-                |error| format!("POST returned {error}"),
-            );
-            return Err(observe_error.context(format!(
-                "observe finalized RootPN.{method} receipt after {submit_context}"
-            )));
-        }
-    };
-    note_deploy_rootpn_action_result(method, submit_error, receipt)
 }
 
 /// `RootPN.deployPrivateNote` arguments. `value` is the NOMINAL the proof was built over -- the
@@ -2687,19 +2918,40 @@ fn note_deploy_private_note_params(
     }))
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn note_deploy_submit_private_note(
     client: &dexdo_core::ChainClient,
     root_pn: &dexdo_core::Address,
     pn_keys: &dexdo_core::KeyPair,
     deposit_zk: &dexdo_core::private_note::halo2::live::Halo2Proof,
     deposit_identifier_hash: &str,
+    recovery_path: &std::path::Path,
+    expected_note: &str,
 ) -> Result<()> {
+    let mut recovery =
+        crate::cli::note::load_note_deploy_recovery(recovery_path)?.ok_or_else(|| {
+            anyhow::anyhow!("paid note-deploy recovery disappeared before RootPN submit")
+        })?;
+    if recovery.owner_public_key_hex != pn_keys.public_hex()
+        || recovery
+            .deposit_voucher
+            .as_ref()
+            .and_then(|voucher| voucher.proof.as_ref())
+            != Some(&crate::cli::note::NoteDeployVoucherProof::from_halo2(
+                deposit_zk,
+            ))
+    {
+        bail!("RootPN submit does not match the durable paid owner/proof; refusing to submit");
+    }
     note_deploy_submit_rootpn_call(
         client,
         root_pn,
         "deployPrivateNote",
         note_deploy_private_note_params(pn_keys.public_hex(), deposit_zk, deposit_identifier_hash)?,
         pn_keys,
+        recovery_path,
+        &mut recovery,
+        expected_note,
     )
     .await
 }
@@ -2721,8 +2973,6 @@ async fn deploy_private_note_from_multisig_recoverable(
     };
     use dexdo_core::Address;
     use serde_json::json;
-    use std::time::Duration;
-
     if recovery.shell_funded && recovery.sanity_checked {
         recovery.ensure_ready_for_pool()?;
         return recovery.to_onboard_state();
@@ -2780,10 +3030,37 @@ async fn deploy_private_note_from_multisig_recoverable(
                 .map_err(|e| {
                     anyhow::anyhow!("RootPN.getPrivateNoteAddress before deployPrivateNote: {e}")
                 })?;
-            let pn = Address::parse(&pn_address)?;
-            let recovered_active = had_persisted_deposit_proof
-                && note_deploy_wait_existing_active(client, &pn, NOTE_DEPLOY_ACTIVE_TIMEOUT)
-                    .await?;
+            let mut previous_failure = None;
+            let recovered_active = if had_persisted_deposit_proof {
+                match note_deploy_wait_confirmation(
+                    client,
+                    &pn_address,
+                    recovery_path,
+                    recovery.deploy_submission.as_ref(),
+                )
+                .await
+                {
+                    Ok(()) => true,
+                    Err(error) if note_deploy_has_exact_finalized_rootpn_exit_code(&error, 403) => {
+                        previous_failure = Some(error);
+                        false
+                    }
+                    Err(error)
+                        if error
+                            .downcast_ref::<NoteDeployUnconfirmed>()
+                            .is_some_and(|pending| pending.may_resubmit)
+                            && recovery.deploy_submission.as_ref().is_none_or(|saved| {
+                                u64::from(saved.expire_at_unix)
+                                    <= note_deploy_now_unix().unwrap_or(0)
+                            }) =>
+                    {
+                        false
+                    }
+                    Err(error) => return Err(error),
+                }
+            } else {
+                false
+            };
             if recovered_active {
                 eprintln!(
                     "note deploy recovery: recovered active PrivateNote {} from persisted \
@@ -2804,12 +3081,20 @@ async fn deploy_private_note_from_multisig_recoverable(
                     async |proof| {
                         note_deploy_submit_proof_once(
                             proof,
-                            async |_proof| {
-                                note_deploy_wait_existing_active(client, &pn, Duration::ZERO).await
-                            },
+                            // Confirmation already checked the note in the same cycle as the exact receipt.
+                            async |_proof| Ok(false),
                             async |proof| {
+                                if let Some(error) = previous_failure.take() {
+                                    return Err(error);
+                                }
                                 note_deploy_submit_private_note(
-                                    client, &root_pn, pn_keys, proof, &dih_dec,
+                                    client,
+                                    &root_pn,
+                                    pn_keys,
+                                    proof,
+                                    &dih_dec,
+                                    recovery_path,
+                                    &pn_address,
                                 )
                                 .await
                             },
@@ -2846,7 +3131,6 @@ async fn deploy_private_note_from_multisig_recoverable(
                 )
                 .await?;
 
-                note_deploy_wait_active(client, &pn, NOTE_DEPLOY_ACTIVE_TIMEOUT).await?;
                 if failpoints.after_deploy_before_note_record {
                     bail!(
                         "simulated interruption after deployPrivateNote active before recovery note record. \
@@ -2945,25 +3229,6 @@ async fn note_deploy_wait_existing_shell_funding(
     .await
 }
 
-async fn note_deploy_wait_existing_active(
-    client: &dexdo_core::ChainClient,
-    note: &dexdo_core::Address,
-    timeout: std::time::Duration,
-) -> Result<bool> {
-    let deadline = std::time::Instant::now() + timeout;
-    loop {
-        if let Some(acc) = client.get_account_retrying(note).await? {
-            if acc.is_active() {
-                return Ok(true);
-            }
-        }
-        if std::time::Instant::now() >= deadline {
-            return Ok(false);
-        }
-        tokio::time::sleep(NOTE_DEPLOY_ACTIVE_POLL_INTERVAL).await;
-    }
-}
-
 async fn note_deploy_private_note_address(
     client: &dexdo_core::ChainClient,
     root_pn: &dexdo_core::Address,
@@ -2985,29 +3250,6 @@ async fn note_deploy_private_note_address(
         .ok_or_else(|| {
             anyhow::anyhow!("RootPN.getPrivateNoteAddress missing privateNoteAddress: {out}")
         })
-}
-
-async fn note_deploy_wait_active(
-    client: &dexdo_core::ChainClient,
-    address: &dexdo_core::Address,
-    timeout: std::time::Duration,
-) -> Result<()> {
-    let deadline = std::time::Instant::now() + timeout;
-    loop {
-        if let Some(acc) = client.get_account_retrying(address).await? {
-            if acc.is_active() {
-                return Ok(());
-            }
-        }
-        if std::time::Instant::now() >= deadline {
-            return Err(anyhow::anyhow!(
-                "{} did not become Active within {}s",
-                dexdo_core::address::display(&address.with_workchain()),
-                timeout.as_secs()
-            ));
-        }
-        tokio::time::sleep(NOTE_DEPLOY_ACTIVE_POLL_INTERVAL).await;
-    }
 }
 
 #[cfg(test)]
@@ -12497,3 +12739,11 @@ mod tests {
 #[cfg(test)]
 #[path = "note_sweep_1742_tests.rs"]
 mod note_sweep_1742_tests;
+
+#[cfg(test)]
+#[path = "note_deploy_confirmation_2043_tests.rs"]
+mod note_deploy_confirmation_2043_tests;
+
+#[cfg(test)]
+#[path = "note_deploy_confirmation_2043_review_tests.rs"]
+mod note_deploy_confirmation_2043_review_tests;

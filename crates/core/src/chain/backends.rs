@@ -8820,6 +8820,38 @@ impl ChainBackend for RealSellerBackend {
         self.chain.network()
     }
 
+    async fn seller_nonce_is_retired(&self, nonce: u64) -> Result<bool, ChainError> {
+        retry_seller_read("seller residual nonce history", || async {
+            let seller_pubkey = json!(format!("0x{}", self.keys.public_hex()));
+            let root_model = self
+                .chain
+                .root_model_address_for(&seller_pubkey)
+                .await
+                .map_err(map_err)?;
+            let tc = self
+                .chain
+                .token_contract_deploy_address(&self.keys, &root_model, nonce)
+                .await
+                .map_err(map_err)?;
+            if self
+                .chain
+                .get_account_retrying(&tc)
+                .await
+                .map_err(map_err)?
+                .is_some_and(|account| account.is_active())
+            {
+                return Ok(false);
+            }
+            Ok(self
+                .chain
+                .token_contract_settlement_receipts_if_present(&tc)
+                .await
+                .map_err(map_err)?
+                .is_some_and(|receipts| !receipts.events.is_empty()))
+        })
+        .await
+    }
+
     /// the seller daemon publishes offers without `provision_market`'s note-current gate; enforce it here
     /// so a note orphaned by a contract redeploy (stale code_hash) fails closed with an actionable "re-mint"
     /// message instead of a raw `TVM_ERROR` from `postSellOffer`.

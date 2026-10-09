@@ -301,19 +301,21 @@ mod issue_1203 {
             super::super::BuyerSubmitIntentKind::ContinuityRenewal,
             current,
         );
-        runtime.block_on(super::super::submit_buyer_continuity_next_deal(
-            chain,
-            &buyer,
-            Some(planner),
-            &current.to_string(),
-            Some(note_addr),
-            &intent,
-            super::super::BuyerOrderTerms {
-                ticks: TICKS,
-                max_price: MAX_PRICE,
-                escrow: dexdo_core::required_escrow_for_buy(TICKS, MAX_PRICE),
-            },
-        ))
+        runtime
+            .block_on(super::super::submit_buyer_continuity_next_deal(
+                chain,
+                &buyer,
+                Some(planner),
+                &current.to_string(),
+                Some(note_addr),
+                &intent,
+                super::super::BuyerOrderTerms {
+                    ticks: TICKS,
+                    max_price: MAX_PRICE,
+                    escrow: dexdo_core::required_escrow_for_buy(TICKS, MAX_PRICE),
+                },
+            ))
+            .map(|outcome| outcome.token_contract)
     }
 
     #[test]

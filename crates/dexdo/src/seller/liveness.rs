@@ -998,52 +998,73 @@ async fn reap_expired_offer(
     // precondition is simply already true. This is also why "somebody else expired it first" needs no
     // branch of its own: it is the ordinary first pass, minus the submit.
     let mut expiry_submit = "not_needed".to_string();
-    let mut submitted = false;
-    let mut last;
-    loop {
-        // Every read is inside the budget, not merely checked against it afterwards: a chain that
-        // never answers must not hold the seller in a cleanup it can neither finish nor abandon.
-        match tokio::time::timeout_at(deadline, reap_state(chain, cfg, identity)).await {
-            Ok(Ok(Ok(decision))) => return decision,
-            Ok(Ok(Err(pending))) => last = format!("expiry_submit={expiry_submit}; {pending}"),
-            Ok(Err(error)) => last = format!("expiry_submit={expiry_submit}; read_failed: {error}"),
-            Err(_) => last = format!("expiry_submit={expiry_submit}; read_failed: timeout"),
-        }
-        if !submitted {
-            submitted = true;
-            expiry_submit = match tokio::time::timeout_at(
-                deadline,
-                chain.expire_resting_sell_order(&identity.token_contract, identity.order_id),
-            )
-            .await
-            {
-                Ok(Ok(())) => "submitted".to_string(),
-                Ok(Err(error)) => format!("failed: {error}"),
-                Err(_) => "timeout".to_string(),
+    let mut last = match tokio::time::timeout_at(deadline, reap_state(chain, cfg, identity)).await {
+        Ok(Ok(Ok(decision))) => return decision,
+        Ok(Ok(Err(pending))) => pending,
+        Ok(Err(error)) => format!("read_failed: {error}"),
+        Err(_) => "read_failed: timeout".to_string(),
+    };
+    if tokio::time::Instant::now() < deadline {
+        expiry_submit = "pending".to_string();
+        let result = tokio::time::timeout_at(deadline, async {
+            // A missing submit response must not hide a removal that is already readable. Keep
+            // exactly one submit in flight while the existing authoritative gate keeps polling.
+            let submit =
+                chain.expire_resting_sell_order(&identity.token_contract, identity.order_id);
+            let confirmation = async {
+                loop {
+                    let wake_at =
+                        std::cmp::min(tokio::time::Instant::now() + poll_interval, deadline);
+                    tokio::time::sleep_until(wake_at).await;
+                    if tokio::time::Instant::now() >= deadline {
+                        return std::future::pending::<RelistDecision>().await;
+                    }
+                    match reap_state(chain, cfg, identity).await {
+                        Ok(Ok(decision)) => return decision,
+                        Ok(Err(pending)) => last = pending,
+                        Err(error) => last = format!("read_failed: {error}"),
+                    }
+                }
             };
-            tracing::info!(
-                event = "seller_offer_reap",
-                timestamp = unix_timestamp(),
-                owner_note = %display_dexdo_address(&identity.owner_note),
-                token_contract = %display_token_contract(&identity.token_contract),
-                order_id = identity.order_id,
-                expiry_submit = %expiry_submit,
-                "permissionless expiry submitted for the seller's own expired ask"
-            );
-            last = format!("expiry_submit={expiry_submit}; awaiting authoritative removal");
+            tokio::pin!(submit, confirmation);
+            tokio::select! {
+                decision = &mut confirmation => decision,
+                result = &mut submit => {
+                    expiry_submit = match result {
+                        Ok(()) => "submitted".to_string(),
+                        Err(error) => format!("failed: {error}"),
+                    };
+                    confirmation.await
+                }
+            }
+        })
+        .await;
+        if result.is_err() {
+            if expiry_submit == "pending" {
+                expiry_submit = "timeout".to_string();
+            }
+            last = format!("{last}; read_failed: timeout");
         }
-        if tokio::time::Instant::now() >= deadline {
-            return RelistDecision::Unproven {
-                known_result: format!(
-                    "{last}; operator_action=run `dexdo orders list` with the same `--note-addr` \
-                     and `--market` or `--model` this seller was started with, and confirm \
-                     TokenContract {} carries no live SELL before restarting the seller",
-                    display_token_contract(&identity.token_contract)
-                ),
-            };
+        tracing::info!(
+            event = "seller_offer_reap",
+            timestamp = unix_timestamp(),
+            owner_note = %display_dexdo_address(&identity.owner_note),
+            token_contract = %display_token_contract(&identity.token_contract),
+            order_id = identity.order_id,
+            expiry_submit = %expiry_submit,
+            "permissionless expiry submitted for the seller's own expired ask"
+        );
+        if let Ok(decision) = result {
+            return decision;
         }
-        let wake_at = std::cmp::min(tokio::time::Instant::now() + poll_interval, deadline);
-        tokio::time::sleep_until(wake_at).await;
+    }
+    RelistDecision::Unproven {
+        known_result: format!(
+            "expiry_submit={expiry_submit}; {last}; operator_action=run `dexdo orders list` with the same \
+             `--note-addr` and `--market` or `--model` this seller was started with, and confirm \
+             TokenContract {} carries no live SELL before restarting the seller",
+            display_token_contract(&identity.token_contract)
+        ),
     }
 }
 
@@ -1176,6 +1197,13 @@ fn trace_offer_relisted(
     successor_deadline: u64,
     remaining_ticks: u64,
 ) {
+    // Keep the accepted successor visible in ordinary output, just like the startup announcement.
+    use std::io::Write;
+    println!(
+        "seller_offer_relisted order_id={successor_order_id} previous_order_id={} ticks={remaining_ticks}",
+        identity.order_id
+    );
+    let _ = std::io::stdout().flush();
     tracing::info!(
         event = "seller_offer_relisted",
         timestamp = unix_timestamp(),
@@ -2762,6 +2790,7 @@ fn canonical_timing(
 
 #[cfg(test)]
 mod tests {
+    include!("expiry_confirmation_2050_tests.rs");
 
     /// the seller's manual-cancellation guidance is the one output path here that names a
     /// command, and it must not pretend to be a runnable line: `orders` needs an identity and a
@@ -5948,6 +5977,9 @@ mod tests {
         latch_release_after_reads: u64,
         latch_reads: AtomicU64,
         expire_fails: bool,
+        expiry_reply_pending: bool,
+        expiry_duplicate: bool,
+        reap_read_errors: AtomicU64,
         /// Set the moment the expiry write is submitted, so a test can order a shutdown after cleanup.
         reaped: Arc<tokio::sync::Notify>,
         /// Set after the freshly posted successor is read back from the authoritative book.
@@ -5974,6 +6006,9 @@ mod tests {
                 latch_release_after_reads: 0,
                 latch_reads: AtomicU64::new(0),
                 expire_fails: false,
+                expiry_reply_pending: false,
+                expiry_duplicate: false,
+                reap_read_errors: AtomicU64::new(0),
                 reaped: Arc::new(tokio::sync::Notify::new()),
                 successor_observed: Arc::new(tokio::sync::Notify::new()),
             };
@@ -6130,6 +6165,16 @@ mod tests {
             &self,
             token_contract: &TokenContract,
         ) -> Result<Vec<OrderBookOrder>, ChainError> {
+            if !self.expire_calls.lock().unwrap().is_empty()
+                && self
+                    .reap_read_errors
+                    .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |n| n.checked_sub(1))
+                    .is_ok()
+            {
+                return Err(ChainError::Transport(
+                    "expiry confirmation read failed".into(),
+                ));
+            }
             let rows = self
                 .rows
                 .lock()
@@ -6155,18 +6200,30 @@ mod tests {
                 return Err(ChainError::Transport("response lost after submit".into()));
             }
             if self.expiry_is_ignored {
-                return Ok(());
+                return if self.expiry_duplicate {
+                    Err(ChainError::Transport("DUPLICATE_MESSAGE".into()))
+                } else {
+                    Ok(())
+                };
             }
-            let mut rows = self.rows.lock().unwrap();
-            let Some(position) = rows.iter().position(|row| row.order_id == order_id) else {
-                return Ok(());
-            };
-            if unix_timestamp() < rows[position].deadline {
-                return Ok(());
+            {
+                let mut rows = self.rows.lock().unwrap();
+                let Some(position) = rows.iter().position(|row| row.order_id == order_id) else {
+                    return Ok(());
+                };
+                if unix_timestamp() < rows[position].deadline {
+                    return Ok(());
+                }
+                rows.remove(position);
+                if self.latch_release_after_reads == 0 {
+                    *self.offer_posted.lock().unwrap() = false;
+                }
             }
-            rows.remove(position);
-            if self.latch_release_after_reads == 0 {
-                *self.offer_posted.lock().unwrap() = false;
+            if self.expiry_reply_pending {
+                std::future::pending::<()>().await;
+            }
+            if self.expiry_duplicate {
+                return Err(ChainError::Transport("DUPLICATE_MESSAGE".into()));
             }
             Ok(())
         }
@@ -6334,6 +6391,65 @@ mod tests {
         cfg.price_per_tick = 1000;
         cfg.max_ticks = ticks;
         cfg
+    }
+
+    fn relist_child_output(test_name: &str) -> String {
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                &format!("seller::liveness::tests::{test_name}"),
+                "--show-output",
+            ])
+            .env_remove("RUST_LOG")
+            .output()
+            .expect("run the relist scenario without a tracing subscriber");
+        let stdout = String::from_utf8(output.stdout).unwrap();
+        assert!(
+            output.status.success() && stdout.contains("1 passed;"),
+            "relist scenario {test_name} failed or did not run: {stdout}\n{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        stdout
+    }
+
+    /// every accepted successor is visible even when INFO tracing is disabled.
+    #[test]
+    fn relist_reports_each_successor_without_tracing() {
+        let output =
+            relist_child_output("relisting_conserves_capacity_and_never_doubles_the_live_offer");
+        let events = output
+            .lines()
+            .filter(|line| line.starts_with("seller_offer_relisted "))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            events,
+            [
+                "seller_offer_relisted order_id=12 previous_order_id=11 ticks=256",
+                "seller_offer_relisted order_id=14 previous_order_id=13 ticks=256",
+                "seller_offer_relisted order_id=16 previous_order_id=15 ticks=256",
+                "seller_offer_relisted order_id=18 previous_order_id=17 ticks=256",
+            ],
+            "each generation reports its accepted successor exactly once"
+        );
+        assert!(!output.contains("seller_offer_outcome RESTED"));
+        assert!(!output.contains("seller_offer_resume RESTING"));
+    }
+
+    /// failed cleanup, refusal, a match and shutdown must not announce a relist.
+    #[test]
+    fn relist_reports_no_success_when_no_successor_was_accepted() {
+        for test_name in [
+            "e2e_sell_11_an_unconfirmed_expiry_never_becomes_a_successor",
+            "e2e_sell_11_used_or_undersized_deals_never_get_a_successor",
+            "e2e_sell_11_a_match_wins_the_expiry_race_and_no_successor_is_posted",
+            "e2e_sell_11_a_shutdown_after_cleanup_never_creates_a_successor",
+        ] {
+            let output = relist_child_output(test_name);
+            assert!(
+                !output.contains("seller_offer_relisted"),
+                "{test_name} announced a relist without an accepted successor: {output}"
+            );
+        }
     }
 
     /// E2E-SELL-10 /, the whole money path: deadline -> `expireOrder(exact id)` -> the deal's

@@ -1,3 +1,33 @@
+## v0.7.0
+
+### Fixes
+
+- Sellers can renew an expired offer as soon as the order book and deal confirm its removal,
+  even when the expiry request's response is delayed. Duplicate-message errors still require
+  confirmation before another offer is posted; existing automatic recovery remains available.
+- Sellers now print `seller_offer_relisted order_id=<new> previous_order_id=<old> ticks=<n>`
+  after each confirmed expiry re-post, so redirected output records successor offers even without
+  `RUST_LOG=info`.
+- `dexdo monitor` now reads the current order books for the supplied `--market` files and shows
+  the seller's live SELL offers instead of always reporting `offers in book: 0`. Repeated market
+  files do not duplicate offers, and a failed book read reports an error instead of an empty book.
+- Keep selling when a request finishes while the paid probe is being accepted. Delivery after the
+  probe decision remains claimable, including after a restart. Seller failures now explicitly warn
+  when a funded deal stops being served before settlement is confirmed.
+- `dexdo seller` skips destroyed contract addresses when provisioning unsold capacity and
+  automatically replaces an unused saved successor nonce that points to a destroyed contract.
+  Restarting the seller no longer requires editing its cursor file to recover that capacity.
+- `dexdo note deploy` now checks the exact receipt and waits up to two minutes for the expected
+  note after an uncertain RootPN submission, preserving the message identity for restart recovery.
+  `NOTE_DEPLOY_UNCONFIRMED` explains an unconfirmed result instead of reporting an internal error.
+  Resume the original command with the same recovery file; previously paid vouchers are reused
+  without another wallet payment, including recovery files created by older clients.
+- Buyer submissions now preserve purchase recovery when the Block Manager reports a timeout
+  forwarding to the Block Producer. The client checks the original purchase and retains its
+  identity through handover instead of reporting an internal error or submitting another BUY.
+  If confirmation is unavailable, keep the recovery files and re-run the same buyer command;
+  `AMBIGUOUS_SUBMIT` forbids a fresh money submission while the previous result is unknown.
+
 ## v0.6.0
 
 ### Breaking Changes

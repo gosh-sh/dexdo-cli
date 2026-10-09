@@ -1,7 +1,13 @@
 use crate::cli::args::MonitorArgs;
 use crate::cli::support::{load_note_tree, print_tree_snapshot, resolve_endpoints_file};
 use anyhow::{bail, Result};
-use dexdo_core::{aggregate_tree, ChainBackend, DobParams, MockChainBackend, ProtocolConsts};
+use dexdo_core::{
+    aggregate_tree, ChainBackend, DealView, DobParams, MarketManifest, MockChainBackend,
+    OfferListing, OrderBookOrder, ProtocolConsts, TreeSnapshot,
+};
+use std::collections::BTreeSet;
+use std::future::Future;
+use std::path::PathBuf;
 
 pub(crate) async fn run_monitor(args: MonitorArgs) -> Result<()> {
     // Real chain monitoring: a `RealNote` is a single key, not an HD tree, so the real monitor
@@ -32,9 +38,9 @@ pub(crate) async fn run_monitor(args: MonitorArgs) -> Result<()> {
 /// by-fact deal state on-chain through the SAME `print_tree_snapshot` (per-model breakdown + anomaly
 /// surfacing) as the mock path. Read-only -- only getters, moves nothing. Each manifest's `TokenContract` is
 /// read via `real_market_deal_view` (`getState`/`getSellerBond` + the buyer pubkey); the model/price come from the
-/// manifest. Live-verifiable once a deal `TokenContract` is deployed.
+/// manifest. Own live SELL offers are read from the book's current storage, rather than bounded event history.
 pub(crate) async fn run_monitor_real(args: &MonitorArgs) -> Result<()> {
-    use dexdo_core::{real_market_deal_view, MarketManifest, RealChainBackend, TreeSnapshot};
+    use dexdo_core::{real_market_deal_view, Address, RealChainBackend};
     if args.market.is_empty() {
         bail!(
             "a real chain monitor: pass --market <manifest>... (the operator's `dexdo provision` market \
@@ -54,10 +60,35 @@ pub(crate) async fn run_monitor_real(args: &MonitorArgs) -> Result<()> {
         )
     })?;
     let chain = RealChainBackend::connect(contracts)?;
+    let snapshot = read_real_monitor_snapshot_with(&args.market, |manifest| {
+        let chain = &chain;
+        async move {
+            let deal = real_market_deal_view(chain, &manifest).await?;
+            let book = Address::parse(&manifest.inference_order_book)?;
+            let orders = chain.inference_orderbook_live_orders(&book).await?;
+            Ok((deal, orders))
+        }
+    })
+    .await?;
+    print_tree_snapshot(&snapshot);
+    Ok(())
+}
+
+// Keep the snapshot assembly on the production path; tests replace only the chain reads.
+async fn read_real_monitor_snapshot_with<R, Fut>(
+    markets: &[PathBuf],
+    mut read_market: R,
+) -> Result<TreeSnapshot>
+where
+    R: FnMut(MarketManifest) -> Fut,
+    Fut: Future<Output = Result<(DealView, Vec<OrderBookOrder>)>>,
+{
+    let mut offers = Vec::new();
+    let mut seen_offers = BTreeSet::new();
     let mut note_ids = Vec::new();
     let mut deals = Vec::new();
     let mut exposure: u64 = 0;
-    for m in &args.market {
+    for m in markets {
         let json = std::fs::read_to_string(m)
             .map_err(|e| anyhow::anyhow!("read --market {}: {e}", m.display()))?;
         let manifest = MarketManifest::from_json(&json)
@@ -68,9 +99,31 @@ pub(crate) async fn run_monitor_real(args: &MonitorArgs) -> Result<()> {
         note_ids.push(manifest.seller_note.clone());
         // Fail loud (review): the real reader returns an error for an undeployed/unreadable TC or a
         // manifest/getter mismatch -- surface it with the offending --market file, never as empty data.
-        let deal = real_market_deal_view(&chain, &manifest)
+        let (deal, orders) = read_market(manifest.clone())
             .await
             .map_err(|e| anyhow::anyhow!("--market {}: {e}", m.display()))?;
+        let as_of = crate::cli::provenance::now_unix()?;
+        let seller = dexdo_core::normalize_wallet_address(&manifest.seller_note)
+            .map_err(anyhow::Error::msg)?;
+        for order in orders
+            .iter()
+            .filter(|order| order.is_live_resting_ask_at(as_of))
+        {
+            if dexdo_core::normalize_wallet_address(&order.owner_note)
+                .map_err(anyhow::Error::msg)?
+                != seller
+                || !seen_offers.insert((manifest.inference_order_book.clone(), order.order_id))
+            {
+                continue;
+            }
+            offers.push(OfferListing {
+                seller_id: order.owner_note.clone(),
+                // The live resting-ask predicate already requires a TokenContract.
+                token_contract: order.token_contract.clone().unwrap(),
+                price_per_tick: u64::try_from(order.price_per_tick).unwrap_or(u64::MAX),
+                max_ticks: u64::try_from(order.ticks).unwrap_or(u64::MAX),
+            });
+        }
         if let Some(s) = &deal.snapshot {
             if !s.closed {
                 // The operator is the SELLER of their own market, so the note's at-risk SHELL is the
@@ -82,11 +135,14 @@ pub(crate) async fn run_monitor_real(args: &MonitorArgs) -> Result<()> {
         }
         deals.push(deal);
     }
-    print_tree_snapshot(&TreeSnapshot {
+    Ok(TreeSnapshot {
         note_ids,
-        offers: Vec::new(),
+        offers,
         deals,
         exposure,
-    });
-    Ok(())
+    })
 }
+
+#[cfg(test)]
+#[path = "monitor_2048_tests.rs"]
+mod tests;

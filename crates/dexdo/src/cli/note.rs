@@ -662,8 +662,51 @@ pub(crate) struct NoteDeployRecoveryState {
     pub deployed_at_unix: Option<u64>,
     #[serde(default)]
     pub deposit_voucher: Option<NoteDeployVoucherCheckpoint>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub deploy_submission: Option<NoteDeploySubmission>,
     pub shell_funded: bool,
     pub sanity_checked: bool,
+}
+
+/// Identity of a prepared RootPN submit, persisted before POST. An expected address is not a deploy fact.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub(crate) struct NoteDeploySubmission {
+    pub message_hash: String,
+    pub root_pn_address: String,
+    pub expected_note_address: String,
+    pub time_ms: u64,
+    pub expire_at_unix: u32,
+    pub last_submit_error: Option<String>,
+}
+
+impl NoteDeploySubmission {
+    pub(crate) fn validate(&self) -> Result<()> {
+        if normalize_secret_like_hex(&self.message_hash, "deploy message hash")?
+            != self.message_hash
+        {
+            bail!("deploy message hash must be normalized");
+        }
+        let root = dexdo_core::CanonicalAddress::parse(&self.root_pn_address)
+            .map_err(|error| anyhow::anyhow!(error))?;
+        let expected = dexdo_core::CanonicalAddress::parse(&self.expected_note_address)
+            .map_err(|error| anyhow::anyhow!(error))?;
+        if root.to_string() != self.root_pn_address
+            || expected.to_string() != self.expected_note_address
+        {
+            bail!("deploy submission addresses must retain canonical DApp identities");
+        }
+        let pinned_root =
+            dexdo_core::Address::parse(dexdo_core::private_note::artifacts::ROOT_PN_ADDRESS)?;
+        if root.account_id() != pinned_root.bare() || root.dapp_id() != expected.dapp_id() {
+            bail!("deploy submission has a different RootPN identity");
+        }
+        if u64::from(self.expire_at_unix)
+            <= std::time::Duration::from_millis(self.time_ms).as_secs()
+        {
+            bail!("deploy submission expiry must follow its message time");
+        }
+        Ok(())
+    }
 }
 
 impl std::fmt::Debug for NoteDeployRecoveryState {
@@ -1129,6 +1172,7 @@ impl NoteDeployRecoveryState {
             deposit_identifier_hash: None,
             deployed_at_unix: None,
             deposit_voucher: None,
+            deploy_submission: None,
             shell_funded: false,
             sanity_checked: false,
         };
@@ -1192,6 +1236,27 @@ impl NoteDeployRecoveryState {
             bail!(
                 "note deploy recovery file has pn_address but no deposit_identifier_hash; refusing to guess"
             );
+        }
+        if let Some(submission) = &self.deploy_submission {
+            submission.validate()?;
+            if self
+                .deposit_voucher
+                .as_ref()
+                .and_then(|voucher| voucher.proof.as_ref())
+                .is_none()
+            {
+                bail!("deploy submission has no persisted paid voucher proof");
+            }
+            if let Some(address) = &self.pn_address {
+                let recorded = dexdo_core::CanonicalAddress::parse(address)
+                    .map_err(|error| anyhow::anyhow!(error))?;
+                let expected =
+                    dexdo_core::CanonicalAddress::parse(&submission.expected_note_address)
+                        .map_err(|error| anyhow::anyhow!(error))?;
+                if recorded != expected {
+                    bail!("deploy submission expected note differs from the recorded note");
+                }
+            }
         }
         if let Some(voucher) = &self.deposit_voucher {
             voucher.ensure_matches(
@@ -2949,6 +3014,7 @@ mod note_deploy_tests {
             deposit_identifier_hash: state.deposit_identifier_hash,
             deployed_at_unix: state.deployed_at_unix,
             deposit_voucher: None,
+            deploy_submission: None,
             shell_funded: state.shell_funded,
             sanity_checked: state.sanity_checked,
         }

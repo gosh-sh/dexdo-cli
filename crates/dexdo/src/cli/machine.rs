@@ -327,6 +327,7 @@ pub(crate) enum ErrorCode {
     AccountUnreadable,
     ChainRevert,
     AmbiguousSubmit,
+    NoteDeployUnconfirmed,
     SettlementFailed,
     NotRecoverableYet,
     DisputedDeal,
@@ -376,6 +377,7 @@ impl ErrorCode {
             Self::AccountUnreadable => "ACCOUNT_UNREADABLE",
             Self::ChainRevert => "CHAIN_REVERT",
             Self::AmbiguousSubmit => "AMBIGUOUS_SUBMIT",
+            Self::NoteDeployUnconfirmed => "NOTE_DEPLOY_UNCONFIRMED",
             Self::SettlementFailed => "SETTLEMENT_FAILED",
             Self::NotRecoverableYet => "NOT_RECOVERABLE_YET",
             Self::DisputedDeal => "DISPUTED_DEAL",
@@ -399,6 +401,7 @@ impl ErrorCode {
                 | Self::EndpointReadinessFailed
                 | Self::GatewayConnectFailed
                 | Self::ChainTransport
+                | Self::NoteDeployUnconfirmed
                 | Self::SettlementFailed
                 | Self::NotRecoverableYet
         )
@@ -424,6 +427,7 @@ impl ErrorCode {
             }
             Self::ChainRevert => "chain returned a non-success contract result",
             Self::AmbiguousSubmit => "money submit outcome is unknown and must not be retried",
+            Self::NoteDeployUnconfirmed => "PrivateNote creation is not confirmed; resume the same note deploy command with the same recovery file, without another wallet payment",
             Self::SettlementFailed => "settlement submission failed",
             Self::NotRecoverableYet => "deal is not recoverable yet",
             Self::DisputedDeal => "deal is disputed and needs dispute resolution",
@@ -444,6 +448,13 @@ mod machine_classifier_conformance_1795;
 
 pub(crate) fn classify_error(operation: &str, err: &anyhow::Error) -> ErrorCode {
     for cause in err.chain() {
+        if operation == OP_NOTE_DEPLOY
+            && cause
+                .downcast_ref::<super::note_cmd::NoteDeployUnconfirmed>()
+                .is_some()
+        {
+            return ErrorCode::NoteDeployUnconfirmed;
+        }
         if cause
             .downcast_ref::<super::deals::DealHandleSchemaTooNew>()
             .is_some()

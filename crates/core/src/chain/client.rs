@@ -3646,7 +3646,7 @@ fn checked_submit_response(resp: Value) -> Result<Value> {
     })
 }
 
-fn external_message_hash(boc_base64: &str) -> Result<String> {
+pub fn external_message_hash(boc_base64: &str) -> Result<String> {
     use base64::Engine;
 
     let bytes = base64::engine::general_purpose::STANDARD
@@ -3939,8 +3939,28 @@ async fn send_message_routed_money_once(
             source: anyhow::Error::new(source),
         })
     })?;
-    checked_submit_response(response)
-        .map_err(|source| anyhow::Error::new(MoneySubmitError::Rejected { source }))
+    checked_submit_response(response).map_err(|source| {
+        // The manager timed out after forwarding the BOC. Its response is not proof that
+        // the producer rejected it; keep the original identity and reconcile without a new POST.
+        anyhow::Error::new(if is_block_producer_forwarding_timeout(&source) {
+            MoneySubmitError::Ambiguous { source }
+        } else {
+            MoneySubmitError::Rejected { source }
+        })
+    })
+}
+
+fn is_block_producer_forwarding_timeout(error: &anyhow::Error) -> bool {
+    error
+        .downcast_ref::<crate::onchain_diagnostics::OnchainSubmitError>()
+        .is_some_and(|error| {
+            let response = &error.sanitized_payload()["error"];
+            response["code"] == "INTERNAL_ERROR"
+                && response["message"].as_str().is_some_and(|message| {
+                    message.starts_with("The message redirection to the Block Producer has failed:")
+                        && message.contains("(source: operation timed out)")
+                })
+        })
 }
 
 fn is_queue_overflow_submit(error: &anyhow::Error) -> bool {
@@ -4244,6 +4264,27 @@ pub struct NoteDeployRootPnActionObservation {
     pub compute_exit_code: i64,
     pub aborted: bool,
     pub action_result_code: Option<i64>,
+}
+
+/// One exact-hash read for note deploy's bounded confirmation and post-restart recovery.
+/// Reuses the existing receipt query, retry policy and destination/finality correlation.
+pub async fn read_note_deploy_rootpn_action_by_hash(
+    http: &reqwest::Client,
+    endpoint: &str,
+    message_hash: &str,
+    account_id: &str,
+    dapp_id: &str,
+) -> Result<Option<NoteDeployRootPnActionObservation>> {
+    let response =
+        query_exact_destination_receipt(http, endpoint, account_id, dapp_id, message_hash).await?;
+    if let Some(errors) = response.get("errors") {
+        return Err(anyhow!(
+            "note-deploy RootPN receipt GraphQL errors: {errors}"
+        ));
+    }
+    parse_exact_destination_receipt(&response, account_id, dapp_id, message_hash)?
+        .map(note_deploy_rootpn_action_observation)
+        .transpose()
 }
 
 pub async fn observe_note_deploy_rootpn_action(
@@ -19418,4 +19459,6 @@ mod tests {
             crate::onchain_diagnostics::contract_error_names(121).contains(&"dex::ERR_NOTE_BUSY")
         );
     }
+
+    include!("client/issue_2064_tests.rs");
 }

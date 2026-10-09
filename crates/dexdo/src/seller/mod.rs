@@ -339,6 +339,27 @@ pub fn persist_seller_replacement(
     Ok(result)
 }
 
+/// Replace only an unlinked nonce reservation, after the caller has proven its address retired.
+/// An adopted successor and a reservation changed by another writer must never be overwritten.
+pub fn replace_unlinked_seller_replacement_nonce(
+    cursor_path: &Path,
+    token_contract: &TokenContract,
+    retired_nonce: u64,
+    fresh_nonce: u64,
+) -> Result<()> {
+    let mut cursor = SellerMatchWatchCursor::load_or_new(cursor_path, token_contract)?;
+    let fill = cursor
+        .fill
+        .as_mut()
+        .ok_or_else(|| anyhow!("seller match has no fill lineage"))?;
+    fill.validate()?;
+    if fill.replacement_nonce != Some(retired_nonce) || fill.replacement_token_contract.is_some() {
+        bail!("seller replacement nonce changed or is already linked; refusing to replace nonce {retired_nonce}");
+    }
+    fill.replacement_nonce = Some(fresh_nonce);
+    cursor.save(cursor_path)
+}
+
 fn now_unix() -> Result<u64> {
     Ok(std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)

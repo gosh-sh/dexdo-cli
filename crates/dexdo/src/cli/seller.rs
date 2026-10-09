@@ -51,6 +51,21 @@ struct OrdinaryCapacityObserver {
 }
 
 impl dexdo::seller::ClaimStateObserver for OrdinaryCapacityObserver {
+    fn prepare_probe(
+        &self,
+        token_contract: &dexdo_core::TokenContract,
+        delivered: u64,
+    ) -> std::result::Result<u64, dexdo_core::ChainError> {
+        self.gateway
+            .prepare_probe_capacity(token_contract, delivered)
+            .map_err(|error| {
+                dexdo_core::ChainError::Chain(format!(
+                    "TokenContract {}: persist probe delivery boundary before acceptProbe: {error}",
+                    display_token_contract(token_contract)
+                ))
+            })
+    }
+
     fn observe(
         &self,
         token_contract: &dexdo_core::TokenContract,
@@ -125,6 +140,21 @@ struct ClaimMeasurementObserver {
 }
 
 impl dexdo::seller::ClaimStateObserver for ClaimMeasurementObserver {
+    fn prepare_probe(
+        &self,
+        token_contract: &dexdo_core::TokenContract,
+        delivered: u64,
+    ) -> std::result::Result<u64, dexdo_core::ChainError> {
+        self.gateway
+            .prepare_probe_capacity(token_contract, delivered)
+            .map_err(|error| {
+                dexdo_core::ChainError::Chain(format!(
+                    "TokenContract {}: persist probe delivery boundary before acceptProbe: {error}",
+                    display_token_contract(token_contract)
+                ))
+            })
+    }
+
     fn observe(
         &self,
         _token_contract: &dexdo_core::TokenContract,
@@ -1244,6 +1274,13 @@ async fn record_advance_result(
                     }
                 }
             };
+            if !resolved {
+                tracing::error!(
+                    token_contract = %display_token_contract(&token_contract),
+                    "seller pool stopped serving an unresolved funded deal; settlement is unconfirmed \
+                     and operator action is required"
+                );
+            }
             if !resolved && first_error.is_none() {
                 first_error.replace(anyhow::anyhow!(
                     "--token-contract {}: by-fact advance failed: {error}",
@@ -2828,6 +2865,38 @@ impl SellerPoolPolicyView for SellerStartupPolicy<'_> {
     }
 }
 
+async fn select_seller_replacement_nonce(
+    current: &SellerPoolDeal,
+    fill: &dexdo::seller::SellerFillLineage,
+    known_nonces: &std::collections::HashMap<u64, SellerPoolDeal>,
+    context: &SellerPoolContext<'_>,
+) -> Result<u64> {
+    let mut nonce = match fill.replacement_nonce {
+        Some(nonce) => {
+            // A linked/known child or an unresolved deploy must recover its exact identity.
+            // History must never authorize a second successor for a potentially submitted deal.
+            if fill.replacement_token_contract.is_some()
+                || known_nonces.contains_key(&nonce)
+                || seller_market_handle_records(context.deals_dir, context.note_addr)?
+                    .into_values()
+                    .any(|record| record.provision_pending && record.market.nonce == nonce)
+            {
+                return Ok(nonce);
+            }
+            nonce
+        }
+        None => current.nonce.checked_add(1).ok_or_else(|| {
+            anyhow::anyhow!("seller residual nonce overflow at {}", current.nonce)
+        })?,
+    };
+    while known_nonces.contains_key(&nonce) || current.chain.seller_nonce_is_retired(nonce).await? {
+        nonce = nonce
+            .checked_add(1)
+            .ok_or_else(|| anyhow::anyhow!("seller residual nonce overflow at {nonce}"))?;
+    }
+    Ok(nonce)
+}
+
 async fn run_seller_pool<S, F, Fut, P>(
     seller: &dexdo::seller::RunningSeller,
     deals: Vec<SellerPoolDeal>,
@@ -3237,26 +3306,29 @@ where
                         let _ = std::io::stdout().flush();
                     }
                 }
-                let next_nonce = match fill.replacement_nonce {
-                    Some(nonce) => nonce,
-                    None => {
-                        let mut nonce = current.nonce.checked_add(1).ok_or_else(|| {
-                            anyhow::anyhow!("seller residual nonce overflow at {}", current.nonce)
-                        })?;
-                        while known_nonces.contains_key(&nonce) {
-                            nonce = nonce.checked_add(1).ok_or_else(|| {
-                                anyhow::anyhow!("seller residual nonce overflow at {nonce}")
-                            })?;
-                        }
-                        dexdo::seller::persist_seller_replacement(
-                            &current.watch.cursor_path,
-                            &current.cfg.token_contract,
-                            nonce,
-                            None,
+                let next_nonce = select_seller_replacement_nonce(
+                    &current, &fill, &known_nonces, &context,
+                ).await?;
+                // The chain reads above may have taken time. Recheck shutdown before reserving or
+                // submitting a successor, just as at the pending-queue boundary.
+                if *shutdown_requested || futures::poll!(shutdown.as_mut()).is_ready() {
+                    *shutdown_requested = true;
+                    return Ok(());
+                }
+                match fill.replacement_nonce {
+                    Some(retired) if retired != next_nonce => {
+                        dexdo::seller::replace_unlinked_seller_replacement_nonce(
+                            &current.watch.cursor_path, &current.cfg.token_contract,
+                            retired, next_nonce,
                         )?;
-                        nonce
                     }
-                };
+                    None => {
+                        dexdo::seller::persist_seller_replacement(
+                            &current.watch.cursor_path, &current.cfg.token_contract, next_nonce, None,
+                        )?;
+                    }
+                    _ => {}
+                }
                 let frame_model = current
                     .market
                     .as_ref()
@@ -3504,6 +3576,11 @@ where
                     "seller pool isolated residual provision failure"
                 );
                 first_error.get_or_insert(error);
+            }
+            if *shutdown_requested {
+                stopped_by_operator = true;
+                let _ = stop_tx.send(true);
+                break 'pool;
             }
         }
 
@@ -6291,6 +6368,9 @@ mod tests {
         /// Unknown owner-fill TokenContracts whose terminal account disappearance is scripted by
         /// the pool-entry regressions. Empty for every pre-existing pool test.
         terminal_owner_fills: Mutex<std::collections::HashSet<String>>,
+        retired_nonces: Mutex<std::collections::HashSet<u64>>,
+        nonce_read_failure: AtomicBool,
+        nonce_read_calls: AtomicU64,
     }
 
     impl PoolTestBackend {
@@ -6352,6 +6432,9 @@ mod tests {
                 getdeal_gone: AtomicBool::new(false),
                 terms_override: Mutex::new(None),
                 terminal_owner_fills: Mutex::new(std::collections::HashSet::new()),
+                retired_nonces: Mutex::new(std::collections::HashSet::new()),
+                nonce_read_failure: AtomicBool::new(false),
+                nonce_read_calls: AtomicU64::new(0),
             }
         }
 
@@ -6417,6 +6500,16 @@ mod tests {
 
     #[async_trait::async_trait]
     impl ChainBackend for PoolTestBackend {
+        async fn seller_nonce_is_retired(&self, nonce: u64) -> Result<bool, ChainError> {
+            self.nonce_read_calls.fetch_add(1, Ordering::Relaxed);
+            if self.nonce_read_failure.load(Ordering::Relaxed) {
+                return Err(ChainError::Chain(
+                    "injected nonce history read failure".to_string(),
+                ));
+            }
+            Ok(self.retired_nonces.lock().unwrap().contains(&nonce))
+        }
+
         // only a fixture that opted into `cancel_confirms` accepts a cancel; every other
         // fixture keeps the trait's default refusal, unchanged.
         async fn cancel_resting_sell_order(
@@ -10410,6 +10503,7 @@ mod tests {
     }
 
     include!("seller_1057_shutdown_tests.rs");
+    include!("seller_2047_nonce_tests.rs");
 
     include!("seller_1773_shutdown_drain_tests.rs");
 

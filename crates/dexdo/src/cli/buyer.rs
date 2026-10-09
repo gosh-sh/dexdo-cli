@@ -3034,6 +3034,7 @@ async fn complete_buyer_submit_with_journal(
     note_addr: &str,
     journal_path: &std::path::Path,
 ) -> Result<(dexdo_core::TokenContract, MatchedTokenContractStatus)> {
+    let ambiguous_submit = submit_result.as_ref().is_err_and(is_ambiguous_submit_error);
     if let Err(error) = &submit_result {
         if money_submit_error_clears_journal(error) {
             clear_buyer_submit_journal(journal_path)?;
@@ -3050,12 +3051,12 @@ async fn complete_buyer_submit_with_journal(
         .await
         .map_err(|error| {
             anyhow::Error::new(ChainError::AmbiguousSubmit(format!(
-                "buyer money POST may have landed but its MatchedFill is not yet provable; journal retained and no resubmit is safe: {error}"
+                "buyer money POST may have landed but its MatchedFill is not yet provable; journal retained; re-run the same buyer command to check the saved purchase before any new BUY: {error}"
             )))
         })?
         .ok_or_else(|| {
             anyhow::Error::new(ChainError::AmbiguousSubmit(
-                "buyer money POST may have landed but returned no MatchedFill; journal retained"
+                "buyer money POST may have landed but returned no MatchedFill; journal retained; re-run the same buyer command to check the saved purchase before any new BUY"
                     .to_string(),
             ))
         })?;
@@ -3091,7 +3092,11 @@ async fn complete_buyer_submit_with_journal(
                 "buyer money POST landed but its matched TokenContract state is not yet provable; journal retained and no resubmit is safe: {error}"
             )))
         })?;
-    clear_buyer_submit_journal(journal_path)?;
+    // An uncertain POST can be followed by a crash before handover/handle persistence.
+    // Keep its proven match and identity until the caller has durably adopted the deal.
+    if !ambiguous_submit {
+        clear_buyer_submit_journal(journal_path)?;
+    }
     Ok((token_contract, status))
 }
 
@@ -3792,10 +3797,9 @@ fn buyer_fresh_buy_budget(
 }
 
 /// `recovery` is `--resume`, the one entry point whose job is getting out of a crash. It
-/// decides one thing and nothing else: whether a sentinel whose holder the kernel says is GONE may
-/// be taken over. Everything after this point is identical either way, and that is deliberate -- the
-/// by-fact reconciliation below is what makes reclaiming safe, so it must not be something the
-/// recovery path can skip.
+/// permits taking over a sentinel whose holder the kernel says is gone. A matched successor also
+/// resumes its saved intent and terms rather than becoming a new foreground buy. The same strict
+/// journal validation and by-fact reconciliation apply before adoption.
 #[allow(clippy::too_many_arguments)]
 async fn raise_pending_buyer_money_before_fresh_reads(
     chain: &dyn ChainBackend,
@@ -3831,6 +3835,55 @@ async fn raise_pending_buyer_money_before_fresh_reads(
             pending.submit_identity,
             display_dexdo_address(&pending.order_book)
         ),
+    };
+    // Only the CLI recovery entry may adopt an already-matched successor's original generation.
+    // Fresh submits and explicit continuity requests retain their strict intent equality guard.
+    let successor_resume = recovery
+        && intent.predecessor_token_contract.is_none()
+        && matches!(
+            intent.kind,
+            BuyerSubmitIntentKind::Foreground | BuyerSubmitIntentKind::OnDemand
+        )
+        && matches!(
+            pending.intent.kind,
+            BuyerSubmitIntentKind::PolicyNextSeller
+                | BuyerSubmitIntentKind::ContinuityNextSeller
+                | BuyerSubmitIntentKind::ContinuityRenewal
+        )
+        && (!pending.resolved_matches.is_empty() || pending.resolved_match.is_some());
+    if successor_resume {
+        if let Some(requested_tc) = expected_token_contract {
+            let requested_tc = dexdo_core::Address::parse(requested_tc)?.with_workchain();
+            if !pending
+                .resolved_matches
+                .iter()
+                .chain(pending.resolved_match.iter())
+                .any(|matched| matched.token_contract.eq_ignore_ascii_case(&requested_tc))
+            {
+                return Err(anyhow::Error::new(ChainError::AmbiguousSubmit(
+                    "saved successor does not match the requested TokenContract; no new BOC was sent".into(),
+                )));
+            }
+        }
+    }
+    let intent = if successor_resume {
+        &pending.intent
+    } else {
+        intent
+    };
+    let expected_token_contract = if successor_resume {
+        pending.expected_token_contract.as_deref()
+    } else {
+        expected_token_contract
+    };
+    let requested_budget = if successor_resume {
+        Some(BuyerFreshBuyBudget {
+            ticks: pending.ticks,
+            max_price_per_tick: pending.max_price_per_tick,
+            escrow: pending.escrow,
+        })
+    } else {
+        requested_budget
     };
     let selection = BuyerQuoteSelection {
         order_book: if pending.expected_token_contract.is_some() {
@@ -6188,6 +6241,7 @@ fn is_malformed_handover_error(error: &anyhow::Error) -> bool {
     msg.contains("malformed handover") || msg.contains("handover decrypt failed")
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn apply_malformed_handover_policy(
     chain: &dyn ChainBackend,
     buyer: &dexdo::buyer::Buyer,
@@ -6195,6 +6249,8 @@ async fn apply_malformed_handover_policy(
     buyer_policy: &policy::BuyerRuntimePolicy,
     preserve_matched_subscription: bool,
     error: &anyhow::Error,
+    pool_note_addr: Option<&str>,
+    submit_identity: Option<&str>,
 ) -> Result<()> {
     let token_contract_display = dexdo_core::address::display_self_dapp(token_contract);
     if preserve_matched_subscription {
@@ -6211,6 +6267,7 @@ async fn apply_malformed_handover_policy(
             // is no inactivity gate to wait out any more, and stopping returns everything except the
             // consumption already promoted.
             let settlement = chain.stop(token_contract, buyer.note.as_ref()).await?;
+            clear_adopted_buyer_money_journal(pool_note_addr, submit_identity, token_contract)?;
             bail!(
                 "buyer: malformed handover for {token_contract_display}: {error}\n\
                  policy_action failure_class=malformed_handover action=reclaim token_contract={token_contract_display} \
@@ -6330,10 +6387,11 @@ enum PolicyCleanupOutcome {
     HandoverOpened,
 }
 
+#[allow(clippy::large_enum_variant)]
 #[derive(Debug)]
 enum NoHandoverPolicyOutcome {
     RetryCurrent,
-    RetryNext(dexdo_core::TokenContract),
+    RetryNext(BuyerQuoteSubmitOutcome),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -6437,6 +6495,7 @@ async fn apply_no_handover_after_match_policy(
     attempt: u64,
     diagnostic: &str,
     pool_note_addr: Option<&str>,
+    submit_identity: Option<&str>,
 ) -> Result<NoHandoverPolicyOutcome> {
     let token_contract_display = dexdo_core::address::display_self_dapp(token_contract);
     if preserve_matched_subscription {
@@ -6464,6 +6523,7 @@ async fn apply_no_handover_after_match_policy(
             let PolicyCleanupOutcome::Cleaned(settlement) = outcome else {
                 return Ok(NoHandoverPolicyOutcome::RetryCurrent);
             };
+            clear_adopted_buyer_money_journal(pool_note_addr, submit_identity, token_contract)?;
             bail!(
                 "{diagnostic}\npolicy_action failure_class=no_handover_after_match action=wait_then_reclaim \
                  token_contract={token_contract_display} state=funded/opened result=money_reclaimed settlement={settlement}"
@@ -6493,6 +6553,7 @@ async fn apply_no_handover_after_match_policy(
             if matches!(outcome, PolicyCleanupOutcome::HandoverOpened) {
                 return Ok(NoHandoverPolicyOutcome::RetryCurrent);
             }
+            clear_adopted_buyer_money_journal(pool_note_addr, submit_identity, token_contract)?;
             let next_attempt = attempt.saturating_add(1);
             let projected_spend = escrow.saturating_mul(next_attempt as u128);
             if projected_spend > buyer_policy.total_spend_cap_shells as u128 {
@@ -6519,7 +6580,7 @@ async fn apply_no_handover_after_match_policy(
                 escrow,
             )
             .await?;
-            let next_display = dexdo_core::address::display_self_dapp(&next);
+            let next_display = dexdo_core::address::display_self_dapp(&next.token_contract);
             record_policy_action(&format!(
                 "policy_action failure_class=no_handover_after_match action=next_seller \
                  token_contract={token_contract_display} result=next_seller_matched \
@@ -6684,7 +6745,7 @@ async fn submit_buyer_monitor_next_deal(
     ticks: u128,
     max_price: u128,
     escrow: u128,
-) -> Result<dexdo_core::TokenContract> {
+) -> Result<BuyerQuoteSubmitOutcome> {
     let intent = BuyerSubmitIntent::after(BuyerSubmitIntentKind::PolicyNextSeller, current);
     submit_buyer_continuity_next_deal(
         chain,
@@ -6717,7 +6778,7 @@ async fn submit_buyer_continuity_next_deal(
     pool_note_addr: Option<&str>,
     intent: &BuyerSubmitIntent,
     terms: BuyerOrderTerms,
-) -> Result<dexdo_core::TokenContract> {
+) -> Result<BuyerQuoteSubmitOutcome> {
     let BuyerOrderTerms {
         ticks,
         max_price,
@@ -6752,7 +6813,7 @@ async fn submit_buyer_continuity_next_deal(
                 |_progress| async { Ok(()) },
             )
             .await?;
-            return Ok(outcome.token_contract);
+            return Ok(outcome);
         }
 
         let since_unix = unix_now_secs() as i64;
@@ -6772,10 +6833,17 @@ async fn submit_buyer_continuity_next_deal(
             })?;
         let token_contract = correlated_buy_token_contract(fill, None, ticks, max_price)
             .map_err(anyhow::Error::new)?;
-        validate_reported_match_state(chain, &token_contract)
+        let status = validate_reported_match_state(chain, &token_contract)
             .await
             .map_err(anyhow::Error::new)?;
-        Ok(token_contract)
+        Ok(BuyerQuoteSubmitOutcome {
+            token_contract,
+            status,
+            ticks,
+            max_price_per_tick: max_price,
+            escrow,
+            submit_reconciliation: None,
+        })
     }
     .await;
     if let (Some(planner), Err(error)) = (planner, &result) {
@@ -6798,6 +6866,47 @@ async fn submit_buyer_continuity_next_deal(
         }
     }
     result
+}
+
+fn adopt_buyer_continuity_deal(
+    outcome: &mut BuyerQuoteSubmitOutcome,
+    note_addr: Option<&str>,
+    frame_model: &str,
+    deals_dir: Option<&std::path::Path>,
+    market_path: Option<&std::path::Path>,
+    network: &str,
+) -> Result<()> {
+    let Some(proof) = outcome.submit_reconciliation.as_ref() else {
+        return Ok(());
+    };
+    let note = note_addr
+        .ok_or_else(|| anyhow::anyhow!("durable renewal adoption requires its buyer note"))?;
+    persist_buyer_token_contract_for_note_result(Some(note), &outcome.token_contract)?;
+    save_runtime_deal_handle_for_network(
+        RuntimeDealHandleInput {
+            role: deals::DealHandleRole::Buyer,
+            deals_dir,
+            token_contract: &outcome.token_contract,
+            note_addr: note,
+            frame_model,
+            market: None,
+            market_path,
+            contracts: &crate::cli::commands::manifest_path()?,
+            endpoint: None,
+            created_order_ids: Vec::new(),
+        },
+        network,
+        false,
+    )?;
+    clear_adopted_buyer_money_journal(
+        Some(note),
+        Some(&proof.submit_identity),
+        &outcome.token_contract,
+    )?;
+    // Route replacement may still fail on the old deal's STOP. Its saved successor stays pending,
+    // but a successful journal adoption must not be cleared a second time on that retry.
+    outcome.submit_reconciliation = None;
+    Ok(())
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -6825,6 +6934,9 @@ fn spawn_buyer_service_renewal(
     models_cfg: Arc<dexdo::seller::ModelsConfig>,
     api_failure_policy: dexdo::buyer::api::BuyerApiFailurePolicy,
     spelling_diverged: bool,
+    frame_model: String,
+    deals_dir: Option<std::path::PathBuf>,
+    market_path: Option<std::path::PathBuf>,
 ) {
     if spelling_diverged {
         tracing::warn!(
@@ -6834,10 +6946,17 @@ fn spawn_buyer_service_renewal(
         );
         return;
     }
+    #[derive(Clone, Copy, PartialEq, Eq)]
+    enum PendingCleanup {
+        RetryDefiniteRefusal,
+        Unknown,
+        Confirmed,
+    }
     struct PendingRenewal {
         current: dexdo_core::TokenContract,
-        next: Option<dexdo_core::TokenContract>,
-        matched_at: Option<std::time::Instant>,
+        next: Option<BuyerQuoteSubmitOutcome>,
+        matched_at: Option<tokio::time::Instant>,
+        cleanup: Option<(PendingCleanup, tokio::time::Instant)>,
     }
     struct PrepareRetry {
         current: dexdo_core::TokenContract,
@@ -6987,8 +7106,64 @@ fn spawn_buyer_service_renewal(
 
             let mut ready_next = None;
             let mut waiting_for_pending_handover = false;
-            if let Some(p) = pending.as_ref().filter(|p| p.current == current_tc) {
-                if let Some(next) = p.next.as_ref() {
+            if let Some(p) = pending.as_mut().filter(|p| p.current == current_tc) {
+                if let Some(outcome) = p.next.as_ref() {
+                    let next = &outcome.token_contract;
+                    if let Some((mut cleanup, retry_at)) = p.cleanup {
+                        if tokio::time::Instant::now() < retry_at {
+                            continue;
+                        }
+                        if cleanup != PendingCleanup::Confirmed {
+                            match chain.deal_state(next).await {
+                                Ok(state)
+                                    if buyer_monitor_recovery_is_terminal(
+                                        BuyerMonitorRecoveryKind::CleanupUnopened,
+                                        state.as_ref(),
+                                    ) && state
+                                        .is_none_or(|state| !state.opened && !state.disputed) =>
+                                {
+                                    cleanup = PendingCleanup::Confirmed;
+                                }
+                                Ok(_) if cleanup == PendingCleanup::RetryDefiniteRefusal => {
+                                    // Only a definite refusal permits another attempt after fresh facts.
+                                    planner.keep_active(next);
+                                }
+                                result => {
+                                    p.cleanup = Some((
+                                        cleanup,
+                                        tokio::time::Instant::now()
+                                            + buyer_monitor_recovery_backoff(),
+                                    ));
+                                    tracing::warn!(
+                                        ?result,
+                                        "buyer continuity: pending cleanup needs terminal facts"
+                                    );
+                                    continue;
+                                }
+                            }
+                        }
+                        if cleanup == PendingCleanup::Confirmed {
+                            p.cleanup = Some((
+                                cleanup,
+                                tokio::time::Instant::now() + buyer_monitor_recovery_backoff(),
+                            ));
+                            if let Err(error) = clear_adopted_buyer_money_journal(
+                                pool_note_addr.as_deref(),
+                                outcome
+                                    .submit_reconciliation
+                                    .as_ref()
+                                    .map(|proof| proof.submit_identity.as_str()),
+                                next,
+                            ) {
+                                tracing::warn!(%error, "buyer continuity: confirmed cleanup journal retained");
+                                continue;
+                            }
+                            planner.clear_pending_next(&current_tc);
+                            pending = None;
+                            continue;
+                        }
+                        p.cleanup = None;
+                    }
                     if buyer.resolve_endpoint(chain.as_ref(), next).await.is_ok() {
                         ready_next = Some(DealFacts::handover_ready(
                             next.clone(),
@@ -6996,36 +7171,39 @@ fn spawn_buyer_service_renewal(
                         ));
                     } else if let Some(matched_at) = p.matched_at {
                         waiting_for_pending_handover = true;
-                        let age = matched_at.elapsed().as_secs();
                         let recovery = planner.tick(
-                            Some(DealFacts::funded_never_opened(next.clone(), age)),
+                            Some(DealFacts::funded_never_opened(
+                                next.clone(),
+                                matched_at.elapsed().as_secs(),
+                            )),
                             None,
                             cfg,
                         );
                         if let Some((_kind, token_contract, result)) =
                             execute_buyer_monitor_recovery(chain.as_ref(), recovery, None).await
                         {
-                            match result {
-                                Ok(Some(settlement)) => {
-                                    tracing::warn!(
-                                        current = %display_token_contract(&current_tc),
-                                        next = %display_token_contract(&token_contract),
-                                        settlement = %settlement,
-                                        "buyer continuity: cleaned up renewal deal that never opened"
-                                    );
-                                }
-                                Ok(None) => {}
-                                Err(e) => {
-                                    tracing::warn!(
-                                        current = %display_token_contract(&current_tc),
-                                        next = %display_token_contract(&token_contract),
-                                        error = %e,
-                                        "buyer continuity: cleanup_unopened failed"
-                                    );
-                                }
-                            }
-                            planner.clear_pending_next(&current_tc);
-                            pending = None;
+                            let cleanup = match &result {
+                                Ok(Some(_)) => PendingCleanup::Confirmed,
+                                Err(
+                                    ChainError::Contract(_)
+                                    | ChainError::MoneySubmitPreparation(_)
+                                    | ChainError::MoneySubmitRejected(_),
+                                ) => PendingCleanup::RetryDefiniteRefusal,
+                                _ => PendingCleanup::Unknown,
+                            };
+                            p.cleanup = Some((
+                                cleanup,
+                                tokio::time::Instant::now()
+                                    + if cleanup == PendingCleanup::Confirmed {
+                                        std::time::Duration::ZERO
+                                    } else {
+                                        buyer_monitor_recovery_backoff()
+                                    },
+                            ));
+                            tracing::warn!(
+                                next = %display_token_contract(&token_contract), ?result,
+                                "buyer continuity: pending cleanup outcome retained for completion"
+                            );
                             continue;
                         }
                     } else {
@@ -7186,16 +7364,20 @@ fn spawn_buyer_service_renewal(
                     .await
                     {
                         Ok(next) => {
-                            persist_buyer_token_contract_for_note(pool_note_addr.as_deref(), &next);
+                            persist_buyer_token_contract_for_note(
+                                pool_note_addr.as_deref(),
+                                &next.token_contract,
+                            );
                             prepare_retry = None;
-                            planner.note_pending_next(current.clone(), next.clone());
+                            planner.note_pending_next(current.clone(), next.token_contract.clone());
                             pending = Some(PendingRenewal {
                                 current,
                                 next: Some(next.clone()),
-                                matched_at: Some(std::time::Instant::now()),
+                                matched_at: Some(tokio::time::Instant::now()),
+                                cleanup: None,
                             });
                             tracing::info!(
-                                next = %display_token_contract(&next),
+                                next = %display_token_contract(&next.token_contract),
                                 "buyer continuity: fresh buy matched; waiting for handover"
                             );
                         }
@@ -7261,16 +7443,20 @@ fn spawn_buyer_service_renewal(
                     .await
                     {
                         Ok(next) => {
-                            persist_buyer_token_contract_for_note(pool_note_addr.as_deref(), &next);
+                            persist_buyer_token_contract_for_note(
+                                pool_note_addr.as_deref(),
+                                &next.token_contract,
+                            );
                             prepare_retry = None;
-                            planner.note_pending_next(current.clone(), next.clone());
+                            planner.note_pending_next(current.clone(), next.token_contract.clone());
                             pending = Some(PendingRenewal {
                                 current,
                                 next: Some(next.clone()),
-                                matched_at: Some(std::time::Instant::now()),
+                                matched_at: Some(tokio::time::Instant::now()),
+                                cleanup: None,
                             });
                             tracing::info!(
-                                next = %display_token_contract(&next),
+                                next = %display_token_contract(&next.token_contract),
                                 "buyer continuity: renewal buy matched; waiting for handover"
                             );
                         }
@@ -7298,6 +7484,24 @@ fn spawn_buyer_service_renewal(
                             continue;
                         }
                     };
+                    if let Some(outcome) = pending
+                        .as_mut()
+                        .filter(|pending| pending.current == previous)
+                        .and_then(|pending| pending.next.as_mut())
+                        .filter(|outcome| outcome.token_contract == next)
+                    {
+                        if let Err(error) = adopt_buyer_continuity_deal(
+                            outcome,
+                            pool_note_addr.as_deref(),
+                            &frame_model,
+                            deals_dir.as_deref(),
+                            market_path.as_deref(),
+                            chain.network(),
+                        ) {
+                            tracing::warn!(%error, "buyer continuity: durable adoption failed; journal retained");
+                            continue;
+                        }
+                    }
                     if let Err(error) = deals
                         .replace_active(
                             || {
@@ -10604,7 +10808,7 @@ async fn prepare_lazy_buyer_api_deal_once(
         }
     }
 
-    let adopted_submit_identity = raised_money
+    let mut adopted_submit_identity = raised_money
         .as_ref()
         .and_then(|outcome| outcome.submit_reconciliation.as_ref())
         .map(|reconciliation| reconciliation.submit_identity.clone());
@@ -10728,6 +10932,10 @@ async fn prepare_lazy_buyer_api_deal_once(
                         },
                     )
                     .await?;
+                    adopted_submit_identity = outcome
+                        .submit_reconciliation
+                        .as_ref()
+                        .map(|reconciliation| reconciliation.submit_identity.clone());
                     emit_shared_buyer_event(
                         &events,
                         "matched",
@@ -10882,6 +11090,10 @@ async fn prepare_lazy_buyer_api_deal_once(
                     },
                 )
                 .await?;
+                adopted_submit_identity = outcome
+                    .submit_reconciliation
+                    .as_ref()
+                    .map(|reconciliation| reconciliation.submit_identity.clone());
                 emit_shared_buyer_event(
                     &events,
                     "matched",
@@ -11025,6 +11237,8 @@ async fn prepare_lazy_buyer_api_deal_once(
                                 policy,
                                 preserve_subscription,
                                 &e,
+                                args.identity.note_addr.as_deref(),
+                                adopted_submit_identity.as_deref(),
                             )
                             .await?;
                         }
@@ -11054,6 +11268,7 @@ async fn prepare_lazy_buyer_api_deal_once(
                                 handover_attempt,
                                 &diagnostic,
                                 args.identity.note_addr.as_deref(),
+                                adopted_submit_identity.as_deref(),
                             )
                             .await;
                             match policy_outcome {
@@ -11064,7 +11279,12 @@ async fn prepare_lazy_buyer_api_deal_once(
                                     continue 'handover;
                                 }
                                 Ok(NoHandoverPolicyOutcome::RetryNext(next)) => {
-                                    token_contract = next;
+                                    adopted_submit_identity = next
+                                        .submit_reconciliation
+                                        .as_ref()
+                                        .map(|proof| proof.submit_identity.clone());
+                                    buyer_order_id = None;
+                                    token_contract = next.token_contract;
                                     record_buyer_token_contract_after_money_move(
                                         args.as_ref(),
                                         &token_contract,
@@ -11604,6 +11824,9 @@ async fn run_buyer_on_demand_local_api(
             models_cfg,
             api_failure_policy,
             spelling_diverged,
+            frame_model.clone(),
+            args.deals_dir.clone(),
+            args.market.clone(),
         );
     }
     let (addr, task) = match api::serve(bind, state, args.anthropic_compat, shutdown).await {
@@ -12372,7 +12595,7 @@ async fn run_buyer_inner(
     }
     // Resolve the deal `TokenContract`: explicit (flag/manifest) or model-only (book -> choose -> buy -> fill
     // event). `buy_ticks` is the chosen volume (the consumer-API token budget tracks it).
-    let adopted_submit_identity = raised_money
+    let mut adopted_submit_identity = raised_money
         .as_ref()
         .and_then(|outcome| outcome.submit_reconciliation.as_ref())
         .map(|reconciliation| reconciliation.submit_identity.clone());
@@ -12586,6 +12809,10 @@ async fn run_buyer_inner(
                         },
                     )
                     .await?;
+                    adopted_submit_identity = outcome
+                        .submit_reconciliation
+                        .as_ref()
+                        .map(|reconciliation| reconciliation.submit_identity.clone());
                     if let Some(events) = machine_events.as_mut() {
                         events.event(
                             "matched",
@@ -12840,6 +13067,10 @@ async fn run_buyer_inner(
                     },
                 )
                 .await?;
+                adopted_submit_identity = outcome
+                    .submit_reconciliation
+                    .as_ref()
+                    .map(|reconciliation| reconciliation.submit_identity.clone());
                 tracing::info!("model-only buy placed and matched from the note's fill event");
                 machine_context.set_token_contract(&outcome.token_contract);
                 if let Some(events) = machine_events.as_mut() {
@@ -12983,6 +13214,8 @@ async fn run_buyer_inner(
                                 policy,
                                 preserve_subscription,
                                 &e,
+                                args.identity.note_addr.as_deref(),
+                                adopted_submit_identity.as_deref(),
                             )
                             .await?;
                         }
@@ -13010,6 +13243,7 @@ async fn run_buyer_inner(
                                 handover_attempt,
                                 &diagnostic,
                                 args.identity.note_addr.as_deref(),
+                                adopted_submit_identity.as_deref(),
                             )
                             .await;
                             match policy_outcome {
@@ -13020,7 +13254,12 @@ async fn run_buyer_inner(
                                     continue 'handover;
                                 }
                                 Ok(NoHandoverPolicyOutcome::RetryNext(next)) => {
-                                    token_contract = next;
+                                    adopted_submit_identity = next
+                                        .submit_reconciliation
+                                        .as_ref()
+                                        .map(|proof| proof.submit_identity.clone());
+                                    buyer_order_id = None;
+                                    token_contract = next.token_contract;
                                     record_buyer_token_contract_after_money_move(
                                         &args,
                                         &token_contract,
@@ -13193,6 +13432,9 @@ async fn run_buyer_inner(
                 models_cfg.clone(),
                 api_failure_policy,
                 spelling_diverged,
+                frame_model.clone(),
+                args.deals_dir.clone(),
+                args.market.clone(),
             );
         }
         // SIGINT/SIGTERM drains in-flight responses and closes the listener. Ordinary deals retain the awaited
@@ -17417,7 +17659,11 @@ mod tests {
         assert!(body.contains("has_active_or_recent_request"), "{body}");
         assert!(body.contains("CONSUMER_DEMAND_RECENT_SECS"), "{body}");
         assert!(body.contains("deal_state"), "{body}");
-        assert!(body.contains("cleanup_unopened"), "{body}");
+        // Cleanup is dispatched by the recovery helper; log wording is not an action.
+        assert!(
+            body.contains("BuyerMonitorRecoveryKind::CleanupUnopened"),
+            "{body}"
+        );
         assert!(body.contains("execute_buyer_monitor_recovery"), "{body}");
         assert!(body.contains("RENEWAL_FAILURE_BACKOFF_SECS"), "{body}");
         assert!(body.contains("prepare_retry"), "{body}");
@@ -17518,6 +17764,7 @@ mod tests {
 
     #[derive(Clone, Copy)]
     enum ModelBuyFailure {
+        Ambiguous,
         Transport,
         Contract,
     }
@@ -17537,13 +17784,27 @@ mod tests {
         deal_state: Option<dexdo_core::DealChainState>,
         snapshot: Option<dexdo_core::StreamSnapshot>,
         next_match: Option<dexdo_core::TokenContract>,
+        next_match_after_cleanup: Option<dexdo_core::TokenContract>,
+        no_deal_state_for: Option<dexdo_core::TokenContract>,
+        model_buy_terms: Option<super::BuyerOrderTerms>,
+        model_buy_ambiguous_after_cleanup: bool,
+        handover_token_contract: Option<dexdo_core::TokenContract>,
         model_buy_failure: Option<ModelBuyFailure>,
         stop_error: Option<String>,
+        stop_ambiguous: bool,
+        successor_state_for: Option<dexdo_core::TokenContract>,
+        successor_state: std::sync::Mutex<Option<dexdo_core::DealChainState>>,
+        successor_state_read_failures: std::sync::atomic::AtomicUsize,
+        successor_state_reads: std::sync::atomic::AtomicUsize,
+        cleanup_completes_successor: bool,
+        cleanup_completion_lock_note: Option<String>,
+        cleanup_completion_lock: std::sync::Mutex<Option<super::BuyerMoneyLock>>,
         heartbeat_during_reclaim_preflight: std::sync::Mutex<Option<dexdo::buyer::api::ApiDeal>>,
         monitor_state_enabled: std::sync::atomic::AtomicBool,
         monitor_deal_state: std::sync::Mutex<Option<dexdo_core::DealChainState>>,
         monitor_deal_state_calls: std::sync::atomic::AtomicUsize,
         cleanup_failures_remaining: std::sync::atomic::AtomicUsize,
+        cleanup_ambiguous_remaining: std::sync::atomic::AtomicUsize,
         reclaim_failures_remaining: std::sync::atomic::AtomicUsize,
         reclaim_transport_failures_remaining: std::sync::atomic::AtomicUsize,
         reclaim_ambiguous_remaining: std::sync::atomic::AtomicUsize,
@@ -17555,6 +17816,17 @@ mod tests {
     }
 
     impl RecordingRecoveryChain {
+        fn next_buy_token_contract(&self) -> dexdo_core::TokenContract {
+            if self.cleanup_calls.load(std::sync::atomic::Ordering::SeqCst) > 0 {
+                if let Some(next) = &self.next_match_after_cleanup {
+                    return next.clone();
+                }
+            }
+            self.next_match
+                .clone()
+                .unwrap_or_else(|| format!("0:{}", "5".repeat(64)))
+        }
+
         fn with_deal_state(state: dexdo_core::DealChainState) -> Self {
             Self {
                 deal_state: Some(state),
@@ -17684,12 +17956,13 @@ mod tests {
         ) -> Result<Vec<dexdo_core::OfferListing>, dexdo_core::ChainError> {
             Ok(vec![dexdo_core::OfferListing {
                 seller_id: format!("0:{}", "6".repeat(64)),
-                token_contract: self
-                    .next_match
-                    .clone()
-                    .unwrap_or_else(|| format!("0:{}", "5".repeat(64))),
-                price_per_tick: 1,
-                max_ticks: 1,
+                token_contract: self.next_buy_token_contract(),
+                price_per_tick: self
+                    .model_buy_terms
+                    .map_or(1, |terms| u64::try_from(terms.max_price).unwrap()),
+                max_ticks: self
+                    .model_buy_terms
+                    .map_or(1, |terms| u64::try_from(terms.ticks).unwrap()),
             }])
         }
 
@@ -17727,11 +18000,18 @@ mod tests {
 
         async fn read_handover(
             &self,
-            _token_contract: &dexdo_core::TokenContract,
+            token_contract: &dexdo_core::TokenContract,
         ) -> Result<Option<Vec<u8>>, dexdo_core::ChainError> {
             self.handover_reads
                 .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             *self.handover_thread.lock().unwrap() = Some(std::thread::current().id());
+            if self
+                .handover_token_contract
+                .as_ref()
+                .is_some_and(|expected| expected != token_contract)
+            {
+                return Ok(None);
+            }
             Ok(self.handover.lock().unwrap().clone())
         }
 
@@ -17742,6 +18022,11 @@ mod tests {
         ) -> Result<dexdo_core::Settlement, dexdo_core::ChainError> {
             self.stop_calls
                 .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            if self.stop_ambiguous {
+                return Err(dexdo_core::ChainError::AmbiguousSubmit(
+                    "unknown STOP result".into(),
+                ));
+            }
             if let Some(error) = &self.stop_error {
                 return Err(dexdo_core::ChainError::Transport(error.clone()));
             }
@@ -17782,6 +18067,11 @@ mod tests {
         ) -> Result<dexdo_core::Settlement, dexdo_core::ChainError> {
             self.cleanup_calls
                 .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            if Self::consume_failure(&self.cleanup_ambiguous_remaining) {
+                return Err(dexdo_core::ChainError::AmbiguousSubmit(
+                    "injected unknown cleanup result".to_string(),
+                ));
+            }
             if Self::consume_failure(&self.cleanup_failures_remaining) {
                 return Err(dexdo_core::ChainError::Contract(
                     "injected early cleanup rejection".to_string(),
@@ -17792,6 +18082,14 @@ mod tests {
                 .load(std::sync::atomic::Ordering::SeqCst)
             {
                 *self.monitor_deal_state.lock().unwrap() = None;
+            }
+            if self.cleanup_completes_successor {
+                *self.successor_state.lock().unwrap() = None;
+            }
+            if let Some(note) = self.cleanup_completion_lock_note.as_deref() {
+                let mut lock = super::BuyerMoneyLock::open(note).unwrap();
+                lock.try_acquire().unwrap();
+                *self.cleanup_completion_lock.lock().unwrap() = Some(lock);
             }
             Ok(dexdo_core::Settlement::SellerNoShow {
                 to_buyer_refund: 0,
@@ -17810,7 +18108,17 @@ mod tests {
         ) -> Result<(), dexdo_core::ChainError> {
             self.place_next_calls
                 .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-            match self.model_buy_failure {
+            let failure = if self.model_buy_ambiguous_after_cleanup
+                && self.cleanup_calls.load(std::sync::atomic::Ordering::SeqCst) > 0
+            {
+                Some(ModelBuyFailure::Ambiguous)
+            } else {
+                self.model_buy_failure
+            };
+            match failure {
+                Some(ModelBuyFailure::Ambiguous) => Err(dexdo_core::ChainError::AmbiguousSubmit(
+                    "injected producer forwarding timeout".to_string(),
+                )),
                 Some(ModelBuyFailure::Transport) => Err(dexdo_core::ChainError::Transport(
                     "model-only transport cause".to_string(),
                 )),
@@ -17840,10 +18148,7 @@ mod tests {
             ) -> Result<(), dexdo_core::ChainError>
                       + Send),
         ) -> Result<(), dexdo_core::ChainError> {
-            let expected_token_contract = self
-                .next_match
-                .clone()
-                .unwrap_or_else(|| format!("0:{}", "5".repeat(64)));
+            let expected_token_contract = self.next_buy_token_contract();
             let quoted_order = quoted_order.ok_or_else(|| {
                 dexdo_core::ChainError::Chain(
                     "recording recovery fixture requires one quoted ask".to_string(),
@@ -17896,12 +18201,9 @@ mod tests {
             }
             Ok(Some(dexdo_core::MatchedFill {
                 order_id: 1,
-                token_contract: self
-                    .next_match
-                    .clone()
-                    .unwrap_or_else(|| format!("0:{}", "5".repeat(64))),
-                ticks: 1,
-                price_per_tick: 1,
+                token_contract: self.next_buy_token_contract(),
+                ticks: self.model_buy_terms.map_or(1, |terms| terms.ticks),
+                price_per_tick: self.model_buy_terms.map_or(1, |terms| terms.max_price),
             }))
         }
 
@@ -17909,6 +18211,9 @@ mod tests {
             &self,
             token_contract: &dexdo_core::TokenContract,
         ) -> Result<Option<dexdo_core::DealChainState>, dexdo_core::ChainError> {
+            if self.no_deal_state_for.as_ref() == Some(token_contract) {
+                return Ok(None);
+            }
             if self
                 .monitor_state_enabled
                 .load(std::sync::atomic::Ordering::SeqCst)
@@ -17934,7 +18239,26 @@ mod tests {
                 }
                 return Ok(*self.monitor_deal_state.lock().unwrap());
             }
-            Ok(self.deal_state)
+            let mut state = if self.successor_state_for.as_ref() == Some(token_contract) {
+                self.successor_state_reads
+                    .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                if Self::consume_failure(&self.successor_state_read_failures) {
+                    return Err(dexdo_core::ChainError::Transport(
+                        "temporary successor read failure".into(),
+                    ));
+                }
+                *self.successor_state.lock().unwrap()
+            } else {
+                self.deal_state
+            };
+            if self.handover_token_contract.as_ref() == Some(token_contract)
+                && self.handover.lock().unwrap().is_some()
+            {
+                if let Some(state) = state.as_mut() {
+                    state.opened = true;
+                }
+            }
+            Ok(state)
         }
 
         async fn snapshot(
@@ -18278,6 +18602,9 @@ mod tests {
             // The fixture is about renewal behaviour, so the spelling is the registered one and the
             // carve-out is not in play. `a_diverged_spelling_starts_no_renewal` covers the other side.
             false,
+            "Qwen3-32B".to_string(),
+            None,
+            None,
         );
         (state, routes, session, init_calls)
     }
@@ -19955,6 +20282,7 @@ mod tests {
             1,
             "diagnostic",
             None,
+            None,
         )
         .await
         .unwrap_err()
@@ -19991,6 +20319,7 @@ mod tests {
             1,
             "diagnostic",
             None,
+            None,
         )
         .await
         .unwrap_err()
@@ -20007,6 +20336,8 @@ mod tests {
             &malformed_policy,
             true,
             &anyhow::anyhow!("malformed handover: invalid bytes"),
+            None,
+            None,
         )
         .await
         .unwrap_err()
@@ -20083,13 +20414,14 @@ mod tests {
             1,
             "diagnostic",
             Some(pool_note_addr),
+            None,
         )
         .await
         .expect("next_seller dispatch succeeds");
 
         assert!(matches!(
             outcome,
-            super::NoHandoverPolicyOutcome::RetryNext(tc) if tc == next_token_contract
+            super::NoHandoverPolicyOutcome::RetryNext(outcome) if outcome.token_contract == next_token_contract
         ));
         assert_eq!(chain.cleanup_calls.load(Ordering::SeqCst), 1);
         assert_eq!(chain.place_next_calls.load(Ordering::SeqCst), 1);
@@ -20153,6 +20485,7 @@ mod tests {
             1,
             "diagnostic",
             Some(&buyer_note),
+            None,
         )
         .await
         .expect_err("the post-submit fill read must remain unknown");
@@ -20212,6 +20545,7 @@ mod tests {
             1,
             "diagnostic",
             None,
+            None,
         )
         .await
         .unwrap_err()
@@ -20241,6 +20575,8 @@ mod tests {
             &policy,
             false,
             &handover_error,
+            None,
+            None,
         )
         .await
         .unwrap_err()
@@ -20273,6 +20609,8 @@ mod tests {
             &policy,
             false,
             &handover_error,
+            None,
+            None,
         )
         .await
         .unwrap_err()
@@ -20309,6 +20647,8 @@ mod tests {
             &policy,
             false,
             &handover_error,
+            None,
+            None,
         )
         .await
         .unwrap_err()
@@ -31139,4 +31479,6 @@ mod tests {
             );
         }
     }
+
+    include!("buyer/issue_2064_test.rs");
 }

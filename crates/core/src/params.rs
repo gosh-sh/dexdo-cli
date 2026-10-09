@@ -1569,7 +1569,7 @@ pub const NOTE_DEPLOY_WALLET_BUSY_MAX_ATTEMPTS: u64 = 3;
 /// Linear wallet-busy retry delay per attempt, in seconds.
 pub const NOTE_DEPLOY_WALLET_BUSY_BACKOFF_STEP_SECS: u64 = 10;
 
-/// Maximum wait for a deployed PrivateNote to become active.
+/// Maximum PrivateNote confirmation wait; receipt and account-activation reads share this budget.
 pub const NOTE_DEPLOY_ACTIVE_TIMEOUT: Duration = Duration::from_secs(120);
 
 /// Maximum wait for SHELL funding after submitting it to a PrivateNote.

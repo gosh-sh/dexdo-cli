@@ -31,17 +31,17 @@ pub use book_events::{
 };
 pub use client::NoteDealCreditReceipt;
 pub use client::{
-    chain_clock_skew_preflight, chain_http_client, endpoint_urls, normalize_endpoint,
-    note_transfer_amount_refusal, note_transfer_deposit_identifier_hash,
+    chain_clock_skew_preflight, chain_http_client, endpoint_urls, external_message_hash,
+    normalize_endpoint, note_transfer_amount_refusal, note_transfer_deposit_identifier_hash,
     note_transfer_dest_refusal, note_transfer_sender_refusal, note_transfer_submit_hint,
-    observe_note_deploy_rootpn_action, observe_note_deploy_wallet_action, resolve_endpoint,
-    BookFillCandidateRefusal, BookFillCandidateReport, ChainDoctorCheck, ChainDoctorReport,
-    ChainDoctorStatus, Deployed, MoneySubmitError, NoteDeployRootPnActionObservation,
-    NoteDeployWalletActionObservation, NoteHistoryCoverage, NoteTransferRefusal,
-    OutstandingDealLead, OutstandingDealLeadRefusal, PrivateNoteOutstandingReport,
-    RealChainBackend, RecoveredRestingOrder, TokenContractCurrentFacts,
-    TokenContractReceiptChainData, TokenContractSettlementEvent, TokenContractSettlementReceipt,
-    TokenContractSettlementReceipts, CHAIN_DOCTOR_CHECK_COUNT,
+    observe_note_deploy_rootpn_action, observe_note_deploy_wallet_action,
+    read_note_deploy_rootpn_action_by_hash, resolve_endpoint, BookFillCandidateRefusal,
+    BookFillCandidateReport, ChainDoctorCheck, ChainDoctorReport, ChainDoctorStatus, Deployed,
+    MoneySubmitError, NoteDeployRootPnActionObservation, NoteDeployWalletActionObservation,
+    NoteHistoryCoverage, NoteTransferRefusal, OutstandingDealLead, OutstandingDealLeadRefusal,
+    PrivateNoteOutstandingReport, RealChainBackend, RecoveredRestingOrder,
+    TokenContractCurrentFacts, TokenContractReceiptChainData, TokenContractSettlementEvent,
+    TokenContractSettlementReceipt, TokenContractSettlementReceipts, CHAIN_DOCTOR_CHECK_COUNT,
 };
 pub use client::{
     chain_time_secs, decode_multisig_queue_event, parse_message_destination,

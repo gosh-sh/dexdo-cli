@@ -117,6 +117,16 @@ pub trait ClaimStateObserver: Send + Sync {
         state: DealChainState,
     ) -> Result<(), ChainError>;
 
+    /// Save the delivered prefix absorbed by the paid probe before submitting acceptProbe.
+    /// Retries may return an already durable boundary; failure must prevent the chain write.
+    fn prepare_probe(
+        &self,
+        _token_contract: &TokenContract,
+        delivered: u64,
+    ) -> Result<u64, ChainError> {
+        Ok(delivered)
+    }
+
     fn observe_terminal(&self, _token_contract: &TokenContract) -> Result<(), ChainError> {
         Ok(())
     }
@@ -362,7 +372,16 @@ pub async fn drive_advance_with_observer(
         // This is the seller's probe decision boundary. Usage already accepted is absorbed by the
         // full protocol probe tick; later accepted usage extends its cumulative high-water.
         let deal_delivery_count = delivered.load(Ordering::Acquire);
-        let delivery_at_probe = u128::from(deal_delivery_count).min(TICK_SIZE);
+        let delivery_at_probe = u128::from(
+            observer.prepare_probe(token_contract, deal_delivery_count.min(TICK_SIZE as u64))?,
+        );
+        if delivery_at_probe == 0
+            || delivery_at_probe > u128::from(deal_delivery_count).min(TICK_SIZE)
+        {
+            return Err(ChainError::Chain(format!(
+                "TokenContract {token_contract_display}: invalid durable probe decision prefix {delivery_at_probe}"
+            )));
+        }
         observer.observe_probe_decision(
             token_contract,
             ClaimDeliveryMeasurement {
@@ -1525,6 +1544,161 @@ mod tests {
             "no acceptProbe write may happen after observer failure"
         );
         assert!(backend.claims().is_empty());
+    }
+
+    struct RejectingProbeObserver;
+
+    impl ClaimStateObserver for RejectingProbeObserver {
+        fn observe(&self, _: &TokenContract, _: DealChainState) -> Result<(), ChainError> {
+            Ok(())
+        }
+
+        fn prepare_probe(&self, _: &TokenContract, _: u64) -> Result<u64, ChainError> {
+            Err(ChainError::Chain("probe boundary write failed".to_string()))
+        }
+    }
+
+    #[tokio::test]
+    async fn probe_boundary_write_failure_prevents_accept_and_claim_2046() {
+        let backend = RecordingBackend::new();
+        let error = drive_advance_with_observer(
+            &backend,
+            &"tc-probe-boundary-failure-2046".to_string(),
+            &LocalNote::generate(),
+            instant(),
+            2,
+            TICK_SIZE as u64,
+            true,
+            Arc::new(AtomicU64::new(57)),
+            Arc::new(AtomicBool::new(true)),
+            &RejectingProbeObserver,
+        )
+        .await
+        .unwrap_err();
+        assert!(error.to_string().contains("probe boundary write failed"));
+        assert_eq!(backend.accepts.load(Ordering::Relaxed), 0);
+        assert!(backend.claims().is_empty());
+        assert_eq!(backend.finalized.load(Ordering::Relaxed), 0);
+    }
+
+    #[tokio::test]
+    async fn invalid_probe_boundary_prevents_accept_and_claim_2046() {
+        struct InvalidProbeObserver(u64);
+        impl ClaimStateObserver for InvalidProbeObserver {
+            fn observe(&self, _: &TokenContract, _: DealChainState) -> Result<(), ChainError> {
+                Ok(())
+            }
+            fn prepare_probe(&self, _: &TokenContract, _: u64) -> Result<u64, ChainError> {
+                Ok(self.0)
+            }
+        }
+        for invalid in [0, 58, TICK_SIZE as u64 + 1] {
+            let backend = RecordingBackend::new();
+            let error = drive_advance_with_observer(
+                &backend,
+                &"tc-invalid-probe-boundary-2046".to_string(),
+                &LocalNote::generate(),
+                instant(),
+                2,
+                TICK_SIZE as u64,
+                true,
+                Arc::new(AtomicU64::new(57)),
+                Arc::new(AtomicBool::new(true)),
+                &InvalidProbeObserver(invalid),
+            )
+            .await
+            .unwrap_err();
+            assert!(error
+                .to_string()
+                .contains("invalid durable probe decision prefix"));
+            assert_eq!(backend.accepts.load(Ordering::Relaxed), 0);
+            assert!(backend.claims().is_empty());
+        }
+    }
+
+    #[tokio::test]
+    async fn claim_driver_reconciles_its_own_delivery_after_probe_decision_2046() {
+        use crate::seller::capacity::CapacityManager;
+        struct ProbeRaceObserver {
+            capacity: CapacityManager,
+            delivered: Arc<AtomicU64>,
+            deal: dexdo_core::DealSubscription,
+        }
+        impl ClaimStateObserver for ProbeRaceObserver {
+            fn observe(&self, tc: &TokenContract, state: DealChainState) -> Result<(), ChainError> {
+                self.capacity
+                    .reconcile_deal(tc, state, self.deal)
+                    .map(|_| ())
+                    .map_err(|error| ChainError::Chain(error.to_string()))
+            }
+
+            fn prepare_probe(&self, tc: &TokenContract, delivered: u64) -> Result<u64, ChainError> {
+                self.capacity
+                    .prepare_probe(tc, delivered)
+                    .map_err(|error| ChainError::Chain(error.to_string()))
+            }
+
+            fn observe_probe_decision(
+                &self,
+                tc: &TokenContract,
+                measurement: ClaimDeliveryMeasurement,
+            ) {
+                assert_eq!(measurement.delivery_at_probe, Some(57));
+                // A provider terminal arrives after the exact probe decision, before its chain readback.
+                self.capacity
+                    .reserve(tc, 196)
+                    .unwrap()
+                    .finish_with_delivery(196)
+                    .unwrap();
+                self.delivered.fetch_add(196, Ordering::Release);
+            }
+        }
+        let backend = RecordingBackend::new();
+        let directory = tempfile::tempdir().unwrap();
+        let tc = "tc-probe-claim-race-2046".to_string();
+        let observer = ProbeRaceObserver {
+            capacity: CapacityManager::in_deals_dir(directory.path().to_path_buf()),
+            delivered: Arc::new(AtomicU64::new(57)),
+            deal: dexdo_core::DealSubscription {
+                deal_flags: 0,
+                sub_weeks: 0,
+                week_index: 0,
+                tokens_per_week: 2 * TICK_SIZE,
+                funded_tokens: 2 * TICK_SIZE,
+                tokens_paid: 0,
+                period_start: 0,
+                week_base_tokens: 0,
+            },
+        };
+        observer.observe(&tc, claim_state(false, 0, 0)).unwrap();
+        observer
+            .capacity
+            .reserve(&tc, 57)
+            .unwrap()
+            .finish_with_delivery(57)
+            .unwrap();
+        let claimed = drive_advance_with_observer(
+            &backend,
+            &tc,
+            &LocalNote::generate(),
+            instant(),
+            2,
+            TICK_SIZE as u64,
+            true,
+            observer.delivered.clone(),
+            Arc::new(AtomicBool::new(true)),
+            &observer,
+        )
+        .await
+        .unwrap();
+        assert_eq!(claimed, TICK_SIZE + 196);
+        assert_eq!(backend.claims(), vec![TICK_SIZE + 196]);
+        assert_eq!(backend.accepts.load(Ordering::Relaxed), 1);
+        assert_eq!(backend.finalized.load(Ordering::Relaxed), 1);
+        let snapshot = observer.capacity.snapshot(&tc).unwrap().unwrap();
+        assert_eq!(snapshot.tokens_pending_anchor, TICK_SIZE + 196);
+        assert_eq!(snapshot.local_delivered_after_anchor, 0);
+        assert!(observer.capacity.reserve(&tc, 1).is_ok());
     }
 
     #[tokio::test]
