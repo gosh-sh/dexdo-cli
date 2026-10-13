@@ -111,6 +111,10 @@ struct SellerMatchWatchCursor {
     opened_at_unix: Option<u64>,
     #[serde(default)]
     fill: Option<SellerFillLineage>,
+    /// The operator replaced this offer. Paid recovery remains valid; its unsold capacity must
+    /// never be posted again, including through the parent's saved residual link.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    unsold_retired: bool,
 }
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
@@ -157,6 +161,7 @@ impl SellerMatchWatchCursor {
             last_polled_unix: None,
             opened_at_unix: None,
             fill: None,
+            unsold_retired: false,
         })
     }
 
@@ -301,6 +306,24 @@ pub fn read_seller_fill_lineage(
         fill.validate()?;
     }
     Ok(fill)
+}
+
+pub fn seller_unsold_is_retired(
+    cursor_path: &Path,
+    token_contract: &TokenContract,
+) -> Result<bool> {
+    Ok(SellerMatchWatchCursor::load_or_new(cursor_path, token_contract)?.unsold_retired)
+}
+
+/// Persist the operator's decision without rewriting purchased volume, terms, or recovery history.
+/// The caller must first prove the unsold offer unmatchable while holding the seller pool lock.
+pub fn retire_seller_unsold(cursor_path: &Path, token_contract: &TokenContract) -> Result<()> {
+    let mut cursor = SellerMatchWatchCursor::load_or_new(cursor_path, token_contract)?;
+    if let Some(fill) = cursor.fill.as_ref() {
+        fill.validate()?;
+    }
+    cursor.unsold_retired = true;
+    cursor.save(cursor_path)
 }
 
 pub fn persist_seller_replacement(
@@ -846,9 +869,44 @@ pub async fn provision_match(
         deal,
     )?;
     if !read_opened_with_retry(chain, &cfg.token_contract).await? {
-        chain
-            .open_stream(&cfg.token_contract, enc, seller.note.as_ref())
-            .await?;
+        loop {
+            match chain
+                .open_stream(&cfg.token_contract, enc.clone(), seller.note.as_ref())
+                .await
+            {
+                Ok(()) => break,
+                Err(
+                    error @ (dexdo_core::ChainError::Transport(_)
+                    | dexdo_core::ChainError::OpenUnconfirmed(_)),
+                ) => {
+                    tracing::warn!(
+                        token_contract = %display_token_contract(&cfg.token_contract),
+                        %error,
+                        "seller open is unconfirmed; retaining funded deal and retrying"
+                    );
+                    tokio::time::sleep(dexdo_core::params::DEFAULT_MATCH_POLL_INTERVAL).await;
+                    // A timeout may have landed. Do not issue another open until a fresh
+                    // authoritative read proves that the buyer still funds an unopened deal.
+                    loop {
+                        match chain.deal_state(&cfg.token_contract).await {
+                            Ok(Some(state))
+                                if state.funded && !state.is_stopped() && state.opened =>
+                            {
+                                return Ok(())
+                            }
+                            Ok(Some(state)) if state.funded && !state.is_stopped() => break,
+                            Ok(_) => return Err(error.into()),
+                            Err(dexdo_core::ChainError::Transport(_)) => {
+                                tokio::time::sleep(dexdo_core::params::DEFAULT_MATCH_POLL_INTERVAL)
+                                    .await;
+                            }
+                            Err(error) => return Err(error.into()),
+                        }
+                    }
+                }
+                Err(error) => return Err(error.into()),
+            }
+        }
     } else {
         tracing::info!(
             token_contract = %display_token_contract(&cfg.token_contract),
@@ -877,9 +935,17 @@ async fn poll_match(
     chain: &dyn ChainBackend,
     cfg: &SellerConfig,
     cursor_path: &Path,
+    known_matched: bool,
 ) -> Result<(SellerMatchWatchCursor, Option<Match>)> {
     let mut cursor = SellerMatchWatchCursor::load_or_new(cursor_path, &cfg.token_contract)?;
     cursor.last_polled_unix = Some(now_unix()?);
+    if known_matched && cursor.fill.is_none() {
+        let state = chain.deal_state(&cfg.token_contract).await?;
+        if !state.is_some_and(|state| state.funded && !state.is_stopped()) {
+            cursor.save(cursor_path)?;
+            bail!("TokenContract {} ended before its authoritative fill was recovered; capacity remains unresolved", display_token_contract(&cfg.token_contract));
+        }
+    }
     let fills = chain
         .poll_seller_fills(seller.note.as_ref(), &mut cursor.source)
         .await?;
@@ -913,7 +979,7 @@ async fn poll_match(
     let mut openable_match = None;
     if cursor.fill.is_none() {
         openable_match = chain.read_openable_match_now(&cfg.token_contract).await?;
-        if cursor.opened_at_unix.is_some() || openable_match.is_some() {
+        if known_matched || cursor.opened_at_unix.is_some() || openable_match.is_some() {
             let mut history = MatchWatchCursor::new(0);
             let mut fills = chain
                 .poll_seller_fills(seller.note.as_ref(), &mut history)
@@ -931,14 +997,15 @@ async fn poll_match(
                     display_token_contract(&cfg.token_contract)
                 );
             }
-            let fill = fills.pop().ok_or_else(|| {
-                anyhow!(
-                    "legacy seller cursor for opened TokenContract {} has no persisted fill and \
-                     the authoritative owner history cannot recover it; refusing to resume or \
-                     start advance with guessed capacity",
-                    display_token_contract(&cfg.token_contract)
-                )
-            })?;
+            let Some(fill) = fills.pop() else {
+                // The contract is already matched, but note history may lag. Keep the exact
+                // cursor and wait for its authoritative fill rather than abandoning the deal.
+                tracing::warn!(
+                    token_contract = %display_token_contract(&cfg.token_contract),
+                    "seller matched deal is awaiting authoritative fill history; retrying"
+                );
+                return Ok((cursor, None));
+            };
             let (authoritative_price, authoritative_ticks) = chain
                 .sell_offer_terms(&cfg.token_contract)
                 .await?
@@ -970,7 +1037,7 @@ pub async fn poll_match_and_maybe_open(
     cfg: &SellerConfig,
     cursor_path: &Path,
 ) -> Result<Option<Match>> {
-    let (mut cursor, found) = poll_match(seller, chain, cfg, cursor_path).await?;
+    let (mut cursor, found) = poll_match(seller, chain, cfg, cursor_path, false).await?;
     cursor.save(cursor_path)?;
     if let Some(m) = found {
         provision_match(seller, chain, cfg, m.clone()).await?;
@@ -994,25 +1061,48 @@ pub async fn wait_for_match(
     cfg: &SellerConfig,
     watch: &SellerMatchWatchConfig,
 ) -> Result<Match> {
+    wait_for_match_inner(seller, chain, cfg, watch, false).await
+}
+
+/// Resume a match that was already observed; absence/cleanup is terminal while its fill is missing.
+pub async fn wait_for_known_match(
+    seller: &RunningSeller,
+    chain: &dyn ChainBackend,
+    cfg: &SellerConfig,
+    watch: &SellerMatchWatchConfig,
+) -> Result<Match> {
+    wait_for_match_inner(seller, chain, cfg, watch, true).await
+}
+
+async fn wait_for_match_inner(
+    seller: &RunningSeller,
+    chain: &dyn ChainBackend,
+    cfg: &SellerConfig,
+    watch: &SellerMatchWatchConfig,
+    known_matched: bool,
+) -> Result<Match> {
     loop {
-        let (cursor, found) = match poll_match(seller, chain, cfg, &watch.cursor_path).await {
-            Ok(polled) => polled,
-            Err(error)
-                if error
-                    .downcast_ref::<dexdo_core::ChainError>()
-                    .is_some_and(|error| matches!(error, dexdo_core::ChainError::Transport(_))) =>
-            {
-                tracing::warn!(
-                    event = "seller_match_watch_network_error",
-                    token_contract = %display_token_contract(&cfg.token_contract),
-                    error = %error,
-                    "transient seller match-watch network error; keeping gateway alive"
-                );
-                tokio::time::sleep(watch.poll_interval).await;
-                continue;
-            }
-            Err(error) => return Err(error),
-        };
+        let (cursor, found) =
+            match poll_match(seller, chain, cfg, &watch.cursor_path, known_matched).await {
+                Ok(polled) => polled,
+                Err(error)
+                    if error
+                        .downcast_ref::<dexdo_core::ChainError>()
+                        .is_some_and(|error| {
+                            matches!(error, dexdo_core::ChainError::Transport(_))
+                        }) =>
+                {
+                    tracing::warn!(
+                        event = "seller_match_watch_network_error",
+                        token_contract = %display_token_contract(&cfg.token_contract),
+                        error = %error,
+                        "transient seller match-watch network error; keeping gateway alive"
+                    );
+                    tokio::time::sleep(watch.poll_interval).await;
+                    continue;
+                }
+                Err(error) => return Err(error),
+            };
         if let Some(m) = found {
             cursor.save(&watch.cursor_path)?;
             return Ok(m);
@@ -1022,6 +1112,25 @@ pub async fn wait_for_match(
     }
 }
 
+pub async fn recover_known_match_fill(
+    seller: &RunningSeller,
+    chain: &dyn ChainBackend,
+    cfg: &SellerConfig,
+    watch: &SellerMatchWatchConfig,
+    matched: &Match,
+) -> Result<()> {
+    if read_seller_fill_lineage(&watch.cursor_path, &cfg.token_contract)?.is_none() {
+        let recovered = wait_for_known_match(seller, chain, cfg, watch).await?;
+        if recovered.token_contract != matched.token_contract
+            || recovered.buyer_pubkey != matched.buyer_pubkey
+            || recovered.price_per_tick != matched.price_per_tick
+        {
+            bail!("seller recovered fill does not match the observed deal");
+        }
+    }
+    Ok(())
+}
+
 pub async fn serve_watched_match(
     seller: &RunningSeller,
     chain: &dyn ChainBackend,
@@ -1029,6 +1138,7 @@ pub async fn serve_watched_match(
     watch: &SellerMatchWatchConfig,
     matched: Match,
 ) -> Result<Match> {
+    recover_known_match_fill(seller, chain, cfg, watch, &matched).await?;
     provision_match(seller, chain, cfg, matched.clone()).await?;
     let mut cursor = SellerMatchWatchCursor::load_or_new(&watch.cursor_path, &cfg.token_contract)?;
     cursor.opened_at_unix.get_or_insert(now_unix()?);
@@ -1108,6 +1218,14 @@ mod tests {
         record_created_at: i64,
         matched_ticks: u128,
         offer_ticks: u64,
+        failed_open_state: Option<bool>,
+        contract_open_failure: bool,
+        open_unconfirmed: bool,
+        reconcile_transport_failures: AtomicU64,
+        omit_fill_history: bool,
+        cleanup_after_history: bool,
+        cleanup_state: Option<DealChainState>,
+        cleaned_up: AtomicBool,
     }
 
     impl PollBackend {
@@ -1131,6 +1249,14 @@ mod tests {
                 record_created_at,
                 matched_ticks: 8,
                 offer_ticks: 8,
+                failed_open_state: None,
+                contract_open_failure: false,
+                open_unconfirmed: false,
+                reconcile_transport_failures: AtomicU64::new(0),
+                omit_fill_history: false,
+                cleanup_after_history: false,
+                cleanup_state: None,
+                cleaned_up: AtomicBool::new(false),
             }
         }
 
@@ -1150,6 +1276,14 @@ mod tests {
                 record_created_at: 1,
                 matched_ticks: 8,
                 offer_ticks: 8,
+                failed_open_state: None,
+                contract_open_failure: false,
+                open_unconfirmed: false,
+                reconcile_transport_failures: AtomicU64::new(0),
+                omit_fill_history: false,
+                cleanup_after_history: false,
+                cleanup_state: None,
+                cleaned_up: AtomicBool::new(false),
             }
         }
 
@@ -1204,6 +1338,9 @@ mod tests {
             cursor: &mut MatchWatchCursor,
         ) -> Result<Vec<MatchedFill>, ChainError> {
             self.polls.fetch_add(1, Ordering::Relaxed);
+            if self.omit_fill_history {
+                return Ok(Vec::new());
+            }
             if self.poll_failures_remaining.load(Ordering::Relaxed) > 0 {
                 self.poll_failures_remaining.fetch_sub(1, Ordering::Relaxed);
                 return Err(ChainError::Transport("connection reset".to_string()));
@@ -1251,6 +1388,18 @@ mod tests {
             self.opens.fetch_add(1, Ordering::Relaxed);
             if self.open_failures_remaining.load(Ordering::Relaxed) > 0 {
                 self.open_failures_remaining.fetch_sub(1, Ordering::Relaxed);
+                if let Some(opened) = self.failed_open_state {
+                    self.opened.store(opened, Ordering::Relaxed);
+                    self.cleaned_up.store(!opened, Ordering::Relaxed);
+                }
+                if self.contract_open_failure {
+                    return Err(ChainError::Contract("exit_code=151".to_string()));
+                }
+                if self.open_unconfirmed {
+                    return Err(ChainError::OpenUnconfirmed(
+                        self.matched.as_ref().unwrap().token_contract.clone(),
+                    ));
+                }
                 return Err(ChainError::Transport(
                     "timeout after signed writes".to_string(),
                 ));
@@ -1282,13 +1431,28 @@ mod tests {
             _: &TokenContract,
         ) -> Result<Option<DealChainState>, ChainError> {
             self.state_reads.fetch_add(1, Ordering::Relaxed);
+            if self.cleanup_after_history && self.polls.load(Ordering::Relaxed) > 0 {
+                self.cleaned_up.store(true, Ordering::Relaxed);
+            }
+            if self.cleaned_up.load(Ordering::Relaxed) {
+                return Ok(self.cleanup_state);
+            }
+            if self.opens.load(Ordering::Relaxed) > 0
+                && self.reconcile_transport_failures.load(Ordering::Relaxed) > 0
+            {
+                self.reconcile_transport_failures
+                    .fetch_sub(1, Ordering::Relaxed);
+                return Err(ChainError::Transport(
+                    "reconciliation read unavailable".into(),
+                ));
+            }
             if self.state_failures_remaining.load(Ordering::Relaxed) > 0 {
                 self.state_failures_remaining
                     .fetch_sub(1, Ordering::Relaxed);
                 return Err(ChainError::Chain("transient getState failure".to_string()));
             }
             Ok(Some(DealChainState {
-                funded: true,
+                funded: !self.cleaned_up.load(Ordering::Relaxed),
                 opened: self.opened.load(Ordering::Relaxed),
                 probe_accepted: false,
                 disputed: false,
@@ -2544,7 +2708,7 @@ mod tests {
         assert!(seller.state.auth.verify_response(tc, nonce, &signature));
     }
 
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn partial_fill_lineage_is_saved_before_open_stream() {
         let (_cursor_dir, cursor_path) = temp_cursor_path("partial-before-open");
         let seller = test_seller();
@@ -2558,11 +2722,12 @@ mod tests {
         .with_matched_ticks(3)
         .with_open_failures(1);
 
-        let error = poll_match_and_maybe_open(&seller, &backend, &cfg, &cursor_path)
-            .await
-            .expect_err("the signed open write fails after the fill is persisted");
-
-        assert!(error.to_string().contains("timeout after signed writes"));
+        let opening = poll_match_and_maybe_open(&seller, &backend, &cfg, &cursor_path);
+        tokio::pin!(opening);
+        assert!(
+            futures::poll!(opening.as_mut()).is_pending(),
+            "the failed open waits for retry"
+        );
         let saved: SellerMatchWatchCursor =
             serde_json::from_slice(&std::fs::read(&cursor_path).unwrap()).unwrap();
         assert_eq!(
@@ -2582,6 +2747,11 @@ mod tests {
             "the cursor must not claim that a failed open completed"
         );
         assert_eq!(backend.opens.load(Ordering::Relaxed), 1);
+        opening
+            .await
+            .unwrap()
+            .expect("the same funded deal opens on retry");
+        assert_eq!(backend.opens.load(Ordering::Relaxed), 2);
     }
 
     #[tokio::test]
@@ -2609,6 +2779,111 @@ mod tests {
         assert!(error.contains("TokenContract.getDeal"), "{error}");
         assert!(!cursor_path.exists());
         assert_eq!(backend.opens.load(Ordering::Relaxed), 0);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn issue_2030_direct_match_saves_fill_before_failed_open_and_recovers_on_restart() {
+        let (_dir, cursor_path) = temp_cursor_path("2030-direct");
+        let seller = test_seller();
+        let cfg = test_cfg("tc-2030-direct");
+        let buyer = LocalNote::generate();
+        let matched = sample_match(&cfg.token_contract, buyer.pubkey());
+        let mut backend =
+            PollBackend::new(Some(matched.clone()), None, now_unix().unwrap() as i64 + 1)
+                .with_matched_ticks(3)
+                .with_open_failures(1);
+        backend.contract_open_failure = true;
+        let watch = SellerMatchWatchConfig {
+            cursor_path: cursor_path.clone(),
+            poll_interval: dexdo_core::params::DEFAULT_MATCH_POLL_INTERVAL,
+        };
+        serve_watched_match(&seller, &backend, &cfg, &watch, matched)
+            .await
+            .unwrap_err();
+        let saved = read_seller_fill_lineage(&cursor_path, &cfg.token_contract)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            (
+                saved.offered_ticks,
+                saved.matched_ticks,
+                saved.residual_ticks
+            ),
+            (8, 3, 5)
+        );
+        // A fresh gateway restores the same already-consumed event cursor and exact capacity.
+        let restarted = test_seller();
+        backend.contract_open_failure = false;
+        watch_and_serve_match(&restarted, &backend, &cfg, &watch)
+            .await
+            .unwrap();
+        assert_eq!(backend.opens.load(Ordering::Relaxed), 2);
+        assert_eq!(
+            read_seller_fill_lineage(&cursor_path, &cfg.token_contract).unwrap(),
+            Some(saved)
+        );
+        seller.server_task.abort();
+        restarted.server_task.abort();
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn issue_2030_lost_open_response_does_not_repeat_landed_open() {
+        let seller = test_seller();
+        let cfg = test_cfg("tc-2030-landed");
+        let mut backend = PollBackend::new(
+            Some(sample_match(
+                &cfg.token_contract,
+                LocalNote::generate().pubkey(),
+            )),
+            None,
+            1,
+        )
+        .with_open_failures(1);
+        backend.failed_open_state = Some(true);
+        serve_match(&seller, &backend, &cfg).await.unwrap();
+        assert_eq!(backend.opens.load(Ordering::Relaxed), 1);
+        seller.server_task.abort();
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn issue_2030_buyer_cleanup_ends_open_retry() {
+        let seller = test_seller();
+        let cfg = test_cfg("tc-2030-cleanup");
+        let mut backend = PollBackend::new(
+            Some(sample_match(
+                &cfg.token_contract,
+                LocalNote::generate().pubkey(),
+            )),
+            None,
+            1,
+        )
+        .with_open_failures(1);
+        backend.failed_open_state = Some(false);
+        serve_match(&seller, &backend, &cfg).await.unwrap_err();
+        assert_eq!(backend.opens.load(Ordering::Relaxed), 1);
+        seller.server_task.abort();
+    }
+
+    include!("issue_2030_review_tests.rs");
+
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(32))]
+        #[test]
+        fn issue_2030_funded_open_survives_any_number_of_transient_failures(failures in 0u64..32, unconfirmed in any::<bool>()) {
+            let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+            runtime.block_on(async {
+                tokio::time::pause();
+                let seller = test_seller();
+                let cfg = test_cfg("tc-2030-retry");
+                let mut backend = PollBackend::new(Some(sample_match(&cfg.token_contract,
+                    LocalNote::generate().pubkey())), None, 1).with_open_failures(failures);
+                backend.open_unconfirmed = unconfirmed;
+                serve_match(&seller, &backend, &cfg).await.unwrap();
+                assert_eq!(backend.opens.load(Ordering::Relaxed), failures + 1);
+                assert!(backend.opened.load(Ordering::Relaxed));
+                seller.server_task.abort();
+            });
+        }
     }
 
     proptest! {
@@ -2724,8 +2999,8 @@ mod tests {
         assert_eq!(backend.opens.load(Ordering::Relaxed), 0);
     }
 
-    #[tokio::test]
-    async fn post_match_transport_error_surfaces_without_reprovisioning() {
+    #[tokio::test(start_paused = true)]
+    async fn post_match_transport_error_retries_without_reprovisioning() {
         let (_cursor_dir, cursor_path) = temp_cursor_path("post-match-transport");
         let seller = test_seller();
         let cfg = test_cfg("tc-post-match-transport");
@@ -2741,16 +3016,10 @@ mod tests {
             poll_interval: Duration::from_millis(1),
         };
 
-        let error = watch_and_serve_match(&seller, &backend, &cfg, &watch)
+        let matched = watch_and_serve_match(&seller, &backend, &cfg, &watch)
             .await
-            .expect_err("post-match transport error must surface");
-
-        assert!(
-            error
-                .downcast_ref::<ChainError>()
-                .is_some_and(|error| matches!(error, ChainError::Transport(_))),
-            "post-match transport error must remain observable: {error}"
-        );
+            .expect("the funded match must remain recoverable after an open timeout");
+        assert_eq!(matched.token_contract, cfg.token_contract);
         assert_eq!(
             backend.polls.load(Ordering::Relaxed),
             1,
@@ -2758,8 +3027,8 @@ mod tests {
         );
         assert_eq!(
             backend.opens.load(Ordering::Relaxed),
-            1,
-            "a post-match failure must not retry signed provisioning writes"
+            2,
+            "the same funded unopened deal must retry opening after a fresh state read"
         );
     }
 

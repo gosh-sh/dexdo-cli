@@ -138,11 +138,12 @@ fn status_next_for(
         (Some("seller"), "stopped", _, _, _) => "destroy",
         (Some("seller"), _, _, true, false) => "seller_wait_delivery_then_accept_probe",
         (Some("seller"), _, _, true, true) => "seller_claim_finalize_or_settle_week_or_seller_stop",
-        (Some("seller"), _, true, false, false) => "buyer_cleanup_after_timeout",
+        (Some("seller"), _, true, false, false) => "seller_resume_open",
         (Some("buyer"), "stopped", _, _, _) => "none",
         (Some("buyer"), _, _, true, _) => "stream_stop",
         (Some("buyer"), _, true, false, false) => "cleanup_unopened_after_timeout",
         (Some("buyer"), _, _, _, _) => "cancel_resting_bid_or_wait_match",
+        (None, _, true, false, false) => "resolve_role_for_funded_deal",
         _ => "unknown_role",
     };
     machine::StatusNext {
@@ -150,9 +151,12 @@ fn status_next_for(
         retryable_after_unix: None,
         command: if action == "none" {
             "none".to_string()
+        } else if action == "resolve_role_for_funded_deal" {
+            "status".to_string()
         } else if matches!(
             action,
-            "seller_wait_delivery_then_accept_probe"
+            "seller_resume_open"
+                | "seller_wait_delivery_then_accept_probe"
                 | "seller_claim_finalize_or_settle_week_or_seller_stop"
         ) {
             "seller".to_string()
@@ -723,6 +727,26 @@ mod tests {
 
         assert_eq!(next.action, "none");
         assert_eq!(next.command, "none");
+    }
+
+    #[test]
+    fn issue_2030_funded_seller_status_recommends_resuming_seller() {
+        let next = super::status_next_for(
+            Some("seller"),
+            "funded-but-never-opened",
+            true,
+            false,
+            false,
+        );
+        assert_eq!(next.action, "seller_resume_open");
+        assert_eq!(next.command, "seller");
+        let buyer =
+            super::status_next_for(Some("buyer"), "funded-but-never-opened", true, false, false);
+        assert_eq!(buyer.action, "cleanup_unopened_after_timeout");
+        assert_eq!(buyer.command, "close");
+        let raw = super::status_next_for(None, "funded-but-never-opened", true, false, false);
+        assert_eq!(raw.action, "resolve_role_for_funded_deal");
+        assert_eq!(raw.command, "status");
     }
 }
 

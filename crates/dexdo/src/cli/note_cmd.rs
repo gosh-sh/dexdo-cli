@@ -2588,7 +2588,7 @@ async fn note_deploy_wait_confirmation(
         },
         async || {
             Ok(client
-                .get_account_retrying(&note)
+                .get_system_account_retrying(&note)
                 .await?
                 .is_some_and(|account| account.is_active()))
         },
@@ -3188,7 +3188,7 @@ async fn note_deploy_read_note_ecc_shell(
     note: &dexdo_core::Address,
 ) -> Result<Option<u128>> {
     Ok(client
-        .get_account_retrying(note)
+        .get_system_account_retrying(note)
         .await?
         .map(|acc| acc.ecc_balance(SHELL_CURRENCY_ID)))
 }
@@ -4819,8 +4819,7 @@ pub(crate) async fn run_note_balance(args: NoteBalanceArgs) -> Result<()> {
     let note_display = dexdo_core::address::display(&note.to_string());
     let chain = RealChainBackend::connect_with_endpoint(manifest, None)?;
     let account = chain
-        .client()
-        .get_account_retrying(&note)
+        .get_system_account_retrying(&note)
         .await
         .map_err(|e| anyhow::anyhow!("read PrivateNote account {note_display}: {e}"))?;
     chain.assert_note_balance_private_note_account(&note, account.as_ref())?;
@@ -5569,8 +5568,7 @@ pub(crate) async fn run_note_topup(args: crate::cli::args::NoteTopupArgs) -> Res
 
     let chain = RealChainBackend::connect_with_endpoint(&manifest, None)?;
     let account = chain
-        .client()
-        .get_account_retrying(&note)
+        .get_system_account_retrying(&note)
         .await
         .map_err(|e| anyhow::anyhow!("read PrivateNote account {note_display}: {e}"))?;
     // Refuse to send SHELL anywhere that is not a live, current-generation PrivateNote, and refuse
@@ -6039,8 +6037,7 @@ async fn note_transfer_assert_live_note(
 ) -> Result<()> {
     let display = dexdo_core::address::display(&note.with_workchain());
     let account = chain
-        .client()
-        .get_account_retrying(note)
+        .get_system_account_retrying(note)
         .await
         .map_err(|e| anyhow::anyhow!("{flag} {display}: read PrivateNote account: {e}"))?;
     chain
@@ -11953,13 +11950,13 @@ mod tests {
         );
         let body =
             crate::cli::source_probe::code_of(source, "pub(crate) async fn run_note_balance");
-        assert!(body.contains(".get_account_retrying("), "{body}");
+        assert!(body.contains(".get_system_account_retrying("), "{body}");
         assert!(
             body.contains(".assert_note_balance_private_note_account("),
             "{body}"
         );
         assert!(body.contains(".private_note_details("), "{body}");
-        let get_account = body.find(".get_account_retrying(").unwrap();
+        let get_account = body.find(".get_system_account_retrying(").unwrap();
         let identity_guard = body
             .find(".assert_note_balance_private_note_account(")
             .unwrap();

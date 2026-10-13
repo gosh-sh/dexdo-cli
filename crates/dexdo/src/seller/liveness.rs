@@ -218,8 +218,7 @@ impl std::fmt::Display for CancellationDisposition {
     }
 }
 
-/// The authoritative expiry of the exact supervised SELL, and the moment the seller observed it
-/// .
+/// The exact supervised SELL's last authoritative deadline and its expiry/removal observation.
 
 /// `deadline` is read back out of the order book, never reconstructed as `post time + MAX_SELL_TTL`:
 /// the chain anchors it at `block.timestamp` inside `PrivateNote.postSellOffer`
@@ -229,8 +228,30 @@ impl std::fmt::Display for CancellationDisposition {
 pub struct RestingOfferExpiry {
     /// The absolute deadline the book holds for this order.
     pub deadline: u64,
-    /// Unix seconds at the read that proved the deadline had passed.
+    /// Unix seconds at the read that proved expiration or exact-row absence.
     pub observed_at: u64,
+    /// The exact row was absent. Its disappearance alone does not prove cancellation or expiry.
+    pub removed_from_book: bool,
+}
+
+impl RestingOfferExpiry {
+    fn deadline_status(&self) -> &'static str {
+        if self.deadline == 0 {
+            "unknown"
+        } else if self.observed_at >= self.deadline {
+            "passed"
+        } else {
+            "not_reached"
+        }
+    }
+
+    fn disposition(&self) -> &'static str {
+        if self.removed_from_book {
+            "removed"
+        } else {
+            "expired"
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -238,7 +259,7 @@ pub enum RestingStopReason {
     Health(HealthFailure),
     Shutdown,
     Watcher(String),
-    /// the supervised order reached its own on-chain deadline.
+    /// The supervised order reached its deadline or disappeared without an observed fill.
 
     /// Terminal, and deliberately NOT a health failure -- nothing is wrong with this seller. Its offer
     /// simply stopped being executable, which is the ordinary end of every SELL: the deadline is
@@ -817,6 +838,7 @@ async fn target_state(
             return Ok(TargetState::Expired(RestingOfferExpiry {
                 deadline: order.deadline,
                 observed_at,
+                removed_from_book: false,
             }));
         }
         return Ok(TargetState::Present);
@@ -837,7 +859,7 @@ enum SupervisedOfferPoll {
     /// Terminal: past its own deadline in the book, or already removed from it without a fill.
     Expired(RestingOfferExpiry),
     /// The deal is matched. Not this branch's business -- the match path owns it.
-    Matched,
+    Matched(Match),
 }
 
 /// Is the exact supervised order past its own authoritative deadline right now?
@@ -850,7 +872,7 @@ enum SupervisedOfferPoll {
 /// an order that has left the book WITHOUT a fill is the same fact arriving early. Expiry removal
 /// is permissionless, so a matcher crossing the book or another keeper may sweep this seller's ask
 /// seconds after its deadline and before this poll ever sees it expired
-/// (`contracts/airegistry/InferenceOrderBook.sol:1015-1019,1679-1691`). The removal counts as an expiry
+/// (`contracts/airegistry/InferenceOrderBook.sol:1015-1019,1679-1691`). The removal permits recovery
 /// only once the deal proves it was not a fill -- an unfunded deal has sold nothing, and a fill and its
 /// funding land in the same match (`contracts/airegistry/InferenceOrderBook.sol:1082-1092`). Without
 /// this, a swept ask left the seller supervising an order that no longer exists, healthy and
@@ -871,12 +893,11 @@ async fn resting_offer_expiry(
         .iter()
         .find(|order| order.order_id == identity.order_id)
     else {
-        if chain
+        if let Some(matched) = chain
             .read_openable_match_now(&identity.token_contract)
             .await?
-            .is_some()
         {
-            return Ok(SupervisedOfferPoll::Matched);
+            return Ok(SupervisedOfferPoll::Matched(matched));
         }
         return Ok(SupervisedOfferPoll::Expired(RestingOfferExpiry {
             // The book's own figure, from while it still held the row. A zero says the row was gone
@@ -884,6 +905,7 @@ async fn resting_offer_expiry(
             // authoritative fact, and no locally reconstructed `post time + TTL` stands in for it.
             deadline: last_observed_deadline.unwrap_or(0),
             observed_at,
+            removed_from_book: true,
         }));
     };
     if dexdo_core::order_deadline_is_live(order.is_buy, order.deadline, observed_at) {
@@ -891,13 +913,20 @@ async fn resting_offer_expiry(
             deadline: order.deadline,
         });
     }
+    if let Some(matched) = chain
+        .read_openable_match_now(&identity.token_contract)
+        .await?
+    {
+        return Ok(SupervisedOfferPoll::Matched(matched));
+    }
     Ok(SupervisedOfferPoll::Expired(RestingOfferExpiry {
         deadline: order.deadline,
         observed_at,
+        removed_from_book: false,
     }))
 }
 
-/// The terminal expiry line an operator and a log scraper both read.
+/// Removal is not proof of expiration: a cancelled ask can disappear before its last read deadline.
 
 /// It carries the order id, the TokenContract, the absolute deadline and the observed time, so the
 /// outcome can be checked against the chain without trusting the process that emitted it.
@@ -910,8 +939,9 @@ fn trace_offer_expired(identity: &RestingOfferIdentity, expiry: &RestingOfferExp
         order_id = identity.order_id,
         deadline = expiry.deadline,
         observed_at = expiry.observed_at,
-        disposition = "expired",
-        "resting SELL reached its authoritative deadline and is no longer executable"
+        disposition = expiry.disposition(),
+        deadline_status = expiry.deadline_status(),
+        "supervised SELL is no longer executable or was removed without an observed match"
     );
 }
 
@@ -1189,10 +1219,38 @@ async fn reap_state(
     }))
 }
 
-/// The line that correlates a reaped generation with its successor.
+/// Confirm the existing relist invariants after cancellation, without submitting
+/// an expiry transaction for an order already removed from the book.
+async fn confirm_removed_offer(
+    chain: &dyn ChainBackend,
+    cfg: &SellerConfig,
+    identity: &RestingOfferIdentity,
+    deadline: tokio::time::Instant,
+    poll_interval: Duration,
+) -> RelistDecision {
+    loop {
+        let known_result =
+            match tokio::time::timeout_at(deadline, reap_state(chain, cfg, identity)).await {
+                Ok(Ok(Ok(decision))) => return decision,
+                Ok(Ok(Err(pending))) => pending,
+                Ok(Err(error)) => format!("authoritative_read=failed: {error}"),
+                Err(_) => "authoritative_read=timeout".to_string(),
+            };
+        if tokio::time::Instant::now() >= deadline {
+            return RelistDecision::Unproven { known_result };
+        }
+        tokio::time::sleep_until(std::cmp::min(
+            tokio::time::Instant::now() + poll_interval,
+            deadline,
+        ))
+        .await;
+    }
+}
+
+/// The line that correlates a removed generation with its successor.
 fn trace_offer_relisted(
     identity: &RestingOfferIdentity,
-    expired: &RestingOfferExpiry,
+    expired: Option<&RestingOfferExpiry>,
     successor_order_id: u128,
     successor_deadline: u64,
     remaining_ticks: u64,
@@ -1210,12 +1268,16 @@ fn trace_offer_relisted(
         owner_note = %display_dexdo_address(&identity.owner_note),
         token_contract = %display_token_contract(&identity.token_contract),
         previous_order_id = identity.order_id,
-        previous_deadline = expired.deadline,
+        previous_deadline = expired.map(|expiry| expiry.deadline),
+        previous_observed_at = expired.map(|expiry| expiry.observed_at),
+        previous_disposition = expired.map(RestingOfferExpiry::disposition),
+        previous_deadline_status = expired.map(RestingOfferExpiry::deadline_status),
         order_id = successor_order_id,
         deadline = successor_deadline,
         remaining_ticks,
         disposition = "relisted",
-        "expired ask reaped and exactly one successor accepted for the remaining capacity"
+        cause = if expired.is_some() { "expiry" } else { "upstream_recovery" },
+        "previous ask removed and exactly one successor accepted for the remaining capacity"
     );
 }
 
@@ -1720,7 +1782,9 @@ async fn stop_exact_offer(
             disposition,
         }),
         disposition => {
-            seller.server_task.abort();
+            if timing.abort_gateway_on_stop {
+                seller.server_task.abort();
+            }
             Ok(SellerStartupOutcome::Stopped {
                 identity: Some(identity.clone()),
                 reason,
@@ -1856,15 +1920,19 @@ async fn resolve_interrupted_startup(
 /// plain completion in two seconds: `upstream_authentication_and_model timed out: bounded upstream
 /// model probe expired`, and the offer was never placed.
 
-/// Only a timeout is retried. A readiness FAILURE -- a dead gateway, a model that is not the model
-/// this market sells -- stays fatal on the first answer, as before: it is evidence of unfitness, and
-/// asking twice cannot change it.
+/// Ordinary startup only retries a timeout. After a confirmed upstream withdrawal,
+/// every upstream failure keeps the deal off the book and repeats full readiness at
+/// the health cadence; an error string never authorizes an offer.
 async fn startup_readiness_with_timeout_retries(
     seller: &RunningSeller,
     cfg: &SellerConfig,
     existing_identity: Option<&RestingOfferIdentity>,
     timing: SupervisionTiming,
+    recover_upstream: bool,
 ) -> std::result::Result<(), HealthFailure> {
+    if recover_upstream {
+        tokio::time::sleep(timing.health_interval).await;
+    }
     let mut attempt = 1;
     loop {
         let outcome = check_startup_readiness(
@@ -1878,6 +1946,18 @@ async fn startup_readiness_with_timeout_retries(
         .await;
         match outcome {
             Ok(()) => return Ok(()),
+            Err(failure)
+                if recover_upstream && failure.component == HealthComponent::UpstreamModel =>
+            {
+                tracing::warn!(
+                    event = "seller_upstream_recovery_wait",
+                    token_contract = %display_token_contract(&cfg.token_contract),
+                    reason = %failure,
+                    retry_interval_ms = timing.health_interval.as_millis() as u64,
+                    "SELL remains withdrawn; waiting for full model readiness before relisting"
+                );
+                tokio::time::sleep(timing.health_interval).await;
+            }
             Err(failure)
                 if failure.timed_out && attempt < SELLER_UPSTREAM_HEALTH_TIMEOUT_MAX_ATTEMPTS =>
             {
@@ -1911,6 +1991,33 @@ async fn prepare_seller_offer_with_timing<S>(
 where
     S: Future<Output = ()>,
 {
+    prepare_seller_offer_with_recovery(
+        seller,
+        chain,
+        cfg,
+        expected_owner,
+        existing_identity,
+        shutdown,
+        timing,
+        false,
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn prepare_seller_offer_with_recovery<S>(
+    seller: &RunningSeller,
+    chain: &dyn ChainBackend,
+    cfg: &SellerConfig,
+    expected_owner: &str,
+    existing_identity: Option<&RestingOfferIdentity>,
+    shutdown: S,
+    timing: SupervisionTiming,
+    recover_upstream: bool,
+) -> Result<SellerStartupOutcome>
+where
+    S: Future<Output = ()>,
+{
     // E2E-ADV-14 -- "the note covers the 2P security deposit before the offer is posted". This runs
     // FIRST, ahead of the readiness probe and ahead of any post: a note whose record cannot pay the
     // deal's exact mirror bond must neither emit a readiness success nor rest an ask. It is also the
@@ -1921,7 +2028,13 @@ where
         .assert_note_covers_seller_bond(&cfg.token_contract)
         .await?;
     let readiness_deadline = tokio::time::Instant::now() + timing.cycle_timeout;
-    let readiness = startup_readiness_with_timeout_retries(seller, cfg, existing_identity, timing);
+    let readiness = startup_readiness_with_timeout_retries(
+        seller,
+        cfg,
+        existing_identity,
+        timing,
+        recover_upstream,
+    );
     let gateway_stopped = wait_for_gateway_task_stop(seller);
     tokio::pin!(readiness);
     tokio::pin!(gateway_stopped);
@@ -1948,7 +2061,9 @@ where
             )
             .await;
         }
-        seller.server_task.abort();
+        if timing.abort_gateway_on_stop {
+            seller.server_task.abort();
+        }
         return match reason {
             RestingStopReason::Shutdown => Ok(SellerStartupOutcome::Stopped {
                 identity: None,
@@ -2341,10 +2456,14 @@ where
                                 SupervisedOfferPoll::Live { deadline } => {
                                     last_deadline = Some(deadline);
                                 }
-                                SupervisedOfferPoll::Matched => {}
+                                SupervisedOfferPoll::Matched(matched) => break Ok(matched),
                             }
                         }
                         Ok(Err(error)) => {
+                            if error.downcast_ref::<dexdo_core::ChainError>().is_some_and(|error|
+                                !matches!(error, dexdo_core::ChainError::Transport(_))) {
+                                return Err(error);
+                            }
                             consecutive_expiry_read_failures =
                                 consecutive_expiry_read_failures.saturating_add(1);
                             trace_offer_expiry_read_failure(
@@ -2423,13 +2542,14 @@ where
 }
 
 /// Supervise one resting ask and, when it dies of its own deadline, reap it and carry the deal's
-/// remaining capacity into exactly one successor.
+/// remaining capacity into exactly one successor. An upstream failure withdraws the
+/// offer first, then waits for full readiness before re-offering the same unsold deal.
 
 /// A SELL's deadline is mandatory and capped at `MAX_SELL_TTL = 3600`
 /// (`contracts/dex/PrivateNote.sol:41,792`), so an alive seller meets it by design rather than by
 /// fault. Every iteration of this loop supervises ONE generation: the loop only turns after the
 /// previous generation is authoritatively off the book, and it stops for good at the first outcome
-/// that is not an expiry.
+/// that is neither an expiry nor a confirmed upstream withdrawal.
 
 /// The successor rests on the SAME deal, and that is not a shortcut. A `TokenContract`'s
 /// `_maxTicks` and `_pricePerTick` are constructor statics -- `postFromNote` re-posts exactly them
@@ -2462,41 +2582,73 @@ where
     // holds the entry the shutdown sweep will act on -- so advancing a private copy left the
     // pool pointing at a consumed predecessor and the successor resting unserved.
     let mut cfg = cfg.clone();
+    let mut pending_stop = None;
     loop {
-        let expired = match supervise_with_timing(
-            seller,
-            chain,
-            &cfg,
-            watch,
-            &*identity,
-            shutdown.as_mut(),
-            timing,
-        )
-        .await?
-        {
-            RestingSellerOutcome::Stopped {
-                reason: RestingStopReason::Expired(expired),
-                ..
-            } => expired,
-            settled => return Ok(settled),
+        let outcome = match pending_stop.take() {
+            Some(outcome) => outcome,
+            None => {
+                supervise_with_timing(
+                    seller,
+                    chain,
+                    &cfg,
+                    watch,
+                    &*identity,
+                    shutdown.as_mut(),
+                    SupervisionTiming {
+                        abort_gateway_on_stop: false,
+                        ..timing
+                    },
+                )
+                .await?
+            }
         };
+        let (reason, disposition) = match outcome {
+            RestingSellerOutcome::Stopped {
+                reason,
+                disposition,
+            } => (reason, disposition),
+            matched => return Ok(matched),
+        };
+        let expired = match &reason {
+            RestingStopReason::Expired(expired) => Some(*expired),
+            RestingStopReason::Health(failure)
+                if failure.component == HealthComponent::UpstreamModel
+                    && matches!(
+                        disposition,
+                        CancellationDisposition::Cancelled
+                            | CancellationDisposition::AlreadyAbsent
+                            | CancellationDisposition::NotAttemptedExpired
+                    ) =>
+            {
+                None
+            }
+            _ => {
+                if timing.abort_gateway_on_stop && disposition.proven_unmatchable() {
+                    seller.server_task.abort();
+                }
+                return Ok(RestingSellerOutcome::Stopped {
+                    reason,
+                    disposition,
+                });
+            }
+        };
+        let recover_upstream = expired.is_none();
 
         let reap_deadline = tokio::time::Instant::now() + timing.reap_timeout;
-        let (remaining_ticks, price_per_tick) = match reap_expired_offer(
-            chain,
-            &cfg,
-            &*identity,
-            reap_deadline,
-            timing.reap_poll,
-        )
-        .await
+        let relist = if expired.is_some()
+            || matches!(disposition, CancellationDisposition::NotAttemptedExpired)
         {
+            reap_expired_offer(chain, &cfg, &*identity, reap_deadline, timing.reap_poll).await
+        } else {
+            confirm_removed_offer(chain, &cfg, &*identity, reap_deadline, timing.reap_poll).await
+        };
+        let (remaining_ticks, price_per_tick) = match relist {
             RelistDecision::Relist {
                 remaining_ticks,
                 price_per_tick,
             } => (remaining_ticks, price_per_tick),
             RelistDecision::Matched(matched) => return Ok(RestingSellerOutcome::Matched(matched)),
-            RelistDecision::Refused { reason } => {
+            RelistDecision::Refused { reason: refusal } => {
                 tracing::warn!(
                     event = "seller_offer_relist_refused",
                     timestamp = unix_timestamp(),
@@ -2504,12 +2656,15 @@ where
                     token_contract = %display_token_contract(&identity.token_contract),
                     order_id = identity.order_id,
                     disposition = "reaped_not_relisted",
-                    reason = %reason,
-                    "expired ask reaped; the deal is not this seller's to re-offer"
+                    previous_deadline = expired.map(|expiry| expiry.deadline),
+                    previous_disposition = expired.as_ref().map(RestingOfferExpiry::disposition),
+                    previous_deadline_status = expired.as_ref().map(RestingOfferExpiry::deadline_status),
+                    reason = %refusal,
+                    "previous ask removed; the deal is not this seller's to re-offer"
                 );
                 return Ok(RestingSellerOutcome::Stopped {
-                    reason: RestingStopReason::Expired(expired),
-                    disposition: CancellationDisposition::ReapedNotRelisted { reason },
+                    reason,
+                    disposition: CancellationDisposition::ReapedNotRelisted { reason: refusal },
                 });
             }
             RelistDecision::Unproven { known_result } => {
@@ -2520,11 +2675,14 @@ where
                     token_contract = %display_token_contract(&identity.token_contract),
                     order_id = identity.order_id,
                     disposition = "unknown_failure",
+                    previous_deadline = expired.map(|expiry| expiry.deadline),
+                    previous_disposition = expired.as_ref().map(RestingOfferExpiry::disposition),
+                    previous_deadline_status = expired.as_ref().map(RestingOfferExpiry::deadline_status),
                     known_result = %known_result,
-                    "expiry cleanup has no terminal authoritative fact; refusing to relist"
+                    "offer removal has no terminal authoritative fact; refusing to relist"
                 );
                 return Ok(RestingSellerOutcome::Stopped {
-                    reason: RestingStopReason::Expired(expired),
+                    reason,
                     disposition: CancellationDisposition::UnknownFailure { known_result },
                 });
             }
@@ -2532,14 +2690,19 @@ where
 
         cfg.price_per_tick = price_per_tick;
         cfg.max_ticks = remaining_ticks;
-        let successor = match prepare_seller_offer_with_timing(
+        let successor = match prepare_seller_offer_with_recovery(
             seller,
             chain,
             &cfg,
             &identity.owner_note,
             None,
             shutdown.as_mut(),
-            timing,
+            SupervisionTiming {
+                // The outer loop decides whether to recover or honor caller-owned shutdown.
+                abort_gateway_on_stop: false,
+                ..timing
+            },
+            recover_upstream,
         )
         .await?
         {
@@ -2562,7 +2725,7 @@ where
                 // this arm cannot be reached; treating it as an unconfirmed write keeps the
                 // fail-closed rule even if that ever changes.
                 return Ok(RestingSellerOutcome::Stopped {
-                    reason: RestingStopReason::Expired(expired),
+                    reason,
                     disposition: CancellationDisposition::UnknownFailure {
                         known_result: format!(
                             "successor_post=unconfirmed for TokenContract {}",
@@ -2572,14 +2735,19 @@ where
                 });
             }
             SellerStartupOutcome::Stopped {
+                identity: stopped_identity,
                 reason,
                 disposition,
-                ..
             } => {
-                return Ok(RestingSellerOutcome::Stopped {
+                if let Some(stopped_identity) = stopped_identity {
+                    *identity = stopped_identity;
+                }
+                // Classify this generation's result, regardless of the predecessor's cause.
+                pending_stop = Some(RestingSellerOutcome::Stopped {
                     reason,
                     disposition,
-                })
+                });
+                continue;
             }
         };
 
@@ -2588,7 +2756,7 @@ where
         // would spin this loop against an order that can never be live.
         if successor == identity.order_id {
             return Ok(RestingSellerOutcome::Stopped {
-                reason: RestingStopReason::Expired(expired),
+                reason,
                 disposition: CancellationDisposition::UnknownFailure {
                     known_result: format!(
                         "successor_post=returned the reaped order id {} for TokenContract {}",
@@ -2610,30 +2778,31 @@ where
         )
         .await
         {
-            Ok(deadline) if deadline > expired.deadline => deadline,
+            Ok(deadline) if expired.is_none_or(|expired| deadline > expired.deadline) => deadline,
             Ok(deadline) => {
                 return Ok(RestingSellerOutcome::Stopped {
-                    reason: RestingStopReason::Expired(expired),
+                    reason,
                     disposition: CancellationDisposition::UnknownFailure {
                         known_result: format!(
                             "successor order {successor} carries deadline {deadline}, which does not \
                              advance past the reaped {}; TokenContract {} now rests an offer this \
                              seller will not supervise",
-                            expired.deadline, display_token_contract(&identity.token_contract)
+                            expired.expect("only expiry requires advancing the deadline").deadline,
+                            display_token_contract(&identity.token_contract)
                         ),
                     },
                 });
             }
             Err(known_result) => {
                 return Ok(RestingSellerOutcome::Stopped {
-                    reason: RestingStopReason::Expired(expired),
+                    reason,
                     disposition: CancellationDisposition::UnknownFailure { known_result },
                 });
             }
         };
         trace_offer_relisted(
             &*identity,
-            &expired,
+            expired.as_ref(),
             successor,
             successor_deadline,
             remaining_ticks,
@@ -2791,6 +2960,7 @@ fn canonical_timing(
 #[cfg(test)]
 mod tests {
     include!("expiry_confirmation_2050_tests.rs");
+    include!("upstream_recovery_2077_tests.rs");
 
     /// the seller's manual-cancellation guidance is the one output path here that names a
     /// command, and it must not pretend to be a runnable line: `orders` needs an identity and a
@@ -3144,7 +3314,31 @@ mod tests {
                     "authoritative match watcher failed".to_string(),
                 ));
             }
-            Ok(Vec::new())
+            Ok(self
+                .matched
+                .lock()
+                .unwrap()
+                .as_ref()
+                .map(|matched| dexdo_core::MatchedFill {
+                    order_id: self.posted_order_id,
+                    token_contract: matched.token_contract.clone(),
+                    ticks: 8,
+                    price_per_tick: u128::from(matched.price_per_tick),
+                })
+                .into_iter()
+                .collect())
+        }
+
+        async fn sell_offer_terms(
+            &self,
+            _: &TokenContract,
+        ) -> Result<Option<(u64, u64)>, ChainError> {
+            Ok(self
+                .matched
+                .lock()
+                .unwrap()
+                .as_ref()
+                .map(|matched| (matched.price_per_tick, 8)))
         }
 
         async fn read_openable_match_now(
@@ -3202,12 +3396,13 @@ mod tests {
             &self,
             _: &TokenContract,
         ) -> Result<Option<DealChainState>, ChainError> {
+            let funded = self.matched.lock().unwrap().is_some();
             Ok(Some(DealChainState {
-                funded: self.matched.lock().unwrap().is_some(),
+                funded,
                 opened: false,
                 probe_accepted: false,
                 disputed: false,
-                deposit: 0,
+                deposit: if funded { dexdo_core::PRICE_STEP } else { 0 },
                 finalized_owed: 0,
                 tokens_final: 0,
                 tokens_pending: 0,
@@ -5963,6 +6158,8 @@ mod tests {
         /// which a shutdown cancels on its way out.
         postings: Mutex<Vec<OrderBookOrder>>,
         cancelled: Mutex<Vec<u128>>,
+        reject_cancellation: bool,
+        match_on_cancel: Option<Match>,
         offer_posted: Mutex<bool>,
         deal_terms: Option<(u64, u64)>,
         state: Mutex<DealChainState>,
@@ -5994,6 +6191,8 @@ mod tests {
                 rows: Mutex::new(Vec::new()),
                 postings: Mutex::new(Vec::new()),
                 cancelled: Mutex::new(Vec::new()),
+                reject_cancellation: false,
+                match_on_cancel: None,
                 offer_posted: Mutex::new(false),
                 deal_terms: Some((1000, ticks)),
                 state: Mutex::new(fresh_deal_state()),
@@ -6025,7 +6224,9 @@ mod tests {
                 owner_note: self.owner.clone(),
                 token_contract: Some(self.token_contract.clone()),
                 is_buy: false,
-                price_per_tick: 1000,
+                price_per_tick: u128::from(
+                    self.deal_terms.expect("test deal has constructor terms").0,
+                ),
                 ticks: u128::from(ticks),
                 escrow: 0,
                 deadline,
@@ -6267,12 +6468,32 @@ mod tests {
             order_id: u128,
         ) -> Result<(), ChainError> {
             self.cancelled.lock().unwrap().push(order_id);
+            if self.reject_cancellation {
+                return Ok(());
+            }
             let mut rows = self.rows.lock().unwrap();
             rows.retain(|row| row.order_id != order_id);
             if rows.is_empty() {
                 *self.offer_posted.lock().unwrap() = false;
             }
+            if let Some(matched) = &self.match_on_cancel {
+                *self.matched.lock().unwrap() = Some(matched.clone());
+                self.state.lock().unwrap().funded = true;
+            }
             Ok(())
+        }
+
+        async fn resting_sell_cancel_rejection_after(
+            &self,
+            _: &TokenContract,
+            _: u128,
+            _: &str,
+            _: &RestingSellCancelWatch,
+        ) -> Result<Option<u8>, ChainError> {
+            Ok(
+                (self.reject_cancellation && !self.cancelled.lock().unwrap().is_empty())
+                    .then_some(1),
+            )
         }
 
         async fn poll_seller_fills(
@@ -6391,6 +6612,56 @@ mod tests {
         cfg.price_per_tick = 1000;
         cfg.max_ticks = ticks;
         cfg
+    }
+
+    #[test]
+    fn issue_2073_relist_diagnostics_distinguish_deadline_from_unexplained_removal() {
+        #[derive(Clone)]
+        struct Writer(Arc<Mutex<Vec<u8>>>);
+        impl std::io::Write for Writer {
+            fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+                self.0.lock().unwrap().extend_from_slice(bytes);
+                Ok(bytes.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        for (deadline, observed_at, removed_from_book, outcome, status) in [
+            (1791567244, 1791564079, true, "removed", "not_reached"),
+            (1791567244, 1791567244, false, "expired", "passed"),
+            (1791567244, 1791567244, true, "removed", "passed"),
+            (0, 1791564079, true, "removed", "unknown"),
+        ] {
+            let captured = Arc::new(Mutex::new(Vec::new()));
+            let writer = Writer(captured.clone());
+            let subscriber = tracing_subscriber::fmt()
+                .without_time()
+                .with_ansi(false)
+                .with_max_level(tracing::Level::INFO)
+                .with_writer(move || writer.clone())
+                .finish();
+            let expiry = RestingOfferExpiry {
+                deadline,
+                observed_at,
+                removed_from_book,
+            };
+            let offer = identity(&address('a'), &address('b'), 13);
+            tracing::subscriber::with_default(subscriber, || {
+                trace_offer_expired(&offer, &expiry);
+                trace_offer_relisted(&offer, Some(&expiry), 14, 1791567672, 98);
+            });
+            let output = String::from_utf8(captured.lock().unwrap().clone()).unwrap();
+            assert!(
+                output.contains(&format!("previous_disposition=\"{outcome}\"")),
+                "{output}"
+            );
+            assert!(
+                output.contains(&format!("previous_deadline_status=\"{status}\"")),
+                "{output}"
+            );
+            assert!(!output.contains("expired ask reaped"), "{output}");
+        }
     }
 
     fn relist_child_output(test_name: &str) -> String {
@@ -8176,6 +8447,9 @@ mod tests {
             expired: OrderBookOrder,
             watcher_release: Option<Arc<tokio::sync::Notify>>,
             watcher_outcome: Option<PendingWatcherOutcome>,
+            expiry_match: Option<Match>,
+            expiry_match_failures: AtomicU64,
+            expiry_match_pending: Option<Arc<tokio::sync::Notify>>,
         }
 
         impl ScriptedExpiryBackend {
@@ -8202,6 +8476,9 @@ mod tests {
                     ),
                     watcher_release: None,
                     watcher_outcome: None,
+                    expiry_match: None,
+                    expiry_match_failures: AtomicU64::new(0),
+                    expiry_match_pending: None,
                 }
             }
 
@@ -8297,7 +8574,20 @@ mod tests {
                 &self,
                 _: &TokenContract,
             ) -> Result<Option<Match>, ChainError> {
-                Ok(None)
+                if self.attempts() == 0 {
+                    return Ok(None);
+                }
+                if let Some(started) = &self.expiry_match_pending {
+                    started.notify_one();
+                    return std::future::pending().await;
+                }
+                if self.expiry_match_failures.load(Ordering::SeqCst) > 0 {
+                    self.expiry_match_failures.fetch_sub(1, Ordering::SeqCst);
+                    return Err(ChainError::Transport(
+                        "fresh expiry TC read unavailable".into(),
+                    ));
+                }
+                Ok(self.expiry_match.clone())
             }
 
             async fn place_buy(&self, _: &TokenContract, _: &dyn Note) -> Result<(), ChainError> {
@@ -8402,9 +8692,61 @@ mod tests {
             outcome
         }
 
+        #[tokio::test]
+        async fn issue_2030_funded_match_wins_over_expired_offer_row() {
+            let owner = address('e');
+            let token_contract = address('f');
+            let mut backend =
+                ScriptedExpiryBackend::new(&owner, &token_contract, 11, [ExpiryReadStep::Expired]);
+            backend.expiry_match = Some(Match {
+                token_contract: token_contract.clone(),
+                buyer_pubkey: LocalNote::generate().pubkey(),
+                price_per_tick: dexdo_core::PRICE_STEP as u64,
+            });
+            // The pinned fill watcher has not received the event yet. Only the fresh
+            // funded state read at expiry can prevent retiring this bought deal.
+            let outcome = run_to_expiry(&backend, "issue-2030-funded-expiry").await;
+            assert!(matches!(outcome, RestingSellerOutcome::Matched(matched)
+                if matched.token_contract == token_contract));
+            assert_eq!(backend.attempts(), 1);
+        }
+
+        #[tokio::test(start_paused = true)]
+        async fn issue_2030_review_expiry_transient_tc_read_retains_same_match() {
+            let owner = address('e');
+            let token_contract = address('f');
+            let mut backend = ScriptedExpiryBackend::new(
+                &owner,
+                &token_contract,
+                11,
+                [ExpiryReadStep::Expired, ExpiryReadStep::Expired],
+            );
+            backend.expiry_match = Some(sample_match(&token_contract));
+            backend.expiry_match_failures.store(1, Ordering::SeqCst);
+            let outcome = run_to_expiry(&backend, "2030-expiry-transient-tc").await;
+            assert!(matches!(outcome, RestingSellerOutcome::Matched(matched)
+                if matched.token_contract == token_contract));
+            assert_eq!(backend.attempts(), 2);
+        }
+
+        #[tokio::test(start_paused = true)]
+        async fn issue_2030_review_pending_expiry_tc_read_keeps_pinned_match_watcher() {
+            let matched = sample_match(&address('f'));
+            let (outcome, elapsed) = release_watcher_during_pending_expiry_read(
+                "2030-pending-expiry-tc",
+                PendingWatcherOutcome::Match(matched.clone()),
+                true,
+            )
+            .await;
+            assert!(matches!(outcome, RestingSellerOutcome::Matched(actual)
+                if actual.token_contract == matched.token_contract));
+            assert!(elapsed < quiet_timing().expiry_poll);
+        }
+
         async fn release_watcher_during_pending_expiry_read(
             name: &'static str,
             watcher_outcome: PendingWatcherOutcome,
+            pending_tc: bool,
         ) -> (RestingSellerOutcome, Duration) {
             let owner = address('e');
             let token_contract = address('f');
@@ -8413,13 +8755,20 @@ mod tests {
             assert!(timing.expiry_poll < TRANSIENT_READ_TOTAL_BUDGET);
             let expiry_read_started = Arc::new(tokio::sync::Notify::new());
             let release_watcher = Arc::new(tokio::sync::Notify::new());
-            let backend = ScriptedExpiryBackend::new(
+            let mut backend = ScriptedExpiryBackend::new(
                 &owner,
                 &token_contract,
                 identity.order_id,
-                [ExpiryReadStep::Pending(Arc::clone(&expiry_read_started))],
+                [if pending_tc {
+                    ExpiryReadStep::Expired
+                } else {
+                    ExpiryReadStep::Pending(Arc::clone(&expiry_read_started))
+                }],
             )
             .with_watcher(Arc::clone(&release_watcher), watcher_outcome);
+            if pending_tc {
+                backend.expiry_match_pending = Some(Arc::clone(&expiry_read_started));
+            }
             let supervisor = tokio::spawn(async move {
                 let seller = super::super::super::start_gateway_with_note(
                     "127.0.0.1:0".parse().unwrap(),
@@ -8465,6 +8814,7 @@ mod tests {
             let (matched_outcome, matched_elapsed) = release_watcher_during_pending_expiry_read(
                 "issue-1168-pending-read-match",
                 PendingWatcherOutcome::Match(expected.clone()),
+                false,
             )
             .await;
             let matched = match matched_outcome {
@@ -8483,6 +8833,7 @@ mod tests {
             let (error_outcome, error_elapsed) = release_watcher_during_pending_expiry_read(
                 "issue-1168-pending-read-watcher-error",
                 PendingWatcherOutcome::Error(watcher_error),
+                false,
             )
             .await;
             assert!(

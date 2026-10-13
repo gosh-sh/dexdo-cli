@@ -2981,13 +2981,43 @@ impl LimitedChainClient {
         args: serde_json::Value,
     ) -> Result<Option<serde_json::Value>> {
         self.gate.admit().await;
-        self.inner.run_getter(address, abi, method, args).await
+        run_contract_getter(&self.inner, address, abi, method, args).await
     }
 
     pub async fn chain_liveness(&self) -> Result<ChainLiveness> {
         self.gate.admit().await;
         self.inner.chain_liveness().await
     }
+}
+
+async fn run_contract_getter(
+    client: &ChainClient,
+    address: &Address,
+    abi: &str,
+    method: &str,
+    args: Value,
+) -> Result<Option<Value>> {
+    if abi != PRIVATENOTE_ABI
+        && abi != TOKENCONTRACT_ABI
+        && abi != crate::private_note::artifacts::PRIVATE_NOTE_ABI_JSON
+    {
+        return client.run_getter(address, abi, method, args).await;
+    }
+    let dapp = Address::parse(&format!("0:{}", crate::address::DEXDO_DAPP_ID))?;
+    let Some(account) = client
+        .get_account_in_dapp(address, &dapp)
+        .await?
+        .filter(Account::is_active)
+    else {
+        return Ok(None);
+    };
+    let boc = account
+        .boc
+        .ok_or_else(|| anyhow!("account {address} active but returned no boc"))?;
+    gosh_ackinacki::airegistry::run::GetterRunner::new()?
+        .run_getter(abi, &address.with_workchain(), &boc, method, args)
+        .await
+        .map(Some)
 }
 
 /// Chain reads that repeat when they got no answer. See [`retry_transient_read`] for the policy
@@ -3003,6 +3033,9 @@ pub trait RetryingReads {
     ) -> Result<Option<serde_json::Value>>;
 
     async fn get_account_retrying(&self, address: &Address) -> Result<Option<Account>>;
+
+    /// Known PrivateNote/TokenContract account, without discovery or self-dapp fallback.
+    async fn get_system_account_retrying(&self, address: &Address) -> Result<Option<Account>>;
 
     async fn chain_liveness_retrying(&self) -> Result<ChainLiveness>;
 }
@@ -3020,11 +3053,16 @@ impl RetryingReads for ChainClient {
         method: &str,
         args: serde_json::Value,
     ) -> Result<Option<serde_json::Value>> {
-        retry_transient_read(|| self.run_getter(address, abi, method, args.clone())).await
+        retry_transient_read(|| run_contract_getter(self, address, abi, method, args.clone())).await
     }
 
     async fn get_account_retrying(&self, address: &Address) -> Result<Option<Account>> {
         retry_transient_read(|| self.get_account(address)).await
+    }
+
+    async fn get_system_account_retrying(&self, address: &Address) -> Result<Option<Account>> {
+        let dapp = Address::parse(&format!("0:{}", crate::address::DEXDO_DAPP_ID))?;
+        retry_transient_read(|| self.get_account_in_dapp(address, &dapp)).await
     }
 
     async fn chain_liveness_retrying(&self) -> Result<ChainLiveness> {
@@ -3045,6 +3083,11 @@ impl RetryingReads for LimitedChainClient {
 
     async fn get_account_retrying(&self, address: &Address) -> Result<Option<Account>> {
         retry_transient_read(|| self.get_account(address)).await
+    }
+
+    async fn get_system_account_retrying(&self, address: &Address) -> Result<Option<Account>> {
+        let dapp = Address::parse(&format!("0:{}", crate::address::DEXDO_DAPP_ID))?;
+        retry_transient_read(|| self.get_account_in_dapp(address, &dapp)).await
     }
 
     async fn chain_liveness_retrying(&self) -> Result<ChainLiveness> {
@@ -3099,7 +3142,7 @@ impl DealSnapshotSource for LiveDealSnapshotSource<'_> {
         let Some(account) = self
             .chain
             .client
-            .get_account_retrying(self.token_contract)
+            .get_system_account_retrying(self.token_contract)
             .await?
         else {
             return Ok(None);
@@ -3875,25 +3918,111 @@ pub(super) async fn send_message_routed_checked(
     if let Some(thread_id) = thread_id {
         item["thread_id"] = json!(bare_hex(thread_id));
     }
-    let response = http
-        .post(format!("{}/v2/messages", endpoint.trim_end_matches('/')))
-        .header("Content-Type", "application/json")
-        .json(&json!([item]))
-        .send()
-        .await?;
-    if response.status().is_redirection() {
-        return Err(anyhow!(
-            "chain submit refused HTTP redirect {}",
-            response.status()
-        ));
+    let mut target = endpoint.to_string();
+    for hop in 0..=crate::params::PRODUCER_REDIRECT_MAX_HOPS {
+        let response = http
+            .post(format!("{}/v2/messages", target.trim_end_matches('/')))
+            .header("Content-Type", "application/json")
+            .json(&json!([item.clone()]))
+            .send()
+            .await?;
+        if response.status().is_redirection() {
+            return Err(anyhow!(
+                "chain submit refused HTTP redirect {}",
+                response.status()
+            ));
+        }
+        // Producers also return their protocol refusal as HTTP 400. Other HTTP errors keep
+        // the existing transport classification; this is not a generic HTTP redirect policy.
+        let response = if response.status() == reqwest::StatusCode::BAD_REQUEST {
+            response
+        } else {
+            chain_response_for_status(response).await?
+        };
+        let status = response.status();
+        let http_error = response.error_for_status_ref().err();
+        let resp = response
+            .json::<Value>()
+            .await
+            .map_err(|source| MessagePostResponseDecodeError { status, source })?;
+        if hop < crate::params::PRODUCER_REDIRECT_MAX_HOPS {
+            if let Some(data) = producer_redirect_data(&resp) {
+                target = producer_redirect_endpoint(endpoint, &data)?;
+                if let Some(thread) = data["thread_id"].as_str() {
+                    if thread.len() != bare_hex(account_id).len()
+                        || !thread.bytes().all(|byte| byte.is_ascii_hexdigit())
+                    {
+                        return Err(anyhow!("producer redirect has invalid thread_id"));
+                    }
+                    item["thread_id"] = json!(thread);
+                }
+                continue;
+            }
+        }
+        let result = checked_submit_response(resp)?;
+        if let Some(error) = http_error {
+            return Err(error.into());
+        }
+        return Ok(result);
     }
-    let response = chain_response_for_status(response).await?;
-    let status = response.status();
-    let resp = response
-        .json::<Value>()
-        .await
-        .map_err(|source| MessagePostResponseDecodeError { status, source })?;
-    checked_submit_response(resp)
+    unreachable!("the final hop returns its checked response")
+}
+
+fn producer_redirect_data(response: &Value) -> Option<Value> {
+    let error = &response["error"];
+    let embedded = error["message"].as_str().and_then(|message| {
+        message
+            .strip_prefix("Block Producer returned non-success HTTP status 400 Bad Request: ")
+            .and_then(|body| serde_json::from_str::<Value>(body).ok())
+    });
+    let refusal = if error["code"] == "WRONG_PRODUCER" {
+        error
+    } else {
+        let inner = embedded.as_ref()?.get("error")?;
+        if inner["code"] != "WRONG_PRODUCER" {
+            return None;
+        }
+        inner
+    };
+    // A manager can carry a newer SDK producer observation than its embedded response.
+    // Prefer the newer timestamp, and repeat this decision on every hop.
+    [&refusal["data"], &error["data"]["tvm_sdk_error"]["data"]]
+        .into_iter()
+        .filter(|data| data["producers"].as_array().is_some_and(|p| !p.is_empty()))
+        .max_by_key(|data| data["current_time"].as_u64().unwrap_or_default())
+        .cloned()
+}
+
+fn producer_redirect_endpoint(original: &str, data: &Value) -> Result<String> {
+    let producer = data["producers"][0]
+        .as_str()
+        .ok_or_else(|| anyhow!("producer redirect has no target"))?;
+    let original = reqwest::Url::parse(original)?;
+    let target = if producer.contains("://") {
+        producer.to_string()
+    } else {
+        format!("{}://{producer}", original.scheme())
+    };
+    let url = reqwest::Url::parse(&target)?;
+    if !matches!(url.scheme(), "http" | "https")
+        || url.host_str().is_none()
+        || (original.scheme() == "https" && url.scheme() != "https")
+        || !url.username().is_empty()
+        || url.password().is_some()
+        || !matches!(url.path(), "" | "/")
+        || url.query().is_some()
+        || url.fragment().is_some()
+    {
+        return Err(anyhow!("producer redirect has invalid target"));
+    }
+    Ok(url.as_str().trim_end_matches('/').to_string())
+}
+
+pub(super) fn is_producer_open_failure(error: &anyhow::Error) -> bool {
+    is_block_producer_forwarding_timeout(error)
+        || error
+            .downcast_ref::<OnchainSubmitError>()
+            .is_some_and(|error| producer_redirect_data(error.sanitized_payload()).is_some())
 }
 
 async fn send_message_routed_money_once(
@@ -7048,6 +7177,24 @@ impl RealChainBackend {
         RetryingReads::get_account_retrying(&self.client, address).await
     }
 
+    pub async fn get_system_account_retrying(&self, address: &Address) -> Result<Option<Account>> {
+        self.client.get_system_account_retrying(address).await
+    }
+
+    pub(super) async fn token_contract_is_retired(&self, tc: &Address) -> Result<bool> {
+        if self
+            .get_system_account_retrying(tc)
+            .await?
+            .is_some_and(|account| account.is_active())
+        {
+            return Ok(false);
+        }
+        Ok(self
+            .token_contract_settlement_receipts_if_present(tc)
+            .await?
+            .is_some_and(|receipts| !receipts.events.is_empty()))
+    }
+
     pub async fn run_getter_retrying(
         &self,
         address: &Address,
@@ -7089,8 +7236,17 @@ impl RealChainBackend {
         retry_transient_read(|| fetch_chain_time_secs(&self.http, self.client.endpoint())).await
     }
 
-    pub async fn account_active_code_hash(&self, addr: &Address) -> Result<(bool, Option<String>)> {
-        let Some(acc) = self.client.get_account_retrying(addr).await? else {
+    pub async fn account_active_code_hash(
+        &self,
+        addr: &Address,
+        system_dapp: bool,
+    ) -> Result<(bool, Option<String>)> {
+        let account = if system_dapp {
+            self.client.get_system_account_retrying(addr).await?
+        } else {
+            self.client.get_account_retrying(addr).await?
+        };
+        let Some(acc) = account else {
             return Ok((false, None));
         };
         Ok((
@@ -7107,7 +7263,7 @@ impl RealChainBackend {
         expected: &str,
         build: fn(&Address, &str, Option<&str>) -> ChainDoctorCheck,
     ) -> Result<ChainDoctorCheck> {
-        let (active, hash) = self.account_active_code_hash(addr).await?;
+        let (active, hash) = self.account_active_code_hash(addr, false).await?;
         Ok(build(
             addr,
             expected,
@@ -7249,21 +7405,24 @@ impl RealChainBackend {
         name: &str,
         addr: &Address,
         expected: &str,
+        system_dapp: bool,
     ) -> Result<ChainDoctorCheck> {
-        let (active, hash) = self.account_active_code_hash(addr).await?;
+        let (active, hash) = self.account_active_code_hash(addr, system_dapp).await?;
         if !active {
             return Ok(code_hash_check(name, Some(addr), expected, None));
         }
         Ok(code_hash_check(name, Some(addr), expected, hash.as_deref()))
     }
 
-    async fn self_dapp_code_hash_account_check(
+    async fn token_contract_code_hash_account_check(
         &self,
         name: &str,
         addr: &Address,
         expected: &str,
     ) -> Result<ChainDoctorCheck> {
-        let mut check = self.code_hash_account_check(name, addr, expected).await?;
+        let mut check = self
+            .code_hash_account_check(name, addr, expected, true)
+            .await?;
         check.address = Some(display_token_contract(addr));
         Ok(check)
     }
@@ -7372,7 +7531,7 @@ impl RealChainBackend {
             );
         } else {
             let dapp_config = Address::parse(&self.deployed.dapp_config)?;
-            let (dapp_active, _) = self.account_active_code_hash(&dapp_config).await?;
+            let (dapp_active, _) = self.account_active_code_hash(&dapp_config, false).await?;
             record_doctor_check(
                 &mut checks,
                 &mut observe,
@@ -7474,6 +7633,7 @@ impl RealChainBackend {
                     "RootModel code hash",
                     &rm,
                     SUPERROOT_PINNED_RM_CODE_HASH,
+                    false,
                 )
                 .await?,
             );
@@ -7496,7 +7656,7 @@ impl RealChainBackend {
             record_doctor_check(
                 &mut checks,
                 &mut observe,
-                self.self_dapp_code_hash_account_check(
+                self.token_contract_code_hash_account_check(
                     "TokenContract code hash",
                     &tc,
                     ROOTMODEL_PINNED_TC_CODE_HASH,
@@ -7717,7 +7877,7 @@ impl RealChainBackend {
         // uninitialised-but-funded account into "available". Only authoritative absence qualifies.
         if self
             .client
-            .get_account_retrying(&token_contract)
+            .get_system_account_retrying(&token_contract)
             .await?
             .is_some()
         {
@@ -8069,7 +8229,12 @@ impl RealChainBackend {
         keys: &KeyPair,
     ) -> Result<Value> {
         let boc = Self::encode_signed_call_boc(addr, abi_json, method, args, keys).await?;
-        self.send_with_retry(&boc).await
+        if abi_json == TOKENCONTRACT_ABI || abi_json == PRIVATENOTE_ABI {
+            self.retry_submit(&boc, false, Some(crate::address::DEXDO_DAPP_ID))
+                .await
+        } else {
+            self.send_with_retry(&boc).await
+        }
     }
 
     async fn prepare_money_post(
@@ -8089,9 +8254,13 @@ impl RealChainBackend {
         let endpoint = self.client.endpoint().to_string();
         let account_id = dest_account_id_hex(&boc)
             .map_err(|source| anyhow::Error::new(MoneySubmitError::Preparation { source }))?;
-        let dapp_id = fetch_dapp_id(&self.http, &endpoint, &account_id)
-            .await
-            .map_err(|source| anyhow::Error::new(MoneySubmitError::Preparation { source }))?;
+        let dapp_id = if abi_json == TOKENCONTRACT_ABI || abi_json == PRIVATENOTE_ABI {
+            crate::address::DEXDO_DAPP_ID.to_string()
+        } else {
+            fetch_dapp_id(&self.http, &endpoint, &account_id)
+                .await
+                .map_err(|source| anyhow::Error::new(MoneySubmitError::Preparation { source }))?
+        };
         Ok((endpoint, boc, account_id, dapp_id))
     }
 
@@ -8116,7 +8285,8 @@ impl RealChainBackend {
         .await
     }
 
-    /// Submit `boc` to `/v2/messages`. `deploy` selects the routing:
+    /// Submit `boc` to `/v2/messages`. Known PrivateNote/TokenContract calls supply system `dapp`.
+    /// Otherwise `deploy` selects the routing:
     /// - `false` -- a regular write to an **existing** contract (call/fund): `send_message`, which
     /// reads the real `dapp_id` via the BK REST `/v2/account`. A 404 there is a real error -> propagates.
     /// - `true` -- a **deploy-message send** whose destination is a not-yet-deployed self-dapp address:
@@ -8124,10 +8294,22 @@ impl RealChainBackend {
     /// fall back to `dapp_id = account_id` (self-dapp) and submit via `send_message_routed` (which skips
     /// the `/v2/account` read). This lets one `dexdo provision` land a fresh deploy in a SINGLE shot
     /// instead of dying on the first attempt and forcing a cumulative re-funded retry.
-    /// **Scoped:** only the deploy/fund submit sites pass `deploy = true`; every regular write keeps the
-    /// unchanged `send_message` path. Any non-`/v2/account` 404 (or other error) still propagates.
-    async fn submit_once(&self, boc: &str, deploy: bool) -> Result<Value> {
+    /// Only deploy/fund sites pass `deploy = true`. Without an explicit dapp, any non-uninit
+    /// `/v2/account` error still propagates.
+    async fn submit_once(&self, boc: &str, deploy: bool, dapp: Option<&str>) -> Result<Value> {
         let endpoint = self.client.endpoint();
+        if let Some(dapp) = dapp {
+            let account_id = dest_account_id_hex(boc)?;
+            return send_message_routed_checked(
+                &self.money_post_http,
+                endpoint,
+                boc,
+                &account_id,
+                dapp,
+                None,
+            )
+            .await;
+        }
         if !deploy {
             return send_message_checked(&self.http, &self.money_post_http, endpoint, boc).await;
         }
@@ -8151,11 +8333,11 @@ impl RealChainBackend {
     /// Submit a message to the chain with retry on the shared transient transport classification or
     /// the block manager's explicit `QUEUE_OVERFLOW` answer. `deploy` is threaded to [`submit_once`]
     /// so only deploy-message sends get the funded-uninit `/v2/account` 404 tolerance.
-    async fn retry_submit(&self, boc: &str, deploy: bool) -> Result<Value> {
+    async fn retry_submit(&self, boc: &str, deploy: bool, dapp: Option<&str>) -> Result<Value> {
         self.clock_skew_preflight().await?;
         let mut delay = crate::params::TRANSIENT_SUBMIT_INITIAL_BACKOFF;
         for attempt in 1..=crate::params::TRANSIENT_SUBMIT_RETRIES_BEFORE_FINAL {
-            match self.submit_once(boc, deploy).await {
+            match self.submit_once(boc, deploy, dapp).await {
                 Ok(v) => return Ok(v),
                 Err(e) if is_transient_submit_failure(&e) => {
                     eprintln!(
@@ -8169,18 +8351,18 @@ impl RealChainBackend {
             }
         }
         // Final attempt -- pass the result through as-is (Ok or the final error).
-        self.submit_once(boc, deploy).await
+        self.submit_once(boc, deploy, dapp).await
     }
 
-    /// Regular write to an **existing** contract (call/fund) -- unchanged `send_message` routing.
+    /// Regular write without a known system-contract ABI: discover the destination dapp.
     pub(super) async fn send_with_retry(&self, boc: &str) -> Result<Value> {
-        self.retry_submit(boc, false).await
+        self.retry_submit(boc, false, None).await
     }
 
     /// A **deploy-message** send (its destination is a not-yet-deployed self-dapp address): tolerates
     /// the funded-uninit `/v2/account` 404 via self-dapp routing. Use ONLY for deploy submits.
     async fn send_deploy_with_retry(&self, boc: &str) -> Result<Value> {
-        self.retry_submit(boc, true).await
+        self.retry_submit(boc, true, None).await
     }
 
     /// The owner note deploys `InferenceOrderBook` (`deployInferenceOrderBook(code, modelHash,
@@ -8250,18 +8432,11 @@ impl RealChainBackend {
               }
             }
         "#;
-        // both requests go through the one read retry policy, like every other reader in
-        // this file. Without it this poll was the buyer's only account of money already POSTed and
-        // a single connection reset on the dapp-id lookup ended the purchase with `ambiguous
-        // submit` -- measured on live shellnet, ten seconds into a 300-second wait. The retry is
-        // bounded by the policy: an exhausted read still leaves the loop, it just is not
-        // one unanswered request any more.
+        // Keep the bounded read retry policy for owner fill history after money was POSTed.
+        // PrivateNote belongs to the system dapp, so no account-id lookup is needed here.
         let resp: Value = retry_transient_read(|| async {
-            // the dapp-id lookup is a request of its own, so it takes a slot of its own, and
-            // so does the ext-out query below -- this reader has its own inline GraphQL and never
-            // reached the pager's gate.
-            self.client.gate().admit().await;
-            let dapp_id = fetch_dapp_id(&self.http, endpoint, &account_id).await?;
+            // This inline GraphQL request takes the same gate as the history pager.
+            let dapp_id = crate::address::DEXDO_DAPP_ID;
             self.client.gate().admit().await;
             let response = self
                 .http
@@ -8345,9 +8520,7 @@ impl RealChainBackend {
         let want_tc = token_contract.with_workchain();
         let endpoint = self.client.endpoint();
         let gql = format!("{}/graphql", endpoint.trim_end_matches('/'));
-        // the dapp-id lookup is a request of its own, so it takes a slot of its own.
-        self.client.gate().admit().await;
-        let dapp_id = fetch_dapp_id(&self.http, endpoint, &account_id).await?;
+        let dapp_id = crate::address::DEXDO_DAPP_ID;
         let query = r#"
             query($accountId: String!, $dappId: String!, $last: Int!) {
               blockchain {
@@ -8821,7 +8994,7 @@ impl RealChainBackend {
         note: &Address,
         escrow: u128,
     ) -> Result<()> {
-        let Ok(Some(account)) = self.client.get_account_retrying(note).await else {
+        let Ok(Some(account)) = self.client.get_system_account_retrying(note).await else {
             return Ok(());
         };
         let Ok(private_balance) = self.private_note_shell_balance(note).await else {
@@ -9211,9 +9384,7 @@ impl RealChainBackend {
         let account_id = acct.strip_prefix("0:").unwrap_or(&acct).to_string();
         let endpoint = self.client.endpoint();
         let gql = format!("{}/graphql", endpoint.trim_end_matches('/'));
-        // the dapp-id lookup is a request of its own, so it takes a slot of its own.
-        self.client.gate().admit().await;
-        let dapp_id = fetch_dapp_id(&self.http, endpoint, &account_id).await?;
+        let dapp_id = crate::address::DEXDO_DAPP_ID;
         let query = r#"
             query($accountId: String!, $dappId: String!, $last: Int!, $before: String) {
               blockchain {
@@ -9321,7 +9492,7 @@ impl RealChainBackend {
 
         let account = self
             .client
-            .get_account_retrying(note)
+            .get_system_account_retrying(note)
             .await?
             .ok_or_else(|| anyhow!("PrivateNote {note} account is absent"))?;
         let boc = account
@@ -9497,9 +9668,7 @@ impl RealChainBackend {
         const PAGE_SIZE: u32 = 1_000;
         let account_id = note.bare().to_string();
         let endpoint = self.client.endpoint().trim_end_matches('/');
-        // the dapp-id lookup is a request of its own, so it takes a slot of its own.
-        self.client.gate().admit().await;
-        let dapp_id = fetch_dapp_id(&self.http, endpoint, &account_id).await?;
+        let dapp_id = crate::address::DEXDO_DAPP_ID;
         let gql = format!("{endpoint}/graphql");
         let query = r#"
             query($accountId: String!, $dappId: String!, $last: Int!, $before: String) {
@@ -9537,7 +9706,7 @@ impl RealChainBackend {
                     "query": query,
                     "variables": {
                         "accountId": account_id.as_str(),
-                        "dappId": dapp_id.as_str(),
+                        "dappId": dapp_id,
                         "last": PAGE_SIZE,
                         "before": before.as_deref(),
                     },
@@ -9676,15 +9845,7 @@ impl RealChainBackend {
         let account_id = token_contract.bare().to_string();
         let endpoint = self.client.endpoint().trim_end_matches('/');
         let gql = format!("{endpoint}/graphql");
-        // The same account and the same post-terminal `/v2/account` 404 as
-        // `token_contract_settlement_receipts`, which reads this deal's ext-out side.
-        // the dapp-id lookup is a request of its own, so it takes a slot of its own.
-        self.client.gate().admit().await;
-        let dapp_id = match fetch_dapp_id(&self.http, endpoint, &account_id).await {
-            Ok(dapp_id) => dapp_id,
-            Err(error) if is_uninit_account_404(&error.to_string()) => account_id.clone(),
-            Err(error) => return Err(error),
-        };
+        let dapp_id = crate::address::DEXDO_DAPP_ID;
         // One projection for both sides, so the receipt id and the inbound message id are compared
         // as the same field of the same type: the ext-out receipt names its emitting transaction
         // through `src_transaction`, and the message that transaction consumed names it back
@@ -9721,7 +9882,7 @@ impl RealChainBackend {
                     "query": query,
                     "variables": {
                         "accountId": bare_hex(&account_id),
-                        "dappId": bare_hex(&dapp_id),
+                        "dappId": bare_hex(dapp_id),
                         // The existing account-message pager bound; not a second copy of it.
                         "last": crate::params::EXT_OUT_PAGE_SIZE,
                         "before": before.as_deref(),
@@ -9832,29 +9993,14 @@ impl RealChainBackend {
         token_contract: &Address,
     ) -> Result<TokenContractSettlementReceipts> {
         let account_id = token_contract.bare().to_string();
-        // A TokenContract is its own dapp. Its immutable ext-out history remains queryable after
-        // terminal withdrawal destroys the account and `/v2/account` starts returning 404.
-        // and it goes through the read retry policy, because this is what the settlement
-        // confirmation loop polls after the money POST. A 404 is a real answer and is not retried
-        // by the policy, so the uninit branch below keeps seeing it.
-        let dapp_id = match retry_transient_read(|| async {
-            // the dapp-id lookup is a request of its own, so it takes a slot of its own.
-            self.client.gate().admit().await;
-            fetch_dapp_id(&self.http, self.client.endpoint(), &account_id).await
-        })
-        .await
-        {
-            Ok(dapp_id) => dapp_id,
-            Err(error) if is_uninit_account_404(&error.to_string()) => account_id.clone(),
-            Err(error) => return Err(error),
-        };
+        let dapp_id = crate::address::DEXDO_DAPP_ID;
         let messages = retry_transient_read(|| {
             fetch_all_ext_out_messages_routed(
                 self.client.gate(),
                 &self.http,
                 self.client.endpoint(),
                 &account_id,
-                &dapp_id,
+                dapp_id,
                 |message| Ok(Some(message)),
             )
         })
@@ -9885,7 +10031,11 @@ impl RealChainBackend {
         &self,
         token_contract: &Address,
     ) -> Result<TokenContractReceiptChainData> {
-        let account = self.client.get_account(token_contract).await?;
+        let dapp = Address::parse(&format!("0:{}", crate::address::DEXDO_DAPP_ID))?;
+        let account = self
+            .client
+            .get_account_in_dapp(token_contract, &dapp)
+            .await?;
         let account_active = account.as_ref().is_some_and(Account::is_active);
         let code_hash = account
             .as_ref()
@@ -10322,8 +10472,8 @@ impl RealChainBackend {
         let message_hash = external_message_hash(&boc)?;
         let endpoint = self.client.endpoint();
         let account_id = dest_account_id_hex(&boc)?;
-        let dapp_id = fetch_dapp_id(&self.http, endpoint, &account_id).await?;
-        match self.send_with_retry(&boc).await {
+        let dapp_id = crate::address::DEXDO_DAPP_ID;
+        match self.retry_submit(&boc, false, Some(dapp_id)).await {
             Ok(value) => Ok(value),
             Err(error) => {
                 let aborted = error
@@ -10338,7 +10488,7 @@ impl RealChainBackend {
                     &self.http,
                     endpoint,
                     &account_id,
-                    &dapp_id,
+                    dapp_id,
                     &message_hash,
                 )
                 .await
@@ -10404,7 +10554,7 @@ impl RealChainBackend {
     pub(super) async fn deal_reserve_ecc(&self, addr: &Address) -> Result<u128> {
         let account = self
             .client
-            .get_account_retrying(addr)
+            .get_system_account_retrying(addr)
             .await?
             .ok_or_else(|| anyhow!("contract {addr} is missing; cannot read its ECC[2] reserve"))?;
         Ok(account.ecc_balance(crate::params::SHELL_CURRENCY_ID))
@@ -10413,7 +10563,7 @@ impl RealChainBackend {
     pub(super) async fn active_native_balance(&self, addr: &Address) -> Result<u128> {
         let account = self
             .client
-            .get_account_retrying(addr)
+            .get_system_account_retrying(addr)
             .await?
             .ok_or_else(|| anyhow!("contract {addr} is missing; cannot gas-health check"))?;
         if !account.is_active() {
@@ -10425,8 +10575,13 @@ impl RealChainBackend {
         Ok(account.balance)
     }
 
-    async fn account_snapshot(&self, addr: &Address) -> String {
-        match self.client.get_account_retrying(addr).await {
+    async fn account_snapshot(&self, addr: &Address, system_dapp: bool) -> String {
+        let account = if system_dapp {
+            self.client.get_system_account_retrying(addr).await
+        } else {
+            self.client.get_account_retrying(addr).await
+        };
+        match account {
             Ok(Some(a)) => format!(
                 "status={} native={} ecc2={} code_hash={}",
                 a.status,
@@ -10449,11 +10604,11 @@ impl RealChainBackend {
         eprintln!(
             "deploy-prefund {stage}: note {} [{}]; RootModel {} [{}]; TokenContract {} [{}]",
             display_dexdo_address(note),
-            self.account_snapshot(note).await,
+            self.account_snapshot(note, true).await,
             display_dexdo_address(rm),
-            self.account_snapshot(rm).await,
+            self.account_snapshot(rm, false).await,
             display_token_contract(tc),
-            self.account_snapshot(tc).await,
+            self.account_snapshot(tc, true).await,
         );
     }
 
@@ -10534,7 +10689,7 @@ impl RealChainBackend {
             // has not run. Not an error -- the seller's funding order reaches here before and after.
             return Ok(());
         };
-        let Some(account) = self.client.get_account_retrying(deal).await? else {
+        let Some(account) = self.client.get_system_account_retrying(deal).await? else {
             return Ok(());
         };
         if !account.is_active() {
@@ -10591,7 +10746,7 @@ impl RealChainBackend {
     /// that matters now, because ECC[2] is what the burns come out of and what a top-up moves.
     async fn wait_ecc_balance_at_least(&self, addr: &Address, min: u128) -> Result<()> {
         for _ in 0..crate::params::GAS_BALANCE_CONFIRM_MAX_READS {
-            if let Ok(Some(account)) = self.client.get_account_retrying(addr).await {
+            if let Ok(Some(account)) = self.client.get_system_account_retrying(addr).await {
                 if account.ecc_balance(crate::params::SHELL_CURRENCY_ID) >= min {
                     return Ok(());
                 }
@@ -10961,7 +11116,7 @@ impl RealChainBackend {
     pub async fn note_withdraw_gate(&self, note: &Address) -> Result<NoteWithdrawGate> {
         let account = self
             .client
-            .get_account_retrying(note)
+            .get_system_account_retrying(note)
             .await?
             .ok_or_else(|| anyhow!("PrivateNote {note} account is not found"))?;
         let boc = account
@@ -11090,7 +11245,7 @@ impl RealChainBackend {
     async fn note_ecc_shell_pocket(&self, note: &Address) -> Result<u128> {
         let account = self
             .client
-            .get_account_retrying(note)
+            .get_system_account_retrying(note)
             .await?
             .ok_or_else(|| anyhow!("PrivateNote {note} account is not found"))?;
         Ok(account.ecc_balance(crate::params::SHELL_CURRENCY_ID))
@@ -11209,10 +11364,11 @@ impl RealChainBackend {
         call: &str,
     ) -> Result<()> {
         let charge = crate::params::DEAL_BURN_TERMINAL_RAW;
-        let Ok(Some(note_account)) = self.client.get_account_retrying(buyer_note).await else {
+        let Ok(Some(note_account)) = self.client.get_system_account_retrying(buyer_note).await
+        else {
             return Ok(());
         };
-        let Ok(Some(deal_account)) = self.client.get_account_retrying(tc).await else {
+        let Ok(Some(deal_account)) = self.client.get_system_account_retrying(tc).await else {
             return Ok(());
         };
         let note_ecc = note_account.ecc_balance(crate::params::SHELL_CURRENCY_ID);
@@ -11387,7 +11543,7 @@ impl RealChainBackend {
             .await
             .err();
         if self
-            .wait_active(&addr, crate::params::ACCOUNT_ACTIVATION_MAX_ATTEMPTS)
+            .wait_active(&addr, crate::params::ACCOUNT_ACTIVATION_MAX_ATTEMPTS, false)
             .await
         {
             if let Some(e) = submit_err {
@@ -11604,7 +11760,11 @@ impl RealChainBackend {
             max_ticks,
         };
         let target_active = self
-            .wait_active(&tc, crate::params::ACCOUNT_ACTIVE_SINGLE_CHECK_ATTEMPTS)
+            .wait_active(
+                &tc,
+                crate::params::ACCOUNT_ACTIVE_SINGLE_CHECK_ATTEMPTS,
+                true,
+            )
             .await;
         if target_active
             && !self
@@ -11617,13 +11777,17 @@ impl RealChainBackend {
             ));
         }
         if !self
-            .wait_active(&ob, crate::params::ACCOUNT_ACTIVE_SINGLE_CHECK_ATTEMPTS)
+            .wait_active(
+                &ob,
+                crate::params::ACCOUNT_ACTIVE_SINGLE_CHECK_ATTEMPTS,
+                false,
+            )
             .await
         {
             self.deploy_inference_orderbook(note, seed_keys, &model_hash, frame_model, TICK_SIZE)
                 .await?;
             if !self
-                .wait_active(&ob, crate::params::ACCOUNT_ACTIVATION_MAX_ATTEMPTS)
+                .wait_active(&ob, crate::params::ACCOUNT_ACTIVATION_MAX_ATTEMPTS, false)
                 .await
             {
                 return Err(anyhow!(
@@ -11652,7 +11816,11 @@ impl RealChainBackend {
         // from the RootModel `getTokenContractAddress` getter, so a not-yet-`Active` RootModel cannot
         // abort the idempotency check; that getter is used only as a post-`Active` cross-check below.
         let rm_absent = !self
-            .wait_active(&rm, crate::params::ACCOUNT_ACTIVE_SINGLE_CHECK_ATTEMPTS)
+            .wait_active(
+                &rm,
+                crate::params::ACCOUNT_ACTIVE_SINGLE_CHECK_ATTEMPTS,
+                false,
+            )
             .await;
         if rm_absent {
             self.deploy_root_model_note_funded(seed_keys).await?;
@@ -11724,7 +11892,7 @@ impl RealChainBackend {
             // That derived address is also the convergence guard the old external path needed a
             // separate check for -- nothing here reports an address of its own to disagree with it.
             if !self
-                .wait_active(&tc, crate::params::ACCOUNT_ACTIVATION_MAX_ATTEMPTS)
+                .wait_active(&tc, crate::params::ACCOUNT_ACTIVATION_MAX_ATTEMPTS, true)
                 .await
             {
                 return Err(anyhow::Error::new(MoneySubmitError::Ambiguous {
@@ -12098,7 +12266,7 @@ impl RealChainBackend {
     ) -> Result<Value> {
         let account = self
             .client
-            .get_account_retrying(note)
+            .get_system_account_retrying(note)
             .await?
             .ok_or_else(|| anyhow!("PrivateNote {note} account is not found"))?;
         note_balance_private_note_account(self.private_note_pin()?, note, Some(&account))?;
@@ -12387,7 +12555,7 @@ impl RealChainBackend {
             .ok_or_else(|| anyhow!("PMP {display_pmp} getDetails unavailable"))?;
         validate_pmp_manifest(&details, manifest)?;
         let deployer = pmp_deployer(&details)?;
-        let deployer_account = self.client.get_account_retrying(&deployer).await?;
+        let deployer_account = self.client.get_system_account_retrying(&deployer).await?;
         note_balance_private_note_account(
             self.private_note_pin()?,
             &deployer,
@@ -12649,12 +12817,20 @@ impl RealChainBackend {
         let order_book = Address::parse(&market.inference_order_book)?;
         let oracle = self.oracle_address(oracle_name).await?;
         if !self
-            .wait_active(&oracle, crate::params::ACCOUNT_ACTIVE_SINGLE_CHECK_ATTEMPTS)
+            .wait_active(
+                &oracle,
+                crate::params::ACCOUNT_ACTIVE_SINGLE_CHECK_ATTEMPTS,
+                false,
+            )
             .await
         {
             self.deploy_oracle(oracle_keys, oracle_name).await?;
             if !self
-                .wait_active(&oracle, crate::params::ACCOUNT_ACTIVATION_MAX_ATTEMPTS)
+                .wait_active(
+                    &oracle,
+                    crate::params::ACCOUNT_ACTIVATION_MAX_ATTEMPTS,
+                    false,
+                )
                 .await
             {
                 return Err(anyhow!(
@@ -12668,7 +12844,11 @@ impl RealChainBackend {
             .oracle_event_list_address(&oracle, event_list_index)
             .await?;
         if !self
-            .wait_active(&oel, crate::params::ACCOUNT_ACTIVE_SINGLE_CHECK_ATTEMPTS)
+            .wait_active(
+                &oel,
+                crate::params::ACCOUNT_ACTIVE_SINGLE_CHECK_ATTEMPTS,
+                false,
+            )
             .await
         {
             self.deploy_oracle_event_list(
@@ -12679,7 +12859,7 @@ impl RealChainBackend {
             )
             .await?;
             if !self
-                .wait_active(&oel, crate::params::ACCOUNT_ACTIVATION_MAX_ATTEMPTS)
+                .wait_active(&oel, crate::params::ACCOUNT_ACTIVATION_MAX_ATTEMPTS, false)
                 .await
             {
                 return Err(anyhow!(
@@ -12719,7 +12899,11 @@ impl RealChainBackend {
             .pmp_address(&event_id, &oracle_names, token_type)
             .await?;
         if !self
-            .wait_active(&pmp, crate::params::ACCOUNT_ACTIVE_SINGLE_CHECK_ATTEMPTS)
+            .wait_active(
+                &pmp,
+                crate::params::ACCOUNT_ACTIVE_SINGLE_CHECK_ATTEMPTS,
+                false,
+            )
             .await
         {
             self.deploy_pmp(
@@ -12734,7 +12918,7 @@ impl RealChainBackend {
             )
             .await?;
             if !self
-                .wait_active(&pmp, crate::params::ACCOUNT_ACTIVATION_MAX_ATTEMPTS)
+                .wait_active(&pmp, crate::params::ACCOUNT_ACTIVATION_MAX_ATTEMPTS, false)
                 .await
             {
                 return Err(anyhow!(
@@ -12877,7 +13061,7 @@ impl RealChainBackend {
     /// `TVM_ERROR` in the compute phase. Catch both here with an actionable "re-mint your pool" message
     /// instead of letting provision fail opaquely downstream.
     pub async fn assert_seller_note_current(&self, note: &Address) -> Result<()> {
-        let account = self.client.get_account_retrying(note).await?;
+        let account = self.client.get_system_account_retrying(note).await?;
         seller_note_account_current(self.private_note_pin()?, note, account.as_ref())
     }
 
@@ -12900,7 +13084,7 @@ impl RealChainBackend {
     pub async fn assert_note_withdraw_generation(&self, note: &Address) -> Result<()> {
         let acc = self
             .client
-            .get_account_retrying(note)
+            .get_system_account_retrying(note)
             .await?
             .ok_or_else(|| {
                 anyhow!(
@@ -12955,9 +13139,14 @@ impl RealChainBackend {
     /// Poll `get_account(addr).is_active()` up to `tries` times (3s apart; `tries=1` = a single check).
     /// A query error or a not-yet-existent account (e.g. a self-dapp uninit address that 404s) counts
     /// as "not active" -- the caller then deploys or fails with a clear message.
-    async fn wait_active(&self, addr: &Address, tries: u32) -> bool {
+    async fn wait_active(&self, addr: &Address, tries: u32, system_dapp: bool) -> bool {
         for i in 0..tries {
-            if let Ok(Some(a)) = self.client.get_account_retrying(addr).await {
+            let account = if system_dapp {
+                self.client.get_system_account_retrying(addr).await
+            } else {
+                self.client.get_account_retrying(addr).await
+            };
+            if let Ok(Some(a)) = account {
                 if a.is_active() {
                     return true;
                 }
@@ -15244,8 +15433,20 @@ mod tests {
                         .and_then(Value::as_array)
                         .and_then(|entries| entries.first())
                         .filter(|entry| entry["account_id"] == fixture_account_id)
-                        .filter(|entry| entry["dapp_id"] == fixture_account_id)
-                        .and_then(|entry| entry["body"].as_str());
+                        .and_then(|entry| {
+                            let boc = entry["body"].as_str()?;
+                            let expected_dapp =
+                                if decode_external_abi_message_boc(boc, TOKENCONTRACT_ABI, true)
+                                    .is_some_and(|call| {
+                                        call.function_name == "resolveDisputeTimeout"
+                                    })
+                                {
+                                    crate::address::DEXDO_DAPP_ID
+                                } else {
+                                    &fixture_account_id
+                                };
+                            (entry["dapp_id"] == expected_dapp).then_some(boc)
+                        });
                     if let Some(boc) = routed_boc {
                         server_bocs.lock().unwrap().push(boc.to_string());
                         server_posts.fetch_add(1, Ordering::SeqCst);
@@ -15378,7 +15579,10 @@ mod tests {
     async fn unsafe_clock_produces_zero_posts_in_regular_and_money_paths() {
         for chain_offset in [60, -300] {
             let (backend, posts, _, task) = skew_fixture_backend(chain_offset).await;
-            let regular = backend.retry_submit("not-posted", false).await.unwrap_err();
+            let regular = backend
+                .retry_submit("not-posted", false, None)
+                .await
+                .unwrap_err();
             assert!(format!("{regular:#}").contains("CLOCK_SKEW"));
 
             let address = Address::parse(&format!("0:{}", "1".repeat(64))).unwrap();
@@ -19461,4 +19665,5 @@ mod tests {
     }
 
     include!("client/issue_2064_tests.rs");
+    include!("client/issue_2030_tests.rs");
 }

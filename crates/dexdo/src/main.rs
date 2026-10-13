@@ -449,7 +449,6 @@ impl Command {
                     DEFAULT_MARKET_MANIFEST_OUTPUT_PATH,
                 );
             }
-            Command::Markets(args) => models(&mut args.models),
             Command::Market(args) => models(&mut args.models),
             Command::ExecutableBook(args) => models(&mut args.models),
             Command::Quote(args) => models(&mut args.models),
@@ -622,15 +621,16 @@ async fn main() -> Result<()> {
         Ok(matches) => matches,
         Err(err) => {
             if let Some(operation) = raw_machine_operation(&raw_args) {
+                let error = machine::argument_error(operation, &err);
                 if operation == machine::OP_BUYER_START {
                     let mut events = machine::BuyerEventWriter::new();
                     events.error(
                         machine::OP_BUYER_START,
                         machine::ErrorCode::InvalidArgument,
-                        serde_json::json!({}),
+                        serde_json::to_value(error)?,
                     )?;
                 } else {
-                    machine::print_short_error(operation, machine::ErrorCode::InvalidArgument)?;
+                    machine::print_json(&error)?;
                 }
                 std::process::exit(err.exit_code());
             }
@@ -1509,16 +1509,18 @@ mod market_orders_cli_tests {
     #[test]
     fn markets_and_quote_subcommands_parse() {
         let c = Cli::try_parse_from([
-            "dexdo", "markets", "--market", "m1.json", "--market", "m2.json",
+            "dexdo",
+            "markets",
+            "--all",
+            "--indexer-url",
+            "http://127.0.0.1:8080",
         ])
-        .expect("markets with manifests parses");
+        .expect("indexer markets flags parse");
         let Command::Markets(m) = c.command else {
             panic!("expected Command::Markets");
         };
-        assert_eq!(
-            m.market,
-            vec![PathBuf::from("m1.json"), PathBuf::from("m2.json")]
-        );
+        assert!(m.all);
+        assert_eq!(m.indexer_url.as_deref(), Some("http://127.0.0.1:8080"));
         assert_eq!(
             m.read_timeout.read_timeout_secs,
             DEFAULT_CHAIN_READ_TIMEOUT_SECS
@@ -3139,7 +3141,8 @@ mod tests {
             panic!("markets command")
         };
         assert_eq!(markets.frame_model, p::DEFAULT_MARKETS_FRAME_MODEL);
-        assert_eq!(markets.models, Path::new(p::DEFAULT_MODELS_PATH));
+        assert!(!markets.all);
+        assert!(markets.indexer_url.is_none());
         assert_eq!(
             markets.read_timeout.read_timeout_secs,
             p::DEFAULT_CHAIN_READ_TIMEOUT_SECS

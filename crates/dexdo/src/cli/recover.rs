@@ -1240,7 +1240,7 @@ pub(crate) async fn run_resolve_dispute_timeout(args: ResolveDisputeTimeoutArgs)
         Address::parse(&tc_str).map_err(|e| anyhow::anyhow!("token_contract {tc_str}: {e}"))?;
     let tc_display = display_token_contract(&tc);
     let expected_hash = dexdo_core::chain::compiled_contract_hash("TokenContract")?;
-    let (active, code_hash) = chain.account_active_code_hash(&tc).await?;
+    let (active, code_hash) = chain.account_active_code_hash(&tc, true).await?;
     let mut identity_ok =
         active && code_hash.as_deref() == Some(expected_hash.trim_start_matches("0x"));
     if let Some(path) = args.market.as_deref() {

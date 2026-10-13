@@ -17,6 +17,7 @@ pub(crate) struct MarketsQuery<'a> {
     pub(crate) inference_order_book_address: Option<&'a str>,
     pub(crate) producer: Option<&'a str>,
     pub(crate) status: Option<&'a str>,
+    pub(crate) liquidity: Option<&'a str>,
     pub(crate) cursor: Option<&'a str>,
     pub(crate) limit: Option<u32>,
 }
@@ -41,7 +42,7 @@ pub(crate) struct InferenceMarketsResponse {
 pub(crate) struct InferenceMarket {
     pub(crate) inference_order_book_address: String,
     pub(crate) model_ref_name: String,
-    pub(crate) contract_version: String,
+    pub(crate) contract_version: Option<String>,
     pub(crate) status: String,
     pub(crate) quote_asset: String,
     pub(crate) maker_commission: String,
@@ -52,6 +53,8 @@ pub(crate) struct InferenceMarket {
     pub(crate) step_size: String,
     pub(crate) min_notional: String,
     pub(crate) reference_price: Option<String>,
+    pub(crate) best_ask: Option<String>,
+    pub(crate) total_ask_ticks: String,
     pub(crate) created_at: i64,
 }
 
@@ -98,6 +101,9 @@ impl IndexerClient {
             }
             if let Some(status) = non_empty_trimmed(query.status, "status")? {
                 qp.append_pair("status", status);
+            }
+            if let Some(liquidity) = non_empty_trimmed(query.liquidity, "liquidity")? {
+                qp.append_pair("liquidity", liquidity);
             }
             if let Some(cursor) = query.cursor {
                 qp.append_pair("cursor", cursor);
@@ -198,6 +204,10 @@ impl ManifestIndexer {
                 .and_then(|value| value.as_str())
                 .map(str::to_string),
         })
+    }
+
+    pub(crate) fn network(&self) -> &str {
+        &self.network
     }
 }
 
@@ -375,7 +385,7 @@ fn render_market_line(market: &InferenceMarket) -> String {
         "market address={} model_ref={} contract_version={} status={} quote_asset={} maker_commission={} taker_commission={} price_precision={} quantity_precision={} tick_size={} step_size={} min_notional={} reference_price={} created_at={}",
         dexdo_core::address::display(&market.inference_order_book_address),
         market.model_ref_name,
-        market.contract_version,
+        market.contract_version.as_deref().unwrap_or("-"),
         market.status,
         market.quote_asset,
         market.maker_commission,
@@ -422,11 +432,13 @@ fn validate_markets_response(response: &InferenceMarketsResponse) -> Result<()> 
                 market.inference_order_book_address
             );
         }
-        if market.contract_version.trim().is_empty() {
-            bail!(
-                "market {}: contractVersion must not be empty",
-                market.inference_order_book_address
-            );
+        if let Some(contract_version) = &market.contract_version {
+            if contract_version.trim().is_empty() {
+                bail!(
+                    "market {}: contractVersion must not be empty",
+                    market.inference_order_book_address
+                );
+            }
         }
         if market.status.trim().is_empty() {
             bail!(
@@ -529,6 +541,8 @@ mod tests {
     "stepSize": "1",
     "minNotional": "1",
     "referencePrice": null,
+    "bestAsk": "110.000000000",
+    "totalAskTicks": "2",
     "createdAt": 1788790129
   }]
 }"#;
@@ -551,6 +565,8 @@ mod tests {
     "stepSize": "1",
     "minNotional": "1",
     "referencePrice": null,
+    "bestAsk": null,
+    "totalAskTicks": "0",
     "createdAt": 1788791442
   }]
 }"#;
@@ -576,6 +592,8 @@ mod tests {
       "stepSize": "1",
       "minNotional": "0.000000001",
       "referencePrice": null,
+      "bestAsk": "1.000000000",
+      "totalAskTicks": "8",
       "createdAt": 1782897852
     }}
   ]
@@ -630,7 +648,10 @@ mod tests {
         let response = parse_markets_json(markets_fixture().as_bytes()).unwrap();
         assert_eq!(response.markets.len(), 1);
         assert_eq!(response.markets[0].model_ref_name, "qwen--qwen3--32b");
-        assert_eq!(response.markets[0].contract_version, "4.0.36");
+        assert_eq!(
+            response.markets[0].contract_version.as_deref(),
+            Some("4.0.36")
+        );
         let rendered = render_markets_table(&response, TEST_INDEXER_URL);
         assert_eq!(
             rendered,
@@ -674,7 +695,7 @@ mod tests {
     }
 
     #[test]
-    fn rejects_missing_or_empty_market_identity_fields() {
+    fn accepts_unknown_contract_version_but_rejects_invalid_identity_fields() {
         let missing_model_ref =
             markets_fixture().replace("      \"modelRefName\": \"qwen--qwen3--32b\",\n", "");
         let error = parse_markets_json(missing_model_ref.as_bytes()).unwrap_err();
@@ -682,8 +703,21 @@ mod tests {
 
         let missing_contract_version =
             markets_fixture().replace("      \"contractVersion\": \"4.0.36\",\n", "");
-        let error = parse_markets_json(missing_contract_version.as_bytes()).unwrap_err();
-        assert!(format!("{error:#}").contains("contractVersion"));
+        let response = parse_markets_json(missing_contract_version.as_bytes())
+            .expect("an omitted unknown contract version is valid");
+        assert_eq!(response.markets[0].contract_version, None);
+
+        let null_contract_version = markets_fixture().replace(
+            "\"contractVersion\": \"4.0.36\"",
+            "\"contractVersion\": null",
+        );
+        let response = parse_markets_json(null_contract_version.as_bytes())
+            .expect("a null unknown contract version is valid");
+        assert_eq!(response.markets[0].contract_version, None);
+        assert!(
+            render_markets_table(&response, TEST_INDEXER_URL).contains("contract_version=-"),
+            "unknown metadata must remain explicit in table output"
+        );
 
         let empty_model_ref = markets_fixture().replace(
             "\"modelRefName\": \"qwen--qwen3--32b\"",

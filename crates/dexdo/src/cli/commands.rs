@@ -2026,7 +2026,6 @@ mod registry_target_tests {
             frame_model: frame_model.to_string(),
             model_hash: model_hash_for(frame_model),
             order_book: order_book.map(str::to_string),
-            root_model: None,
             note_addr: Some(NOTE.to_string()),
         }
     }
@@ -3319,10 +3318,9 @@ mod doctor_output_1860_tests {
 
 pub(crate) struct BookTarget {
     pub(crate) frame_model: String,
-    // Filled on every path; only the chain book/market views read these three back.
+    // Filled on every path; only the chain book/market views read these back.
     pub(crate) model_hash: String,
     pub(crate) order_book: Option<String>,
-    pub(crate) root_model: Option<String>,
     pub(crate) note_addr: Option<String>,
 }
 
@@ -3357,7 +3355,6 @@ pub(crate) fn book_target_for(frame_model: String, note_addr: Option<String>) ->
         model_hash: model_hash_for(&frame_model),
         frame_model,
         order_book: None,
-        root_model: None,
         note_addr,
     }
 }
@@ -3608,7 +3605,6 @@ pub(crate) fn target_from_market(path: &std::path::Path) -> Result<BookTarget> {
         frame_model: m.frame_model,
         model_hash: m.model_hash,
         order_book: Some(m.inference_order_book),
-        root_model: Some(m.root_model),
         note_addr: None,
     })
 }
@@ -4156,8 +4152,7 @@ pub(crate) fn close_hint(
         }
         Some(deals::DealHandleRole::Seller) if s.funded && !s.probe_accepted => {
             format!(
-                "next=buyer_cleanup_after_timeout action=the buyer {}",
-                close_guidance(&target.token_contract, Some("buyer"), "buyer", deals_dir)
+                "next=seller_resume_open action=restart the original dexdo seller command with the same note, market and data directory to resume opening {deal}"
             )
         }
         // what is left here is the UNSOLD deal -- never funded, so never opened and never
@@ -4181,13 +4176,14 @@ pub(crate) fn close_hint(
         Some(deals::DealHandleRole::Buyer) => {
             "next=cancel_resting_bid_or_wait_match reason=deal_not_funded".to_string()
         }
+        None if s.funded && !s.opened => "next=resolve_role_for_funded_deal action=use the local deal handle with dexdo status; seller: restart the original seller command; buyer: use dexdo close after the cleanup timeout".to_string(),
         None => "next=unknown_role pass_local_handle_or_--role".to_string(),
     }
 }
 
-/// One resting ask as the order-book renderer needs it: price per tick, its max ticks, and the full deal
-/// `TokenContract` address. Kept minimal so both the buyer's pre-buy view and the read-only `dexdo markets`
-/// table view can build it from their own sources (`discover_offers` / `OrderBookSnapshot::resting_asks`).
+/// One resting ask as the order-book renderer needs it: price per tick, its max ticks, and the full
+/// deal `TokenContract` address. Kept minimal so both the buyer's pre-buy view and the read-only
+/// `dexdo market` table view can build it from their chain snapshots.
 pub struct BookRow {
     pub price_per_tick: u128,
     pub max_ticks: u128,

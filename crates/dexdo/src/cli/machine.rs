@@ -3,10 +3,9 @@ use rand::RngCore;
 use serde::Serialize;
 use serde_json::{json, Map, Value};
 
-// v2: every SHELL figure in these objects is stated in SHELL, not in raw ECC[2] units. A consumer
-// that kept reading `best_ask` as raw would be off by a factor of a billion, and a version is the
-// only thing that says so before it is read.
-pub(crate) const MARKETS_SCHEMA: &str = "dexdo.markets.v2";
+// v3: market rows are the indexer's aggregate model-book view. The removed v2 fields came from
+// chain reads or had no information; `total_ask_ticks` and `best_ask` retain the indexer's units.
+pub(crate) const MARKETS_SCHEMA: &str = "dexdo.markets.v3";
 // v1: `markets address` carries no SHELL figure at all -- it names an address, a model hash and the
 // registry spelling the name resolved to, so the SHELL-unit revisions above do not apply to it.
 pub(crate) const MARKETS_ADDRESS_SCHEMA: &str = "dexdo.markets_address.v1";
@@ -631,7 +630,9 @@ pub(crate) struct MachineError {
     pub(crate) schema: &'static str,
     pub(crate) operation: &'static str,
     pub(crate) code: &'static str,
-    pub(crate) message: &'static str,
+    pub(crate) message: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) arguments: Option<Vec<String>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) cause: Option<String>,
     pub(crate) retryable: bool,
@@ -667,7 +668,8 @@ impl MachineError {
             schema: ERROR_SCHEMA,
             operation,
             code: code.as_str(),
-            message: code.safe_message(),
+            message: code.safe_message().to_string(),
+            arguments: None,
             cause: None,
             retryable: code.retryable(),
             network: None,
@@ -717,6 +719,74 @@ pub(crate) fn print_json<T: Serialize>(value: &T) -> Result<()> {
 
 pub(crate) fn print_short_error(operation: &'static str, code: ErrorCode) -> Result<()> {
     print_json(&MachineError::new(operation, code))
+}
+
+/// Keep clap's argument identities and reason without echoing values, argv, or usage.
+pub(crate) fn argument_error(operation: &'static str, err: &clap::Error) -> MachineError {
+    use clap::error::{ContextKind, ContextValue, ErrorKind};
+    use std::error::Error as _;
+
+    let mut error = MachineError::new(operation, ErrorCode::InvalidArgument);
+    let mut arguments: Vec<String> = err
+        .get(ContextKind::InvalidArg)
+        .into_iter()
+        .chain(
+            err.get(ContextKind::PriorArg)
+                .filter(|_| err.kind() == ErrorKind::ArgumentConflict),
+        )
+        .flat_map(|context| match context {
+            ContextValue::String(label) => std::slice::from_ref(label),
+            ContextValue::Strings(labels) => labels.as_slice(),
+            _ => &[],
+        })
+        .filter_map(|label| label.split_ascii_whitespace().next())
+        .map(|label| label.split('=').next().unwrap_or(label))
+        // Unknown input is user supplied: retain only option spellings, never paths or values.
+        .filter(|label| {
+            err.kind() != ErrorKind::UnknownArgument
+                || (label.starts_with('-')
+                    && label
+                        .chars()
+                        .all(|ch| ch.is_ascii_alphanumeric() || ch == '-'))
+        })
+        .map(str::to_string)
+        .collect();
+    arguments.dedup();
+    if arguments.is_empty() {
+        return error;
+    }
+
+    let mut reason = err
+        .kind()
+        .as_str()
+        .unwrap_or(ErrorCode::InvalidArgument.safe_message())
+        .to_string();
+    if let Some(ContextValue::String(value)) = err.get(ContextKind::InvalidValue) {
+        if value.is_empty() {
+            reason = "a value is required but none was supplied".to_string();
+        }
+    }
+    if err.kind() == ErrorKind::ValueValidation {
+        // Custom sources can echo fragments or rewritten input, not just the full value.
+        // Standard integer errors contain no input; other reasons are produced locally.
+        if arguments.iter().any(|arg| arg == "--max-price-per-tick") {
+            reason = format!(
+                "expected a positive whole number of SHELL per tick, no larger than {} SHELL",
+                dexdo_core::params::MAX_NOTE_NOMINAL_SHELL
+            );
+        } else if let Some(source) = err
+            .source()
+            .and_then(|source| source.downcast_ref::<std::num::ParseIntError>())
+        {
+            reason = source.to_string();
+        }
+    }
+    if let Some(ContextValue::Strings(values)) = err.get(ContextKind::ValidValue) {
+        reason.push_str(&format!("; expected one of: {}", values.join(", ")));
+    }
+    error.message = format!("{}: {reason}", arguments.join(", "));
+    error.arguments = Some(arguments);
+    error
 }
 
 pub(crate) fn print_error(
@@ -885,19 +955,10 @@ pub(crate) struct MarketsResponse {
 #[derive(Serialize)]
 pub(crate) struct MarketEntry {
     pub(crate) frame_model: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub(crate) model_flags: Option<dexdo_core::CanonicalModelFlags>,
-    pub(crate) model_hash: String,
     pub(crate) order_book: String,
-    pub(crate) root_model: Option<String>,
-    pub(crate) active: bool,
-    pub(crate) order_count: u128,
-    pub(crate) ask_count: u128,
-    pub(crate) depth_ticks: String,
+    pub(crate) total_ask_ticks: String,
     pub(crate) best_ask: Option<String>,
-    pub(crate) min_liquidity: String,
     pub(crate) tick_size: String,
-    pub(crate) source: String,
 }
 
 #[derive(Serialize)]
@@ -1322,7 +1383,7 @@ mod tests {
 
     #[test]
     fn stable_schema_constants_match_contract() {
-        assert_eq!(MARKETS_SCHEMA, "dexdo.markets.v2");
+        assert_eq!(MARKETS_SCHEMA, "dexdo.markets.v3");
         assert_eq!(QUOTE_SCHEMA, "dexdo.quote.v2");
         assert_eq!(BUYER_EVENT_SCHEMA, "dexdo.buyer.event.v2");
         assert_eq!(STATUS_SCHEMA, "dexdo.status.v3");

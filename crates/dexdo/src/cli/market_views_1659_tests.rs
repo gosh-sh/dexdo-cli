@@ -5,10 +5,10 @@
 //! to see. A view that says "this market is live and rests nothing" is a statement an operator
 //! prices against.
 
-//! Driven through `read_executable_market_view_with`, which is the production path with its three
-//! reads as seams.
+//! Driven through `read_executable_market_view_with`, which is the production path with its two
+//! chain reads as seams.
 
-use super::{read_executable_market_view_with, IndexerMarketContext};
+use super::read_executable_market_view_with;
 use dexdo_core::{OrderBookOrder, OrderBookSnapshot};
 
 const BOOK: &str = "0:917d85f33c24d3ed930355bf98a488456256d27de3c022d2c785315fcfcdb80f";
@@ -48,11 +48,6 @@ fn row(order_id: u128) -> OrderBookOrder {
 #[tokio::test]
 async fn an_empty_fold_does_not_become_an_empty_market() {
     let view = read_executable_market_view_with(
-        || async {
-            Ok(IndexerMarketContext {
-                last_update_id: "ix-1".to_string(),
-            })
-        },
         || async { Ok((snapshot_with(Vec::new()), "fold-1".to_string())) },
         || async { Ok(snapshot_with(vec![row(3)])) },
     )
@@ -75,16 +70,11 @@ async fn an_empty_fold_does_not_become_an_empty_market() {
     );
 }
 
-/// A fold that saw rows keeps them, keeps the indexer's freshness marker, and costs no extra read.
+/// A fold that saw rows keeps them, keeps its chain freshness marker, and costs no extra read.
 #[tokio::test]
 async fn a_fold_that_saw_rows_keeps_its_own_provenance() {
     let storage_reads = std::cell::Cell::new(0u32);
     let view = read_executable_market_view_with(
-        || async {
-            Ok(IndexerMarketContext {
-                last_update_id: "ix-1".to_string(),
-            })
-        },
         || async { Ok((snapshot_with(vec![row(3)]), "fold-1".to_string())) },
         || {
             storage_reads.set(storage_reads.get() + 1);
@@ -95,7 +85,8 @@ async fn a_fold_that_saw_rows_keeps_its_own_provenance() {
     .expect("a non-empty fold answers on its own");
 
     assert_eq!(view.rows, crate::cli::provenance::ROWS_CHAIN_EVENTS);
-    assert_eq!(view.source, "indexer");
+    assert_eq!(view.source, "chain");
+    assert_eq!(view.last_update_id, "fold-1");
     assert!(view.active);
     assert_eq!(storage_reads.get(), 0);
 }

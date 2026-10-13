@@ -3,24 +3,18 @@
 use crate::cli::args::MarketsAddressArgs;
 use crate::cli::args::{MarketsArgs, MarketsCommand};
 use crate::cli::commands::{
-    declared_model_flags, mock_chain_for_machine, render_model_flags_field,
+    direct_chain_read_with_timeout, resolve_registry_content_identity, ReadBudget,
 };
-use crate::cli::commands::{
-    direct_chain_read_with_timeout, enforce_model_registry_policy,
-    load_enabled_model_registry_policy, preload_model_registry_policy, read_executable_book_target,
-    resolve_model_registry_target, resolve_registry_content_identity, target_from_market,
-    BookTarget,
-};
+use crate::cli::commands::{mock_chain_for_machine, render_model_flags_field};
+use crate::cli::indexer::{self, IndexerClient, InferenceMarket, MarketsQuery};
 use crate::cli::machine;
-use anyhow::bail;
 use anyhow::Context;
 use anyhow::Result;
-use dexdo::registry::{
-    BuyerMissingBookPolicy, RegistryBookAction, RegistryRole, RegistrySuggestions,
-};
+use dexdo::registry::{RegistryRole, RegistrySuggestions};
 use dexdo_core::address as addr;
-use dexdo_core::OrderBookSnapshot;
 use dexdo_core::{model_hash_for, ChainBackend, DobParams, MockChainBackend};
+use std::collections::HashSet;
+use std::time::Duration;
 
 async fn mock_market_entry(
     chain: &MockChainBackend,
@@ -31,18 +25,10 @@ async fn mock_market_entry(
     let best_ask = offers.iter().map(|o| o.price_per_tick).min();
     Ok(machine::MarketEntry {
         frame_model: frame_model.to_string(),
-        model_flags: declared_model_flags(frame_model),
-        model_hash: model_hash_for(frame_model),
         order_book: "mock:order-book".to_string(),
-        root_model: Some("mock:root-model".to_string()),
-        active: true,
-        order_count: offers.len() as u128,
-        ask_count: offers.len() as u128,
-        depth_ticks: machine::amount(depth_ticks),
+        total_ask_ticks: machine::amount(depth_ticks),
         best_ask: best_ask.map(dexdo_core::shell_amount),
-        min_liquidity: machine::amount(0u8),
         tick_size: machine::amount(DobParams::canonical().tick_size),
-        source: "mock_chain".to_string(),
     })
 }
 
@@ -58,60 +44,68 @@ async fn run_markets_mock(args: MarketsArgs) -> Result<()> {
         });
     }
     println!(
-        "model={}{} order_book={} active={} order_count={} ask_count={} depth_ticks={} best_ask={}",
+        "model={}{} order_book={} total_ask_ticks={} best_ask={} tick_size={}",
         entry.frame_model,
         render_model_flags_field(&entry.frame_model),
         addr::display(&entry.order_book),
-        entry.active,
-        entry.order_count,
-        entry.ask_count,
-        entry.depth_ticks,
-        entry.best_ask.as_deref().unwrap_or("-")
+        entry.total_ask_ticks,
+        entry.best_ask.as_deref().unwrap_or("-"),
+        entry.tick_size,
     );
     Ok(())
 }
 
-/// the totals a buyer reads off `dexdo markets` are a liquidity claim, so they count only asks
-/// that are still reachable at `now_unix` -- the deadline-blind `resting_asks()` shape filter is not
-/// enough here.
-
-/// The clock belongs to the caller, sampled AFTER the chain reads rather than once per command. Each
-/// target in `run_markets` costs its own book read plus a registry getter, so the snapshot that
-/// produced these rows can be minutes old by the time they print; a deadline crossed in between is
-/// exactly the incident, where 956 ticks were advertised at a price no buy could obtain.
-
-/// `order_count` stays the book's own `getStats` number and is deliberately NOT filtered: it is the
-/// contract's count of everything the book holds, not a claim about what a buyer can reach.
-fn market_entry_from_snapshot(
-    snapshot: &OrderBookSnapshot,
-    root_model: Option<String>,
-    source: &str,
-    now_unix: u64,
-) -> machine::MarketEntry {
-    let depth_ticks: u128 = snapshot
-        .live_resting_asks_at(now_unix)
-        .map(|o| o.ticks)
-        .sum();
-    let best_ask = snapshot
-        .live_resting_asks_at(now_unix)
-        .map(|o| o.price_per_tick)
-        .min();
-    let order_count = snapshot.stats.as_ref().map(|s| s.order_count).unwrap_or(0);
+fn market_entry_from_indexer(market: InferenceMarket) -> machine::MarketEntry {
     machine::MarketEntry {
-        frame_model: snapshot.frame_model.clone(),
-        model_flags: declared_model_flags(&snapshot.frame_model),
-        model_hash: snapshot.model_hash.clone(),
-        order_book: snapshot.order_book.clone(),
-        root_model,
-        active: snapshot.active(),
-        order_count,
-        ask_count: snapshot.live_resting_asks_at(now_unix).count() as u128,
-        depth_ticks: machine::amount(depth_ticks),
-        best_ask: best_ask.map(dexdo_core::shell_amount),
-        min_liquidity: machine::amount(0u8),
-        tick_size: machine::amount(DobParams::canonical().tick_size),
-        source: source.to_string(),
+        frame_model: market.model_ref_name,
+        order_book: market.inference_order_book_address,
+        total_ask_ticks: market.total_ask_ticks,
+        best_ask: market.best_ask,
+        tick_size: market.tick_size,
     }
+}
+
+async fn read_all_indexer_markets(
+    client: &IndexerClient,
+    liquidity: Option<&str>,
+    read_timeout_secs: u64,
+) -> Result<Vec<InferenceMarket>> {
+    let budget = ReadBudget::new(read_timeout_secs);
+    let mut cursor = None;
+    let mut seen_cursors = HashSet::new();
+    let mut markets = Vec::new();
+    loop {
+        let page = budget
+            .read(client.markets(MarketsQuery {
+                inference_order_book_address: None,
+                producer: None,
+                status: None,
+                liquidity,
+                cursor: cursor.as_deref(),
+                limit: None,
+            }))
+            .await
+            .context("indexer API unavailable for `dexdo markets`")?;
+        markets.extend(page.markets);
+        if !page.has_more {
+            return Ok(markets);
+        }
+        let next = page.next_cursor.ok_or_else(|| {
+            anyhow::anyhow!(
+                "indexer API returned hasMore=true without nextCursor for `dexdo markets`"
+            )
+        })?;
+        if !seen_cursors.insert(next.clone()) {
+            return Err(anyhow::anyhow!(
+                "indexer API repeated nextCursor `{next}` for `dexdo markets`"
+            ));
+        }
+        cursor = Some(next);
+    }
+}
+
+fn markets_liquidity_filter(all: bool) -> Option<&'static str> {
+    (!all).then_some(dexdo_core::params::MARKETS_INDEXER_LIQUIDITY_FILTER)
 }
 
 pub(crate) async fn run_markets(mut args: MarketsArgs) -> Result<()> {
@@ -121,152 +115,41 @@ pub(crate) async fn run_markets(mut args: MarketsArgs) -> Result<()> {
     if args.mock_chain {
         return run_markets_mock(args).await;
     }
-    // read ONCE -- but BELOW the two early returns, not above them. Each call re-reads the
-    // environment and can fail on its own, so hoisting it to the top of the function would make
-    // `--mock-chain` and the `address` subcommand refuse without `DEXDO_MANIFEST`, which neither of
-    // them needs: one never touches a chain and the other reads the manifest itself.
+    // Keep the two non-indexer modes above the manifest read: neither `markets address` nor the
+    // explicit mock chain depends on a configured indexer.
     let manifest_path = crate::cli::commands::manifest_path()?;
-    let registry_policy =
-        load_enabled_model_registry_policy(RegistryRole::Buyer, &args.registry, &manifest_path)?;
-    let chain = dexdo_core::RealChainBackend::connect(
-        manifest_path
-            .to_str()
-            .ok_or_else(|| anyhow::anyhow!("DEXDO_MANIFEST: non-printable path"))?,
+    let manifest = indexer::ManifestIndexer::load(&manifest_path)?;
+    let network = manifest.network().to_string();
+    let base_url = indexer::resolve_base_url(args.indexer_url.as_deref(), Some(&manifest))?;
+    let client = IndexerClient::new(
+        base_url,
+        Duration::from_secs(args.read_timeout.read_timeout_secs),
     )?;
-    let targets = if args.market.is_empty() {
-        let note_addr = args.note_addr.clone().ok_or_else(|| {
-            anyhow::anyhow!(
-                "markets without --market requires --note-addr to derive order-book addresses"
-            )
-        })?;
-        // THE CATALOG IS THE RIGHT SOURCE HERE, and it is the only one of these read paths where
-        // that is true. The other views are given a NAME and can ask the registry what it
-        // means; this form is given nothing and answers "the markets of the models I serve", which
-        // is a question only a local catalog can answer -- the registry holds ten thousand names
-        // and none of them is "mine".
-
-        // So the file stays required, and what changes is the refusal. `ModelsConfig::load` says
-        // `read models config models.json: No such file or directory`: true, and useless to someone
-        // who never had that file and did not know this command wanted one. It names neither what
-        // the command was trying to do nor any way forward.
-        if !args.models.exists() {
-            bail!(
-                "`markets` without --market lists the books of the models in your catalog, and \
-                 there is no catalog at {}. Nothing was read.\n\n    \
-                 * one model, no catalog needed:  dexdo markets address --model '<name>'\n    \
-                 * a market you provisioned:      dexdo markets --market '<market.json>'\n    \
-                 * your own catalog:              write {} with the models you serve\n\n\
-                 The names the chain carries are the ModelRegistry's; `markets address` resolves \
-                 one without any local file.",
-                args.models.display(),
-                args.models.display()
-            );
-        }
-        let cfg = dexdo::seller::ModelsConfig::load(&args.models)?;
-        cfg.models
-            .values()
-            .map(|m| BookTarget {
-                frame_model: m.frame_model.clone(),
-                model_hash: model_hash_for(&m.frame_model),
-                order_book: None,
-                root_model: None,
-                note_addr: Some(note_addr.clone()),
-            })
-            .collect::<Vec<_>>()
-    } else {
-        args.market
-            .iter()
-            .map(|p| target_from_market(p))
-            .collect::<Result<Vec<_>>>()?
-    };
-    direct_chain_read_with_timeout(args.read_timeout.read_timeout_secs, async {
-        preload_model_registry_policy(
-            RegistryRole::Buyer,
-            registry_policy.as_ref(),
-            &manifest_path,
-        )
-        .await?;
-        let mut resolved_targets = Vec::with_capacity(targets.len());
-        for target in targets {
-            let requested_model = target.frame_model.clone();
-            resolved_targets.push(
-                resolve_model_registry_target(
-                    RegistryRole::Buyer,
-                    registry_policy.as_ref(),
-                    &manifest_path,
-                    &requested_model,
-                    target,
-                )
-                .await?,
-            );
-        }
-        let mut available = Vec::with_capacity(resolved_targets.len());
-        for target in resolved_targets {
-            let source = if target.order_book.is_some() {
-                "market_manifest"
-            } else {
-                "models_config"
-            };
-            let root_model = target.root_model.clone();
-            let snapshot = read_executable_book_target(&chain, &target).await?;
-            if let Some(policy) = registry_policy.as_ref() {
-                let action = enforce_model_registry_policy(
-                    RegistryRole::Buyer,
-                    policy,
-                    &manifest_path,
-                    &target.frame_model,
-                    &snapshot.order_book,
-                    snapshot.active(),
-                    BuyerMissingBookPolicy::HideFromAvailableList,
-                )
-                .await?;
-                if action == RegistryBookAction::BuyerHideMissing {
-                    continue;
-                }
-            }
-            available.push((snapshot, root_model, source));
-        }
-        // one clock, sampled here -- after every book read and registry getter above, and once
-        // for the whole listing so two markets in the same output cannot disagree about what "now" is.
-        let as_of = crate::cli::provenance::now_unix()?;
-        if args.json {
-            let markets = available
-                .iter()
-                .map(|(snapshot, root_model, source)| {
-                    market_entry_from_snapshot(snapshot, root_model.clone(), source, as_of)
-                })
-                .collect();
-            return machine::print_json(&machine::MarketsResponse {
-                schema: machine::MARKETS_SCHEMA,
-                network: chain.network().to_string(),
-                generated_at_unix: machine::now_unix()?,
-                markets,
-            });
-        }
-        for (snapshot, _, _) in available {
-            let depth_ticks: u128 = snapshot.live_resting_asks_at(as_of).map(|o| o.ticks).sum();
-            let best_ask = snapshot
-                .live_resting_asks_at(as_of)
-                .map(|o| o.price_per_tick)
-                .min();
-            let order_count = snapshot.stats.as_ref().map(|s| s.order_count).unwrap_or(0);
-            println!(
-                "model={}{} order_book={} active={} order_count={} ask_count={} depth_ticks={} best_ask={}",
-                snapshot.frame_model,
-                render_model_flags_field(&snapshot.frame_model),
-                addr::display(&snapshot.order_book),
-                snapshot.active(),
-                order_count,
-                snapshot.live_resting_asks_at(as_of).count(),
-                depth_ticks,
-                best_ask
-                    .map(dexdo_core::shell_amount)
-                    .unwrap_or_else(|| "-".to_string())
-            );
-        }
-        Ok(())
-    })
-    .await
+    let liquidity = markets_liquidity_filter(args.all);
+    let markets = read_all_indexer_markets(&client, liquidity, args.read_timeout.read_timeout_secs)
+        .await?
+        .into_iter()
+        .map(market_entry_from_indexer)
+        .collect::<Vec<_>>();
+    if args.json {
+        return machine::print_json(&machine::MarketsResponse {
+            schema: machine::MARKETS_SCHEMA,
+            network,
+            generated_at_unix: machine::now_unix()?,
+            markets,
+        });
+    }
+    for market in markets {
+        println!(
+            "model={} order_book={} total_ask_ticks={} best_ask={} tick_size={}",
+            market.frame_model,
+            addr::display(&market.order_book),
+            market.total_ask_ticks,
+            market.best_ask.as_deref().unwrap_or("-"),
+            market.tick_size,
+        );
+    }
+    Ok(())
 }
 
 /// name one model's canonical order-book address, without a note and without spending.
@@ -284,10 +167,8 @@ pub(crate) async fn run_markets(mut args: MarketsArgs) -> Result<()> {
 /// code hash and depth -- so the derived address IS the registry's answer, not a second opinion
 /// about it.
 
-/// The listing form of `markets` gets the same address by running `getInferenceOrderBookAddress` on
-/// a NOTE, passing that same carried code image in as an argument. The note contributes nothing to
-/// the result; it only has to be alive to execute the getter. That is the cost reported, and
-/// the reason this question is asked on its own.
+/// The listing form of `markets` now receives the address from the selected indexer. This command
+/// remains the independent on-chain derivation for one requested registry model.
 
 /// The candidate walk is why the requested spelling is reported next to the registry's own: 4.0.36
 /// seeded the catalogue WITHOUT producers, so `openai/gpt-5.2-pro` is answered about
@@ -351,35 +232,10 @@ pub(crate) async fn run_markets_address(args: MarketsAddressArgs) -> Result<()> 
 
 #[cfg(test)]
 mod tests {
-    /// one bounded read per command here, and a guard so it stays that way.
+    use super::*;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::TcpListener;
 
-    /// `markets.rs` was checked for the read multiplier and correctly left alone: both commands
-    /// wrap everything in ONE `direct_chain_read_with_timeout`, so there is no second budget to
-    /// share. But `buyer.rs` and `market_views.rs` carry a guard forbidding a second call and this
-    /// file did not, which means the day someone adds one the doubling comes back in silence. The
-    /// class is only closed when the file that has nothing to fix is guarded too.
-    #[test]
-    fn each_command_here_makes_at_most_one_bounded_read() {
-        let source = include_str!("markets.rs");
-        let production = source
-            .split_once("#[cfg(test)]\nmod tests")
-            .map_or(source, |(before, _)| before);
-        let calls = production
-            .matches("direct_chain_read_with_timeout(")
-            .count();
-        assert_eq!(
-            calls, 2,
-            "one per command and no more. Two commands live here; a third call means one of them \
-             now takes two full `--read-timeout` budgets, which is the defect  removed from \
-             `market_views.rs`, `buyer.rs` and `orders.rs`. Share a `ReadBudget` instead"
-        );
-    }
-
-    /// `--mock-chain` and the `address` subcommand must not need `DEXDO_MANIFEST`.
-
-    /// Same defect as in `run_subscription`, same cause: hoisting the manifest read to the top of
-    /// the function to stop re-reading it put it in front of two early returns that never touch a
-    /// chain. `run_markets_address` reads the manifest itself; the mock path reads nothing.
     #[test]
     fn the_early_returns_come_before_the_manifest_is_read() {
         let body = crate::cli::source_probe::code_of(
@@ -401,156 +257,336 @@ mod tests {
         }
     }
 
-    /// `dexdo markets` is a discovery/listing path. With buyer registry validation enabled, a
-    /// registered model whose canonical book is missing is hidden from the available list instead
-    /// of rendered as buyable.
     #[test]
-    fn buyer_markets_hides_missing_canonical_book() {
-        let source = include_str!("markets.rs");
-        let body = crate::cli::source_probe::code_of(source, "pub(crate) async fn run_markets");
-
-        let hide_policy = body
-            .find("BuyerMissingBookPolicy::HideFromAvailableList")
-            .expect("markets uses hide policy");
-        let hidden_action = body[hide_policy..]
-            .find("RegistryBookAction::BuyerHideMissing")
-            .map(|offset| hide_policy + offset)
-            .expect("markets handles hidden action");
-        let skip = body[hidden_action..]
-            .find("continue;")
-            .map(|offset| hidden_action + offset)
-            .expect("markets skips hidden books");
-        let timeout = body
-            .find("direct_chain_read_with_timeout(")
-            .expect("markets read timeout present");
-        let resolution = body
-            .find("resolve_model_registry_target(")
-            .expect("markets registry resolution present");
-        let json = body.find("if args.json").expect("markets JSON branch");
-        let print = body
-            .find("println!(")
-            .expect("markets prints visible books");
-
-        assert!(
-            hide_policy < hidden_action && hidden_action < skip && skip < json && json < print,
-            "markets must apply one registry filter before JSON or human output"
+    fn default_lists_sell_liquidity_and_all_omits_the_filter() {
+        assert_eq!(
+            markets_liquidity_filter(false),
+            Some(dexdo_core::params::MARKETS_INDEXER_LIQUIDITY_FILTER)
         );
-        assert!(
-            timeout < resolution,
-            "markets registry getter must run inside the existing read timeout"
-        );
+        assert_eq!(markets_liquidity_filter(true), None);
     }
 
-    /// E2E-ORD-26 /: `markets` reads each book, then runs a registry getter per target, then
-    /// prints. A snapshot is therefore already older than the print, and the deadline it was filtered
-    /// against is the READ's, not the print's.
+    #[test]
+    fn a_network_without_a_named_indexer_is_a_refusal() {
+        let manifest = indexer::ManifestIndexer::from_json(r#"{"network":"isolated"}"#)
+            .expect("manifest fixture");
+        let error = indexer::resolve_base_url_with_env(None, Some(&manifest), None)
+            .expect_err("markets has no chain fallback");
+        let rendered = format!("{error:#}");
 
-    /// This is the live incident's shape: SELL 11 rested 956 ticks at 5 SHELL/tick with deadline
-    /// 1785678525 and was still being advertised at 1785679304, 779 seconds later -- the cheapest ask
-    /// in the book, so a deadline-blind `min()` publishes a `best_ask` no buy can obtain.
+        assert!(rendered.contains("carries no `indexer`"), "{rendered}");
+        assert!(rendered.contains("nothing says who to ask"), "{rendered}");
+    }
 
-    /// The lapsed row and the live row are priced apart and sized apart, so no single number can pass
-    /// by accident: `ask_count` distinguishes them by row, `depth_ticks` by size, `best_ask` by price.
     /// E2E-ROW: E2E-ORD-26/L0
     #[test]
-    fn market_totals_exclude_an_ask_that_lapsed_between_the_read_and_the_print() {
-        use dexdo_core::{OrderBookOrder, OrderBookSnapshot};
-
-        /// SELL 11's deadline, and the moment it was still being advertised.
-        const LAPSED_DEADLINE: u64 = 1_785_678_525;
-        const PRINTED_AT: u64 = 1_785_679_304;
-
-        fn ask(order_id: u128, price_per_tick: u128, ticks: u128, deadline: u64) -> OrderBookOrder {
-            OrderBookOrder {
-                order_id,
-                owner_note: "0:seller".to_string(),
-                token_contract: Some(format!("0:tc{order_id}")),
-                is_buy: false,
-                price_per_tick,
-                ticks,
-                escrow: 0,
-                deadline,
-                flags: 0,
-                timestamp: 0,
-            }
+    fn markets_v3_preserves_indexer_liquidity_aggregates_and_has_exactly_five_fields() {
+        let entry = market_entry_from_indexer(market('a', "model-a", "8"));
+        let value = serde_json::to_value(entry).expect("serialize v3 market row");
+        let object = value.as_object().expect("market row object");
+        assert_eq!(object.len(), 5, "v3 must not retain chain-only v2 fields");
+        for field in [
+            "frame_model",
+            "order_book",
+            "total_ask_ticks",
+            "best_ask",
+            "tick_size",
+        ] {
+            assert!(object.contains_key(field), "missing {field}: {object:?}");
         }
-
-        let snapshot = OrderBookSnapshot {
-            frame_model: "qwen--qwen3--32b".to_string(),
-            model_hash: "hash".to_string(),
-            order_book: "0:book".to_string(),
-            stats: None,
-            orders: vec![
-                ask(11, 5_000_000_000, 956, LAPSED_DEADLINE),
-                ask(13, 7_000_000_000, 40, PRINTED_AT + 3_600),
-            ],
-        };
-
-        let read_at = LAPSED_DEADLINE - 1;
-        assert_eq!(
-            super::market_entry_from_snapshot(&snapshot, None, "market_manifest", read_at)
-                .ask_count,
-            2,
-            "before the deadline both asks are reachable, so this snapshot is one a real read produces"
-        );
-
-        let entry =
-            super::market_entry_from_snapshot(&snapshot, None, "market_manifest", PRINTED_AT);
-        assert_eq!(
-            entry.ask_count, 1,
-            "the lapsed ask is no longer an offer a buyer can reach"
-        );
-        assert_eq!(
-            entry.depth_ticks,
-            crate::cli::machine::amount(40u128),
-            "advertised depth is the live ask's 40 ticks, not 956 + 40"
-        );
-        assert_eq!(
-            entry.best_ask,
-            Some(dexdo_core::shell_amount(7_000_000_000u128)),
-            "the lapsed ask was the cheapest row and must not set the advertised price"
-        );
+        assert_eq!(object["total_ask_ticks"], "8");
+        assert_eq!(object["best_ask"], "1.000000000");
+        assert_eq!(object["tick_size"], "1");
     }
 
-    /// The deadline second itself is already expired on chain -- `_isExpired` is
-    /// `deadline != 0 && block.timestamp >= deadline`
-    /// (`contracts/airegistry/InferenceOrderBook.sol:1115-1117`). The advertised totals must not be
-    /// one second more generous than the matcher.
-    #[test]
-    fn market_totals_drop_an_ask_on_the_deadline_second_itself() {
-        use dexdo_core::{OrderBookOrder, OrderBookSnapshot};
+    fn market(fill: char, name: &str, total_ask_ticks: &str) -> InferenceMarket {
+        InferenceMarket {
+            inference_order_book_address: format!("0:{}", fill.to_string().repeat(64)),
+            model_ref_name: name.to_string(),
+            contract_version: Some("4.0.36".to_string()),
+            status: "TRADING".to_string(),
+            quote_asset: "SHELL".to_string(),
+            maker_commission: "-0.02".to_string(),
+            taker_commission: "0.025".to_string(),
+            price_precision: 9,
+            quantity_precision: 0,
+            tick_size: "1".to_string(),
+            step_size: "1".to_string(),
+            min_notional: "1".to_string(),
+            reference_price: None,
+            best_ask: Some("1.000000000".to_string()),
+            total_ask_ticks: total_ask_ticks.to_string(),
+            created_at: 1,
+        }
+    }
 
-        const DEADLINE: u64 = 1_785_678_525;
+    fn page(market: &InferenceMarket, next_cursor: Option<&str>, has_more: bool) -> String {
+        serde_json::json!({
+            "serverTime": 1,
+            "nextCursor": next_cursor,
+            "hasMore": has_more,
+            "markets": [market],
+        })
+        .to_string()
+    }
 
-        let snapshot = OrderBookSnapshot {
-            frame_model: "qwen--qwen3--32b".to_string(),
-            model_hash: "hash".to_string(),
-            order_book: "0:book".to_string(),
-            stats: None,
-            orders: vec![OrderBookOrder {
-                order_id: 11,
-                owner_note: "0:seller".to_string(),
-                token_contract: Some("0:tc11".to_string()),
-                is_buy: false,
-                price_per_tick: 5_000_000_000,
-                ticks: 956,
-                escrow: 0,
-                deadline: DEADLINE,
-                flags: 0,
-                timestamp: 0,
-            }],
-        };
+    async fn page_server(pages: Vec<String>) -> (String, tokio::task::JoinHandle<Vec<String>>) {
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind indexer fixture");
+        let address = listener.local_addr().expect("fixture address");
+        let server = tokio::spawn(async move {
+            let mut requests = Vec::new();
+            for body in pages {
+                let (mut socket, _) = listener.accept().await.expect("accept request");
+                let mut request = vec![0u8; 4096];
+                let read = socket.read(&mut request).await.expect("read request");
+                requests.push(String::from_utf8_lossy(&request[..read]).into_owned());
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    body.len(),
+                    body
+                );
+                socket
+                    .write_all(response.as_bytes())
+                    .await
+                    .expect("write response");
+            }
+            requests
+        });
+        (format!("http://{address}"), server)
+    }
 
-        assert_eq!(
-            super::market_entry_from_snapshot(&snapshot, None, "market_manifest", DEADLINE - 1)
-                .ask_count,
-            1
-        );
-        assert_eq!(
-            super::market_entry_from_snapshot(&snapshot, None, "market_manifest", DEADLINE)
-                .ask_count,
-            0,
-            "at `now == deadline` the book already refuses the order"
-        );
+    async fn delayed_page_server(
+        pages: Vec<(Duration, String)>,
+    ) -> (String, tokio::task::JoinHandle<Vec<String>>) {
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind delayed indexer fixture");
+        let address = listener.local_addr().expect("fixture address");
+        let server = tokio::spawn(async move {
+            let mut requests = Vec::new();
+            for (delay, body) in pages {
+                let (mut socket, _) = listener.accept().await.expect("accept request");
+                let mut request = vec![0u8; 4096];
+                let read = socket.read(&mut request).await.expect("read request");
+                requests.push(String::from_utf8_lossy(&request[..read]).into_owned());
+                tokio::time::sleep(delay).await;
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    body.len(),
+                    body
+                );
+                let _ = socket.write_all(response.as_bytes()).await;
+            }
+            requests
+        });
+        (format!("http://{address}"), server)
+    }
+
+    #[tokio::test]
+    async fn every_market_page_uses_the_sell_filter_and_next_cursor() {
+        let first = market('a', "model-a", "8");
+        let second = market('b', "model-b", "13");
+        let (endpoint, server) = page_server(vec![
+            page(&first, Some("page-2"), true),
+            page(&second, None, false),
+        ])
+        .await;
+        let client = IndexerClient::new(endpoint, Duration::from_secs(2)).expect("client");
+
+        let markets = read_all_indexer_markets(
+            &client,
+            Some(dexdo_core::params::MARKETS_INDEXER_LIQUIDITY_FILTER),
+            2,
+        )
+        .await
+        .expect("read every page");
+        let requests = server.await.expect("fixture server");
+
+        assert_eq!(markets.len(), 2);
+        assert!(requests[0].contains("liquidity=SELL"), "{}", requests[0]);
+        assert!(!requests[0].contains("cursor="), "{}", requests[0]);
+        assert!(requests[1].contains("liquidity=SELL"), "{}", requests[1]);
+        assert!(requests[1].contains("cursor=page-2"), "{}", requests[1]);
+    }
+
+    #[tokio::test]
+    async fn all_omits_the_liquidity_filter_from_the_request() {
+        let only = market('a', "model-a", "0");
+        let (endpoint, server) = page_server(vec![page(&only, None, false)]).await;
+        let client = IndexerClient::new(endpoint, Duration::from_secs(2)).expect("client");
+
+        let markets = read_all_indexer_markets(&client, None, 2)
+            .await
+            .expect("read unfiltered markets");
+        let requests = server.await.expect("fixture server");
+
+        assert_eq!(markets.len(), 1);
+        assert!(!requests[0].contains("liquidity="), "{}", requests[0]);
+    }
+
+    #[tokio::test]
+    async fn null_and_omitted_contract_versions_keep_every_valid_v3_row() {
+        let mut null_version = serde_json::to_value(market('a', "model-a", "0"))
+            .expect("serialize null-version fixture");
+        null_version["contractVersion"] = serde_json::Value::Null;
+        null_version["bestAsk"] = serde_json::Value::Null;
+        let mut omitted_version = serde_json::to_value(market('b', "model-b", "0"))
+            .expect("serialize omitted-version fixture");
+        omitted_version["bestAsk"] = serde_json::Value::Null;
+        omitted_version
+            .as_object_mut()
+            .expect("market fixture object")
+            .remove("contractVersion");
+        let body = serde_json::json!({
+            "serverTime": 1,
+            "nextCursor": null,
+            "hasMore": false,
+            "markets": [null_version, omitted_version],
+        })
+        .to_string();
+        let (endpoint, server) = page_server(vec![body]).await;
+        let client = IndexerClient::new(endpoint, Duration::from_secs(2)).expect("client");
+
+        let entries = read_all_indexer_markets(&client, None, 2)
+            .await
+            .expect("optional contract metadata must not break listing")
+            .into_iter()
+            .map(market_entry_from_indexer)
+            .collect::<Vec<_>>();
+        let requests = server.await.expect("fixture server");
+
+        assert_eq!(requests.len(), 1);
+        assert_eq!(entries.len(), 2);
+        assert_eq!(entries[0].frame_model, "model-a");
+        assert_eq!(entries[1].frame_model, "model-b");
+        for entry in entries {
+            let value = serde_json::to_value(entry).expect("serialize v3 market row");
+            let object = value.as_object().expect("v3 market row object");
+            assert_eq!(object.len(), 5, "v3 row changed shape: {object:?}");
+            assert_eq!(object["total_ask_ticks"], "0");
+            assert_eq!(object["best_ask"], serde_json::Value::Null);
+        }
+    }
+
+    #[tokio::test]
+    async fn has_more_without_a_cursor_fails_the_whole_listing() {
+        let only = market('a', "model-a", "8");
+        let (endpoint, server) = page_server(vec![page(&only, None, true)]).await;
+        let client = IndexerClient::new(endpoint, Duration::from_secs(2)).expect("client");
+
+        let error = read_all_indexer_markets(&client, None, 2)
+            .await
+            .expect_err("a partial listing must not be returned");
+        let requests = server.await.expect("fixture server");
+
+        assert_eq!(requests.len(), 1);
+        assert!(format!("{error:#}").contains("without nextCursor"));
+    }
+
+    #[tokio::test]
+    async fn a_directly_repeated_cursor_fails_the_whole_listing() {
+        let first = market('a', "model-a", "8");
+        let second = market('b', "model-b", "13");
+        let (endpoint, server) = page_server(vec![
+            page(&first, Some("page-a"), true),
+            page(&second, Some("page-a"), true),
+        ])
+        .await;
+        let client = IndexerClient::new(endpoint, Duration::from_secs(2)).expect("client");
+
+        let error = read_all_indexer_markets(&client, None, 2)
+            .await
+            .expect_err("a partial listing must not be returned");
+        let requests = server.await.expect("fixture server");
+
+        assert_eq!(requests.len(), 2);
+        assert!(format!("{error:#}").contains("repeated nextCursor `page-a`"));
+    }
+
+    #[tokio::test]
+    async fn a_non_consecutive_cursor_cycle_fails_the_whole_listing() {
+        let first = market('a', "model-a", "8");
+        let second = market('b', "model-b", "13");
+        let third = market('c', "model-c", "21");
+        let (endpoint, server) = page_server(vec![
+            page(&first, Some("page-a"), true),
+            page(&second, Some("page-b"), true),
+            page(&third, Some("page-a"), true),
+        ])
+        .await;
+        let client = IndexerClient::new(endpoint, Duration::from_secs(2)).expect("client");
+
+        let error = read_all_indexer_markets(&client, None, 2)
+            .await
+            .expect_err("a cursor cycle must not return duplicated partial rows");
+        let requests = server.await.expect("fixture server");
+
+        assert_eq!(requests.len(), 3);
+        assert!(format!("{error:#}").contains("repeated nextCursor `page-a`"));
+    }
+
+    #[tokio::test]
+    async fn every_page_spends_the_same_command_read_budget() {
+        let first = market('a', "model-a", "8");
+        let second = market('b', "model-b", "13");
+        let (endpoint, server) = delayed_page_server(vec![
+            (
+                Duration::from_millis(250),
+                page(&first, Some("page-2"), true),
+            ),
+            (Duration::from_millis(900), page(&second, None, false)),
+        ])
+        .await;
+        let client = IndexerClient::new(endpoint, Duration::from_secs(2)).expect("client");
+
+        let error = read_all_indexer_markets(&client, None, 1)
+            .await
+            .expect_err("two slow pages must share one one-second budget");
+        let requests = server.await.expect("fixture server");
+        let rendered = format!("{error:#}");
+
+        assert_eq!(requests.len(), 2);
+        assert!(rendered.contains("this command's 1s `--read-timeout` budget"));
+    }
+
+    #[tokio::test]
+    async fn an_unavailable_indexer_fails_without_a_fallback() {
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind failing indexer fixture");
+        let endpoint = format!("http://{}", listener.local_addr().expect("fixture address"));
+        let server = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.expect("accept request");
+            let mut request = vec![0u8; 4096];
+            let read = socket.read(&mut request).await.expect("read request");
+            let body = "indexer unavailable";
+            let response = format!(
+                "HTTP/1.1 503 Service Unavailable\r\nContent-Type: text/plain\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                body.len(),
+                body
+            );
+            socket
+                .write_all(response.as_bytes())
+                .await
+                .expect("write response");
+            String::from_utf8_lossy(&request[..read]).into_owned()
+        });
+        let client = IndexerClient::new(endpoint, Duration::from_secs(2)).expect("client");
+
+        let error = read_all_indexer_markets(
+            &client,
+            Some(dexdo_core::params::MARKETS_INDEXER_LIQUIDITY_FILTER),
+            2,
+        )
+        .await
+        .expect_err("markets must fail when its sole source is unavailable");
+        let request = server.await.expect("fixture server");
+        let rendered = format!("{error:#}");
+
+        assert!(request.contains("liquidity=SELL"), "{request}");
+        assert!(rendered.contains("indexer API unavailable"), "{rendered}");
+        assert!(rendered.contains("503 Service Unavailable"), "{rendered}");
     }
 }

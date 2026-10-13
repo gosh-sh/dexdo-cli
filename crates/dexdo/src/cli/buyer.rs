@@ -4306,9 +4306,10 @@ pub(crate) fn render_buyer_human_preflight(
     // or removed") and states the choice between them: a constant `true` is worse than no field,
     // because it manufactures certainty. The field is therefore dropped rather than faked. The
     // computed form also asks for -- a reason separating price-above-ceiling, insufficient head
-    // volume, an expired counterparty and an empty book -- is delivered on the refusal path instead
+    // volume and an empty book -- is delivered on the refusal path instead
     // (`human_buyer_quote_error`), which the operator reaches INSTEAD of this render, and which is
-    // classified where the book was actually read.
+    // classified where the book was actually read. Expired asks are skipped and do not become a
+    // separate buyer-visible state.
     format!(
         "BUYER_PREFLIGHT model={frame_model} requested_ticks={ticks} \
          minimum_ticks={} best_ask={} \
@@ -5099,14 +5100,9 @@ fn human_buyer_quote_error(
         && lower.contains("refusing to send escrow into the wrong deal")
     {
         "wrong_target"
-    } else if lower.contains(dexdo_core::params::EXPIRED_COUNTERPARTY_ASK_REASON) {
-        // Checked BEFORE the no-match arms: the expired-ask refusal also carries "no executable
-        // matching ask", and naming it a no-match would hide the one fact that explains it.
-        dexdo_core::params::EXPIRED_COUNTERPARTY_ASK_CLASS
     } else if lower.contains(dexdo_core::params::INSUFFICIENT_HEAD_ASK_REASON) {
-        // 's remaining two states, above the no-match arm for the same reason the expired arm
-        // is: both refusals also carry "no executable matching ask", so the generic class would
-        // swallow them and send the operator to raise a ceiling that is already high enough. The
+        // This refusal also carries "no executable matching ask", so keep its actionable size
+        // diagnosis above the generic no-match arm. The
         // head-capacity refusal names its own fact wherever it is raised -- the model-only preflight
         // and the explicit-TokenContract one produce the same literal -- so it is read directly.
         dexdo_core::params::INSUFFICIENT_HEAD_ASK_CLASS
@@ -5200,15 +5196,6 @@ fn buyer_refusal(reason: &str, wanted: BuyRequest, machine: &str) -> crate::cli:
                 )),
             ),
         ]),
-        class if class == dexdo_core::params::EXPIRED_COUNTERPARTY_ASK_CLASS => Refusal::new(
-            format!(
-                "The {model} ask this buy would have taken had already expired, and nothing was \
-                 committed."
-            ),
-            "Run the same command again: the book is re-read each time, and an expired ask is \
-             cleared from it.",
-            machine,
-        ),
         "wrong_target" => Refusal::new(
             format!(
                 "The {model} book would have matched a different deal than the one named, so no \
@@ -5387,7 +5374,6 @@ mod refusal_1432_tests {
         for class in [
             dexdo_core::params::EMPTY_MODEL_BOOK_CLASS,
             dexdo_core::params::INSUFFICIENT_HEAD_ASK_CLASS,
-            dexdo_core::params::EXPIRED_COUNTERPARTY_ASK_CLASS,
             "ceiling_below_best_ask",
             "wrong_target",
             "no_executable_ask",
@@ -10080,18 +10066,13 @@ pub(crate) async fn run_buyer(args: BuyerArgs) -> Result<()> {
         if let Some(events) = machine_events.as_mut() {
             let code = machine::classify_error(machine::OP_BUYER_START, &err);
             machine_context.enrich_from_error(&err);
-            if code == machine::ErrorCode::NoLiquidity {
-                let detail = format!("{err:#}").to_ascii_lowercase();
-                // An expired crossing ask is its own class: the book DID hold an ask this buy
-                // crosses, so reporting `no_executable_ask` would send the operator to raise a
-                // ceiling that is already high enough (E2E-ORD-02).
-                if detail.contains(dexdo_core::params::EXPIRED_COUNTERPARTY_ASK_REASON) {
-                    machine_context.failure_class =
-                        Some(dexdo_core::params::EXPIRED_COUNTERPARTY_ASK_CLASS.to_string());
-                } else if detail.contains(dexdo_core::params::NO_EXECUTABLE_ASK_CLASS) {
-                    machine_context.failure_class =
-                        Some(dexdo_core::params::NO_EXECUTABLE_ASK_CLASS.to_string());
-                }
+            if code == machine::ErrorCode::NoLiquidity
+                && format!("{err:#}")
+                    .to_ascii_lowercase()
+                    .contains(dexdo_core::params::NO_EXECUTABLE_ASK_CLASS)
+            {
+                machine_context.failure_class =
+                    Some(dexdo_core::params::NO_EXECUTABLE_ASK_CLASS.to_string());
             }
             events.error_with_cause(
                 machine::OP_BUYER_START,
@@ -12288,9 +12269,6 @@ async fn run_buyer_inner(
                 order_book: selected_market
                     .as_ref()
                     .map(|market| market.inference_order_book.clone()),
-                root_model: selected_market
-                    .as_ref()
-                    .map(|market| market.root_model.clone()),
                 note_addr: args.identity.note_addr.clone(),
             },
         )
@@ -25036,8 +25014,14 @@ mod tests {
         let max_price_per_tick = chain
             .model_submit_safe_order
             .as_ref()
-            .unwrap()
-            .price_per_tick;
+            .map(|order| order.price_per_tick)
+            .or_else(|| {
+                chain
+                    .offers
+                    .first()
+                    .map(|offer| u128::from(offer.price_per_tick))
+            })
+            .expect("fixture carries a quoted price");
         let escrow = dexdo_core::required_escrow_for_buy(ticks, max_price_per_tick);
         let selection =
             super::buyer_quote_selection(chain, None, ticks, max_price_per_tick, Some(escrow))
@@ -25247,10 +25231,9 @@ mod tests {
 
     /// 's other half: when the buyer refuses, the reason has to say WHICH state the book is in.
 
-    /// The four states names need four answers because the operator's next step differs in
-    /// each: raise the ceiling, buy fewer ticks, wait for the seller to repost, wait for a seller at
-    /// all. Three of them shared the name `no_executable_ask`, which reads as "raise your ceiling"
-    /// -- advice that is wrong for two of the three and impossible for the third.
+    /// The actionable states names need distinct answers because the operator's next step
+    /// differs: raise the ceiling, buy fewer ticks, or wait for a seller. Expired rows are skipped
+    /// by the matcher and are not a separate buyer-visible state.
 
     /// Driven through `run_buyer_inner`, the command entry, for both new states, because the
     /// classification is only worth anything if the entry reaches it: an undersized head ask on the
@@ -25711,22 +25694,27 @@ mod tests {
         }
     }
 
-    /// An already-expired submit-safe row is driven through the real quote and journal-to-POST
-    /// path. The refusal must name its authoritative deadline; unknown/stale identity mutation is
-    /// the adjacent adversary and neither arm may create an order, journal, debit, or money POST.
+    /// An already-expired row is driven through the real quote and journal-to-POST path. It is no
+    /// longer a special refusal: the book skips it, and with nothing live left the buyer reports
+    /// ordinary no liquidity. Neither arm may create an order, journal, debit, or money POST.
 
     /// E2E-ORD-02, `tests/e2e/test-specification.md` at matrix head
     /// `40f8aae352a4e1aa19508c68b8f54c9ca2b6c676`.
     /// E2E-ROW: E2E-ORD-02/L0
-    #[ignore = "EXPECTED TO FAIL until the production buyer rejects a submit-safe ask whose deadline is already past"]
     #[tokio::test]
-    async fn ord_02_expired_ask_exits_before_order_journal_debit_or_escrow() {
+    async fn ord_02_expired_ask_is_no_liquidity_before_journal_debit_or_escrow() {
         use std::sync::atomic::Ordering;
 
         let as_of = super::unix_now_secs();
         let mut expired = issue67_real_like_order();
         expired.deadline = as_of.saturating_sub(60);
         let mut chain = issue67_pipeline_chain(&expired, Some(expired.clone()));
+        chain.model_submit_safe_order = None;
+        chain.model_preflight_error = Some(format!(
+            "{}: no matchable ask for max_price_per_tick {}, requested ticks 2",
+            dexdo_core::params::NO_EXECUTABLE_ASK_CLASS,
+            expired.price_per_tick
+        ));
         chain.note_shell_balance = Some(dexdo_core::required_escrow_for_buy(
             2,
             expired.price_per_tick,
@@ -25734,10 +25722,12 @@ mod tests {
         let (dir, _cleanup) = buyer_journal_test_dir("ord-02-expired-production-path");
         let journal_path = dir.join("expired.json");
         let result = issue67_select_and_submit(&chain, &journal_path, None).await;
-        let expiry_named = result.as_ref().is_err_and(|error| {
+        let no_liquidity = result.as_ref().is_err_and(|error| {
             let message = format!("{error:#}");
-            message.contains("counterparty ask expired at")
-                && message.contains(&expired.deadline.to_string())
+            (message.contains("no_executable_ask") || message.contains("no matchable ask"))
+                && !message.contains("counterparty ask expired")
+                && !message.contains("clean/cancel")
+                && !message.contains("Run the same command")
         });
         let expired_state_unchanged = !journal_path.exists()
             && chain.model_money_submit_calls.load(Ordering::SeqCst) == 0
@@ -25764,7 +25754,7 @@ mod tests {
                 .is_empty();
 
         assert!(
-            expiry_named && expired_state_unchanged && unknown_safe,
+            no_liquidity && expired_state_unchanged && unknown_safe,
             "E2E-ORD-02 missing capability: expired ask reached order, journal, debit, or escrow"
         );
     }

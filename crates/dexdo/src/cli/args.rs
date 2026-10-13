@@ -691,6 +691,11 @@ pub(crate) struct ProvisionArgs {
     /// seller`/`buyer` load it via `--market`.
     #[arg(long, default_value = DEFAULT_MARKET_MANIFEST_OUTPUT_PATH)]
     pub(crate) output: PathBuf,
+    /// Replace saved offers for the previous market's seller note and model. Stop that seller
+    /// first. Unsold offers are cancelled and durably retired; funded deals remain recoverable.
+    /// A cancellation failure or concurrent match aborts replacement and keeps the old manifest.
+    #[arg(long)]
+    pub(crate) replace_market: Option<PathBuf>,
     /// Local deal-handle directory. Pass the same directory to `provision` and `seller` so they
     /// share the note-wide capacity lock and durable provision reservations.
     #[arg(long)]
@@ -922,15 +927,21 @@ pub(crate) struct ModelRegistryArgs {
     pub(crate) read_timeout: ChainReadTimeoutArgs,
 }
 
-/// Read-only market discovery: list configured/per-manifest inference order books.
+/// Read-only market discovery: list inference order books reported by the selected indexer.
 #[derive(Args)]
 pub(crate) struct MarketsArgs {
     /// Pointed read-only questions about one market that need no note.
     #[command(subcommand)]
     pub(crate) command: Option<MarketsCommand>,
-    /// Emit the stable `dexdo.markets.v2` JSON object.
+    /// Emit the stable `dexdo.markets.v3` JSON object.
     #[arg(long)]
     pub(crate) json: bool,
+    /// Include markets without matchable sell liquidity.
+    #[arg(long)]
+    pub(crate) all: bool,
+    /// Dodex indexer base URL. Env fallback: DEXDO_INDEXER_URL; otherwise use the manifest.
+    #[arg(long)]
+    pub(crate) indexer_url: Option<String>,
     #[command(flatten)]
     pub(crate) read_timeout: ChainReadTimeoutArgs,
     /// Use the local mock chain state next to --endpoints-file.
@@ -942,17 +953,6 @@ pub(crate) struct MarketsArgs {
     /// Frame model id for mock-chain discovery output.
     #[arg(long, default_value = DEFAULT_MARKETS_FRAME_MODEL)]
     pub(crate) frame_model: String,
-    #[command(flatten)]
-    pub(crate) registry: ModelRegistryValidationArgs,
-    /// Optional provisioned market manifest(s). If absent, markets are derived from --models via --note-addr.
-    #[arg(long)]
-    pub(crate) market: Vec<PathBuf>,
-    /// Models config used when --market is absent.
-    #[arg(long, default_value = DEFAULT_MODELS_PATH)]
-    pub(crate) models: PathBuf,
-    /// Any active inference PrivateNote address used to derive per-model order-book addresses when --market is absent.
-    #[arg(long, value_parser = dexdo_core::address::arg_to_chain_param)]
-    pub(crate) note_addr: Option<String>,
 }
 
 #[derive(Subcommand)]
@@ -963,12 +963,10 @@ pub(crate) enum MarketsCommand {
 
 /// Name one model's canonical `InferenceOrderBook` address.
 
-/// The listing form of `markets` derives book addresses by running the note's
-/// `getInferenceOrderBookAddress` getter, so it refuses without `--note-addr` and refuses again if
-/// that note is not live. Neither fact is about the market: the book address is `tvm.hash` of a
-/// StateInit built from the pinned `InferenceOrderBook` code and the model hash, and the client
-/// carries that code image itself. This asks the question on its own, so no note has to exist for
-/// an operator to be told where a market lives.
+/// The listing form of `markets` now reads the indexer. This subcommand remains the canonical
+/// on-chain answer for one model name: the book address is `tvm.hash` of a StateInit built from the
+/// pinned `InferenceOrderBook` code and the model hash, and no note has to exist for an operator to
+/// be told where that market lives.
 #[derive(Args)]
 pub(crate) struct MarketsAddressArgs {
     /// Model to name the order book for, in any spelling ModelRegistry accepts.

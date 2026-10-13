@@ -479,31 +479,15 @@ pub const DEFAULT_BUYER_EMPTY_STREAM_ACTION: &str = "reclaim";
 /// Default buyer reaction when a seller stalls after delivering some tokens.
 pub const DEFAULT_BUYER_STALLS_MID_STREAM_ACTION: &str = "accept_delivered_then_reclaim";
 
-/// The exact phrase a buy refusal leads with when the only asks this buy crosses are past their
-/// own deadline (E2E-ORD-02).
-
-/// The operator must read "the counterparty's ask ran out", never "there is nothing here" -- a
-/// higher `--max-price-per-tick` cannot help and only the seller reposting can. Every layer that
-/// re-wraps the refusal keys its own classification off this one literal, so it lives here rather
-/// than being spelled out again in each crate.
-pub const EXPIRED_COUNTERPARTY_ASK_REASON: &str = "counterparty ask expired at";
-
-/// Machine failure class carried by the refusal `EXPIRED_COUNTERPARTY_ASK_REASON` names.
-
-/// Deliberately NOT `no_executable_ask`: that class means the book holds nothing this buy can
-/// cross, and reporting it here would tell the operator to raise a ceiling that is already high
-/// enough.
-pub const EXPIRED_COUNTERPARTY_ASK_CLASS: &str = "expired_counterparty_ask";
-
 /// Machine failure class for a book that holds no ask this buy can cross at all.
 pub const NO_EXECUTABLE_ASK_CLASS: &str = "no_executable_ask";
 
 /// Machine failure class for a model book with no resting ask in it whatsoever.
 
-/// requires the buyer preflight to separate the four states a buy is refused in, because the
-/// operator's next step differs in each. Split out of `NO_EXECUTABLE_ASK_CLASS`, which covers a
-/// book that HAS rows this buy cannot cross -- there the answer is a higher ceiling or a cleanup;
-/// here there is nothing to cross and only a seller posting an ask changes it.
+/// requires the buyer preflight to separate the actionable states a buy is refused in,
+/// because the operator's next step differs in each. Split out of `NO_EXECUTABLE_ASK_CLASS`, which
+/// covers the generic case where this buy has no live matchable ask; here the raw book has no
+/// resting ask at all and only a seller posting one changes it.
 pub const EMPTY_MODEL_BOOK_CLASS: &str = "empty_model_book";
 
 /// The exact phrase a buy refusal leads with when the head ask this buy crosses is live, funded and
@@ -534,14 +518,6 @@ pub const EMPTY_MODEL_BOOK_REASON: &str = "no resting asks in this model book";
 /// book, and it is the only side that carries this wrapper.
 pub const RAW_MATCHER_NO_SUBMIT_SAFE_ASK: &str = "raw order-book matcher has no submit-safe ask";
 
-/// The exact phrase the `executable-book` listing leads with when every row crossing this buy is
-/// out of the book by its own deadline.
-
-/// It is the listing surface's spelling of the state `EXPIRED_COUNTERPARTY_ASK_REASON` names on the
-/// buy preflight, and `book_refusal_class` maps both onto `EXPIRED_COUNTERPARTY_ASK_CLASS` so the
-/// two surfaces cannot answer differently for one book.
-pub const LAPSED_MODEL_BOOK_REASON: &str = "no live asks in this model book";
-
 /// Every phrase that names a book state this buy simply cannot cross, without saying which of the
 /// states it is. Recognising them is what separates "the book refused this buy" from "the read
 /// failed"; the arms above then decide which of the four classes it belongs to.
@@ -558,14 +534,11 @@ const GENERIC_NO_MATCH_REASONS: &[&str] = &[
 /// The machine class an already-built refusal belongs to, or `None` when the text is not a book
 /// state at all (a chain read that failed, a malformed manifest, anything else).
 
-/// This is the ONE classifier every buy surface reads. `crossing_expired_ask_reason` is the only
-/// producer that names an expiry, and it leads with `EXPIRED_COUNTERPARTY_ASK_REASON`; every wrapper
-/// between it and the CLI carries the reason verbatim, so that one literal is what distinguishes
-/// "the crossing ask ran out" from "this book has nothing to cross" after the two have been folded
-/// into the same `String`. splits two more states out of the generic class the same way,
-/// because each sends the operator somewhere else: an empty book is waited on, an undersized head is
-/// bought smaller, and only what is left over is the "rows exist, none of them are usable" case
-/// `NO_EXECUTABLE_ASK_CLASS` names.
+/// This is the ONE classifier every buy surface reads. Expired rows are removed by the matcher and
+/// therefore never create their own buyer-visible class: if nothing live remains, the refusal is the
+/// same generic no-liquidity state as any other book with no matchable ask. splits two states
+/// out of that generic class because each sends the operator somewhere else: an actually empty book
+/// is waited on and an undersized head is bought smaller.
 
 /// `dexdo executable-book` reads the same verdict from here rather than hardcoding the
 /// generic class into its line. Two classifiers that must agree are the defect, not the fix -- the
@@ -573,10 +546,7 @@ const GENERIC_NO_MATCH_REASONS: &[&str] = &[
 /// one function.
 pub fn book_refusal_class(reason: &str) -> Option<&'static str> {
     let reason = reason.to_ascii_lowercase();
-    if reason.contains(EXPIRED_COUNTERPARTY_ASK_REASON) || reason.contains(LAPSED_MODEL_BOOK_REASON)
-    {
-        Some(EXPIRED_COUNTERPARTY_ASK_CLASS)
-    } else if reason.contains(INSUFFICIENT_HEAD_ASK_REASON) {
+    if reason.contains(INSUFFICIENT_HEAD_ASK_REASON) {
         Some(INSUFFICIENT_HEAD_ASK_CLASS)
     } else if reason.contains(EMPTY_MODEL_BOOK_REASON)
         && reason.contains(RAW_MATCHER_NO_SUBMIT_SAFE_ASK)
@@ -845,6 +815,9 @@ pub const INT_IN_PAGE_SIZE: u32 = 200;
 
 /// Transient submit retries performed before one final unslept attempt.
 pub const TRANSIENT_SUBMIT_RETRIES_BEFORE_FINAL: u32 = 8;
+
+/// Maximum producer changes followed by one signed submit; each refusal supplies a fresh target.
+pub const PRODUCER_REDIRECT_MAX_HOPS: u32 = 8;
 
 /// Initial delay after a a transient chain submit failure.
 pub const TRANSIENT_SUBMIT_INITIAL_BACKOFF: Duration = Duration::from_secs(2);
@@ -1277,8 +1250,10 @@ pub const ORACLE_RESOLUTION_MAX_READS: usize = 60;
 /// Interval between private-marketplace resolution reads.
 pub const ORACLE_RESOLUTION_POLL_INTERVAL: Duration = Duration::from_secs(3);
 
-/// Timeout for the indexer fast-path before direct chain fallback.
-pub const INDEXER_FAST_TIMEOUT: Duration = Duration::from_secs(2);
+/// Indexer-side liquidity filter used by `dexdo markets` unless `--all` is set.
+
+/// The indexer names order sides as `BUY`/`SELL`; asks are resting SELL orders.
+pub const MARKETS_INDEXER_LIQUIDITY_FILTER: &str = "SELL";
 
 /// Maximum compact indexer error-response body exposed to operators.
 pub const INDEXER_ERROR_BODY_MAX_BYTES: usize = 2_048;
@@ -3304,7 +3279,7 @@ mod tests {
     /// the `executable-book` listing -- reads its class from here, so this is the truth table both
     /// of them are held to.
     #[test]
-    fn book_refusal_class_separates_the_four_states() {
+    fn book_refusal_class_separates_the_supported_states() {
         for (reason, expected) in [
             (
                 format!(
@@ -3313,20 +3288,6 @@ mod tests {
                     super::EMPTY_MODEL_BOOK_REASON
                 ),
                 super::EMPTY_MODEL_BOOK_CLASS,
-            ),
-            (
-                format!(
-                    "{} 1785678525: nearest ask is gone",
-                    super::EXPIRED_COUNTERPARTY_ASK_REASON
-                ),
-                super::EXPIRED_COUNTERPARTY_ASK_CLASS,
-            ),
-            (
-                format!(
-                    "{} for max_price_per_tick 10",
-                    super::LAPSED_MODEL_BOOK_REASON
-                ),
-                super::EXPIRED_COUNTERPARTY_ASK_CLASS,
             ),
             (
                 format!(

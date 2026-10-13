@@ -17,9 +17,8 @@ use crate::cli::machine;
 use anyhow::{bail, Result};
 use dexdo::registry::{BuyerMissingBookPolicy, RegistryRole};
 use dexdo_core::address as addr;
-use dexdo_core::params::INDEXER_FAST_TIMEOUT;
 use dexdo_core::{
-    chain::BookEventFold, submit_safe_single_ask_quote, DobParams, ExecutableQuote, OrderBookOrder,
+    chain::BookEventFold, submit_safe_single_ask_quote, ExecutableQuote, OrderBookOrder,
     OrderBookSnapshot,
 };
 use dexdo_core::{executable_quote, model_hash_for, ChainBackend};
@@ -47,75 +46,13 @@ use std::future::Future;
 /// `models.json` is consulted on BOTH arms: a nickname is the operator's own shorthand and must keep
 
 #[derive(Debug)]
-struct IndexerMarketContext {
-    last_update_id: String,
-}
-
-#[derive(Debug)]
 struct ExecutableMarketView {
     snapshot: OrderBookSnapshot,
     active: bool,
     source: &'static str,
     last_update_id: String,
-    /// where the displayed ROWS came from, which is not always where `source`/`last_update_id`
-    /// came from -- the freshness marker can be the indexer's while the rows are the chain's.
+    /// Which chain read supplied the displayed rows.
     rows: &'static str,
-}
-
-async fn read_indexer_market_context(order_book: &str) -> Result<IndexerMarketContext> {
-    // which indexer may answer follows from the chain this run is on, not from a
-    // compile-time default. On a network with no indexer this resolves to a refusal, and the caller
-    // falls back to reading the book from the chain itself -- which is the right answer, not a
-    // degraded one.
-
-    // The manifest is LOADED here, as `run_market_data` loads it. It used to be built by a second
-    // constructor that took the connected backend's label and set `indexer: None` -- it carried the
-    // network and threw the field away. That was survivable while `resolve_base_url` fell through to
-    // a compiled-in default per network; removed the default, so the throw-away became "no
-    // indexer named" on EVERY chain, including the two whose manifests declare one. Nothing broke
-    // loudly, because the caller catches the refusal and reads the book from the chain: the fast
-    // path simply stopped existing, and `source=indexer` became unreachable outside
-    // `DEXDO_INDEXER_URL`.
-
-    // That constructor is DELETED rather than fixed. It had this one caller, and a record that can
-    // be built without the field is a way for this to come back that no test can watch for.
-    let manifest =
-        indexer::ManifestIndexer::load(crate::cli::commands::manifest_path()?.as_path())?;
-    let base_url = indexer::resolve_base_url(None, Some(&manifest))?;
-    let client = IndexerClient::new(base_url, INDEXER_FAST_TIMEOUT)?;
-    let markets = client
-        .markets(indexer_market_address_query(order_book))
-        .await?;
-    if !markets.markets.iter().any(|market| {
-        market
-            .inference_order_book_address
-            .eq_ignore_ascii_case(order_book)
-    }) {
-        bail!(
-            "Dodex indexer has no market context for {}",
-            addr::display(order_book)
-        );
-    }
-    let depth = client
-        .depth(DepthQuery {
-            inference_order_book_address: order_book,
-            limit: None,
-        })
-        .await?;
-    Ok(IndexerMarketContext {
-        last_update_id: if depth.last_update_id.is_empty() {
-            "-".to_string()
-        } else {
-            depth.last_update_id
-        },
-    })
-}
-
-fn indexer_market_address_query(order_book: &str) -> MarketsQuery<'_> {
-    MarketsQuery {
-        inference_order_book_address: Some(order_book),
-        ..MarketsQuery::default()
-    }
 }
 
 #[cfg(test)]
@@ -128,20 +65,16 @@ mod market_views_1659_tests;
 #[path = "market_views_1871_tests.rs"]
 mod market_views_1871_tests;
 
-async fn read_executable_market_view_with<FI, FFI, FF, FFF, FB, FBFut>(
-    mut indexer_read: FI,
+async fn read_executable_market_view_with<FF, FFF, FB, FBFut>(
     mut fold_read: FF,
     mut fallback_read: FB,
 ) -> Result<ExecutableMarketView>
 where
-    FI: FnMut() -> FFI,
-    FFI: Future<Output = Result<IndexerMarketContext>>,
     FF: FnMut() -> FFF,
     FFF: Future<Output = Result<(OrderBookSnapshot, String)>>,
     FB: FnMut() -> FBFut,
     FBFut: Future<Output = Result<OrderBookSnapshot>>,
 {
-    let indexer = retry_executable_read("indexer market context", &mut indexer_read).await;
     match retry_executable_read("order-book event fold", &mut fold_read).await {
         Ok((snapshot, fold_id)) => {
             // the fold ANSWERED, and an empty answer is the one it cannot settle. History is
@@ -162,13 +95,6 @@ where
                 )
                 .await?;
             let from_storage = row_source == crate::cli::fold_completeness::RowSource::Storage;
-            let (source, last_update_id) = match indexer {
-                Ok(context) => ("indexer", context.last_update_id),
-                Err(error) => {
-                    tracing::warn!(error = %format!("{error:#}"), "indexer unavailable; using chain event context");
-                    ("chain", fold_id)
-                }
-            };
             let active = if from_storage {
                 // The storage answer is the book's own state, so liveness comes from it rather than
                 // from an assumption made before it was read.
@@ -179,11 +105,11 @@ where
             Ok(ExecutableMarketView {
                 snapshot,
                 active,
-                source: if from_storage { "chain" } else { source },
+                source: "chain",
                 last_update_id: if from_storage {
                     "-".to_string()
                 } else {
-                    last_update_id
+                    fold_id
                 },
                 rows: row_source.provenance(),
             })
@@ -210,7 +136,6 @@ async fn read_executable_market_view(
     order_book: &str,
 ) -> Result<ExecutableMarketView> {
     read_executable_market_view_with(
-        || read_indexer_market_context(order_book),
         || async {
             let fold = chain
                 .fold_order_book_events(order_book, BookEventFold::default())
@@ -347,10 +272,9 @@ pub(crate) fn quote_fill_line(fill: &dexdo_core::market::QuoteFill) -> String {
 /// well-formed SELL with capacity", which is exactly the question `is_resting_ask` was reported for.
 /// The snapshot reaching this function was gated at the chain read, but that read costs a book walk
 /// plus a `getState` and a balance read per ask, so it can be minutes old by the time it prints --
-/// and this is the single-model view a buyer reads immediately before buying. `dexdo markets`
-/// already re-filters at print time for precisely this reason; the
-/// single-model view did not, so an ask that lapsed during the reads was still printed as
-/// executable depth under an `as_of` stamp newer than the verdict.
+/// and this is the single-model view a buyer reads immediately before buying. Without this final
+/// filter, an ask that lapsed during the chain reads would still print as executable depth under an
+/// `as_of` stamp newer than the verdict.
 
 /// The clock is read here rather than passed in so that no future caller can render this table
 /// against no clock at all; the `as_of` the context line prints is a second sample taken in the same
@@ -378,8 +302,8 @@ fn executable_market_rows(snapshot: &OrderBookSnapshot) -> Result<Vec<BookRow>> 
     executable_market_rows_with_clock(snapshot, crate::cli::provenance::now_unix())
 }
 
-/// say where these rows came from and how fresh they are, so a divergence from
-/// `dexdo orders list` reads as indexer lag / a different scope, not as contradictory truth.
+/// say which chain view supplied these rows and how fresh it is, so a divergence from
+/// `dexdo orders list` reads as a different scope or observation point, not contradictory truth.
 fn render_market_context(source: &str, last_update_id: &str, as_of: u64, rows: &str) -> String {
     format!(
         "market {}",
@@ -520,21 +444,6 @@ pub(crate) async fn run_market(args: MarketArgs) -> Result<()> {
             view.rows,
         )
     );
-    if rows.is_empty() {
-        let raw_order_count = snapshot.stats.as_ref().map(|s| s.order_count).unwrap_or(0);
-        if raw_order_count > 0 {
-            let tick_size = DobParams::canonical().tick_size;
-            println!(
-                "inference order book -- {}{}  (1 tick = {tick_size} model tokens)",
-                snapshot.frame_model,
-                render_model_flags_field(&snapshot.frame_model)
-            );
-            println!(
-                "  * no executable asks; raw order_count={raw_order_count} is blocked by stale/non-executable rows"
-            );
-            return Ok(());
-        }
-    }
     // Read-only discovery: no `--max-price-per-tick` ceiling, so the `exec` column stays blank (this is not a buy).
     print_book_table(&snapshot.frame_model, &rows, None, None);
     Ok(())
@@ -574,10 +483,10 @@ fn render_executable_book_line(
 
 /// the class comes from `buy_refusal_class` -- the same function the buy preflight stamps its
 /// own refusal with -- so the listing and the buyer cannot describe one book at one ceiling with two
-/// different answers. `no_executable_ask` is now one of the four possible flags rather than the flag
+/// different answers. `no_executable_ask` is one of the possible flags rather than the flag
 /// every empty result carries: an empty book prints `empty_model_book=true`, a short head prints
-/// `insufficient_head_ask=true`, an all-lapsed book prints `expired_counterparty_ask=true`, and only
-/// "rows exist, none of them usable" keeps `no_executable_ask=true`.
+/// `insufficient_head_ask=true`, and "rows exist, none of them usable" keeps
+/// `no_executable_ask=true`. Expired rows are skipped and do not create a separate buyer state.
 /// The book this name derives is not on chain, said out loud.
 
 /// **Why it exists.** `run_executable_book` already says this: an empty result there carries an
@@ -888,6 +797,7 @@ pub(crate) async fn run_market_data(args: MarketDataArgs) -> Result<()> {
                     inference_order_book_address: None,
                     producer: producer.as_deref(),
                     status: status.as_deref(),
+                    liquidity: None,
                     cursor: cursor.as_deref(),
                     limit,
                 })
@@ -912,6 +822,7 @@ pub(crate) async fn run_market_data(args: MarketDataArgs) -> Result<()> {
                     inference_order_book_address: Some(&inference_order_book_address),
                     producer: None,
                     status: None,
+                    liquidity: None,
                     cursor: None,
                     limit: None,
                 })
@@ -1019,7 +930,6 @@ mod tests {
             frame_model: "qwen--qwen3--32b".to_string(),
             model_hash: "model-hash".to_string(),
             order_book: Some("0:book".to_string()),
-            root_model: None,
             note_addr: None,
         }
     }
@@ -1048,36 +958,15 @@ mod tests {
         super::fold_snapshot_from_orders(&target, "0:book", orders.iter())
     }
 
-    #[test]
-    fn indexer_market_address_lookup_omits_list_limit() {
-        let query = super::indexer_market_address_query("0:book");
-
-        assert_eq!(query.inference_order_book_address, Some("0:book"));
-        assert_eq!(query.limit, None);
-    }
-
     #[tokio::test]
-    async fn market_uses_indexer_for_fast_path_no_getorder_walk() {
+    async fn market_and_quote_view_uses_only_chain_event_rows() {
         use std::sync::atomic::{AtomicUsize, Ordering};
         use std::sync::Arc;
 
-        let indexer_calls = Arc::new(AtomicUsize::new(0));
         let fold_calls = Arc::new(AtomicUsize::new(0));
         let getorder_walk_calls = Arc::new(AtomicUsize::new(0));
         let snapshot = wire_snapshot();
         let view = super::read_executable_market_view_with(
-            {
-                let calls = indexer_calls.clone();
-                move || {
-                    let calls = calls.clone();
-                    async move {
-                        calls.fetch_add(1, Ordering::SeqCst);
-                        Ok(super::IndexerMarketContext {
-                            last_update_id: "indexer-77".to_string(),
-                        })
-                    }
-                }
-            },
             {
                 let calls = fold_calls.clone();
                 let snapshot = snapshot.clone();
@@ -1104,79 +993,10 @@ mod tests {
             },
         )
         .await
-        .expect("indexer and fold reads succeed");
-
-        assert_eq!(view.source, "indexer");
-        assert_eq!(view.last_update_id, "indexer-77");
-        assert_eq!(indexer_calls.load(Ordering::SeqCst), 1);
-        assert_eq!(fold_calls.load(Ordering::SeqCst), 1);
-        assert_eq!(getorder_walk_calls.load(Ordering::SeqCst), 0);
-        // the rows are the chain's even when the freshness marker is the indexer's -- the
-        // annotation must say both, or an indexer lag reads as a contradiction against `orders`.
-        assert_eq!(view.rows, crate::cli::provenance::ROWS_CHAIN_EVENTS);
-        assert_eq!(
-            super::render_market_context(
-                view.source,
-                &view.last_update_id,
-                1_754_006_400,
-                view.rows
-            ),
-            "market source=indexer lastUpdateId=indexer-77 as_of=1754006400 \
-             rows=chain:order-book-events scope=executable-asks"
-        );
-    }
-
-    #[tokio::test]
-    async fn market_falls_back_to_chain_when_indexer_fails() {
-        use std::sync::atomic::{AtomicUsize, Ordering};
-        use std::sync::Arc;
-
-        let indexer_calls = Arc::new(AtomicUsize::new(0));
-        let fold_calls = Arc::new(AtomicUsize::new(0));
-        let getorder_walk_calls = Arc::new(AtomicUsize::new(0));
-        let snapshot = wire_snapshot();
-        let view = super::read_executable_market_view_with(
-            {
-                let calls = indexer_calls.clone();
-                move || {
-                    let calls = calls.clone();
-                    async move {
-                        calls.fetch_add(1, Ordering::SeqCst);
-                        Err(anyhow::anyhow!("Dodex indexer HTTP 500"))
-                    }
-                }
-            },
-            {
-                let calls = fold_calls.clone();
-                let snapshot = snapshot.clone();
-                move || {
-                    let calls = calls.clone();
-                    let snapshot = snapshot.clone();
-                    async move {
-                        calls.fetch_add(1, Ordering::SeqCst);
-                        Ok((snapshot, "fold-13".to_string()))
-                    }
-                }
-            },
-            {
-                let calls = getorder_walk_calls.clone();
-                let snapshot = snapshot.clone();
-                move || {
-                    let calls = calls.clone();
-                    let snapshot = snapshot.clone();
-                    async move {
-                        calls.fetch_add(1, Ordering::SeqCst);
-                        Ok(snapshot)
-                    }
-                }
-            },
-        )
-        .await
-        .expect("event-fold chain path succeeds");
+        .expect("chain event fold succeeds");
 
         assert_eq!(view.source, "chain");
-        assert_eq!(view.last_update_id, "fold-13");
-        assert_eq!(indexer_calls.load(Ordering::SeqCst), 3);
+        assert_eq!(view.last_update_id, "fold-12");
         assert_eq!(fold_calls.load(Ordering::SeqCst), 1);
         assert_eq!(getorder_walk_calls.load(Ordering::SeqCst), 0);
         assert_eq!(view.rows, crate::cli::provenance::ROWS_CHAIN_EVENTS);
@@ -1187,7 +1007,7 @@ mod tests {
                 1_754_006_400,
                 view.rows
             ),
-            "market source=chain lastUpdateId=fold-13 as_of=1754006400 \
+            "market source=chain lastUpdateId=fold-12 as_of=1754006400 \
              rows=chain:order-book-events scope=executable-asks"
         );
     }
@@ -1277,14 +1097,14 @@ mod tests {
     }
 
     #[test]
-    fn quote_reports_indexer_last_update_id() {
+    fn quote_reports_chain_last_update_id() {
         let snapshot = wire_snapshot();
         let quote = dexdo_core::submit_safe_single_ask_quote(&snapshot.orders, Some(2), None)
             .expect("quote executable ask");
-        let output = super::render_quote_summary(&snapshot, &quote, "indexer", "depth-991");
+        let output = super::render_quote_summary(&snapshot, &quote, "chain", "fold-991");
 
-        assert!(output.contains("source=indexer"), "{output}");
-        assert!(output.contains("lastUpdateId=depth-991"), "{output}");
+        assert!(output.contains("source=chain"), "{output}");
+        assert!(output.contains("lastUpdateId=fold-991"), "{output}");
     }
 
     #[test]
@@ -1417,7 +1237,7 @@ mod tests {
         assert!(line.contains("best ask price 11"), "{line}");
     }
 
-    /// the line names the state the buy preflight names, for each of the four classes.
+    /// the line names the same state as the buy preflight.
 
     /// Observed live on the 4.0.35 acceptance campaign: `executable-book` printed
     /// `none=true no_executable_ask=true` for a book the buyer refused, one ceiling and seconds
@@ -1436,7 +1256,6 @@ mod tests {
             orders: Vec::new(),
         };
         let all_classes = [
-            params::EXPIRED_COUNTERPARTY_ASK_CLASS,
             params::INSUFFICIENT_HEAD_ASK_CLASS,
             params::EMPTY_MODEL_BOOK_CLASS,
             params::NO_EXECUTABLE_ASK_CLASS,
@@ -1444,20 +1263,6 @@ mod tests {
         // Each refusal is spelled with the literal its producer leads with, never a hand-copied
         // sentence, so a reworded message moves this test with it instead of leaving it green.
         let cases = [
-            (
-                format!(
-                    "{} 1785678525: every ask crossing this buy is out of the book by its own deadline",
-                    params::EXPIRED_COUNTERPARTY_ASK_REASON
-                ),
-                params::EXPIRED_COUNTERPARTY_ASK_CLASS,
-            ),
-            (
-                format!(
-                    "{} for max_price_per_tick 10, requested ticks 8: 1 resting ask(s) are past their deadline",
-                    params::LAPSED_MODEL_BOOK_REASON
-                ),
-                params::EXPIRED_COUNTERPARTY_ASK_CLASS,
-            ),
             (
                 format!(
                     "{}: {} order  tokenContract 0:tc has only 1 ticks, buyer requested 8",
@@ -1475,7 +1280,8 @@ mod tests {
                 params::EMPTY_MODEL_BOOK_CLASS,
             ),
             (
-                "no executable matching ask for max_price_per_tick 10, requested ticks 8".to_string(),
+                "no executable matching ask for max_price_per_tick 10, requested ticks 8"
+                    .to_string(),
                 params::NO_EXECUTABLE_ASK_CLASS,
             ),
         ];
@@ -1511,10 +1317,6 @@ mod tests {
 
         for reason in [
             format!(
-                "{} 1785678525: nearest ask is gone",
-                params::EXPIRED_COUNTERPARTY_ASK_REASON
-            ),
-            format!(
                 "{} order  has only 1 ticks",
                 params::INSUFFICIENT_HEAD_ASK_REASON
             ),
@@ -1522,10 +1324,6 @@ mod tests {
                 "{}: {} for max_price_per_tick 10",
                 params::RAW_MATCHER_NO_SUBMIT_SAFE_ASK,
                 params::EMPTY_MODEL_BOOK_REASON
-            ),
-            format!(
-                "{} for max_price_per_tick 10",
-                params::LAPSED_MODEL_BOOK_REASON
             ),
             "no executable matching ask for max_price_per_tick 10".to_string(),
             "best ask price 11 is above buyer max_price_per_tick 10".to_string(),

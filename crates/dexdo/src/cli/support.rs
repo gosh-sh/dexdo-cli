@@ -1800,8 +1800,7 @@ pub(crate) async fn provision_replacement_seller_with_deal_gas_overhead(
         };
         chain.assert_seller_note_current(&note).await?;
         let note_ecc = chain
-            .client()
-            .get_account(&note)
+            .get_system_account_retrying(&note)
             .await?
             .ok_or_else(|| {
                 anyhow::anyhow!(

@@ -129,7 +129,6 @@ fn book_target_from_model_hash(model_hash: &str, note_addr: &str) -> Result<Book
         frame_model: String::new(),
         model_hash: format!("0x{}", digits.to_ascii_lowercase()),
         order_book: None,
-        root_model: None,
         note_addr: Some(note_addr.to_string()),
     })
 }
@@ -1236,7 +1235,6 @@ mod tests {
             frame_model: "qwen--qwen3--32b".to_string(),
             model_hash: "model-hash".to_string(),
             order_book: Some(format!("0:{}", "d".repeat(64))),
-            root_model: None,
             note_addr: None,
         };
         let snapshot = fold_snapshot_from_orders(&target, &format!("0:{}", "d".repeat(64)), orders);
@@ -1420,7 +1418,6 @@ mod tests {
             frame_model: "qwen--qwen3--32b".to_string(),
             model_hash: "model-hash".to_string(),
             order_book: Some(order_book.clone()),
-            root_model: None,
             note_addr: None,
         };
 

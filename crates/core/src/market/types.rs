@@ -778,6 +778,9 @@ pub enum ChainError {
     /// The RPC/HTTP transport failed before a by-fact chain result was available.
     #[error("{net} transport: {0}", net = crate::params::current_network())]
     Transport(String),
+    /// An accepted open has not appeared in authoritative state within the confirmation budget.
+    #[error("stream open remains unconfirmed for {0}")]
+    OpenUnconfirmed(TokenContract),
     /// The chain returned a contract-level refusal/revert.
     #[error("{net} contract: {0}", net = crate::params::current_network())]
     Contract(String),

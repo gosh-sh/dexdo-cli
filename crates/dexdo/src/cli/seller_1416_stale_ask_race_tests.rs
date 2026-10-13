@@ -18,8 +18,9 @@ use super::{
 };
 use dexdo::seller::liveness::{CancellationDisposition, RestingOfferIdentity, RestingStopReason};
 use dexdo_core::{
-    ChainBackend, ChainError, DealChainSnapshot, Match, Note, OfferListing, OrderBookOrder,
-    SellOffer, Settlement, StreamSnapshot, TokenContract,
+    ChainBackend, ChainError, DealChainSnapshot, DealChainState, Match, MatchWatchCursor,
+    MatchedFill, Note, OfferListing, OrderBookOrder, SellOffer, Settlement, StreamSnapshot,
+    TokenContract,
 };
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
@@ -43,8 +44,8 @@ struct BookState {
     book_order_id: Mutex<u128>,
     /// Which generation each cancel was aimed at.
     cancel_targets: Mutex<Vec<u128>>,
-    /// How many times the deal was actually SERVED -- `serve_watched_match` reads the deal snapshot
-    /// first, so this counts real attempts to discharge a match rather than mentions of one.
+    /// How many times serving reached its coherent deal snapshot, after authoritative fill recovery.
+    /// This counts attempts to discharge a match rather than mentions of one.
     serve_attempts: AtomicUsize,
 }
 
@@ -81,6 +82,7 @@ impl BookState {
 struct StaleAskBackend {
     token_contract: String,
     book: Arc<BookState>,
+    _cursor_dir: tempfile::TempDir,
 }
 
 #[async_trait::async_trait]
@@ -136,8 +138,54 @@ impl ChainBackend for StaleAskBackend {
         Ok(Some(crossed_match(token_contract)))
     }
 
-    /// The FIRST chain read `serve_watched_match` performs, through `read_coherent_deal_capacity`.
-    /// Counting it is how these tests tell "the match was served" from "the match was mentioned".
+    async fn deal_state(&self, _: &TokenContract) -> Result<Option<DealChainState>, ChainError> {
+        Ok(self
+            .book
+            .matched
+            .load(Ordering::SeqCst)
+            .then_some(DealChainState {
+                funded: true,
+                opened: false,
+                probe_accepted: false,
+                disputed: false,
+                deposit: dexdo_core::required_escrow_for_buy(2, dexdo_core::PRICE_STEP),
+                finalized_owed: 0,
+                tokens_final: 0,
+                tokens_pending: 0,
+                probe_tick: 0,
+                funded_time: Some(1),
+                probe_time: 0,
+                last_claim_time: 0,
+                dispute_time: 0,
+            }))
+    }
+
+    async fn poll_seller_fills(
+        &self,
+        _: &dyn Note,
+        _: &mut MatchWatchCursor,
+    ) -> Result<Vec<MatchedFill>, ChainError> {
+        Ok(if self.book.matched.load(Ordering::SeqCst) {
+            vec![MatchedFill {
+                order_id: *self.book.book_order_id.lock().expect("book order id"),
+                token_contract: self.token_contract.clone(),
+                ticks: 2,
+                price_per_tick: dexdo_core::PRICE_STEP,
+            }]
+        } else {
+            Vec::new()
+        })
+    }
+
+    async fn sell_offer_terms(&self, _: &TokenContract) -> Result<Option<(u64, u64)>, ChainError> {
+        Ok(Some((
+            u64::try_from(dexdo_core::PRICE_STEP).expect("canonical price fits the getter"),
+            2,
+        )))
+    }
+
+    /// The serve's coherent capacity read follows durable authoritative fill recovery.
+    /// Counting it tells "the match was served" from "the match was mentioned".
     async fn deal_snapshot(
         &self,
         _token_contract: &TokenContract,
@@ -204,7 +252,8 @@ impl ChainBackend for StaleAskBackend {
 fn crossed_match(token_contract: &TokenContract) -> Match {
     Match {
         token_contract: token_contract.clone(),
-        buyer_pubkey: dexdo_core::LocalNote::generate().pubkey(),
+        // Cancellation and fill recovery must observe the same simulated buyer.
+        buyer_pubkey: dexdo_core::LocalNote::from_seed(&[0x42; 32]).pubkey(),
         price_per_tick: 1_000_000_000,
     }
 }
@@ -231,9 +280,12 @@ fn test_seller() -> dexdo::seller::RunningSeller {
 }
 
 fn deal_with(token_contract: &str, book: Arc<BookState>) -> SellerPoolDeal {
+    let cursor_dir = tempfile::tempdir().expect("private stale-ask fixture cursor directory");
+    let cursor_path = cursor_dir.path().join("seller.cursor.json");
     let backend = StaleAskBackend {
         token_contract: token_contract.to_string(),
         book,
+        _cursor_dir: cursor_dir,
     };
     SellerPoolDeal {
         chain: Arc::new(backend) as Arc<dyn ChainBackend>,
@@ -246,11 +298,7 @@ fn deal_with(token_contract: &str, book: Arc<BookState>) -> SellerPoolDeal {
             mock_token_count: 0,
         },
         watch: dexdo::seller::SellerMatchWatchConfig {
-            cursor_path: std::env::temp_dir().join(format!(
-                "dexdo-1416-cursor-{}-{}.json",
-                std::process::id(),
-                token_contract.len()
-            )),
+            cursor_path,
             poll_interval: std::time::Duration::from_millis(1),
         },
         upstream: dexdo::seller::UpstreamConfig::Mock,
@@ -281,6 +329,7 @@ async fn a_match_found_at_shutdown_is_served_not_merely_reported() {
     let seller = test_seller();
     let book = BookState::resting(29);
     let survivors = vec![entry(UNPROVEN_TC, Arc::clone(&book), 29)];
+    let deal = survivors[0].0.clone();
 
     // The ask is crossed AFTER the entry was built -- the state the first stand could not express.
     book.cross();
@@ -291,6 +340,14 @@ async fn a_match_found_at_shutdown_is_served_not_merely_reported() {
         book.serves(),
         1,
         "the sweep must ATTEMPT to serve the buyer, not report that nobody did"
+    );
+    let fill =
+        dexdo::seller::read_seller_fill_lineage(&deal.watch.cursor_path, &deal.cfg.token_contract)
+            .expect("read saved fill")
+            .expect("the authoritative fill must precede the serve attempt");
+    assert_eq!(
+        (fill.order_id, fill.matched_ticks, fill.residual_ticks),
+        (29, 2, 0)
     );
     let rendered = error
         .expect("this stand cannot complete a serve, so it must surface")

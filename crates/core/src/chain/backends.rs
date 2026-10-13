@@ -28,9 +28,8 @@ use crate::params::SUBSCRIPTION_WEEKS;
 // ceiling cannot be given two different answers.
 use crate::params::{
     buy_refusal_class, cli_buy_deadline_is_valid, default_buy_deadline, ClaimConfirmationParams,
-    Shell, EMPTY_MODEL_BOOK_REASON, LAPSED_MODEL_BOOK_REASON, MATCH_OPEN_TIMEOUT_SECS,
-    OFFER_ACCEPTANCE_TIMEOUT, POST_SELL_OFFER_SUBMIT_TIMEOUT, RAW_MATCHER_NO_SUBMIT_SAFE_ASK,
-    SELLER_READ_BACKOFF, TICK_SIZE,
+    Shell, EMPTY_MODEL_BOOK_REASON, MATCH_OPEN_TIMEOUT_SECS, OFFER_ACCEPTANCE_TIMEOUT,
+    POST_SELL_OFFER_SUBMIT_TIMEOUT, RAW_MATCHER_NO_SUBMIT_SAFE_ASK, SELLER_READ_BACKOFF, TICK_SIZE,
 };
 use anyhow::{anyhow, Result};
 use async_trait::async_trait;
@@ -1039,7 +1038,7 @@ async fn seller_note_physical_shell(
     let display_note = display_dexdo_address(seller_note);
     let acc = chain
         .client()
-        .get_account_retrying(seller_note)
+        .get_system_account_retrying(seller_note)
         .await
         .map_err(map_err)?
         .ok_or_else(|| {
@@ -2124,40 +2123,6 @@ fn resting_ask_from_order(order_id: u128, order: &Value) -> Option<OrderBookOrde
         .filter(|o| o.is_resting_ask())
 }
 
-/// An ask the book's matcher has already dropped because its own deadline passed.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct LapsedAsk {
-    deadline: u64,
-    now: u64,
-}
-
-impl LapsedAsk {
-    fn describe(&self) -> String {
-        format!(
-            "expired at unix {}, {} seconds before this selection at unix {}",
-            self.deadline,
-            self.now.saturating_sub(self.deadline),
-            self.now
-        )
-    }
-}
-
-/// Classify one ask against the wall clock read at the moment of this selection.
-
-/// This is `InferenceOrderBook._isExpired` verbatim --
-/// `deadline != 0 && block.timestamp >= deadline` -- and must stay verbatim. In particular
-/// `deadline == 0` does NOT expire: such a row is still live to the matcher, so the client may not
-/// refuse it. That the current SELL ingress (`PrivateNote.postSellOffer` rejects `ttl == 0`,
-/// `placeSellOffer` rejects `deadline == 0`) makes a zero-deadline ask unlikely does not make it
-/// impossible, and refusing what the chain accepts is the same defect as accepting what the chain
-/// rejects, only mirrored.
-fn ask_expiry(ask: &OrderBookOrder, now: u64) -> Option<LapsedAsk> {
-    (ask.deadline != 0 && ask.deadline <= now).then_some(LapsedAsk {
-        deadline: ask.deadline,
-        now,
-    })
-}
-
 /// Split resting asks into the candidates this buy may still cross and the ones their own deadline
 /// already removed from the book's matcher.
 
@@ -2168,13 +2133,16 @@ fn ask_expiry(ask: &OrderBookOrder, now: u64) -> Option<LapsedAsk> {
 fn live_selection_candidates(
     asks: &[OrderBookOrder],
     now: u64,
-) -> (Vec<OrderBookOrder>, Vec<(OrderBookOrder, LapsedAsk)>) {
+) -> (Vec<OrderBookOrder>, Vec<OrderBookOrder>) {
     let mut live = Vec::with_capacity(asks.len());
     let mut lapsed = Vec::new();
     for ask in asks.iter().filter(|ask| ask.is_resting_ask()) {
-        match ask_expiry(ask, now) {
-            Some(expiry) => lapsed.push((ask.clone(), expiry)),
-            None => live.push(ask.clone()),
+        // The matcher treats deadline 0 as non-expiring (`_isExpired` checks `deadline != 0`).
+        // SELL ingress rejects that shape, but selection must still mirror the matcher exactly.
+        if ask.deadline == 0 || ask.deadline > now {
+            live.push(ask.clone());
+        } else {
+            lapsed.push(ask.clone());
         }
     }
     (live, lapsed)
@@ -2182,7 +2150,7 @@ fn live_selection_candidates(
 
 /// Live candidates, coalesced -- the order every selection below must use: expiry first, then
 /// coalescing of what survives.
-type CoalescedLiveCandidates = (Vec<OrderBookOrder>, Vec<(OrderBookOrder, LapsedAsk)>);
+type CoalescedLiveCandidates = (Vec<OrderBookOrder>, Vec<OrderBookOrder>);
 
 fn coalesced_live_candidates(
     asks: &[OrderBookOrder],
@@ -2192,36 +2160,19 @@ fn coalesced_live_candidates(
     Ok((coalesce_equivalent_resting_asks(&live)?, lapsed))
 }
 
-/// Name the lapsed counterparty when the only asks crossing this buy are the ones the deadline
-/// filter removed, so the operator does not read "no matchable ask" as "raise the ceiling".
-fn crossing_expired_ask_reason(
-    lapsed: &[(OrderBookOrder, LapsedAsk)],
-    max_price_per_tick: u128,
-    ticks: u128,
-) -> Option<String> {
-    let (ask, expiry) = lapsed
-        .iter()
-        .filter(|(ask, _)| ask.price_per_tick <= max_price_per_tick)
-        .min_by_key(|(ask, _)| (ask.price_per_tick, ask.order_id))?;
-    Some(format!(
-        "{} {}: every ask crossing this buy is out of the book by its own deadline; nearest is {} which {}. \
-         An expired ask cannot be matched, so no escrow was sent and a higher --max-price-per-tick would \
-         not help; wait for the seller to repost. Requested ticks {ticks}, max_price_per_tick {max_price_per_tick}",
-        crate::params::EXPIRED_COUNTERPARTY_ASK_REASON,
-        expiry.deadline,
-        describe_buy_ask(ask),
-        expiry.describe(),
-    ))
-}
-
 fn no_selectable_ask_reason(
     live: &[OrderBookOrder],
-    lapsed: &[(OrderBookOrder, LapsedAsk)],
+    lapsed: &[OrderBookOrder],
     max_price_per_tick: u128,
     ticks: u128,
 ) -> String {
-    crossing_expired_ask_reason(lapsed, max_price_per_tick, ticks)
-        .unwrap_or_else(|| no_matching_ask_reason(live, max_price_per_tick, ticks))
+    if live.is_empty() && !lapsed.is_empty() {
+        return format!(
+            "no matchable ask for max_price_per_tick {}, requested ticks {ticks}",
+            crate::params::shell_amount(max_price_per_tick)
+        );
+    }
+    no_matching_ask_reason(live, max_price_per_tick, ticks)
 }
 
 /// The ask this AON buy would actually cross: cheapest first, but only among asks whose own size can
@@ -2305,9 +2256,8 @@ fn check_model_buy_full_fill(
 }
 
 /// Pick the ask this buy would cross, as of `now` -- the wall clock read at the moment of the call,
-/// never a value carried over from an earlier book snapshot. An ask past its own deadline is not a
-/// candidate: the book's matcher drops it, so crossing it would only rest our BUY and lock
-/// its escrow.
+/// never a value carried over from an earlier book snapshot. An ask past its own deadline is skipped
+/// exactly as the book skips and removes it before continuing to later makers.
 fn selected_model_buy_ask(
     asks: &[OrderBookOrder],
     max_price_per_tick: u128,
@@ -2362,12 +2312,8 @@ fn selected_model_buy_ask_matching_executable_depth(
     ticks: u128,
     now: u64,
 ) -> Result<OrderBookOrder, String> {
-    let raw_selected = selected_model_buy_ask(raw_asks, max_price_per_tick, ticks, now).map_err(|e| {
-        format!(
-            "{RAW_MATCHER_NO_SUBMIT_SAFE_ASK}: {e}. Retry after the seller posts a fresh ask with enough ticks, \
-             or clean/cancel stale order-book rows if you operate this market"
-        )
-    })?;
+    let raw_selected = selected_model_buy_ask(raw_asks, max_price_per_tick, ticks, now)
+        .map_err(|e| format!("{RAW_MATCHER_NO_SUBMIT_SAFE_ASK}: {e}"))?;
     let executable_selected =
         selected_model_buy_ask(executable_asks, max_price_per_tick, ticks, now).map_err(|e| {
             format!(
@@ -2419,18 +2365,7 @@ fn submit_safe_executable_book_asks(
     // executable; on the raw side because the on-chain matcher sweeps expired makers inline as it
     // crosses (`_match`, IOB:1016-1021) -- it does not stop at one. Leaving a lapsed row in the raw set
     // would make it a listing blocker and hide the live asks queued behind a dead order.
-    let lapsed_raw_asks = raw_asks
-        .iter()
-        .filter(|ask| !ask.is_live_resting_ask_at(now))
-        .count();
-    // Only the lapsed rows this buy would have CROSSED make it "the counterparty ran out" -- the same
-    // price filter `crossing_expired_ask_reason` applies on the buy preflight. A lapsed row priced
-    // above the ceiling never was this buy's counterparty, and calling it one here would answer
-    // `expired_counterparty_ask` where the preflight answers `empty_model_book`.
-    let crossing_lapsed_raw_asks = raw_asks
-        .iter()
-        .filter(|ask| !ask.is_live_resting_ask_at(now) && ask.price_per_tick <= max_price_per_tick)
-        .count();
+    let had_lapsed_raw_asks = raw_asks.iter().any(|ask| !ask.is_live_resting_ask_at(now));
     let raw_asks = raw_asks
         .into_iter()
         .filter(|ask| ask.is_live_resting_ask_at(now))
@@ -2487,15 +2422,12 @@ fn submit_safe_executable_book_asks(
                 )
             }
         }
-    } else if raw_asks.is_empty() && crossing_lapsed_raw_asks > 0 {
-        // "no resting asks" would be a lie the operator cannot act on -- the rows exist, they
-        // are simply past their deadline, and no price ceiling brings them back.:
-        // `LAPSED_MODEL_BOOK_REASON` is the literal `book_refusal_class` reads this state off, so the
-        // listing and the buy preflight both answer `expired_counterparty_ask` for it.
+    } else if raw_asks.is_empty() && had_lapsed_raw_asks {
+        // The matcher removes expired rows and keeps walking. If nothing live remains, report only
+        // the buyer-visible result: this request has no matchable liquidity. Internal stale-row
+        // details and cleanup advice are neither required nor actionable for the buyer.
         format!(
-            "{LAPSED_MODEL_BOOK_REASON} for max_price_per_tick {max_price_per_tick}, requested \
-             ticks {ticks}: {lapsed_raw_asks} resting ask(s) are past their deadline at unix time \
-             {now}. A higher --max-price-per-tick does not revive an expired ask"
+            "no matchable ask for max_price_per_tick {max_price_per_tick}, requested ticks {ticks}"
         )
     } else if raw_asks.is_empty() {
         // The RAW book itself is empty. Carry the wrapper the buy preflight's raw side carries, so
@@ -2555,16 +2487,7 @@ fn check_expected_buy_target(
             .as_deref()
             .is_some_and(|tc| tc.eq_ignore_ascii_case(expected_tc_lower))
     };
-    let (live, lapsed) = coalesced_live_candidates(asks, now)?;
-    // The buyer named this TokenContract, so its own lapsed deadline is the answer -- reported
-    // before any price/queue reasoning.
-    if let Some((ask, expiry)) = lapsed.iter().find(|(ask, _)| is_expected(ask)) {
-        return Err(format!(
-            "the expected ask {} which {}. An expired ask cannot be matched, so no escrow was sent",
-            describe_buy_ask(ask),
-            expiry.describe(),
-        ));
-    }
+    let (live, _lapsed) = coalesced_live_candidates(asks, now)?;
     let expected = live.iter().find(|ask| is_expected(ask));
     let Some(best) = next_matching_ask(&live, max_price_per_tick, ticks) else {
         return Err(match expected {
@@ -2580,15 +2503,10 @@ fn check_expected_buy_target(
                  buyer max_price_per_tick {max_price_per_tick}, requested ticks {ticks}",
                 display_ask_tc(ask), ask.price_per_tick, ask.ticks,
             ),
-            None => match crossing_expired_ask_reason(&lapsed, max_price_per_tick, ticks) {
-                Some(reason) => {
-                    format!("no resting ask for expected tokenContract {expected_tc_display}; {reason}")
-                }
-                None => format!(
-                    "no resting ask for expected tokenContract {expected_tc_display}, and no matchable ask for \
-                     max_price_per_tick {max_price_per_tick}, requested ticks {ticks}"
-                ),
-            },
+            None => format!(
+                "no resting ask for expected tokenContract {expected_tc_display}, and no matchable ask for \
+                 max_price_per_tick {max_price_per_tick}, requested ticks {ticks}"
+            ),
         });
     };
     if best
@@ -3617,10 +3535,9 @@ mod offer_rested_match_tests {
         let err = selected_model_buy_ask(&asks, LAPSED_PRICE, 2, NOW)
             .expect_err("an ask whose deadline has passed is not a candidate");
 
-        assert!(err.contains("deadline"), "{err}");
-        assert!(err.contains("expired at unix 1785678525"), "{err}");
-        assert!(err.contains("779 seconds"), "{err}");
-        assert!(err.contains("order "), "{err}");
+        assert!(err.contains("no matchable ask"), "{err}");
+        assert!(!err.contains("expired"), "{err}");
+        assert!(!err.contains(&LAPSED_DEADLINE.to_string()), "{err}");
     }
 
     #[test]
@@ -3634,7 +3551,8 @@ mod offer_rested_match_tests {
             selected_model_buy_ask_matching_executable_depth(&asks, &asks, LAPSED_PRICE, 2, NOW)
                 .expect_err("no escrow may be sent against a lapsed counterparty");
 
-        assert!(err.contains("expired at unix 1785678525"), "{err}");
+        assert!(err.contains("no matchable ask"), "{err}");
+        assert!(!err.contains("expired"), "{err}");
         assert!(
             !err.contains("executable quote selected"),
             "the lapsed ask must not survive on one side of the cross-check: {err}"
@@ -3657,19 +3575,16 @@ mod offer_rested_match_tests {
     }
 
     #[test]
-    fn model_only_selection_names_expiry_instead_of_the_price_ceiling() {
+    fn model_only_selection_reports_only_no_liquidity_for_an_expired_only_book() {
         let asks = vec![lapsed_incident_ask()];
 
         let err = selected_model_buy_ask(&asks, LAPSED_PRICE, 2, NOW)
             .expect_err("a lapsed sole counterparty is a refusal");
 
-        // Raising the ceiling does not revive a lapsed ask, so the refusal must not read as one.
-        assert!(
-            !(err.contains("best ask price") && err.contains("above buyer max_price_per_tick")),
-            "expiry must not be reported as a price-ceiling problem: {err}"
-        );
-        assert!(!err.contains("Raise --max-price-per-tick"), "{err}");
-        assert!(err.contains("would not help"), "{err}");
+        assert!(err.contains("no matchable ask"), "{err}");
+        assert!(!err.contains("expired"), "{err}");
+        assert!(!err.contains("Retry"), "{err}");
+        assert!(!err.contains("clean/cancel"), "{err}");
     }
 
     #[test]
@@ -3684,7 +3599,8 @@ mod offer_rested_match_tests {
 
         let err = selected_model_buy_ask(&asks, LAPSED_PRICE, 2, LAPSED_DEADLINE)
             .expect_err("at its deadline the ask leaves the candidate set");
-        assert!(err.contains("expired at unix 1785678525"), "{err}");
+        assert!(err.contains("no matchable ask"), "{err}");
+        assert!(!err.contains("expired"), "{err}");
     }
 
     #[test]
@@ -3747,8 +3663,12 @@ mod offer_rested_match_tests {
         let err = check_expected_buy_target(&asks, LAPSED_TC, LAPSED_PRICE, 2, NOW)
             .expect_err("the named TokenContract's own ask has lapsed");
 
-        assert!(err.contains("expired at unix 1785678525"), "{err}");
-        assert!(err.contains("no escrow was sent"), "{err}");
+        assert!(
+            err.contains("no resting ask for expected tokenContract"),
+            "{err}"
+        );
+        assert!(err.contains("no matchable ask"), "{err}");
+        assert!(!err.contains("expired"), "{err}");
     }
 
     #[test]
@@ -4004,11 +3924,11 @@ mod offer_rested_match_tests {
                 .expect("a lapsed ask is an empty book, not a duplicate-book error");
 
         assert!(rows.is_empty(), "{rows:?}");
-        // ...and the refusal says WHY. "No resting asks" would send the operator hunting for a book
-        // that is not empty, and a higher price ceiling does not revive a dead ask.
+        // The buyer-visible state carries no stale-row details or cleanup advice.
         let reason = reason.expect("an all-lapsed book carries a reason");
-        assert!(reason.contains("past their deadline"), "{reason}");
-        assert!(reason.contains(&ASK_OBSERVED_AT.to_string()), "{reason}");
+        assert!(reason.contains("no matchable ask"), "{reason}");
+        assert!(!reason.contains("expired"), "{reason}");
+        assert!(!reason.contains(&ASK_OBSERVED_AT.to_string()), "{reason}");
     }
 
     /// The same ask, the same book, one second earlier: the clock is what decides, and the row is
@@ -4211,7 +4131,7 @@ mod offer_rested_match_tests {
                 )],
                 Vec::new(),
                 101,
-                crate::params::EXPIRED_COUNTERPARTY_ASK_CLASS,
+                crate::params::NO_EXECUTABLE_ASK_CLASS,
             ),
             (
                 "the head ask crosses but is smaller than the request",
@@ -4310,10 +4230,8 @@ mod offer_rested_match_tests {
         );
     }
 
-    /// A lapsed row priced ABOVE the ceiling never was this buy's counterparty, so it may not be
-    /// reported as one. The buy preflight already applies that price filter
-    /// (`crossing_expired_ask_reason`); makes the listing apply it too, so both answer
-    /// `empty_model_book` rather than one of them blaming an expiry the buyer never crossed.
+    /// A lapsed row priced above the ceiling is still absent liquidity. Neither surface exposes it
+    /// as a distinct buyer state.
     #[test]
     fn a_lapsed_ask_above_the_ceiling_is_an_empty_book_on_both_surfaces() {
         let tc = "0:1111000000000000000000000000000000000000000000000000000000000000";
@@ -4345,7 +4263,7 @@ mod offer_rested_match_tests {
         );
         assert_eq!(
             buy_refusal_class(&listing),
-            crate::params::EMPTY_MODEL_BOOK_CLASS,
+            crate::params::NO_EXECUTABLE_ASK_CLASS,
             "{listing}"
         );
     }
@@ -4554,7 +4472,7 @@ mod expired_ask_selection_wiring_tests {
     }
 
     #[tokio::test]
-    async fn production_selection_refuses_an_expired_ask_before_any_chain_read() {
+    async fn production_selection_reports_no_liquidity_before_any_chain_read() {
         let (endpoint, hits, server) = counting_endpoint().await;
         let chain = RealChainBackend::connect_with_endpoint(manifest(), Some(&endpoint))
             .expect("backend against the counting endpoint");
@@ -4566,12 +4484,15 @@ mod expired_ask_selection_wiring_tests {
         let error = chain
             .submit_safe_model_buy_ask(&snapshot, 2, 5_000_000_000)
             .await
-            .expect_err("the production seam must refuse a lapsed counterparty");
+            .expect_err("an all-lapsed book has no liquidity");
         let rendered = format!("{error:#}");
 
-        assert!(rendered.contains("expired at unix"), "{rendered}");
-        assert!(rendered.contains("779 seconds"), "{rendered}");
-        assert!(rendered.contains("order "), "{rendered}");
+        assert!(
+            rendered.contains(crate::params::NO_EXECUTABLE_ASK_CLASS),
+            "{rendered}"
+        );
+        assert!(!rendered.contains("expired"), "{rendered}");
+        assert!(!rendered.contains("clean/cancel"), "{rendered}");
         assert_eq!(
             hits.load(Ordering::SeqCst),
             0,
@@ -4581,16 +4502,10 @@ mod expired_ask_selection_wiring_tests {
         server.abort();
     }
 
-    /// E2E-ORD-02's whole point is the WORDING the operator reads, so the production seam is
-    /// checked for it here, at the one place the refusal is assembled.
-
-    /// The book DID hold an ask this buy crosses; it simply ran out. Reporting the ordinary
-    /// `no_executable_ask` class would send the operator to raise a `--max-price-per-tick` that is
-    /// already high enough, so that class may not appear anywhere in the rendered refusal -- not as
-    /// the leading marker every wrapper copies, and not as the failure class the CLI derives from
-    /// it.
+    /// An expired-only raw book is indistinguishable to the buyer from any other book with no live
+    /// liquidity. Its internal stale rows and cleanup mechanics are not operator advice.
     #[tokio::test]
-    async fn the_expired_ask_refusal_names_the_expiry_and_is_not_an_ordinary_no_match() {
+    async fn an_expired_only_book_has_no_special_refusal_or_retry_advice() {
         let (endpoint, _hits, server) = counting_endpoint().await;
         let chain = RealChainBackend::connect_with_endpoint(manifest(), Some(&endpoint))
             .expect("backend against the counting endpoint");
@@ -4603,23 +4518,20 @@ mod expired_ask_selection_wiring_tests {
                 5_000_000_000,
             )
             .await
-            .expect_err("the production seam must refuse a lapsed counterparty");
+            .expect_err("an all-lapsed book has no liquidity");
         let rendered = format!("{error:#}");
 
         assert!(
-            rendered.contains(&format!(
-                "{} {deadline}",
-                crate::params::EXPIRED_COUNTERPARTY_ASK_REASON
-            )),
-            "the refusal must name the counterparty's own expiry time: {rendered}"
+            rendered.contains(crate::params::NO_EXECUTABLE_ASK_CLASS),
+            "the refusal must be ordinary no liquidity: {rendered}"
         );
         assert!(
-            !rendered.contains(crate::params::NO_EXECUTABLE_ASK_CLASS),
-            "an expired crossing ask is not an ordinary no-match: {rendered}"
+            !rendered.contains("expired") && !rendered.contains(&deadline.to_string()),
+            "stale-row details must not leak into the refusal: {rendered}"
         );
         assert!(
-            rendered.contains(crate::params::EXPIRED_COUNTERPARTY_ASK_CLASS),
-            "the refusal must carry its own machine class: {rendered}"
+            !rendered.contains("Retry after") && !rendered.contains("clean/cancel"),
+            "the refusal must not advise an ineffective retry or cleanup: {rendered}"
         );
 
         server.abort();
@@ -4634,10 +4546,7 @@ mod expired_ask_selection_wiring_tests {
         };
         let ceiling_reason = selected_model_buy_ask(&[dear], 5_000_000_000, 2, real_unix_now())
             .expect_err("an ask above the ceiling is still refused");
-        assert!(
-            !ceiling_reason.contains(crate::params::EXPIRED_COUNTERPARTY_ASK_REASON),
-            "a live ask above the ceiling did not expire: {ceiling_reason}"
-        );
+        assert!(!ceiling_reason.contains("expired"), "{ceiling_reason}");
         assert_eq!(
             buy_refusal_class(&ceiling_reason),
             crate::params::NO_EXECUTABLE_ASK_CLASS,
@@ -4757,8 +4666,8 @@ mod expired_ask_selection_wiring_tests {
         .expect_err("an expired crossing ask is refused");
         assert_eq!(
             buy_refusal_class(&expired_reason),
-            crate::params::EXPIRED_COUNTERPARTY_ASK_CLASS,
-            "an expired counterparty keeps its own name: {expired_reason}"
+            crate::params::NO_EXECUTABLE_ASK_CLASS,
+            "an all-lapsed book is ordinary no liquidity: {expired_reason}"
         );
     }
 
@@ -5961,7 +5870,11 @@ async fn submit_finalize_confirmed(
     for attempt in 0..confirmation.max_reads {
         let state = chain.token_contract_deal_state(tc).await.map_err(map_err)?;
         let active = if state.is_none() {
-            chain.account_active_code_hash(tc).await.map_err(map_err)?.0
+            chain
+                .account_active_code_hash(tc, true)
+                .await
+                .map_err(map_err)?
+                .0
         } else {
             true
         };
@@ -6064,15 +5977,35 @@ mod finalize_confirmation_tests {
     }
 }
 
+#[cfg(test)]
+#[path = "backends_issue_2030_review_tests.rs"]
+mod issue_2030_review_tests;
+
 async fn wait_tc_bool(
     chain: &RealChainBackend,
     tc: &Address,
     key: &str,
     want: bool,
 ) -> Result<(), ChainError> {
+    wait_tc_bool_with(tc, key, want, || async {
+        chain.token_contract_deal_state(tc).await.map_err(map_err)
+    })
+    .await
+}
+
+async fn wait_tc_bool_with<Read, ReadFuture>(
+    tc: &Address,
+    key: &str,
+    want: bool,
+    mut read: Read,
+) -> Result<(), ChainError>
+where
+    Read: FnMut() -> ReadFuture + Send,
+    ReadFuture: std::future::Future<Output = Result<Option<DealChainState>, ChainError>> + Send,
+{
     let display_tc = display_token_contract(tc);
     for _ in 0..crate::params::TC_BOOL_CONFIRM_MAX_READS {
-        if let Some(st) = chain.token_contract_deal_state(tc).await.map_err(map_err)? {
+        if let Some(st) = read().await? {
             let actual = match key {
                 "funded" => st.funded,
                 "opened" => st.opened,
@@ -6089,6 +6022,9 @@ async fn wait_tc_bool(
             }
         }
         tokio::time::sleep(crate::params::TC_BOOL_CONFIRM_POLL_INTERVAL).await;
+    }
+    if key == "opened" && want {
+        return Err(ChainError::OpenUnconfirmed(tc.with_workchain()));
     }
     Err(ChainError::Chain(format!(
         "TC {display_tc}: field {key} != {want} within the allotted time"
@@ -8123,8 +8059,8 @@ impl RealChainBackend {
         // The first decides only WHAT TO FETCH. An ask the matcher has already dropped is not
         // liquidity, so its deal state is not worth a chain read, and a book whose crossing asks
         // have all lapsed is refused before a single chain read -- therefore before any money-moving
-        // POST. The unfiltered `raw_asks` still goes into the selection, so the refusal can name the
-        // lapsed counterparty rather than report an empty book.
+        // POST. The unfiltered `raw_asks` still goes into the selection so expired rows can be
+        // skipped consistently without being exposed as a separate buyer outcome.
         let fetch_now = buy_deadline_now_secs()?;
         let raw_asks: Vec<OrderBookOrder> = snapshot.resting_asks().cloned().collect();
         let live_snapshot = OrderBookSnapshot {
@@ -8370,7 +8306,7 @@ impl ChainBackend for RealDealBackend {
                 .map_err(map_err)?;
             let active = if post.is_none() {
                 self.chain
-                    .account_active_code_hash(&tc)
+                    .account_active_code_hash(&tc, true)
                     .await
                     .map_err(map_err)?
                     .0
@@ -8833,21 +8769,10 @@ impl ChainBackend for RealSellerBackend {
                 .token_contract_deploy_address(&self.keys, &root_model, nonce)
                 .await
                 .map_err(map_err)?;
-            if self
-                .chain
-                .get_account_retrying(&tc)
+            self.chain
+                .token_contract_is_retired(&tc)
                 .await
-                .map_err(map_err)?
-                .is_some_and(|account| account.is_active())
-            {
-                return Ok(false);
-            }
-            Ok(self
-                .chain
-                .token_contract_settlement_receipts_if_present(&tc)
-                .await
-                .map_err(map_err)?
-                .is_some_and(|receipts| !receipts.events.is_empty()))
+                .map_err(map_err)
         })
         .await
     }
@@ -9366,7 +9291,15 @@ impl ChainBackend for RealSellerBackend {
         self.chain
             .open_stream(&tc, &self.keys, &enc_endpoint)
             .await
-            .map_err(map_err)?;
+            .map_err(|error| {
+                if super::client::is_producer_open_failure(&error) {
+                    // Only open retries this decoded producer failure after re-reading the TC.
+                    // The generic transport classifier and non-idempotent money writes stay intact.
+                    ChainError::Transport(format!("{error:#}"))
+                } else {
+                    map_err(error)
+                }
+            })?;
         wait_tc_bool(&self.chain, &tc, "opened", true).await
     }
 
@@ -9442,7 +9375,7 @@ impl ChainBackend for RealSellerBackend {
                 .map_err(map_err)?;
             let active = if post.is_none() {
                 self.chain
-                    .account_active_code_hash(&tc)
+                    .account_active_code_hash(&tc, true)
                     .await
                     .map_err(map_err)?
                     .0
@@ -10395,7 +10328,7 @@ impl ChainBackend for RealBuyerBackend {
                 .map_err(map_err)?;
             let active = if post.is_none() {
                 self.chain
-                    .account_active_code_hash(&tc)
+                    .account_active_code_hash(&tc, true)
                     .await
                     .map_err(map_err)?
                     .0

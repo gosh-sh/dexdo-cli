@@ -1,3 +1,39 @@
+## v0.8.0
+
+### Breaking Changes
+
+- `dexdo markets` now lists the selected indexer's aggregate market rows and
+  emits `dexdo.markets.v3`. Each JSON market contains exactly `frame_model`,
+  `order_book`, `total_ask_ticks`, `best_ask`, and `tick_size`; the old v2
+  chain-derived fields and the `--market`, `--models`, and `--note-addr` listing
+  inputs are removed. The default request includes `liquidity=SELL`; pass
+  `--all` to include markets without sell liquidity.
+
+### Fixes
+
+- `dexdo market`, `dexdo quote`, and buyer selection remain authoritative chain
+  reads and do not depend on indexer availability. Expired asks are skipped like
+  the order-book matcher skips them; an expired-only book reports ordinary no
+  liquidity without stale-row details or ineffective retry/cleanup advice.
+- `dexdo provision --replace-market <previous market.json>` and `server.sh reprovision --yes`
+  retire previous unsold offers and their remaining capacity,
+  while preserving recovery of already funded buyer deals. Stop the seller before replacing its
+  market. Failed cancellation or a concurrent buyer match keeps the previous manifest available;
+  restarting with the replacement market no longer reposts the old unsold offers.
+  Relist logs distinguish a passed deadline from removal before the deadline or an unknown deadline.
+- With `--json`, argument parse errors now name the missing or invalid options in
+  `arguments` and explain the reason in `message`, including both options in a
+  conflict. Use these fields to correct the command; `INVALID_ARGUMENT` and exit
+  code 2 are unchanged. Rejected values are
+  omitted from the diagnostic, including their components and rewritten forms.
+- Sellers retain funded deals through Block Producer timeouts and follow bounded producer
+  redirections. Match recovery saves the purchased and remaining capacity before opening,
+  including matches discovered at offer expiry, so restarting resumes the same deal.
+  PrivateNote and TokenContract requests use the system DApp id instead of an account-id fallback.
+  Status and close guidance tell a seller with a funded unopened deal to resume its seller command.
+- Sellers automatically restore a withdrawn offer when the upstream model becomes ready
+  again after a failed readiness check, without requiring a manual restart.
+
 ## v0.7.0
 
 ### Fixes

@@ -367,6 +367,11 @@ pub(crate) async fn run_provision_with_deal_gas_overhead(
     // A3: reject an invalid limit price at the command boundary, before any key/file/network read or write.
     validate_price_step(args.price_per_tick)?;
     let seller_policy = policy::load_seller_runtime_policy(args.policy.as_deref())?;
+    let previous_market = args
+        .replace_market
+        .as_deref()
+        .map(crate::cli::support::load_market)
+        .transpose()?;
     // The manifest path comes from the environment now. The flag it used to come from is
     // gone, and with it the case where an operator typed something unprintable -- what is left is a
     // path this process was handed, which still has to be text before it can be passed on as one.
@@ -408,6 +413,9 @@ pub(crate) async fn run_provision_with_deal_gas_overhead(
         Some(address) => address,
         None => crate::cli::note_pick::ask_which_note(&manifest_path, None).await?,
     };
+    if let Some(previous) = previous_market.as_ref() {
+        crate::cli::support::assert_market_seller_note(&previous.seller_note, &note_addr)?;
+    }
     // Prime the buyer-equivalent content registry now; its existing strict/opt-out decision below
     // still owns how a cached read failure is reported.
     let _ = preload_default_model_registry_with_endpoint(&manifest_path, None).await;
@@ -448,7 +456,6 @@ pub(crate) async fn run_provision_with_deal_gas_overhead(
             frame_model: requested_model.clone(),
             model_hash: dexdo_core::model_hash_for(&requested_model),
             order_book: None,
-            root_model: None,
             note_addr: Some(note_addr.clone()),
         },
     )
@@ -468,6 +475,15 @@ pub(crate) async fn run_provision_with_deal_gas_overhead(
     )?
     .to_string();
     let chain = RealChainBackend::connect_with_endpoint(manifest, None)?;
+    if let Some(previous) = previous_market.as_ref() {
+        if previous.network != chain.network() {
+            bail!(
+                "--replace-market belongs to network {}, not {}",
+                previous.network,
+                chain.network()
+            );
+        }
+    }
     let deal_gas_overhead_raw = dexdo_core::params::resolve_deal_gas_overhead_raw(
         chain.network(),
         supplied_deal_gas_overhead_raw,
@@ -527,6 +543,32 @@ pub(crate) async fn run_provision_with_deal_gas_overhead(
     } else {
         false
     };
+    if let Some(previous) = previous_market.as_ref() {
+        if crate::cli::deals::normalize_addr(&previous.token_contract)
+            == crate::cli::deals::normalize_addr(&expected_market.token_contract)
+        {
+            bail!("--replace-market requires a fresh deal nonce; the replacement cannot reuse the old TokenContract");
+        }
+        crate::cli::seller::retire_superseded_seller_offers(
+            args.deals_dir.as_deref(),
+            previous,
+            &expected_market,
+            &manifest_path,
+            |market| {
+                let (backend, _) =
+                    dexdo_core::RealSellerBackend::from_provisioned_with_deal_gas_overhead(
+                        manifest,
+                        &note_addr,
+                        seed.trim(),
+                        &market.frame_model,
+                        market.nonce,
+                        supplied_deal_gas_overhead_raw,
+                    )?;
+                Ok(std::sync::Arc::new(backend) as std::sync::Arc<dyn dexdo_core::ChainBackend>)
+            },
+        )
+        .await?;
+    }
     let capacity =
         crate::cli::seller::seller_deal_capacity(args.deals_dir.as_deref(), &note_addr, |market| {
             let (backend, _) =
@@ -613,8 +655,7 @@ pub(crate) async fn run_provision_with_deal_gas_overhead(
             // actionable re-mint reason.
             chain.assert_seller_note_current(&note).await?;
             let note_ecc = chain
-                .client()
-                .get_account(&note)
+                .get_system_account_retrying(&note)
                 .await?
                 .ok_or_else(|| {
                     anyhow::anyhow!(
@@ -689,10 +730,10 @@ pub(crate) async fn run_provision_with_deal_gas_overhead(
             return Err(error);
         }
     };
-    drop(seller_pool_lock);
     let json = m.to_json()?;
     std::fs::write(&args.output, &json)
         .map_err(|e| anyhow::anyhow!("write --output {}: {e}", args.output.display()))?;
+    drop(seller_pool_lock);
     println!("provisioned market -> {}", args.output.display());
     println!("{json}");
     Ok(())
@@ -707,7 +748,7 @@ fn ensure_provision_capacity(
             "provision refuses before deploying anything: working_deals={} candidates={} \
              pending_provisions={} \
              seller.max_open_deals={max_open_deals}; finish or retire a deal before provisioning \
-             another TokenContract. Nothing was sent",
+             another TokenContract. No new TokenContract was deployed",
             capacity.working,
             capacity.candidates,
             capacity.pending,
@@ -759,7 +800,10 @@ mod tests {
         assert!(error.contains("candidates=0"), "{error}");
         assert!(error.contains("pending_provisions=0"), "{error}");
         assert!(error.contains("seller.max_open_deals=1"), "{error}");
-        assert!(error.contains("Nothing was sent"), "{error}");
+        assert!(
+            error.contains("No new TokenContract was deployed"),
+            "{error}"
+        );
 
         ensure_provision_capacity(
             crate::cli::seller::SellerDealCapacity {
@@ -1090,7 +1134,10 @@ mod tests {
             .expect_err("the second sequential provision must stop before spending")
             .to_string();
         assert!(error.contains("candidates=1"), "{error}");
-        assert!(error.contains("Nothing was sent"), "{error}");
+        assert!(
+            error.contains("No new TokenContract was deployed"),
+            "{error}"
+        );
     }
 
     #[tokio::test]
@@ -1555,6 +1602,7 @@ mod tests {
             max_ticks: 1,
             deposit_shells: None,
             output: "must-not-be-written.json".into(),
+            replace_market: None,
             deals_dir: None,
             policy: None,
         };
@@ -1663,7 +1711,6 @@ pub(crate) async fn run_market_deploy(args: MarketDeployArgs) -> Result<()> {
             frame_model: requested_model.clone(),
             model_hash: model_hash_for(&requested_model),
             order_book: None,
-            root_model: None,
             note_addr: Some(note_addr.clone()),
         },
     )
