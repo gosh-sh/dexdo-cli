@@ -84,6 +84,7 @@ where
 #[serde(rename_all = "snake_case")]
 pub enum BuyerSubmitReconciliationState {
     FreshUnresolved,
+    FreshProven,
     DurableUnresolved,
     RecoveredProven,
 }
