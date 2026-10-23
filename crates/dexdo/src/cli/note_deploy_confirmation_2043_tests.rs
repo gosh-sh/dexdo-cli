@@ -239,8 +239,16 @@ fn paid_recovery() -> crate::cli::note::NoteDeployRecoveryState {
         proof: "abcd".into(),
         deposit_identifier_hash_hex: "a".repeat(64),
         final_layer_historical_hash_root_hex: "1".repeat(64),
-        voucher_nominal_fr_hex: "2".repeat(64),
-        token_type_fr_hex: "3".repeat(64),
+        voucher_nominal_fr_hex: {
+            let mut bytes = [0; 32];
+            bytes[..8].copy_from_slice(&state.raw_value.to_le_bytes());
+            hex::encode(bytes)
+        },
+        token_type_fr_hex: {
+            let mut bytes = [0; 32];
+            bytes[..4].copy_from_slice(&state.token_type.to_le_bytes());
+            hex::encode(bytes)
+        },
         ephemeral_pubkey_hex: owner.public_hex().into(),
         voucher_value: state.raw_value,
         voucher_token_type: state.token_type,
@@ -410,8 +418,9 @@ async fn production_submit_saves_exact_identity_before_post_and_waits_for_delaye
         .unwrap()
         .to_halo2();
     let client = dexdo_core::ChainClient::connect(&endpoint).unwrap();
-    let root =
-        dexdo_core::Address::parse(dexdo_core::private_note::artifacts::ROOT_PN_ADDRESS).unwrap();
+    let root = dexdo_core::address::parse_chain_address(dexdo_core::params::ROOT_PN_ADDRESS)
+        .unwrap()
+        .into_chain();
     note_deploy_submit_private_note(
         &client,
         &root,
@@ -478,8 +487,9 @@ async fn cancelling_the_production_post_leaves_a_readable_submit_checkpoint() {
         .unwrap()
         .to_halo2();
     let client = dexdo_core::ChainClient::connect(&endpoint).unwrap();
-    let root =
-        dexdo_core::Address::parse(dexdo_core::private_note::artifacts::ROOT_PN_ADDRESS).unwrap();
+    let root = dexdo_core::address::parse_chain_address(dexdo_core::params::ROOT_PN_ADDRESS)
+        .unwrap()
+        .into_chain();
     let expected = expected_note();
     let input = {
         let pending = note_deploy_submit_private_note(

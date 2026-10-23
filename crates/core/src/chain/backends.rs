@@ -36,6 +36,14 @@ use async_trait::async_trait;
 use gosh_ackinacki::sdk::{Address, KeyPair};
 use serde_json::{json, Value};
 
+#[cfg(test)]
+#[path = "backends_issue_2108_tests.rs"]
+mod backends_issue_2108_tests;
+
+#[cfg(test)]
+#[path = "backends_issue_2122_tests.rs"]
+mod backends_issue_2122_tests;
+
 fn display_dexdo_address(address: impl ToString) -> String {
     crate::address::display(&address.to_string())
 }
@@ -731,12 +739,34 @@ fn map_err(error: anyhow::Error) -> ChainError {
             crate::MoneySubmitError::Rejected { .. } => ChainError::MoneySubmitRejected(message),
         };
     }
+    if error.chain().any(|cause| {
+        matches!(
+            cause.downcast_ref::<ChainError>(),
+            Some(ChainError::OrderUnavailable(_))
+        )
+    }) {
+        return ChainError::OrderUnavailable(message);
+    }
     if super::client::is_transient_transport_failure(&error) {
         ChainError::Transport(message)
     } else if message_is_contract_failure(&message) {
         ChainError::Contract(message)
     } else {
         ChainError::Chain(message)
+    }
+}
+
+// Read-only supervision and buyer snapshots share this mapping. Exhausting a bounded
+// read retry must preserve recovery without broadening money-submit retries.
+fn map_read_err(error: anyhow::Error) -> ChainError {
+    if super::client::is_transient_read_failure(&error)
+        || error
+            .chain()
+            .any(|cause| cause.is::<tokio::time::error::Elapsed>())
+    {
+        ChainError::Transport(format!("{error:#}"))
+    } else {
+        map_err(error)
     }
 }
 
@@ -752,6 +782,18 @@ fn map_claim_submit_err(error: anyhow::Error) -> ChainError {
         ));
     }
     map_err(error)
+}
+
+fn map_sell_offer_submit_err(error: anyhow::Error) -> ChainError {
+    if super::client::is_block_producer_forwarding_timeout(&error)
+        || error
+            .downcast_ref::<super::client::MoneySubmitError>()
+            .is_some_and(|e| e.is_ambiguous())
+    {
+        ChainError::AmbiguousSubmit(format!("{error:#}"))
+    } else {
+        map_err(error)
+    }
 }
 
 async fn retry_seller_read<T, F, Fut>(label: &str, mut read: F) -> Result<T, ChainError>
@@ -781,6 +823,33 @@ where
 #[cfg(test)]
 mod chain_error_mapping_tests {
     use super::*;
+
+    #[test]
+    fn issue_2096_forwarding_timeout_is_ambiguous_only_for_sell_offer_recovery() {
+        let error = crate::validate_onchain_submit_response(serde_json::json!({
+            "error": {
+                "code": "INTERNAL_ERROR",
+                "message": "The message redirection to the Block Producer has failed: error sending request for url (http://producer/v2/messages) (source: operation timed out)"
+            }
+        })).unwrap_err();
+        assert!(matches!(
+            map_sell_offer_submit_err(anyhow::Error::new(error)),
+            ChainError::AmbiguousSubmit(_)
+        ));
+        assert!(matches!(
+            map_sell_offer_submit_err(anyhow::anyhow!(
+                "on-chain revert exit_code=101 ERR_INVALID_SENDER"
+            )),
+            ChainError::Contract(_)
+        ));
+        assert!(
+            matches!(
+                map_sell_offer_submit_err(anyhow::anyhow!("operation timed out")),
+                ChainError::Chain(_)
+            ),
+            "untyped text must not become a retry permission"
+        );
+    }
 
     fn http_status_error(status: reqwest::StatusCode) -> anyhow::Error {
         let response: reqwest::Response = http::Response::builder()
@@ -832,6 +901,15 @@ mod chain_error_mapping_tests {
             "buyer aborted pre-accept: placeInferenceBuy would revert ERR_INVALID_SENDER 101"
         ));
         assert!(matches!(preflight, ChainError::Chain(_)));
+    }
+
+    #[test]
+    fn consumer_errors_1450_order_cause_survives_the_backend_adapter() {
+        let typed = anyhow::Error::new(ChainError::OrderUnavailable("changed wording".into()))
+            .context("outer diagnostic");
+        assert!(matches!(map_err(typed), ChainError::OrderUnavailable(_)));
+        let prose = anyhow!("order_unavailable; no escrow was sent");
+        assert!(matches!(map_err(prose), ChainError::Chain(_)));
     }
 
     #[test]
@@ -8080,7 +8158,7 @@ impl RealChainBackend {
             now,
         )
         .map_err(|e| {
-            anyhow!(
+            anyhow!(ChainError::OrderUnavailable(format!(
                 "{}: no executable matching ask for InferenceOrderBook {} at max_price_per_tick {}, \
                  requested ticks {}: {e}. IOB stats {}",
                 buy_refusal_class(&e),
@@ -8088,7 +8166,7 @@ impl RealChainBackend {
                 max_price_per_tick,
                 ticks,
                 orderbook_stats_for_error(snapshot)
-            )
+            )))
         })
     }
 
@@ -8118,6 +8196,16 @@ impl RealChainBackend {
 
 #[async_trait]
 impl ChainBackend for RealDealBackend {
+    async fn deal_purchase_terms(
+        &self,
+        token_contract: &TokenContract,
+    ) -> Result<Option<(u128, u128)>, ChainError> {
+        self.chain
+            .token_contract_purchase_terms(&parse_tc(token_contract)?)
+            .await
+            .map_err(map_err)
+    }
+
     fn network(&self) -> &str {
         self.chain.network()
     }
@@ -8513,6 +8601,8 @@ pub struct RealSellerBackend {
     /// [`crate::params::DEAL_GAS_OVERHEAD_RAW`]'s provenance.
     supplied_deal_gas_overhead_raw: Option<u128>,
     offer_post_started_at: std::sync::Mutex<Option<u64>>,
+    offer_journal_dir: Option<std::path::PathBuf>,
+    pending_offer: tokio::sync::Mutex<Option<super::client::SellerPlacement>>,
 }
 
 impl RealSellerBackend {
@@ -8552,7 +8642,107 @@ impl RealSellerBackend {
             tick_size,
             supplied_deal_gas_overhead_raw,
             offer_post_started_at: std::sync::Mutex::new(None),
+            offer_journal_dir: None,
+            pending_offer: tokio::sync::Mutex::new(None),
         }
+    }
+
+    /// The CLI uses its existing seller-watch directory for per-deal submission recovery.
+    pub fn with_offer_journal_dir(mut self, directory: std::path::PathBuf) -> Self {
+        self.offer_journal_dir = Some(directory);
+        self
+    }
+
+    fn offer_journal_path(&self, tc: &Address) -> Option<std::path::PathBuf> {
+        self.offer_journal_dir
+            .as_ref()
+            .map(|dir| dir.join(format!("{}.sell.json", tc.bare())))
+    }
+
+    async fn load_pending_offer(&self, tc: &Address, book: &Address) -> Result<(), ChainError> {
+        let mut pending = self.pending_offer.lock().await;
+        if pending.is_none() {
+            if let Some(path) = self.offer_journal_path(tc) {
+                *pending = super::client::SellerPlacement::load(&path).map_err(map_err)?;
+            }
+        }
+        if let Some(post) = pending.as_ref() {
+            post.validate(self.chain.network(), &self.note, tc, book)
+                .map_err(map_err)?;
+        }
+        Ok(())
+    }
+
+    pub(super) async fn reconcile_pending_offer(
+        &self,
+        tc: &Address,
+        book: &Address,
+    ) -> Result<bool, ChainError> {
+        self.load_pending_offer(tc, book).await?;
+        let mut pending = self.pending_offer.lock().await;
+        let Some(post) = pending.as_mut() else {
+            return Ok(false);
+        };
+        let path = self.offer_journal_path(tc);
+        let message_id = post.message_id.clone();
+        let trace = tokio::time::timeout(
+            OFFER_ACCEPTANCE_TIMEOUT,
+            self.chain.reconcile_seller_placement(post, path.as_deref()),
+        )
+        .await;
+        // The closure below deliberately uses the immutable id: the execution cursor advances.
+        let unresolved = |detail: String| {
+            ChainError::AmbiguousSubmit(format!(
+            "SELL submission {message_id} for TokenContract {} remains unresolved: {detail}; \
+             preserving its journal; reconcile this exact message and its destination transactions before another SELL",
+            display_token_contract(tc)
+        ))
+        };
+        match trace {
+            Ok(Ok(())) => {}
+            Ok(Err(error)) => return Err(unresolved(format!("{error:#}"))),
+            Err(_) => return Err(unresolved("execution read timed out".into())),
+        }
+        let state = self
+            .chain
+            .token_contract_deal_state(tc)
+            .await
+            .map_err(|error| unresolved(format!("TokenContract.getState: {error:#}")))?
+            .ok_or_else(|| unresolved("missing TokenContract.getState".into()))?;
+        if state.funded {
+            return Ok(true);
+        }
+        // The exact execution above is already checkpointed under the pending-offer lock.
+        if !retry_seller_read("seller reconciled exact-TC SELL rows", || async {
+            self.chain
+                .raw_resting_sell_orders_for_tc(book, tc)
+                .await
+                .map_err(map_err)
+        })
+        .await?
+        .is_empty()
+        {
+            return Ok(true);
+        }
+        if self
+            .chain
+            .token_contract_offer(tc)
+            .await
+            .map_err(map_err)?
+            .is_none_or(|latch| latch.offer_posted)
+        {
+            return Err(unresolved(
+                "execution reconciled, but the TokenContract offer latch is not released".into(),
+            ));
+        }
+        tracing::info!(event = "seller_offer_submission_terminal", %message_id,
+            token_contract = %display_token_contract(tc), result = ?post.terminal,
+            "previous SELL execution reconciled; book empty and offer latch released");
+        if let Some(path) = path {
+            std::fs::remove_file(path).map_err(|error| ChainError::Chain(error.to_string()))?;
+        }
+        *pending = None;
+        Ok(false)
     }
 
     /// Assemble the seller backend and the seller's note from the `--note-key` seed. Directive: the
@@ -8651,7 +8841,7 @@ impl RealSellerBackend {
             .chain
             .token_contract_deal_state(&tc)
             .await
-            .map_err(map_err)?
+            .map_err(map_read_err)?
         else {
             return Ok(None);
         };
@@ -8675,7 +8865,7 @@ impl RealSellerBackend {
             .chain
             .token_contract_buyer_pubkey(&tc)
             .await
-            .map_err(map_err)?
+            .map_err(map_read_err)?
             .ok_or_else(|| {
                 ChainError::Chain(format!(
                     "TC {}: funded, but buyerPubkey is empty",
@@ -8887,6 +9077,9 @@ impl ChainBackend for RealSellerBackend {
                 .map_err(map_err)
         })
         .await?;
+        if self.reconcile_pending_offer(&tc, &ob).await? {
+            return Ok(());
+        }
         if retry_seller_read("seller order-book state", || async {
             self.chain
                 .inference_orderbook_stats(&ob)
@@ -8929,43 +9122,94 @@ impl ChainBackend for RealSellerBackend {
                 max_ticks
             );
         }
+        // postFromNote burns the deal's ECC[2] reserve even when it only renews an expired ask.
+        // Reuse the same measured reserve check as the other seller writes, after reconciling any
+        // older submission so an unread execution never authorizes another funding operation.
+        self.ensure_tc_gas(&tc).await?;
         *self.offer_post_started_at.lock().map_err(|_| {
             ChainError::Chain("seller offer submission marker lock poisoned".to_string())
         })? = Some(now_secs()?.saturating_sub(crate::params::SELLER_OFFER_EVENT_LOOKBACK_SECS));
-        match tokio::time::timeout(
-            POST_SELL_OFFER_SUBMIT_TIMEOUT,
-            // One seller call: postSellOffer(flags, nonce, ttl). The note derives the canonical TC and
-            // hands it the baked book hash; the TC posts its own ask. The on-chain terms read + drift check
-            // above stay as a pre-post sanity check. The ttl is mandatory; ask for the maximum the
-            // contract allows so the offer is not cut short by our own default.
-            self.chain.post_sell_offer(
-                &self.note,
-                &self.keys,
-                offer.flags,
-                self.nonce,
-                crate::params::MAX_SELL_TTL.as_secs(),
-            ),
-        )
-        .await
-        {
+        let path = self.offer_journal_path(&tc);
+        let mut pending = self.pending_offer.lock().await;
+        let since = now_secs()?.saturating_sub(crate::params::SELLER_OFFER_EVENT_LOOKBACK_SECS);
+        let submitted = {
+            let mut before_post = |message_id| {
+                let post = super::client::SellerPlacement::new(
+                    self.chain.network(),
+                    &self.note,
+                    &tc,
+                    &ob,
+                    message_id,
+                    since,
+                );
+                post.save(path.as_deref())?;
+                *pending = Some(post);
+                Ok(())
+            };
+            tokio::time::timeout(
+                POST_SELL_OFFER_SUBMIT_TIMEOUT,
+                // One seller call: postSellOffer(flags, nonce, ttl). The note derives the canonical TC and
+                // hands it the baked book hash; the TC posts its own ask. The on-chain terms read + drift check
+                // above stay as a pre-post sanity check. The ttl is mandatory; ask for the maximum the
+                // contract allows so the offer is not cut short by our own default.
+                self.chain.post_sell_offer_with_identity(
+                    &self.note,
+                    &self.keys,
+                    offer.flags,
+                    self.nonce,
+                    crate::params::MAX_SELL_TTL.as_secs(),
+                    &mut before_post,
+                ),
+            )
+            .await
+        };
+        if let Ok(Err(error)) = &submitted {
+            if error
+                .downcast_ref::<super::client::MoneySubmitError>()
+                .is_some_and(|error| error.clears_journal())
+                && pending.is_some()
+            {
+                if let Some(path) = path.as_ref() {
+                    std::fs::remove_file(path).map_err(|error| map_err(error.into()))?;
+                }
+                *pending = None;
+            }
+        }
+        drop(pending);
+        match submitted {
             Ok(Ok(_)) => {}
-            Ok(Err(e)) => return Err(map_err(e)),
+            Ok(Err(e)) => return Err(map_sell_offer_submit_err(e)),
             Err(_) => {
                 let (canonical_evidence, tc_state_evidence) =
                     self.post_offer_failure_evidence(&tc).await;
-                return Err(ChainError::Chain(seller_post_sell_offer_timeout_message(
-                    &ob,
-                    &offer.token_contract,
-                    &self.model_hash,
-                    self.nonce,
-                    &self.note,
-                    POST_SELL_OFFER_SUBMIT_TIMEOUT,
-                    &canonical_evidence,
-                    &tc_state_evidence,
-                )));
+                return Err(ChainError::AmbiguousSubmit(
+                    seller_post_sell_offer_timeout_message(
+                        &ob,
+                        &offer.token_contract,
+                        &self.model_hash,
+                        self.nonce,
+                        &self.note,
+                        POST_SELL_OFFER_SUBMIT_TIMEOUT,
+                        &canonical_evidence,
+                        &tc_state_evidence,
+                    ),
+                ));
             }
         }
         Ok(())
+    }
+
+    async fn has_pending_sell_offer(&self, tc: &TokenContract) -> Result<bool, ChainError> {
+        let tc = parse_tc(tc)?;
+        let pending = self.pending_offer.lock().await;
+        let saved = match self.offer_journal_path(&tc) {
+            Some(path) => super::client::SellerPlacement::load(&path).map_err(map_err)?,
+            None => None,
+        };
+        Ok(pending
+            .iter()
+            .chain(saved.iter())
+            .any(|post| post.terminal.is_none()))
     }
 
     async fn confirm_offer_outcome(
@@ -8980,6 +9224,44 @@ impl ChainBackend for RealSellerBackend {
         })
         .await?;
         let tc_addr = parse_tc(tc)?;
+        self.load_pending_offer(&tc_addr, &ob).await?;
+        if self.pending_offer.lock().await.is_some() {
+            let started = std::time::Instant::now();
+            loop {
+                if self.read_openable_match_once(tc).await?.is_some() {
+                    return Ok(Some(SellOfferOutcome::Matched));
+                }
+                let orders = self.raw_resting_sell_orders_for_tc(tc).await?;
+                if let [order] = orders.as_slice() {
+                    return Ok(Some(SellOfferOutcome::Rested {
+                        order_id: order.order_id,
+                    }));
+                }
+                let mut pending = self.pending_offer.lock().await;
+                let post = pending
+                    .as_mut()
+                    .expect("pending SELL retained through confirmation");
+                let path = self.offer_journal_path(&tc_addr);
+                let remaining = OFFER_ACCEPTANCE_TIMEOUT.saturating_sub(started.elapsed());
+                let trace = tokio::time::timeout(
+                    remaining,
+                    self.chain.reconcile_seller_placement(post, path.as_deref()),
+                )
+                .await;
+                if let Some(order_id) = post.accepted_order_id {
+                    return Ok(Some(SellOfferOutcome::Rested { order_id }));
+                }
+                if post.terminal.is_some() || started.elapsed() >= OFFER_ACCEPTANCE_TIMEOUT {
+                    return Err(ChainError::AmbiguousSubmit(format!(
+                        "SELL submission {}: terminal={:?}; execution_read={trace:?}; \
+                         preserving submission identity for recovery; no successor accepted yet",
+                        post.message_id, post.terminal,
+                    )));
+                }
+                drop(pending);
+                tokio::time::sleep(crate::params::SELLER_OFFER_OUTCOME_POLL_INTERVAL).await;
+            }
+        }
         let since = self
             .offer_post_started_at
             .lock()
@@ -9022,7 +9304,7 @@ impl ChainBackend for RealSellerBackend {
             }
             tokio::time::sleep(crate::params::SELLER_OFFER_OUTCOME_POLL_INTERVAL).await;
         }
-        Err(ChainError::Chain(format!(
+        Err(ChainError::AmbiguousSubmit(format!(
             "seller postSellOffer outcome is not yet confirmed for TokenContract {}; no placement, match, or returned placement value was observed",
             display_token_contract(tc)
         )))
@@ -9038,7 +9320,7 @@ impl ChainBackend for RealSellerBackend {
                 self.chain
                     .token_contract_deal_terms(&tc)
                     .await
-                    .map_err(map_err)
+                    .map_err(map_read_err)
             })
             .await?
         else {
@@ -9075,16 +9357,37 @@ impl ChainBackend for RealSellerBackend {
             self.chain
                 .inference_orderbook_address(&self.note, &self.model_hash, self.tick_size)
                 .await
-                .map_err(map_err)
+                .map_err(map_read_err)
         })
         .await?;
-        retry_seller_read("seller raw exact-TC SELL rows", || async {
+        let orders = retry_seller_read("seller raw exact-TC SELL rows", || async {
             self.chain
                 .raw_resting_sell_orders_for_tc(&order_book, &tc)
                 .await
-                .map_err(map_err)
+                .map_err(map_read_err)
         })
-        .await
+        .await?;
+        if !orders.is_empty() {
+            // Both fresh Rested confirmation and restart inspection pass here. Consume the
+            // correlated execution while its receipts are available, before ordinary expiry
+            // can make renewal depend on history that has since been pruned. A visible row
+            // does not identify an unknown send; only the exact-message trace advances it.
+            self.load_pending_offer(&tc, &order_book).await?;
+            let mut pending = self.pending_offer.lock().await;
+            if let Some(post) = pending.as_mut() {
+                let path = self.offer_journal_path(&tc);
+                let trace = tokio::time::timeout(
+                    OFFER_ACCEPTANCE_TIMEOUT,
+                    self.chain.reconcile_seller_placement(post, path.as_deref()),
+                )
+                .await;
+                if !matches!(trace, Ok(Ok(()))) {
+                    tracing::warn!(message_id = %post.message_id, ?trace,
+                        "resting SELL execution remains unresolved; retaining its journal");
+                }
+            }
+        }
+        Ok(orders)
     }
 
     /// submit the permissionless `expireOrder(orderId)` for this seller's own expired ask.
@@ -9120,7 +9423,10 @@ impl ChainBackend for RealSellerBackend {
     ) -> Result<Option<DealOfferLatch>, ChainError> {
         let tc = parse_tc(token_contract)?;
         retry_seller_read("seller TokenContract offer latch", || async {
-            self.chain.token_contract_offer(&tc).await.map_err(map_err)
+            self.chain
+                .token_contract_offer(&tc)
+                .await
+                .map_err(map_read_err)
         })
         .await
     }
@@ -9250,11 +9556,11 @@ impl ChainBackend for RealSellerBackend {
             .chain
             .inference_orderbook_address(&self.note, &self.model_hash, self.tick_size)
             .await
-            .map_err(map_err)?;
+            .map_err(map_read_err)?;
         self.chain
             .poll_inference_filled_tcs(&self.note, &order_book, false, cursor)
             .await
-            .map_err(map_err)
+            .map_err(map_read_err)
     }
 
     async fn place_buy(&self, tc: &TokenContract, _note: &dyn Note) -> Result<(), ChainError> {
@@ -9418,7 +9724,7 @@ impl ChainBackend for RealSellerBackend {
         self.chain
             .token_contract_deal_snapshot(&tc)
             .await
-            .map_err(map_err)
+            .map_err(map_read_err)
     }
 
     async fn deal_subscription(
@@ -9512,7 +9818,7 @@ impl ChainBackend for RealSellerBackend {
             .chain
             .token_contract_settlement_receipts(&tc)
             .await
-            .map_err(map_err)?;
+            .map_err(map_read_err)?;
         exact_terminal_settlement(receipts)
     }
 
@@ -9812,7 +10118,7 @@ impl RealBuyerBackend {
         let want = tc.with_workchain().to_ascii_lowercase();
         let now = buy_deadline_now_secs()?;
         check_expected_buy_target(&asks, &want, max_price_per_tick, ticks, now).map_err(|e| {
-            ChainError::Chain(format!(
+            ChainError::OrderUnavailable(format!(
                 "buyer target preflight failed for InferenceOrderBook {}: {e}. IOB stats {}",
                 display_dexdo_address(&snapshot.order_book),
                 snapshot
@@ -9846,13 +10152,13 @@ impl RealBuyerBackend {
             state.is_some(),
         )
         .map_err(|e| {
-            ChainError::Chain(format!(
+            ChainError::OrderUnavailable(format!(
                 "buyer selected-TC preflight failed for InferenceOrderBook {}: {e}",
                 display_dexdo_address(order_book)
             ))
         })?;
         check_selected_token_contract_unused(token_contract, state).map_err(|e| {
-            ChainError::Chain(format!(
+            ChainError::OrderUnavailable(format!(
                 "buyer selected-TC preflight failed for InferenceOrderBook {}: {e}",
                 display_dexdo_address(order_book)
             ))
@@ -9862,6 +10168,16 @@ impl RealBuyerBackend {
 
 #[async_trait]
 impl ChainBackend for RealBuyerBackend {
+    async fn deal_purchase_terms(
+        &self,
+        token_contract: &TokenContract,
+    ) -> Result<Option<(u128, u128)>, ChainError> {
+        self.chain
+            .token_contract_purchase_terms(&parse_tc(token_contract)?)
+            .await
+            .map_err(map_err)
+    }
+
     fn network(&self) -> &str {
         self.chain.network()
     }
@@ -9874,7 +10190,7 @@ impl ChainBackend for RealBuyerBackend {
         self.chain
             .token_contract_deal_snapshot(&tc)
             .await
-            .map_err(map_err)
+            .map_err(map_read_err)
     }
 
     fn model_buy_order_book_identity(&self) -> Option<String> {
@@ -12013,8 +12329,18 @@ mod codecell_tests {
             .find("sell_offer_terms(&offer.token_contract)")
             .expect("post_offer reads on-chain deal terms");
         let submit = body
-            .find(".post_sell_offer(")
+            .find(".post_sell_offer")
             .expect("post_offer submits to the chain");
+        let reconciled = body
+            .find("reconcile_pending_offer(&tc, &ob)")
+            .expect("pending SELL is reconciled before another write");
+        let gas = body
+            .find("ensure_tc_gas(&tc)")
+            .expect("postFromNote burn is covered before posting");
+        assert!(
+            reconciled < gas && terms < gas && gas < submit,
+            "reconcile first, then use the existing authoritative gas reserve check before SELL"
+        );
         assert!(
             withdrawn < submit,
             "PrivateNote.hasWithdrawn must be checked before postSellOffer"
@@ -12056,11 +12382,11 @@ mod codecell_tests {
                 .unwrap_or(post.len());
             let post = &post[..end];
             assert!(
-                post.contains(".post_sell_offer("),
+                post.contains(".post_sell_offer"),
                 "{label} must call the real PrivateNote post path"
             );
             assert!(
-                post.contains("\n                offer.flags,\n"),
+                post.contains("offer.flags,"),
                 "{label} must pass the exact SellOffer flags argument to post_sell_offer"
             );
         }

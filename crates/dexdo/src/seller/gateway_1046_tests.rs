@@ -49,6 +49,7 @@ fn authorized_request(
     state.auth.issue_challenge(token_contract, nonce.clone());
     let signature = buyer.sign(&challenge_bytes(token_contract, &nonce));
     Request::new(StreamRequest {
+        shared_budget: false,
         token_contract: token_contract.to_string(),
         nonce,
         signature: signature.0.to_vec(),
@@ -61,6 +62,7 @@ fn authorized_request(
                 max_tokens,
                 ..SamplingParams::default()
             }),
+            ..Default::default()
         }),
         billing_grant_tokens: u64::from(max_tokens).saturating_add(1),
     })
@@ -97,6 +99,7 @@ async fn anthropic_fixture() -> (AnthropicConfig, tokio::task::JoinHandle<()>) {
         api_key_env: "PATH".into(),
         tokenizer_family: "fixture-tokenizer".into(),
         max_output_tokens: Some(8),
+        reasoning_disable: Default::default(),
     };
     (config, server)
 }

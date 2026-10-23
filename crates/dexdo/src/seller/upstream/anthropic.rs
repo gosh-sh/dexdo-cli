@@ -1,10 +1,11 @@
 //! Native Anthropic Messages API seller upstream.
 
 use super::{
-    annotate_seller_config_fault, resolve_model_output_cap, UpstreamEvent, UpstreamResult,
+    annotate_seller_config_fault, resolve_model_output_cap, ThinkingRequest, UpstreamEvent,
+    UpstreamResult,
 };
 use crate::seller::models::ModelConfig;
-use dexdo_core::params::UPSTREAM_SSE_FRAME_MAX_BYTES;
+use dexdo_core::params::{ReasoningDisableControl, UPSTREAM_SSE_FRAME_MAX_BYTES};
 use dexdo_proto::{BillingUsage, CanonChunk, CanonRequest, SignalManifest};
 use serde::{Deserialize, Deserializer, Serialize};
 use tokio::sync::mpsc;
@@ -24,6 +25,8 @@ pub struct AnthropicConfig {
     /// serving fails closed before the provider is contacted. The Messages API always requires `max_tokens`
     /// and rejects anything above the model's limit, so a deal-budget-only bound never delivered.
     pub max_output_tokens: Option<u32>,
+    /// Only the native thinking-disabled profile is supported by this adapter.
+    pub reasoning_disable: ReasoningDisableControl,
 }
 
 impl AnthropicConfig {
@@ -44,6 +47,7 @@ impl AnthropicConfig {
             api_key_env: model.api_key_env.clone(),
             tokenizer_family: model.tokenizer_family.clone(),
             max_output_tokens: model.capabilities.max_output_tokens,
+            reasoning_disable: model.capabilities.reasoning_disable,
         }
     }
 }
@@ -60,6 +64,8 @@ struct MessagesRequest<'a> {
     temperature: Option<f64>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     stop_sequences: Vec<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    thinking: Option<ThinkingRequest>,
 }
 
 #[derive(Serialize)]
@@ -115,6 +121,11 @@ fn build_request<'a>(
         system: (!system.is_empty()).then(|| system.join("\n")),
         temperature,
         stop_sequences,
+        thinking: req
+            .params
+            .as_ref()
+            .is_some_and(|p| p.disable_reasoning)
+            .then_some(ThinkingRequest::Disabled),
     }
 }
 
@@ -146,7 +157,7 @@ pub async fn run(
         match resolve_model_output_cap(cfg.max_output_tokens, &cfg.frame_model, &cfg.model) {
             Ok(cap) => cap,
             Err(status) => {
-                let _ = tx.send(Err(status)).await;
+                let _ = super::send_event(&tx, Err(status)).await;
                 return;
             }
         };
@@ -154,24 +165,28 @@ pub async fn run(
         .ok()
         .filter(|key| !key.is_empty())
     else {
-        let _ = tx
-            .send(Err(Status::failed_precondition(format!(
+        let _ = super::send_event(
+            &tx,
+            Err(Status::failed_precondition(format!(
                 "real upstream key absent ({})",
                 cfg.api_key_env
-            ))))
-            .await;
+            ))),
+        )
+        .await;
         return;
     };
     let Some(req) = req else {
-        let _ = tx
-            .send(Err(Status::invalid_argument(
+        let _ = super::send_event(
+            &tx,
+            Err(Status::invalid_argument(
                 "real upstream requires a canonical request",
-            )))
-            .await;
+            )),
+        )
+        .await;
         return;
     };
     if let Err(status) = stream_upstream(cfg, &key, count, &req, &tx, model_output_cap).await {
-        let _ = tx.send(Err(*status)).await;
+        let _ = super::send_event(&tx, Err(*status)).await;
     }
 }
 
@@ -185,16 +200,48 @@ async fn stream_upstream(
 ) -> Result<(), Box<Status>> {
     use futures::StreamExt;
 
+    if req
+        .params
+        .as_ref()
+        .is_some_and(|p| p.reasoning_effort.is_some())
+    {
+        return Err(Box::new(Status::invalid_argument(
+            "unsupported_parameter: native Anthropic reasoning effort is not supported",
+        )));
+    }
+    if req.params.as_ref().is_some_and(|p| p.disable_reasoning)
+        && cfg.reasoning_disable != ReasoningDisableControl::ThinkingDisabled
+    {
+        return Err(Box::new(Status::invalid_argument(
+            "unsupported_parameter: this seller/model cannot disable reasoning",
+        )));
+    }
     let client = reqwest::Client::new();
     let body = build_request(cfg, req, count, model_output_cap);
+    crate::telemetry::attempt(None);
     let response = http_request(&client, cfg, key, &body)
         .send()
         .await
-        .map_err(|e| Status::unavailable(format!("upstream connect failed: {e}")))?;
+        .map_err(|e| {
+            let status = Status::unavailable(format!("upstream connect failed: {e}"));
+            if super::openai::retryable_transport_error(&e) {
+                dexdo_proto::retryable_upstream_status(status)
+            } else {
+                status
+            }
+        })?;
+    crate::telemetry::attempt(Some(response.status().as_u16()));
     if !response.status().is_success() {
         // a `4xx` rejects a request the seller built end to end -- name the model and the sent limit.
         return Err(Box::new(annotate_seller_config_fault(
-            Status::unavailable(format!("upstream HTTP {}", response.status())),
+            {
+                let status = Status::unavailable(format!("upstream HTTP {}", response.status()));
+                if matches!(response.status().as_u16(), 429 | 502 | 503) {
+                    dexdo_proto::retryable_upstream_status(status)
+                } else {
+                    status
+                }
+            },
             response.status().as_u16(),
             &cfg.model,
             body.max_tokens,
@@ -211,9 +258,18 @@ async fn stream_upstream(
     let mut reported_output: Option<u64> = None;
     let mut post_output_reported: Option<u64> = None;
     let mut reported_input: Option<u64> = None;
+    let mut reported_cache_read = 0_u64;
+    let mut reported_cache_write = 0_u64;
     let mut message_started = false;
     while let Some(part) = stream.next().await {
-        let bytes = part.map_err(|e| Status::unavailable(format!("upstream read failed: {e}")))?;
+        let bytes = part.map_err(|e| {
+            let status = Status::unavailable(format!("upstream read failed: {e}"));
+            if seq == 0 && super::openai::retryable_transport_error(&e) {
+                dexdo_proto::retryable_upstream_status(status)
+            } else {
+                status
+            }
+        })?;
         buffer.extend_from_slice(&bytes);
         for event in drain_complete_events(&mut buffer)? {
             match parse_event(&event)? {
@@ -240,13 +296,18 @@ async fn stream_upstream(
                         usage: None,
                     };
                     seq += 1;
-                    if tx.send(Ok(UpstreamEvent::Chunk(chunk))).await.is_err() {
+                    if super::send_event(tx, Ok(UpstreamEvent::Chunk(chunk)))
+                        .await
+                        .is_err()
+                    {
                         return Ok(());
                     }
                 }
                 ParsedEvent::InitialUsage {
                     input_tokens,
                     output_tokens,
+                    cache_read_tokens,
+                    cache_write_tokens,
                 } => {
                     if message_started {
                         return Err(Box::new(Status::data_loss(
@@ -258,6 +319,8 @@ async fn stream_upstream(
                     })?;
                     message_started = true;
                     reported_input = Some(input_tokens);
+                    reported_cache_read = cache_read_tokens.unwrap_or(0);
+                    reported_cache_write = cache_write_tokens.unwrap_or(0);
                     let output_tokens = output_tokens.unwrap_or(0);
                     if reported_output.is_some_and(|previous| output_tokens < previous) {
                         return Err(Box::new(Status::data_loss(
@@ -269,10 +332,19 @@ async fn stream_upstream(
                 ParsedEvent::CumulativeUsage {
                     input_tokens,
                     output_tokens,
+                    cache_read_tokens,
+                    cache_write_tokens,
                 } => {
                     if !message_started {
                         return Err(Box::new(Status::data_loss(
                             "Anthropic message_delta usage arrived before message_start usage",
+                        )));
+                    }
+                    if cache_read_tokens.is_some_and(|count| count != reported_cache_read)
+                        || cache_write_tokens.is_some_and(|count| count != reported_cache_write)
+                    {
+                        return Err(Box::new(Status::data_loss(
+                            "Anthropic cumulative cache usage disagrees with initial usage",
                         )));
                     }
                     if let Some(input_tokens) = input_tokens {
@@ -318,9 +390,20 @@ async fn stream_upstream(
                                 "Anthropic output ended without positive post-output cumulative output_tokens",
                             )
                         })?;
-                    let usage = BillingUsage::new(input_tokens, output_tokens, None)
+                    // Anthropic reports uncached input separately. The wire keeps total input,
+                    // with cache counters as subsets, just like OpenAI prompt_tokens.
+                    let input_tokens = input_tokens
+                        .checked_add(reported_cache_read)
+                        .and_then(|count| count.checked_add(reported_cache_write))
+                        .ok_or_else(|| Status::data_loss("Anthropic input usage overflows u64"))?;
+                    let mut usage = BillingUsage::new(input_tokens, output_tokens, None)
                         .map_err(Status::data_loss)?;
-                    if tx.send(Ok(UpstreamEvent::Usage(usage))).await.is_err() {
+                    usage.cache_read_tokens = reported_cache_read;
+                    usage.cache_write_tokens = reported_cache_write;
+                    if super::send_event(tx, Ok(UpstreamEvent::Usage(usage)))
+                        .await
+                        .is_err()
+                    {
                         return Ok(());
                     }
                     return Ok(());
@@ -338,9 +421,12 @@ async fn stream_upstream(
             "incomplete Anthropic SSE frame at EOF",
         )));
     }
-    Err(Box::new(Status::data_loss(
-        "Anthropic SSE ended without message_stop",
-    )))
+    let status = Status::data_loss("Anthropic SSE ended without message_stop");
+    Err(Box::new(if seq == 0 {
+        dexdo_proto::retryable_upstream_status(status)
+    } else {
+        status
+    }))
 }
 
 #[allow(clippy::result_large_err)]
@@ -420,12 +506,23 @@ where
     u64::deserialize(deserializer).map(UsageCount::Value)
 }
 
+fn deserialize_cache_count<'de, D: Deserializer<'de>>(
+    deserializer: D,
+) -> Result<UsageCount, D::Error> {
+    Option::<u64>::deserialize(deserializer)
+        .map(|count| count.map_or(UsageCount::Missing, UsageCount::Value))
+}
+
 #[derive(Clone, Copy, Debug, Default, Deserialize, PartialEq, Eq)]
 struct EventUsage {
     #[serde(default, deserialize_with = "deserialize_usage_count")]
     input_tokens: UsageCount,
     #[serde(default, deserialize_with = "deserialize_usage_count")]
     output_tokens: UsageCount,
+    #[serde(default, deserialize_with = "deserialize_cache_count")]
+    cache_read_input_tokens: UsageCount,
+    #[serde(default, deserialize_with = "deserialize_cache_count")]
+    cache_creation_input_tokens: UsageCount,
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -437,10 +534,14 @@ enum ParsedEvent {
     InitialUsage {
         input_tokens: Option<u64>,
         output_tokens: Option<u64>,
+        cache_read_tokens: Option<u64>,
+        cache_write_tokens: Option<u64>,
     },
     CumulativeUsage {
         input_tokens: Option<u64>,
         output_tokens: Option<u64>,
+        cache_read_tokens: Option<u64>,
+        cache_write_tokens: Option<u64>,
     },
     Stop,
     Error(String),
@@ -482,20 +583,28 @@ fn parse_event(event: &str) -> Result<ParsedEvent, Status> {
             ParsedEvent::InitialUsage {
                 input_tokens: None,
                 output_tokens: None,
+                cache_read_tokens: None,
+                cache_write_tokens: None,
             },
             |usage| ParsedEvent::InitialUsage {
                 input_tokens: usage.input_tokens.into_option(),
                 output_tokens: usage.output_tokens.into_option(),
+                cache_read_tokens: usage.cache_read_input_tokens.into_option(),
+                cache_write_tokens: usage.cache_creation_input_tokens.into_option(),
             },
         ),
         ("message_delta", _) => event.usage.map_or(
             ParsedEvent::CumulativeUsage {
                 input_tokens: None,
                 output_tokens: None,
+                cache_read_tokens: None,
+                cache_write_tokens: None,
             },
             |usage| ParsedEvent::CumulativeUsage {
                 input_tokens: usage.input_tokens.into_option(),
                 output_tokens: usage.output_tokens.into_option(),
+                cache_read_tokens: usage.cache_read_input_tokens.into_option(),
+                cache_write_tokens: usage.cache_creation_input_tokens.into_option(),
             },
         ),
         ("message_stop", _) => ParsedEvent::Stop,
@@ -520,10 +629,18 @@ mod tests {
             api_key_env: "ANTHROPIC_API_KEY".to_string(),
             tokenizer_family: "claude".to_string(),
             max_output_tokens: Some(TEST_OUTPUT_CAP),
+            reasoning_disable: ReasoningDisableControl::default(),
         }
     }
 
     async fn run_test_stream(body: Vec<u8>) -> (Result<(), Box<Status>>, Vec<UpstreamEvent>) {
+        run_test_response(body, false).await
+    }
+
+    async fn run_test_response(
+        body: Vec<u8>,
+        truncated: bool,
+    ) -> (Result<(), Box<Status>>, Vec<UpstreamEvent>) {
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -534,7 +651,7 @@ mod tests {
             let _ = socket.read(&mut request).await.unwrap();
             let header = format!(
                 "HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\ncontent-length: {}\r\nconnection: close\r\n\r\n",
-                body.len()
+                body.len() + usize::from(truncated)
             );
             socket.write_all(header.as_bytes()).await.unwrap();
             socket.write_all(&body).await.unwrap();
@@ -549,6 +666,7 @@ mod tests {
                 content: "hello".into(),
             }],
             params: None,
+            ..Default::default()
         };
         let (tx, mut rx) = mpsc::channel(16);
         let result = stream_upstream(&cfg, "secret", 8, &request, &tx, TEST_OUTPUT_CAP).await;
@@ -559,6 +677,120 @@ mod tests {
             events.push(event.unwrap());
         }
         (result, events)
+    }
+
+    #[tokio::test]
+    async fn issue_2135_native_retry_metadata_excludes_malformed_and_post_output_failures() {
+        use tonic::Code::{DataLoss, Unavailable};
+
+        const START: &str = "data: {\"type\":\"message_start\",\"message\":{\"usage\":{\"input_tokens\":1,\"output_tokens\":0}}}\n\n";
+        let output = format!("{START}data: {{\"type\":\"content_block_delta\",\"delta\":{{\"type\":\"text_delta\",\"text\":\"partial\"}}}}\n\n");
+        for (body, truncated, code, retryable) in [
+            ("", false, DataLoss, true),
+            (START, false, DataLoss, true),
+            (START, true, Unavailable, true),
+            (output.as_str(), false, DataLoss, false),
+            (output.as_str(), true, Unavailable, false),
+            ("data: {\n\n", false, DataLoss, false),
+            ("data: {", false, DataLoss, false),
+            (
+                "data: {\"type\":\"error\",\"error\":{\"message\":\"authentication failed\"}}\n\n",
+                false,
+                Unavailable,
+                false,
+            ),
+        ] {
+            let (result, events) = run_test_response(body.as_bytes().to_vec(), truncated).await;
+            let status = result.unwrap_err();
+            assert_eq!(status.code(), code, "{body:?}, truncated={truncated}");
+            assert_eq!(
+                dexdo_proto::is_retryable_upstream(&status),
+                retryable,
+                "{status:?}"
+            );
+            assert!(
+                events
+                    .iter()
+                    .all(|event| matches!(event, UpstreamEvent::Chunk(_))),
+                "an incomplete stream must authorize no usage"
+            );
+            assert_eq!(events.len(), usize::from(body == output));
+        }
+    }
+
+    #[tokio::test]
+    async fn issue_2135_native_connect_failure_is_retryable_but_bad_url_is_not() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        drop(listener);
+        for (base_url, retryable) in [
+            (format!("http://{address}"), true),
+            ("invalid endpoint".into(), false),
+        ] {
+            let cfg = AnthropicConfig {
+                base_url,
+                ..config()
+            };
+            let request = CanonRequest {
+                messages: vec![ChatMessage {
+                    role: "user".into(),
+                    content: "hello".into(),
+                }],
+                ..Default::default()
+            };
+            let (tx, _rx) = mpsc::channel(16);
+            let status = stream_upstream(&cfg, "secret", 8, &request, &tx, TEST_OUTPUT_CAP)
+                .await
+                .unwrap_err();
+            assert_eq!(status.code(), tonic::Code::Unavailable);
+            assert!(status.message().starts_with("upstream connect failed:"));
+            assert_eq!(
+                dexdo_proto::is_retryable_upstream(&status),
+                retryable,
+                "{status:?}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn cache_usage_2132_is_normalized_once_and_conflicts_fail_closed() {
+        for (initial, repeated, valid) in [
+            (serde_json::json!(4), serde_json::json!(4), true),
+            (serde_json::json!(null), serde_json::json!(null), true),
+            (serde_json::json!(4), serde_json::json!(5), false),
+            (serde_json::json!("4"), serde_json::json!(4), false),
+            (
+                serde_json::json!(u64::MAX),
+                serde_json::json!(u64::MAX),
+                false,
+            ),
+        ] {
+            let start = serde_json::json!({"type":"message_start","message":{"usage":{
+                "input_tokens":3,"cache_read_input_tokens":initial,"cache_creation_input_tokens":2}}});
+            let delta = serde_json::json!({"type":"message_delta","usage":{
+                "output_tokens":1,"cache_read_input_tokens":repeated}});
+            let body=format!("event: message_start\ndata: {start}\n\nevent: content_block_delta\ndata: {{\"type\":\"content_block_delta\",\"delta\":{{\"type\":\"text_delta\",\"text\":\"x\"}}}}\n\nevent: message_delta\ndata: {delta}\n\nevent: message_stop\ndata: {{\"type\":\"message_stop\"}}\n\n");
+            let (result, events) = run_test_stream(body.into_bytes()).await;
+            let usage = events.iter().find_map(|event| {
+                if let UpstreamEvent::Usage(usage) = event {
+                    Some(*usage)
+                } else {
+                    None
+                }
+            });
+            if valid {
+                result.unwrap();
+                let usage = usage.unwrap();
+                let read = initial.as_u64().unwrap_or(0);
+                assert_eq!(usage.input_tokens, 3 + read + 2);
+                assert_eq!(usage.total_tokens, 3 + read + 2 + 1);
+                assert_eq!(usage.cache_read_tokens, read);
+                assert_eq!(usage.cache_write_tokens, 2);
+            } else {
+                assert!(result.is_err());
+                assert!(usage.is_none());
+            }
+        }
     }
 
     #[test]
@@ -580,7 +812,10 @@ mod tests {
                 max_tokens: 64,
                 stop: vec!["STOP".into()],
                 greedy: false,
+                disable_reasoning: false,
+                reasoning_effort: None,
             }),
+            ..Default::default()
         };
         let body = build_request(&cfg, &request, 32, TEST_OUTPUT_CAP);
         let built = http_request(&reqwest::Client::new(), &cfg, "secret", &body)
@@ -614,10 +849,12 @@ mod tests {
                 max_tokens,
                 ..Default::default()
             }),
+            ..Default::default()
         };
         let no_request_limit = CanonRequest {
             messages: vec![],
             params: None,
+            ..Default::default()
         };
 
         assert_eq!(
@@ -678,6 +915,7 @@ mod tests {
                         content: "hello".into(),
                     }],
                     params: None,
+                    ..Default::default()
                 }),
                 tx,
             ),
@@ -757,11 +995,11 @@ mod tests {
     fn handles_message_usage_and_stop_events() {
         assert_eq!(
             parse_event("event: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"usage\":{\"input_tokens\":12,\"output_tokens\":1}}}").unwrap(),
-            ParsedEvent::InitialUsage { input_tokens: Some(12), output_tokens: Some(1) }
+            ParsedEvent::InitialUsage { input_tokens: Some(12), output_tokens: Some(1), cache_read_tokens: None, cache_write_tokens: None }
         );
         assert_eq!(
             parse_event("event: message_delta\ndata: {\"type\":\"message_delta\",\"usage\":{\"output_tokens\":7}}").unwrap(),
-            ParsedEvent::CumulativeUsage { input_tokens: None, output_tokens: Some(7) }
+            ParsedEvent::CumulativeUsage { input_tokens: None, output_tokens: Some(7), cache_read_tokens: None, cache_write_tokens: None }
         );
         assert_eq!(
             parse_event("event: message_stop\ndata: {\"type\":\"message_stop\"}").unwrap(),
@@ -800,7 +1038,9 @@ mod tests {
             .unwrap(),
             ParsedEvent::CumulativeUsage {
                 input_tokens: None,
-                output_tokens: Some(7)
+                output_tokens: Some(7),
+                cache_read_tokens: None,
+                cache_write_tokens: None,
             }
         );
         assert_eq!(
@@ -810,7 +1050,9 @@ mod tests {
             .unwrap(),
             ParsedEvent::CumulativeUsage {
                 input_tokens: Some(12),
-                output_tokens: Some(7)
+                output_tokens: Some(7),
+                cache_read_tokens: None,
+                cache_write_tokens: None,
             }
         );
     }
@@ -855,6 +1097,7 @@ mod tests {
                 content: "hello".into(),
             }],
             params: None,
+            ..Default::default()
         };
         let (tx, mut rx) = mpsc::channel(8);
         stream_upstream(&cfg, "secret", 8, &request, &tx, TEST_OUTPUT_CAP)

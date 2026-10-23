@@ -88,6 +88,7 @@ async fn issue_1773_signalled_watcher_returns_instead_of_hanging() {
             &seller,
             deal,
             Some(identity),
+            None,
             fill_tx,
             dexdo::seller::liveness::AdvertiseProbePolicy::default(),
             stop_rx,

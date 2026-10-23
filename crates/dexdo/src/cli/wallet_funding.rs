@@ -358,6 +358,10 @@ pub(crate) fn payload_hash(payload: &str) -> String {
 /// the same claim as "the chain showed this executed, here is what it showed".
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) struct FundingEvidence {
+    /// Queue identity proven to belong to this journal generation, never a fingerprint-only
+    /// history candidate. Retained so pruning the node's history cannot erase that proof.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) queue_transaction_id: Option<u64>,
     /// What the evidence establishes, in one word, for the record and for the operator.
     pub(crate) verdict: String,
     /// Where it came from - the finalized message or transaction that carried it.
@@ -394,14 +398,19 @@ pub(crate) enum RequestPresence {
         chain_created_at_unix: Option<u64>,
     },
     /// Gone from the queue, and finalized history proves it EXECUTED. The money left the Vault.
-    /// A verdict bound to this generation's parseable queue id retires that generation; an
+    /// A verdict carrying this generation's confirmed queue id retires that generation; an
     /// id-less history fallback remains conservative and never permits another submit.
     Executed { evidence: FundingEvidence },
     /// Proven absent, with nothing of ours ever having been in the queue. This permits an initial
     /// submit; it never overrides a journal record that says a generation may still execute.
     Absent,
     /// Could not be established. Never permits a submit.
-    Unknown { reason: String },
+    Unknown {
+        reason: String,
+        /// Admission identity independently proven for the recorded generation, even when its
+        /// execution is not visible yet. Persist it without changing the state or evidence.
+        queue_transaction_id: Option<u64>,
+    },
 }
 
 /// The result of asking a provider to create the funding request.
@@ -517,6 +526,9 @@ pub(crate) struct RecordedRequest {
     /// The canonical UTC age anchor: local creation time for this process's durable `Prepared`
     /// record, or finalized chain admission time after adopting an external queue request.
     pub(crate) created_at_unix: u64,
+    /// Finalized execution already observed by this client. Unbound history matches remain
+    /// conservative candidates; the provider must validate their identity before reusing them.
+    pub(crate) evidence: Option<FundingEvidence>,
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -665,11 +677,16 @@ impl FundingJournalRecord {
             // An execution match with no parseable id can come from a generation-invariant history
             // fallback. It may forbid a submit, but cannot prove this generation safe to forget.
             FundingState::Executed => {
-                self.pending_transaction_id
+                let known_id = self
+                    .pending_transaction_id
                     .as_deref()
-                    .and_then(|id| id.parse::<u64>().ok())
-                    .is_none()
-                    || self.evidence.is_none()
+                    .and_then(|id| id.parse::<u64>().ok());
+                known_id.is_none()
+                    || !self.evidence.as_ref().is_some_and(|evidence| {
+                        evidence.verdict == "executed"
+                            && evidence.queue_transaction_id == known_id
+                            && evidence.delivery_message_id.is_some()
+                    })
             }
             FundingState::Expired | FundingState::Satisfied => false,
         }
@@ -677,13 +694,18 @@ impl FundingJournalRecord {
 
     /// The generation a finalized execution retires, when the verdict can be bound to it.
 
-    /// Only a parseable recorded queue id binds a `TransactionSent` to THIS generation; a
+    /// Only a confirmed queue identity binds a `TransactionSent` to THIS generation; a
     /// generation-invariant history fallback may forbid a submit, but can never say which
     /// generation executed.
     fn retirable_generation(&self) -> Option<u32> {
         self.pending_transaction_id
             .as_deref()
             .and_then(|id| id.parse::<u64>().ok())
+            .filter(|id| {
+                self.evidence
+                    .as_ref()
+                    .is_some_and(|evidence| evidence.queue_transaction_id == Some(*id))
+            })
             .map(|_| self.generation)
     }
 
@@ -758,6 +780,9 @@ impl FundingJournalRecord {
             transaction_hash: self.transaction_hash.clone(),
             submit_attempted: self.submit_attempted,
             created_at_unix: self.created_at_unix,
+            evidence: (self.state == FundingState::Executed)
+                .then(|| self.evidence.clone())
+                .flatten(),
         }
     }
 
@@ -1927,6 +1952,9 @@ fn funding_timeout_refusal(
             let cause = if evidence.delivery_message_id.is_some() {
                 " An earlier Vault transfer had already executed and the Hot has not shown its \
                  credit yet, so this run submitted nothing."
+            } else if evidence.queue_transaction_id.is_some() {
+                " The original Vault request is confirmed executed, but its finalized Hot delivery \
+                 receipt is still missing, so this run submitted nothing. Retain the funding journal."
             } else {
                 " An earlier Vault transfer had already executed but could not be bound to this \
                  request, so this run submitted nothing rather than risk a second transfer."
@@ -1992,6 +2020,7 @@ mod issue_1621_nothing_pending_is_not_waiting_for_you {
     fn unbindable_execution() -> FundingNotice {
         FundingNotice::RequestExecuted {
             evidence: FundingEvidence {
+                queue_transaction_id: None,
                 verdict: "executed".to_string(),
                 source: "finalized history".to_string(),
                 observed_at_unix: Some(1_787_173_349),
@@ -2279,6 +2308,18 @@ fn close_journal_if_open(
     if !record.is_open() {
         return Ok(());
     }
+    // An independently sufficient balance may fund the command, but must not erase an executed
+    // transfer whose delivery is still unknown. Otherwise spending that balance could expose the
+    // same shortfall again while the original transfer is still in flight.
+    if record.state == FundingState::Executed
+        && record.retirable_generation().is_some()
+        && record
+            .evidence
+            .as_ref()
+            .is_some_and(|evidence| evidence.delivery_message_id.is_none())
+    {
+        return Ok(());
+    }
     if record.needs_reconciliation_before_close() {
         if let Some(pending) = record.pending_transaction_id.as_deref() {
             bail!(
@@ -2385,8 +2426,8 @@ where
         // labelling it `token=2` would have the operator send a currency the wait never looks
         // at, and the command would time out however much they sent. (The deploy case differs
         // because its code carries `flag=16`, which is what converts the arriving SHELL into
-        // native vmshell -- measured in `ledger.md`: at flag 1 the same ECC[2] arrives as
-        // ECC[2]. Being uninit is not what converts it, and this comment used to say it was.)
+        // native vmshell -- measured on chain: at flag 1 the same ECC[2] arrives as ECC[2].
+        // Being uninit is not what converts it, and this comment used to say it was.)
         // * `native_shortfall` is capped by FUNDING_WALLET_NATIVE_FLOOR_RAW, ~0.507 vmshell, so
         // `div_ceil(SHELL_UNIT).max(1)` is 1 for every possible value. The line above says
         // "short 100 SHELL" and the code beneath it would open the send screen pre-filled with
@@ -2473,10 +2514,13 @@ where
             // retire it before opening the next generation for today's exact shortfall. An id-less
             // or malformed-id history fallback remains conservative: it may forbid a submit, but
             // cannot prove which generation executed.
-            let retired_generation = open.retirable_generation();
             let mut record = open;
+            if let Some(id) = evidence.queue_transaction_id {
+                record.pending_transaction_id = Some(id.to_string());
+            }
             record.state = FundingState::Executed;
             record.evidence = Some(evidence.clone());
+            let retired_generation = record.retirable_generation();
             record.last_checked_at_unix = Some(unix_now_secs());
             store_funding_journal(data_dir, &record)?;
             if retired_generation.is_some() && evidence.delivery_message_id.is_some() {
@@ -2599,7 +2643,16 @@ where
             }
             Ok(FundingNotice::RequestExecuted { evidence })
         }
-        RequestPresence::Unknown { reason } => {
+        RequestPresence::Unknown {
+            reason,
+            queue_transaction_id,
+        } => {
+            if let Some(id) = queue_transaction_id {
+                let mut record = open;
+                record.pending_transaction_id = Some(id.to_string());
+                record.last_checked_at_unix = Some(unix_now_secs());
+                store_funding_journal(data_dir, &record)?;
+            }
             // Not proven absent, so not submittable. The record keeps whatever state the chain last
             // proved; nothing here advances it.
             eprintln!(
@@ -2732,13 +2785,16 @@ where
         }
         RequestPresence::Executed { evidence } => {
             let mut record = record;
+            if let Some(id) = evidence.queue_transaction_id {
+                record.pending_transaction_id = Some(id.to_string());
+            }
             record.state = FundingState::Executed;
             record.evidence = Some(evidence.clone());
             record.last_checked_at_unix = Some(unix_now_secs());
             store_funding_journal(data_dir, &record)?;
             return Ok(FundingNotice::RequestExecuted { evidence });
         }
-        RequestPresence::Unknown { reason } => {
+        RequestPresence::Unknown { reason, .. } => {
             eprintln!(
                 "{operation}: cannot establish whether a Vault -> Hot funding request for \
                  {hot_address} already exists ({reason}). Not submitting one. It remains recorded \

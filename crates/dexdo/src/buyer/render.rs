@@ -7,9 +7,11 @@
 //! [`crate::buyer::verify::StreamVerifier`]; chunks arrive here already
 //! past it (the verdict affects accept/STOP, B10).
 
+use dexdo_core::params::ReasoningEffort;
 use dexdo_proto::{BillingUsage, CanonRequest, ChatMessage, SamplingParams};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use std::collections::BTreeMap;
 
 // ---------------------------------------------------------------------------
 // OpenAI chat-completions: consumer request.
@@ -22,6 +24,7 @@ pub struct OpenAiChatRequest {
     /// Kept for the "outside the frame -> reject" check.
     #[serde(default)]
     pub model: Option<String>,
+    pub prompt_cache_key: Option<String>,
     pub messages: Vec<OpenAiMessage>,
     #[serde(default)]
     pub temperature: Option<f64>,
@@ -35,6 +38,51 @@ pub struct OpenAiChatRequest {
     pub stream_options: Option<OpenAiStreamOptions>,
     #[serde(default)]
     pub tools: Vec<Value>,
+    #[serde(default)]
+    pub reasoning_effort: Option<Value>,
+    // Preserve legacy handling of unrelated unknown fields; reasoning controls must not disappear.
+    #[serde(flatten)]
+    pub extra_fields: BTreeMap<String, Value>,
+}
+
+impl OpenAiChatRequest {
+    pub fn validate_reasoning(&self) -> Result<(), String> {
+        for field in [
+            "reasoning",
+            "enable_thinking",
+            "thinking",
+            "thinking_budget",
+            "reasoning_budget",
+            "chat_template_kwargs",
+            "include_reasoning",
+            "disable_reasoning",
+            "reasoning_format",
+            "think",
+            "thinking_token_budget",
+            "reasoning_control",
+            "separate_reasoning",
+            "stream_reasoning",
+        ] {
+            if self.extra_fields.contains_key(field) {
+                return Err(format!(
+                    "unsupported Chat Completions field: {field}; use reasoning_effort"
+                ));
+            }
+        }
+        reasoning_disabled(self.reasoning_effort.as_ref()).map(|_| ())
+    }
+}
+
+fn reasoning_disabled(effort: Option<&Value>) -> Result<bool, String> {
+    match effort {
+        None => Ok(false),
+        Some(Value::String(value)) if value == "none" => Ok(true),
+        Some(Value::String(value)) if ReasoningEffort::parse(value).is_some() => Ok(false),
+        Some(_) => Err(
+            "unsupported reasoning effort: expected none, minimal, low, medium, high, xhigh, or max"
+                .into(),
+        ),
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -82,10 +130,19 @@ pub fn openai_to_canon(req: OpenAiChatRequest) -> CanonRequest {
         max_tokens: req.max_tokens.unwrap_or(0),
         stop: req.stop.map(StringOrVec::into_vec).unwrap_or_default(),
         greedy: false,
+        disable_reasoning: req.reasoning_effort.as_ref().is_some_and(|v| v == "none"),
+        reasoning_effort: req
+            .reasoning_effort
+            .as_ref()
+            .and_then(Value::as_str)
+            .filter(|value| ReasoningEffort::parse(value).is_some())
+            .map(str::to_owned),
     };
     CanonRequest {
         messages,
         params: Some(params),
+        prompt_cache_key: req.prompt_cache_key,
+        ..Default::default()
     }
 }
 
@@ -97,6 +154,7 @@ pub fn openai_to_canon(req: OpenAiChatRequest) -> CanonRequest {
 #[serde(deny_unknown_fields)]
 struct ResponsesRequest {
     model: Option<String>,
+    prompt_cache_key: Option<String>,
     input: Value,
     #[serde(default)]
     instructions: Option<String>,
@@ -114,6 +172,14 @@ struct ResponsesRequest {
     parallel_tool_calls: Option<bool>,
     #[serde(default)]
     text: Option<Value>,
+    #[serde(default)]
+    reasoning: Option<ResponsesReasoning>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ResponsesReasoning {
+    effort: Value,
 }
 
 pub struct ResponsesTextRequest {
@@ -127,6 +193,7 @@ pub struct ResponsesTextRequest {
 pub fn responses_text_request(body: Value) -> Result<ResponsesTextRequest, String> {
     let request: ResponsesRequest = serde_json::from_value(body)
         .map_err(|error| format!("invalid or unsupported Responses field: {error}"))?;
+    let disable_reasoning = reasoning_disabled(request.reasoning.as_ref().map(|r| &r.effort))?;
     if request.store == Some(true) {
         return Err("unsupported Responses field: store=true".into());
     }
@@ -181,10 +248,19 @@ pub fn responses_text_request(body: Value) -> Result<ResponsesTextRequest, Strin
         stream: request.stream,
         canon: CanonRequest {
             messages,
+            prompt_cache_key: request.prompt_cache_key,
             params: Some(SamplingParams {
                 max_tokens: request.max_output_tokens.unwrap_or(0),
+                disable_reasoning,
+                reasoning_effort: request
+                    .reasoning
+                    .as_ref()
+                    .and_then(|r| r.effort.as_str())
+                    .filter(|value| ReasoningEffort::parse(value).is_some())
+                    .map(str::to_owned),
                 ..Default::default()
             }),
+            ..Default::default()
         },
     })
 }
@@ -569,10 +645,13 @@ pub fn anthropic_to_canon(req: AnthropicRequest) -> CanonRequest {
         max_tokens: req.max_tokens.unwrap_or(0),
         stop: req.stop_sequences.unwrap_or_default(),
         greedy: false,
+        disable_reasoning: false,
+        reasoning_effort: None,
     };
     CanonRequest {
         messages,
         params: Some(params),
+        ..Default::default()
     }
 }
 
@@ -674,6 +753,9 @@ mod tests {
         assert_eq!(request.canon.params.unwrap().max_tokens, 8);
 
         let usage = BillingUsage {
+            charged_tokens: None,
+            cache_read_tokens: 0,
+            cache_write_tokens: 0,
             input_tokens: 3,
             output_tokens: 7,
             total_tokens: 10,
@@ -720,6 +802,9 @@ mod tests {
     #[test]
     fn responses_empty_text_is_failed_without_usage() {
         let usage = BillingUsage {
+            charged_tokens: None,
+            cache_read_tokens: 0,
+            cache_write_tokens: 0,
             input_tokens: 1,
             output_tokens: 8,
             total_tokens: 9,
@@ -750,7 +835,7 @@ mod tests {
             ),
             (serde_json::json!({"input": "hi", "store": true}), "store"),
             (
-                serde_json::json!({"input": "hi", "reasoning": {"effort": "high"}}),
+                serde_json::json!({"input": "hi", "reasoning": {"effort": "invalid"}}),
                 "reasoning",
             ),
             (
@@ -767,6 +852,74 @@ mod tests {
 
     proptest! {
         #[test]
+        fn reasoning_2172_levels_preserve_the_exact_request(
+            effort in proptest::sample::select(vec![
+                ReasoningEffort::Minimal, ReasoningEffort::Low, ReasoningEffort::Medium,
+                ReasoningEffort::High, ReasoningEffort::XHigh, ReasoningEffort::Max,
+            ]),
+            content in ".*", max_tokens: u32,
+        ) {
+            let chat: OpenAiChatRequest = serde_json::from_value(serde_json::json!({
+                "messages":[{"role":"user","content":content}],
+                "max_tokens":max_tokens,"reasoning_effort":effort.as_str()
+            })).unwrap();
+            prop_assert!(chat.validate_reasoning().is_ok());
+            let chat = openai_to_canon(chat);
+            let responses = responses_text_request(serde_json::json!({
+                "input":content,"reasoning":{"effort":effort.as_str()}
+            })).unwrap().canon;
+            prop_assert_eq!(&chat.messages, &responses.messages);
+            for params in [chat.params.unwrap(), responses.params.unwrap()] {
+                prop_assert!(!params.disable_reasoning);
+                prop_assert_eq!(params.reasoning_effort.as_deref(), Some(effort.as_str()));
+            }
+        }
+
+        #[test]
+        fn prompt_cache_key_2094_preserves_text_and_optional_key(
+            key in proptest::option::of(".*"), instructions in ".*", prompt in ".*"
+        ) {
+            let messages = serde_json::json!([
+                {"role": "system", "content": instructions}, {"role": "user", "content": prompt}
+            ]);
+            let chat = openai_to_canon(serde_json::from_value(serde_json::json!({
+                "messages": messages, "prompt_cache_key": key
+            })).unwrap());
+            let responses = responses_text_request(serde_json::json!({
+                "instructions": instructions, "input": prompt, "prompt_cache_key": key
+            })).unwrap().canon;
+            prop_assert_eq!(&chat.prompt_cache_key, &key);
+            prop_assert_eq!(&responses.prompt_cache_key, &key);
+            prop_assert_eq!(&chat.messages, &responses.messages);
+            prop_assert_eq!(&chat.messages[0].content, &instructions);
+            prop_assert_eq!(&chat.messages[1].content, &prompt);
+        }
+
+        #[test]
+        fn reasoning_2090_preserves_sampling_and_prompt(
+            disabled: bool, max_tokens: u32, temperature in 0.1f64..1.0f64,
+            content in "[a-z ]{1,40}", key in proptest::option::of("[a-z]{1,16}")
+        ) {
+            let mut body = serde_json::json!({
+                "messages":[{"role":"user","content":content}],
+                "temperature":temperature,"max_tokens":max_tokens,"stop":"END",
+                "unrelated_legacy_field":true,"prompt_cache_key":key
+            });
+            if disabled { body["reasoning_effort"] = serde_json::json!("none"); }
+            let request: OpenAiChatRequest = serde_json::from_value(body).unwrap();
+            prop_assert!(request.validate_reasoning().is_ok());
+            let canon = openai_to_canon(request);
+            prop_assert_eq!(&canon.prompt_cache_key, &key);
+            let params = canon.params.unwrap();
+            prop_assert_eq!(params.disable_reasoning, disabled);
+            prop_assert_eq!(params.max_tokens, max_tokens);
+            prop_assert_eq!(params.temperature, temperature);
+            prop_assert_eq!(params.stop, vec!["END"]);
+            prop_assert!(!params.greedy);
+            prop_assert_eq!(canon.messages[0].content.as_str(), content.as_str());
+        }
+
+        #[test]
         fn responses_never_ignores_an_unknown_top_level_field(field in "[a-z]{1,16}") {
             let field = format!("unsupported_{field}");
             let mut body = serde_json::json!({"input": "hi"});
@@ -780,6 +933,7 @@ mod tests {
     fn openai_request_maps_to_canon_without_model() {
         let req = OpenAiChatRequest {
             model: Some("untrusted-model".into()),
+            prompt_cache_key: None,
             messages: vec![OpenAiMessage {
                 role: "user".into(),
                 content: "hi".into(),
@@ -790,6 +944,8 @@ mod tests {
             stream: true,
             stream_options: None,
             tools: vec![],
+            reasoning_effort: None,
+            extra_fields: BTreeMap::new(),
         };
         let canon = openai_to_canon(req);
         assert_eq!(canon.messages.len(), 1);
@@ -802,6 +958,9 @@ mod tests {
     #[test]
     fn openai_usage_is_provider_native_for_aggregated_and_streamed_responses() {
         let usage = BillingUsage {
+            charged_tokens: None,
+            cache_read_tokens: 0,
+            cache_write_tokens: 0,
             input_tokens: 7,
             output_tokens: 57,
             total_tokens: 64,

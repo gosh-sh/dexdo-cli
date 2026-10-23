@@ -1652,13 +1652,9 @@ fn is_note_deploy_history_proof_expired_error(error: &anyhow::Error) -> bool {
     crate::cli::note_cmd::note_deploy_has_exact_finalized_rootpn_exit_code(error, 403)
 }
 
-/// `dex::ERR_INVALID_ZKPROOF` (137) finalized by RootPN, which is the OPPOSITE of the 403 next to it.
-
-/// 403 is a race against the node's history window and is answered by proving again; 137 says the
-/// proof's public inputs disagree with the `value`/`tokenType` RootPN was handed, which no retry can
-/// change. Both arrive as "the submit failed", and found them sharing one outcome -- so they are
-/// separated here by the exact finalized exit code, never by matching text.
-fn is_note_deploy_zk_public_input_mismatch_error(error: &anyhow::Error) -> bool {
+/// RootPN uses 137 for nominal/type binding failures AND a rejected ZK verification.
+/// The finalized code alone cannot establish which check failed.
+fn is_note_deploy_invalid_zkproof_error(error: &anyhow::Error) -> bool {
     crate::cli::note_cmd::note_deploy_has_exact_finalized_rootpn_exit_code(error, 137)
 }
 
@@ -1670,17 +1666,20 @@ pub(crate) fn note_deploy_error(
     if is_note_deploy_history_proof_expired_error(&error) {
         anyhow::anyhow!(
             "note deploy failed: history proof expired (exit 403). The same paid voucher recovery is preserved; \
-             re-run the same `dexdo note deploy` command with its `--recovery` file later \
+             run `dexdo note recover` with its original `--recovery` file later \
              (action=resume_same_paid_voucher_later). \
              Do not fund a new voucher. Raw error: deploy PrivateNote from wallet \
              {funding_multisig_address}: {error}"
         )
-    } else if is_note_deploy_zk_public_input_mismatch_error(&error) {
+    } else if is_note_deploy_invalid_zkproof_error(&error) {
         anyhow::anyhow!(
-            "note deploy failed: the proof's public inputs do not match what RootPN was given \
-             (exit 137, dex::ERR_INVALID_ZKPROOF). This is NOT the 403 history-proof race: proving \
-             the same voucher again, on any history layer, reverts identically \
-             (action=do_not_retry_this_voucher). Raw error: deploy PrivateNote from wallet \
+            "note deploy failed: RootPN rejected the proof (exit 137, dex::ERR_INVALID_ZKPROOF). \
+             This code can mean a nominal/token-type mismatch or a ZK verifier failure; the exact \
+             cause is not established. The paid voucher recovery is preserved. Inspect its event, \
+             public inputs and verifier compatibility, then run `dexdo note recover` with its original \
+             `--recovery` file; it reconciles the submission and reproves once when safe. \
+             Do not fund a new voucher (action=inspect_paid_voucher_proof). \
+             Raw error: deploy PrivateNote from wallet \
              {funding_multisig_address}: {error}"
         )
     } else if is_note_deploy_wallet_busy_error(&error) {

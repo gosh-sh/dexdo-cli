@@ -7,7 +7,8 @@
 //! the endpoint against", and the rows prove the difference three ways: `run_note_deploy` proves
 //! its manifest's `network` against the endpoint before it connects, `note_pick::balance_reader`
 //! takes its endpoint from a manifest but never holds it against that manifest's label, and
-//! `run_note_recover` has no second opinion to hold anything against at all. Three situations, one
+//! `run_note_recover` requires its journal endpoint to match the selected manifest before a
+//! pending paid deploy may resume. Completed-note recovery only reads the saved endpoint. One
 //! spelling. Reading the list as the set of unchecked paths overstates it, in the direction that
 //! sends a reader to the wrong site.
 
@@ -41,14 +42,10 @@
 
 /// Whether a site can tell which chain it is dialling, and whether anyone checked.
 
-/// Three states rather than a yes/no, because the two `false` halves have different repairs and
-/// collapsing them is how this set got read as uniform. A path with nothing to compare needs a
-/// declared network invented for it; a path that has one and ignores it needs one line.
+/// Spending paths require one authoritative manifest. Read-only paths may retain an unproved
+/// endpoint source; they cannot submit a chain operation.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum DeclaredNetwork {
-    /// Nothing on this path names a chain. `note recover` takes its endpoint from the recovery
-    /// file and has no second opinion to hold it against.
-    None,
     /// A declared network is on hand -- a `--network` flag, a binding's own field, a manifest --
     /// and nothing compares it to the endpoint being dialled. An explicit `--endpoint` naming the
     /// other chain is accepted in silence.
@@ -83,12 +80,12 @@ struct Site {
 /// and not what, and the whole point of a ratchet is that the diff explains itself.
 const PRODUCTION_SITES: &[Site] = &[
     Site {
-        // `note recover` reads a getter off a note whose endpoint came out of the recovery file.
-        // The one site with no declared network anywhere on it.
+        // Pending paid recovery may submit RootPN and requires the selected manifest endpoint
+        // to match the journal. Completed journals keep their original read-only finalization.
         file: "cli/note_cmd.rs",
         function: "run_note_recover",
-        declared: DeclaredNetwork::None,
-        spends: false,
+        declared: DeclaredNetwork::OneSource,
+        spends: true,
     },
     Site {
         // The command that mints a note and spends the funding wallet -- and the one site that was

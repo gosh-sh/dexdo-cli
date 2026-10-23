@@ -13,20 +13,29 @@
 //! loopback endpoint.
 
 pub mod anthropic;
+mod closure;
+mod error;
 pub mod openai;
 mod stream;
+mod usage;
+
+use error::capacity_rejection;
+pub use error::{ConsumerError, ConsumerErrorCode};
 
 use crate::buyer::verify::Verdict;
 use crate::buyer::Buyer;
 use crate::seller::ModelsConfig;
 use anyhow::Result;
 use axum::body::{Body, Bytes};
+use axum::extract::DefaultBodyLimit;
 use axum::response::Response;
+use closure::{ClosureCategory, KnownChainState, RecoveryState, ServingDiagnostics};
 use dexdo_core::{
     params::{
-        CONTENT_PROBE_MAX_TOKENS, DEFAULT_BUYER_DEAD_GATEWAY_ACTION,
-        DEFAULT_BUYER_EMPTY_STREAM_ACTION, DEFAULT_BUYER_STALLS_MID_STREAM_ACTION,
-        DEFAULT_BUYER_VERIFICATION_BAIL_ACTION, MATCH_OPEN_TIMEOUT,
+        BUYER_API_REQUEST_BODY_MAX_BYTES, CONTENT_PROBE_MAX_TOKENS,
+        DEFAULT_BUYER_DEAD_GATEWAY_ACTION, DEFAULT_BUYER_EMPTY_STREAM_ACTION,
+        DEFAULT_BUYER_STALLS_MID_STREAM_ACTION, DEFAULT_BUYER_VERIFICATION_BAIL_ACTION,
+        MATCH_OPEN_TIMEOUT,
     },
     ChainBackend, Handover, Note, TokenContract, MATCH_OPEN_TIMEOUT_SECS,
 };
@@ -48,6 +57,9 @@ fn display_token_contract(token_contract: &str) -> String {
 pub(crate) const REQUEST_ID_HEADER: &str = "x-dexdo-request-id";
 
 pub(crate) fn consumer_request_id() -> String {
+    if let Some(id) = usage::current_request_id() {
+        return id;
+    }
     format!(
         "req-dexdo-{}-{:032x}",
         unix_now_secs(),
@@ -105,16 +117,13 @@ pub struct BuyerSubmitReconciliation {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DealInitError {
-    message: String,
+    error: ConsumerError,
     reconciliation: Option<BuyerSubmitReconciliation>,
 }
 
 impl DealInitError {
     pub fn new(message: impl Into<String>) -> Self {
-        Self {
-            message: message.into(),
-            reconciliation: None,
-        }
+        Self::with_code(ConsumerErrorCode::DealUnavailable, message)
     }
 
     pub fn with_reconciliation(
@@ -122,13 +131,13 @@ impl DealInitError {
         reconciliation: BuyerSubmitReconciliation,
     ) -> Self {
         Self {
-            message: message.into(),
+            error: ConsumerError::new(ConsumerErrorCode::PurchaseReconciliationRequired, message),
             reconciliation: Some(reconciliation),
         }
     }
 
     pub fn message(&self) -> &str {
-        &self.message
+        &self.error.message
     }
 
     pub fn reconciliation(&self) -> Option<&BuyerSubmitReconciliation> {
@@ -138,7 +147,7 @@ impl DealInitError {
 
 impl fmt::Display for DealInitError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter.write_str(&self.message)
+        formatter.write_str(self.message())
     }
 }
 
@@ -149,6 +158,7 @@ pub enum VerificationBailAction {
     Stop,
     Dispute,
     StopAndBlacklist,
+    KeepOpen,
 }
 
 impl VerificationBailAction {
@@ -157,6 +167,7 @@ impl VerificationBailAction {
             Self::Stop => "stop",
             Self::Dispute => "dispute",
             Self::StopAndBlacklist => "stop_and_blacklist",
+            Self::KeepOpen => "keep_open",
         }
     }
 }
@@ -166,6 +177,7 @@ pub enum DeadGatewayAction {
     RetryThenReclaim,
     NextSeller,
     FailClosed,
+    KeepOpen,
 }
 
 impl DeadGatewayAction {
@@ -174,6 +186,7 @@ impl DeadGatewayAction {
             Self::RetryThenReclaim => "retry_then_reclaim",
             Self::NextSeller => "next_seller",
             Self::FailClosed => "fail_closed",
+            Self::KeepOpen => "keep_open",
         }
     }
 }
@@ -183,6 +196,7 @@ pub enum EmptyStreamAction {
     Reclaim,
     NextSeller,
     FailClosed,
+    KeepOpen,
 }
 
 impl EmptyStreamAction {
@@ -191,6 +205,7 @@ impl EmptyStreamAction {
             Self::Reclaim => "reclaim",
             Self::NextSeller => "next_seller",
             Self::FailClosed => "fail_closed",
+            Self::KeepOpen => "keep_open",
         }
     }
 }
@@ -199,6 +214,7 @@ impl EmptyStreamAction {
 pub enum SellerStallsMidStreamAction {
     AcceptDeliveredThenReclaim,
     Dispute,
+    KeepOpen,
 }
 
 impl SellerStallsMidStreamAction {
@@ -206,6 +222,7 @@ impl SellerStallsMidStreamAction {
         match self {
             Self::AcceptDeliveredThenReclaim => "accept_delivered_then_reclaim",
             Self::Dispute => "dispute",
+            Self::KeepOpen => "keep_open",
         }
     }
 }
@@ -342,20 +359,17 @@ pub struct SubscriptionWeeklyBudget {
 
 /// What the pre-request admission gate decided.
 enum RouteBudget {
-    /// Billable tokens this request has reserved against the route. Holding it serializes requests
-    /// on one deal; dropping it returns the part not accepted by terminal usage.
+    /// Per-request payment authorization from the shared route budget.
     Admitted(RouteReservation),
-    /// Nothing is deliverable; the payload is the operator-facing reject text.
-    Exhausted(String),
+    /// Nothing is deliverable; preserve the cause alongside its diagnostic text.
+    Exhausted(ConsumerError),
 }
 
 /// An admitted request's claim on the route's remaining tokens.
 
-/// Reservation happens once, atomically, before the model is contacted. `granted` is the total
-/// input+output billing grant, not the output cap; the consumer's `max_tokens` remains output-only.
-/// What terminal usage does not consume comes back when this is dropped.
+/// `granted` bounds this request's accepted payment, separately from the output cap.
+/// Authorizations overlap; the seller atomically allocates the shared paid capacity at completion.
 struct RouteReservation {
-    reserved: Arc<AtomicU64>,
     granted: u64,
     used: u64,
 }
@@ -379,16 +393,10 @@ impl RouteReservation {
     }
 }
 
-impl Drop for RouteReservation {
-    fn drop(&mut self) {
-        self.reserved.fetch_sub(self.remaining(), Ordering::SeqCst);
-    }
-}
-
 /// Tell the seller the request's output-only limit.
 
-/// Admission now holds the whole free route remainder because provider-native input usage is unknown.
-/// That billing grant is sent separately. This function only clamps canonical `max_tokens` to the
+/// Admission authorizes payment up to the current remainder; shared requests may overlap.
+/// The billing grant is sent separately. This function only clamps canonical `max_tokens` to the
 /// consumer's requested output and the available grant, and returns the output cap enforced on reply.
 fn cap_canon_to_grant(canon: &mut dexdo_proto::CanonRequest, granted: u64) -> u64 {
     let granted = u32::try_from(granted).unwrap_or(u32::MAX);
@@ -407,6 +415,8 @@ fn cap_canon_to_grant(canon: &mut dexdo_proto::CanonRequest, granted: u64) -> u6
                 max_tokens: granted,
                 stop: Vec::new(),
                 greedy: false,
+                disable_reasoning: false,
+                reasoning_effort: None,
             });
             granted
         }
@@ -415,7 +425,7 @@ fn cap_canon_to_grant(canon: &mut dexdo_proto::CanonRequest, granted: u64) -> u6
 }
 
 const ORDINARY_BUDGET_EXHAUSTED: &str =
-    "active deal budget exhausted; waiting for renewal handover";
+    "active deal budget exhausted; authorize a new purchase explicitly";
 
 /// Refusal for a deal that still owes its one-per-deal identity verification and no longer has the
 /// budget to pay for that AND deliver an answer.
@@ -556,12 +566,19 @@ impl SubscriptionWeeklyBudget {
     /// Nothing is published until the whole coherent state has been validated. Publishing the week or
     /// its expiry before the ceiling that belongs to them would leave a stale positive ceiling looking
     /// fresh, and the next request would skip reconciliation entirely and serve it.
-    async fn reconcile(&self, ceiling: &AtomicU64, delivered: &AtomicU64) -> Result<(), String> {
+    async fn reconcile(
+        &self,
+        ceiling: &AtomicU64,
+        delivered: &AtomicU64,
+    ) -> Result<(), ConsumerError> {
         let token_contract = display_token_contract(&self.token_contract);
         if self.is_terminal() {
-            return Err(format!(
-                "subscription {} is terminal; the contract admits no further claim",
-                token_contract
+            return Err(ConsumerError::new(
+                ConsumerErrorCode::SubscriptionTerminal,
+                format!(
+                    "subscription {} is terminal; the contract admits no further claim",
+                    token_contract
+                ),
             ));
         }
         // Ask the chain to cross whatever it owes. A deal with nothing due answers ERR_SETTLE_WINDOW_OPEN
@@ -590,21 +607,28 @@ impl SubscriptionWeeklyBudget {
             return Err(format!(
                 "TokenContract {} is not a subscription; its budget has no weekly boundary",
                 token_contract
-            ));
+            )
+            .into());
         }
         if snapshot.state.disputed || snapshot.state.is_stopped() {
             self.terminal.store(true, Ordering::SeqCst);
-            return Err(format!(
-                "subscription {} is disputed/stopped; it cannot be revived by a quota refresh",
-                token_contract
+            return Err(ConsumerError::new(
+                ConsumerErrorCode::SubscriptionTerminal,
+                format!(
+                    "subscription {} is disputed/stopped; it cannot be revived by a quota refresh",
+                    token_contract
+                ),
             ));
         }
         if snapshot.subscription.term_is_over() {
             self.terminal.store(true, Ordering::SeqCst);
-            return Err(format!(
-                "subscription {} has served its full {}-week term; the claim ceiling is the \
+            return Err(ConsumerError::new(
+                ConsumerErrorCode::SubscriptionTerminal,
+                format!(
+                    "subscription {} has served its full {}-week term; the claim ceiling is the \
                  cumulative total already declared and no quota remains",
-                token_contract, snapshot.subscription.sub_weeks
+                    token_contract, snapshot.subscription.sub_weeks
+                ),
             ));
         }
         if !snapshot.state.opened {
@@ -613,7 +637,8 @@ impl SubscriptionWeeklyBudget {
             return Err(format!(
                 "subscription {} is not open; no weekly quota is servable",
                 token_contract
-            ));
+            )
+            .into());
         }
         let week = snapshot.subscription.week_index;
         let expires_at = snapshot.subscription.recorded_week_expires_at();
@@ -630,7 +655,8 @@ impl SubscriptionWeeklyBudget {
                  refusing rather than serving week {} on a read that lags the booking",
                 token_contract,
                 u32::from(week) + 1
-            ));
+            )
+            .into());
         }
         // Nothing booked, and the week on record has run out on the wall clock. Whether the contract
         // refused because no boundary was due or the submission never landed cannot be told apart
@@ -645,7 +671,8 @@ impl SubscriptionWeeklyBudget {
                 token_contract,
                 u32::from(week) + 1,
                 snapshot.subscription.sub_weeks
-            ));
+            )
+            .into());
         }
 
         // Everything below is computed BEFORE anything is published, so a failure here leaves the
@@ -708,13 +735,13 @@ impl SubscriptionWeeklyBudget {
             if rebased {
                 self.anchored_before_probe.store(false, Ordering::SeqCst);
             }
-            return Err(format!(
+            return Err(ConsumerError::new(ConsumerErrorCode::SubscriptionBudgetExhausted, format!(
                 "subscription {} week {} of {} is drawn down ({booked}); the next weekly quota opens \
                  at unix {expires_at} and the deal stays live until then",
                 token_contract,
                 u32::from(week) + 1,
                 snapshot.subscription.sub_weeks,
-            ));
+            )));
         }
         self.publish(week, expires_at, ceiling, published_ceiling);
         if rebased {
@@ -747,9 +774,6 @@ pub struct ApiDeal {
     /// (`max(token_ids.len(), 1)` per accepted chunk). It remains the implicit-terminal
     /// delivery witness; monetary accounting uses `billable_tokens` instead.
     route_visible_output_tokens: Arc<AtomicU64>,
-    /// Billable tokens handed out to admitted requests, used or still in flight. Admission moves this and
-    /// nothing else, so two requests can never be handed the same remainder.
-    reserved_billable_tokens: Arc<AtomicU64>,
     /// Live ceiling on the CUMULATIVE `billable_tokens` counter. An ordinary deal pins it to
     /// `route.max_tokens` for the life of the deal; a subscription republishes it from the contract's
     /// own claim ceiling every time a week boundary is BOOKED.
@@ -759,6 +783,7 @@ pub struct ApiDeal {
     accepted_output_generation: Arc<AtomicU64>,
     active_requests: Arc<AtomicU64>,
     last_request_started_unix_secs: Arc<AtomicU64>,
+    purchase_terms: Arc<OnceCell<(u128, u128)>>,
 }
 
 impl ApiDeal {
@@ -777,13 +802,13 @@ impl ApiDeal {
             content_gate,
             billable_tokens,
             route_visible_output_tokens,
-            reserved_billable_tokens: Arc::new(AtomicU64::new(0)),
             token_ceiling,
             weekly: None,
             last_accepted_output_unix_secs: Arc::new(AtomicU64::new(0)),
             accepted_output_generation: Arc::new(AtomicU64::new(0)),
             active_requests: Arc::new(AtomicU64::new(0)),
             last_request_started_unix_secs: Arc::new(AtomicU64::new(0)),
+            purchase_terms: Arc::new(OnceCell::new()),
         }
     }
 
@@ -816,7 +841,7 @@ impl ApiDeal {
         self.route_visible_output_tokens.load(Ordering::SeqCst)
     }
 
-    /// Tokens still deliverable under the published ceiling -- what has NOT been handed to a request.
+    /// Unspent paid capacity under the published ceiling. In-flight usage is not yet known.
     pub fn remaining_tokens(&self) -> u64 {
         if self.weekly.as_ref().is_some_and(|w| w.is_terminal()) {
             return 0;
@@ -825,7 +850,7 @@ impl ApiDeal {
         // request admission applies the authoritative pre-probe clamp immediately after its required
         // chain read.
         self.admission_ceiling(true)
-            .saturating_sub(self.reserved_billable_tokens.load(Ordering::SeqCst))
+            .saturating_sub(self.billable_tokens.load(Ordering::SeqCst))
     }
 
     /// The contract admits at most its canonical trial tick until `acceptProbe` has been observed
@@ -861,42 +886,17 @@ impl ApiDeal {
         published
     }
 
-    /// Reserve the route's entire free billable remainder atomically. Provider input is unknown until
-    /// terminal usage, so concurrent requests on one deal cannot safely share this reservation.
-
-    /// The full grant is needed because input cannot be predicted from `max_tokens`. The verification
-    /// floor still prevents consuming the last remainder on a probe that cannot be followed by an
-    /// answer. A compare-exchange loser recomputes both floor and free capacity; while the winner holds
-    /// the full remainder, every other request is refused, providing the one-in-flight invariant.
+    /// Authorize a request against the current paid remainder. Authorizations may overlap;
+    /// the seller enforces its slot limit and atomically allocates actual charges at completion.
     fn try_reserve(&self, probe_accepted: bool) -> Option<RouteReservation> {
-        let mut reserved = self.reserved_billable_tokens.load(Ordering::SeqCst);
-        loop {
-            let ceiling = self.admission_ceiling(probe_accepted);
-            let free = ceiling.saturating_sub(reserved);
-            let floor = self.content_gate.outstanding_verification_tokens();
-            let granted = free;
-            if granted <= floor {
-                return None;
-            }
-            match self.reserved_billable_tokens.compare_exchange(
-                reserved,
-                reserved.saturating_add(granted),
-                Ordering::SeqCst,
-                Ordering::SeqCst,
-            ) {
-                Ok(_) => {
-                    return Some(RouteReservation {
-                        reserved: self.reserved_billable_tokens.clone(),
-                        granted,
-                        used: 0,
-                    })
-                }
-                Err(observed) => reserved = observed,
-            }
-        }
+        let granted = self
+            .admission_ceiling(probe_accepted)
+            .saturating_sub(self.billable_tokens.load(Ordering::SeqCst));
+        (granted > self.content_gate.outstanding_verification_tokens())
+            .then_some(RouteReservation { granted, used: 0 })
     }
 
-    /// The pre-request admission gate: reserve the route's free billable remainder, or say why not.
+    /// Authorize payment from the route's shared paid remainder, or say why not.
 
     /// An ordinary deal exposes one tick until the authoritative open-state read observes an accepted
     /// probe, then answers from its fixed funded budget. A subscription reconciles against the chain
@@ -917,19 +917,25 @@ impl ApiDeal {
         _requested: Option<u32>,
         probe_accepted: bool,
     ) -> RouteBudget {
-        // Provider-native input usage is not known before the terminal record. The admitted request therefore
-        // holds the whole free route remainder as its total billing grant; its canonical `max_tokens` remains
-        // an independent output-only cap. The reservation guard returns every unused token at request end.
+        if let Some(error) = self.session.unresolved_usage_rejection() {
+            return RouteBudget::Exhausted(error);
+        }
+        // Provider-native input is known only at terminal usage. The grant limits this request's
+        // authorized payment; the shared seller ledger allocates the paid remainder exactly once.
+        // Canonical max_tokens remains an independent output-only cap.
         let Some(weekly) = self.weekly.as_ref() else {
             return match self.try_reserve(probe_accepted) {
                 Some(reservation) => RouteBudget::Admitted(reservation),
-                None => RouteBudget::Exhausted(self.exhausted_reason()),
+                None => RouteBudget::Exhausted(self.exhausted_reason(probe_accepted)),
             };
         };
         if weekly.is_terminal() {
-            return RouteBudget::Exhausted(format!(
-                "subscription {} is terminal; the contract admits no further claim",
-                display_token_contract(&self.route.token_contract)
+            return RouteBudget::Exhausted(ConsumerError::new(
+                ConsumerErrorCode::SubscriptionTerminal,
+                format!(
+                    "subscription {} is terminal; the contract admits no further claim",
+                    display_token_contract(&self.route.token_contract)
+                ),
             ));
         }
         // A route anchored before the trial tick was accepted must ask the chain: acceptance moves
@@ -951,7 +957,7 @@ impl ApiDeal {
         {
             return match self.try_reserve(probe_accepted) {
                 Some(reservation) => RouteBudget::Admitted(reservation),
-                None => RouteBudget::Exhausted(self.exhausted_reason()),
+                None => RouteBudget::Exhausted(self.exhausted_reason(probe_accepted)),
             };
         }
         match weekly
@@ -960,7 +966,7 @@ impl ApiDeal {
         {
             Ok(()) => match self.try_reserve(probe_accepted) {
                 Some(reservation) => RouteBudget::Admitted(reservation),
-                None => RouteBudget::Exhausted(self.exhausted_reason()),
+                None => RouteBudget::Exhausted(self.exhausted_reason(probe_accepted)),
             },
             Err(reason) => RouteBudget::Exhausted(reason),
         }
@@ -970,11 +976,33 @@ impl ApiDeal {
     /// its identity verification can be refused with budget left on the route, so the two
     /// cases do not share one sentence: "exhausted" would send an operator looking for a spent deal
     /// when the remainder is simply too small to verify and answer out of.
-    fn exhausted_reason(&self) -> String {
-        if self.content_gate.outstanding_verification_tokens() > 0 {
-            UNVERIFIED_BUDGET_CANNOT_COVER_VERIFICATION.to_string()
+    fn exhausted_reason(&self, probe_accepted: bool) -> ConsumerError {
+        let verification_tokens = self.content_gate.outstanding_verification_tokens();
+        let paid_ceiling = self.token_ceiling.load(Ordering::SeqCst);
+        if self.admission_ceiling(probe_accepted) < paid_ceiling
+            && paid_ceiling.saturating_sub(self.billable_tokens.load(Ordering::SeqCst))
+                > verification_tokens
+        {
+            ConsumerError::new(
+                ConsumerErrorCode::DealCapacityUnavailable,
+                "the trial tick's admission capacity cannot serve this request yet; retry after \
+                 authoritative probe acceptance and capacity reconciliation",
+            )
+        } else if verification_tokens > 0 {
+            ConsumerError::new(
+                ConsumerErrorCode::VerificationBudgetInsufficient,
+                UNVERIFIED_BUDGET_CANNOT_COVER_VERIFICATION,
+            )
+        } else if self.weekly.is_some() {
+            ConsumerError::new(
+                ConsumerErrorCode::SubscriptionBudgetExhausted,
+                "the current weekly budget is exhausted; wait for the next weekly cycle",
+            )
         } else {
-            ORDINARY_BUDGET_EXHAUSTED.to_string()
+            ConsumerError::new(
+                ConsumerErrorCode::DealBudgetExhausted,
+                ORDINARY_BUDGET_EXHAUSTED,
+            )
         }
     }
 
@@ -1015,6 +1043,7 @@ impl ApiDeal {
 
     pub fn accepted_output_guard(&self) -> dexdo_core::market::HeartbeatGuard {
         dexdo_core::market::HeartbeatGuard::new(self.accepted_output_generation.clone())
+            .with_stop_veto(self.session.unresolved_output_usage.clone())
     }
 
     pub(crate) fn begin_request(&self, now_secs: u64) -> ConsumerRequestGuard {
@@ -1026,8 +1055,13 @@ impl ApiDeal {
             accepted_output_generation: self.accepted_output_generation.clone(),
             session: self.session.clone(),
             failure_heartbeat: None,
+            failure_observed: false,
             reservation: None,
+            usage_phase: "answer",
             request_usage: BillingUsage {
+                charged_tokens: None,
+                cache_read_tokens: 0,
+                cache_write_tokens: 0,
                 input_tokens: 0,
                 output_tokens: 0,
                 total_tokens: 0,
@@ -1053,6 +1087,8 @@ const CLIENT_CLOSED_REQUEST_STATUS: u16 = 499;
 
 struct PendingRequestDelivery {
     events: Option<DeliveryEvents>,
+    usage: Option<Arc<crate::buyer::usage::UsageStore>>,
+    usage_history_complete: bool,
     token_contract: TokenContract,
     request_id: String,
     protocol: &'static str,
@@ -1074,7 +1110,40 @@ pub(crate) struct RequestDeliveryFinalizer {
     pending: Arc<StdMutex<Option<PendingRequestDelivery>>>,
 }
 
+// The phase scope belongs only to the OnceCell initializer, never its cached waiters.
+// Observation is durable before EOF; the existing billing callback remains the acceptance gate.
+tokio::task_local! {
+    static VERIFICATION_USAGE: (Option<RequestDeliveryFinalizer>, &'static str);
+}
+
+pub(super) fn observe_verification_usage(record: Option<BillingUsage>) {
+    let _ = VERIFICATION_USAGE.try_with(|(finalizer, phase)| {
+        if let Some(finalizer) = finalizer {
+            match record {
+                Some(record) => finalizer.persist_usage(phase, phase, record, false),
+                // A zero-valued state row carries only completeness, not invented provider work.
+                None => {
+                    finalizer.persist_usage(phase, "in_progress", BillingUsage::default(), false)
+                }
+            }
+        }
+    });
+}
+
 impl RequestDeliveryFinalizer {
+    fn persist_usage(&self, phase: &str, call_id: &str, record: BillingUsage, accepted: bool) {
+        self.with_pending(|pending| {
+            if let Some(store) = pending.usage.as_ref() {
+                if let Err(error) =
+                    store.record_call_usage(&pending.request_id, phase, call_id, record, accepted)
+                {
+                    pending.usage_history_complete = false;
+                    tracing::error!(%error, "buyer usage: could not persist call usage/state");
+                }
+            }
+        });
+    }
+
     fn new(pending: PendingRequestDelivery) -> Self {
         Self {
             pending: Arc::new(StdMutex::new(Some(pending))),
@@ -1108,6 +1177,11 @@ impl RequestDeliveryFinalizer {
         debug_assert_eq!(pending.request_id, delivery.request_id);
         debug_assert_eq!(pending.protocol, delivery.protocol);
         debug_assert_eq!(pending.streamed, delivery.streamed);
+        usage::finish_delivery(
+            pending.usage.as_deref(),
+            &delivery,
+            pending.usage_history_complete,
+        );
         report_request_delivery(pending.events.as_ref(), delivery);
     }
 
@@ -1128,9 +1202,12 @@ impl RequestDeliveryFinalizer {
                 return;
             };
             let events = pending.events.clone();
+            let store = pending.usage.clone();
+            let history_complete = pending.usage_history_complete;
             *slot = None;
-            (events, delivery)
+            (events, delivery, store, history_complete)
         };
+        usage::finish_delivery(prepared.2.as_deref(), &prepared.1, prepared.3);
         report_request_delivery(prepared.0.as_ref(), prepared.1);
     }
 
@@ -1165,32 +1242,33 @@ impl RequestDeliveryFinalizer {
                 false,
                 pending.provider_output_tokens < pending.output_limit_tokens,
             ));
-        report_request_delivery(
-            pending.events.as_ref(),
-            RequestDelivery {
-                token_contract: pending.token_contract,
-                request_id: pending.request_id,
-                protocol: pending.protocol,
-                streamed: pending.streamed,
-                http_status: pending.http_status,
-                failure_stage: Some("consumer_disconnect"),
-                billing_grant_tokens: pending.billing_grant_tokens,
-                output_limit_tokens: pending.output_limit_tokens,
-                visible_output_tokens: pending.visible_output_tokens,
-                rendered_tokens: pending.rendered_tokens,
-                route_delivered_tokens,
-                input_tokens: answer_usage.map(|usage| usage.input_tokens),
-                output_tokens: answer_usage.map(|usage| usage.output_tokens),
-                billable_tokens: answer_usage.map(|usage| usage.total_tokens),
-                request_input_tokens: request_usage.input_tokens,
-                request_output_tokens: request_usage.output_tokens,
-                request_billable_tokens: request_usage.total_tokens,
-                route_billable_tokens,
-                finish_reason: "cancelled",
-                truncated_by_output_limit,
-                ended_before_output_limit,
-            },
-        );
+        let store = pending.usage.clone();
+        let events = pending.events.clone();
+        let delivery = RequestDelivery {
+            token_contract: pending.token_contract,
+            request_id: pending.request_id,
+            protocol: pending.protocol,
+            streamed: pending.streamed,
+            http_status: pending.http_status,
+            failure_stage: Some("consumer_disconnect"),
+            billing_grant_tokens: pending.billing_grant_tokens,
+            output_limit_tokens: pending.output_limit_tokens,
+            visible_output_tokens: pending.visible_output_tokens,
+            rendered_tokens: pending.rendered_tokens,
+            route_delivered_tokens,
+            input_tokens: answer_usage.map(|usage| usage.input_tokens),
+            output_tokens: answer_usage.map(|usage| usage.output_tokens),
+            billable_tokens: answer_usage.map(|usage| usage.total_tokens),
+            request_input_tokens: request_usage.input_tokens,
+            request_output_tokens: request_usage.output_tokens,
+            request_billable_tokens: request_usage.total_tokens,
+            route_billable_tokens,
+            finish_reason: "cancelled",
+            truncated_by_output_limit,
+            ended_before_output_limit,
+        };
+        usage::finish_delivery(store.as_deref(), &delivery, pending.usage_history_complete);
+        report_request_delivery(events.as_ref(), delivery);
     }
 }
 
@@ -1199,12 +1277,15 @@ pub(crate) struct ConsumerRequestGuard {
     accepted_output_generation: Arc<AtomicU64>,
     session: Arc<SessionSettle>,
     failure_heartbeat: Option<dexdo_core::market::HeartbeatGuard>,
-    /// This request's whole free billing remainder. Dropped with the guard, which returns whatever
-    /// terminal input+output usage did not consume.
+    /// Keep recovery cancellation-safe after a real failure, without treating a caller's
+    /// cancellation of otherwise healthy work as a seller failure.
+    failure_observed: bool,
+    /// This request's payment authorization. Actual charged totals spend the shared route ceiling.
     reservation: Option<RouteReservation>,
     /// Every accepted provider terminal charged to this top-level consumer request, including the
     /// one-per-deal content-verification calls that can complete before the answer stream opens.
     request_usage: BillingUsage,
+    usage_phase: &'static str,
     /// Armed after admission. Normal terminal paths consume it; `Drop` emits the cancellation
     /// terminal when a handler future or streaming response body disappears first.
     delivery_finalizer: Option<RequestDeliveryFinalizer>,
@@ -1245,10 +1326,13 @@ impl ConsumerRequestGuard {
         protocol: &'static str,
         streamed: bool,
         output_limit_tokens: u64,
-    ) {
+    ) -> Result<()> {
         debug_assert!(self.delivery_finalizer.is_none());
+        let usage = usage::arm_request(&request_id, &deal.route.token_contract, streamed)?;
         self.delivery_finalizer = Some(RequestDeliveryFinalizer::new(PendingRequestDelivery {
             events,
+            usage,
+            usage_history_complete: true,
             token_contract: deal.route.token_contract.clone(),
             request_id,
             protocol,
@@ -1264,6 +1348,7 @@ impl ConsumerRequestGuard {
             observed_request_usage: None,
             prepared_delivery: None,
         }));
+        Ok(())
     }
 
     fn set_delivery_output_limit(&mut self, output_limit_tokens: u64) {
@@ -1317,6 +1402,7 @@ impl ConsumerRequestGuard {
             .ok_or_else(|| "consumer request output-token accounting overflow".to_string())?;
         let observed =
             BillingUsage::new(input_tokens, output_tokens, None).map_err(str::to_string)?;
+        self.persist_usage("answer", usage, false);
         let finalizer = self
             .delivery_finalizer
             .as_ref()
@@ -1368,8 +1454,24 @@ impl ConsumerRequestGuard {
             .output_tokens
             .checked_add(usage.output_tokens)
             .ok_or_else(|| "consumer request output-token accounting overflow".to_string())?;
-        let request_usage =
+        let mut request_usage =
             BillingUsage::new(request_input, request_output, None).map_err(str::to_string)?;
+        request_usage.cache_read_tokens = self
+            .request_usage
+            .cache_read_tokens
+            .checked_add(usage.cache_read_tokens)
+            .ok_or_else(|| "consumer request cache-read accounting overflow".to_string())?;
+        request_usage.cache_write_tokens = self
+            .request_usage
+            .cache_write_tokens
+            .checked_add(usage.cache_write_tokens)
+            .ok_or_else(|| "consumer request cache-write accounting overflow".to_string())?;
+        request_usage.charged_tokens = Some(
+            self.request_usage
+                .billable_tokens()
+                .checked_add(usage.billable_tokens())
+                .ok_or_else(|| "consumer request charged-token accounting overflow".to_string())?,
+        );
         // The existing anchor mutex is the acceptance cutover mutex. Every subscription chunk takes
         // it, including chunks from old reservations after the pre-probe flag has been cleared: a
         // chunk either commits before the cutover samples delivery, or validates the new ceiling.
@@ -1385,10 +1487,11 @@ impl ConsumerRequestGuard {
         let reservation = self.reservation.as_mut().ok_or_else(|| {
             "accepted billing usage has no admitted route reservation".to_string()
         })?;
-        let next_used = reservation.checked_used_after(usage.total_tokens)?;
-        deal.record_billable(usage.total_tokens)?;
+        let next_used = reservation.checked_used_after(usage.billable_tokens())?;
+        deal.record_billable(usage.billable_tokens())?;
         reservation.used = next_used;
         self.request_usage = request_usage;
+        self.persist_usage(self.usage_phase, usage, true);
         if let Some(finalizer) = self.delivery_finalizer.as_ref() {
             finalizer.with_pending(|pending| {
                 if pending.observed_answer_usage.is_some() {
@@ -1400,10 +1503,70 @@ impl ConsumerRequestGuard {
         Ok(())
     }
 
+    fn persist_usage(&self, phase: &str, record: BillingUsage, accepted: bool) {
+        if let Some(finalizer) = self.delivery_finalizer.as_ref() {
+            finalizer.persist_usage(phase, phase, record, accepted);
+            if accepted && phase != "answer" {
+                finalizer.persist_usage(phase, "in_progress", BillingUsage::default(), true);
+            }
+        }
+    }
+
+    fn pause_unresolved_usage(&mut self) {
+        self.session
+            .unresolved_output_usage
+            .store(true, Ordering::SeqCst);
+        self.session.disable_drop_backup();
+        if let Some(finalizer) = self.delivery_finalizer.as_ref() {
+            // On write failure the existing incomplete/unfinished request is the durable fallback.
+            finalizer.persist_usage(
+                self.usage_phase,
+                "in_progress",
+                BillingUsage::default(),
+                false,
+            );
+        }
+        self.complete();
+    }
+
+    fn verification_failure(&mut self, error: &anyhow::Error, output_started: bool) -> String {
+        let provider_output = error
+            .downcast_ref::<tonic::Status>()
+            .and_then(dexdo_proto::upstream_output_started);
+        if output_started || provider_output == Some(true) {
+            self.pause_unresolved_usage();
+        } else if let Some(finalizer) = self.delivery_finalizer.as_ref() {
+            // A failure before any output completes only this phase's state row.
+            finalizer.persist_usage(
+                self.usage_phase,
+                "in_progress",
+                BillingUsage::default(),
+                true,
+            );
+        }
+        error.to_string()
+    }
+
     pub(crate) fn arm_upstream_failure(&mut self) {
+        self.failure_observed = false;
         self.failure_heartbeat = Some(dexdo_core::market::HeartbeatGuard::new(
             self.accepted_output_generation.clone(),
         ));
+    }
+
+    pub(crate) fn observe_upstream_failure(&mut self) {
+        self.failure_observed = true;
+    }
+
+    /// A seller failure answered by the `buyer.on.*` field behind `failure`. Under `keep_open` the
+    /// failure belongs to this request alone: nothing is observed, so ending the request latches no
+    /// recovery episode and the next request runs the normal path on the same deal.
+    fn observe_policy_failure(&mut self, failure: ClosureCategory) {
+        if self.session.keeps_open(failure) {
+            self.complete();
+        } else {
+            self.observe_upstream_failure();
+        }
     }
 
     pub(crate) fn complete(&mut self) {
@@ -1453,10 +1616,12 @@ impl Drop for ConsumerRequestGuard {
                 self.session.route_billable_tokens(),
             );
         }
-        if self
-            .failure_heartbeat
-            .as_ref()
-            .is_some_and(dexdo_core::market::HeartbeatGuard::unchanged)
+        if self.failure_observed
+            && self.session.unresolved_usage_rejection().is_none()
+            && self
+                .failure_heartbeat
+                .as_ref()
+                .is_some_and(dexdo_core::market::HeartbeatGuard::unchanged)
         {
             self.session.close_recovery_episode(
                 RecoveryKind::ReclaimOpened,
@@ -1478,9 +1643,26 @@ pub struct RouteManager {
     replace_settled: bool,
     initializer_timeout: Duration,
     initializer_lock: Mutex<()>,
+    usage: StdMutex<Option<Arc<crate::buyer::usage::UsageStore>>>,
 }
 
 impl RouteManager {
+    fn bind_usage(&self, state: &ApiState) {
+        *self.usage.lock().expect("route usage lock poisoned") = state.usage.clone();
+    }
+
+    async fn persist_quota(&self, deal: &ApiDeal) -> Result<()> {
+        let usage = self
+            .usage
+            .lock()
+            .expect("route usage lock poisoned")
+            .clone();
+        if let Some(store) = usage {
+            usage::persist_deal_quota(deal, &store).await?;
+        }
+        Ok(())
+    }
+
     pub fn new(active: ApiDeal) -> Self {
         Self {
             active: RwLock::new(Some(active)),
@@ -1488,6 +1670,7 @@ impl RouteManager {
             replace_settled: false,
             initializer_timeout: MATCH_OPEN_TIMEOUT,
             initializer_lock: Mutex::new(()),
+            usage: StdMutex::new(None),
         }
     }
 
@@ -1498,6 +1681,7 @@ impl RouteManager {
             replace_settled: false,
             initializer_timeout,
             initializer_lock: Mutex::new(()),
+            usage: StdMutex::new(None),
         }
     }
 
@@ -1508,6 +1692,7 @@ impl RouteManager {
             replace_settled: true,
             initializer_timeout,
             initializer_lock: Mutex::new(()),
+            usage: StdMutex::new(None),
         }
     }
 
@@ -1522,6 +1707,7 @@ impl RouteManager {
             replace_settled: true,
             initializer_timeout,
             initializer_lock: Mutex::new(()),
+            usage: StdMutex::new(None),
         }
     }
 
@@ -1557,7 +1743,12 @@ impl RouteManager {
                     self.initializer_timeout.as_secs()
                 ))
             })??;
-        *self.active.write().await = Some(prepared.clone());
+        let mut active = self.active.write().await;
+        *active = Some(prepared.clone());
+        // Retain this already purchased route on failure; a retry must not execute another BUY.
+        self.persist_quota(&prepared).await.map_err(|error| {
+            DealInitError::new(format!("opened deal quota unavailable: {error}"))
+        })?;
         Ok(prepared)
     }
 
@@ -1568,8 +1759,13 @@ impl RouteManager {
     ) -> Result<(), dexdo_core::ChainError> {
         let mut active = self.active.write().await;
         if let Some(previous) = active.as_ref() {
+            if let Some(error) = previous.session.unresolved_usage_rejection() {
+                return Err(dexdo_core::ChainError::Chain(error.message));
+            }
             if previous.session.implicit_terminal_lacks_delivery() {
-                previous.session.close_local_api();
+                previous
+                    .session
+                    .close_local_api(ClosureCategory::NoDelivery, None);
                 previous.session.disable_drop_backup();
                 tracing::warn!(
                     %reason,
@@ -1580,10 +1776,24 @@ impl RouteManager {
                      delivered no tokens"
                 );
             } else {
-                previous.session.settle(reason).await?;
+                let heartbeat = previous.accepted_output_guard();
+                if !previous
+                    .session
+                    .settle_guarded(reason, Some(&heartbeat))
+                    .await?
+                    && !previous.session.is_settled()
+                {
+                    return Err(dexdo_core::ChainError::Chain(
+                        "automatic route settlement vetoed; keep the current route".into(),
+                    ));
+                }
             }
         }
-        *active = Some(next());
+        let next = next();
+        *active = Some(next.clone());
+        self.persist_quota(&next).await.map_err(|error| {
+            dexdo_core::ChainError::Chain(format!("opened deal quota unavailable: {error}"))
+        })?;
         Ok(())
     }
 
@@ -1642,7 +1852,7 @@ pub struct RequestDelivery {
     pub input_tokens: Option<u64>,
     /// Provider-native output usage of the answer stream, present only after its clean terminal.
     pub output_tokens: Option<u64>,
-    /// Provider-native checked input+output usage charged for the answer stream.
+    /// Provider-native checked input+output usage of the answer stream, including seller-funded excess.
     pub billable_tokens: Option<u64>,
     /// Provider-native input attributed to the whole top-level request, including completed
     /// verification and seller-claimable terminal usage observed before a cancelled clean EOF.
@@ -1847,6 +2057,7 @@ pub(crate) fn report_pre_answer_failure(
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum StreamErrorPolicyAction {
     RequestScoped,
+    ReconcileUsage,
     DeadGateway,
     SellerStallsMidStream,
 }
@@ -1861,25 +2072,36 @@ pub(crate) fn stream_error_policy_action(error: &str, received: u64) -> StreamEr
     }
 }
 
-pub(crate) async fn handle_stream_error_policy(
+async fn handle_stream_error_policy(
     deal: &ApiDeal,
     received: u64,
-    error: &str,
+    error: &stream::CanonStreamError,
+    request_guard: &mut ConsumerRequestGuard,
 ) -> StreamErrorPolicyAction {
-    let action = stream_error_policy_action(error, received);
+    let action = error.policy_action(received);
     match action {
         StreamErrorPolicyAction::RequestScoped => {}
+        StreamErrorPolicyAction::ReconcileUsage => request_guard.pause_unresolved_usage(),
         StreamErrorPolicyAction::DeadGateway => {
             let heartbeat = deal.accepted_output_guard();
             deal.session
                 .settle_dead_gateway("stream-error-before-token", &heartbeat)
                 .await;
+            if deal.session.keeps_open(ClosureCategory::DeadGateway) {
+                return StreamErrorPolicyAction::RequestScoped;
+            }
         }
         StreamErrorPolicyAction::SellerStallsMidStream => {
             let heartbeat = deal.accepted_output_guard();
             deal.session
                 .settle_seller_stalls_mid_stream("seller-stalls-mid-stream", &heartbeat)
                 .await;
+            if deal
+                .session
+                .keeps_open(ClosureCategory::SellerStallsMidStream)
+            {
+                return StreamErrorPolicyAction::RequestScoped;
+            }
         }
     }
     action
@@ -2025,8 +2247,7 @@ impl ContentGate {
     /// accepted probe charges its checked terminal input+output total against the held billing grant,
     /// and fails closed if that total does not fit. Zero once a definitive
     /// verdict is cached: the gate never probes twice, so its admission floor becomes zero. Each
-    /// later request still reserves the route's whole free billable remainder while provider-native
-    /// input is unknown.
+    /// later request receives a payment authorization from the shared remainder.
     pub(crate) fn outstanding_verification_tokens(&self) -> u64 {
         match &self.check {
             ContentCheck::Skip => 0,
@@ -2050,79 +2271,121 @@ impl ContentGate {
         buyer: &Buyer,
         deal: &ApiDeal,
         request_guard: &mut ConsumerRequestGuard,
-    ) -> Result<(), String> {
+    ) -> Result<()> {
         match &self.check {
             ContentCheck::Skip => Ok(()),
             ContentCheck::Probe { model_id } => {
                 let Some(models) = self.models.as_deref() else {
                     // A Probe gate is only built via `new`/`probe`, both of which carry the config; a missing
                     // config is a construction bug -- fail closed rather than silently pass a content check.
-                    return Err(
-                        "content gate: Probe selected without a loaded models config".to_string(),
-                    );
+                    return Err(anyhow::anyhow!(
+                        "content gate: Probe selected without a loaded models config"
+                    ));
                 };
                 // OUTER Err = transport error (NOT cached -> retried next request); INNER `Result<(), String>` =
                 // the cached definitive verdict (`Ok(())` pass, `Err(reason)` bail).
+
+                // Under `bad_output_scam = keep_open` the operator has switched this lever off: the
+                // request that saw the bail is refused with its reason, and the gate caches a pass so
+                // every later request is served on the same deal.
+                let mut kept_open_bail = None;
                 let cached: &Result<(), String> = self
                     .verdict
-                    .get_or_try_init::<String, _, _>(|| async {
+                    .get_or_try_init::<anyhow::Error, _, _>(|| async {
+                        deal.session.ensure_paid_phase()?;
                         // B8 content fingerprint. The `?` makes a transport error the OUTER Err (not cached);
                         // a definitive verdict goes through `Ok(...)`.
                         let (b8_output_limit, b8_grant) =
                             verification_stream_limits(request_guard.remaining_grant());
-                        let v8 = {
-                            let mut charge = |usage| request_guard.record_billing(deal, usage);
-                            let mut record_output = |tokens| deal.record_visible_output(tokens);
-                            buyer
-                                .behavioral_probe(
-                                    &deal.route.handover,
-                                    &deal.route.token_contract,
-                                    model_id,
-                                    b8_output_limit,
-                                    b8_grant,
-                                    models,
-                                    Some(&mut charge),
-                                    Some(&mut record_output),
+                        request_guard.usage_phase = "verification_b8";
+                        let history = request_guard.delivery_finalizer();
+                        let mut b8_output_started = false;
+                        let v8 = VERIFICATION_USAGE
+                            .scope((history, "verification_b8"), async {
+                                let mut charge = |usage| request_guard.record_billing(deal, usage);
+                                let mut record_output = |tokens| {
+                                    b8_output_started |= tokens > 0;
+                                    deal.record_visible_output(tokens)
+                                };
+                                buyer
+                                    .behavioral_probe(
+                                        &deal.route.handover,
+                                        &deal.route.token_contract,
+                                        model_id,
+                                        b8_output_limit,
+                                        b8_grant,
+                                        models,
+                                        Some(&mut charge),
+                                        Some(&mut record_output),
+                                    )
+                                    .await
+                            })
+                            .await
+                            .map_err(|error| {
+                                anyhow::anyhow!(
+                                    request_guard.verification_failure(&error, b8_output_started)
                                 )
-                                .await
-                                .map_err(|e| e.to_string())?
-                        };
+                            })?;
                         if let Verdict::Bail(r) = v8 {
                             deal.session
                                 .settle_verification_bail("content-identity-bail")
                                 .await;
+                            if deal.session.keeps_open(ClosureCategory::VerificationBail) {
+                                kept_open_bail = Some(r);
+                                return Ok(Ok(()));
+                            }
                             return Ok(Err(r));
                         }
                         // B7-full reference spot-check (greedy vs the official endpoint).
+                        deal.session.ensure_paid_phase()?;
                         let (b7_output_limit, b7_grant) =
                             verification_stream_limits(request_guard.remaining_grant());
-                        let v7 = {
-                            let mut charge = |usage| request_guard.record_billing(deal, usage);
-                            let mut record_output = |tokens| deal.record_visible_output(tokens);
-                            buyer
-                                .reference_spotcheck(
-                                    &deal.route.handover,
-                                    &deal.route.token_contract,
-                                    model_id,
-                                    b7_output_limit,
-                                    b7_grant,
-                                    models,
-                                    Some(&mut charge),
-                                    Some(&mut record_output),
+                        request_guard.usage_phase = "verification_b7";
+                        let history = request_guard.delivery_finalizer();
+                        let mut b7_output_started = false;
+                        let v7 = VERIFICATION_USAGE
+                            .scope((history, "verification_b7"), async {
+                                let mut charge = |usage| request_guard.record_billing(deal, usage);
+                                let mut record_output = |tokens| {
+                                    b7_output_started |= tokens > 0;
+                                    deal.record_visible_output(tokens)
+                                };
+                                buyer
+                                    .reference_spotcheck(
+                                        &deal.route.handover,
+                                        &deal.route.token_contract,
+                                        model_id,
+                                        b7_output_limit,
+                                        b7_grant,
+                                        models,
+                                        Some(&mut charge),
+                                        Some(&mut record_output),
+                                    )
+                                    .await
+                            })
+                            .await
+                            .map_err(|error| {
+                                anyhow::anyhow!(
+                                    request_guard.verification_failure(&error, b7_output_started)
                                 )
-                                .await
-                                .map_err(|e| e.to_string())?
-                        };
+                            })?;
                         if let Verdict::Bail(r) = v7 {
                             deal.session
                                 .settle_verification_bail("content-identity-bail")
                                 .await;
+                            if deal.session.keeps_open(ClosureCategory::VerificationBail) {
+                                kept_open_bail = Some(r);
+                                return Ok(Ok(()));
+                            }
                             return Ok(Err(r));
                         }
                         Ok(Ok(()))
                     })
                     .await?;
-                cached.clone()
+                if let Some(reason) = kept_open_bail {
+                    return Err(anyhow::Error::msg(reason));
+                }
+                cached.clone().map_err(anyhow::Error::msg)
             }
         }
     }
@@ -2137,6 +2400,9 @@ pub struct ApiState {
     pub frame_model: String,
     /// Locally trusted explicit `--mock-model` mode; never inferred from seller-supplied manifest data.
     pub mock_model: bool,
+    /// Existing service authorization for fresh continuation, used only for refusal diagnostics.
+    /// This flag never starts a purchase or changes route replacement policy.
+    pub renewal_enabled: bool,
     /// Active deal slot. A one-shot service never replaces it; continuous service mode may publish the next
     /// already-opened handover here while keeping the local HTTP listener alive.
     pub deals: Arc<RouteManager>,
@@ -2144,6 +2410,8 @@ pub struct ApiState {
     /// the record on the tracing surface only, which is what a test or an embedder that has no
     /// machine output wants; the CLI attaches its JSONL writer here.
     pub delivery_events: Option<DeliveryEvents>,
+    /// Durable local history, attached by the CLI for its instance.
+    pub usage: Option<Arc<crate::buyer::usage::UsageStore>>,
 }
 
 /// Session-scoped deal settlement. The consumer endpoint serves
@@ -2151,14 +2419,14 @@ pub struct ApiState {
 /// request. A single shared `Arc<SessionSettle>` lives on [`ApiState`]. The funds-safety guarantee is an
 /// **awaited** STOP -- a verification-bail/dispute (`settle().await` in a handler) or graceful shutdown
 /// (`serve()` awaits `settle("shutdown")`). [`Drop`] is ONLY a best-effort backup for abnormal teardown
-/// (crash/SIGKILL), never the guarantee. `settled` is set only after a terminal recovery action lands; `closed`
-/// gates the local API immediately after a policy incident even when recovery is still pending.
+/// (crash/SIGKILL), never the guarantee. `settled` is set only after a terminal recovery action lands;
+/// the first typed closure gates the local API immediately even when recovery is still pending.
 pub struct SessionSettle {
     chain: Arc<dyn ChainBackend>,
     token_contract: TokenContract,
     note: Arc<dyn Note>,
     settled: AtomicBool,
-    closed: AtomicBool,
+    diagnostics: StdMutex<ServingDiagnostics>,
     closed_tx: watch::Sender<bool>,
     recovery_episode: AtomicU8,
     recovery_closed_session: AtomicBool,
@@ -2181,6 +2449,8 @@ pub struct SessionSettle {
     /// from the figure the money path actually charged. `None` for a session that serves no consumer
     /// route (the one-shot terminal), which has no route-billing model here at all.
     route_billing: OnceLock<Arc<AtomicU64>>,
+    usage_quota: OnceLock<Arc<crate::buyer::usage::UsageStore>>,
+    unresolved_output_usage: Arc<AtomicBool>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -2358,7 +2628,7 @@ impl SessionSettle {
             token_contract,
             note,
             settled: AtomicBool::new(false),
-            closed: AtomicBool::new(false),
+            diagnostics: StdMutex::new(ServingDiagnostics::default()),
             closed_tx,
             recovery_episode: AtomicU8::new(0),
             recovery_closed_session: AtomicBool::new(false),
@@ -2372,6 +2642,8 @@ impl SessionSettle {
             client_stop_recorder: OnceLock::new(),
             route_delivery: OnceLock::new(),
             route_billing: OnceLock::new(),
+            usage_quota: OnceLock::new(),
+            unresolved_output_usage: Arc::new(AtomicBool::new(false)),
         }
     }
 
@@ -2444,7 +2716,7 @@ impl SessionSettle {
         if !self.implicit_terminal_lacks_delivery() {
             return false;
         }
-        self.close_local_api();
+        self.close_local_api(ClosureCategory::NoDelivery, None);
         self.disable_drop_backup();
         tracing::warn!(
             %reason,
@@ -2461,25 +2733,41 @@ impl SessionSettle {
     }
 
     async fn settle_on_exit(&self, reason: &str) -> Result<bool, dexdo_core::ChainError> {
+        if self.unresolved_usage_rejection().is_some() {
+            return Ok(false);
+        }
         match self.lifetime {
             SessionLifetimePolicy::SettleOnExit => {
                 if self.veto_implicit_terminal_without_delivery(reason) {
                     return Ok(false);
                 }
-                self.settle(reason).await
+                self.settle_guarded(reason, Some(&self.usage_stop_guard()))
+                    .await
             }
             SessionLifetimePolicy::Preserve => {
-                self.preserve_without_implicit_chain_write(reason);
+                self.preserve_without_implicit_chain_write(
+                    reason,
+                    ClosureCategory::PlannedShutdown,
+                    None,
+                );
                 Ok(false)
             }
         }
     }
 
-    fn preserve_without_implicit_chain_write(&self, reason: &str) -> bool {
+    fn preserve_without_implicit_chain_write(
+        &self,
+        reason: &str,
+        category: ClosureCategory,
+        policy_action: Option<&str>,
+    ) -> bool {
+        if self.unresolved_usage_rejection().is_some() {
+            return true;
+        }
         if self.lifetime != SessionLifetimePolicy::Preserve {
             return false;
         }
-        self.close_local_api();
+        self.close_local_api(category, policy_action);
         self.disable_drop_backup();
         tracing::info!(
             %reason,
@@ -2488,6 +2776,45 @@ impl SessionSettle {
             "consumer API: implicit terminal action vetoed; deal preserved"
         );
         true
+    }
+
+    /// Recheck admission after an async gate, before starting another paid phase.
+    fn ensure_paid_phase(&self) -> Result<(), ConsumerError> {
+        if let Some(error) = self.unresolved_usage_rejection() {
+            return Err(error);
+        }
+        if self.is_closed() {
+            return Err(ConsumerError::new(
+                ConsumerErrorCode::DealUnavailable,
+                "deal serving closed before this paid phase started",
+            ));
+        }
+        Ok(())
+    }
+
+    /// These automatic STOPs depend on accounting, not on whether fresh output arrived.
+    fn usage_stop_guard(&self) -> dexdo_core::market::HeartbeatGuard {
+        dexdo_core::market::HeartbeatGuard::new(Arc::new(AtomicU64::new(0)))
+            .with_stop_veto(self.unresolved_output_usage.clone())
+    }
+
+    fn unresolved_usage_rejection(&self) -> Option<ConsumerError> {
+        let pending = self.unresolved_output_usage.load(Ordering::SeqCst)
+            || self.usage_quota.get().is_some_and(|store| {
+                store.has_unresolved_output_usage(&self.token_contract).unwrap_or_else(|error| {
+                    tracing::error!(%error, "buyer usage: cannot verify unresolved output usage");
+                    true
+                })
+            });
+        if !pending {
+            return None;
+        }
+        self.unresolved_output_usage.store(true, Ordering::SeqCst);
+        self.disable_drop_backup();
+        Some(ConsumerError::new(
+            ConsumerErrorCode::UpstreamUsageUnresolved,
+            "provider output has no reconciled terminal usage; preserve this deal and reconcile the failed request before resuming",
+        ))
     }
 
     pub fn dead_gateway_action(&self) -> DeadGatewayAction {
@@ -2503,11 +2830,18 @@ impl SessionSettle {
         self.lifetime == SessionLifetimePolicy::Preserve
     }
 
+    /// A one-shot buyer exits with its only request. When that request failed under `keep_open`,
+    /// dropping the session must not submit the STOP the policy declined.
+    pub fn keep_open_after_drop(&self) {
+        self.disable_drop_backup();
+    }
+
     pub fn terminal_action(&self) -> Option<SessionTerminalAction> {
         SessionTerminalAction::from_code(self.terminal_action.load(Ordering::SeqCst))
     }
 
     fn record_terminal_action(&self, action: SessionTerminalAction) {
+        self.close_usage_quota();
         if action == SessionTerminalAction::ObservedTerminal {
             let _ = self.terminal_action.compare_exchange(
                 0,
@@ -2519,20 +2853,31 @@ impl SessionSettle {
             // A chain write is stronger evidence than a concurrent read-only terminal observation.
             self.terminal_action.store(action.code(), Ordering::SeqCst);
         }
+        self.diagnostics
+            .lock()
+            .expect("serving diagnostics lock poisoned")
+            .record_chain_state(if action == SessionTerminalAction::StreamDispute {
+                KnownChainState::Disputed
+            } else {
+                KnownChainState::Terminal
+            });
     }
 
     /// Whether the local API must reject new requests for this deal. This is distinct from terminal settlement:
     /// a policy failure closes serving immediately while leaving STOP-on-shutdown/retry recovery eligible.
     pub fn is_closed(&self) -> bool {
-        self.closed.load(Ordering::SeqCst)
+        self.diagnostics
+            .lock()
+            .expect("serving diagnostics lock poisoned")
+            .closure
+            .is_some()
     }
 
-    fn close_local_api(&self) -> bool {
-        if !self.closed.swap(true, Ordering::SeqCst) {
-            self.closed_tx.send_replace(true);
-            true
-        } else {
-            false
+    fn close_usage_quota(&self) {
+        if let Some(store) = self.usage_quota.get() {
+            if let Err(error) = store.close_deal_quota(&self.token_contract) {
+                tracing::error!(%error, "buyer usage: could not persist closed quota");
+            }
         }
     }
 
@@ -2582,7 +2927,9 @@ impl SessionSettle {
             .recovery_episode
             .compare_exchange(0, kind.code(), Ordering::SeqCst, Ordering::SeqCst)
             .is_ok();
-        if self.close_local_api() && self.recovery_episode.load(Ordering::SeqCst) == kind.code() {
+        if self.close_local_api(ClosureCategory::Recovery, None)
+            && self.recovery_episode.load(Ordering::SeqCst) == kind.code()
+        {
             self.recovery_closed_session.store(true, Ordering::SeqCst);
         }
         if started {
@@ -2596,7 +2943,13 @@ impl SessionSettle {
         started
     }
 
-    fn begin_recovery_attempt(&self, kind: RecoveryKind, handler_origin: bool) -> bool {
+    fn begin_recovery_attempt(
+        &self,
+        kind: RecoveryKind,
+        handler_origin: bool,
+        category: ClosureCategory,
+        policy_action: Option<&str>,
+    ) -> bool {
         let existing = self.recovery_episode.load(Ordering::SeqCst);
         let started = if existing == 0 {
             self.recovery_episode
@@ -2631,7 +2984,7 @@ impl SessionSettle {
             return false;
         }
         if handler_origin {
-            if self.close_local_api() {
+            if self.close_local_api(category, policy_action) {
                 self.recovery_closed_session.store(true, Ordering::SeqCst);
             }
             if !started {
@@ -2647,7 +3000,7 @@ impl SessionSettle {
         true
     }
 
-    fn cancel_recovery_without_post(&self, kind: RecoveryKind) {
+    fn cancel_recovery_without_post(&self, kind: RecoveryKind, previous_state: RecoveryState) {
         if self
             .recovery_episode
             .compare_exchange(kind.code(), 0, Ordering::SeqCst, Ordering::SeqCst)
@@ -2659,9 +3012,15 @@ impl SessionSettle {
             .store(false, Ordering::SeqCst);
         self.recovery_submit_may_have_landed
             .store(false, Ordering::SeqCst);
+        let mut diagnostics = self
+            .diagnostics
+            .lock()
+            .expect("serving diagnostics lock poisoned");
+        diagnostics.recovery_state = previous_state;
         if self.recovery_closed_session.swap(false, Ordering::SeqCst)
             && !self.settled.load(Ordering::SeqCst)
-            && self.closed.swap(false, Ordering::SeqCst)
+            && !diagnostics.verification_bailed
+            && diagnostics.closure.take().is_some()
         {
             self.closed_tx.send_replace(false);
         }
@@ -2675,30 +3034,85 @@ impl SessionSettle {
 
     /// A decrypted handover and a reachable gateway are not enough: showed that a stale handover can let the
     /// local endpoint serve a response while the TokenContract remains funded-but-never-opened and unaccounted.
-    pub async fn ensure_open_for_serving(&self) -> Result<dexdo_core::DealChainState, String> {
+    pub async fn ensure_open_for_serving(
+        &self,
+    ) -> Result<dexdo_core::DealChainState, ConsumerError> {
         let state = match self.chain.deal_state(&self.token_contract).await {
             Ok(Some(state)) => state,
             Ok(None) => {
+                // Once this session's purchase was observed open, absent code is terminal
+                // knowledge even if the financial refund is still being reconciled.
+                if self.usage_quota.get().is_some() {
+                    self.diagnostics
+                        .lock()
+                        .expect("serving diagnostics lock poisoned")
+                        .record_chain_state(KnownChainState::Terminal);
+                    self.close_usage_quota();
+                }
                 let reason = "deal state unavailable before serving user response".to_string();
                 self.fail_closed_before_serving(&reason).await;
-                return Err(reason);
+                return Err(ConsumerError::new(
+                    ConsumerErrorCode::DealUnavailable,
+                    reason,
+                ));
+            }
+            Err(dexdo_core::ChainError::Transport(error)) => {
+                let reason = format!(
+                    "deal state temporarily unreadable before serving user response: {error}"
+                );
+                tracing::warn!(
+                    %reason,
+                    token_contract = %display_token_contract(&self.token_contract),
+                    result = "request_fail_closed",
+                    "consumer API: refusing request until authoritative deal state is readable"
+                );
+                return Err(ConsumerError::new(
+                    ConsumerErrorCode::DealStateUnavailable,
+                    reason,
+                ));
             }
             Err(e) => {
                 let reason = format!("deal state unreadable before serving user response: {e}");
                 self.fail_closed_before_serving(&reason).await;
-                return Err(reason);
+                return Err(ConsumerError::new(
+                    ConsumerErrorCode::DealUnavailable,
+                    reason,
+                ));
             }
         };
         if state.funded && state.opened && !state.disputed {
+            if let Some(error) = self.unresolved_usage_rejection() {
+                return Err(error);
+            }
             return Ok(state);
         }
 
         let now_secs = unix_now_secs();
         let cleanup = unopened_cleanup_decision(state, now_secs);
         let reason = not_safely_open_reason(state, cleanup);
-        self.fail_closed_unopened_before_serving(&reason, cleanup)
+        let category = if state.is_stopped() {
+            self.diagnostics
+                .lock()
+                .expect("serving diagnostics lock poisoned")
+                .record_chain_state(KnownChainState::Terminal);
+            ClosureCategory::TerminalObserved
+        } else {
+            if state.disputed {
+                self.diagnostics
+                    .lock()
+                    .expect("serving diagnostics lock poisoned")
+                    .record_chain_state(KnownChainState::Disputed);
+            }
+            ClosureCategory::DealNotOpen
+        };
+        self.fail_closed_unopened_before_serving(&reason, cleanup, category)
             .await;
-        Err(reason)
+        let code = if state.funded && !state.opened && !state.disputed && !state.is_stopped() {
+            ConsumerErrorCode::DealNotOpened
+        } else {
+            ConsumerErrorCode::DealUnavailable
+        };
+        Err(ConsumerError::new(code, reason))
     }
 
     async fn fail_closed_before_serving(&self, reason: &str) {
@@ -2706,7 +3120,7 @@ impl SessionSettle {
         if self.settled.load(Ordering::SeqCst) {
             return;
         }
-        self.close_local_api();
+        self.close_local_api(ClosureCategory::ChainStateUnavailable, None);
         tracing::error!(
             %reason,
             token_contract = %display_token_contract(&self.token_contract),
@@ -2719,9 +3133,13 @@ impl SessionSettle {
         &self,
         reason: &str,
         cleanup: Option<UnopenedCleanupDecision>,
+        category: ClosureCategory,
     ) {
         if cleanup == Some(UnopenedCleanupDecision::Ready) {
-            match self.recover_cleanup_unopened(true).await {
+            match self
+                .recover_cleanup_unopened_with_cause(true, category)
+                .await
+            {
                 Ok(Some(s)) => {
                     tracing::warn!(
                         %reason,
@@ -2745,7 +3163,7 @@ impl SessionSettle {
             if self.settled.load(Ordering::SeqCst) {
                 return;
             }
-            self.close_local_api();
+            self.close_local_api(category, None);
             tracing::error!(
                 %reason,
                 token_contract = %display_token_contract(&self.token_contract),
@@ -2768,7 +3186,7 @@ impl SessionSettle {
             .store(false, Ordering::SeqCst);
         self.recovery_submit_may_have_landed
             .store(false, Ordering::SeqCst);
-        self.close_local_api();
+        self.close_local_api(ClosureCategory::TerminalObserved, None);
         tracing::info!(%reason, "consumer API: session deal marked recovered");
         true
     }
@@ -2785,7 +3203,7 @@ impl SessionSettle {
             .store(false, Ordering::SeqCst);
         self.recovery_submit_may_have_landed
             .store(false, Ordering::SeqCst);
-        self.close_local_api();
+        self.close_local_api(ClosureCategory::TerminalObserved, None);
         tracing::info!(%reason, "consumer API: session deal marked recovered");
         true
     }
@@ -2794,19 +3212,35 @@ impl SessionSettle {
         &self,
         handler_origin: bool,
     ) -> Result<Option<dexdo_core::Settlement>, dexdo_core::ChainError> {
-        if self.preserve_without_implicit_chain_write("cleanup-unopened") {
+        self.recover_cleanup_unopened_with_cause(handler_origin, ClosureCategory::Recovery)
+            .await
+    }
+
+    async fn recover_cleanup_unopened_with_cause(
+        &self,
+        handler_origin: bool,
+        category: ClosureCategory,
+    ) -> Result<Option<dexdo_core::Settlement>, dexdo_core::ChainError> {
+        if self.preserve_without_implicit_chain_write("cleanup-unopened", category, None) {
             return Ok(None);
         }
         let _guard = self.settle_lock.lock().await;
-        if self.settled.load(Ordering::SeqCst) {
+        if self.unresolved_usage_rejection().is_some() || self.settled.load(Ordering::SeqCst) {
             return Ok(None);
         }
-        if !self.begin_recovery_attempt(RecoveryKind::CleanupUnopened, handler_origin) {
+        if !self.begin_recovery_attempt(
+            RecoveryKind::CleanupUnopened,
+            handler_origin,
+            category,
+            None,
+        ) {
             return Ok(None);
         }
+        self.recovery_pending();
         let settlement = match self.chain.cleanup_unopened(&self.token_contract).await {
             Ok(settlement) => settlement,
             Err(error) => {
+                self.recovery_failed(&error);
                 if handler_origin {
                     self.handler_recovery_reconciliation
                         .store(true, Ordering::SeqCst);
@@ -2814,7 +3248,7 @@ impl SessionSettle {
                 return Err(error);
             }
         };
-        self.close_local_api();
+        self.close_local_api(category, None);
         self.record_terminal_action(SessionTerminalAction::StreamCleanup);
         self.settled.store(true, Ordering::SeqCst);
         self.recovery_closed_session.store(false, Ordering::SeqCst);
@@ -2830,19 +3264,41 @@ impl SessionSettle {
         heartbeat: &dexdo_core::market::HeartbeatGuard,
         handler_origin: bool,
     ) -> Result<Option<dexdo_core::Settlement>, dexdo_core::ChainError> {
-        if self.preserve_without_implicit_chain_write("reclaim-opened") {
+        self.recover_reclaim_opened_with_cause(
+            heartbeat,
+            handler_origin,
+            ClosureCategory::Recovery,
+            None,
+        )
+        .await
+    }
+
+    async fn recover_reclaim_opened_with_cause(
+        &self,
+        heartbeat: &dexdo_core::market::HeartbeatGuard,
+        handler_origin: bool,
+        category: ClosureCategory,
+        policy_action: Option<&str>,
+    ) -> Result<Option<dexdo_core::Settlement>, dexdo_core::ChainError> {
+        if self.preserve_without_implicit_chain_write("reclaim-opened", category, policy_action) {
             return Ok(None);
         }
         let _guard = self.settle_lock.lock().await;
-        if self.settled.load(Ordering::SeqCst) {
+        if self.unresolved_usage_rejection().is_some() || self.settled.load(Ordering::SeqCst) {
             return Ok(None);
         }
-        if !self.begin_recovery_attempt(RecoveryKind::ReclaimOpened, handler_origin) {
+        if !self.begin_recovery_attempt(
+            RecoveryKind::ReclaimOpened,
+            handler_origin,
+            category,
+            policy_action,
+        ) {
             return Ok(None);
         }
         // This path exists only for an explicitly configured automatic failure policy. The continuity
         // monitor never infers STOP from idle time alone. If accepted output resumes while the policy's
         // signed STOP is prepared, the final heartbeat guard cancels that stale automatic decision.
+        let previous_state = self.recovery_pending();
         let settlement = match self
             .chain
             .stop_if_heartbeat(&self.token_contract, self.note.as_ref(), heartbeat)
@@ -2850,6 +3306,7 @@ impl SessionSettle {
         {
             Ok(settlement) => settlement,
             Err(error) => {
+                self.recovery_failed(&error);
                 if !self.latch_possibly_landed_stop(&error) && handler_origin {
                     self.handler_recovery_reconciliation
                         .store(true, Ordering::SeqCst);
@@ -2858,10 +3315,10 @@ impl SessionSettle {
             }
         };
         if settlement.is_none() {
-            self.cancel_recovery_without_post(RecoveryKind::ReclaimOpened);
+            self.cancel_recovery_without_post(RecoveryKind::ReclaimOpened, previous_state);
             return Ok(None);
         }
-        self.close_local_api();
+        self.close_local_api(ClosureCategory::Recovery, None);
         self.record_terminal_action(SessionTerminalAction::from_stop_settlement(
             settlement.as_ref().expect("checked Some settlement"),
         ));
@@ -2880,7 +3337,18 @@ impl SessionSettle {
     /// An unresolved STOP error leaves the session explicitly recoverable; `Drop` must not issue an
     /// untracked retry after an awaited failure.
     pub async fn settle(&self, reason: &str) -> Result<bool, dexdo_core::ChainError> {
+        self.settle_guarded(reason, None).await
+    }
+
+    async fn settle_guarded(
+        &self,
+        reason: &str,
+        heartbeat: Option<&dexdo_core::market::HeartbeatGuard>,
+    ) -> Result<bool, dexdo_core::ChainError> {
         let _guard = self.settle_lock.lock().await;
+        if heartbeat.is_some() && self.unresolved_usage_rejection().is_some() {
+            return Ok(false);
+        }
         if self.settled.load(Ordering::SeqCst) {
             return Ok(false); // already settled by an earlier bail / shutdown / Drop
         }
@@ -2891,13 +3359,34 @@ impl SessionSettle {
                 display_token_contract(&self.token_contract)
             )));
         }
-        self.close_local_api();
-        match self
-            .chain
-            .stop(&self.token_contract, self.note.as_ref())
-            .await
-        {
-            Ok(s) => {
+        if heartbeat.is_none() {
+            self.close_usage_quota();
+            self.close_local_api(ClosureCategory::SessionStop, None);
+            self.recovery_pending();
+        }
+        let result = match heartbeat {
+            Some(heartbeat) => {
+                self.chain
+                    .stop_if_heartbeat(&self.token_contract, self.note.as_ref(), heartbeat)
+                    .await
+            }
+            None => self
+                .chain
+                .stop(&self.token_contract, self.note.as_ref())
+                .await
+                .map(Some),
+        };
+        if matches!(result, Ok(None)) {
+            return Ok(false);
+        }
+        // A veto must leave the old route and quota usable; publish closure only after the guard.
+        if heartbeat.is_some() {
+            self.close_usage_quota();
+            self.close_local_api(ClosureCategory::SessionStop, None);
+            self.recovery_pending();
+        }
+        match result {
+            Ok(Some(s)) => {
                 let terminal_action = SessionTerminalAction::from_stop_settlement(&s);
                 self.record_terminal_action(terminal_action);
                 self.settled.store(true, Ordering::SeqCst);
@@ -2916,6 +3405,7 @@ impl SessionSettle {
                 )
             }
             Err(e) => {
+                self.recovery_failed(&e);
                 self.latch_possibly_landed_stop(&e);
                 tracing::warn!(
                     %reason,
@@ -2925,8 +3415,39 @@ impl SessionSettle {
                 self.disable_drop_backup();
                 return Err(e);
             }
+            Ok(None) => unreachable!("veto returned before closure"),
         }
         Ok(true)
+    }
+
+    /// Whether the `buyer.on.*` field behind `failure` is `keep_open`.
+    fn keeps_open(&self, failure: ClosureCategory) -> bool {
+        let policy = self.failure_policy;
+        match failure {
+            ClosureCategory::DeadGateway => policy.dead_gateway == DeadGatewayAction::KeepOpen,
+            ClosureCategory::EmptyStream => policy.empty_stream == EmptyStreamAction::KeepOpen,
+            ClosureCategory::SellerStallsMidStream => {
+                policy.seller_stalls_mid_stream == SellerStallsMidStreamAction::KeepOpen
+            }
+            ClosureCategory::VerificationBail => {
+                policy.verification_bail == VerificationBailAction::KeepOpen
+            }
+            _ => false,
+        }
+    }
+
+    /// `keep_open`: the failure ends with the request that saw it. No chain write, no local closure;
+    /// the next request opens a new stream on the same deal.
+    fn policy_keep_open(&self, failure_class: &str, reason: &str) -> bool {
+        tracing::warn!(
+            %reason,
+            policy_failure_class = failure_class,
+            policy_action = "keep_open",
+            token_contract = %display_token_contract(&self.token_contract),
+            chain_write_submitted = false,
+            "consumer API: selected policy keeps the deal open; the failure is scoped to this request"
+        );
+        false
     }
 
     async fn policy_fail_closed(&self, failure_class: &str, action: &str, reason: &str) -> bool {
@@ -2934,7 +3455,7 @@ impl SessionSettle {
         if self.settled.load(Ordering::SeqCst) || !self.drop_backup_enabled.load(Ordering::SeqCst) {
             return false;
         }
-        self.close_local_api();
+        self.close_local_api(ClosureCategory::failure_class(failure_class), Some(action));
         tracing::error!(
             %reason,
             policy_failure_class = failure_class,
@@ -2957,7 +3478,7 @@ impl SessionSettle {
         if self.settled.load(Ordering::SeqCst) {
             return false;
         }
-        self.close_local_api();
+        self.close_local_api(ClosureCategory::failure_class(failure_class), Some(action));
         tracing::error!(
             %reason,
             policy_failure_class = failure_class,
@@ -2977,7 +3498,15 @@ impl SessionSettle {
         reason: &str,
         heartbeat: &dexdo_core::market::HeartbeatGuard,
     ) -> bool {
-        match self.recover_reclaim_opened(heartbeat, true).await {
+        match self
+            .recover_reclaim_opened_with_cause(
+                heartbeat,
+                true,
+                ClosureCategory::failure_class(failure_class),
+                Some(action),
+            )
+            .await
+        {
             Ok(Some(s)) => {
                 self.record_confirmed_client_stop(
                     &s,
@@ -3022,14 +3551,19 @@ impl SessionSettle {
     }
 
     async fn policy_dispute(&self, failure_class: &str, action: &str, reason: &str) -> bool {
-        if self.preserve_without_implicit_chain_write(reason) {
+        if self.preserve_without_implicit_chain_write(
+            reason,
+            ClosureCategory::failure_class(failure_class),
+            Some(action),
+        ) {
             return false;
         }
         let _guard = self.settle_lock.lock().await;
-        if self.settled.load(Ordering::SeqCst) {
+        if self.unresolved_usage_rejection().is_some() || self.settled.load(Ordering::SeqCst) {
             return false;
         }
-        self.close_local_api();
+        self.close_local_api(ClosureCategory::failure_class(failure_class), Some(action));
+        self.recovery_pending();
         match self
             .chain
             .dispute(&self.token_contract, self.note.as_ref())
@@ -3049,6 +3583,7 @@ impl SessionSettle {
                 true
             }
             Err(e) => {
+                self.recovery_failed(&e);
                 tracing::warn!(
                     %reason,
                     policy_failure_class = failure_class,
@@ -3066,15 +3601,29 @@ impl SessionSettle {
     /// existing streamDispute lever and reports the per-deal freeze. `stop_and_blacklist` is not silently
     /// degraded in the consumer API surface because this surface has no seller-id blacklist store.
     pub async fn settle_verification_bail(&self, reason: &str) -> bool {
-        if self.preserve_without_implicit_chain_write(reason) {
+        if self.keeps_open(ClosureCategory::VerificationBail) {
+            return self.policy_keep_open("bad_output_scam", reason);
+        }
+        if self.preserve_without_implicit_chain_write(
+            reason,
+            ClosureCategory::VerificationBail,
+            Some(self.failure_policy.verification_bail.as_str()),
+        ) {
             return false;
         }
+        let action = self.failure_policy.verification_bail;
+        // The verification verdict closes admission immediately; it is not a chain/quota outcome.
+        self.close_local_api(ClosureCategory::VerificationBail, Some(action.as_str()));
         let _guard = self.settle_lock.lock().await;
         if self.settled.load(Ordering::SeqCst) {
             return false;
         }
-        self.close_local_api();
-        let action = self.failure_policy.verification_bail;
+        if self.unresolved_usage_rejection().is_some() {
+            return false;
+        }
+        if action == VerificationBailAction::Dispute {
+            self.recovery_pending();
+        }
         match action {
             VerificationBailAction::Stop
                 if self.recovery_submit_may_have_landed(RecoveryKind::ReclaimOpened) =>
@@ -3089,47 +3638,60 @@ impl SessionSettle {
                 );
                 false
             }
-            VerificationBailAction::Stop => match self
-                .chain
-                .stop(&self.token_contract, self.note.as_ref())
-                .await
-            {
-                Ok(s) => {
-                    let terminal_action = SessionTerminalAction::from_stop_settlement(&s);
-                    self.record_terminal_action(terminal_action);
-                    self.settled.store(true, Ordering::SeqCst);
-                    self.record_confirmed_client_stop(
-                        &s,
-                        "verification_bail",
-                        reason,
-                        Some("bad_output_scam"),
-                        Some(action.as_str()),
-                    );
-                    tracing::info!(
-                        %reason,
-                        policy_failure_class = "bad_output_scam",
-                        policy_action = action.as_str(),
-                        token_contract = %display_token_contract(&self.token_contract),
-                        settlement = ?s,
-                        terminal_action = terminal_action.event_action(),
-                        chain_write_submitted = terminal_action.chain_write_submitted(),
-                        "consumer API: verification bail terminal chain outcome recorded"
-                    );
-                    true
+            VerificationBailAction::Stop => {
+                let result = self
+                    .chain
+                    .stop_if_heartbeat(
+                        &self.token_contract,
+                        self.note.as_ref(),
+                        &self.usage_stop_guard(),
+                    )
+                    .await;
+                if matches!(result, Ok(None)) {
+                    return false;
                 }
-                Err(e) => {
-                    self.latch_possibly_landed_stop(&e);
-                    tracing::warn!(
-                        %reason,
-                        policy_failure_class = "bad_output_scam",
-                        policy_action = action.as_str(),
-                        token_contract = %display_token_contract(&self.token_contract),
-                        error = %e,
-                        "consumer API: verification-bail STOP failed; session remains recoverable"
-                    );
-                    false
+                // Serving stays closed on the known verdict; a veto leaves quota nonterminal.
+                self.recovery_pending();
+                match result {
+                    Ok(Some(s)) => {
+                        let terminal_action = SessionTerminalAction::from_stop_settlement(&s);
+                        self.record_terminal_action(terminal_action);
+                        self.settled.store(true, Ordering::SeqCst);
+                        self.record_confirmed_client_stop(
+                            &s,
+                            "verification_bail",
+                            reason,
+                            Some("bad_output_scam"),
+                            Some(action.as_str()),
+                        );
+                        tracing::info!(
+                            %reason,
+                            policy_failure_class = "bad_output_scam",
+                            policy_action = action.as_str(),
+                            token_contract = %display_token_contract(&self.token_contract),
+                            settlement = ?s,
+                            terminal_action = terminal_action.event_action(),
+                            chain_write_submitted = terminal_action.chain_write_submitted(),
+                            "consumer API: verification bail terminal chain outcome recorded"
+                        );
+                        true
+                    }
+                    Err(e) => {
+                        self.recovery_failed(&e);
+                        self.latch_possibly_landed_stop(&e);
+                        tracing::warn!(
+                            %reason,
+                            policy_failure_class = "bad_output_scam",
+                            policy_action = action.as_str(),
+                            token_contract = %display_token_contract(&self.token_contract),
+                            error = %e,
+                            "consumer API: verification-bail STOP failed; session remains recoverable"
+                        );
+                        false
+                    }
+                    Ok(None) => unreachable!("veto returned before closure"),
                 }
-            },
+            }
             VerificationBailAction::Dispute => match self
                 .chain
                 .dispute(&self.token_contract, self.note.as_ref())
@@ -3149,6 +3711,7 @@ impl SessionSettle {
                     true
                 }
                 Err(e) => {
+                    self.recovery_failed(&e);
                     tracing::warn!(
                         %reason,
                         policy_failure_class = "bad_output_scam",
@@ -3172,6 +3735,8 @@ impl SessionSettle {
                 );
                 false
             }
+            // Answered before the local API was closed, at the top of this function.
+            VerificationBailAction::KeepOpen => false,
         }
     }
 
@@ -3199,6 +3764,7 @@ impl SessionSettle {
                 self.policy_fail_closed("dead_gateway", action.as_str(), reason)
                     .await
             }
+            DeadGatewayAction::KeepOpen => self.policy_keep_open("dead_gateway", reason),
         }
     }
 
@@ -3226,6 +3792,7 @@ impl SessionSettle {
                 self.policy_fail_closed("empty_stream", action.as_str(), reason)
                     .await
             }
+            EmptyStreamAction::KeepOpen => self.policy_keep_open("empty_stream", reason),
         }
     }
 
@@ -3248,6 +3815,9 @@ impl SessionSettle {
             SellerStallsMidStreamAction::Dispute => {
                 self.policy_dispute("seller_stalls_mid_stream", action.as_str(), reason)
                     .await
+            }
+            SellerStallsMidStreamAction::KeepOpen => {
+                self.policy_keep_open("seller_stalls_mid_stream", reason)
             }
         }
     }
@@ -3321,7 +3891,8 @@ impl Drop for SessionSettle {
         // funds-safety guarantee. If the session ended with no explicit settle (abnormal teardown), spawn a
         // last-chance STOP -- a crash/SIGKILL/runtime teardown may still skip it, and the on-chain
         // `seller_timeout` is the ultimate backstop.
-        if self.lifetime == SessionLifetimePolicy::Preserve
+        if self.unresolved_usage_rejection().is_some()
+            || self.lifetime == SessionLifetimePolicy::Preserve
             || self.settled.load(Ordering::SeqCst)
             || !self.drop_backup_enabled.load(Ordering::SeqCst)
             || self.recovery_submit_may_have_landed.load(Ordering::SeqCst)
@@ -3394,8 +3965,10 @@ impl ApiState {
             buyer,
             frame_model,
             mock_model: false,
+            renewal_enabled: false,
             deals: Arc::new(RouteManager::new(deal)),
             delivery_events: None,
+            usage: None,
         }
     }
 
@@ -3409,8 +3982,10 @@ impl ApiState {
             buyer,
             frame_model,
             mock_model: false,
+            renewal_enabled: false,
             deals: Arc::new(RouteManager::lazy(initializer, initializer_timeout)),
             delivery_events: None,
+            usage: None,
         }
     }
 
@@ -3424,11 +3999,13 @@ impl ApiState {
             buyer,
             frame_model,
             mock_model: false,
+            renewal_enabled: false,
             deals: Arc::new(RouteManager::recoverable_lazy(
                 initializer,
                 initializer_timeout,
             )),
             delivery_events: None,
+            usage: None,
         }
     }
 
@@ -3443,13 +4020,20 @@ impl ApiState {
             buyer,
             frame_model,
             mock_model: false,
+            renewal_enabled: false,
             deals: Arc::new(RouteManager::recoverable_lazy_with_active(
                 active,
                 initializer,
                 initializer_timeout,
             )),
             delivery_events: None,
+            usage: None,
         }
+    }
+
+    pub fn with_usage(mut self, store: Arc<crate::buyer::usage::UsageStore>) -> Self {
+        self.usage = Some(store);
+        self
     }
 
     pub fn with_mock_model(mut self, mock_model: bool) -> Self {
@@ -3458,7 +4042,11 @@ impl ApiState {
     }
 
     pub async fn current_deal(&self) -> Result<ApiDeal, DealInitError> {
-        self.deals.current_or_prepare().await
+        let deal = self.deals.current_or_prepare().await?;
+        usage::sync_deal_quota(self).await.map_err(|error| {
+            DealInitError::new(format!("opened deal quota unavailable: {error}"))
+        })?;
+        Ok(deal)
     }
 
     /// The model is forced by the market (B2/B19): an empty/None `model` is ok (there is a single
@@ -3480,15 +4068,23 @@ impl ApiState {
 /// Build the consumer-interface axum router. The Anthropic transcode (B20) is mounted only
 /// when `anthropic_compat = true`.
 pub fn router(state: ApiState, anthropic_compat: bool) -> axum::Router {
+    state.deals.bind_usage(&state);
     use axum::routing::{get, post};
     let mut app = axum::Router::new()
         .route("/v1/chat/completions", post(openai::chat_completions))
         .route("/v1/responses", post(openai::responses))
-        .route("/v1/models", get(openai::models));
+        .route("/v1/models", get(openai::models))
+        .route("/v1/usage", get(usage::get_usage))
+        .route("/v1/usage/facts", get(usage::get_facts));
     if anthropic_compat {
         app = app.route("/v1/messages", post(anthropic::messages));
     }
-    app.with_state(state)
+    app.layer(DefaultBodyLimit::max(BUYER_API_REQUEST_BODY_MAX_BYTES))
+        .layer(axum::middleware::from_fn_with_state(
+            state.clone(),
+            usage::track_request,
+        ))
+        .with_state(state)
 }
 
 /// Bring up the local consumer interface on `bind`. Returns the actual address
@@ -3505,9 +4101,10 @@ pub async fn serve(
     // same reason as the seller gateway. `dexdo buyer --local-listen 127.0.0.1:0
     // --max-price-per-tick 1` serves an
     // OpenAI-compatible endpoint, and a consumer that closes the connection part-way through an
-    // answer is ordinary. Under the entry policy that a one-shot printer wants, that hangup would
-    // end this process instead of this request. Not a duplicate of `main` -- the opposite decision.
+    // answer is ordinary, and must end that request, not this process. Since process entry
+    // already leaves SIGPIPE ignored; stated again here so serving does not depend on it.
     crate::serving_process_ignores_sigpipe();
+    usage::sync_deal_quota(&state).await?;
     let listener = tokio::net::TcpListener::bind(bind).await?;
     let local_addr = listener.local_addr()?;
     let deals = state.deals.clone();
@@ -3531,10 +4128,21 @@ mod fixture_seller;
 
 #[cfg(test)]
 mod tests {
+    mod consumer_errors_1450;
+    mod quota_review_2133;
+    mod usage_history;
     use super::*;
     use dexdo_core::SUB_WEEK_LEN;
 
+    mod closure_2092;
+    mod consumer_cancel_2127;
+    mod keep_open_2148;
+    mod provider_failure_2144;
+    mod read_recovery_2129;
+    mod reasoning_2090;
+    mod request_body_2173;
     mod route_swap_1025;
+    mod upstream_retry_2135;
 
     #[test]
     fn default_failure_policy_uses_canonical_parameters() {
@@ -3615,6 +4223,62 @@ mod tests {
                 model_id: "Qwen/Qwen3-32B".to_string()
             }
         );
+    }
+
+    #[tokio::test]
+    async fn reasoning_2172_malformed_efforts_never_start_lazy_purchase() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let calls = Arc::new(AtomicUsize::new(0));
+        let init_calls = calls.clone();
+        let state = ApiState::lazy(
+            Arc::new(Buyer::from_note(
+                Arc::new(dexdo_core::LocalNote::generate()),
+            )),
+            "dexdo-mock".into(),
+            Arc::new(move || {
+                let calls = init_calls.clone();
+                Box::pin(async move {
+                    calls.fetch_add(1, Ordering::SeqCst);
+                    Err(DealInitError::new("unexpected purchase initializer"))
+                }) as DealInitFuture
+            }),
+            Duration::from_secs(1),
+        );
+        let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel::<()>();
+        let (addr, task) = serve("127.0.0.1:0".parse().unwrap(), state, false, async move {
+            let _ = shutdown_rx.await;
+        })
+        .await
+        .unwrap();
+        for path in ["/v1/chat/completions", "/v1/responses"] {
+            for effort in [
+                serde_json::json!("invalid"),
+                serde_json::json!(false),
+                serde_json::json!(0),
+                serde_json::json!([]),
+                serde_json::json!({}),
+            ] {
+                let body = if path == "/v1/responses" {
+                    serde_json::json!({"input":"hello", "reasoning":{"effort":effort}})
+                } else {
+                    serde_json::json!({"messages":[{"role":"user","content":"hello"}], "reasoning_effort":effort})
+                };
+                let response = reqwest::Client::new()
+                    .post(format!("http://{addr}{path}"))
+                    .json(&body)
+                    .send()
+                    .await
+                    .unwrap();
+                assert_eq!(response.status(), reqwest::StatusCode::BAD_REQUEST);
+            }
+        }
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            0,
+            "malformed controls must not reach quote/place_buy/handover work"
+        );
+        let _ = shutdown_tx.send(());
+        task.await.unwrap();
     }
 
     #[tokio::test]
@@ -3994,6 +4658,9 @@ mod tests {
         recovery_stop_calls: std::sync::atomic::AtomicUsize,
         cleanup_unopened_calls: std::sync::atomic::AtomicUsize,
         fail_stop: std::sync::atomic::AtomicBool,
+        stop_gate: StdMutex<Option<(tokio::sync::oneshot::Sender<()>, Arc<tokio::sync::Notify>)>>,
+        stop_result_gate:
+            StdMutex<Option<(tokio::sync::oneshot::Sender<()>, Arc<tokio::sync::Notify>)>>,
         fail_dispute: std::sync::atomic::AtomicBool,
         fail_recovery_stop: std::sync::atomic::AtomicBool,
         ambiguous_stop: std::sync::atomic::AtomicBool,
@@ -4001,7 +4668,10 @@ mod tests {
         ambiguous_recovery_stop: std::sync::atomic::AtomicBool,
         fail_cleanup_unopened: std::sync::atomic::AtomicBool,
         fail_deal_state: std::sync::atomic::AtomicBool,
+        transient_deal_state: std::sync::atomic::AtomicBool,
         deal_state: std::sync::Mutex<Option<dexdo_core::DealChainState>>,
+        purchase_terms: std::sync::Mutex<Option<(u128, u128)>>,
+        fail_purchase_terms: std::sync::atomic::AtomicBool,
         heartbeat_during_reclaim_preflight: std::sync::Mutex<Option<ApiDeal>>,
         heartbeat_during_explicit_stop_preflight: std::sync::Mutex<Option<ApiDeal>>,
     }
@@ -4114,6 +4784,11 @@ mod tests {
             _note: &dyn Note,
             heartbeat: &dexdo_core::market::HeartbeatGuard,
         ) -> Result<Option<dexdo_core::Settlement>, dexdo_core::ChainError> {
+            let gate = self.stop_gate.lock().unwrap().take();
+            if let Some((started, release)) = gate {
+                let _ = started.send(());
+                release.notified().await;
+            }
             // Simulate a legitimate claim landing between the decision to exit and the money POST.
             if let Some(deal) = self
                 .heartbeat_during_reclaim_preflight
@@ -4128,6 +4803,11 @@ mod tests {
             }
             self.recovery_stop_calls
                 .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            let gate = self.stop_result_gate.lock().unwrap().take();
+            if let Some((started, release)) = gate {
+                let _ = started.send(());
+                release.notified().await;
+            }
             if self
                 .ambiguous_recovery_stop
                 .load(std::sync::atomic::Ordering::SeqCst)
@@ -4155,6 +4835,11 @@ mod tests {
             _token_contract: &TokenContract,
             _note: &dyn Note,
         ) -> Result<dexdo_core::Settlement, dexdo_core::ChainError> {
+            let gate = self.stop_gate.lock().unwrap().take();
+            if let Some((started, release)) = gate {
+                let _ = started.send(());
+                release.notified().await;
+            }
             if let Some(deal) = self
                 .heartbeat_during_explicit_stop_preflight
                 .lock()
@@ -4234,6 +4919,9 @@ mod tests {
             &self,
             _token_contract: &TokenContract,
         ) -> Result<Option<dexdo_core::DealChainState>, dexdo_core::ChainError> {
+            if self.transient_deal_state.load(Ordering::SeqCst) {
+                return Err(dexdo_core::ChainError::Transport("read timed out".into()));
+            }
             if self
                 .fail_deal_state
                 .load(std::sync::atomic::Ordering::SeqCst)
@@ -4243,6 +4931,18 @@ mod tests {
                 ));
             }
             Ok(*self.deal_state.lock().unwrap())
+        }
+
+        async fn deal_purchase_terms(
+            &self,
+            _token_contract: &TokenContract,
+        ) -> Result<Option<(u128, u128)>, dexdo_core::ChainError> {
+            if self.fail_purchase_terms.load(Ordering::SeqCst) {
+                return Err(dexdo_core::ChainError::Transport(
+                    "purchase terms timed out".into(),
+                ));
+            }
+            Ok(*self.purchase_terms.lock().unwrap())
         }
 
         async fn snapshot(
@@ -4523,6 +5223,12 @@ mod tests {
         subscription_task.await.unwrap();
         tokio::task::yield_now().await;
         assert_eq!(subscription_chain.stop_calls.load(Ordering::SeqCst), 0);
+        assert_eq!(
+            subscription_chain
+                .recovery_stop_calls
+                .load(Ordering::SeqCst),
+            0
+        );
 
         let ordinary_chain = Arc::new(RecordingSettleChain::default());
         let (ordinary_shutdown_tx, ordinary_shutdown_rx) = tokio::sync::oneshot::channel::<()>();
@@ -4546,7 +5252,8 @@ mod tests {
         ordinary_shutdown_tx.send(()).unwrap();
         ordinary_task.await.unwrap();
         tokio::task::yield_now().await;
-        assert_eq!(ordinary_chain.stop_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(ordinary_chain.recovery_stop_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(ordinary_chain.stop_calls.load(Ordering::SeqCst), 0);
     }
 
     #[tokio::test]
@@ -4567,7 +5274,8 @@ mod tests {
             state.deals.settle_active_on_exit("shutdown").await.unwrap(),
             "accepted output must defeat the  no-delivery veto even without terminal usage"
         );
-        assert_eq!(chain.stop_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(chain.recovery_stop_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(chain.stop_calls.load(Ordering::SeqCst), 0);
     }
 
     fn recovery_test_deal(
@@ -4773,7 +5481,7 @@ mod tests {
         use std::sync::atomic::Ordering;
 
         let chain = Arc::new(RecordingSettleChain::default());
-        chain.fail_stop.store(true, Ordering::SeqCst);
+        chain.fail_recovery_stop.store(true, Ordering::SeqCst);
         let note = Arc::new(dexdo_core::LocalNote::generate());
         let previous_session = Arc::new(SessionSettle::new(
             chain.clone(),
@@ -4816,7 +5524,7 @@ mod tests {
             .expect_err("old STOP failure must prevent route replacement");
 
         assert!(
-            error.to_string().contains("injected stop failure"),
+            error.to_string().contains("injected recovery stop failure"),
             "{error}"
         );
         assert_eq!(
@@ -4826,9 +5534,9 @@ mod tests {
         assert!(!previous_session.is_settled());
         assert!(!next_session.is_settled());
         assert!(!next_factory_called.load(Ordering::SeqCst));
-        assert_eq!(chain.stop_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(chain.recovery_stop_calls.load(Ordering::SeqCst), 1);
 
-        chain.fail_stop.store(false, Ordering::SeqCst);
+        chain.fail_recovery_stop.store(false, Ordering::SeqCst);
         routes
             .replace_active(
                 || {
@@ -4846,7 +5554,7 @@ mod tests {
             routes.current().await.unwrap().route.token_contract,
             "tc-next"
         );
-        assert_eq!(chain.stop_calls.load(Ordering::SeqCst), 2);
+        assert_eq!(chain.recovery_stop_calls.load(Ordering::SeqCst), 2);
     }
 
     #[tokio::test]
@@ -4878,7 +5586,7 @@ mod tests {
         use std::sync::atomic::Ordering;
 
         let chain = Arc::new(RecordingSettleChain::default());
-        chain.fail_stop.store(true, Ordering::SeqCst);
+        chain.fail_recovery_stop.store(true, Ordering::SeqCst);
         let session = SessionSettle::new_with_verification_bail_action(
             chain.clone(),
             "tc-failed-stop".to_string(),
@@ -4895,13 +5603,14 @@ mod tests {
             !session.is_settled(),
             "failed STOP must not make the session terminal"
         );
-        assert_eq!(chain.stop_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(chain.recovery_stop_calls.load(Ordering::SeqCst), 1);
 
-        chain.fail_stop.store(false, Ordering::SeqCst);
+        chain.fail_recovery_stop.store(false, Ordering::SeqCst);
         assert!(session.settle("shutdown").await.unwrap());
         assert!(session.is_closed());
         assert!(session.is_settled());
-        assert_eq!(chain.stop_calls.load(Ordering::SeqCst), 2);
+        assert_eq!(chain.recovery_stop_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(chain.stop_calls.load(Ordering::SeqCst), 1);
     }
 
     #[tokio::test]
@@ -4909,7 +5618,7 @@ mod tests {
         use std::sync::atomic::Ordering;
 
         let chain = Arc::new(RecordingSettleChain::default());
-        chain.ambiguous_stop.store(true, Ordering::SeqCst);
+        chain.ambiguous_recovery_stop.store(true, Ordering::SeqCst);
         let session = SessionSettle::new_with_verification_bail_action(
             chain.clone(),
             "tc-ambiguous-verification-stop".to_string(),
@@ -4918,13 +5627,13 @@ mod tests {
         );
 
         assert!(!session.settle_verification_bail("test-bail").await);
-        assert_eq!(chain.stop_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(chain.recovery_stop_calls.load(Ordering::SeqCst), 1);
         assert!(
             !session.settle_verification_bail("repeat-test-bail").await,
             "the same verification-bail entry point must reconcile instead of posting STOP again"
         );
         assert_eq!(
-            chain.stop_calls.load(Ordering::SeqCst),
+            chain.recovery_stop_calls.load(Ordering::SeqCst),
             1,
             "the same verification-bail entry point must remain suppressed"
         );
@@ -4939,7 +5648,7 @@ mod tests {
             Err(dexdo_core::ChainError::AmbiguousSubmit(_))
         ));
         assert_eq!(
-            chain.stop_calls.load(Ordering::SeqCst),
+            chain.recovery_stop_calls.load(Ordering::SeqCst),
             1,
             "an alternate explicit STOP entry point must remain suppressed"
         );
@@ -4947,10 +5656,11 @@ mod tests {
         drop(session);
         tokio::time::sleep(std::time::Duration::from_millis(20)).await;
         assert_eq!(
-            chain.stop_calls.load(Ordering::SeqCst),
+            chain.recovery_stop_calls.load(Ordering::SeqCst),
             1,
             "Drop must not retry an ambiguous verification-bail STOP"
         );
+        assert_eq!(chain.stop_calls.load(Ordering::SeqCst), 0);
     }
 
     #[tokio::test]
@@ -4975,9 +5685,9 @@ mod tests {
             Some(RecoveryKind::CleanupUnopened)
         );
 
-        chain.ambiguous_stop.store(true, Ordering::SeqCst);
+        chain.ambiguous_recovery_stop.store(true, Ordering::SeqCst);
         assert!(!session.settle_verification_bail("test-bail").await);
-        assert_eq!(chain.stop_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(chain.recovery_stop_calls.load(Ordering::SeqCst), 1);
         assert_eq!(
             session.recovery_episode(),
             Some(RecoveryKind::ReclaimOpened),
@@ -4996,7 +5706,7 @@ mod tests {
             Err(dexdo_core::ChainError::AmbiguousSubmit(_))
         ));
         assert_eq!(
-            chain.stop_calls.load(Ordering::SeqCst),
+            chain.recovery_stop_calls.load(Ordering::SeqCst),
             1,
             "neither repeated verification bail nor shutdown may repost STOP"
         );
@@ -5004,10 +5714,11 @@ mod tests {
         drop(session);
         tokio::time::sleep(std::time::Duration::from_millis(20)).await;
         assert_eq!(
-            chain.stop_calls.load(Ordering::SeqCst),
+            chain.recovery_stop_calls.load(Ordering::SeqCst),
             1,
             "Drop must not retry after an ambiguous STOP replaced an older recovery episode"
         );
+        assert_eq!(chain.stop_calls.load(Ordering::SeqCst), 0);
     }
 
     #[tokio::test]
@@ -5127,8 +5838,8 @@ mod tests {
             .await
             .expect_err("funded-never-opened must fail closed before serving");
 
-        assert!(err.contains("opened=false"), "{err}");
-        assert!(err.contains("cleanup_ready=false"), "{err}");
+        assert!(err.message.contains("opened=false"), "{err}");
+        assert!(err.message.contains("cleanup_ready=false"), "{err}");
         assert!(
             session.is_closed(),
             "local API is closed before any response"
@@ -5180,8 +5891,8 @@ mod tests {
             .await
             .expect_err("funded-never-opened must fail closed before serving");
 
-        assert!(err.contains("opened=false"), "{err}");
-        assert!(err.contains("cleanup_ready=true"), "{err}");
+        assert!(err.message.contains("opened=false"), "{err}");
+        assert!(err.message.contains("cleanup_ready=true"), "{err}");
         assert!(
             session.is_closed(),
             "local API is closed before any response"
@@ -5306,7 +6017,6 @@ mod tests {
             route_budget - 3,
             "acceptance reopens everything except already billed usage"
         );
-        drop(reopened);
 
         let short_budget = tick - 1;
         let short_deal = ApiDeal::new(
@@ -5470,7 +6180,7 @@ mod tests {
         let anthropic = include_str!("anthropic.rs");
         for source in [openai, anthropic] {
             assert!(
-                source.contains("deal.session.is_closed()"),
+                source.contains("deal.session.closed_rejection("),
                 "request gate must reject locally closed recovery-pending sessions"
             );
             assert!(
@@ -5517,7 +6227,7 @@ mod tests {
                 .find("begin_request")
                 .expect("handler records consumer demand");
             let closed_gate = source
-                .find("deal.session.is_closed()")
+                .find("deal.session.closed_rejection(")
                 .expect("handler gates closed sessions");
             assert!(
                 model_check < mark_demand,
@@ -5682,6 +6392,7 @@ mod tests {
         /// What the last read would have returned had it not been served stale.
         pre_booking: std::sync::Mutex<Option<dexdo_core::DealChainSnapshot>>,
         snapshot_reads: std::sync::atomic::AtomicUsize,
+        transient_deal_state: std::sync::atomic::AtomicBool,
         settle_calls: std::sync::atomic::AtomicUsize,
         settle_bookings: std::sync::atomic::AtomicUsize,
         dispute_calls: std::sync::atomic::AtomicUsize,
@@ -5716,6 +6427,7 @@ mod tests {
                 stale_reads: std::sync::atomic::AtomicUsize::new(0),
                 pre_booking: std::sync::Mutex::new(None),
                 snapshot_reads: std::sync::atomic::AtomicUsize::new(0),
+                transient_deal_state: std::sync::atomic::AtomicBool::new(false),
                 settle_calls: std::sync::atomic::AtomicUsize::new(0),
                 settle_bookings: std::sync::atomic::AtomicUsize::new(0),
                 dispute_calls: std::sync::atomic::AtomicUsize::new(0),
@@ -5858,6 +6570,17 @@ mod tests {
 
     #[async_trait::async_trait]
     impl ChainBackend for WeeklyQuotaChain {
+        async fn deal_purchase_terms(
+            &self,
+            token_contract: &TokenContract,
+        ) -> Result<Option<(u128, u128)>, dexdo_core::ChainError> {
+            assert_eq!(token_contract, &self.token_contract);
+            Ok(Some((
+                self.snapshot.lock().unwrap().subscription.funded_tokens / dexdo_core::TICK_SIZE,
+                TEST_TICK_VALUE,
+            )))
+        }
+
         async fn discover_offers(
             &self,
         ) -> Result<Vec<dexdo_core::OfferListing>, dexdo_core::ChainError> {
@@ -6019,6 +6742,9 @@ mod tests {
             token_contract: &TokenContract,
         ) -> Result<Option<dexdo_core::DealChainState>, dexdo_core::ChainError> {
             assert_eq!(token_contract, &self.token_contract);
+            if self.transient_deal_state.load(Ordering::SeqCst) {
+                return Err(dexdo_core::ChainError::Transport("read timed out".into()));
+            }
             Ok(Some(self.snapshot.lock().unwrap().state))
         }
 
@@ -6213,8 +6939,10 @@ mod tests {
             buyer: harness.buyer.clone(),
             frame_model: "dexdo-mock".to_string(),
             mock_model: true,
+            renewal_enabled: false,
             deals: harness.deals.clone(),
             delivery_events: Some(delivery_events),
+            usage: None,
         }
     }
 
@@ -6234,7 +6962,12 @@ mod tests {
         match path {
             "/v1/chat/completions" => {
                 let request = serde_json::from_value(body).expect("valid Chat Completions request");
-                openai::chat_completions(axum::extract::State(state), axum::Json(request)).await
+                openai::chat_completions(
+                    axum::extract::State(state),
+                    http::HeaderMap::new(),
+                    Ok(axum::Json(request)),
+                )
+                .await
             }
             "/v1/responses" => {
                 let body = serde_json::json!({
@@ -6243,11 +6976,16 @@ mod tests {
                     "max_output_tokens": max_tokens,
                     "stream": stream
                 });
-                openai::responses(axum::extract::State(state), axum::Json(body)).await
+                openai::responses(
+                    axum::extract::State(state),
+                    http::HeaderMap::new(),
+                    Ok(axum::Json(body)),
+                )
+                .await
             }
             "/v1/messages" => {
                 let request = serde_json::from_value(body).expect("valid Anthropic request");
-                anthropic::messages(axum::extract::State(state), axum::Json(request)).await
+                anthropic::messages(axum::extract::State(state), Ok(axum::Json(request))).await
             }
             other => panic!("unsupported direct consumer path {other}"),
         }
@@ -6422,6 +7160,13 @@ mod tests {
     async fn weekly_route_harness_gated_with_policy(
         scenario: WeeklyRouteScenario,
     ) -> WeeklyRouteHarness {
+        weekly_route_harness_with_seller_shape(scenario, None).await
+    }
+
+    async fn weekly_route_harness_with_seller_shape(
+        scenario: WeeklyRouteScenario,
+        seller_shape: Option<dexdo_core::DealSubscription>,
+    ) -> WeeklyRouteHarness {
         let WeeklyRouteScenario {
             claimed,
             subscription,
@@ -6473,7 +7218,7 @@ mod tests {
                 note.pubkey(),
                 upstream_tokens,
                 upstream_state,
-                dexdo_core::DealSubscription {
+                seller_shape.unwrap_or(dexdo_core::DealSubscription {
                     deal_flags: 0,
                     sub_weeks: 0,
                     week_index: 0,
@@ -6482,7 +7227,7 @@ mod tests {
                     tokens_paid: 0,
                     period_start: 0,
                     week_base_tokens: 0,
-                },
+                }),
             )
             .expect("register the upstream stream");
 
@@ -6750,7 +7495,7 @@ mod tests {
         let RouteBudget::Exhausted(reason) = deal.admit(Some(1)).await else {
             panic!("a terminal subscription may not admit a request");
         };
-        assert!(reason.contains("terminal"), "{reason}");
+        assert!(reason.message.contains("terminal"), "{reason}");
         assert_eq!(deal.remaining_tokens(), 0);
         assert_eq!(
             harness.chain.bookings(),
@@ -6765,16 +7510,28 @@ mod tests {
         harness.shutdown().await;
     }
 
-    /// Adversarial admission: the simultaneous requested sum far exceeds the exact remaining quota, on
-    /// BOTH consumer paths. Reservation is what must hold the line - delivered may never pass the
-    /// authoritative remainder, whoever asks first.
+    /// Concurrent requests on both consumer paths may share authorizations, but accepted payment
+    /// must never exceed the authoritative remainder, regardless of completion order.
     #[tokio::test]
-    async fn concurrent_requests_cannot_be_handed_the_same_remainder() {
-        let harness = weekly_route_harness(WEEK_QUOTA - 12, true).await;
+    async fn shared_budget_2091_concurrent_http_requests_cannot_double_charge_the_remainder() {
+        let harness = weekly_route_harness_with_seller_shape(
+            WeeklyRouteScenario {
+                claimed: WEEK_QUOTA - 12,
+                subscription: true,
+                expires_in: SUB_WEEK_LEN.as_secs(),
+                upstream_tokens: UNCONSTRAINED_UPSTREAM,
+                content_gate: ContentGate::skip(),
+                upstream: crate::seller::UpstreamConfig::Mock,
+                failure_policy: BuyerApiFailurePolicy::default(),
+                lifetime: SessionLifetimePolicy::Preserve,
+            },
+            Some(weekly_subscription(unix_now_secs(), 0, 0)),
+        )
+        .await;
         assert_eq!(harness.remaining().await, 12);
 
-        // Six requests race for twelve billable tokens. Exactly one may hold the whole unknown-input
-        // grant; after its eight-token terminal bill, the unused four return.
+        // Six requests race for twelve paid tokens. A freed seller slot may be reused during the
+        // race, so the total number served is not the simultaneous-request limit.
         let mut answers = Vec::new();
         for path in [
             "/v1/chat/completions",
@@ -6791,18 +7548,22 @@ mod tests {
             .iter()
             .filter(|(status, _)| *status == reqwest::StatusCode::OK)
             .count();
-        assert_eq!(served, 1, "one request owns the entire in-flight grant");
+        assert!(
+            served >= 2,
+            "requests share the purchased remainder: {answers:?}"
+        );
 
         assert!(
             harness.delivered().await <= 12,
             "delivered {} exceeded the authoritative weekly remainder of 12",
             harness.delivered().await
         );
-        assert_eq!(harness.delivered().await, 8);
-        assert_eq!(harness.remaining().await, 4);
+        assert_eq!(harness.delivered().await, 12);
+        assert_eq!(harness.remaining().await, 0);
         for (status, body) in &answers {
             assert!(
                 *status == reqwest::StatusCode::OK
+                    || *status == reqwest::StatusCode::TOO_MANY_REQUESTS
                     || *status == reqwest::StatusCode::SERVICE_UNAVAILABLE,
                 "{status}: {body}"
             );
@@ -6810,7 +7571,7 @@ mod tests {
         harness.shutdown().await;
     }
 
-    /// An over-asking request must not strand the week: what it did not deliver comes back.
+    /// An over-asking request spends only its actual charge and leaves the rest of the week usable.
     #[tokio::test]
     async fn an_unused_reservation_returns_to_the_week() {
         let harness =
@@ -6818,9 +7579,8 @@ mod tests {
                 .await;
         assert_eq!(harness.remaining().await, 16);
 
-        // Reserve the WHOLE remainder against a model that stops after five tokens: admission takes
-        // all sixteen out of the week, the stream uses five, and the other eleven must come back. A
-        // test that asked for exactly what it delivers would pass with the refund deleted.
+        // Authorize the whole remainder against a model that stops after five tokens. Only its
+        // actual charge spends the shared budget; the other eleven remain available.
         let (status, body) = harness.ask(16).await;
         assert_eq!(status, reqwest::StatusCode::OK, "{body}");
         let delivered = harness.delivered().await;
@@ -7194,18 +7954,14 @@ mod tests {
         }
     }
 
-    /// A complete answer that consumes the paid billing grant tells the buyer that no paid volume
-    /// remains, while preserving the full answer and its accepted terminal usage.
-
-    /// This is a deliberate compatibility boundary. Reaching `max_tokens` exactly is not proof of
-    /// truncation: the buyer keeps consuming through terminal usage and clean EOF, and reports
-    /// truncation only when a later content chunk does not fit. Independently, an input+output
-    /// terminal total equal to the billing grant means the paid volume is exhausted.
+    /// A complete answer preserves its full text and accepted usage even when it spends the grant.
+    /// OpenAI retains its capacity signal; Anthropic's end_turn describes generation, not
+    /// shared-budget payment allocation. An exact output-cap fit alone is not truncation.
     #[tokio::test]
     async fn a_complete_render_that_spends_the_whole_grant_reports_capacity_exhaustion() {
         for (path, terminal) in [
             ("/v1/chat/completions", "capacity"),
-            ("/v1/messages", "max_tokens"),
+            ("/v1/messages", "end_turn"),
         ] {
             for stream in [true, false] {
                 let harness = weekly_route_harness(WEEK_QUOTA - 6, true).await;
@@ -7836,7 +8592,7 @@ mod tests {
             .current()
             .await
             .expect("the harness route is published");
-        let RouteBudget::Admitted(reservation) = deal.admit(Some(1)).await else {
+        let RouteBudget::Admitted(_) = deal.admit(Some(1)).await else {
             panic!("the booked week must be servable");
         };
         assert_eq!(harness.chain.bookings(), 1);
@@ -7847,7 +8603,6 @@ mod tests {
         let (state, subscription) = harness.chain.books();
         let cap = dexdo_core::subscription_claim_cap_at(&state, &subscription).expect("cap");
         assert_eq!(cap, PROBE_CLAIM + WEEK_QUOTA);
-        drop(reservation);
         assert_eq!(
             deal.remaining_tokens(),
             quota,
@@ -7880,10 +8635,9 @@ mod tests {
             .current()
             .await
             .expect("the harness route is published");
-        let RouteBudget::Admitted(reservation) = deal.admit(Some(1)).await else {
+        let RouteBudget::Admitted(_) = deal.admit(Some(1)).await else {
             panic!("the current week is still servable after acceptance");
         };
-        drop(reservation);
 
         // The cumulative claim is now one tick and the week's cap is one quota, so what the contract
         // will still admit is `quota - TICK_SIZE` - whatever this route delivered before acceptance,
@@ -7942,15 +8696,12 @@ mod tests {
         rebase_barrier.wait();
         let first = first.await.expect("first admission task");
         let second = second.await.expect("second admission task");
-        let (admitted, exhausted) = match (first, second) {
-            (RouteBudget::Admitted(reservation), RouteBudget::Exhausted(reason))
-            | (RouteBudget::Exhausted(reason), RouteBudget::Admitted(reservation)) => {
-                (reservation, reason)
-            }
-            _ => panic!("exactly one request must own the corrected week's billing remainder"),
-        };
-        assert!(exhausted.contains(ORDINARY_BUDGET_EXHAUSTED));
-        drop(admitted);
+        for authorization in [first, second] {
+            let RouteBudget::Admitted(grant) = authorization else {
+                panic!("both requests may use the corrected shared remainder");
+            };
+            assert_eq!(grant.granted, quota - probe);
+        }
         assert_eq!(
             deal.remaining_tokens(),
             quota - probe,
@@ -8045,12 +8796,11 @@ mod tests {
         delivery_barrier.wait();
         cutover_barrier.wait();
 
-        let RouteBudget::Exhausted(reason) = cutover.await.expect("acceptance cutover task") else {
-            panic!(
-                "the in-flight request must retain exclusive ownership of the billing remainder"
-            );
+        let RouteBudget::Admitted(after_cutover) = cutover.await.expect("acceptance cutover task")
+        else {
+            panic!("the corrected shared remainder remains available");
         };
-        assert!(reason.contains(ORDINARY_BUDGET_EXHAUSTED));
+        assert!(after_cutover.granted <= quota - probe);
         let in_flight = delivery
             .await
             .expect("delivery task")
@@ -8123,7 +8873,7 @@ mod tests {
         let RouteBudget::Exhausted(reason) = cutover.await.expect("acceptance cutover task") else {
             panic!("the accepted probe consumes all of Q=T");
         };
-        assert!(reason.contains("drawn down"), "{reason}");
+        assert!(reason.message.contains("drawn down"), "{reason}");
 
         let (late_delivery, old_request) = delivery.await.expect("late delivery task");
         let error = late_delivery.expect_err("a late token is above the rebased zero ceiling");
@@ -8138,13 +8888,9 @@ mod tests {
             0,
             "rejection leaves cumulative delivery unchanged, so no chunk can be exposed"
         );
-        assert_eq!(
-            deal.reserved_billable_tokens.load(Ordering::SeqCst),
-            probe,
-            "the held reservation is unchanged until its guard drops"
-        );
+        assert_eq!(old_request.remaining_grant(), probe);
         drop(old_request);
-        assert_eq!(deal.reserved_billable_tokens.load(Ordering::SeqCst), 0);
+        assert_eq!(deal.billable_tokens(), 0);
         assert_eq!(
             deal.remaining_tokens(),
             0,
@@ -8485,6 +9231,7 @@ mod tests {
                 api_key_env: api_key_env.to_string(),
                 tokenizer_family: "mock".to_string(),
                 max_output_tokens: Some(1024),
+                reasoning_disable: Default::default(),
             }),
             failure_policy: BuyerApiFailurePolicy {
                 verification_bail: VerificationBailAction::Dispute,
@@ -9213,12 +9960,13 @@ mod tests {
         let (delivery_tx, mut delivery_rx) = tokio::sync::mpsc::unbounded_channel();
         let response = openai::responses(
             axum::extract::State(direct_state_with_deliveries(&harness, delivery_tx)),
-            axum::Json(serde_json::json!({
+            http::HeaderMap::new(),
+            Ok(axum::Json(serde_json::json!({
                 "model": "dexdo-mock",
                 "input": "DEXDO_FIXTURE_STRADDLE DEXDO_FIXTURE_ECHOLIMIT terminal cutover",
                 "max_output_tokens": 8,
                 "stream": true
-            })),
+            }))),
         )
         .await;
         assert_eq!(response.status(), http::StatusCode::OK);
@@ -9267,7 +10015,7 @@ mod tests {
         .expect("valid Anthropic request");
         let response = anthropic::messages(
             axum::extract::State(direct_state_with_deliveries(&harness, delivery_tx)),
-            axum::Json(request),
+            Ok(axum::Json(request)),
         )
         .await;
         assert_eq!(response.status(), http::StatusCode::OK);
@@ -9306,12 +10054,13 @@ mod tests {
         let (delivery_tx, mut delivery_rx) = tokio::sync::mpsc::unbounded_channel();
         let response = openai::responses(
             axum::extract::State(direct_state_with_deliveries(&harness, delivery_tx)),
-            axum::Json(serde_json::json!({
+            http::HeaderMap::new(),
+            Ok(axum::Json(serde_json::json!({
                 "model": "dexdo-mock",
                 "input": "DEXDO_FIXTURE_DELAY_EOF",
                 "max_output_tokens": 4,
                 "stream": true
-            })),
+            }))),
         )
         .await;
         assert_eq!(response.status(), http::StatusCode::OK);
@@ -9403,7 +10152,7 @@ mod tests {
         .expect("valid Anthropic request");
         let response = anthropic::messages(
             axum::extract::State(direct_state_with_deliveries(&harness, delivery_tx)),
-            axum::Json(request),
+            Ok(axum::Json(request)),
         )
         .await;
         assert_eq!(response.status(), http::StatusCode::OK);
@@ -9616,7 +10365,7 @@ mod tests {
     }
 
     /// Provider-native input is unknown before terminal usage, so concurrent first requests are
-    /// serialized by one reservation over the whole free route remainder.
+    /// authorized from the shared remainder while the one-per-deal verification gate is pending.
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn a_concurrent_first_request_is_never_handed_a_partial_verification() {
         const ASK: u64 = 2;
@@ -9666,23 +10415,17 @@ mod tests {
 
         assert_eq!(
             admitted.len(),
-            1,
-            "only one of these requests can be paid for in full: {refused:?}"
+            4,
+            "all authorizations preserve the verification floor: {refused:?}"
         );
-        assert_eq!(
-            admitted[0].granted, FREE,
-            "the winner holds the entire free billing remainder"
-        );
-        for reason in &refused {
-            assert!(
-                reason.contains(UNVERIFIED_BUDGET_CANNOT_COVER_VERIFICATION),
-                "the losers see no unreserved remainder: {reason}"
-            );
+        for grant in &admitted {
+            assert_eq!(grant.granted, FREE);
         }
+        assert!(refused.is_empty());
         assert_eq!(
             deal.remaining_tokens(),
-            0,
-            "the winner holds the whole remainder while its provider-native input is unknown"
+            FREE,
+            "authorization does not spend the shared budget"
         );
         drop(admitted);
         harness.shutdown().await;
@@ -9772,7 +10515,7 @@ mod tests {
         // verification this deal has already paid for. Written against the constant, because a
         // remainder ABOVE the debt would let the unconditional-floor regression pass.
         const _: () = assert!(ASK < VERIFICATION_DEBT);
-        let spent = deal.reserved_billable_tokens.load(Ordering::SeqCst);
+        let spent = deal.billable_tokens.load(Ordering::SeqCst);
         deal.token_ceiling.store(spent + ASK, Ordering::SeqCst);
         assert_eq!(deal.remaining_tokens(), ASK, "the tail is the fixture");
 
@@ -9788,10 +10531,9 @@ mod tests {
         );
         assert_eq!(
             deal.remaining_tokens(),
-            0,
-            "the whole remainder is handed to the one request that asked for it"
+            ASK,
+            "unused authorization remains available to concurrent requests"
         );
-        drop(reservation);
         harness.shutdown().await;
     }
 
@@ -10045,8 +10787,10 @@ mod tests {
             buyer: harness.buyer.clone(),
             frame_model: "dexdo-mock".to_string(),
             mock_model: true,
+            renewal_enabled: false,
             deals: harness.deals.clone(),
             delivery_events: Some(delivery_tx),
+            usage: None,
         };
         let request =
             serde_json::from_value::<crate::buyer::render::OpenAiChatRequest>(serde_json::json!({
@@ -10057,7 +10801,12 @@ mod tests {
             }))
             .expect("OpenAI request");
         let mut handler = tokio::spawn(async move {
-            openai::chat_completions(axum::extract::State(state), axum::Json(request)).await
+            openai::chat_completions(
+                axum::extract::State(state),
+                http::HeaderMap::new(),
+                Ok(axum::Json(request)),
+            )
+            .await
         });
 
         // which of the two outcomes happened is decided by facts, not by a clock. Reaching the
@@ -10106,7 +10855,11 @@ mod tests {
             13,
             "B8 and the seller half of B7 are charged before B7 awaits its reference"
         );
-        assert_eq!(deal.remaining_tokens(), 0, "the whole grant is still held");
+        assert_eq!(
+            deal.remaining_tokens(),
+            GRANT - 13,
+            "only completed verification spends the shared budget"
+        );
 
         handler.abort();
         let _ = handler.await;
@@ -10226,11 +10979,11 @@ mod tests {
         harness.shutdown().await;
     }
 
-    /// Exactly one request may hold a billing grant on a deal while provider-native input remains
-    /// unknown; dropping it reopens the full unused remainder.
+    /// Buyer authorizations overlap without spending capacity; the seller allocates payment
+    /// and enforces the per-deal concurrency limit.
     /// E2E-ROW: E2E-UPS-39/L0
     #[tokio::test]
-    async fn one_in_flight_billing_reservation_serializes_a_deal() {
+    async fn shared_budget_2091_buyer_authorizations_do_not_exclusively_reserve_a_deal() {
         const ASK: u64 = 64;
         const FREE: u64 = ASK + VERIFICATION_DEBT;
         let harness = weekly_route_harness_gated(
@@ -10260,20 +11013,17 @@ mod tests {
             RouteBudget::Exhausted(reason) => panic!("first request was refused: {reason}"),
         };
         assert_eq!(first.granted, FREE);
-        assert_eq!(deal.remaining_tokens(), 0);
+        assert_eq!(deal.remaining_tokens(), FREE);
+        let RouteBudget::Admitted(second) = deal.admit(Some(ASK as u32)).await else {
+            panic!("a second request must not wait for the first authorization");
+        };
+        assert_eq!(second.granted, FREE);
 
-        assert!(matches!(
-            deal.admit(Some(ASK as u32)).await,
-            RouteBudget::Exhausted(_)
-        ));
-
-        drop(first);
         let reopened = match deal.admit(Some(ASK as u32)).await {
             RouteBudget::Admitted(reservation) => reservation,
             RouteBudget::Exhausted(reason) => panic!("unused grant did not reopen: {reason}"),
         };
         assert_eq!(reopened.granted, FREE);
-        drop(reopened);
         harness.shutdown().await;
     }
 
@@ -10298,6 +11048,120 @@ mod tests {
         assert!(body.contains(ORDINARY_BUDGET_EXHAUSTED), "{body}");
         assert_eq!(harness.chain.reads(), 0);
         assert_eq!(harness.chain.settle_calls(), 0);
+        harness.shutdown().await;
+    }
+    /// E2E-ROW: E2E-UPS-39/L0
+    #[tokio::test]
+    async fn shared_budget_2091_a_short_http_request_finishes_while_another_response_is_open() {
+        let harness = weekly_route_harness(0, true).await;
+        let mut long = harness
+            .send_full(
+                "/v1/chat/completions",
+                8,
+                "DEXDO_FIXTURE_HOLD_SHARED_RESPONSE",
+                true,
+            )
+            .await;
+        assert_eq!(long.status(), reqwest::StatusCode::OK);
+        assert!(long.chunk().await.unwrap().is_some());
+        let deal = harness.deals.current().await.unwrap();
+        assert!(deal.has_active_request());
+        let (status, body) = harness.ask_full("/v1/responses", 2, "short", false).await;
+        assert_eq!(status, reqwest::StatusCode::OK, "{body}");
+        assert!(
+            deal.has_active_request(),
+            "the held first response is still active"
+        );
+        harness.seller.release_delayed_eof();
+        let tail = long.text().await.unwrap();
+        assert!(tail.contains("[DONE]"), "{tail}");
+        assert_eq!(harness.delivered().await, 12);
+        harness.shutdown().await;
+    }
+    #[tokio::test]
+    async fn shared_budget_2091_anthropic_finish_reason_is_independent_of_payment() {
+        for stream in [false, true] {
+            for (marker, charge) in [
+                ("DEXDO_FIXTURE_ZERO_CHARGE", 0),
+                ("DEXDO_FIXTURE_PARTIAL_CHARGE", 1),
+            ] {
+                for output_cap in [2, 3] {
+                    let harness = weekly_route_harness(0, true).await;
+                    let (status, body) = harness
+                        .ask_full("/v1/messages", output_cap, marker, stream)
+                        .await;
+                    assert_eq!(status, reqwest::StatusCode::OK, "{body}");
+                    assert!(body.contains(marker), "{body}");
+                    assert_eq!(
+                        terminal_reason(&body).as_deref(),
+                        Some("end_turn"),
+                        "{body}"
+                    );
+                    let delivery = harness.last_delivery().await;
+                    assert_eq!(delivery.finish_reason, "end_turn");
+                    assert_eq!(delivery.failure_stage, None);
+                    assert_eq!(delivery.input_tokens, Some(1));
+                    assert_eq!(delivery.output_tokens, Some(2));
+                    assert_eq!(delivery.billable_tokens, Some(3));
+                    assert_eq!(delivery.request_billable_tokens, 3);
+                    assert_eq!(delivery.visible_output_tokens, 2);
+                    assert_eq!(delivery.route_billable_tokens, Some(charge));
+                    assert_eq!(harness.delivered().await, charge);
+                    assert!(!delivery.truncated_by_output_limit);
+                    assert_eq!(delivery.ended_before_output_limit, output_cap > 2);
+                    harness.shutdown().await;
+                }
+            }
+            // Actual output clipping still reports max_tokens and cannot accept a terminal bill.
+            let harness = weekly_route_harness(WEEK_QUOTA - 2, true).await;
+            let (status, body) = harness
+                .ask_full(
+                    "/v1/messages",
+                    8,
+                    "DEXDO_FIXTURE_STRADDLE DEXDO_FIXTURE_ZERO_CHARGE",
+                    stream,
+                )
+                .await;
+            assert_eq!(status, reqwest::StatusCode::OK, "{body}");
+            assert_eq!(
+                terminal_reason(&body).as_deref(),
+                Some("max_tokens"),
+                "{body}"
+            );
+            let delivery = harness.last_delivery().await;
+            assert_eq!(delivery.finish_reason, "max_tokens");
+            assert!(delivery.truncated_by_output_limit);
+            assert_eq!(delivery.visible_output_tokens, 1);
+            assert_eq!(delivery.billable_tokens, None);
+            assert_eq!(delivery.route_billable_tokens, Some(0));
+            assert_eq!(harness.delivered().await, 0);
+            harness.shutdown().await;
+        }
+    }
+    #[tokio::test]
+    async fn shared_budget_2091_zero_charge_answers_succeed_on_each_consumer_protocol() {
+        let harness = weekly_route_harness(0, true).await;
+        for path in ["/v1/chat/completions", "/v1/responses", "/v1/messages"] {
+            for stream in [false, true] {
+                let (status, body) = harness
+                    .ask_full(path, 2, "DEXDO_FIXTURE_ZERO_CHARGE", stream)
+                    .await;
+                assert_eq!(
+                    status,
+                    reqwest::StatusCode::OK,
+                    "{path} stream={stream}: {body}"
+                );
+                assert!(
+                    body.contains("DEXDO_FIXTURE_ZERO_CHARGE"),
+                    "the full answer is preserved: {body}"
+                );
+                assert_eq!(
+                    harness.delivered().await,
+                    0,
+                    "a zero charge must not spend the deal"
+                );
+            }
+        }
         harness.shutdown().await;
     }
 }

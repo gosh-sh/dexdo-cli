@@ -577,23 +577,15 @@ pub(crate) async fn operator_shutdown_signal() {
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    // a reader that has gone away is the end of output, not a fault.
+    // a reader that has gone away is the end of output, not a fault -- signal 13, reported
+    // as 141, rather than exit 101 with `panicked at` on stderr. Measured against a reader that has
+    // closed: a 143-byte single-line command panicked 20 times out of 20.
 
-    // Rust's runtime sets SIGPIPE to SIG_IGN before `main`, so a closed stdout arrives as `EPIPE`
-    // on the write, and `print!`/`println!` panic on a write error by contract. The result is exit
-    // 101 -- a panic code -- for `dexdo... | less` that was quit, or any consumer that hung up.
-    // Measured against a reader that has closed: a 143-byte single-line command dies 20 times out
-    // of 20. The count of print sites that once stood here is dropped rather than recomputed -- it
-    // reproduces at no scope today, so any number put in its place would be a fresh count wearing
-    // the original measurement's clothes. Restoring the default disposition here, once, ends the
-    // process the way every other Unix tool ends it: signal 13, reported as 141.
-    #[cfg(unix)]
-    // SAFETY: `signal` on SIGPIPE with SIG_DFL only restores the disposition the kernel gave this
-    // process before Rust's runtime overrode it. It is a process-wide setting, so it is done here,
-    // at the one place that owns process entry, and never per print site.
-    unsafe {
-        libc::signal(libc::SIGPIPE, libc::SIG_DFL);
-    }
+    // and a peer that closed a SOCKET is an error to handle, not a death. got the
+    // first by putting SIGPIPE back to SIG_DFL for the whole process, which also killed
+    // `wallet onboard ackinacki-wallet` with -13 mid-binding. The disposition stays ignored, and
+    // only the print panic is turned into the signal -- see `closed_stdout_ends_on_sigpipe`.
+    dexdo::closed_stdout_ends_on_sigpipe();
     let raw_args = std::env::args_os().collect::<Vec<_>>();
     // Parsed through the matches rather than through `Cli::try_parse_from`, because the matches are
     // the only place that records WHERE each value came from. A struct field holds `ticks == 2`
@@ -693,6 +685,20 @@ async fn main() -> Result<()> {
         })
     });
 
+    // Validate enabled seller telemetry before any financial command dispatch.
+    let telemetry = if let Command::Seller(args) = &cli.command {
+        let config = dexdo::telemetry::Config::from_env()?.map(|config| {
+            if args.mock.mock_chain {
+                config.with_mock_network()
+            } else {
+                config
+            }
+        });
+        dexdo::telemetry::Session::start(config)?
+    } else {
+        None
+    };
+
     let result = match instance_lock {
         Err(error) => Err(error),
         Ok(_instance_lock) if deal_gas_override_on_non_funding_command => Err(anyhow::anyhow!(
@@ -758,6 +764,10 @@ async fn main() -> Result<()> {
             Command::Accumulator(args) => run_accumulator(args).await,
         },
     };
+    if let Some(telemetry) = telemetry {
+        telemetry.shutdown().await;
+    }
+
     if let Err(err) = result {
         if machine::is_printed_error(&err) {
             std::process::exit(1);

@@ -32,6 +32,34 @@ pub enum UpstreamEvent {
 
 pub type UpstreamResult = Result<UpstreamEvent, Status>;
 
+/// Observe the existing send, without extra buffering or changing stream semantics. `Err` means the
+/// receiver is gone; callers only test for it, so the undelivered event is not handed back.
+pub(crate) async fn send_event(
+    tx: &mpsc::Sender<UpstreamResult>,
+    event: UpstreamResult,
+) -> Result<(), ()> {
+    if let Err(status) = &event {
+        crate::telemetry::failed(status.code());
+    }
+    let content = matches!(&event, Ok(UpstreamEvent::Chunk(chunk)) if !chunk.text.is_empty() || !chunk.reasoning.is_empty() || !chunk.token_ids.is_empty());
+    let terminal = matches!(&event, Ok(UpstreamEvent::Usage(_)));
+    tx.send(event).await.map_err(|_| ())?;
+    if content {
+        crate::telemetry::chunk();
+    }
+    if terminal {
+        crate::telemetry::completed();
+    }
+    Ok(())
+}
+
+/// Fixed native thinking-off payload, shared by compatible Chat and Messages APIs.
+#[derive(serde::Serialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub(crate) enum ThinkingRequest {
+    Disabled,
+}
+
 /// The two canonical model-id flags this startup probe can prove from an upstream response.
 /// Other flag slots deliberately never reach this type: their enforcement belongs to other
 /// delivery artifacts, and precision is attested rather than enforced.
@@ -80,9 +108,12 @@ impl StartupCapabilityRequirements {
     }
 
     fn wrap_status(self, status: Status) -> Status {
-        if status
-            .message()
-            .starts_with("startup capability probe for ")
+        // Startup retries need the original typed throttle and HTTP status message.
+        if (dexdo_proto::is_retryable_upstream(&status)
+            && status.message().starts_with("upstream HTTP 429 "))
+            || status
+                .message()
+                .starts_with("startup capability probe for ")
         {
             return status;
         }
@@ -189,6 +220,56 @@ pub enum UpstreamConfig {
 }
 
 impl UpstreamConfig {
+    pub(crate) fn supported_reasoning_efforts(&self) -> Vec<String> {
+        match self {
+            Self::OpenAi(cfg) => cfg
+                .capabilities
+                .reasoning_effort
+                .as_ref()
+                .map(|cfg| {
+                    cfg.supported
+                        .iter()
+                        .map(|effort| effort.as_str().to_owned())
+                        .collect()
+                })
+                .unwrap_or_default(),
+            _ => Vec::new(),
+        }
+    }
+
+    #[allow(clippy::result_large_err)]
+    pub(crate) fn validate_reasoning(&self, params: Option<&SamplingParams>) -> Result<(), Status> {
+        if let Self::OpenAi(cfg) = self {
+            return cfg.capabilities.validate_reasoning(params);
+        }
+        if params.is_some_and(|p| p.reasoning_effort.is_some()) {
+            return Err(Status::invalid_argument(
+                "unsupported_parameter: this seller/model does not support reasoning effort",
+            ));
+        }
+        if params.is_some_and(|p| p.disable_reasoning) && !self.supports_reasoning_disable() {
+            return Err(Status::invalid_argument(
+                "unsupported_parameter: this seller/model cannot disable reasoning",
+            ));
+        }
+        Ok(())
+    }
+
+    /// Per-deal declaration, read before any paid inference. Old/undeclared profiles stay unsupported.
+    pub(crate) fn supports_reasoning_disable(&self) -> bool {
+        match self {
+            Self::OpenAi(cfg) => {
+                cfg.capabilities.reasoning_disable
+                    != dexdo_core::params::ReasoningDisableControl::Unsupported
+            }
+            Self::Anthropic(cfg) => {
+                cfg.reasoning_disable
+                    == dexdo_core::params::ReasoningDisableControl::ThinkingDisabled
+            }
+            _ => false,
+        }
+    }
+
     /// **Provider health.** Prove that the configured endpoint accepts the configured credentials and
     /// exact served model through the same adapter used for buyer traffic. The caller owns the timeout.
 
@@ -255,7 +336,7 @@ impl UpstreamConfig {
         }
     }
 
-    fn startup_market_model(&self) -> Option<&str> {
+    pub(crate) fn startup_market_model(&self) -> Option<&str> {
         match self {
             Self::MockWithClaimedModel(model) => Some(model),
             _ => self.market_model(),
@@ -357,16 +438,34 @@ impl UpstreamConfig {
                 // Readiness asks only whether the provider can answer. B7's provider-specific greedy
                 // control is irrelevant here and may itself be rejected by an otherwise healthy endpoint.
                 greedy: false,
+                disable_reasoning: false,
+                reasoning_effort: None,
             }),
+            ..Default::default()
         };
         let (tx, mut rx) = mpsc::channel(UPSTREAM_HEALTH_CHANNEL_CAPACITY);
-        let run = self.run_for_market(
-            market,
-            requirements,
-            u64::from(max_tokens),
-            Some(request),
-            tx,
-        );
+        // Readiness has its own outer deadline and cadence. Return a typed throttle now,
+        // rather than hiding it inside a longer request retry until readiness calls it a timeout.
+        let (model, backend) = self.metric_labels();
+        let run = crate::telemetry::request(model, "probe", backend, async {
+            match self {
+                Self::OpenAi(cfg) => {
+                    openai::run_probe(
+                        cfg,
+                        market,
+                        requirements,
+                        u64::from(max_tokens),
+                        Some(request),
+                        tx,
+                    )
+                    .await
+                }
+                _ => {
+                    self.dispatch(u64::from(max_tokens), Some(request), tx)
+                        .await
+                }
+            }
+        });
         tokio::pin!(run);
 
         loop {
@@ -441,18 +540,30 @@ impl UpstreamConfig {
         req: Option<CanonRequest>,
         tx: mpsc::Sender<UpstreamResult>,
     ) {
-        self.run_for_market(None, None, output_limit, req, tx).await
+        let (model, backend) = self.metric_labels();
+        crate::telemetry::request(
+            model,
+            "inference",
+            backend,
+            self.dispatch(output_limit, req, tx),
+        )
+        .await
     }
 
-    /// [`Self::run`], for a caller that knows which market the call is being made for (seller readiness).
-    /// The market only selects which question the adapter's served-model check answers; it changes nothing
-    /// about the request sent upstream. Buyer traffic passes `None` -- by the time a buyer streams, the
-    /// market verdict was already given at readiness, and refusing mid-stream would strand paid capacity
-    /// .
-    async fn run_for_market(
+    /// `model` and `backend` labels for this upstream's request metrics.
+    fn metric_labels(&self) -> (&str, &'static str) {
+        let backend = match self {
+            Self::OpenAi(_) => "openai",
+            Self::Anthropic(_) => "anthropic",
+            _ => "mock",
+        };
+        (self.startup_market_model().unwrap_or("mock"), backend)
+    }
+
+    /// One upstream call without request metrics: [`Self::run`] and the readiness probe each
+    /// measure it once under their own `purpose`.
+    async fn dispatch(
         &self,
-        market: Option<&str>,
-        requirements: Option<StartupCapabilityRequirements>,
         output_limit: u64,
         req: Option<CanonRequest>,
         tx: mpsc::Sender<UpstreamResult>,
@@ -472,13 +583,7 @@ impl UpstreamConfig {
             UpstreamConfig::MockScammer => {
                 mock::run(output_limit, req.as_ref(), tx, true, None).await
             }
-            UpstreamConfig::OpenAi(cfg) => match requirements {
-                Some(requirements) => {
-                    openai::run_startup_probe(cfg, market, requirements, output_limit, req, tx)
-                        .await
-                }
-                None => openai::run(cfg, market, output_limit, req, tx).await,
-            },
+            UpstreamConfig::OpenAi(cfg) => openai::run(cfg, None, output_limit, req, tx).await,
             UpstreamConfig::Anthropic(cfg) => anthropic::run(cfg, output_limit, req, tx).await,
         }
     }
@@ -645,6 +750,25 @@ mod tests {
             "Qwen/Qwen3-32B"
         );
         assert_eq!(first_claimed_model(UpstreamConfig::Mock).await, "mock");
+    }
+
+    #[test]
+    fn issue_2147_capability_context_preserves_the_startup_throttle_verdict() {
+        for (tools, think) in [(true, false), (false, true), (true, true)] {
+            let requirements = StartupCapabilityRequirements { tools, think };
+            let throttle = dexdo_proto::retryable_upstream_status(Status::unavailable(
+                "upstream HTTP 429 Too Many Requests",
+            ));
+            let annotated = requirements.wrap_status(throttle.clone());
+            assert!(dexdo_proto::is_retryable_upstream(&annotated));
+            assert_eq!(annotated.message(), throttle.message());
+            assert_eq!(annotated.code(), throttle.code());
+
+            let rejected = requirements.wrap_status(Status::unauthenticated("bad credentials"));
+            assert_eq!(rejected.code(), tonic::Code::Unauthenticated);
+            assert!(!dexdo_proto::is_retryable_upstream(&rejected));
+            assert!(rejected.message().contains(requirements.flags()));
+        }
     }
 
     #[test]

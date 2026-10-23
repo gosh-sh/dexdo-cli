@@ -7,7 +7,9 @@
 //! an empty config, an unknown model -> an explicit error, not a silent degradation.
 
 use anyhow::{bail, Context, Result};
-pub use dexdo_core::params::SampleAlgorithm;
+pub use dexdo_core::params::{
+    ReasoningDisableControl, ReasoningEffort, ReasoningEffortControl, SampleAlgorithm,
+};
 use serde::Deserialize;
 use std::collections::BTreeMap;
 use std::path::Path;
@@ -33,6 +35,55 @@ pub struct Capabilities {
     /// generations.
     #[serde(default)]
     pub sample_algorithm: SampleAlgorithm,
+    /// Verified disable control for this exact endpoint/model and server version.
+    /// Absent = unsupported. Native Anthropic accepts only `thinking_disabled`.
+    #[serde(default)]
+    pub reasoning_disable: ReasoningDisableControl,
+    /// Verified effort control and supported levels, independent of reasoning disable.
+    #[serde(default)]
+    pub reasoning_effort: Option<ReasoningEffortCapability>,
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct ReasoningEffortCapability {
+    pub control: ReasoningEffortControl,
+    pub supported: Vec<ReasoningEffort>,
+}
+
+impl Capabilities {
+    #[allow(clippy::result_large_err)]
+    pub(crate) fn validate_reasoning(
+        &self,
+        params: Option<&dexdo_proto::SamplingParams>,
+    ) -> Result<(), tonic::Status> {
+        let Some(params) = params else { return Ok(()) };
+        if params.disable_reasoning && params.reasoning_effort.is_some() {
+            return Err(tonic::Status::invalid_argument(
+                "unsupported_parameter: reasoning effort and disable cannot be combined",
+            ));
+        }
+        if params.disable_reasoning
+            && self.reasoning_disable == ReasoningDisableControl::Unsupported
+        {
+            return Err(tonic::Status::invalid_argument(
+                "unsupported_parameter: this seller/model cannot disable reasoning",
+            ));
+        }
+        if let Some(value) = &params.reasoning_effort {
+            let supported = ReasoningEffort::parse(value).is_some_and(|effort| {
+                self.reasoning_effort
+                    .as_ref()
+                    .is_some_and(|cfg| cfg.supported.contains(&effort))
+            });
+            if !supported {
+                return Err(tonic::Status::invalid_argument(format!(
+                    "unsupported_parameter: this seller/model does not support reasoning effort {value:?}",
+                )));
+            }
+        }
+        Ok(())
+    }
 }
 
 impl Default for Capabilities {
@@ -40,6 +91,8 @@ impl Default for Capabilities {
         Self {
             max_output_tokens: None,
             sample_algorithm: dexdo_core::params::OPENAI_COMPATIBLE_SAMPLE_ALGORITHM_DEFAULT,
+            reasoning_disable: dexdo_core::params::REASONING_DISABLE_CONTROL_DEFAULT,
+            reasoning_effort: None,
         }
     }
 }
@@ -149,6 +202,23 @@ impl ModelsConfig {
         if cfg.models.is_empty() {
             bail!("no models in the config");
         }
+        for (name, model) in &cfg.models {
+            if let Some(effort) = &model.capabilities.reasoning_effort {
+                if effort.supported.is_empty() {
+                    bail!(
+                        "model {name:?}: capabilities.reasoning_effort.supported must not be empty"
+                    );
+                }
+                for (index, level) in effort.supported.iter().enumerate() {
+                    if effort.supported[..index].contains(level) {
+                        bail!(
+                            "model {name:?}: duplicate reasoning effort {:?}",
+                            level.as_str()
+                        );
+                    }
+                }
+            }
+        }
         Ok(cfg)
     }
 
@@ -235,6 +305,37 @@ mod tests {
     }
 
     #[test]
+    fn reasoning_2090_profiles_load_for_both_adapters() {
+        for (name, control) in [
+            ("unsupported", ReasoningDisableControl::Unsupported),
+            ("chat_template", ReasoningDisableControl::ChatTemplate),
+            (
+                "chat_template_thinking",
+                ReasoningDisableControl::ChatTemplateThinking,
+            ),
+            ("reasoning_effort", ReasoningDisableControl::ReasoningEffort),
+            ("openrouter", ReasoningDisableControl::OpenRouter),
+            (
+                "thinking_disabled",
+                ReasoningDisableControl::ThinkingDisabled,
+            ),
+        ] {
+            let mut body: serde_json::Value = serde_json::from_str(SAMPLE).unwrap();
+            body["models"]["qwen"]["capabilities"]["reasoning_disable"] = name.into();
+            let cfg = ModelsConfig::from_json(&body.to_string()).unwrap();
+            let model = cfg.get("qwen").unwrap();
+            assert_eq!(model.capabilities.reasoning_disable, control);
+            assert_eq!(
+                crate::seller::AnthropicConfig::from_model(model, None).reasoning_disable,
+                control
+            );
+        }
+        let mut body: serde_json::Value = serde_json::from_str(SAMPLE).unwrap();
+        body["models"]["qwen"]["capabilities"]["reasoning_disable"] = "guess_from_model".into();
+        assert!(ModelsConfig::from_json(&body.to_string()).is_err());
+    }
+
+    #[test]
     fn unknown_model_fails_loud_with_list() {
         let cfg = ModelsConfig::from_json(SAMPLE).unwrap();
         let err = cfg.get("gpt-4o").unwrap_err().to_string();
@@ -262,6 +363,10 @@ mod tests {
         let m = cfg.get("m").unwrap();
         // an undeclared output cap is UNKNOWN, never "unbounded" -- the seller fails closed.
         assert_eq!(m.capabilities.max_output_tokens, None);
+        assert_eq!(
+            m.capabilities.reasoning_disable,
+            ReasoningDisableControl::Unsupported
+        );
         assert!(
             m.capabilities.sample_algorithm == SampleAlgorithm::None,
             "an omitted sample_algorithm uses the conservative NONE default"
@@ -424,5 +529,75 @@ mod tests {
         let cfg = ModelsConfig::from_json(json).unwrap();
         let m = cfg.get("m").unwrap();
         assert!(!m.fingerprints[0].accepts_reasoning_side_channel);
+    }
+}
+
+#[cfg(test)]
+mod reasoning_2172_tests {
+    use super::*;
+    use proptest::prelude::*;
+
+    #[test]
+    fn effort_capability_is_strict_and_independent_of_disable() {
+        let base = serde_json::json!({"models":{"m":{
+            "frame_model":"m", "base_url":"http://fixture", "served_model":"m",
+            "api_key_env":"unused", "tokenizer_family":"qwen", "price_per_tick":1,
+            "capabilities":{"reasoning_disable":"chat_template"}
+        }}});
+        for control in ["reasoning_effort", "reasoning_effort_nested"] {
+            let mut body = base.clone();
+            body["models"]["m"]["capabilities"]["reasoning_effort"] = serde_json::json!({
+                "control":control, "supported":["minimal", "low", "medium", "high", "xhigh", "max"]
+            });
+            let cfg = ModelsConfig::from_json(&body.to_string()).unwrap();
+            let caps = &cfg.get("m").unwrap().capabilities;
+            assert_eq!(
+                caps.reasoning_disable,
+                ReasoningDisableControl::ChatTemplate
+            );
+            assert_eq!(
+                caps.reasoning_effort
+                    .as_ref()
+                    .unwrap()
+                    .supported
+                    .iter()
+                    .map(|effort| effort.as_str())
+                    .collect::<Vec<_>>(),
+                vec!["minimal", "low", "medium", "high", "xhigh", "max"]
+            );
+            for invalid in [
+                serde_json::json!({"control":control,"supported":[]}),
+                serde_json::json!({"control":control,"supported":["low","low"]}),
+                serde_json::json!({"control":control,"supported":["none"]}),
+                serde_json::json!({"control":control,"supported":["invalid"]}),
+                serde_json::json!({"control":control,"supported":["ultra"]}),
+                serde_json::json!({"control":"invalid","supported":["high"]}),
+                serde_json::json!({"control":control,"supported":["high"],"unknown":true}),
+            ] {
+                body["models"]["m"]["capabilities"]["reasoning_effort"] = invalid;
+                assert!(ModelsConfig::from_json(&body.to_string()).is_err());
+            }
+        }
+    }
+
+    proptest! {
+        #[test]
+        fn undeclared_efforts_and_conflicting_controls_always_fail(
+            value in ".*", disabled: bool,
+        ) {
+            let caps = Capabilities {
+                reasoning_disable: ReasoningDisableControl::ChatTemplate,
+                reasoning_effort: Some(ReasoningEffortCapability {
+                    control: ReasoningEffortControl::ReasoningEffort,
+                    supported: vec![ReasoningEffort::High],
+                }),
+                ..Default::default()
+            };
+            let params = dexdo_proto::SamplingParams {
+                disable_reasoning: disabled, reasoning_effort: Some(value.clone()),
+                ..Default::default()
+            };
+            prop_assert_eq!(caps.validate_reasoning(Some(&params)).is_ok(), !disabled && value == ReasoningEffort::High.as_str());
+        }
     }
 }

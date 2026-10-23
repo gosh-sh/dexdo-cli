@@ -68,6 +68,7 @@ impl HotFundingProvider for DirectTopUpProvider {
         // "absent" here would be a claim about a queue this provider does not have, and `Absent` is
         // the one answer that authorizes a submit.
         Ok(RequestPresence::Unknown {
+            queue_transaction_id: None,
             reason: format!(
                 "provider `{}` has no funding request queue to probe",
                 self.provider.as_str()
@@ -160,6 +161,16 @@ pub(crate) trait VaultChain {
 
     /// Every queue event in the Vault's finalized ext-out history, in chain order.
     async fn history(&self) -> Result<Vec<VaultQueueEvent>>;
+
+    /// Whether this admission event was emitted by our exact finalized submit transaction.
+    /// Unavailable proof must stay false: a matching amount alone cannot bind a generation.
+    async fn submitted_in_transaction(
+        &self,
+        _message_id: &str,
+        _transaction_hash: &str,
+    ) -> Result<bool> {
+        Ok(false)
+    }
 
     /// The INTERNAL message that carried an executed queue transfer to `destination`, proven by the
     /// destination's own finalized receipt.
@@ -259,6 +270,92 @@ fn describe_recorded_request(expected: &FundingFingerprint, recorded: &RecordedR
     )
 }
 
+/// Older journals retained identity only in human-readable evidence. It is usable only when an
+/// independently recorded queue id binds that evidence to this generation. In particular the
+/// no-id fallback that produced must never turn its own text into generation proof.
+fn saved_execution(recorded: &RecordedRequest) -> Result<Option<FundingEvidence>> {
+    let Some(evidence) = recorded.evidence.as_ref() else {
+        return Ok(None);
+    };
+    let known_id = recorded
+        .pending_transaction_id
+        .as_deref()
+        .and_then(|id| id.parse::<u64>().ok());
+    let mut evidence = evidence.clone();
+    if let Some(id) = evidence.queue_transaction_id {
+        if recorded.pending_transaction_id.is_some() && known_id != Some(id) {
+            anyhow::bail!("saved execution queue id {id} conflicts with the journal queue id");
+        }
+    } else {
+        let Some(known_id) = known_id else {
+            return Ok(None);
+        };
+        if evidence
+            .source
+            .strip_prefix("finalized ext-out message ")
+            .is_none_or(|id| id.len() != 64 || !id.bytes().all(|b| b.is_ascii_hexdigit()))
+        {
+            return Ok(None);
+        }
+        let parsed = evidence
+            .detail
+            .strip_prefix("the Vault emitted TransactionSent for queue transaction ")
+            .and_then(|detail| detail.split_once(" to "))
+            .and_then(|(id, detail)| {
+                detail
+                    .split_once(" at chain time ")
+                    .map(|(dest, tail)| (id, dest, tail))
+            });
+        let Some((id, dest, tail)) = parsed else {
+            return Ok(None);
+        };
+        let (time, delivery) = match tail.split_once(", delivered to the Hot by internal message ")
+        {
+            Some((time, delivery)) => {
+                let Some(delivery) =
+                    delivery.strip_suffix(", whose destination receipt is finalized")
+                else {
+                    return Ok(None);
+                };
+                if delivery.len() != 64 || !delivery.bytes().all(|b| b.is_ascii_hexdigit()) {
+                    return Ok(None);
+                }
+                (time, Some(delivery.to_string()))
+            }
+            None => (tail, None),
+        };
+        // An unbound history candidate may name a different equal-amount transfer. It cannot
+        // veto a later independently proven ID; read that request's actual chain evidence instead.
+        if id.parse::<u64>().ok() != Some(known_id) {
+            return Ok(None);
+        }
+        if !addresses_equal(dest, &recorded.fingerprint.dest)
+            || evidence.observed_at_unix.is_none()
+            || time.parse::<u64>().ok() != evidence.observed_at_unix
+        {
+            anyhow::bail!(
+                "saved execution text does not match the recorded destination or chain time"
+            );
+        }
+        if let (Some(saved), Some(parsed)) = (&evidence.delivery_message_id, &delivery) {
+            if saved != parsed {
+                anyhow::bail!("saved execution has conflicting Hot delivery message ids");
+            }
+        }
+        evidence.delivery_message_id = evidence.delivery_message_id.or(delivery);
+        evidence.queue_transaction_id = Some(known_id);
+    }
+    if evidence.verdict != "executed"
+        || evidence
+            .source
+            .strip_prefix("finalized ext-out message ")
+            .is_none_or(|id| id.is_empty() || id.chars().any(char::is_whitespace))
+    {
+        anyhow::bail!("saved execution has no finalized TransactionSent message identity");
+    }
+    Ok(Some(evidence))
+}
+
 /// Whether a queued transaction is the transfer `expected` describes.
 
 /// Every field of the fingerprint, and the creator key among them: a transaction to the same
@@ -337,10 +434,42 @@ impl<C: VaultChain> HotFundingProvider for AckinackiVaultProvider<C> {
         let expected = self.expected_fingerprint(request);
         let known_id = self.known_id();
 
+        let recorded = self.recorded.borrow().clone();
+        if let Some(recorded) = &recorded {
+            match saved_execution(recorded) {
+                Ok(Some(mut evidence)) => {
+                    if evidence.delivery_message_id.is_none() {
+                        let anchor = evidence
+                            .source
+                            .trim_start_matches("finalized ext-out message ");
+                        match self
+                            .chain
+                            .delivery_message_id(anchor, &expected.dest, &expected.dapp_id)
+                            .await
+                        {
+                            Ok(delivery) => evidence.delivery_message_id = delivery,
+                            Err(error) => {
+                                tracing::warn!("retaining confirmed Vault execution; Hot delivery remains unproven: {error}");
+                            }
+                        }
+                    }
+                    return Ok(RequestPresence::Executed { evidence });
+                }
+                Ok(None) => {}
+                Err(error) => {
+                    return Ok(RequestPresence::Unknown {
+                        queue_transaction_id: None,
+                        reason: error.to_string(),
+                    })
+                }
+            }
+        }
+
         let queue = match self.chain.queue().await {
             Ok(queue) => queue,
             Err(error) => {
                 return Ok(RequestPresence::Unknown {
+                    queue_transaction_id: None,
                     reason: format!("the Vault queue could not be read: {error}"),
                 })
             }
@@ -357,6 +486,7 @@ impl<C: VaultChain> HotFundingProvider for AckinackiVaultProvider<C> {
         if let Some(found) = found {
             if !queue_entry_matches(found, &expected) {
                 return Ok(RequestPresence::Unknown {
+                    queue_transaction_id: None,
                     reason: format!(
                         "the Vault queue holds transaction {} but it does not describe the \
                          transfer this journal recorded; refusing to treat it as ours",
@@ -376,6 +506,7 @@ impl<C: VaultChain> HotFundingProvider for AckinackiVaultProvider<C> {
                     Ok(history) => history,
                     Err(error) => {
                         return Ok(RequestPresence::Unknown {
+                            queue_transaction_id: None,
                             reason: format!(
                                 "the Vault queue holds exact transaction {}, but its finalized \
                                  history could not be read to date that request: {error}",
@@ -392,6 +523,7 @@ impl<C: VaultChain> HotFundingProvider for AckinackiVaultProvider<C> {
                         && event.value == expected.value
                 }) else {
                     return Ok(RequestPresence::Unknown {
+                        queue_transaction_id: None,
                         reason: format!(
                             "the Vault queue holds exact transaction {}, but finalized history has \
                              no matching TransactionSubmitted message whose chain time can date it",
@@ -421,6 +553,7 @@ impl<C: VaultChain> HotFundingProvider for AckinackiVaultProvider<C> {
             Ok(history) => history,
             Err(error) => {
                 return Ok(RequestPresence::Unknown {
+                    queue_transaction_id: None,
                     reason: format!("the Vault's finalized history could not be read: {error}"),
                 })
             }
@@ -428,7 +561,7 @@ impl<C: VaultChain> HotFundingProvider for AckinackiVaultProvider<C> {
 
         // Recover the id when our own submit's result was never observed: the wallet's own
         // `TransactionSubmitted` names it, and carries the chain time it was queued at.
-        let submitted = history
+        let mut submitted = history
             .iter()
             .filter(|event| event.kind == VaultQueueEventKind::Submitted)
             .rfind(|event| match known_id {
@@ -440,6 +573,34 @@ impl<C: VaultChain> HotFundingProvider for AckinackiVaultProvider<C> {
                 }
             });
 
+        let mut bound_id = known_id;
+        if known_id.is_none() && recorded.pending_transaction_id.is_none() {
+            if let Some(transaction_hash) = recorded.transaction_hash.as_deref() {
+                for event in history.iter().filter(|event| {
+                    event.kind == VaultQueueEventKind::Submitted
+                        && addresses_equal(&event.dest, &expected.dest)
+                        && dapp_ids_equal(&event.dapp_id, &expected.dapp_id)
+                        && event.value == expected.value
+                }) {
+                    match self.chain.submitted_in_transaction(&event.message_id, transaction_hash).await {
+                        Ok(true) if bound_id.is_some_and(|id| id != event.transaction_id) => {
+                            tracing::warn!("the saved submit receipt identifies conflicting queue ids; retaining unbound execution evidence");
+                            bound_id = None;
+                            break;
+                        }
+                        Ok(true) => {
+                            bound_id = Some(event.transaction_id);
+                            submitted = Some(event);
+                        }
+                        Ok(false) => {}
+                        // Preserve the conservative Sent verdict below even when this additional
+                        // identity read fails. Losing it could leave a submitted record to expire
+                        // after the node has pruned the very execution that forbids a duplicate.
+                        Err(error) => tracing::warn!("cannot bind the recovered queue id to the saved submit receipt: {error}"),
+                    }
+                }
+            }
+        }
         let id = known_id.or_else(|| submitted.map(|event| event.transaction_id));
 
         // Executed? A `TransactionSent` for our id is a positive proof that the money left the
@@ -451,24 +612,15 @@ impl<C: VaultChain> HotFundingProvider for AckinackiVaultProvider<C> {
             {
                 // The event proves the money left the VAULT. Which internal message carried it to
                 // the Hot is a separate question, and it is the one that later decides whether a
-                // replacement generation may be sized: a chain read failure there must not be
-                // allowed to look like "no delivery", so it fails closed as `Unknown`.
-                let delivery_message_id = match self
+                // replacement generation may be sized. Retain the proven execution even when
+                // that read fails, with unproven delivery still forbidding a replacement.
+                let (delivery_message_id, delivery_error) = match self
                     .chain
                     .delivery_message_id(&sent.message_id, &expected.dest, &expected.dapp_id)
                     .await
                 {
-                    Ok(delivery_message_id) => delivery_message_id,
-                    Err(error) => {
-                        return Ok(RequestPresence::Unknown {
-                            reason: format!(
-                                "the Vault emitted TransactionSent for queue transaction {id}, so \
-                                 the money left the Vault, but the internal message that carried it \
-                                 to {} could not be read: {error}",
-                                expected.dest
-                            ),
-                        })
-                    }
+                    Ok(delivery_message_id) => (delivery_message_id, String::new()),
+                    Err(error) => (None, format!("; Hot delivery remains unproven: {error}")),
                 };
                 let delivery = match delivery_message_id.as_deref() {
                     Some(delivery) => format!(
@@ -479,12 +631,13 @@ impl<C: VaultChain> HotFundingProvider for AckinackiVaultProvider<C> {
                 };
                 return Ok(RequestPresence::Executed {
                     evidence: FundingEvidence {
+                        queue_transaction_id: bound_id,
                         verdict: "executed".to_string(),
                         source: format!("finalized ext-out message {}", sent.message_id),
                         observed_at_unix: Some(sent.created_at),
                         detail: format!(
                             "the Vault emitted TransactionSent for queue transaction {id} to {} at \
-                             chain time {}{delivery}",
+                             chain time {}{delivery}{delivery_error}",
                             sent.dest, sent.created_at
                         ),
                         delivery_message_id,
@@ -493,15 +646,33 @@ impl<C: VaultChain> HotFundingProvider for AckinackiVaultProvider<C> {
             }
         }
 
-        // Selection reaches the provider only for a journal record that is still live by its local
-        // UTC deadline. With neither a queue entry nor finalized execution, there is no additional
-        // chain verdict to make here.
+        // An executed record can outlive the queue deadline. Pruned history must not erase its
+        // retained evidence or turn an unresolved generation into permission to transfer twice.
+        let missing = match (&recorded.evidence, bound_id) {
+            (Some(evidence), None) => format!(
+                "the journal retains saved execution evidence ({}) but no confirmed queue identity \
+                 binds it to this generation, and finalized Hot delivery is not established. \
+                 Retain the journal; the missing facts are the original submit receipt linking \
+                 this generation to its queue id and the Hot delivery receipt. Recover those \
+                 from retained evidence or an archive if node history was pruned",
+                evidence.detail
+            ),
+            (Some(evidence), Some(id)) => format!(
+                "the journal retains saved execution evidence ({}) and queue identity {id} is \
+                 confirmed, but finalized Hot delivery is not established. Retain the journal",
+                evidence.detail
+            ),
+            (None, _) => format!(
+                "it remains live in the local funding journal until {}",
+                funding_request_deadline(recorded.created_at_unix)
+            ),
+        };
         Ok(RequestPresence::Unknown {
+            queue_transaction_id: bound_id,
             reason: format!(
                 "{} is not in the Vault queue and finalized history shows no TransactionSent for \
-                 it; it remains live in the local funding journal until {}",
+                 it; {missing}",
                 describe_recorded_request(&expected, &recorded),
-                funding_request_deadline(recorded.created_at_unix)
             ),
         })
     }

@@ -114,6 +114,7 @@ struct FakeVault {
     history: RefCell<Vec<VaultQueueEvent>>,
     queue_error: RefCell<Option<String>>,
     history_error: RefCell<Option<String>>,
+    submit_identity_error: RefCell<Option<String>>,
     submits: Cell<usize>,
     submitted: RefCell<Vec<FundingFingerprint>>,
     next_id: Cell<u64>,
@@ -121,6 +122,7 @@ struct FakeVault {
     reported_pending_id: RefCell<Option<String>>,
     /// When set, the submit's outcome cannot be established.
     indeterminate: Cell<bool>,
+    delivery_available: Cell<bool>,
 }
 
 impl FakeVault {
@@ -130,11 +132,13 @@ impl FakeVault {
             history: RefCell::new(Vec::new()),
             queue_error: RefCell::new(None),
             history_error: RefCell::new(None),
+            submit_identity_error: RefCell::new(None),
             submits: Cell::new(0),
             submitted: RefCell::new(Vec::new()),
             next_id: Cell::new(7),
             reported_pending_id: RefCell::new(None),
             indeterminate: Cell::new(false),
+            delivery_available: Cell::new(true),
         }
     }
 }
@@ -164,7 +168,23 @@ impl VaultChain for &FakeVault {
         _destination: &str,
         _destination_dapp_id: &str,
     ) -> Result<Option<String>> {
-        Ok(Some(format!("delivery-of-{sent_event_message_id}")))
+        Ok(self
+            .delivery_available
+            .get()
+            .then(|| format!("delivery-of-{sent_event_message_id}")))
+    }
+
+    async fn submitted_in_transaction(
+        &self,
+        message_id: &str,
+        transaction_hash: &str,
+    ) -> Result<bool> {
+        if let Some(error) = self.submit_identity_error.borrow().as_ref() {
+            bail!("{error}");
+        }
+        Ok(message_id
+            .strip_prefix("msg-submitted-")
+            .is_some_and(|id| transaction_hash == format!("tx-{id}")))
     }
 
     async fn submit(&self, fingerprint: &FundingFingerprint) -> Result<SubmitOutcome> {
@@ -928,3 +948,5 @@ async fn the_fingerprints_currency_map_survives_the_journal_round_trip() {
 }
 
 mod pr1332_regressions;
+
+mod issue_2112_regressions;

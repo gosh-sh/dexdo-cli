@@ -6,6 +6,7 @@ pub mod continuity;
 pub mod render;
 pub mod routing;
 pub mod tls;
+pub mod usage;
 pub mod verify;
 
 use crate::seller::auth::challenge_bytes;
@@ -164,6 +165,7 @@ impl Buyer {
         exact_mock_output: bool,
     ) -> Result<StreamOutcome> {
         let token_contract_display = dexdo_core::address::display_self_dapp(token_contract);
+        api::observe_verification_usage(None);
         let mut client = self.connect(handover).await?;
         let signed = self
             .authorize(&mut client, token_contract, request, billing_grant_tokens)
@@ -201,10 +203,10 @@ impl Buyer {
                     );
                 }
                 usage.validate().map_err(anyhow::Error::msg)?;
-                if usage.total_tokens > billing_grant_tokens {
+                if usage.billable_tokens() > billing_grant_tokens {
                     anyhow::bail!(
                         "terminal billable usage {} exceeds billing grant {}",
-                        usage.total_tokens,
+                        usage.billable_tokens(),
                         billing_grant_tokens
                     );
                 }
@@ -223,6 +225,7 @@ impl Buyer {
                 if !saw_output || usage.output_tokens == 0 {
                     anyhow::bail!("terminal billing usage has no preceding delivered output");
                 }
+                api::observe_verification_usage(Some(usage));
                 terminal_usage = Some(usage);
                 continue;
             }
@@ -352,7 +355,10 @@ impl Buyer {
                 max_tokens: u32::try_from(output_limit_tokens).unwrap_or(u32::MAX),
                 stop: Vec::new(),
                 greedy: false,
+                disable_reasoning: false,
+                reasoning_effort: None,
             }),
+            ..Default::default()
         };
         let outcome = self
             .connect_and_stream_request(
@@ -442,7 +448,10 @@ impl Buyer {
                 max_tokens: u32::try_from(output_limit_tokens).unwrap_or(u32::MAX),
                 stop: Vec::new(),
                 greedy: true, // temp=0 plus the profile-declared provider control on both legs
+                disable_reasoning: false,
+                reasoning_effort: None,
             }),
+            ..Default::default()
         };
         let outcome = self
             .connect_and_stream_request(
@@ -499,12 +508,15 @@ impl Buyer {
         let challenge = client
             .get_challenge(ChallengeRequest {
                 token_contract: token_contract.clone(),
+                capabilities_only: false,
             })
             .await?
             .into_inner();
+        check_reasoning_support(request.as_ref().and_then(|r| r.params.as_ref()), &challenge)?;
         let msg = challenge_bytes(token_contract, &challenge.nonce);
         let sig = self.note.sign(&msg);
         Ok(StreamRequest {
+            shared_budget: true,
             token_contract: token_contract.clone(),
             nonce: challenge.nonce,
             signature: sig.0.to_vec(),
@@ -512,6 +524,46 @@ impl Buyer {
             billing_grant_tokens,
         })
     }
+
+    /// Money-free capability check, before the consumer's billable identity probes.
+    pub(crate) async fn check_reasoning(
+        &self,
+        handover: &Handover,
+        token_contract: &TokenContract,
+        params: Option<&SamplingParams>,
+    ) -> Result<()> {
+        let challenge = self
+            .connect(handover)
+            .await?
+            .get_challenge(ChallengeRequest {
+                token_contract: token_contract.clone(),
+                capabilities_only: true,
+            })
+            .await?
+            .into_inner();
+        check_reasoning_support(params, &challenge)
+    }
+}
+
+fn check_reasoning_support(
+    params: Option<&SamplingParams>,
+    challenge: &dexdo_proto::Challenge,
+) -> Result<()> {
+    let Some(params) = params else { return Ok(()) };
+    if params.disable_reasoning && !challenge.supports_reasoning_disable {
+        return Err(tonic::Status::invalid_argument(
+            "unsupported_parameter: this seller/model cannot disable reasoning",
+        )
+        .into());
+    }
+    if let Some(effort) = &params.reasoning_effort {
+        if params.disable_reasoning || !challenge.supported_reasoning_efforts.contains(effort) {
+            return Err(tonic::Status::invalid_argument(format!(
+                "unsupported_parameter: this seller/model does not support reasoning effort {effort:?}",
+            )).into());
+        }
+    }
+    Ok(())
 }
 
 /// Greedy (temp=0) request to the official reference endpoint:

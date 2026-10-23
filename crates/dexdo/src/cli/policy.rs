@@ -5,12 +5,22 @@ use std::path::{Path, PathBuf};
 
 pub(crate) const POLICY_VERSION: u64 = 1;
 
-const BUYER_NO_HANDOVER: &[&str] = &["wait_then_reclaim", "next_seller", "fail_closed"];
-const BUYER_MALFORMED_HANDOVER: &[&str] = &["reclaim", "dispute", "fail_closed"];
-const BUYER_DEAD_GATEWAY: &[&str] = &["retry_then_reclaim", "next_seller", "fail_closed"];
-const BUYER_EMPTY_STREAM: &[&str] = &["reclaim", "next_seller", "fail_closed"];
-const BUYER_STALLS: &[&str] = &["accept_delivered_then_reclaim", "dispute"];
-const BUYER_SCAM: &[&str] = &["stop", "dispute", "stop_and_blacklist"];
+const BUYER_NO_HANDOVER: &[&str] = &[
+    "wait_then_reclaim",
+    "next_seller",
+    "fail_closed",
+    "keep_open",
+];
+const BUYER_MALFORMED_HANDOVER: &[&str] = &["reclaim", "dispute", "fail_closed", "keep_open"];
+const BUYER_DEAD_GATEWAY: &[&str] = &[
+    "retry_then_reclaim",
+    "next_seller",
+    "fail_closed",
+    "keep_open",
+];
+const BUYER_EMPTY_STREAM: &[&str] = &["reclaim", "next_seller", "fail_closed", "keep_open"];
+const BUYER_STALLS: &[&str] = &["accept_delivered_then_reclaim", "dispute", "keep_open"];
+const BUYER_SCAM: &[&str] = &["stop", "dispute", "stop_and_blacklist", "keep_open"];
 const SELLER_AFTER_DONE: &[&str] = &["republish", "republish_with_backoff", "retire"];
 const SELLER_BUYER_NO_SHOW: &[&str] = &[
     "cleanup_and_republish",
@@ -117,6 +127,7 @@ pub(crate) enum NoHandoverAfterMatchAction {
     WaitThenReclaim,
     NextSeller,
     FailClosed,
+    KeepOpen,
 }
 
 impl NoHandoverAfterMatchAction {
@@ -125,6 +136,7 @@ impl NoHandoverAfterMatchAction {
             Self::WaitThenReclaim => "wait_then_reclaim",
             Self::NextSeller => "next_seller",
             Self::FailClosed => "fail_closed",
+            Self::KeepOpen => "keep_open",
         }
     }
 }
@@ -134,6 +146,7 @@ pub(crate) enum BadOutputScamAction {
     Stop,
     Dispute,
     StopAndBlacklist,
+    KeepOpen,
 }
 
 impl BadOutputScamAction {
@@ -142,6 +155,7 @@ impl BadOutputScamAction {
             Self::Stop => "stop",
             Self::Dispute => "dispute",
             Self::StopAndBlacklist => "stop_and_blacklist",
+            Self::KeepOpen => "keep_open",
         }
     }
 
@@ -150,6 +164,7 @@ impl BadOutputScamAction {
             Self::Stop => dexdo::buyer::api::VerificationBailAction::Stop,
             Self::Dispute => dexdo::buyer::api::VerificationBailAction::Dispute,
             Self::StopAndBlacklist => dexdo::buyer::api::VerificationBailAction::StopAndBlacklist,
+            Self::KeepOpen => dexdo::buyer::api::VerificationBailAction::KeepOpen,
         }
     }
 }
@@ -159,6 +174,7 @@ pub(crate) enum MalformedHandoverAction {
     Reclaim,
     Dispute,
     FailClosed,
+    KeepOpen,
 }
 
 impl MalformedHandoverAction {
@@ -167,6 +183,7 @@ impl MalformedHandoverAction {
             Self::Reclaim => "reclaim",
             Self::Dispute => "dispute",
             Self::FailClosed => "fail_closed",
+            Self::KeepOpen => "keep_open",
         }
     }
 }
@@ -176,6 +193,7 @@ pub(crate) enum DeadGatewayAction {
     RetryThenReclaim,
     NextSeller,
     FailClosed,
+    KeepOpen,
 }
 
 impl DeadGatewayAction {
@@ -184,6 +202,7 @@ impl DeadGatewayAction {
             Self::RetryThenReclaim => "retry_then_reclaim",
             Self::NextSeller => "next_seller",
             Self::FailClosed => "fail_closed",
+            Self::KeepOpen => "keep_open",
         }
     }
 
@@ -192,6 +211,7 @@ impl DeadGatewayAction {
             Self::RetryThenReclaim => dexdo::buyer::api::DeadGatewayAction::RetryThenReclaim,
             Self::NextSeller => dexdo::buyer::api::DeadGatewayAction::NextSeller,
             Self::FailClosed => dexdo::buyer::api::DeadGatewayAction::FailClosed,
+            Self::KeepOpen => dexdo::buyer::api::DeadGatewayAction::KeepOpen,
         }
     }
 }
@@ -201,6 +221,7 @@ pub(crate) enum EmptyStreamAction {
     Reclaim,
     NextSeller,
     FailClosed,
+    KeepOpen,
 }
 
 impl EmptyStreamAction {
@@ -209,6 +230,7 @@ impl EmptyStreamAction {
             Self::Reclaim => "reclaim",
             Self::NextSeller => "next_seller",
             Self::FailClosed => "fail_closed",
+            Self::KeepOpen => "keep_open",
         }
     }
 
@@ -217,6 +239,7 @@ impl EmptyStreamAction {
             Self::Reclaim => dexdo::buyer::api::EmptyStreamAction::Reclaim,
             Self::NextSeller => dexdo::buyer::api::EmptyStreamAction::NextSeller,
             Self::FailClosed => dexdo::buyer::api::EmptyStreamAction::FailClosed,
+            Self::KeepOpen => dexdo::buyer::api::EmptyStreamAction::KeepOpen,
         }
     }
 }
@@ -225,6 +248,7 @@ impl EmptyStreamAction {
 pub(crate) enum SellerStallsMidStreamAction {
     AcceptDeliveredThenReclaim,
     Dispute,
+    KeepOpen,
 }
 
 impl SellerStallsMidStreamAction {
@@ -232,6 +256,7 @@ impl SellerStallsMidStreamAction {
         match self {
             Self::AcceptDeliveredThenReclaim => "accept_delivered_then_reclaim",
             Self::Dispute => "dispute",
+            Self::KeepOpen => "keep_open",
         }
     }
 
@@ -241,6 +266,7 @@ impl SellerStallsMidStreamAction {
                 dexdo::buyer::api::SellerStallsMidStreamAction::AcceptDeliveredThenReclaim
             }
             Self::Dispute => dexdo::buyer::api::SellerStallsMidStreamAction::Dispute,
+            Self::KeepOpen => dexdo::buyer::api::SellerStallsMidStreamAction::KeepOpen,
         }
     }
 }
@@ -977,6 +1003,7 @@ pub(crate) fn buyer_runtime_policy_of(value: &Value) -> Result<BuyerRuntimePolic
         "wait_then_reclaim" => NoHandoverAfterMatchAction::WaitThenReclaim,
         "next_seller" => NoHandoverAfterMatchAction::NextSeller,
         "fail_closed" => NoHandoverAfterMatchAction::FailClosed,
+        "keep_open" => NoHandoverAfterMatchAction::KeepOpen,
         said => return Err(cannot(key, said)),
     };
     let key = "buyer.on.malformed_handover";
@@ -984,6 +1011,7 @@ pub(crate) fn buyer_runtime_policy_of(value: &Value) -> Result<BuyerRuntimePolic
         "reclaim" => MalformedHandoverAction::Reclaim,
         "dispute" => MalformedHandoverAction::Dispute,
         "fail_closed" => MalformedHandoverAction::FailClosed,
+        "keep_open" => MalformedHandoverAction::KeepOpen,
         said => return Err(cannot(key, said)),
     };
     let key = "buyer.on.dead_gateway";
@@ -991,6 +1019,7 @@ pub(crate) fn buyer_runtime_policy_of(value: &Value) -> Result<BuyerRuntimePolic
         "retry_then_reclaim" => DeadGatewayAction::RetryThenReclaim,
         "next_seller" => DeadGatewayAction::NextSeller,
         "fail_closed" => DeadGatewayAction::FailClosed,
+        "keep_open" => DeadGatewayAction::KeepOpen,
         said => return Err(cannot(key, said)),
     };
     let key = "buyer.on.empty_stream";
@@ -998,12 +1027,14 @@ pub(crate) fn buyer_runtime_policy_of(value: &Value) -> Result<BuyerRuntimePolic
         "reclaim" => EmptyStreamAction::Reclaim,
         "next_seller" => EmptyStreamAction::NextSeller,
         "fail_closed" => EmptyStreamAction::FailClosed,
+        "keep_open" => EmptyStreamAction::KeepOpen,
         said => return Err(cannot(key, said)),
     };
     let key = "buyer.on.seller_stalls_mid_stream";
     let seller_stalls_mid_stream = match choice(key)? {
         "accept_delivered_then_reclaim" => SellerStallsMidStreamAction::AcceptDeliveredThenReclaim,
         "dispute" => SellerStallsMidStreamAction::Dispute,
+        "keep_open" => SellerStallsMidStreamAction::KeepOpen,
         said => return Err(cannot(key, said)),
     };
     let key = "buyer.on.bad_output_scam";
@@ -1011,6 +1042,7 @@ pub(crate) fn buyer_runtime_policy_of(value: &Value) -> Result<BuyerRuntimePolic
         "stop" => BadOutputScamAction::Stop,
         "dispute" => BadOutputScamAction::Dispute,
         "stop_and_blacklist" => BadOutputScamAction::StopAndBlacklist,
+        "keep_open" => BadOutputScamAction::KeepOpen,
         said => return Err(cannot(key, said)),
     };
     Ok(BuyerRuntimePolicy {
@@ -1317,6 +1349,16 @@ pub(crate) fn dispatch_levers(key: &str, action: &str) -> &'static [&'static str
         ("buyer.on.bad_output_scam", "stop") => &["stream_stop"],
         ("buyer.on.bad_output_scam", "dispute") => &["stream_dispute"],
         ("buyer.on.bad_output_scam", "stop_and_blacklist") => &["policy_fail_closed_unsupported"],
+        ("buyer.on.no_handover_after_match" | "buyer.on.malformed_handover", "keep_open") => {
+            &["keep_reading_handover"]
+        }
+        (
+            "buyer.on.dead_gateway"
+            | "buyer.on.empty_stream"
+            | "buyer.on.seller_stalls_mid_stream"
+            | "buyer.on.bad_output_scam",
+            "keep_open",
+        ) => &["request_scoped_error"],
         ("seller.on.after_deal_done", "republish") => &["pre_offer_policy_fail_closed"],
         ("seller.on.after_deal_done", "republish_with_backoff") => {
             &["pre_offer_policy_fail_closed"]
@@ -1393,9 +1435,9 @@ mod tests {
         );
         let msg =
             format_incomplete_error(Path::new("/tmp/policy.json"), RuntimeRole::Buyer, &problems);
-        assert!(
-            msg.contains("buyer.on.dead_gateway -> retry_then_reclaim | next_seller | fail_closed")
-        );
+        assert!(msg.contains(
+            "buyer.on.dead_gateway -> retry_then_reclaim | next_seller | fail_closed | keep_open"
+        ));
         assert!(msg.contains("buyer.failover.total_spend_cap_shells -> integer >=1"));
     }
 
@@ -1583,6 +1625,10 @@ mod tests {
 #[cfg(test)]
 #[path = "policy_1196_tests.rs"]
 mod issue_1196_tests;
+
+#[cfg(test)]
+#[path = "policy_keep_open_2148_tests.rs"]
+mod keep_open_2148_tests;
 
 /// A check must not repair what it checks: `policy validate` reports and writes nothing, even on a
 /// terminal where a command on its way to spending would have asked.

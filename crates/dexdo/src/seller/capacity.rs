@@ -52,9 +52,18 @@ struct DurableCapacityRecord {
     local_delivered_after_anchor: u128,
     #[serde(with = "decimal_u128")]
     outstanding_reservation: u128,
+    /// Legacy durable count of admitted shared-budget requests. Still parsed so older records load;
+    /// it no longer gates admission and is written back as zero. The owner authorized
+    /// this availability policy on 2026-10-21; interrupted-request billing remains in.
+    #[serde(default, skip_serializing_if = "no_shared_requests")]
+    shared_requests: u32,
     /// Exact delivered prefix absorbed by acceptProbe, saved before submitting it. Bounded by one tick.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     probe_delivery_at_decision: Option<u64>,
+}
+
+fn no_shared_requests(count: &u32) -> bool {
+    *count == 0
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -106,6 +115,7 @@ struct CapacityEntryState {
     /// Delivered tokens applied to `record` in memory but not yet written to disk by the compatibility
     /// incremental-accounting path.
     unpersisted_delivered: u128,
+    active_shared_requests: u32,
 }
 
 struct CapacityEntry {
@@ -138,8 +148,8 @@ impl CapacityEntry {
     }
 }
 
-/// One capacity ledger per running gateway. Entries remain independently locked, so concurrent requests for
-/// different TCs do not serialize and concurrent requests for one TC cannot reserve the same token.
+/// One capacity ledger per running gateway. Entries remain independently locked, so different deals
+/// do not serialize; payment allocation on one deal is atomic.
 pub struct CapacityManager {
     store_dir: Option<PathBuf>,
     entries: Mutex<HashMap<TokenContract, Arc<CapacityEntry>>>,
@@ -213,6 +223,7 @@ impl CapacityManager {
                         tokens_pending_anchor: state.tokens_pending,
                         local_delivered_after_anchor: 0,
                         outstanding_reservation: 0,
+                        shared_requests: 0,
                         probe_delivery_at_decision: None,
                     },
                 };
@@ -222,6 +233,7 @@ impl CapacityManager {
                         record,
                         terminal: false,
                         unpersisted_delivered: 0,
+                        active_shared_requests: 0,
                     }),
                 });
                 entries.insert(token_contract.clone(), entry.clone());
@@ -313,6 +325,7 @@ impl CapacityManager {
             tokens_pending_anchor: state.tokens_pending,
             local_delivered_after_anchor,
             outstanding_reservation: old.outstanding_reservation,
+            shared_requests: 0,
             probe_delivery_at_decision: if probe_seed > 0 {
                 None
             } else {
@@ -361,10 +374,91 @@ impl CapacityManager {
         Ok(delivered)
     }
 
+    /// Admit concurrent work without exclusively reserving the purchased remainder.
+    /// The shared paid ceiling is allocated atomically only on validated completion.
+    pub fn admit_shared(
+        &self,
+        token_contract: &TokenContract,
+        requested: u64,
+        limit: std::num::NonZeroU32,
+    ) -> std::result::Result<CapacityReservation, ReserveError> {
+        let entry = self
+            .entries
+            .lock()
+            .map_err(|_| {
+                ReserveError::InvalidState(anyhow!(
+                    "{POISONED_LOCK_MESSAGE}: {CAPACITY_ENTRIES_LOCK}"
+                ))
+            })?
+            .get(token_contract)
+            .cloned()
+            .ok_or(ReserveError::UnknownDeal)?;
+        let mut locked = entry.state.lock().map_err(|_| {
+            ReserveError::InvalidState(anyhow!(
+                "{POISONED_LOCK_MESSAGE}: {CAPACITY_ENTRY_STATE_LOCK}"
+            ))
+        })?;
+        if locked.terminal {
+            return Err(ReserveError::Terminal);
+        }
+        validate_record(&locked.record).map_err(ReserveError::InvalidState)?;
+        if locked.record.outstanding_reservation != 0
+            || locked.record.local_delivered_after_anchor >= SELLER_UNCLAIMED_BILLABLE_RISK_LIMIT
+        {
+            return Err(ReserveError::Exhausted);
+        }
+        if locked.active_shared_requests >= limit.get() {
+            return Err(ReserveError::Concurrency);
+        }
+        let available = CapacitySnapshot::from(&locked.record)
+            .available()
+            .map_err(ReserveError::InvalidState)?;
+        let amount = available.min(u128::from(requested));
+        if amount == 0 {
+            return Err(ReserveError::Exhausted);
+        }
+        locked.active_shared_requests += 1;
+        drop(locked);
+        Ok(CapacityReservation {
+            entry,
+            request: Mutex::new(RequestReservation {
+                initial: amount,
+                remaining: amount,
+                finished: false,
+                shared: true,
+            }),
+        })
+    }
+
+    pub fn active_shared_requests(&self, token_contract: &TokenContract) -> u32 {
+        let entries = lock_or_recover(&self.entries, CAPACITY_ENTRIES_LOCK);
+        entries.get(token_contract).map_or(0, |entry| {
+            lock_or_recover(&entry.state, CAPACITY_ENTRY_STATE_LOCK).active_shared_requests
+        })
+    }
+
     pub fn reserve(
         &self,
         token_contract: &TokenContract,
         requested: u64,
+    ) -> std::result::Result<CapacityReservation, ReserveError> {
+        self.reserve_inner(token_contract, requested, false)
+    }
+
+    /// Peers without shared-budget accounting retain one exclusive request per deal.
+    pub fn reserve_exclusive(
+        &self,
+        token_contract: &TokenContract,
+        requested: u64,
+    ) -> std::result::Result<CapacityReservation, ReserveError> {
+        self.reserve_inner(token_contract, requested, true)
+    }
+
+    fn reserve_inner(
+        &self,
+        token_contract: &TokenContract,
+        requested: u64,
+        exclusive: bool,
     ) -> std::result::Result<CapacityReservation, ReserveError> {
         if requested == 0 {
             return Err(ReserveError::Exhausted);
@@ -387,6 +481,11 @@ impl CapacityManager {
         })?;
         if locked.terminal {
             return Err(ReserveError::Terminal);
+        }
+        if locked.active_shared_requests != 0
+            || exclusive && locked.record.outstanding_reservation != 0
+        {
+            return Err(ReserveError::Concurrency);
         }
         validate_record(&locked.record).map_err(ReserveError::InvalidState)?;
         if locked.record.local_delivered_after_anchor >= SELLER_UNCLAIMED_BILLABLE_RISK_LIMIT {
@@ -418,6 +517,7 @@ impl CapacityManager {
                 initial: amount,
                 remaining: amount,
                 finished: false,
+                shared: false,
             }),
         })
     }
@@ -476,6 +576,7 @@ pub enum ReserveError {
     UnknownDeal,
     Terminal,
     Exhausted,
+    Concurrency,
     InvalidState(anyhow::Error),
 }
 
@@ -485,6 +586,7 @@ impl fmt::Display for ReserveError {
             Self::UnknownDeal => write!(formatter, "deal capacity is not registered"),
             Self::Terminal => write!(formatter, "deal capacity is terminal"),
             Self::Exhausted => write!(formatter, "deal capacity is exhausted"),
+            Self::Concurrency => write!(formatter, "deal request concurrency limit reached"),
             Self::InvalidState(error) => write!(formatter, "invalid deal capacity: {error}"),
         }
     }
@@ -496,16 +598,65 @@ struct RequestReservation {
     initial: u128,
     remaining: u128,
     finished: bool,
+    shared: bool,
 }
 
-/// Request-scoped reservation. Dropping it deliberately does not release anything: a task/process crash is
-/// ambiguous, so restart must retain the durable upper bound until exact chain evidence acknowledges it.
+/// Request-scoped capacity authorization. An unfinished exclusive drop retains its durable
+/// reservation. A shared request releases its slot on any terminal, drop or restart: it charges only
+/// validated usage, so an interrupted one bills nothing and leaves the deal open.
 pub struct CapacityReservation {
     entry: Arc<CapacityEntry>,
     request: Mutex<RequestReservation>,
 }
 
 impl CapacityReservation {
+    pub fn is_shared(&self) -> bool {
+        lock_or_recover(&self.request, CAPACITY_REQUEST_LOCK).shared
+    }
+
+    pub fn active_shared_requests(&self) -> u32 {
+        lock_or_recover(&self.entry.state, CAPACITY_ENTRY_STATE_LOCK).active_shared_requests
+    }
+
+    fn finish_shared(&self, tokens: u64, ambiguous: bool) -> Result<u64> {
+        let mut request = self
+            .request
+            .lock()
+            .map_err(|_| anyhow!("{POISONED_LOCK_MESSAGE}: {CAPACITY_REQUEST_LOCK}"))?;
+        if request.finished {
+            bail!("capacity reservation already finished");
+        }
+        let mut locked = self
+            .entry
+            .state
+            .lock()
+            .map_err(|_| anyhow!("{POISONED_LOCK_MESSAGE}: {CAPACITY_ENTRY_STATE_LOCK}"))?;
+        if locked.terminal {
+            bail!("deal capacity became terminal");
+        }
+        let mut candidate = locked.record.clone();
+        let available = CapacitySnapshot::from(&candidate).available()?;
+        let charged = if ambiguous {
+            0
+        } else {
+            u128::from(tokens).min(request.remaining).min(available)
+        };
+        candidate.local_delivered_after_anchor = candidate
+            .local_delivered_after_anchor
+            .checked_add(charged)
+            .ok_or_else(|| anyhow!("local billable counter overflows uint128"))?;
+        validate_record(&candidate)?;
+        persist_candidate(self.entry.path.as_deref(), &candidate)?;
+        locked.record = candidate;
+        locked.active_shared_requests = locked
+            .active_shared_requests
+            .checked_sub(1)
+            .ok_or_else(|| anyhow!("active shared request count underflow"))?;
+        request.remaining = 0;
+        request.finished = true;
+        Ok(charged as u64)
+    }
+
     pub fn amount(&self) -> u64 {
         let initial = lock_or_recover(&self.request, CAPACITY_REQUEST_LOCK).initial;
         u64::try_from(initial).expect("reservation is bounded by requested u64")
@@ -521,6 +672,9 @@ impl CapacityReservation {
     pub fn finish_with_delivery(&self, tokens: u64) -> Result<u64> {
         if tokens == 0 {
             bail!("terminal billable token total must be positive");
+        }
+        if self.is_shared() {
+            return self.finish_shared(tokens, false);
         }
         let mut request = self
             .request
@@ -642,6 +796,9 @@ impl CapacityReservation {
     /// failed before any billable total could be accepted.
     /// Returns the delivered tokens that became durable in this call (see [`Self::record_delivered`]).
     pub fn finish_exact(&self) -> Result<u64> {
+        if self.is_shared() {
+            return self.finish_shared(0, false);
+        }
         let mut request = self
             .request
             .lock()
@@ -680,6 +837,9 @@ impl CapacityReservation {
     /// buyer without a valid authoritative usage count.
     /// Returns the delivered tokens that became durable in this call (see [`Self::record_delivered`]).
     pub fn finish_ambiguous(&self) -> Result<u64> {
+        if self.is_shared() {
+            return self.finish_shared(0, true);
+        }
         let mut request = self
             .request
             .lock()
@@ -703,6 +863,16 @@ impl CapacityReservation {
         request.remaining = 0;
         request.finished = true;
         Ok(durable)
+    }
+}
+
+impl Drop for CapacityReservation {
+    fn drop(&mut self) {
+        let request = lock_or_recover(&self.request, CAPACITY_REQUEST_LOCK);
+        if request.shared && !request.finished {
+            let mut locked = lock_or_recover(&self.entry.state, CAPACITY_ENTRY_STATE_LOCK);
+            locked.active_shared_requests = locked.active_shared_requests.saturating_sub(1);
+        }
     }
 }
 
@@ -1275,6 +1445,58 @@ mod tests {
             .unwrap();
         assert_eq!(reconciled.local_delivered_after_anchor, 0);
         assert_eq!(manager.reserve(&tc, 1).unwrap().amount(), 1);
+    }
+
+    #[test]
+    fn shared_budget_2155_legacy_migration_preserves_exclusive_and_probe_evidence() {
+        let dir = tempfile::tempdir().unwrap();
+        let tc = "0:shared-legacy-evidence".to_string();
+        {
+            let manager = CapacityManager::in_deals_dir(dir.path().to_path_buf());
+            manager
+                .reconcile_deal(&tc, state(false, 0), ordinary(2 * TICK_SIZE))
+                .unwrap();
+            manager
+                .reserve_exclusive(&tc, 100)
+                .unwrap()
+                .finish_with_delivery(7)
+                .unwrap();
+            manager.prepare_probe(&tc, 5).unwrap();
+            drop(manager.reserve_exclusive(&tc, 30).unwrap());
+        }
+        let path = capacity_path(&dir.path().join("seller-capacity"), &tc);
+        let mut legacy: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        legacy["shared_requests"] = serde_json::json!(1);
+        std::fs::write(&path, serde_json::to_vec(&legacy).unwrap()).unwrap();
+
+        let manager = CapacityManager::in_deals_dir(dir.path().to_path_buf());
+        let snapshot = manager
+            .reconcile_deal(&tc, state(false, 0), ordinary(2 * TICK_SIZE))
+            .unwrap()
+            .unwrap();
+        assert_eq!(snapshot.local_delivered_after_anchor, 7);
+        assert_eq!(snapshot.outstanding_reservation, 30);
+        let rewritten: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        assert!(rewritten.get("shared_requests").is_none());
+        assert_eq!(rewritten["probe_delivery_at_decision"], 5);
+        assert!(matches!(
+            manager.admit_shared(&tc, 100, std::num::NonZeroU32::MIN),
+            Err(ReserveError::Exhausted)
+        ));
+        assert!(matches!(
+            manager.reserve_exclusive(&tc, 100),
+            Err(ReserveError::Concurrency)
+        ));
+        let accepted = manager
+            .reconcile_deal(&tc, state(true, TICK_SIZE), ordinary(2 * TICK_SIZE))
+            .unwrap()
+            .unwrap();
+        assert_eq!(accepted.tokens_pending_anchor, TICK_SIZE);
+        assert_eq!(accepted.local_delivered_after_anchor, 2);
+        assert_eq!(accepted.outstanding_reservation, 30);
+        assert_invariant(accepted);
     }
 
     proptest! {
@@ -2356,7 +2578,10 @@ mod tests {
                 max_tokens: GRANT as u32,
                 stop: Vec::new(),
                 greedy: false,
+                disable_reasoning: false,
+                reasoning_effort: None,
             }),
+            ..Default::default()
         };
         let (up_tx, up_rx) = tokio::sync::mpsc::channel(8);
         let (tx, mut rx) = tokio::sync::mpsc::channel(8);
@@ -2486,5 +2711,220 @@ mod tests {
         );
         assert_eq!(durable.outstanding_reservation, 0);
         assert_invariant(CapacitySnapshot::from(&durable));
+    }
+    #[test]
+    fn shared_budget_2091_admits_to_the_configured_limit_and_caps_combined_payment() {
+        let manager = CapacityManager::in_memory();
+        let tc = "0:shared-budget".to_string();
+        manager
+            .reconcile_deal(&tc, state(true, TICK_SIZE), ordinary(2 * TICK_SIZE))
+            .unwrap();
+        let limit = dexdo_core::params::SELLER_MAX_CONCURRENT_REQUESTS_PER_DEAL;
+        let requests = (0..limit.get())
+            .map(|_| manager.admit_shared(&tc, u64::MAX, limit).unwrap())
+            .collect::<Vec<_>>();
+        assert!(matches!(
+            manager.admit_shared(&tc, 1, limit),
+            Err(ReserveError::Concurrency)
+        ));
+        assert_eq!(
+            requests[0].finish_with_delivery(TICK_SIZE as u64).unwrap(),
+            TICK_SIZE as u64
+        );
+        for request in requests.iter().skip(1) {
+            assert_eq!(request.finish_with_delivery(10).unwrap(), 0);
+        }
+        assert_eq!(manager.active_shared_requests(&tc), 0);
+        assert_eq!(
+            manager.snapshot(&tc).unwrap().unwrap().available().unwrap(),
+            0
+        );
+        assert!(matches!(
+            manager.admit_shared(&tc, 1, limit),
+            Err(ReserveError::Exhausted)
+        ));
+        assert_invariant(manager.snapshot(&tc).unwrap().unwrap());
+    }
+
+    #[test]
+    fn shared_budget_2155_ambiguous_request_leaves_the_deal_serving() {
+        let manager = CapacityManager::in_memory();
+        let tc = "0:shared-ambiguous".to_string();
+        manager
+            .reconcile_deal(&tc, state(true, TICK_SIZE), ordinary(2 * TICK_SIZE))
+            .unwrap();
+        let one = std::num::NonZeroU32::MIN;
+        let request = manager.admit_shared(&tc, 100, one).unwrap();
+        assert!(matches!(
+            manager.admit_shared(&tc, 100, one),
+            Err(ReserveError::Concurrency)
+        ));
+        request.finish_exact().unwrap();
+        let ambiguous = manager.admit_shared(&tc, 100, one).unwrap();
+        assert_eq!(ambiguous.finish_ambiguous().unwrap(), 0);
+        let next = manager.admit_shared(&tc, 1_000, one).unwrap();
+        assert_eq!(next.finish_with_delivery(180).unwrap(), 180);
+        let snapshot = manager.snapshot(&tc).unwrap().unwrap();
+        assert_eq!(snapshot.local_delivered_after_anchor, 180);
+        assert_invariant(snapshot);
+    }
+
+    #[test]
+    fn shared_budget_2155_dropped_request_leaves_the_deal_serving() {
+        let manager = CapacityManager::in_memory();
+        let tc = "0:shared-dropped".to_string();
+        manager
+            .reconcile_deal(&tc, state(true, TICK_SIZE), ordinary(2 * TICK_SIZE))
+            .unwrap();
+        let one = std::num::NonZeroU32::MIN;
+        drop(manager.admit_shared(&tc, 100, one).unwrap());
+        assert_eq!(manager.active_shared_requests(&tc), 0);
+        manager
+            .admit_shared(&tc, 100, one)
+            .unwrap()
+            .finish_exact()
+            .unwrap();
+        manager
+            .reserve_exclusive(&tc, 100)
+            .unwrap()
+            .finish_exact()
+            .unwrap();
+    }
+
+    #[test]
+    fn shared_budget_2155_restart_and_legacy_record_leave_the_deal_serving() {
+        let dir = tempfile::tempdir().unwrap();
+        let tc = "0:shared-restart".to_string();
+        let limit = dexdo_core::params::SELLER_MAX_CONCURRENT_REQUESTS_PER_DEAL;
+        {
+            let manager = CapacityManager::in_deals_dir(dir.path().to_path_buf());
+            manager
+                .reconcile_deal(&tc, state(true, TICK_SIZE), ordinary(2 * TICK_SIZE))
+                .unwrap();
+            let billed = manager.admit_shared(&tc, 100, limit).unwrap();
+            assert_eq!(billed.finish_with_delivery(1).unwrap(), 1);
+            let _interrupted = manager.admit_shared(&tc, 100, limit).unwrap();
+        }
+        // A record written before still carries the unresolved request that wedged the deal.
+        let path = capacity_path(&dir.path().join("seller-capacity"), &tc);
+        let mut legacy: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        legacy["shared_requests"] = serde_json::json!(1);
+        std::fs::write(&path, serde_json::to_vec(&legacy).unwrap()).unwrap();
+
+        let manager = CapacityManager::in_deals_dir(dir.path().to_path_buf());
+        manager
+            .reconcile_deal(&tc, state(true, TICK_SIZE), ordinary(2 * TICK_SIZE))
+            .unwrap();
+        assert_eq!(
+            manager
+                .admit_shared(&tc, 100, limit)
+                .unwrap()
+                .finish_with_delivery(10)
+                .unwrap(),
+            10
+        );
+        let rewritten: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        assert!(rewritten.get("shared_requests").is_none());
+    }
+
+    proptest! {
+        #[test]
+        fn shared_budget_2155_mixed_lifecycles_preserve_charges_and_live_slots(
+            operations in prop::collection::vec((0_u8..8, 1_u64..500), 1..40),
+        ) {
+            let dir = tempfile::tempdir().unwrap();
+            let tc = "0:shared-mixed".to_string();
+            let limit = dexdo_core::params::SELLER_MAX_CONCURRENT_REQUESTS_PER_DEAL;
+            let mut manager = CapacityManager::in_deals_dir(dir.path().to_path_buf());
+            manager.reconcile_deal(&tc, state(true, TICK_SIZE), ordinary(2 * TICK_SIZE)).unwrap();
+            let mut requests = Vec::new();
+            let mut charged = 0_u128;
+            let mut anchored = 0_u128;
+
+            for (operation, amount) in operations {
+                match operation {
+                    0 => {
+                        let result = manager.admit_shared(&tc, amount, limit);
+                        if requests.len() == limit.get() as usize {
+                            prop_assert!(matches!(result, Err(ReserveError::Concurrency)));
+                        } else {
+                            requests.push(result.unwrap());
+                        }
+                    }
+                    1 => {
+                        if let Some(request) = requests.pop() {
+                            let bill = request.finish_with_delivery(amount).unwrap();
+                            prop_assert_eq!(bill, amount.min(request.amount()));
+                            charged += u128::from(bill);
+                            prop_assert!(request.finish_with_delivery(amount).is_err());
+                        }
+                    }
+                    2 => {
+                        if let Some(request) = requests.pop() {
+                            prop_assert_eq!(request.finish_ambiguous().unwrap(), 0);
+                            prop_assert!(request.finish_ambiguous().is_err());
+                        }
+                    }
+                    3 => { drop(requests.pop()); }
+                    4 => {
+                        manager.reconcile_deal(&tc, state(true, TICK_SIZE + anchored), ordinary(2 * TICK_SIZE)).unwrap();
+                    }
+                    5 => {
+                        requests.clear();
+                        // Old runtimes may have left a durable shared count. Migration clears only
+                        // that legacy field, never a known charge or the authoritative anchor.
+                        let path = capacity_path(&dir.path().join("seller-capacity"), &tc);
+                        if path.exists() {
+                            let mut record: serde_json::Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+                            record["shared_requests"] = serde_json::json!(limit.get());
+                            std::fs::write(&path, serde_json::to_vec(&record).unwrap()).unwrap();
+                        }
+                        manager = CapacityManager::in_deals_dir(dir.path().to_path_buf());
+                        manager.reconcile_deal(&tc, state(true, TICK_SIZE + anchored), ordinary(2 * TICK_SIZE)).unwrap();
+                    }
+                    6 => {
+                        anchored = charged;
+                        manager.reconcile_deal(&tc, state(true, TICK_SIZE + anchored), ordinary(2 * TICK_SIZE)).unwrap();
+                    }
+                    _ => {
+                        let result = manager.reserve_exclusive(&tc, amount);
+                        if requests.is_empty() {
+                            result.unwrap().finish_exact().unwrap();
+                        } else {
+                            prop_assert!(matches!(result, Err(ReserveError::Concurrency)));
+                        }
+                    }
+                }
+                prop_assert_eq!(manager.active_shared_requests(&tc), requests.len() as u32);
+                let snapshot = manager.snapshot(&tc).unwrap().unwrap();
+                prop_assert_eq!(snapshot.local_delivered_after_anchor, charged - anchored);
+                prop_assert_eq!(snapshot.tokens_pending_anchor, TICK_SIZE + anchored);
+                prop_assert_eq!(snapshot.outstanding_reservation, 0);
+                prop_assert_eq!(snapshot.available().unwrap(), TICK_SIZE - charged);
+                assert_invariant(snapshot);
+            }
+        }
+
+        #[test]
+        fn shared_budget_2091_payment_is_bounded_under_completion_interleavings(
+            amounts in prop::collection::vec(1_u64..(2 * TICK_SIZE as u64), 1..12),
+            reverse in any::<bool>(),
+        ) {
+            let manager = CapacityManager::in_memory();
+            let tc = "0:shared-property".to_string();
+            manager.reconcile_deal(&tc, state(true, TICK_SIZE), ordinary(2 * TICK_SIZE)).unwrap();
+            let limit = std::num::NonZeroU32::new(amounts.len() as u32).unwrap();
+            let mut requests = amounts.iter().map(|_| manager.admit_shared(&tc, u64::MAX, limit).unwrap()).collect::<Vec<_>>();
+            if reverse { requests.reverse(); }
+            let mut charged = 0;
+            for (request, amount) in requests.into_iter().zip(amounts.iter()) {
+                charged += request.finish_with_delivery(*amount).unwrap();
+                prop_assert!(u128::from(charged) <= TICK_SIZE);
+                assert_invariant(manager.snapshot(&tc).unwrap().unwrap());
+            }
+            prop_assert_eq!(charged, amounts.iter().sum::<u64>().min(TICK_SIZE as u64));
+        }
     }
 }

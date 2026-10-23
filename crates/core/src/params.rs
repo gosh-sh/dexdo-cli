@@ -41,6 +41,15 @@ pub const MIN_NOTE_TRANSFER_SHELL_RAW: u128 = 10_000_000;
 /// constant, and every reader derives from it.
 pub const ROOT_PN_GAS_DEPOSIT_RAW: u64 = 250_000_000_000;
 
+/// RootPN's premine address in the canonical `<dapp_id>::<account_id>` form: the system DApp
+/// [`crate::address::DEXDO_DAPP_ID`] and the account `ROOT_PN_ADDRESS` in
+/// `contracts/dex/modifiers/modifiers.sol` (also `ROOT_PN_ADDR` in
+/// `contracts/airegistry/TokenContract.sol`). `gosh-ackinacki` dropped its own copy in 0.5 and takes
+/// the address from the caller; pass it through [`crate::address::parse_chain_address`].
+pub const ROOT_PN_ADDRESS: &str =
+    "0000000000000000000000000000000000000000000000000000000000000004::\
+     1010101010101010101010101010101010101010101010101010101010101010";
+
 /// Raw ECC[2] SHELL a funding wallet must attach to deploy a note of `nominal_raw`: the nominal plus
 /// the collection `RootPN.generateVoucher(isFee = false)` takes out of every deposit before checking
 /// the remainder against `ALLOWED_NOMINALS`.
@@ -245,6 +254,11 @@ pub const TICK_SIZE: u128 = 1_000_000;
 /// the gate only bounds risk for the next admission.
 pub const SELLER_UNCLAIMED_BILLABLE_RISK_LIMIT: u128 = TICK_SIZE;
 
+/// Default simultaneous provider requests per deal. A positive count limits parallel work,
+/// not the token cost of a request whose provider-native usage is known only at completion.
+pub const SELLER_MAX_CONCURRENT_REQUESTS_PER_DEAL: std::num::NonZeroU32 =
+    std::num::NonZeroU32::new(2).unwrap();
+
 /// Cumulative consumption an accepted probe credits, in tokens: exactly one canonical tick.
 
 /// THE RULE, in one place, because consumers keep inventing their own reading of it: accepting the probe is
@@ -444,6 +458,10 @@ pub const BUYER_HANDOVER_POLL_INTERVAL: Duration = Duration::from_millis(500);
 /// Interval between durable human-readable status records during the seller handover wait.
 pub const BUYER_HANDOVER_PROGRESS_INTERVAL: Duration = Duration::from_secs(30);
 
+/// Interval between on-chain state reads of the deal a `keep_open` handover wait holds. That wait
+/// has no deadline; a deal found closed (not funded or not found) stops the buyer.
+pub const BUYER_KEEP_OPEN_DEAL_CHECK_INTERVAL: Duration = Duration::from_secs(60);
+
 /// Maximum wait for a seller's `postSellOffer` submit response.
 pub const POST_SELL_OFFER_SUBMIT_TIMEOUT: Duration = Duration::from_secs(120);
 
@@ -639,6 +657,76 @@ pub enum SampleAlgorithm {
 /// An unfamiliar endpoint receives no optional field and therefore cannot fail on one. Operators
 /// opt into a deterministic B7 reference only by declaring the provider's supported spelling.
 pub const OPENAI_COMPATIBLE_SAMPLE_ALGORITHM_DEFAULT: SampleAlgorithm = SampleAlgorithm::None;
+
+/// Operator-verified wire control for disabling reasoning on the exact provider/model.
+/// Units: one request mode. Undeclared support must never be inferred from a model name.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ReasoningDisableControl {
+    Unsupported,
+    ChatTemplate,
+    ChatTemplateThinking,
+    ReasoningEffort,
+    #[serde(rename = "openrouter")]
+    OpenRouter,
+    ThinkingDisabled,
+}
+
+pub const REASONING_DISABLE_CONTROL_DEFAULT: ReasoningDisableControl =
+    ReasoningDisableControl::Unsupported;
+
+impl Default for ReasoningDisableControl {
+    fn default() -> Self {
+        REASONING_DISABLE_CONTROL_DEFAULT
+    }
+}
+
+/// Explicit effort levels understood by the CLI. Omission retains provider defaults;
+/// disabling reasoning remains the separate `ReasoningDisableControl` capability.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ReasoningEffort {
+    Minimal,
+    Low,
+    Medium,
+    High,
+    #[serde(rename = "xhigh")]
+    XHigh,
+    Max,
+}
+
+impl ReasoningEffort {
+    pub fn parse(value: &str) -> Option<Self> {
+        match value {
+            "minimal" => Some(Self::Minimal),
+            "low" => Some(Self::Low),
+            "medium" => Some(Self::Medium),
+            "high" => Some(Self::High),
+            "xhigh" => Some(Self::XHigh),
+            "max" => Some(Self::Max),
+            _ => None,
+        }
+    }
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Minimal => "minimal",
+            Self::Low => "low",
+            Self::Medium => "medium",
+            Self::High => "high",
+            Self::XHigh => "xhigh",
+            Self::Max => "max",
+        }
+    }
+}
+
+/// Fixed outbound effort shapes, selected for an operator-verified endpoint/model.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ReasoningEffortControl {
+    ReasoningEffort,
+    ReasoningEffortNested,
+}
 
 /// Fixed RNG seed carried by both supported seed spellings.
 pub const REFERENCE_SAMPLE_SEED: u32 = 0;
@@ -1207,6 +1295,16 @@ pub const DEFAULT_DASHBOARD_LISTEN: &str = "127.0.0.1:8765";
 /// practice market "no endpoint" is a meaningful answer -- it is the one-shot path -- and a
 /// parser default would leave the client no way to say it.
 pub const DEFAULT_BUYER_LOCAL_LISTEN: &str = "127.0.0.1:8080";
+
+/// Maximum buyer API JSON request body, in bytes (32 MiB), inclusive.
+/// Enforced before deal initialization on Chat Completions, Responses and Messages.
+pub const BUYER_API_REQUEST_BODY_MAX_BYTES: usize = 32 * 1024 * 1024;
+
+/// Maximum complete gateway protobuf request, in bytes (33 MiB), inclusive.
+/// The 1 MiB envelope budget covers authorization, protobuf expansion and the
+/// session header (the current HTTP server's entire header buffer is below 512 KiB).
+/// This is a transport bound; the buyer's JSON body limit remains unchanged.
+pub const GATEWAY_REQUEST_MAX_BYTES: usize = BUYER_API_REQUEST_BODY_MAX_BYTES + 1024 * 1024;
 
 /// Default deal-audit export format spelling.
 pub const DEFAULT_EXPORT_FORMAT: &str = "json";
@@ -2239,7 +2337,16 @@ impl Default for ProtocolConsts {
 
 /// Maximum total attempts for one timed-out periodic upstream health probe.
 /// Two attempts absorb one isolated stall while extending only that timeout path by one health-check timeout.
+/// Initial SELL readiness shares this cap between timeouts and typed HTTP 429 throttling;
+/// the latter waits `SellerLivenessParams::health_interval` before its one retry.
 pub const SELLER_UPSTREAM_HEALTH_TIMEOUT_MAX_ATTEMPTS: u32 = 2;
+
+/// Initial full-jitter ceiling for pre-output upstream retries without `Retry-After`.
+pub const UPSTREAM_RETRY_INITIAL_BACKOFF: Duration = Duration::from_secs(1);
+/// Growth factor for each successive retry without a provider-specified delay.
+pub const UPSTREAM_RETRY_BACKOFF_MULTIPLIER: u32 = 2;
+/// Maximum full-jitter ceiling; the original request retry deadline still applies.
+pub const UPSTREAM_RETRY_MAX_BACKOFF: Duration = Duration::from_secs(20);
 
 /// Seller CLI liveness timings for a resting SELL.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -2277,6 +2384,9 @@ pub struct SellerLivenessParams {
     /// poll interval while confirming the reap. Transient read failures inside
     /// [`Self::offer_reap_timeout`] are retried at this cadence; deterministic refusals never are.
     pub offer_reap_poll: Duration,
+    /// Delay between recovery cycles after a failed successor post/confirmation. Each cycle
+    /// reconciles chain state before permitting another submission.
+    pub offer_recovery_backoff: Duration,
 }
 
 impl SellerLivenessParams {
@@ -2292,6 +2402,7 @@ impl SellerLivenessParams {
             offer_expiry_poll: Duration::from_secs(5),
             offer_reap_timeout: Duration::from_secs(60),
             offer_reap_poll: Duration::from_secs(2),
+            offer_recovery_backoff: Duration::from_secs(20),
         }
     }
 }
@@ -2459,10 +2570,23 @@ mod tests {
         HERMEZ_SRS_MAX_ATTEMPTS, HERMEZ_SRS_RETRY_INITIAL_BACKOFF, HERMEZ_SRS_SIZE_BYTES,
         MATCH_OPEN_TIMEOUT, MATCH_OPEN_TIMEOUT_SECS, MAX_CLAIM_DELTA, MIN_STREAM_BUY_TICKS,
         NOTE_DEPLOY_SUBMIT_NATIVE_VALUE, PLATFORM_FEE_BPS, PRICE_STEP, PROBE_SEED_TOKENS,
-        SELLER_TERMINAL_RECEIPT_POLL_INTERVAL, SELLER_TERMINAL_RECEIPT_TIMEOUT, SHELL_UNIT,
-        STOP_SUBMIT_MARGIN, SUBSCRIPTION_MAX_TICKS, SUBSCRIPTION_WEEKS, SUB_TICKS_PER_WEEK,
-        TICK_SIZE,
+        ROOT_PN_ADDRESS, SELLER_TERMINAL_RECEIPT_POLL_INTERVAL, SELLER_TERMINAL_RECEIPT_TIMEOUT,
+        SHELL_UNIT, STOP_SUBMIT_MARGIN, SUBSCRIPTION_MAX_TICKS, SUBSCRIPTION_WEEKS,
+        SUB_TICKS_PER_WEEK, TICK_SIZE,
     };
+
+    #[test]
+    fn root_pn_address_is_canonical_and_names_the_contracts_account_in_the_system_dapp() {
+        let canonical = crate::address::CanonicalAddress::parse(ROOT_PN_ADDRESS).unwrap();
+        assert_eq!(canonical.dapp_id(), crate::address::DEXDO_DAPP_ID);
+        assert_eq!(canonical.account_id(), "10".repeat(32));
+        assert_eq!(
+            crate::address::to_canonical(ROOT_PN_ADDRESS).unwrap(),
+            ROOT_PN_ADDRESS
+        );
+        let chain = crate::address::parse_chain_address(ROOT_PN_ADDRESS).unwrap();
+        assert_eq!(chain.dapp_id(), Some(crate::address::DEXDO_DAPP_ID));
+    }
     use proptest::prelude::*;
     use std::time::Duration;
 
@@ -3046,6 +3170,7 @@ mod tests {
         assert_eq!(params.cancel_confirmation_timeout, Duration::from_secs(60));
         assert_eq!(params.cancel_confirmation_poll, Duration::from_secs(2));
         assert_eq!(params.gateway_task_poll, Duration::from_millis(100));
+        assert_eq!(params.offer_recovery_backoff, Duration::from_secs(20));
     }
 
     #[test]
@@ -3353,3 +3478,43 @@ mod tests {
         assert_eq!(params.agent_name_max_chars, 64);
     }
 }
+
+/// Persistent buyer usage history filename, relative to the instance data directory.
+pub const BUYER_USAGE_DATABASE_FILE: &str = "usage.sqlite3";
+/// Per-network write-ahead purchase metadata extension beside the usage database.
+pub const BUYER_USAGE_QUOTA_JOURNAL_EXTENSION: &str = "quota.json";
+/// Fallback IANA timezone when the buyer server timezone cannot be determined.
+pub const BUYER_USAGE_DEFAULT_TIMEZONE: &str = "UTC";
+/// Default count of local calendar days returned by the buyer usage endpoint.
+pub const BUYER_USAGE_DEFAULT_DAYS: u32 = 30;
+/// Minimum count of local calendar days accepted by the buyer usage endpoint.
+pub const BUYER_USAGE_MIN_DAYS: u32 = 1;
+/// Maximum count of local calendar days accepted by the buyer usage endpoint.
+pub const BUYER_USAGE_MAX_DAYS: u32 = 90;
+/// Maximum wait for a competing local SQLite writer.
+pub const BUYER_USAGE_SQLITE_BUSY_TIMEOUT: Duration = Duration::from_secs(5);
+/// Delay between transient WAL-initialization retries, within the SQLite busy wait budget.
+pub const BUYER_USAGE_SQLITE_INIT_RETRY_INTERVAL: Duration = Duration::from_millis(10);
+/// SQLite format version of the persistent buyer usage history.
+pub const BUYER_USAGE_SCHEMA_VERSION: u32 = 5;
+/// Default number of financial facts per HTTP page (rows).
+pub const BUYER_USAGE_FACTS_DEFAULT_LIMIT: u32 = 100;
+/// Minimum financial-facts page size (rows).
+pub const BUYER_USAGE_FACTS_MIN_LIMIT: u32 = 1;
+/// Maximum number of financial facts per HTTP page (rows).
+pub const BUYER_USAGE_FACTS_MAX_LIMIT: u32 = 1_000;
+/// Maximum encoded financial-facts cursor length (ASCII bytes).
+pub const BUYER_USAGE_FACTS_MAX_CURSOR_BYTES: usize = 4_096;
+/// Delay between buyer usage chain-evidence reconciliation passes.
+pub const BUYER_USAGE_RECONCILE_INTERVAL: Duration = Duration::from_secs(30);
+/// Opt-in seller OTLP metrics policy. Durations are milliseconds on the environment surface.
+/// Default time between metric exports (`OTEL_METRIC_EXPORT_INTERVAL`).
+pub const SELLER_METRICS_EXPORT_INTERVAL: Duration = Duration::from_secs(15);
+/// Default bound on one export and on shutdown flush (`OTEL_EXPORTER_OTLP_METRICS_TIMEOUT`).
+pub const SELLER_METRICS_EXPORT_TIMEOUT: Duration = Duration::from_secs(5);
+/// Age after which a health check or offer read is reported as unknown instead of its last value.
+pub const SELLER_METRICS_FRESHNESS: Duration = Duration::from_secs(120);
+/// Collector origin used when no OTLP endpoint variable is set.
+pub const SELLER_METRICS_DEFAULT_ENDPOINT: &str = "http://localhost:4317";
+/// `service.name` resource attribute when `OTEL_SERVICE_NAME` is unset.
+pub const SELLER_METRICS_SERVICE_NAME: &str = "dexdo-seller";

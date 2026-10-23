@@ -12,7 +12,7 @@ use crate::note::{Note, NotePubkey};
 use crate::params::{ProtocolConsts, Shell};
 use async_trait::async_trait;
 use std::sync::{
-    atomic::{AtomicU64, Ordering},
+    atomic::{AtomicBool, AtomicU64, Ordering},
     Arc,
 };
 
@@ -29,6 +29,7 @@ pub use types::*;
 pub struct HeartbeatGuard {
     generation: Arc<AtomicU64>,
     expected: u64,
+    stop_veto: Option<Arc<AtomicBool>>,
 }
 
 impl HeartbeatGuard {
@@ -37,11 +38,22 @@ impl HeartbeatGuard {
         Self {
             generation,
             expected,
+            stop_veto: None,
         }
+    }
+
+    /// Recheck unresolved accounting at the same final pre-submit boundary as resumed output.
+    pub fn with_stop_veto(mut self, veto: Arc<AtomicBool>) -> Self {
+        self.stop_veto = Some(veto);
+        self
     }
 
     pub fn unchanged(&self) -> bool {
         self.generation.load(Ordering::SeqCst) == self.expected
+            && !self
+                .stop_veto
+                .as_ref()
+                .is_some_and(|veto| veto.load(Ordering::SeqCst))
     }
 }
 
@@ -159,6 +171,15 @@ pub trait ChainBackend: Send + Sync {
     async fn seller_nonce_is_retired(&self, _nonce: u64) -> Result<bool, ChainError> {
         Ok(false)
     }
+    /// A durable SELL without a terminal execution fact must enter pending recovery on restart.
+    /// This is a local journal read, independent of model readiness and chain getter availability.
+    async fn has_pending_sell_offer(
+        &self,
+        _token_contract: &TokenContract,
+    ) -> Result<bool, ChainError> {
+        Ok(false)
+    }
+
     /// After `post_offer`, confirm the seller-visible on-chain outcome. Backends without a live IOB return `None`.
     async fn confirm_offer_outcome(
         &self,
@@ -711,6 +732,15 @@ pub trait ChainBackend: Send + Sync {
     ) -> Result<Option<DealSubscription>, ChainError> {
         Ok(None)
     }
+    /// Actual purchased ticks and execution price (raw SHELL per tick), never the offer's
+    /// maximum volume or the buyer's price ceiling. None when no funded deal is readable.
+    async fn deal_purchase_terms(
+        &self,
+        _token_contract: &TokenContract,
+    ) -> Result<Option<(u128, u128)>, ChainError> {
+        Ok(None)
+    }
+
     /// Snapshot of locks and burned SHELL for the contract -- for e2e checks.
     async fn snapshot(&self, token_contract: &TokenContract) -> Option<StreamSnapshot>;
 
@@ -1010,8 +1040,9 @@ mod tests {
 
         for changed in mutations {
             let error = ensure_pre_submit_quote_unchanged(Some(&quoted), &changed)
-                .expect_err("a changed matcher head must fail before escrow")
-                .to_string();
+                .expect_err("a changed matcher head must fail before escrow");
+            assert!(matches!(&error, ChainError::OrderUnavailable(_)));
+            let error = error.to_string();
             assert!(
                 error.contains(
                     "buyer pre-submit matcher head differs from the rendered quote; no escrow was sent"

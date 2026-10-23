@@ -11,7 +11,9 @@ use crate::seller::upstream::UpstreamConfig;
 use crate::seller::upstream::UpstreamEvent;
 use anyhow::{anyhow, Result as AnyResult};
 use dexdo_core::note::Signature;
-use dexdo_core::params::{GATEWAY_CLIENT_CHANNEL_CAPACITY, GATEWAY_UPSTREAM_CHANNEL_CAPACITY};
+use dexdo_core::params::{
+    GATEWAY_CLIENT_CHANNEL_CAPACITY, GATEWAY_REQUEST_MAX_BYTES, GATEWAY_UPSTREAM_CHANNEL_CAPACITY,
+};
 use dexdo_core::{DealChainState, DealSubscription};
 use dexdo_proto::{
     BillingUsage, CanonChunk, CanonRequest, Challenge, ChallengeRequest, Gateway, GatewayServer,
@@ -22,7 +24,7 @@ use std::collections::HashMap;
 use std::num::NonZeroU64;
 use std::path::PathBuf;
 use std::pin::Pin;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use tokio::sync::{mpsc, watch};
 use tokio_stream::{wrappers::ReceiverStream, Stream};
@@ -102,18 +104,19 @@ impl UpstreamFailure {
             "upstream"
         };
         let retryable = error_class != "auth"
-            && http_status.map_or_else(
-                || {
-                    matches!(
-                        status.code(),
-                        tonic::Code::DeadlineExceeded
-                            | tonic::Code::ResourceExhausted
-                            | tonic::Code::Aborted
-                            | tonic::Code::Unavailable
-                    )
-                },
-                |code| code == 408 || code == 429 || code >= 500,
-            );
+            && (dexdo_proto::is_retryable_upstream(status)
+                || http_status.map_or_else(
+                    || {
+                        matches!(
+                            status.code(),
+                            tonic::Code::DeadlineExceeded
+                                | tonic::Code::ResourceExhausted
+                                | tonic::Code::Aborted
+                                | tonic::Code::Unavailable
+                        )
+                    },
+                    |code| code == 408 || code == 429 || code >= 500,
+                ));
         Self {
             token_contract: token_contract.to_string(),
             error_class,
@@ -129,12 +132,12 @@ impl UpstreamFailure {
     }
 }
 
-/// Per-deal billable-usage tracking. `count` is the **cumulative** checked
-/// input-plus-output total committed across all of this deal's gRPC streams. A deal/session serves many
-/// sequential requests on one `token_contract`, so each clean request terminal adds exactly once to the same
-/// counter. `done` means **no more billable usage will ever arrive for this deal/session**. The ordinary owner
+/// Per-deal payment tracking. `count` is the cumulative accepted payment in
+/// provider-token units across all of this deal's gRPC streams. Each clean request terminal adds its
+/// charged portion exactly once, excluding excess work borne by the seller. `done` means **no more billable usage will ever arrive for this deal/session**. The ordinary owner
 /// is the buyer **session lifecycle**; a provider bill beyond one request's paid reservation also closes
-/// that lifecycle after committing the capped amount. `billing_exhausted` distinguishes only that latter fact,
+/// that lifecycle after committing the capped amount and draining admitted work. `billing_exhausted`
+/// distinguishes only that latter fact,
 /// so an ordinary clean session end never causes a seller-initiated close. The seller's `drive_advance` reads
 /// `count` and `done` (Acquire) so finalized ticks never exceed accepted billable usage.
 #[derive(Clone, Default)]
@@ -199,6 +202,20 @@ pub trait AuthoritativeDeliveryRecorder: Send + Sync {
         event: AuthoritativeDeliveryEvent,
     ) -> Result<(), Status>;
 
+    /// Whether admission and failure reconciliation use the shared request budget.
+    fn shared_budget(&self) -> bool {
+        false
+    }
+
+    /// Commit the accepted amount together with any provider overrun beyond its grant.
+    fn complete_billing(&self, tokens: NonZeroU64, billing_exhausted: bool) -> Result<u64, Status> {
+        self.record_authoritative_delivery(AuthoritativeDeliveryEvent::Completed(tokens))?;
+        if billing_exhausted {
+            self.mark_billing_exhausted();
+        }
+        Ok(tokens.get())
+    }
+
     /// Mark that the provider's terminal bill exceeded this request's authorized reservation.
     /// The accepted amount is recorded first; `done` then tells the existing advance driver that no
     /// later request may add billable usage to this deal.
@@ -235,51 +252,70 @@ struct CapacityDeliveryRecorder {
 }
 
 impl AuthoritativeDeliveryRecorder for CapacityDeliveryRecorder {
+    fn shared_budget(&self) -> bool {
+        self.reservation.is_shared()
+    }
+
+    fn complete_billing(&self, tokens: NonZeroU64, billing_exhausted: bool) -> Result<u64, Status> {
+        let _guard = self.delivery.update_lock.lock().map_err(|_| {
+            capacity_status(anyhow!("{POISONED_LOCK_MESSAGE}: {DELIVERY_UPDATE_LOCK}"))
+        })?;
+        // Admission and completion share this lock: close admission before publishing done.
+        // It also serializes the durable allocation and its claim counter.
+        // Check the wider sum before persistence, including the zero-charge case.
+        let before = self.delivery.count.load(Ordering::Acquire);
+        checked_authoritative_tokens(&self.delivery.count, tokens.get())?;
+        let charged = self
+            .reservation
+            .finish_with_delivery(tokens.get())
+            .map_err(capacity_status)?;
+        self.delivery
+            .count
+            .store(before + charged, Ordering::Release);
+        if billing_exhausted || charged < tokens.get() {
+            self.delivery
+                .billing_exhausted
+                .store(true, Ordering::Release);
+        }
+        if self.delivery.billing_exhausted.load(Ordering::Acquire)
+            && self.reservation.active_shared_requests() == 0
+        {
+            self.delivery.done.store(true, Ordering::Release);
+        }
+        Ok(charged)
+    }
+
     fn record_authoritative_delivery(
         &self,
         event: AuthoritativeDeliveryEvent,
     ) -> Result<(), Status> {
         match event {
             AuthoritativeDeliveryEvent::Completed(tokens) => {
+                self.complete_billing(tokens, false).map(|_| ())
+            }
+            AuthoritativeDeliveryEvent::Finished(finish) => {
                 let _guard = self.delivery.update_lock.lock().map_err(|_| {
                     capacity_status(anyhow!("{POISONED_LOCK_MESSAGE}: {DELIVERY_UPDATE_LOCK}"))
                 })?;
-                let next = checked_authoritative_tokens(&self.delivery.count, tokens.get())?;
-                let durable = self
-                    .reservation
-                    .finish_with_delivery(tokens.get())
-                    .map_err(capacity_status)?;
-                debug_assert_eq!(durable, tokens.get());
-                self.delivery.count.store(next, Ordering::Release);
-                Ok(())
-            }
-            AuthoritativeDeliveryEvent::Finished(finish) => {
                 let durable = match finish {
-                    AuthoritativeDeliveryFinish::Interrupted => {
-                        self.reservation.finish_exact().map_err(capacity_status)?
+                    AuthoritativeDeliveryFinish::Interrupted => self.reservation.finish_exact(),
+                    AuthoritativeDeliveryFinish::AmbiguousUsage => {
+                        self.reservation.finish_ambiguous()
                     }
-                    AuthoritativeDeliveryFinish::AmbiguousUsage => self
-                        .reservation
-                        .finish_ambiguous()
-                        .map_err(capacity_status)?,
-                };
+                }
+                .map_err(capacity_status)?;
                 if durable > 0 {
-                    let _guard = self.delivery.update_lock.lock().map_err(|_| {
-                        capacity_status(anyhow!("{POISONED_LOCK_MESSAGE}: {DELIVERY_UPDATE_LOCK}"))
-                    })?;
                     let next = checked_authoritative_tokens(&self.delivery.count, durable)?;
                     self.delivery.count.store(next, Ordering::Release);
+                }
+                if self.delivery.billing_exhausted.load(Ordering::Acquire)
+                    && self.reservation.active_shared_requests() == 0
+                {
+                    self.delivery.done.store(true, Ordering::Release);
                 }
                 Ok(())
             }
         }
-    }
-
-    fn mark_billing_exhausted(&self) {
-        self.delivery
-            .billing_exhausted
-            .store(true, Ordering::Release);
-        self.delivery.done.store(true, Ordering::Release);
     }
 }
 
@@ -305,6 +341,7 @@ pub struct GatewayState {
     upstream_failure_rx: tokio::sync::Mutex<mpsc::UnboundedReceiver<UpstreamFailure>>,
     chain_unavailable: watch::Sender<bool>,
     keep_serving_when_chain_unavailable: AtomicBool,
+    max_concurrent_requests_per_deal: AtomicU32,
 }
 
 impl GatewayState {
@@ -336,7 +373,20 @@ impl GatewayState {
             upstream_failure_rx: tokio::sync::Mutex::new(upstream_failure_rx),
             chain_unavailable,
             keep_serving_when_chain_unavailable: AtomicBool::new(false),
+            max_concurrent_requests_per_deal: AtomicU32::new(
+                dexdo_core::params::SELLER_MAX_CONCURRENT_REQUESTS_PER_DEAL.get(),
+            ),
         }
+    }
+
+    pub fn set_max_concurrent_requests_per_deal(&self, limit: std::num::NonZeroU32) {
+        self.max_concurrent_requests_per_deal
+            .store(limit.get(), Ordering::Release);
+    }
+
+    pub fn active_requests(&self, token_contract: &str) -> u32 {
+        self.capacity
+            .active_shared_requests(&token_contract.to_string())
     }
 
     pub fn set_chain_unavailable_action(&self, action: ChainUnavailableAction) {
@@ -415,6 +465,7 @@ impl GatewayState {
 
     /// Remove only one terminal/failed deal from the shared listener.
     pub fn unregister_stream(&self, token_contract: &str) {
+        crate::telemetry::forget(token_contract);
         if !self.chain_unavailable() {
             self.auth.unregister(token_contract);
         }
@@ -643,13 +694,14 @@ async fn relay_counting_with_chain_availability<R>(
             up_rx.recv().await
         };
         let Some(event) = event else {
-            let Some(usage) = terminal_usage.take() else {
-                terminal_error = Some(Status::data_loss(
-                    "upstream ended without terminal billing usage",
+            let Some(mut usage) = terminal_usage.take() else {
+                terminal_error = Some(dexdo_proto::upstream_failure_status(
+                    Status::data_loss("upstream ended without terminal billing usage"),
+                    saw_output,
                 ));
                 break unfinished_delivery_finish(saw_output);
             };
-            let Some(tokens) = NonZeroU64::new(usage.total_tokens) else {
+            let Some(tokens) = NonZeroU64::new(usage.total_tokens.min(billing_grant_tokens)) else {
                 terminal_error = Some(Status::data_loss(
                     "terminal billing usage has zero total after delivered output",
                 ));
@@ -659,14 +711,15 @@ async fn relay_counting_with_chain_availability<R>(
                 Ok(permit) => permit,
                 Err(_) => break unfinished_delivery_finish(saw_output),
             };
-            if let Err(status) = recorder
-                .record_authoritative_delivery(AuthoritativeDeliveryEvent::Completed(tokens))
-            {
-                terminal_error = Some(status);
-                break unfinished_delivery_finish(saw_output);
-            }
-            if billing_exhausted {
-                recorder.mark_billing_exhausted();
+            let charged = match recorder.complete_billing(tokens, billing_exhausted) {
+                Ok(charged) => charged,
+                Err(status) => {
+                    terminal_error = Some(status);
+                    break unfinished_delivery_finish(saw_output);
+                }
+            };
+            if recorder.shared_budget() || charged != usage.total_tokens {
+                usage.charged_tokens = Some(charged);
             }
             permit.send(Ok(CanonChunk {
                 seq: next_seq,
@@ -731,7 +784,7 @@ async fn relay_counting_with_chain_availability<R>(
                 permit.send(Ok(chunk));
                 saw_output |= has_output;
             }
-            Ok(UpstreamEvent::Usage(mut usage)) => {
+            Ok(UpstreamEvent::Usage(usage)) => {
                 if terminal_usage.is_some() {
                     terminal_error = Some(Status::data_loss(
                         "upstream emitted duplicate terminal billing usage",
@@ -742,12 +795,7 @@ async fn relay_counting_with_chain_availability<R>(
                     terminal_error = Some(Status::data_loss(error));
                     break unfinished_delivery_finish(saw_output);
                 }
-                if usage.total_tokens > billing_grant_tokens {
-                    billing_exhausted = true;
-                    usage.output_tokens = usage.output_tokens.min(billing_grant_tokens);
-                    usage.input_tokens = billing_grant_tokens - usage.output_tokens;
-                    usage.total_tokens = billing_grant_tokens;
-                }
+                billing_exhausted = usage.total_tokens > billing_grant_tokens;
                 let output_matches = if exact_output_usage {
                     usage.output_tokens == visible_output_tokens
                 } else {
@@ -769,6 +817,7 @@ async fn relay_counting_with_chain_availability<R>(
                 terminal_usage = Some(usage);
             }
             Err(status) => {
+                let status = dexdo_proto::upstream_failure_status(status, saw_output);
                 if let Some((token_contract, event_sequence, failure_tx)) = &failure_context {
                     let _ = failure_tx.send(UpstreamFailure::from_status(
                         token_contract,
@@ -781,6 +830,19 @@ async fn relay_counting_with_chain_availability<R>(
             }
         }
     };
+    if recorder.shared_budget() {
+        if let Some(status) = terminal_error.take() {
+            let _ = tx.send(Err(status)).await;
+        }
+        drop(tx);
+        while up_rx.recv().await.is_some() {}
+        if let Err(status) =
+            recorder.record_authoritative_delivery(AuthoritativeDeliveryEvent::Finished(finish))
+        {
+            tracing::error!(%status, "shared request reconciliation failed after upstream drain");
+        }
+        return;
+    }
     if let Err(status) =
         recorder.record_authoritative_delivery(AuthoritativeDeliveryEvent::Finished(finish))
     {
@@ -805,6 +867,13 @@ fn reserve_status(error: ReserveError) -> Status {
     match error {
         ReserveError::Exhausted => {
             Status::resource_exhausted("deal delivery capacity is exhausted")
+        }
+        ReserveError::Concurrency => {
+            let mut status = Status::resource_exhausted(error.to_string());
+            status
+                .metadata_mut()
+                .insert("dexdo-error-code", "deal_busy".parse().unwrap());
+            status
         }
         ReserveError::UnknownDeal | ReserveError::Terminal => {
             Status::failed_precondition(error.to_string())
@@ -834,7 +903,7 @@ impl GatewayService {
 
     /// Wrap into a tonic server for mounting in `Server::builder`.
     pub fn into_server(self) -> GatewayServer<Self> {
-        GatewayServer::new(self)
+        GatewayServer::new(self).max_decoding_message_size(GATEWAY_REQUEST_MAX_BYTES)
     }
 }
 
@@ -847,15 +916,22 @@ impl Gateway for GatewayService {
         &self,
         request: Request<ChallengeRequest>,
     ) -> Result<Response<Challenge>, Status> {
-        let tc = request.into_inner().token_contract;
-        let mut nonce = vec![0u8; 32];
-        rand::rngs::OsRng.fill_bytes(&mut nonce);
-        self.state.auth.issue_challenge(&tc, nonce.clone());
-        if tc == HEALTH_CHALLENGE_TC {
-            self.state.auth.discard_challenge(&tc, &nonce);
+        let request = request.into_inner();
+        let tc = request.token_contract;
+        let mut nonce = Vec::new();
+        if !request.capabilities_only {
+            nonce.resize(32, 0);
+            rand::rngs::OsRng.fill_bytes(&mut nonce);
+            self.state.auth.issue_challenge(&tc, nonce.clone());
+            if tc == HEALTH_CHALLENGE_TC {
+                self.state.auth.discard_challenge(&tc, &nonce);
+            }
         }
+        let upstream = self.state.upstream(&tc);
         Ok(Response::new(Challenge {
             nonce,
+            supports_reasoning_disable: upstream.supports_reasoning_disable(),
+            supported_reasoning_efforts: upstream.supported_reasoning_efforts(),
             token_contract: tc,
         }))
     }
@@ -904,6 +980,7 @@ impl Gateway for GatewayService {
 
         let request = req.request;
         let upstream = self.state.upstream(&req.token_contract);
+        upstream.validate_reasoning(request.as_ref().and_then(|r| r.params.as_ref()))?;
         let mock_upstream = matches!(
             &upstream,
             UpstreamConfig::Mock
@@ -927,16 +1004,40 @@ impl Gateway for GatewayService {
         // grant is still a hard total bound, so it also supplies the only buyer-side output ceiling;
         // an explicit contradictory max_tokens remains an error instead of being rewritten.
         let requested_output_limit = configured_output_limit.min(req.billing_grant_tokens);
-        // The per-deal reservation is durably committed before the upstream task can observe the request.
+        // Per-deal admission is checked before the upstream task can observe the request. Shared
+        // requests hold live slots; legacy exclusive requests durably reserve their token amount.
         // Both ordinary and subscription limits come only from the matched TC's strict chain snapshot.
         // Seller-local delivery since that snapshot is private, so the actual reservation may be below
         // the buyer's declared grant; that authoritative amount becomes the stricter total-usage limit
         // and also clamps the provider's output-only cap.
-        let reservation = self
-            .state
-            .capacity
-            .reserve(&req.token_contract, req.billing_grant_tokens)
-            .map_err(reserve_status)?;
+        let delivered = self.state.delivery(&req.token_contract);
+        let reservation = {
+            let _guard = delivered.update_lock.lock().map_err(|_| {
+                capacity_status(anyhow!("{POISONED_LOCK_MESSAGE}: {DELIVERY_UPDATE_LOCK}"))
+            })?;
+            // An overrun closes admission while accepted work drains, even with paid capacity left.
+            // The same lock covers completion and its last-active-request check.
+            if delivered.billing_exhausted.load(Ordering::Acquire) {
+                return Err(reserve_status(ReserveError::Exhausted));
+            }
+            if req.shared_budget {
+                self.state.capacity.admit_shared(
+                    &req.token_contract,
+                    req.billing_grant_tokens,
+                    std::num::NonZeroU32::new(
+                        self.state
+                            .max_concurrent_requests_per_deal
+                            .load(Ordering::Acquire),
+                    )
+                    .expect("positive seller concurrency limit"),
+                )
+            } else {
+                self.state
+                    .capacity
+                    .reserve_exclusive(&req.token_contract, req.billing_grant_tokens)
+            }
+            .map_err(reserve_status)?
+        };
         let effective_billing_grant = reservation.amount();
         let output_limit = requested_output_limit.min(effective_billing_grant);
         // R1: the upstream adapts the CANONICAL request that arrived in the opening
@@ -944,9 +1045,7 @@ impl Gateway for GatewayService {
         // provider adapter proxies the request and normalizes the SSE (R1/R5/R6).
         // The per-deal billable tracker is shared across all of this deal's streams (the gateway map returns
         // the same `DealDelivery`), so checked input-plus-output totals accumulate over sequential requests.
-        // The relay is handed only the counter -- `done` stays owned by the buyer session lifecycle,
-        // never set per-stream.
-        let delivered = self.state.delivery(&req.token_contract);
+        // An ordinary completion leaves the session open; an overrun closes it after accepted work drains.
         let chain_unavailable = self.state.subscribe_chain_unavailable();
         let failure_context = (
             req.token_contract.clone(),
@@ -1138,6 +1237,7 @@ mod tests {
         state.auth.issue_challenge(token_contract, nonce.clone());
         let signature = buyer.sign(&challenge_bytes(token_contract, &nonce));
         Request::new(StreamRequest {
+            shared_budget: false,
             token_contract: token_contract.to_string(),
             nonce,
             signature: signature.0.to_vec(),
@@ -1147,6 +1247,7 @@ mod tests {
                     max_tokens,
                     ..SamplingParams::default()
                 }),
+                ..Default::default()
             }),
             billing_grant_tokens,
         })
@@ -1252,6 +1353,7 @@ mod tests {
                 content: "hello".into(),
             }],
             params: None,
+            ..Default::default()
         };
         let (up_tx, up_rx) = mpsc::channel(8);
         let upstream = tokio::spawn(async move {
@@ -1397,6 +1499,7 @@ mod tests {
                 max_tokens: 256,
                 ..SamplingParams::default()
             }),
+            ..Default::default()
         };
 
         assert_eq!(
@@ -1806,8 +1909,9 @@ mod tests {
         );
         let usage = rx.recv().await.unwrap().unwrap().usage.unwrap();
         assert_eq!(usage.input_tokens, 0);
-        assert_eq!(usage.output_tokens, 2);
-        assert_eq!(usage.total_tokens, 2);
+        assert_eq!(usage.output_tokens, 3);
+        assert_eq!(usage.total_tokens, 3);
+        assert_eq!(usage.billable_tokens(), 2);
         assert!(rx.recv().await.is_none());
         let snapshot = state.capacity_snapshot(tc).unwrap().unwrap();
         assert_eq!(snapshot.local_delivered_after_anchor, 2);
@@ -1976,6 +2080,176 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn reasoning_2090_capability_queries_leave_authorization_nonces_untouched() {
+        let state = Arc::new(GatewayState::new());
+        let buyer = LocalNote::generate();
+        let tc = "0:capability-query";
+        state.auth.register(tc, buyer.pubkey());
+        let service = GatewayService::new(state.clone());
+        let challenge = service
+            .get_challenge(Request::new(ChallengeRequest {
+                token_contract: tc.into(),
+                capabilities_only: false,
+            }))
+            .await
+            .unwrap()
+            .into_inner();
+        assert!(!challenge.nonce.is_empty());
+        assert_eq!(state.auth.outstanding_challenge_count(tc), 1);
+        for _ in 0..3 {
+            let query = service
+                .get_challenge(Request::new(ChallengeRequest {
+                    token_contract: tc.into(),
+                    capabilities_only: true,
+                }))
+                .await
+                .unwrap()
+                .into_inner();
+            assert!(query.nonce.is_empty());
+            assert_eq!(query.token_contract, tc);
+            assert_eq!(
+                query.supports_reasoning_disable,
+                challenge.supports_reasoning_disable
+            );
+            assert_eq!(state.auth.outstanding_challenge_count(tc), 1);
+            let signature = buyer.sign(&challenge_bytes(tc, &query.nonce));
+            assert!(!state.auth.verify_response(tc, &query.nonce, &signature));
+        }
+        let signature = buyer.sign(&challenge_bytes(tc, &challenge.nonce));
+        assert!(state.auth.verify_response(tc, &challenge.nonce, &signature));
+        assert_eq!(state.auth.outstanding_challenge_count(tc), 0);
+    }
+
+    #[tokio::test]
+    async fn reasoning_2172_gateway_rechecks_effort_before_capacity_reservation() {
+        for (effort, disabled, declared) in [
+            ("high", false, false),
+            ("invalid", false, true),
+            ("low", false, true),
+            ("high", true, true),
+        ] {
+            let mut cfg = crate::seller::OpenAiConfig {
+                base_url: "http://127.0.0.1:1".into(),
+                api_key_env: "DEXDO_2172_UNUSED_FIXTURE_KEY".into(),
+                ..Default::default()
+            };
+            cfg.capabilities.reasoning_disable =
+                dexdo_core::params::ReasoningDisableControl::ChatTemplate;
+            if declared {
+                cfg.capabilities.reasoning_effort = Some(
+                    serde_json::from_value(serde_json::json!({
+                        "control":"reasoning_effort", "supported":["high"]
+                    }))
+                    .unwrap(),
+                );
+            }
+            let state = Arc::new(GatewayState::with_upstream(UpstreamConfig::OpenAi(cfg)));
+            let buyer = LocalNote::generate();
+            let tc = "0:unsupported-effort";
+            state
+                .register_stream(
+                    tc,
+                    buyer.pubkey(),
+                    8,
+                    subscription_state(TICK_SIZE),
+                    ordinary_shape(TICK_SIZE + 8),
+                )
+                .unwrap();
+            let before = state.capacity_snapshot(tc).unwrap().unwrap();
+            let service = GatewayService::new(state.clone());
+            let query = service
+                .get_challenge(Request::new(ChallengeRequest {
+                    token_contract: tc.into(),
+                    capabilities_only: true,
+                }))
+                .await
+                .unwrap()
+                .into_inner();
+            assert!(query.nonce.is_empty());
+            assert_eq!(
+                query.supported_reasoning_efforts,
+                if declared {
+                    vec!["high".to_owned()]
+                } else {
+                    vec![]
+                }
+            );
+            assert_eq!(state.auth.outstanding_challenge_count(tc), 0);
+            let mut request = authorized_request(&state, &buyer, tc, 8, 8);
+            let params = request
+                .get_mut()
+                .request
+                .as_mut()
+                .unwrap()
+                .params
+                .as_mut()
+                .unwrap();
+            params.reasoning_effort = Some(effort.into());
+            params.disable_reasoning = disabled;
+            let Err(error) = service.open_stream(request).await else {
+                panic!("unsupported effort must be refused")
+            };
+            assert_eq!(error.code(), tonic::Code::InvalidArgument);
+            assert!(error.message().starts_with("unsupported_parameter:"));
+            let after = state.capacity_snapshot(tc).unwrap().unwrap();
+            assert_eq!(
+                after.outstanding_reservation,
+                before.outstanding_reservation
+            );
+            assert_eq!(
+                after.local_delivered_after_anchor,
+                before.local_delivered_after_anchor
+            );
+            assert_eq!(after.available().unwrap(), before.available().unwrap());
+        }
+    }
+
+    #[tokio::test]
+    async fn unsupported_reasoning_2090_is_refused_before_capacity_reservation() {
+        let state = Arc::new(GatewayState::new());
+        let buyer = LocalNote::generate();
+        let tc = "0:unsupported-reasoning";
+        state
+            .register_stream(
+                tc,
+                buyer.pubkey(),
+                8,
+                subscription_state(TICK_SIZE),
+                ordinary_shape(TICK_SIZE + 8),
+            )
+            .unwrap();
+        let before = state.capacity_snapshot(tc).unwrap().unwrap();
+        let mut request = authorized_request(&state, &buyer, tc, 8, 8);
+        request
+            .get_mut()
+            .request
+            .as_mut()
+            .unwrap()
+            .params
+            .as_mut()
+            .unwrap()
+            .disable_reasoning = true;
+        let result = GatewayService::new(state.clone())
+            .open_stream(request)
+            .await;
+        let Err(error) = result else {
+            panic!("unsupported control must be refused");
+        };
+        assert_eq!(error.code(), tonic::Code::InvalidArgument);
+        assert!(error.message().starts_with("unsupported_parameter:"));
+        let after = state.capacity_snapshot(tc).unwrap().unwrap();
+        assert_eq!(
+            after.outstanding_reservation,
+            before.outstanding_reservation
+        );
+        assert_eq!(
+            after.local_delivered_after_anchor,
+            before.local_delivered_after_anchor
+        );
+        assert_eq!(after.available().unwrap(), before.available().unwrap());
+    }
+
+    #[tokio::test]
     async fn terminal_total_above_the_private_capacity_is_capped_and_marks_the_deal_done() {
         let state = Arc::new(GatewayState::new());
         let buyer = LocalNote::generate();
@@ -2014,10 +2288,12 @@ mod tests {
             output, 3,
             "the effective output cap is the private reservation"
         );
-        let usage = terminal.expect("the buyer receives the capped terminal billing record");
-        assert_eq!(usage.input_tokens, 0);
+        let usage = terminal.expect("the buyer receives native usage with a capped charge");
+        usage.validate().unwrap();
+        assert_eq!(usage.input_tokens, 1);
         assert_eq!(usage.output_tokens, 3);
-        assert_eq!(usage.total_tokens, 3);
+        assert_eq!(usage.total_tokens, 4);
+        assert_eq!(usage.billable_tokens(), 3);
         let snapshot = state.capacity_snapshot(tc).unwrap().unwrap();
         assert_eq!(
             snapshot.local_delivered_after_anchor, 3,
@@ -2030,6 +2306,116 @@ mod tests {
         assert_eq!(state.delivery(tc).count.load(Ordering::Acquire), 3);
         assert!(state.delivery(tc).done.load(Ordering::Acquire));
         assert!(state.delivery(tc).billing_exhausted.load(Ordering::Acquire));
+    }
+
+    /// E2E-ROW: E2E-USAGE-14/L0
+    #[tokio::test]
+    async fn cache_usage_2132_gateway_preserves_native_counts_and_caps_only_payment() {
+        use crate::seller::{AnthropicConfig, OpenAiConfig};
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        for anthropic in [false, true] {
+            for shared in [false, true] {
+                for (grant, invalid) in [(5, false), (12, false), (5, true)] {
+                    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+                    let address = listener.local_addr().unwrap();
+                    let write = if invalid { -1 } else { 3 };
+                    let wire = if anthropic {
+                        format!("event: message_start\ndata: {}\n\nevent: content_block_delta\ndata: {}\n\nevent: message_delta\ndata: {}\n\nevent: message_stop\ndata: {{\"type\":\"message_stop\"}}\n\n",
+                            serde_json::json!({"type":"message_start","message":{"usage":{
+                                "input_tokens":0,"cache_read_input_tokens":4,"cache_creation_input_tokens":write}}}),
+                            serde_json::json!({"type":"content_block_delta","delta":{"type":"text_delta","text":"answer"}}),
+                            serde_json::json!({"type":"message_delta","usage":{"output_tokens":5}}))
+                    } else {
+                        format!(
+                            "data: {}\n\ndata: {}\n\ndata: [DONE]\n\n",
+                            serde_json::json!({"choices":[{"delta":{"content":"answer"}}]}),
+                            serde_json::json!({"choices":[],"usage":{"prompt_tokens":7,"completion_tokens":5,
+                                "total_tokens":12,"prompt_tokens_details":{"cached_tokens":4,"cache_write_tokens":write}}})
+                        )
+                    };
+                    let server = tokio::spawn(async move {
+                        let (mut socket, _) = listener.accept().await.unwrap();
+                        let mut request = vec![0; 8192];
+                        let read = socket.read(&mut request).await.unwrap();
+                        assert_ne!(read, 0, "scripted provider received no request bytes");
+                        let response = format!("HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{wire}", wire.len());
+                        socket.write_all(response.as_bytes()).await.unwrap();
+                    });
+                    let upstream = if anthropic {
+                        UpstreamConfig::Anthropic(AnthropicConfig {
+                            base_url: format!("http://{address}"),
+                            model: "scripted".into(),
+                            frame_model: "m".into(),
+                            api_key_env: "PATH".into(),
+                            tokenizer_family: "scripted".into(),
+                            max_output_tokens: Some(5),
+                            reasoning_disable: Default::default(),
+                        })
+                    } else {
+                        UpstreamConfig::OpenAi(OpenAiConfig {
+                            base_url: format!("http://{address}"),
+                            frame_model: "m".into(),
+                            api_key_env: "PATH".into(),
+                            ..Default::default()
+                        })
+                    };
+                    let state = Arc::new(GatewayState::with_upstream(upstream));
+                    let buyer = LocalNote::generate();
+                    let tc = "0:cache-usage-2132";
+                    state
+                        .register_stream(
+                            tc,
+                            buyer.pubkey(),
+                            5,
+                            subscription_state(TICK_SIZE),
+                            ordinary_shape(TICK_SIZE + 20),
+                        )
+                        .unwrap();
+                    let mut request = authorized_request(&state, &buyer, tc, 5, grant);
+                    request.get_mut().shared_budget = shared;
+                    let mut stream = GatewayService::new(state.clone())
+                        .open_stream(request)
+                        .await
+                        .unwrap()
+                        .into_inner();
+                    let mut terminal = None;
+                    let mut error = None;
+                    while let Some(item) = stream.next().await {
+                        match item {
+                            Ok(chunk) if chunk.usage.is_some() => terminal = chunk.usage,
+                            Ok(_) => {}
+                            Err(status) => error = Some(status),
+                        }
+                    }
+                    server.await.unwrap();
+                    let snapshot = state.capacity_snapshot(tc).unwrap().unwrap();
+                    if invalid {
+                        assert!(terminal.is_none());
+                        assert_eq!(error.unwrap().code(), tonic::Code::DataLoss);
+                        assert_eq!(snapshot.local_delivered_after_anchor, 0);
+                        assert_eq!(state.delivery(tc).count.load(Ordering::Acquire), 0);
+                    } else {
+                        assert!(error.is_none(), "{error:?}");
+                        let usage = terminal.unwrap();
+                        usage.validate().unwrap();
+                        assert_eq!(
+                            (usage.input_tokens, usage.output_tokens, usage.total_tokens),
+                            (7, 5, 12)
+                        );
+                        assert_eq!((usage.cache_read_tokens, usage.cache_write_tokens), (4, 3));
+                        assert_eq!(usage.billable_tokens(), grant);
+                        assert_eq!(snapshot.local_delivered_after_anchor, u128::from(grant));
+                        assert_eq!(snapshot.outstanding_reservation, 0);
+                        assert_eq!(state.delivery(tc).count.load(Ordering::Acquire), grant);
+                        assert_eq!(
+                            state.delivery(tc).billing_exhausted.load(Ordering::Acquire),
+                            grant < 12
+                        );
+                    }
+                }
+            }
+        }
     }
 
     #[tokio::test]
@@ -2506,9 +2892,10 @@ mod tests {
             .await;
             assert_eq!(rx.recv().await.unwrap().unwrap().text, "one");
             let usage = rx.recv().await.unwrap().unwrap().usage.unwrap();
-            assert_eq!(usage.input_tokens, 3);
+            assert_eq!(usage.input_tokens, input_tokens);
             assert_eq!(usage.output_tokens, 1);
-            assert_eq!(usage.total_tokens, 4);
+            assert_eq!(usage.total_tokens, input_tokens + 1);
+            assert_eq!(usage.billable_tokens(), 4);
             assert_eq!(
                 recorder.events.events(),
                 vec![AuthoritativeDeliveryEvent::Completed(
@@ -2682,6 +3069,522 @@ mod tests {
                 .iter()
                 .any(|event| matches!(event, AuthoritativeDeliveryEvent::Completed(_))));
         }
+    }
+    #[tokio::test]
+    async fn shared_budget_2091_preserves_full_usage_and_a_zero_charge_answer() {
+        let state = GatewayState::new();
+        let tc = "0:shared-zero-charge";
+        state
+            .register_stream(
+                tc,
+                buyer_pubkey(),
+                u64::MAX,
+                subscription_state(TICK_SIZE),
+                ordinary_shape(TICK_SIZE + 2),
+            )
+            .unwrap();
+        let first = state
+            .capacity
+            .admit_shared(
+                &tc.to_string(),
+                2,
+                dexdo_core::params::SELLER_MAX_CONCURRENT_REQUESTS_PER_DEAL,
+            )
+            .unwrap();
+        let second = state
+            .capacity
+            .admit_shared(
+                &tc.to_string(),
+                2,
+                dexdo_core::params::SELLER_MAX_CONCURRENT_REQUESTS_PER_DEAL,
+            )
+            .unwrap();
+        for (index, reservation) in [first, second].into_iter().enumerate() {
+            let (up_tx, up_rx) = mpsc::channel(2);
+            let (tx, mut rx) = mpsc::channel(2);
+            up_tx
+                .send(Ok(UpstreamEvent::Chunk(CanonChunk {
+                    text: "full answer".into(),
+                    ..Default::default()
+                })))
+                .await
+                .unwrap();
+            up_tx
+                .send(Ok(UpstreamEvent::Usage(
+                    BillingUsage::new(2, 1, None).unwrap(),
+                )))
+                .await
+                .unwrap();
+            drop(up_tx);
+            relay_counting_with_chain_availability(
+                up_rx,
+                tx,
+                CapacityDeliveryRecorder {
+                    reservation,
+                    delivery: state.delivery(tc),
+                },
+                None,
+                None,
+                2,
+                2,
+                false,
+            )
+            .await;
+            assert_eq!(rx.recv().await.unwrap().unwrap().text, "full answer");
+            let usage = rx.recv().await.unwrap().unwrap().usage.unwrap();
+            assert_eq!(usage.total_tokens, 3);
+            assert_eq!(usage.billable_tokens(), if index == 0 { 2 } else { 0 });
+            assert!(rx.recv().await.is_none());
+            assert_eq!(state.delivery(tc).done.load(Ordering::Acquire), index == 1);
+        }
+        assert_eq!(state.delivery(tc).count.load(Ordering::Acquire), 2);
+        assert_eq!(state.active_requests(tc), 0);
+    }
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn shared_budget_2091_overrun_closes_admission_before_draining() {
+        for finish in [
+            AuthoritativeDeliveryEvent::Completed(NonZeroU64::MIN),
+            AuthoritativeDeliveryEvent::Finished(AuthoritativeDeliveryFinish::Interrupted),
+            AuthoritativeDeliveryEvent::Finished(AuthoritativeDeliveryFinish::AmbiguousUsage),
+        ] {
+            let expected_charge = if matches!(finish, AuthoritativeDeliveryEvent::Completed(_)) {
+                2
+            } else {
+                1
+            };
+            let state = Arc::new(GatewayState::new());
+            let buyer = LocalNote::generate();
+            let tc = "0:shared-overrun-drain";
+            state
+                .register_stream(
+                    tc,
+                    buyer.pubkey(),
+                    u64::MAX,
+                    subscription_state(TICK_SIZE),
+                    ordinary_shape(4 * TICK_SIZE),
+                )
+                .unwrap();
+            let limit = dexdo_core::params::SELLER_MAX_CONCURRENT_REQUESTS_PER_DEAL;
+            let first = state.capacity.admit_shared(&tc.into(), 1, limit).unwrap();
+            let second = state.capacity.admit_shared(&tc.into(), 16, limit).unwrap();
+            let delivery = state.delivery(tc);
+            let (up_tx, up_rx) = mpsc::channel(2);
+            let (tx, mut rx) = mpsc::channel(2);
+            up_tx
+                .send(Ok(UpstreamEvent::Chunk(CanonChunk {
+                    text: "full answer".into(),
+                    ..Default::default()
+                })))
+                .await
+                .unwrap();
+            up_tx
+                .send(Ok(UpstreamEvent::Usage(
+                    BillingUsage::new(1, 1, None).unwrap(),
+                )))
+                .await
+                .unwrap();
+            drop(up_tx);
+            relay_counting_with_chain_availability(
+                up_rx,
+                tx,
+                CapacityDeliveryRecorder {
+                    reservation: first,
+                    delivery: delivery.clone(),
+                },
+                None,
+                None,
+                1,
+                1,
+                false,
+            )
+            .await;
+            assert_eq!(rx.recv().await.unwrap().unwrap().text, "full answer");
+            assert_eq!(
+                rx.recv()
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .usage
+                    .unwrap()
+                    .charged_tokens,
+                Some(1)
+            );
+            assert!(delivery.billing_exhausted.load(Ordering::Acquire));
+            assert!(!delivery.done.load(Ordering::Acquire));
+            assert_eq!(state.active_requests(tc), 1);
+            assert!(
+                state
+                    .capacity_snapshot(tc)
+                    .unwrap()
+                    .unwrap()
+                    .available()
+                    .unwrap()
+                    > 0
+            );
+
+            let service = GatewayService::new(state.clone());
+            // A slot and paid capacity remain, but neither protocol may enter a draining deal.
+            for shared in [true, false] {
+                let mut request = authorized_request(&state, &buyer, tc, 1, 100).into_inner();
+                request.shared_budget = shared;
+                let error = service
+                    .open_stream(Request::new(request))
+                    .await
+                    .err()
+                    .expect("an overrun must stop new work before draining accepted work");
+                assert_eq!(error.code(), tonic::Code::ResourceExhausted);
+            }
+            let barrier = Arc::new(tokio::sync::Barrier::new(2));
+            let finish_barrier = barrier.clone();
+            let finish_delivery = delivery.clone();
+            let task = tokio::spawn(async move {
+                finish_barrier.wait().await;
+                CapacityDeliveryRecorder {
+                    reservation: second,
+                    delivery: finish_delivery,
+                }
+                .record_authoritative_delivery(finish)
+                .unwrap();
+            });
+            let mut request = authorized_request(&state, &buyer, tc, 1, 100).into_inner();
+            request.shared_budget = true;
+            barrier.wait().await;
+            assert_eq!(
+                service
+                    .open_stream(Request::new(request))
+                    .await
+                    .err()
+                    .unwrap()
+                    .code(),
+                tonic::Code::ResourceExhausted
+            );
+            task.await.unwrap();
+            assert!(delivery.done.load(Ordering::Acquire));
+            assert_eq!(state.active_requests(tc), 0);
+            assert_eq!(delivery.count.load(Ordering::Acquire), expected_charge);
+            // A normal terminal, a cancellation and ambiguous usage must all preserve the closure.
+            for shared in [true, false] {
+                let mut request = authorized_request(&state, &buyer, tc, 1, 100).into_inner();
+                request.shared_budget = shared;
+                assert_eq!(
+                    service
+                        .open_stream(Request::new(request))
+                        .await
+                        .err()
+                        .unwrap()
+                        .code(),
+                    tonic::Code::ResourceExhausted
+                );
+            }
+            assert!(
+                state
+                    .capacity_snapshot(tc)
+                    .unwrap()
+                    .unwrap()
+                    .available()
+                    .unwrap()
+                    > 0
+            );
+        }
+    }
+    #[tokio::test]
+    async fn shared_budget_2091_gateway_enforces_configuration_and_legacy_cannot_bypass_it() {
+        for count in [1_u32, 4] {
+            let state = Arc::new(GatewayState::new());
+            let buyer = LocalNote::generate();
+            let limit = std::num::NonZeroU32::new(count).unwrap();
+            state.set_max_concurrent_requests_per_deal(limit);
+            let tc = "0:shared-limit";
+            state
+                .register_stream(
+                    tc,
+                    buyer.pubkey(),
+                    u64::MAX,
+                    subscription_state(TICK_SIZE),
+                    ordinary_shape(2 * TICK_SIZE),
+                )
+                .unwrap();
+            let service = GatewayService::new(state.clone());
+            // Keep each real gateway response open beyond its bounded channel capacity. The
+            // terminal cannot commit until we read, so all configured slots stay occupied.
+            let output = u32::try_from(GATEWAY_CLIENT_CHANNEL_CAPACITY + 1).unwrap();
+            let mut requests = Vec::new();
+            for _ in 0..count {
+                let mut request = authorized_request(&state, &buyer, tc, output, 100).into_inner();
+                request.shared_budget = true;
+                requests.push(
+                    service
+                        .open_stream(Request::new(request))
+                        .await
+                        .unwrap()
+                        .into_inner(),
+                );
+            }
+            assert_eq!(state.active_requests(tc), count);
+            for shared in [true, false] {
+                let mut request = authorized_request(&state, &buyer, tc, 1, 100).into_inner();
+                request.shared_budget = shared;
+                let error = service
+                    .open_stream(Request::new(request))
+                    .await
+                    .err()
+                    .expect("full deal must reject before upstream");
+                assert_eq!(error.code(), tonic::Code::ResourceExhausted);
+            }
+            for mut request in requests {
+                let mut terminal = None;
+                while let Some(chunk) = request.next().await {
+                    terminal = chunk.unwrap().usage.or(terminal);
+                }
+                assert_eq!(terminal.unwrap().billable_tokens(), u64::from(output));
+            }
+            assert_eq!(state.active_requests(tc), 0);
+            let legacy = state
+                .capacity
+                .reserve_exclusive(&tc.to_string(), 100)
+                .unwrap();
+            let mut request = authorized_request(&state, &buyer, tc, 1, 100).into_inner();
+            request.shared_budget = true;
+            assert_eq!(
+                service
+                    .open_stream(Request::new(request))
+                    .await
+                    .err()
+                    .unwrap()
+                    .code(),
+                tonic::Code::ResourceExhausted
+            );
+            assert!(state
+                .capacity
+                .reserve_exclusive(&tc.to_string(), 100)
+                .is_err());
+            legacy.finish_exact().unwrap();
+        }
+    }
+    #[tokio::test]
+    async fn shared_budget_2155_gateway_reuses_the_deal_after_repeated_interruptions() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        for failure in [
+            "before_output",
+            "provider_error",
+            "missing_usage",
+            "disconnect",
+        ] {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let address = listener.local_addr().unwrap();
+            let release = Arc::new(tokio::sync::Notify::new());
+            let provider_release = release.clone();
+            let provider = tokio::spawn(async move {
+                for attempt in 0..6 {
+                    let (mut socket, _) = listener.accept().await.unwrap();
+                    let mut request = Vec::new();
+                    let mut buffer = [0_u8; 4096];
+                    loop {
+                        let read = socket.read(&mut buffer).await.unwrap();
+                        assert_ne!(read, 0, "provider request must be complete");
+                        request.extend_from_slice(&buffer[..read]);
+                        let Some(end) = request.windows(4).position(|part| part == b"\r\n\r\n")
+                        else {
+                            continue;
+                        };
+                        let headers = std::str::from_utf8(&request[..end]).unwrap();
+                        let length = headers
+                            .lines()
+                            .find_map(|line| {
+                                let (name, value) = line.split_once(':')?;
+                                name.eq_ignore_ascii_case("content-length")
+                                    .then(|| value.trim().parse::<usize>().unwrap())
+                            })
+                            .unwrap();
+                        if request.len() >= end + 4 + length {
+                            break;
+                        }
+                    }
+                    let clean = attempt == 0 || attempt >= 4;
+                    let prefix = if !clean && failure == "before_output" {
+                        ""
+                    } else {
+                        "data: {\"choices\":[{\"delta\":{\"content\":\"answer\"}}]}\n\n"
+                    };
+                    let suffix = if clean {
+                        "data: {\"choices\":[],\"usage\":{\"prompt_tokens\":2,\"completion_tokens\":1,\"total_tokens\":3}}\n\ndata: [DONE]\n\n"
+                    } else if failure == "provider_error" {
+                        "data: {\"error\":{\"message\":\"scripted provider failure\",\"type\":\"server_error\"}}\n\n"
+                    } else if failure == "disconnect" {
+                        // The relay still observes the upstream after the receiver disappears.
+                        // Charging this cut-off request remains outside this PR.
+                        "data: {\"choices\":[{\"delta\":{\"content\":\"tail\"}}]}\n\ndata: [DONE]\n\n"
+                    } else {
+                        "data: [DONE]\n\n"
+                    };
+                    let header = format!("HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\ncontent-length: {}\r\nconnection: close\r\n\r\n", prefix.len() + suffix.len());
+                    socket.write_all(header.as_bytes()).await.unwrap();
+                    socket.write_all(prefix.as_bytes()).await.unwrap();
+                    if !clean && failure == "disconnect" {
+                        provider_release.notified().await;
+                    }
+                    socket.write_all(suffix.as_bytes()).await.unwrap();
+                }
+            });
+            let state = Arc::new(GatewayState::with_upstream(UpstreamConfig::OpenAi(
+                crate::seller::OpenAiConfig {
+                    base_url: format!("http://{address}"),
+                    api_key_env: "PATH".into(),
+                    ..Default::default()
+                },
+            )));
+            state.set_max_concurrent_requests_per_deal(std::num::NonZeroU32::MIN);
+            let buyer = LocalNote::generate();
+            let tc = "0:shared-2155-gateway";
+            state
+                .register_stream(
+                    tc,
+                    buyer.pubkey(),
+                    u64::MAX,
+                    subscription_state(TICK_SIZE),
+                    ordinary_shape(TICK_SIZE + 9),
+                )
+                .unwrap();
+            let service = GatewayService::new(state.clone());
+            let mut charged = 0;
+            for attempt in 0..6 {
+                let clean = attempt == 0 || attempt >= 4;
+                let mut request = authorized_request(&state, &buyer, tc, 3, 100).into_inner();
+                request.shared_budget = true;
+                let mut response = service
+                    .open_stream(Request::new(request))
+                    .await
+                    .unwrap()
+                    .into_inner();
+                if !clean && failure == "disconnect" {
+                    assert_eq!(response.next().await.unwrap().unwrap().text, "answer");
+                    drop(response);
+                    assert_eq!(state.active_requests(tc), 1);
+                    let mut blocked = authorized_request(&state, &buyer, tc, 3, 100).into_inner();
+                    blocked.shared_budget = true;
+                    assert_eq!(
+                        service
+                            .open_stream(Request::new(blocked))
+                            .await
+                            .err()
+                            .unwrap()
+                            .code(),
+                        tonic::Code::ResourceExhausted
+                    );
+                    release.notify_one();
+                } else {
+                    let mut terminal = None;
+                    let mut error = false;
+                    while let Some(chunk) = response.next().await {
+                        match chunk {
+                            Ok(chunk) => {
+                                terminal = chunk.usage.or(terminal);
+                            }
+                            Err(_) => {
+                                error = true;
+                            }
+                        }
+                    }
+                    if clean {
+                        assert!(!error, "{failure}: clean request failed");
+                        assert_eq!(terminal.unwrap().billable_tokens(), 3);
+                        charged += 3;
+                    } else {
+                        assert!(error, "{failure}: interrupted request must report failure");
+                        assert!(terminal.is_none());
+                    }
+                }
+                tokio::time::timeout(std::time::Duration::from_secs(5), async {
+                    while state.active_requests(tc) != 0 {
+                        tokio::task::yield_now().await;
+                    }
+                })
+                .await
+                .expect("upstream drain must release the live slot");
+                let snapshot = state.capacity_snapshot(tc).unwrap().unwrap();
+                assert_eq!(snapshot.local_delivered_after_anchor, charged);
+                assert_eq!(snapshot.outstanding_reservation, 0);
+                assert_eq!(snapshot.available().unwrap(), 9 - charged);
+                assert_eq!(
+                    u128::from(state.delivery(tc).count.load(Ordering::Acquire)),
+                    charged
+                );
+                assert!(!state.delivery(tc).done.load(Ordering::Acquire));
+            }
+            let mut exhausted = authorized_request(&state, &buyer, tc, 1, 100).into_inner();
+            exhausted.shared_budget = true;
+            assert_eq!(
+                service
+                    .open_stream(Request::new(exhausted))
+                    .await
+                    .err()
+                    .unwrap()
+                    .code(),
+                tonic::Code::ResourceExhausted
+            );
+            provider.await.unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn shared_budget_2091_disconnect_holds_the_slot_until_upstream_really_ends() {
+        let state = Arc::new(GatewayState::new());
+        let tc = "0:shared-drain".to_string();
+        state
+            .register_stream(
+                &tc,
+                buyer_pubkey(),
+                u64::MAX,
+                subscription_state(TICK_SIZE),
+                ordinary_shape(2 * TICK_SIZE),
+            )
+            .unwrap();
+        let one = std::num::NonZeroU32::MIN;
+        let reservation = state.capacity.admit_shared(&tc, 100, one).unwrap();
+        let (up_tx, up_rx) = mpsc::channel(1);
+        let (tx, rx) = mpsc::channel(1);
+        drop(rx);
+        let delivery = state.delivery(&tc);
+        let relay = tokio::spawn(relay_counting_with_chain_availability(
+            up_rx,
+            tx,
+            CapacityDeliveryRecorder {
+                reservation,
+                delivery,
+            },
+            None,
+            None,
+            100,
+            100,
+            false,
+        ));
+        // With a one-event channel, all three sends can finish only if the relay keeps
+        // consuming the real upstream after discovering that the client disappeared.
+        for seq in 0..3 {
+            up_tx
+                .send(Ok(UpstreamEvent::Chunk(CanonChunk {
+                    text: "provider work".into(),
+                    seq,
+                    ..Default::default()
+                })))
+                .await
+                .expect("upstream must remain observed through completion");
+        }
+        assert_eq!(state.active_requests(&tc), 1);
+        assert!(matches!(
+            state.capacity.admit_shared(&tc, 100, one),
+            Err(ReserveError::Concurrency)
+        ));
+        drop(up_tx);
+        relay.await.unwrap();
+        assert_eq!(state.active_requests(&tc), 0);
+        state
+            .capacity
+            .admit_shared(&tc, 100, one)
+            .unwrap()
+            .finish_exact()
+            .unwrap();
     }
 }
 

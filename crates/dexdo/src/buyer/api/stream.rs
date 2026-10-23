@@ -9,8 +9,37 @@ pub(super) enum CanonStreamError {
 }
 
 impl CanonStreamError {
+    pub(super) fn policy_action(&self, received: u64) -> super::StreamErrorPolicyAction {
+        if let Self::Upstream(status) = self {
+            if let Some(started) = dexdo_proto::upstream_output_started(status) {
+                return if started || received > 0 {
+                    super::StreamErrorPolicyAction::ReconcileUsage
+                } else {
+                    super::StreamErrorPolicyAction::RequestScoped
+                };
+            }
+        }
+        if received == 0 && self.is_retryable_upstream() {
+            super::StreamErrorPolicyAction::RequestScoped
+        } else {
+            super::stream_error_policy_action(self.policy_message(), received)
+        }
+    }
+
+    pub(super) fn is_retryable_upstream(&self) -> bool {
+        matches!(self, Self::Upstream(status) if dexdo_proto::is_retryable_upstream(status))
+    }
+
+    pub(super) fn retryable_rejection(&self) -> super::ConsumerError {
+        super::ConsumerError::new(
+            super::ConsumerErrorCode::UpstreamRetryable,
+            format!("temporary provider failure; retry this request on the same deal: {self}"),
+        )
+    }
+
     pub(super) fn is_capacity(&self) -> bool {
-        matches!(self, Self::Upstream(status) if status.code() == tonic::Code::ResourceExhausted)
+        matches!(self, Self::Upstream(status) if status.code() == tonic::Code::ResourceExhausted
+            && dexdo_proto::upstream_output_started(status).is_none())
     }
 
     pub(super) fn policy_message(&self) -> &str {
@@ -138,11 +167,12 @@ impl CanonStreamDriver {
                     if let Err(error) = usage.validate() {
                         return CanonStreamNext::Errored(error.to_string().into());
                     }
-                    if usage.total_tokens > self.billing_grant {
+                    if usage.billable_tokens() > self.billing_grant {
                         return CanonStreamNext::Errored(
                             format!(
                                 "terminal billable usage {} exceeds billing grant {}",
-                                usage.total_tokens, self.billing_grant
+                                usage.billable_tokens(),
+                                self.billing_grant
                             )
                             .into(),
                         );

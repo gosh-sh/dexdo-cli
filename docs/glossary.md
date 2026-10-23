@@ -340,20 +340,39 @@ consequences.
 
 The crash-safe process for resuming an interrupted PrivateNote deployment from
 its recovery file and folding the recovered note into its pool. The dedicated
-command is `dexdo note recover`. This process is distinct from deal recovery
+command is `dexdo note recover --recovery <file> [--pool <path>]`. It continues
+an already submitted voucher payment, automatically reproves after a confirmed
+proof rejection or expired history, and validates the note owner before recording
+it. It never makes another wallet payment. An unspent owner-only file must continue
+through `note deploy`; unavailable historical data still prevents recovery.
+This process is distinct from deal recovery
 with [`dexdo recover`](#recover--dexdo-recover).
 
 ### Probe
 
 The first trial tick in a deal. After the 180-second probe window, the seller
-may call `acceptProbe()`. A buyer that receives no response or output during
-the window stops instead; otherwise buyer silence permits seller acceptance.
-Suspected substitution or fraud belongs to the [dispute](#dispute) path.
-Acceptance atomically credits and pays exactly one tick, starts delivery
-accounting, and starts the subscription term when applicable. Before
-acceptance, a buyer STOP burns the probe on both sides. Exact-model checks
-remain client-side verification, not a cryptographic guarantee by the on-chain
-contract.
+may call `acceptProbe()`. The `dexdo seller` client calls it only once the
+buyer's first request has returned billable usage, so buyer silence without a
+request earns the seller nothing. A buyer that receives no response or output
+may stop instead. Suspected substitution or fraud belongs to the
+[dispute](#dispute) path. Acceptance atomically credits and pays exactly one
+tick, starts delivery accounting, and starts the subscription term when
+applicable. Exact-model checks remain client-side verification, not a
+cryptographic guarantee by the on-chain contract.
+
+A deal that is opened but never used stays in the probe state with no time
+limit. This is the intended behavior: the buyer's deposit and bond and the
+seller's bond stay locked in the deal until one side stops it. Closing the
+buyer process without sending a request leaves the deal open. Before
+acceptance:
+
+- a buyer STOP, whether typed by hand or sent by the buyer's failure policy,
+  burns the buyer's probe price `P` and `P` from the seller bond; the rest of
+  the escrow, the whole buyer bond and the rest of the seller bond are
+  returned ([`ProbeBurned`](#probeburned));
+- a seller stop (`dexdo close` on the seller's deal handle) burns `P` from the
+  seller bond; the buyer gets the probe, the escrow and the bond back, and the
+  seller gets the rest of its bond.
 
 ### ProbeBurned
 

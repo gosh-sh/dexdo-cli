@@ -26,6 +26,8 @@ fn refusal_seller_args(
     policy: std::path::PathBuf,
 ) -> crate::cli::args::SellerArgs {
     crate::cli::args::SellerArgs {
+        max_concurrent_requests_per_deal:
+            dexdo_core::params::SELLER_MAX_CONCURRENT_REQUESTS_PER_DEAL,
         mock: crate::cli::args::MockFlags {
             mock_model: true,
             mock_chain: true,
@@ -61,7 +63,10 @@ fn refusal_seller_args(
 async fn startup_above_max_serves_the_paid_candidate_before_funding_any_residual() {
     let root = tempfile::tempdir().expect(" regression directory");
     let seller_seed = [0x14; 32];
-    crate::cli::support::write_owner_only_key_fixture(&root.path().join("seller.key"), &hex::encode(seller_seed));
+    crate::cli::support::write_owner_only_key_fixture(
+        &root.path().join("seller.key"),
+        &hex::encode(seller_seed),
+    );
     let seller_note = Arc::new(
         dexdo_core::NoteTree::from_secret_hex(&hex::encode(seller_seed))
             .unwrap()

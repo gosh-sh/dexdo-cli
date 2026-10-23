@@ -14,13 +14,14 @@
 
 use super::{
     annotate_seller_config_fault, resolve_model_output_cap, StartupCapabilityRequirements,
-    UpstreamEvent,
+    ThinkingRequest, UpstreamEvent,
 };
 use crate::seller::models::{Capabilities, ModelConfig};
 use dexdo_core::params::{
-    SampleAlgorithm, SellerLivenessParams, REFERENCE_SAMPLE_SEED, REFERENCE_TOP_K,
-    UPSTREAM_ERROR_BODY_MAX_BYTES, UPSTREAM_ERROR_DETAIL_MAX_BYTES,
-    UPSTREAM_ERROR_ECHO_PREFIX_CHARS, UPSTREAM_SSE_FRAME_MAX_BYTES,
+    ReasoningDisableControl, SampleAlgorithm, SellerLivenessParams, REFERENCE_SAMPLE_SEED,
+    REFERENCE_TOP_K, UPSTREAM_ERROR_BODY_MAX_BYTES, UPSTREAM_ERROR_DETAIL_MAX_BYTES,
+    UPSTREAM_ERROR_ECHO_PREFIX_CHARS, UPSTREAM_RETRY_BACKOFF_MULTIPLIER,
+    UPSTREAM_RETRY_INITIAL_BACKOFF, UPSTREAM_RETRY_MAX_BACKOFF, UPSTREAM_SSE_FRAME_MAX_BYTES,
 };
 use dexdo_proto::{BillingUsage, CanonChunk, CanonRequest, SignalManifest};
 use serde::{Deserialize, Serialize};
@@ -93,6 +94,7 @@ impl Default for OpenAiConfig {
                 max_output_tokens: Some(DEFAULT_MAX_OUTPUT_TOKENS),
                 // The built-in demo is a known Groq profile, not an unfamiliar config entry.
                 sample_algorithm: SampleAlgorithm::Seed,
+                ..Default::default()
             },
             identity_aliases: Vec::new(),
         }
@@ -130,6 +132,8 @@ pub fn api_key(env_name: &str) -> Option<String> {
 #[derive(Serialize)]
 struct ChatRequest<'a> {
     model: &'a str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    prompt_cache_key: Option<String>,
     messages: Vec<WireMessage>,
     stream: bool,
     /// the terminal `usage` record is the ONLY billing authority, and an OpenAI-compatible endpoint
@@ -153,6 +157,14 @@ struct ChatRequest<'a> {
     sample_algorithm: Option<SampleAlgorithm>,
     #[serde(skip_serializing_if = "Option::is_none")]
     reasoning: Option<ReasoningRequest>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    chat_template_kwargs: Option<ChatTemplateReasoning>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    reasoning_effort: Option<&'static str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    thinking: Option<ThinkingRequest>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    provider: Option<ProviderRequirements>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     tools: Vec<CapabilityToolDefinition>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -161,8 +173,25 @@ struct ChatRequest<'a> {
 
 #[derive(Serialize)]
 struct ReasoningRequest {
-    enabled: bool,
-    exclude: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    enabled: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    exclude: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    effort: Option<&'static str>,
+}
+
+#[derive(Serialize)]
+struct ChatTemplateReasoning {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    enable_thinking: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    thinking: Option<bool>,
+}
+
+#[derive(Serialize)]
+struct ProviderRequirements {
+    require_parameters: bool,
 }
 
 const CAPABILITY_TOOL_NAME: &str = "dexdo_capability_probe";
@@ -306,8 +335,25 @@ fn build_request_with_startup_capabilities<'a>(
         .max(1);
     let probe_tools = requirements.is_some_and(|requirements| requirements.tools);
     let probe_thinking = requirements.is_some_and(|requirements| requirements.think);
+    let disable_reasoning = req.params.as_ref().is_some_and(|p| p.disable_reasoning);
+    let effort = req
+        .params
+        .as_ref()
+        .and_then(|p| p.reasoning_effort.as_deref())
+        .and_then(dexdo_core::params::ReasoningEffort::parse);
+    let effort_control = cfg
+        .capabilities
+        .reasoning_effort
+        .as_ref()
+        .map(|cfg| cfg.control);
+    let control = if disable_reasoning {
+        cfg.capabilities.reasoning_disable
+    } else {
+        ReasoningDisableControl::Unsupported
+    };
     ChatRequest {
         model: &cfg.model,
+        prompt_cache_key: req.prompt_cache_key.clone(),
         messages,
         stream: true,
         stream_options: StreamOptions {
@@ -321,10 +367,59 @@ fn build_request_with_startup_capabilities<'a>(
             .then_some(REFERENCE_SAMPLE_SEED),
         top_k: (sample_algorithm == Some(SampleAlgorithm::TopK)).then_some(REFERENCE_TOP_K),
         sample_algorithm,
-        reasoning: (probe_thinking || openrouter_qwen_reasoning(cfg)).then_some(ReasoningRequest {
-            enabled: true,
-            exclude: false,
-        }),
+        reasoning: if let Some(effort) = effort.filter(|_| {
+            effort_control
+                == Some(dexdo_core::params::ReasoningEffortControl::ReasoningEffortNested)
+        }) {
+            Some(ReasoningRequest {
+                enabled: None,
+                exclude: None,
+                effort: Some(effort.as_str()),
+            })
+        } else if control == ReasoningDisableControl::OpenRouter {
+            Some(ReasoningRequest {
+                enabled: Some(false),
+                exclude: Some(false),
+                effort: None,
+            })
+        } else {
+            (effort.is_none()
+                && !disable_reasoning
+                && (probe_thinking || openrouter_qwen_reasoning(cfg)))
+            .then_some(ReasoningRequest {
+                enabled: Some(true),
+                exclude: Some(false),
+                effort: None,
+            })
+        },
+        chat_template_kwargs: match control {
+            ReasoningDisableControl::ChatTemplate => Some(ChatTemplateReasoning {
+                enable_thinking: Some(false),
+                thinking: None,
+            }),
+            ReasoningDisableControl::ChatTemplateThinking => Some(ChatTemplateReasoning {
+                enable_thinking: None,
+                thinking: Some(false),
+            }),
+            _ => None,
+        },
+        reasoning_effort: if control == ReasoningDisableControl::ReasoningEffort {
+            Some("none")
+        } else {
+            effort
+                .filter(|_| {
+                    effort_control
+                        == Some(dexdo_core::params::ReasoningEffortControl::ReasoningEffort)
+                })
+                .map(|effort| effort.as_str())
+        },
+        thinking: (control == ReasoningDisableControl::ThinkingDisabled)
+            .then_some(ThinkingRequest::Disabled),
+        provider: (control == ReasoningDisableControl::OpenRouter).then_some(
+            ProviderRequirements {
+                require_parameters: true,
+            },
+        ),
         tools: if probe_tools {
             vec![CapabilityToolDefinition {
                 kind: "function",
@@ -371,18 +466,18 @@ pub async fn run(
     req: Option<CanonRequest>,
     tx: mpsc::Sender<Result<UpstreamEvent, Status>>,
 ) {
-    run_with_startup_capabilities(cfg, market, None, count, req, tx).await
+    run_with_startup_capabilities(cfg, market, None, count, req, tx, true).await
 }
 
-pub(super) async fn run_startup_probe(
+pub(super) async fn run_probe(
     cfg: &OpenAiConfig,
     market: Option<&str>,
-    requirements: StartupCapabilityRequirements,
+    requirements: Option<StartupCapabilityRequirements>,
     count: u64,
     req: Option<CanonRequest>,
     tx: mpsc::Sender<Result<UpstreamEvent, Status>>,
 ) {
-    run_with_startup_capabilities(cfg, market, Some(requirements), count, req, tx).await
+    run_with_startup_capabilities(cfg, market, requirements, count, req, tx, false).await
 }
 
 async fn run_with_startup_capabilities(
@@ -392,6 +487,7 @@ async fn run_with_startup_capabilities(
     count: u64,
     req: Option<CanonRequest>,
     tx: mpsc::Sender<Result<UpstreamEvent, Status>>,
+    retry_throttling: bool,
 ) {
     if count == 0 {
         return;
@@ -407,25 +503,29 @@ async fn run_with_startup_capabilities(
     ) {
         Ok(cap) => cap,
         Err(status) => {
-            let _ = tx.send(Err(status)).await;
+            let _ = super::send_event(&tx, Err(status)).await;
             return;
         }
     };
     let Some(key) = api_key(&cfg.api_key_env) else {
-        let _ = tx
-            .send(Err(Status::failed_precondition(format!(
+        let _ = super::send_event(
+            &tx,
+            Err(Status::failed_precondition(format!(
                 "real upstream key absent ({})",
                 cfg.api_key_env
-            ))))
-            .await;
+            ))),
+        )
+        .await;
         return;
     };
     let Some(req) = req else {
-        let _ = tx
-            .send(Err(Status::invalid_argument(
+        let _ = super::send_event(
+            &tx,
+            Err(Status::invalid_argument(
                 "real upstream requires a canonical request",
-            )))
-            .await;
+            )),
+        )
+        .await;
         return;
     };
 
@@ -435,6 +535,7 @@ async fn run_with_startup_capabilities(
             market,
             requirements,
             count,
+            retry_throttling,
             tx: &tx,
         },
         &key,
@@ -444,7 +545,7 @@ async fn run_with_startup_capabilities(
     .await
     {
         // Send the error into the channel (if the buyer is still listening) -- without leaking the key into the text.
-        let _ = tx.send(Err(*status)).await;
+        let _ = super::send_event(&tx, Err(*status)).await;
     }
 }
 
@@ -467,7 +568,7 @@ fn retryable_provider_status(status: reqwest::StatusCode) -> bool {
 /// A transport that did not produce a response, or whose body decoder died, did not answer.
 /// Invalid request construction and redirect policy are local/configuration answers and stay
 /// terminal rather than being repeated.
-fn retryable_transport_error(error: &reqwest::Error) -> bool {
+pub(super) fn retryable_transport_error(error: &reqwest::Error) -> bool {
     !error.is_builder()
         && !error.is_redirect()
         && (error.is_connect()
@@ -478,7 +579,7 @@ fn retryable_transport_error(error: &reqwest::Error) -> bool {
 }
 
 /// Read both legal `Retry-After` forms: delta-seconds and an HTTP date. An invalid header is not an
-/// instruction, so the caller falls back to the seller's canonical supervision cadence.
+/// instruction, so the caller falls back to exponential backoff with full jitter.
 fn retry_after_delay(headers: &reqwest::header::HeaderMap) -> Option<Duration> {
     let value = headers.get(reqwest::header::RETRY_AFTER)?.to_str().ok()?;
     if let Ok(seconds) = value.parse::<u64>() {
@@ -503,22 +604,39 @@ struct OpenAiStreamContext<'a> {
     market: Option<&'a str>,
     requirements: Option<StartupCapabilityRequirements>,
     count: u64,
+    retry_throttling: bool,
     tx: &'a mpsc::Sender<Result<UpstreamEvent, Status>>,
 }
 
-/// Wait exactly as long as the provider requested, or use the already-canonical seller health
-/// cadence when it gave no usable instruction. The whole pre-output retry phase is bounded by the
+fn retry_delay(
+    retry_after: Option<Duration>,
+    backoff: &mut Duration,
+    rng: &mut impl rand::Rng,
+) -> Duration {
+    retry_after.unwrap_or_else(|| {
+        let delay = rng.gen_range(Duration::ZERO..=*backoff);
+        *backoff = backoff
+            .saturating_mul(UPSTREAM_RETRY_BACKOFF_MULTIPLIER)
+            .min(UPSTREAM_RETRY_MAX_BACKOFF);
+        delay
+    })
+}
+
+/// Wait exactly as long as the provider requested, or use exponential backoff with full jitter
+/// when it gave no usable instruction. The whole pre-output retry phase is bounded by the
 /// existing seller supervision cycle; the buyer closing its stream is an earlier domain bound.
 async fn wait_for_retry(
     failure: Status,
     retry_after: Option<Duration>,
+    backoff: &mut Duration,
     retry_deadline: tokio::time::Instant,
     tx: &mpsc::Sender<Result<UpstreamEvent, Status>>,
+    retry_throttling: bool,
 ) -> Result<RetryStep, Box<Status>> {
-    let timing = SellerLivenessParams::canonical();
-    let delay = retry_after.unwrap_or(timing.health_interval);
+    let failure = dexdo_proto::retryable_upstream_status(failure);
+    let delay = retry_delay(retry_after, backoff, &mut rand::thread_rng());
     let remaining = retry_deadline.saturating_duration_since(tokio::time::Instant::now());
-    if remaining.is_zero() || delay >= remaining {
+    if !retry_throttling || remaining.is_zero() || delay >= remaining {
         // Never retry before `Retry-After`, and never sleep past the domain's supervision cycle.
         return Err(Box::new(failure));
     }
@@ -551,6 +669,7 @@ async fn stream_upstream(
             market,
             requirements: None,
             count,
+            retry_throttling: true,
             tx,
         },
         key,
@@ -573,6 +692,9 @@ async fn stream_upstream_with_startup_capabilities(
         tx,
         ..
     } = context;
+    cfg.capabilities
+        .validate_reasoning(req.params.as_ref())
+        .map_err(Box::new)?;
     let url = format!("{}/chat/completions", cfg.base_url.trim_end_matches('/'));
     let body =
         build_request_with_startup_capabilities(cfg, req, count, model_output_cap, requirements);
@@ -583,9 +705,15 @@ async fn stream_upstream_with_startup_capabilities(
     // this retry deadline no longer applies; the buyer stream itself owns the remaining lifetime.
     let retry_deadline =
         tokio::time::Instant::now() + SellerLivenessParams::canonical().health_cycle_timeout;
+    let mut retry_backoff = UPSTREAM_RETRY_INITIAL_BACKOFF;
 
     'attempt: loop {
-        let send = client.post(&url).bearer_auth(key).json(&body).send();
+        crate::telemetry::attempt(None);
+        let mut request = client.post(&url).bearer_auth(key).json(&body);
+        if let Some(session_id) = &req.session_id {
+            request = request.header("session_id", session_id.as_str());
+        }
+        let send = request.send();
         let response = tokio::select! {
             _ = tx.closed() => return Ok(()),
             response = tokio::time::timeout_at(retry_deadline, send) => response,
@@ -594,7 +722,9 @@ async fn stream_upstream_with_startup_capabilities(
             Ok(Ok(resp)) => resp,
             Ok(Err(error)) if retryable_transport_error(&error) => {
                 let failure = Status::unavailable(format!("upstream connect failed: {error}"));
-                match wait_for_retry(failure, None, retry_deadline, tx).await? {
+                match wait_for_retry(failure, None, &mut retry_backoff, retry_deadline, tx, true)
+                    .await?
+                {
                     RetryStep::Retry => continue 'attempt,
                     RetryStep::BuyerGone => return Ok(()),
                 }
@@ -605,16 +735,28 @@ async fn stream_upstream_with_startup_capabilities(
                 ))))
             }
             Err(_) => {
-                return Err(Box::new(Status::deadline_exceeded(
-                    "upstream produced no output before the seller supervision cycle ended",
+                return Err(Box::new(dexdo_proto::retryable_upstream_status(
+                    Status::deadline_exceeded(
+                        "upstream produced no output before the seller supervision cycle ended",
+                    ),
                 )))
             }
         };
 
+        crate::telemetry::attempt(Some(resp.status().as_u16()));
         if retryable_provider_status(resp.status()) {
             let failure = Status::unavailable(format!("upstream HTTP {}", resp.status()));
             let retry_after = retry_after_delay(resp.headers());
-            match wait_for_retry(failure, retry_after, retry_deadline, tx).await? {
+            match wait_for_retry(
+                failure,
+                retry_after,
+                &mut retry_backoff,
+                retry_deadline,
+                tx,
+                context.retry_throttling || resp.status() != reqwest::StatusCode::TOO_MANY_REQUESTS,
+            )
+            .await?
+            {
                 RetryStep::Retry => continue 'attempt,
                 RetryStep::BuyerGone => return Ok(()),
             }
@@ -639,7 +781,9 @@ async fn stream_upstream_with_startup_capabilities(
         let result = stream_response(resp, context, retry_deadline, &mut ending).await;
         match result {
             Err(failure) if ending.retryable_pre_output_non_answer => {
-                match wait_for_retry(*failure, None, retry_deadline, tx).await? {
+                match wait_for_retry(*failure, None, &mut retry_backoff, retry_deadline, tx, true)
+                    .await?
+                {
                     RetryStep::Retry => continue 'attempt,
                     RetryStep::BuyerGone => return Ok(()),
                 }
@@ -933,6 +1077,7 @@ async fn stream_response(
         requirements,
         count: _,
         tx,
+        ..
     } = context;
 
     // Incremental SSE parsing over the body's byte stream (R6): accumulate a buffer, split on
@@ -963,9 +1108,9 @@ async fn stream_response(
                 item = tokio::time::timeout_at(retry_deadline, byte_stream.next()) => match item {
                     Ok(item) => item,
                     Err(_) => {
-                        return Err(Box::new(Status::deadline_exceeded(
+                        return Err(Box::new(dexdo_proto::retryable_upstream_status(Status::deadline_exceeded(
                             "upstream produced no output before the seller supervision cycle ended",
-                        )))
+                        ))))
                     }
                 },
             }
@@ -1152,7 +1297,10 @@ async fn stream_response(
                         usage: None,
                     };
                     seq += 1;
-                    if tx.send(Ok(UpstreamEvent::Chunk(chunk))).await.is_err() {
+                    if super::send_event(tx, Ok(UpstreamEvent::Chunk(chunk)))
+                        .await
+                        .is_err()
+                    {
                         return Ok(()); // buyer disconnected (STOP)
                     }
                 }
@@ -1205,7 +1353,7 @@ async fn stream_response(
                 "OpenAI-compatible output ended without positive terminal usage.completion_tokens",
             )
             })?;
-        let _ = tx.send(Ok(UpstreamEvent::Usage(usage))).await;
+        let _ = super::send_event(tx, Ok(UpstreamEvent::Usage(usage))).await;
         return Ok(());
     }
     if seq == 0 {
@@ -1583,9 +1731,28 @@ fn native_billing_usage(
         .get("total_tokens")
         .map(|_| token("total_tokens"))
         .transpose()?;
-    BillingUsage::new(input_tokens, output_tokens, declared_total)
-        .map(Some)
-        .map_err(Status::data_loss)
+    let mut usage = BillingUsage::new(input_tokens, output_tokens, declared_total)
+        .map_err(Status::data_loss)?;
+    if let Some(details) = object
+        .get("prompt_tokens_details")
+        .filter(|value| !value.is_null())
+    {
+        let details = details.as_object().ok_or_else(|| {
+            Status::data_loss("OpenAI-compatible prompt_tokens_details is not an object")
+        })?;
+        for (field, count) in [
+            ("cached_tokens", &mut usage.cache_read_tokens),
+            ("cache_write_tokens", &mut usage.cache_write_tokens),
+        ] {
+            if let Some(value) = details.get(field).filter(|value| !value.is_null()) {
+                *count = value.as_u64().ok_or_else(|| {
+                    Status::data_loss(format!("OpenAI-compatible {field} is not a token count"))
+                })?;
+            }
+        }
+    }
+    usage.validate().map_err(Status::data_loss)?;
+    Ok(Some(usage))
 }
 
 /// The frame's terminal native total: the standard `usage` and the Groq mirror `x_groq.usage` are BOTH
@@ -1596,9 +1763,47 @@ fn frame_native_usage(value: &serde_json::Value) -> Result<Option<BillingUsage>,
     let standard = native_billing_usage(value.get("usage"))?;
     let groq = native_billing_usage(value.get("x_groq").and_then(|groq| groq.get("usage")))?;
     match (standard, groq) {
-        (Some(standard), Some(groq)) if standard != groq => Err(Status::data_loss(
-            "OpenAI-compatible native usage totals disagree",
-        )),
+        (Some(mut standard), Some(groq)) => {
+            if (
+                standard.input_tokens,
+                standard.output_tokens,
+                standard.total_tokens,
+            ) != (groq.input_tokens, groq.output_tokens, groq.total_tokens)
+            {
+                return Err(Status::data_loss(
+                    "OpenAI-compatible native usage totals disagree",
+                ));
+            }
+            for (field, count, mirror_count) in [
+                (
+                    "cached_tokens",
+                    &mut standard.cache_read_tokens,
+                    groq.cache_read_tokens,
+                ),
+                (
+                    "cache_write_tokens",
+                    &mut standard.cache_write_tokens,
+                    groq.cache_write_tokens,
+                ),
+            ] {
+                let known = value["usage"]["prompt_tokens_details"][field]
+                    .as_u64()
+                    .is_some();
+                let mirror_known = value["x_groq"]["usage"]["prompt_tokens_details"][field]
+                    .as_u64()
+                    .is_some();
+                if known && mirror_known && *count != mirror_count {
+                    return Err(Status::data_loss(format!(
+                        "OpenAI-compatible {field} usage totals disagree"
+                    )));
+                }
+                if !known {
+                    *count = mirror_count;
+                }
+            }
+            standard.validate().map_err(Status::data_loss)?;
+            Ok(Some(standard))
+        }
         (Some(total), _) | (None, Some(total)) => Ok(Some(total)),
         (None, None) => Ok(None),
     }
@@ -1632,6 +1837,18 @@ fn parse_event(event: &str) -> Result<ParsedEvent, Status> {
     // delta parser does not recognize can neither hide nor invent an aggregate. The identity field
     // is read from the same raw frame for the same reason.
     let usage = frame_native_usage(&value)?;
+    if let (Some(usage), Some(cached_tokens)) = (
+        &usage,
+        value
+            .pointer("/usage/prompt_tokens_details/cached_tokens")
+            .and_then(serde_json::Value::as_u64),
+    ) {
+        tracing::info!(
+            cached_tokens,
+            prompt_tokens = usage.input_tokens,
+            "upstream prompt cache usage"
+        );
+    }
     let model = frame_served_model(&value);
     // an in-band error frame is the provider's answer -- but ONLY after the money field has
     // been read, and only when this frame carries none. A frame that states the authoritative total
@@ -1857,6 +2074,443 @@ data: [DONE]
 mod tests {
     use super::*;
 
+    mod issue_2159 {
+        use super::*;
+        use proptest::prelude::*;
+        use rand::{rngs::StdRng, SeedableRng};
+
+        proptest! {
+            #[test]
+            fn fallback_ceiling_grows_to_cap_and_samples_stay_inside(
+                seed in any::<u64>(), retries in 1_u32..128,
+            ) {
+                let mut rng = StdRng::seed_from_u64(seed);
+                let mut backoff = UPSTREAM_RETRY_INITIAL_BACKOFF;
+                for attempt in 0..retries {
+                    let ceiling = UPSTREAM_RETRY_INITIAL_BACKOFF
+                        .saturating_mul(UPSTREAM_RETRY_BACKOFF_MULTIPLIER.saturating_pow(attempt))
+                        .min(UPSTREAM_RETRY_MAX_BACKOFF);
+                    prop_assert_eq!(backoff, ceiling);
+                    prop_assert!(retry_delay(None, &mut backoff, &mut rng) <= ceiling);
+                    prop_assert!(backoff >= ceiling);
+                    prop_assert!(backoff <= UPSTREAM_RETRY_MAX_BACKOFF);
+                }
+            }
+
+            #[test]
+            fn retry_after_overrides_jitter_and_does_not_advance_backoff(seconds in any::<u64>()) {
+                let mut rng = StdRng::seed_from_u64(2159);
+                let mut backoff = UPSTREAM_RETRY_INITIAL_BACKOFF;
+                let delay = Duration::from_secs(seconds);
+                prop_assert_eq!(retry_delay(Some(delay), &mut backoff, &mut rng), delay);
+                prop_assert_eq!(backoff, UPSTREAM_RETRY_INITIAL_BACKOFF);
+            }
+        }
+
+        #[test]
+        fn independent_requests_use_the_full_jitter_interval() {
+            let mut rng = StdRng::seed_from_u64(2159);
+            let delays: Vec<_> = (0..64)
+                .map(|_| {
+                    let mut backoff = UPSTREAM_RETRY_INITIAL_BACKOFF;
+                    retry_delay(None, &mut backoff, &mut rng)
+                })
+                .collect();
+            assert!(delays
+                .iter()
+                .all(|delay| *delay <= UPSTREAM_RETRY_INITIAL_BACKOFF));
+            assert!(*delays.iter().min().unwrap() < UPSTREAM_RETRY_INITIAL_BACKOFF / 4);
+            assert!(*delays.iter().max().unwrap() > UPSTREAM_RETRY_INITIAL_BACKOFF * 3 / 4);
+        }
+
+        #[tokio::test(start_paused = true)]
+        async fn waits_exactly_retry_after_even_above_the_jitter_cap() {
+            let (tx, _rx) = mpsc::channel(1);
+            let mut backoff = UPSTREAM_RETRY_INITIAL_BACKOFF;
+            let start = tokio::time::Instant::now();
+            let delay = UPSTREAM_RETRY_MAX_BACKOFF * UPSTREAM_RETRY_BACKOFF_MULTIPLIER;
+            assert!(matches!(
+                wait_for_retry(
+                    Status::unavailable("429"),
+                    Some(delay),
+                    &mut backoff,
+                    start + SellerLivenessParams::canonical().health_cycle_timeout,
+                    &tx,
+                    true,
+                )
+                .await,
+                Ok(RetryStep::Retry)
+            ));
+            assert_eq!(start.elapsed(), delay);
+            assert_eq!(backoff, UPSTREAM_RETRY_INITIAL_BACKOFF);
+        }
+
+        #[tokio::test(start_paused = true)]
+        async fn retries_stay_inside_the_original_deadline() {
+            let (tx, _rx) = mpsc::channel(1);
+            let mut backoff = UPSTREAM_RETRY_INITIAL_BACKOFF;
+            let deadline = tokio::time::Instant::now()
+                + SellerLivenessParams::canonical().health_cycle_timeout;
+            while let Ok(step) = wait_for_retry(
+                Status::unavailable("429"),
+                None,
+                &mut backoff,
+                deadline,
+                &tx,
+                true,
+            )
+            .await
+            {
+                assert!(matches!(step, RetryStep::Retry));
+                assert!(tokio::time::Instant::now() < deadline);
+            }
+            assert!(tokio::time::Instant::now() < deadline);
+            assert_eq!(backoff, UPSTREAM_RETRY_MAX_BACKOFF);
+        }
+
+        #[tokio::test(start_paused = true)]
+        async fn expired_deadline_and_retry_after_beyond_budget_refuse_without_waiting() {
+            let (tx, _rx) = mpsc::channel(1);
+            let mut backoff = UPSTREAM_RETRY_INITIAL_BACKOFF;
+            let start = tokio::time::Instant::now();
+            let budget = SellerLivenessParams::canonical().health_cycle_timeout;
+            for (delay, deadline) in [
+                (None, start),
+                (Some(Duration::ZERO), start),
+                (Some(budget), start + budget),
+                (
+                    Some(budget * UPSTREAM_RETRY_BACKOFF_MULTIPLIER),
+                    start + budget,
+                ),
+            ] {
+                let result = wait_for_retry(
+                    Status::unavailable("429"),
+                    delay,
+                    &mut backoff,
+                    deadline,
+                    &tx,
+                    true,
+                )
+                .await;
+                let failure = result
+                    .err()
+                    .expect("retry must not exceed its original budget");
+                assert_eq!(failure.code(), tonic::Code::Unavailable);
+                assert!(dexdo_proto::is_retryable_upstream(&failure));
+                assert_eq!(tokio::time::Instant::now(), start);
+            }
+        }
+
+        #[tokio::test(start_paused = true)]
+        async fn buyer_disconnect_interrupts_a_pending_retry() {
+            let (tx, rx) = mpsc::channel(1);
+            let mut backoff = UPSTREAM_RETRY_INITIAL_BACKOFF;
+            let start = tokio::time::Instant::now();
+            let wait = wait_for_retry(
+                Status::unavailable("429"),
+                Some(UPSTREAM_RETRY_MAX_BACKOFF),
+                &mut backoff,
+                start + SellerLivenessParams::canonical().health_cycle_timeout,
+                &tx,
+                true,
+            );
+            tokio::pin!(wait);
+            assert!(futures::poll!(&mut wait).is_pending());
+            drop(rx);
+            assert!(matches!(wait.await, Ok(RetryStep::BuyerGone)));
+            assert_eq!(tokio::time::Instant::now(), start);
+        }
+
+        #[tokio::test(start_paused = true)]
+        async fn disabled_throttling_retries_still_refuse_immediately() {
+            let (tx, _rx) = mpsc::channel(1);
+            let mut backoff = UPSTREAM_RETRY_INITIAL_BACKOFF;
+            let start = tokio::time::Instant::now();
+            let result = wait_for_retry(
+                Status::unavailable("429"),
+                None,
+                &mut backoff,
+                start + SellerLivenessParams::canonical().health_cycle_timeout,
+                &tx,
+                false,
+            )
+            .await;
+            assert!(result.is_err());
+            assert_eq!(tokio::time::Instant::now(), start);
+        }
+
+        #[tokio::test]
+        async fn recovers_from_429_without_waiting_a_health_interval() {
+            use tokio::io::AsyncWriteExt;
+
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let address = listener.local_addr().unwrap();
+            let provider = tokio::spawn(async move {
+                for (status, body) in [
+                    ("429 Too Many Requests", ""),
+                    ("200 OK", LIVE_GROQ_READINESS_CAPTURE),
+                ] {
+                    let (mut socket, _) = listener.accept().await.unwrap();
+                    read_http_request(&mut socket).await;
+                    let header = format!(
+                        "HTTP/1.1 {status}\r\ncontent-type: text/event-stream\r\ncontent-length: {}\r\nconnection: close\r\n\r\n",
+                        body.len()
+                    );
+                    socket.write_all(header.as_bytes()).await.unwrap();
+                    socket.write_all(body.as_bytes()).await.unwrap();
+                }
+            });
+            let cfg = OpenAiConfig {
+                base_url: format!("http://{address}"),
+                ..OpenAiConfig::default()
+            };
+            let (tx, mut rx) = mpsc::channel(16);
+            tokio::time::timeout(
+                SellerLivenessParams::canonical().health_interval / 2,
+                stream_upstream(
+                    &cfg,
+                    None,
+                    "secret",
+                    64,
+                    &request(),
+                    &tx,
+                    DEFAULT_MAX_OUTPUT_TOKENS,
+                ),
+            )
+            .await
+            .expect("429 without Retry-After must recover before the old fixed 20-second pause")
+            .expect("the retried request must deliver the provider's answer");
+            provider.await.unwrap();
+            drop(tx);
+            let mut events = Vec::new();
+            while let Some(event) = rx.recv().await {
+                events.push(event.unwrap());
+            }
+            assert_eq!(accounted_total(events), 13);
+        }
+    }
+
+    #[test]
+    fn cached_tokens_2094_are_logged_without_changing_billing() {
+        #[derive(Clone)]
+        struct Writer(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
+        impl std::io::Write for Writer {
+            fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+                self.0.lock().unwrap().extend_from_slice(bytes);
+                Ok(bytes.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        for cached in [
+            None,
+            Some(serde_json::json!(4)),
+            Some(serde_json::json!(0)),
+            Some(serde_json::json!(null)),
+        ] {
+            let output = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+            let captured = output.clone();
+            let subscriber = tracing_subscriber::fmt()
+                .without_time()
+                .with_ansi(false)
+                .with_max_level(tracing::Level::INFO)
+                .with_writer(move || Writer(captured.clone()))
+                .finish();
+            let mut frame = serde_json::json!({
+                "choices": [], "usage": {"prompt_tokens": 6, "completion_tokens": 2, "total_tokens": 8,
+                    "input_tokens_details": {"cached_tokens": 999}}
+            });
+            if let Some(cached) = &cached {
+                frame["usage"]["prompt_tokens_details"] =
+                    serde_json::json!({"cached_tokens": cached});
+            }
+            let event = format!("data: {frame}\n\n");
+            let parsed =
+                tracing::subscriber::with_default(subscriber, || parse_event(&event).unwrap());
+            let ParsedEvent::Frame {
+                usage: Some(usage), ..
+            } = parsed
+            else {
+                panic!("terminal usage")
+            };
+            let mut expected = BillingUsage::new(6, 2, Some(8)).unwrap();
+            expected.cache_read_tokens = cached
+                .as_ref()
+                .and_then(serde_json::Value::as_u64)
+                .unwrap_or(0);
+            assert_eq!(usage, expected);
+            let log = String::from_utf8(output.lock().unwrap().clone()).unwrap();
+            if let Some(count) = cached.as_ref().and_then(serde_json::Value::as_u64) {
+                assert!(log.contains(&format!("cached_tokens={count}")), "{log}");
+                assert!(log.contains("prompt_tokens=6"), "{log}");
+            } else {
+                assert!(
+                    !log.contains("cached_tokens="),
+                    "invalid optional metadata is not a count: {log}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn invalid_cached_tokens_2132_fail_closed() {
+        for cached in [
+            serde_json::json!("4"),
+            serde_json::json!(-1),
+            serde_json::json!(1.5),
+            serde_json::json!(7),
+        ] {
+            let frame = serde_json::json!({"prompt_tokens":6,"completion_tokens":2,
+                "prompt_tokens_details":{"cached_tokens":cached}});
+            assert_eq!(
+                native_billing_usage(Some(&frame)).unwrap_err().code(),
+                tonic::Code::DataLoss
+            );
+        }
+    }
+
+    #[test]
+    fn mirrored_cache_2132_may_be_omitted_but_cannot_conflict() {
+        let mut frame = serde_json::json!({"usage":{"prompt_tokens":6,"completion_tokens":2,
+            "prompt_tokens_details":{"cached_tokens":4}},
+            "x_groq":{"usage":{"prompt_tokens":6,"completion_tokens":2}}});
+        assert_eq!(
+            frame_native_usage(&frame)
+                .unwrap()
+                .unwrap()
+                .cache_read_tokens,
+            4
+        );
+        frame["x_groq"]["usage"]["prompt_tokens_details"] = serde_json::json!({"cached_tokens":0});
+        assert!(frame_native_usage(&frame).is_err());
+    }
+
+    #[test]
+    fn cache_write_2132_preserves_reported_counts_and_defaults_missing_or_null_to_zero() {
+        for write in [
+            None,
+            Some(serde_json::Value::Null),
+            Some(serde_json::json!(3)),
+        ] {
+            let mut frame = serde_json::json!({"prompt_tokens":10,"completion_tokens":2,
+                "prompt_tokens_details":{"cached_tokens":4}});
+            if let Some(value) = &write {
+                frame["prompt_tokens_details"]["cache_write_tokens"] = value.clone();
+            }
+            let usage = native_billing_usage(Some(&frame)).unwrap().unwrap();
+            assert_eq!(usage.input_tokens, 10);
+            assert_eq!(usage.total_tokens, 12);
+            assert_eq!(usage.cache_read_tokens, 4);
+            assert_eq!(
+                usage.cache_write_tokens,
+                write.and_then(|v| v.as_u64()).unwrap_or(0)
+            );
+        }
+        for details in [serde_json::Value::Null, serde_json::json!({})] {
+            let usage = native_billing_usage(Some(&serde_json::json!({
+                "prompt_tokens":10,"completion_tokens":2,"prompt_tokens_details":details
+            })))
+            .unwrap()
+            .unwrap();
+            assert_eq!((usage.cache_read_tokens, usage.cache_write_tokens), (0, 0));
+        }
+    }
+
+    #[test]
+    fn invalid_cache_write_2132_is_rejected_in_either_usage_mirror() {
+        for write in [
+            serde_json::json!("3"),
+            serde_json::json!(-1),
+            serde_json::json!(1.5),
+            serde_json::json!(11),
+            serde_json::json!(7),
+            serde_json::json!(u64::MAX),
+            serde_json::from_str("18446744073709551616").unwrap(),
+        ] {
+            let bad = serde_json::json!({"prompt_tokens":10,"completion_tokens":2,
+                "prompt_tokens_details":{"cached_tokens":4,"cache_write_tokens":write}});
+            for frame in [
+                serde_json::json!({"usage":bad}),
+                serde_json::json!({"x_groq":{"usage":bad}}),
+            ] {
+                assert_eq!(
+                    frame_native_usage(&frame).unwrap_err().code(),
+                    tonic::Code::DataLoss
+                );
+            }
+        }
+        let overflow = serde_json::json!({"prompt_tokens":u64::MAX,"completion_tokens":0,
+            "prompt_tokens_details":{"cached_tokens":u64::MAX,"cache_write_tokens":1}});
+        assert!(native_billing_usage(Some(&overflow)).is_err());
+    }
+
+    #[test]
+    fn mirrored_cache_write_2132_merges_only_compatible_known_counts() {
+        let base = serde_json::json!({"prompt_tokens":10,"completion_tokens":2});
+        for standard in [false, true] {
+            let mut reported = base.clone();
+            reported["prompt_tokens_details"] =
+                serde_json::json!({"cached_tokens":4,"cache_write_tokens":3});
+            for absent in [
+                serde_json::Value::Null,
+                serde_json::json!({"cache_write_tokens":null}),
+                serde_json::json!({"cached_tokens":4,"cache_write_tokens":3}),
+            ] {
+                let mut other = base.clone();
+                other["prompt_tokens_details"] = absent;
+                let frame = if standard {
+                    serde_json::json!({"usage":reported,"x_groq":{"usage":other}})
+                } else {
+                    serde_json::json!({"usage":other,"x_groq":{"usage":reported}})
+                };
+                let usage = frame_native_usage(&frame).unwrap().unwrap();
+                assert_eq!((usage.cache_read_tokens, usage.cache_write_tokens), (4, 3));
+            }
+        }
+        for (read, write) in [(4, 0), (0, 3)] {
+            let conflicting = serde_json::json!({"usage":{"prompt_tokens":10,"completion_tokens":2,
+                "prompt_tokens_details":{"cached_tokens":4,"cache_write_tokens":3}},
+                "x_groq":{"usage":{"prompt_tokens":10,"completion_tokens":2,
+                    "prompt_tokens_details":{"cached_tokens":read,"cache_write_tokens":write}}}});
+            assert!(frame_native_usage(&conflicting).is_err());
+        }
+        let combined = serde_json::json!({"usage":{"prompt_tokens":10,"completion_tokens":2,
+            "prompt_tokens_details":{"cached_tokens":8}},
+            "x_groq":{"usage":{"prompt_tokens":10,"completion_tokens":2,
+                "prompt_tokens_details":{"cache_write_tokens":3}}}});
+        assert!(frame_native_usage(&combined).is_err());
+    }
+
+    #[tokio::test]
+    async fn session_id_2094_cannot_inject_provider_headers() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let cfg = OpenAiConfig {
+            base_url: format!("http://{}", listener.local_addr().unwrap()),
+            ..OpenAiConfig::default()
+        };
+        let mut req = request();
+        req.session_id = Some("session\r\nAuthorization: attacker".into());
+        let (tx, _rx) = mpsc::channel(4);
+        let status = stream_upstream(
+            &cfg,
+            None,
+            "secret",
+            8,
+            &req,
+            &tx,
+            DEFAULT_MAX_OUTPUT_TOKENS,
+        )
+        .await
+        .expect_err("invalid routing metadata must fail before contacting the provider");
+        assert_eq!(status.code(), tonic::Code::Unavailable);
+        assert!(
+            tokio::time::timeout(Duration::from_millis(250), listener.accept())
+                .await
+                .is_err()
+        );
+    }
+
     fn request() -> CanonRequest {
         CanonRequest {
             messages: vec![dexdo_proto::ChatMessage {
@@ -1864,6 +2518,7 @@ mod tests {
                 content: "hello".into(),
             }],
             params: None,
+            ..Default::default()
         }
     }
 
@@ -2152,6 +2807,7 @@ mod tests {
             &CanonRequest {
                 messages: vec![],
                 params: None,
+                ..Default::default()
             },
         )
         .await
@@ -3322,6 +3978,7 @@ mod tests {
                 content: request_secret.clone(),
             }],
             params: None,
+            ..Default::default()
         };
         let truncated = error_message_for_request(
             reqwest::StatusCode::BAD_REQUEST,
@@ -3363,7 +4020,10 @@ mod tests {
                 max_tokens: 0,
                 stop: vec![STOP.to_string()],
                 greedy: false,
+                disable_reasoning: false,
+                reasoning_effort: None,
             }),
+            ..Default::default()
         };
         let message = error_message_for_request(
             reqwest::StatusCode::BAD_REQUEST,
@@ -3500,7 +4160,10 @@ mod tests {
                 max_tokens: 0,
                 stop: vec![],
                 greedy: false,
+                disable_reasoning: false,
+                reasoning_effort: None,
             }),
+            ..Default::default()
         };
         let body = build_request(&cfg, &req, 8, DEFAULT_MAX_OUTPUT_TOKENS);
         assert_eq!(body.model, DEFAULT_MODEL);
@@ -3531,6 +4194,7 @@ mod tests {
                 max_tokens,
                 ..Default::default()
             }),
+            ..Default::default()
         };
 
         // The deal budget below every other bound wins.
@@ -3770,6 +4434,7 @@ mod tests {
             capabilities: Capabilities {
                 max_output_tokens: Some(DEFAULT_MAX_OUTPUT_TOKENS),
                 sample_algorithm: SampleAlgorithm::Seed,
+                ..Default::default()
             },
             ..OpenAiConfig::default()
         };
@@ -3780,7 +4445,10 @@ mod tests {
                 max_tokens: 16,
                 stop: vec![],
                 greedy: true,
+                disable_reasoning: false,
+                reasoning_effort: None,
             }),
+            ..Default::default()
         };
         let body = build_request(&cfg, &greedy, 8, DEFAULT_MAX_OUTPUT_TOKENS);
         assert_eq!(body.temperature, Some(0.0));
@@ -3795,7 +4463,10 @@ mod tests {
                 max_tokens: 16,
                 stop: vec![],
                 greedy: false,
+                disable_reasoning: false,
+                reasoning_effort: None,
             }),
+            ..Default::default()
         };
         let body = build_request(&cfg, &regular, 32, DEFAULT_MAX_OUTPUT_TOKENS);
         assert_eq!(body.temperature, Some(0.9));
@@ -3827,7 +4498,10 @@ mod tests {
                     max_tokens: 16,
                     stop: vec![],
                     greedy: true,
+                    disable_reasoning: false,
+                    reasoning_effort: None,
                 }),
+                ..Default::default()
             };
             let body = serde_json::to_value(build_request(&cfg, &greedy, 8, 256)).unwrap();
 
@@ -3861,7 +4535,10 @@ mod tests {
                 max_tokens: 16,
                 stop: vec![],
                 greedy: true,
+                disable_reasoning: false,
+                reasoning_effort: None,
             }),
+            ..Default::default()
         };
         let body = serde_json::to_value(build_request(&cfg, &greedy, 8, 256)).unwrap();
         assert!(
@@ -3885,6 +4562,7 @@ mod tests {
             capabilities: Capabilities {
                 max_output_tokens: Some(DEFAULT_MAX_OUTPUT_TOKENS),
                 sample_algorithm: SampleAlgorithm::Seed,
+                ..Default::default()
             },
             ..OpenAiConfig::default()
         };
@@ -3895,7 +4573,10 @@ mod tests {
                 max_tokens: 16,
                 stop: vec![],
                 greedy: true,
+                disable_reasoning: false,
+                reasoning_effort: None,
             }),
+            ..Default::default()
         };
         let (tx, _rx) = mpsc::channel(4);
 
@@ -3925,6 +4606,56 @@ mod tests {
     }
 
     #[test]
+    fn reasoning_2090_profiles_preserve_default_openrouter_and_override_explicit_disable() {
+        let mut cfg = OpenAiConfig {
+            base_url: "https://openrouter.ai/api/v1".into(),
+            model: "qwen/qwen3-32b".into(),
+            ..Default::default()
+        };
+        let mut request = CanonRequest {
+            messages: Vec::new(),
+            params: Some(Default::default()),
+            ..Default::default()
+        };
+        let baseline =
+            serde_json::to_value(build_request(&cfg, &request, 8, DEFAULT_MAX_OUTPUT_TOKENS))
+                .unwrap();
+        assert_eq!(
+            baseline["reasoning"],
+            serde_json::json!({"enabled":true,"exclude":false})
+        );
+        for control in [
+            ReasoningDisableControl::ChatTemplate,
+            ReasoningDisableControl::ChatTemplateThinking,
+            ReasoningDisableControl::ReasoningEffort,
+            ReasoningDisableControl::OpenRouter,
+            ReasoningDisableControl::ThinkingDisabled,
+        ] {
+            cfg.capabilities.reasoning_disable = control;
+            request.params.as_mut().unwrap().disable_reasoning = false;
+            assert_eq!(
+                serde_json::to_value(build_request(&cfg, &request, 8, DEFAULT_MAX_OUTPUT_TOKENS))
+                    .unwrap(),
+                baseline
+            );
+            request.params.as_mut().unwrap().disable_reasoning = true;
+            let disabled =
+                serde_json::to_value(build_request(&cfg, &request, 8, DEFAULT_MAX_OUTPUT_TOKENS))
+                    .unwrap();
+            if control == ReasoningDisableControl::OpenRouter {
+                assert_eq!(disabled["reasoning"]["enabled"], false);
+                assert_eq!(
+                    disabled["provider"],
+                    serde_json::json!({"require_parameters":true})
+                );
+            } else {
+                assert!(disabled.get("reasoning").is_none());
+                assert!(disabled.get("provider").is_none());
+            }
+        }
+    }
+
+    #[test]
     fn build_request_enables_openrouter_qwen_reasoning_only_for_exact_model() {
         let cfg = OpenAiConfig {
             base_url: "https://openrouter.ai/api/v1".to_string(),
@@ -3937,6 +4668,7 @@ mod tests {
             &CanonRequest {
                 messages: vec![],
                 params: None,
+                ..Default::default()
             },
             8,
             DEFAULT_MAX_OUTPUT_TOKENS,
@@ -3953,6 +4685,7 @@ mod tests {
             &CanonRequest {
                 messages: vec![],
                 params: None,
+                ..Default::default()
             },
             8,
             DEFAULT_MAX_OUTPUT_TOKENS,
@@ -4138,6 +4871,7 @@ data: {"error":{"message":"Tool choice is required, but model did not call a too
                 market,
                 requirements,
                 count,
+                retry_throttling: true,
                 tx: &tx,
             },
             "secret",

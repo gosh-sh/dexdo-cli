@@ -225,6 +225,10 @@ pub(crate) struct SellerArgs {
     /// Local bind/listen address for accepting buyer connections; seller-side equivalent of buyer --local-listen.
     #[arg(long, default_value = DEFAULT_SELLER_GATEWAY_LISTEN)]
     pub(crate) gateway_listen: SocketAddr,
+    /// Maximum simultaneous provider requests on each deal. Excess requests receive backpressure.
+    /// Already admitted requests finish after budget exhaustion; the seller absorbs excess work.
+    #[arg(long, default_value_t = dexdo_core::params::SELLER_MAX_CONCURRENT_REQUESTS_PER_DEAL)]
+    pub(crate) max_concurrent_requests_per_deal: std::num::NonZeroU32,
     /// Public gateway host:port written to the buyer handover. Defaults to --gateway-listen, and on
     /// a real chain the resulting address must be reachable by a REMOTE buyer: a bind-all
     /// (`0.0.0.0`/`::`), loopback, RFC1918/ULA, link-local or CGNAT address is rejected before any
@@ -1709,7 +1713,7 @@ pub(crate) enum NoteCommand {
     /// Deploy: a wallet-funded `PrivateNote` on the chain in-process through `gosh.ackinacki`, folded
     /// into a `DEXDO_PN_POOL` pool the `seller`/`buyer` consume.
     Deploy(NoteDeployArgs),
-    /// Recover/finalize a wallet-funded `PrivateNote` deploy from a crash-safe recovery state file.
+    /// Resume a paid `PrivateNote` deploy and automatically reprove when safe, without another payment.
     Recover(NoteRecoverArgs),
     /// Top up an existing note's ECC[2] SHELL gas pocket from a funding wallet, up to an exact level.
     /// This is the account's coin pocket -- what deploys and deal gas are paid from -- and NOT the
@@ -1970,7 +1974,7 @@ pub(crate) struct NoteDeployArgs {
     pub(crate) funding_timeout: Option<std::time::Duration>,
 }
 
-/// Args for `dexdo note recover`: finalize a deploy whose recovery state was persisted before/after spend.
+/// Args for `dexdo note recover`: resume a paid deploy, automatically reprove when safe, and record the note.
 #[derive(Args)]
 pub(crate) struct NoteRecoverArgs {
     /// Crash-safe recovery state written by `dexdo note deploy`.
@@ -2772,5 +2776,28 @@ mod tests {
         );
         assert!(super::parse_shell_currency_id("1").is_err());
         assert!(super::parse_shell_currency_id("3").is_err());
+    }
+    #[test]
+    fn shared_budget_2091_seller_concurrency_is_configurable_positive_and_canonical() {
+        use clap::Parser as _;
+        assert_eq!(
+            seller_args(&[]).max_concurrent_requests_per_deal,
+            dexdo_core::params::SELLER_MAX_CONCURRENT_REQUESTS_PER_DEAL
+        );
+        for count in [1_u32, 4] {
+            assert_eq!(
+                seller_args(&["--max-concurrent-requests-per-deal", &count.to_string()])
+                    .max_concurrent_requests_per_deal
+                    .get(),
+                count
+            );
+        }
+        assert!(crate::Cli::try_parse_from([
+            "dexdo",
+            "seller",
+            "--max-concurrent-requests-per-deal",
+            "0"
+        ])
+        .is_err());
     }
 }

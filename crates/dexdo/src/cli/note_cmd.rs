@@ -343,11 +343,8 @@ pub(crate) async fn run_note_wallet(args: NoteWalletArgs) -> Result<()> {
 }
 
 pub(crate) async fn run_note_recover(args: NoteRecoverArgs) -> Result<()> {
-    use crate::cli::note::{
-        ensure_recovery_owner_matches_target_note, load_note_deploy_recovery,
-        resolve_private_file_path,
-    };
-    use dexdo_core::{private_note::artifacts::PRIVATE_NOTE_ABI_JSON, ChainClient};
+    use crate::cli::note::{load_note_deploy_recovery, resolve_private_file_path};
+    use dexdo_core::{private_note::Halo2Paths, ChainClient};
 
     let pool_path = resolve_private_file_path(
         args.pool.as_deref().ok_or_else(|| {
@@ -356,56 +353,210 @@ pub(crate) async fn run_note_recover(args: NoteRecoverArgs) -> Result<()> {
         "--pool",
     )?;
     let recovery_path = resolve_private_file_path(&args.recovery, "--recovery")?;
+    note_deploy_same_file_pool_guard(std::env::var_os("DEXDO_PN_POOL").as_deref(), &pool_path)?;
     note_deploy_recovery_pool_guard(&pool_path, &recovery_path)?;
     validate_existing_pool_if_present(&pool_path)?;
+    // The same serial lock covers deploy and recover, including journal read and retirement.
+    // A second recover must re-read the journal after the first has finished with it.
+    let _serial_lock = acquire_note_deploy_serial_lock()?;
     let recovery = load_note_deploy_recovery(&recovery_path)?.ok_or_else(|| {
         anyhow::anyhow!(
             "note recover: recovery file {} not found",
             recovery_path.display()
         )
     })?;
-    recovery.ensure_ready_for_pool()?;
-    let state = recovery.to_onboard_state()?;
-    let note_addr = state
-        .pn_address
-        .as_deref()
-        .ok_or_else(|| anyhow::anyhow!("note recover: recovery state has no pn_address"))?
-        .to_string();
-    let client = ChainClient::connect(&recovery.endpoint)?;
-    let note_address = dexdo_core::address::parse_chain_address(&note_addr)
-        .map_err(|e| anyhow::anyhow!("recovered note {note_addr}: {e}"))?;
-    let note_display = dexdo_core::address::display(&note_addr);
-    let details = client
-        .run_getter_retrying(
-            &note_address,
-            PRIVATE_NOTE_ABI_JSON,
-            "getDetails",
-            serde_json::json!({}),
+    note_recover_require_paid(&recovery)?;
+    // Completed journals only need the original read/finalization path. Pending recovery can
+    // submit deployPrivateNote, so it must use the selected manifest's network and endpoint.
+    let manifest = if recovery.shell_funded && recovery.sanity_checked {
+        None
+    } else {
+        Some(crate::cli::commands::manifest_path()?)
+    };
+    let (endpoint, _wallet_lock) = if let Some(path) = manifest.as_deref() {
+        let deployed = dexdo_core::Deployed::load(path)?;
+        let endpoint = note_endpoint_url(&dexdo_core::chain::resolve_endpoint(None, &deployed)?)?;
+        note_recover_require_endpoint(&recovery, &endpoint)?;
+        let wallet = recovery
+            .funding_multisig_address
+            .as_deref()
+            .ok_or_else(|| {
+                anyhow::anyhow!("note recover: paid recovery has no funding wallet identity")
+            })?;
+        (
+            endpoint,
+            Some(acquire_funding_wallet_lock(&deployed.network, wallet)?),
+        )
+    } else {
+        (note_endpoint_url(&recovery.endpoint)?, None)
+    };
+    let client = ChainClient::connect(&endpoint)?;
+    let paths = Halo2Paths::from_env();
+    let mut ops = NoteRecoverProductionOps {
+        client: &client,
+        manifest: manifest.as_deref(),
+        recovery_path: &recovery_path,
+        pool_path: &pool_path,
+        halo2_paths: &paths,
+    };
+    run_note_recover_resolved(&mut ops).await
+}
+
+fn note_recover_require_endpoint(
+    recovery: &crate::cli::note::NoteDeployRecoveryState,
+    endpoint: &str,
+) -> Result<()> {
+    if note_endpoint_url(&recovery.endpoint)? != endpoint {
+        bail!("note recover: recovery endpoint differs from the current manifest; select the original \
+               network's manifest and keep this recovery file. No wallet payment was submitted.");
+    }
+    Ok(())
+}
+
+fn note_recover_require_paid(recovery: &crate::cli::note::NoteDeployRecoveryState) -> Result<()> {
+    recovery.validate()?;
+    if recovery.pn_address.is_none()
+        && !recovery
+            .deposit_voucher
+            .as_ref()
+            .is_some_and(|voucher| voucher.submit_maybe_sent)
+    {
+        bail!(
+            "note recover: this recovery has no submitted paid voucher or deployed PrivateNote. \
+               Continue the original `dexdo note deploy` command to authorize the initial payment; \
+               recover will not load funding keys or create a new payment. Keep the recovery file."
+        );
+    }
+    Ok(())
+}
+
+/// Recover has no funding credentials and cannot enter the voucher-payment path, even if a
+/// future stage accidentally tries to. Its paid-state guard runs before network/prover work.
+struct NoteRecoverNoFunding;
+
+impl NoteDeployFundingKeyLoader for NoteRecoverNoFunding {
+    fn load_funding_wallet_keys(&self) -> Result<dexdo_core::KeyPair> {
+        bail!("note recover cannot load funding wallet keys or submit a new voucher payment")
+    }
+}
+
+struct NoteRecoverProductionOps<'a> {
+    client: &'a dexdo_core::ChainClient,
+    manifest: Option<&'a std::path::Path>,
+    recovery_path: &'a std::path::Path,
+    pool_path: &'a std::path::Path,
+    halo2_paths: &'a dexdo_core::private_note::Halo2Paths,
+}
+
+#[async_trait::async_trait(?Send)]
+impl NoteDeployResolvedOps for NoteRecoverProductionOps<'_> {
+    async fn load_recovery(&mut self) -> Result<crate::cli::note::NoteDeployRecoveryState> {
+        let recovery = crate::cli::note::load_note_deploy_recovery(self.recovery_path)?
+            .ok_or_else(|| anyhow::anyhow!("note recover: recovery file disappeared"))?;
+        note_recover_require_paid(&recovery)?;
+        note_recover_require_endpoint(&recovery, self.client.endpoint())?;
+        Ok(recovery)
+    }
+
+    async fn preflight_doctor(&mut self) -> Result<()> {
+        let Some(manifest) = self.manifest else {
+            return Ok(());
+        };
+        dexdo_core::chain_clock_skew_preflight(self.client.endpoint()).await?;
+        chain_doctor_preflight_with_endpoint(manifest, Some(self.client.endpoint()), None)
+            .await
+            .map_err(note_deploy_generation_mismatch)
+    }
+
+    async fn prepare_funding(&mut self, route: NoteDeployFundingRoute) -> Result<()> {
+        if route == NoteDeployFundingRoute::FreshSpend {
+            bail!("note recover refuses a fresh wallet payment");
+        }
+        Ok(())
+    }
+
+    async fn preflight_prover(&mut self) -> Result<()> {
+        // The paid stage prepares the prover only after locating its original event. An
+        // unavailable event must not wait for keygen or mutate a shared cache first.
+        Ok(())
+    }
+
+    async fn resume_chain(
+        &mut self,
+        recovery: &mut crate::cli::note::NoteDeployRecoveryState,
+    ) -> Result<crate::cli::note::OnboardPnState> {
+        note_recover_require_paid(recovery)?;
+        let wallet = dexdo_core::CanonicalAddress::parse(
+            recovery.funding_multisig_address.as_deref().unwrap(),
+        )
+        .map_err(|error| anyhow::anyhow!(error))?
+        .legacy();
+        let keys = dexdo_core::KeyPair::from_secret_hex(&recovery.owner_secret_key_hex)
+            .map_err(|error| anyhow::anyhow!("note recover owner key: {error:?}"))?;
+        resume_note_deploy_chain(
+            self.client,
+            self.recovery_path,
+            recovery,
+            &wallet,
+            &NoteRecoverNoFunding,
+            &keys,
+            self.halo2_paths,
+            Default::default(),
         )
         .await
-        .map_err(|e| {
-            anyhow::anyhow!("verify recovered PrivateNote {note_display} owner key: {e}")
-        })?;
-    ensure_recovery_owner_matches_target_note(
-        &recovery_path,
-        &recovery,
-        details.as_ref().and_then(|d| d["ephemeralPubkey"].as_str()),
-    )?;
-    let n = note_deploy_fold_state_into_pool(&pool_path, &state)?;
-    std::fs::remove_file(&recovery_path).map_err(|e| {
-        anyhow::anyhow!(
-            "note recover: remove consumed recovery file {}: {e}",
-            recovery_path.display()
-        )
-    })?;
-    println!(
-        "note recovered -> PrivateNote {note_display}; folded into --pool {} ({} note(s)) from recovery {}. \
-         No wallet spend was submitted.",
-        pool_path.display(),
-        n,
-        recovery_path.display()
-    );
-    Ok(())
+    }
+
+    async fn finalize_pool(
+        &mut self,
+        recovery: &crate::cli::note::NoteDeployRecoveryState,
+        state: &crate::cli::note::OnboardPnState,
+    ) -> Result<()> {
+        use crate::cli::note::ensure_recovery_owner_matches_target_note;
+        use dexdo_core::private_note::artifacts::PRIVATE_NOTE_ABI_JSON;
+        recovery.ensure_ready_for_pool()?;
+        let note = state
+            .pn_address
+            .as_deref()
+            .ok_or_else(|| anyhow::anyhow!("note recover: no PrivateNote"))?;
+        let address = dexdo_core::address::parse_chain_address(note)?;
+        let details = self
+            .client
+            .run_getter_retrying(
+                &address,
+                PRIVATE_NOTE_ABI_JSON,
+                "getDetails",
+                serde_json::json!({}),
+            )
+            .await?;
+        ensure_recovery_owner_matches_target_note(
+            self.recovery_path,
+            recovery,
+            details.as_ref().and_then(|d| d["ephemeralPubkey"].as_str()),
+        )?;
+        let n = note_recover_finalize_pool(self.recovery_path, self.pool_path, recovery, state)?;
+        println!("note recovered -> PrivateNote {}; folded into --pool {} ({n} note(s)). No wallet spend was submitted.",
+            dexdo_core::address::display(note), self.pool_path.display());
+        Ok(())
+    }
+}
+
+fn note_recover_finalize_pool(
+    recovery_path: &std::path::Path,
+    pool_path: &std::path::Path,
+    recovery: &crate::cli::note::NoteDeployRecoveryState,
+    state: &crate::cli::note::OnboardPnState,
+) -> Result<usize> {
+    use crate::cli::note::{retire_a_finished_deploy, FinishedDeploy};
+    // Restart after a durable pool write but before journal retirement: do not append twice.
+    if retire_a_finished_deploy(recovery_path, recovery, pool_path)? == FinishedDeploy::Retired {
+        let pool: serde_json::Value = serde_json::from_slice(&std::fs::read(pool_path)?)?;
+        return Ok(pool["notes"].as_array().map_or(0, Vec::len));
+    }
+    let n = note_deploy_fold_state_into_pool(pool_path, state)?;
+    if retire_a_finished_deploy(recovery_path, recovery, pool_path)? != FinishedDeploy::Retired {
+        bail!("note recover: pool write could not be verified; recovery file was preserved");
+    }
+    Ok(n)
 }
 
 const HERMEZ_SRS_NAME: &str = "hermez_kzg_srs_k19.bin";
@@ -2079,8 +2230,8 @@ async fn note_deploy_mint_voucher_recoverable(
     halo2_paths: &dexdo_core::private_note::Halo2Paths,
     failpoints: NoteDeployVoucherFailpoints,
 ) -> Result<dexdo_core::private_note::halo2::live::Halo2Proof> {
+    use dexdo_core::params::ROOT_PN_ADDRESS;
     use dexdo_core::private_note::{
-        artifacts::ROOT_PN_ADDRESS,
         halo2::{
             live::{prove_voucher_for_event, ProveVoucherForEventParams},
             sk_commit::compute_sk_u_commit_hex,
@@ -2088,7 +2239,7 @@ async fn note_deploy_mint_voucher_recoverable(
         proof,
     };
     let endpoint = client.endpoint();
-    let root_pn = dexdo_core::Address::parse(ROOT_PN_ADDRESS)?;
+    let root_pn = dexdo_core::address::parse_chain_address(ROOT_PN_ADDRESS)?.into_chain();
     let recipient_ephemeral_pubkey_hex = proof::strip_0x(recipient_ephemeral_pubkey_hex);
     let mut guarded_funding_keys = None;
     let mut checkpoint = match recovery.voucher_checkpoint(kind).cloned() {
@@ -2468,6 +2619,7 @@ async fn note_deploy_mint_voucher_recoverable(
         )?;
         proof
     };
+    note_deploy_validate_public_inputs(&proof)?;
     let persisted_proof = crate::cli::note::NoteDeployVoucherProof::from_halo2(&proof);
     if checkpoint.current_proof_is_rejected() {
         checkpoint.replace_rejected_proof(persisted_proof)?;
@@ -2905,6 +3057,7 @@ fn note_deploy_private_note_params(
 ) -> Result<serde_json::Value> {
     use dexdo_core::private_note::proof::{hex_u256_to_dec, pubkey_to_dec};
 
+    note_deploy_validate_public_inputs(deposit_zk)?;
     Ok(serde_json::json!({
         "zkproof": deposit_zk.proof,
         "depositIdentifierHash": deposit_identifier_hash,
@@ -2916,6 +3069,96 @@ fn note_deploy_private_note_params(
         "tokenType": deposit_zk.voucher_token_type,
         "layerNumber": deposit_zk.layer_number,
     }))
+}
+
+/// Match RootPN's _u64ToFr/_u32ToFr: canonical LE field bytes carried as a uint256.
+fn note_deploy_validate_public_inputs(
+    proof: &dexdo_core::private_note::halo2::live::Halo2Proof,
+) -> Result<()> {
+    use dexdo_core::private_note::proof::hex_u256_to_dec;
+
+    for (label, encoded, value) in [
+        (
+            "voucher nominal",
+            &proof.voucher_nominal_fr_hex,
+            proof.voucher_value,
+        ),
+        (
+            "token type",
+            &proof.token_type_fr_hex,
+            u64::from(proof.voucher_token_type),
+        ),
+    ] {
+        let mut expected = [0; 32];
+        expected[..8].copy_from_slice(&value.to_le_bytes());
+        if hex_u256_to_dec(encoded)? != hex_u256_to_dec(&hex::encode(expected))? {
+            bail!(
+                "invalid note deploy {label} public input: it does not match the paid voucher checkpoint; \
+                 refusing to submit or replace the saved proof. Preserve the recovery file and \
+                 reconcile it with the original VoucherGenerated event; do not fund a new voucher."
+            );
+        }
+    }
+    Ok(())
+}
+
+fn note_deploy_require_paid_reproof(
+    recovery: &crate::cli::note::NoteDeployRecoveryState,
+) -> Result<()> {
+    recovery.validate()?;
+    if !recovery.deposit_voucher.as_ref().is_some_and(|voucher| {
+        voucher.submit_maybe_sent && voucher.event.is_some() && voucher.proof.is_some()
+    }) {
+        bail!(
+            "note recovery reprove requires a paid voucher with its saved event and proof; \
+             use the original recovery file. No new wallet payment is permitted."
+        );
+    }
+    Ok(())
+}
+
+/// Only a finalized 137 with a confirmed absent note may discard a saved proof.
+/// Keep the durable checkpoint until its validated replacement is successfully persisted.
+async fn note_deploy_reprove_paid_voucher_with<Confirm, Reprove>(
+    recovery: &mut crate::cli::note::NoteDeployRecoveryState,
+    confirm: Confirm,
+    reprove: Reprove,
+) -> Result<()>
+where
+    Confirm: AsyncFnOnce(&crate::cli::note::NoteDeployRecoveryState) -> Result<()>,
+    Reprove: AsyncFnOnce(&mut crate::cli::note::NoteDeployRecoveryState) -> Result<()>,
+{
+    note_deploy_require_paid_reproof(recovery)?;
+    // A recorded note resumes finalization; a replacement without a POST resumes its first submit.
+    if recovery.pn_address.is_some() || recovery.deploy_submission.is_none() {
+        return Ok(());
+    }
+    match confirm(recovery).await {
+        Ok(()) => return Ok(()), // Existing active note: let the normal deploy resume finalize it.
+        // Preserve this checkpoint for the bounded history-recovery stage.
+        Err(error) if note_deploy_has_exact_finalized_rootpn_exit_code(&error, 403) => {
+            return Ok(())
+        }
+        Err(error) if note_deploy_has_exact_finalized_rootpn_exit_code(&error, 137) => {}
+        Err(error) => return Err(error),
+    }
+    let previous = recovery
+        .deposit_voucher
+        .clone()
+        .expect("paid voucher checked above");
+    let submission = recovery.deploy_submission.take();
+    let voucher = recovery
+        .deposit_voucher
+        .as_mut()
+        .expect("paid voucher checked above");
+    voucher.proof = None;
+    voucher.last_rejected_proof_layer = None;
+    if let Err(error) = reprove(recovery).await {
+        recovery.deposit_voucher = Some(previous);
+        recovery.deploy_submission = submission;
+        return Err(error);
+    }
+    Ok(())
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -2957,6 +3200,124 @@ async fn note_deploy_submit_private_note(
 }
 
 #[allow(clippy::too_many_arguments)]
+async fn resume_note_deploy_chain(
+    client: &dexdo_core::ChainClient,
+    recovery_path: &std::path::Path,
+    recovery: &mut crate::cli::note::NoteDeployRecoveryState,
+    funding_multisig_address: &str,
+    funding_key_loader: &dyn NoteDeployFundingKeyLoader,
+    pn_keys: &dexdo_core::KeyPair,
+    halo2_paths: &dexdo_core::private_note::Halo2Paths,
+    failpoints: NoteDeployVoucherFailpoints,
+) -> Result<crate::cli::note::OnboardPnState> {
+    let multisig = dexdo_core::Address::parse(funding_multisig_address)?;
+    note_deploy_resume_paid_with(
+        recovery,
+        async |state| {
+            let proof = state
+                .deposit_voucher
+                .as_ref()
+                .unwrap()
+                .proof
+                .as_ref()
+                .unwrap();
+            let dih = dexdo_core::private_note::proof::hex_u256_to_dec(
+                &proof.deposit_identifier_hash_hex,
+            )?;
+            let root =
+                dexdo_core::address::parse_chain_address(dexdo_core::params::ROOT_PN_ADDRESS)?
+                    .into_chain();
+            let expected_note = note_deploy_private_note_address(client, &root, &dih).await?;
+            note_deploy_wait_confirmation(
+                client,
+                &expected_note,
+                recovery_path,
+                state.deploy_submission.as_ref(),
+            )
+            .await
+        },
+        async |state| {
+            let token_type = state.token_type;
+            let raw_value = state.raw_value;
+            note_deploy_mint_voucher_recoverable(
+                client,
+                recovery_path,
+                state,
+                crate::cli::note::NoteDeployVoucherKind::Deposit,
+                &multisig,
+                funding_key_loader,
+                client,
+                client,
+                client,
+                pn_keys.public_hex(),
+                token_type,
+                raw_value,
+                false,
+                halo2_paths,
+                failpoints,
+            )
+            .await
+            .map(|_| ())
+        },
+        async |state| {
+            run_note_deploy_with_wallet_busy_retry(
+                funding_multisig_address,
+                async |_attempt| {
+                    deploy_private_note_from_multisig_recoverable(
+                        client,
+                        recovery_path,
+                        state,
+                        &multisig,
+                        funding_key_loader,
+                        pn_keys,
+                        halo2_paths,
+                        failpoints,
+                    )
+                    .await
+                },
+                async |duration| tokio::time::sleep(duration).await,
+            )
+            .await
+        },
+    )
+    .await
+}
+
+async fn note_deploy_resume_paid_with<Confirm, Reprove, Resume>(
+    recovery: &mut crate::cli::note::NoteDeployRecoveryState,
+    confirm: Confirm,
+    reprove: Reprove,
+    resume: Resume,
+) -> Result<crate::cli::note::OnboardPnState>
+where
+    Confirm: AsyncFnOnce(&crate::cli::note::NoteDeployRecoveryState) -> Result<()>,
+    Reprove: AsyncFnOnce(&mut crate::cli::note::NoteDeployRecoveryState) -> Result<()>,
+    Resume: AsyncFnOnce(
+        &mut crate::cli::note::NoteDeployRecoveryState,
+    ) -> Result<crate::cli::note::OnboardPnState>,
+{
+    // A payment without event/proof resumes capture/proving. A replacement without a POST is
+    // reused. Only a previously submitted proof is eligible for one protected 137 reprove.
+    if recovery.pn_address.is_none()
+        && recovery.deploy_submission.is_some()
+        && recovery
+            .deposit_voucher
+            .as_ref()
+            .is_some_and(|voucher| voucher.event.is_some() && voucher.proof.is_some())
+    {
+        match note_deploy_reprove_paid_voucher_with(recovery, confirm, reprove).await {
+            Err(error)
+                if error
+                    .downcast_ref::<NoteDeployUnconfirmed>()
+                    .is_some_and(|pending| pending.may_resubmit) => {}
+            result => result?,
+        }
+        // A safe retry keeps the old proof; the shared stage checks expiry before signing.
+    }
+    resume(recovery).await
+}
+
+#[allow(clippy::too_many_arguments)]
 async fn deploy_private_note_from_multisig_recoverable(
     client: &dexdo_core::ChainClient,
     recovery_path: &std::path::Path,
@@ -2967,10 +3328,8 @@ async fn deploy_private_note_from_multisig_recoverable(
     halo2_paths: &dexdo_core::private_note::Halo2Paths,
     failpoints: NoteDeployVoucherFailpoints,
 ) -> Result<crate::cli::note::OnboardPnState> {
-    use dexdo_core::private_note::{
-        artifacts::{PRIVATE_NOTE_ABI_JSON, ROOT_PN_ADDRESS},
-        proof::hex_u256_to_dec,
-    };
+    use dexdo_core::params::ROOT_PN_ADDRESS;
+    use dexdo_core::private_note::{artifacts::PRIVATE_NOTE_ABI_JSON, proof::hex_u256_to_dec};
     use dexdo_core::Address;
     use serde_json::json;
     if recovery.shell_funded && recovery.sanity_checked {
@@ -2978,7 +3337,7 @@ async fn deploy_private_note_from_multisig_recoverable(
         return recovery.to_onboard_state();
     }
 
-    let root_pn = Address::parse(ROOT_PN_ADDRESS)?;
+    let root_pn = dexdo_core::address::parse_chain_address(ROOT_PN_ADDRESS)?.into_chain();
     let (pn_address, _deposit_identifier_hash) = match (
         recovery.pn_address.clone(),
         recovery.deposit_identifier_hash.clone(),
@@ -3929,7 +4288,20 @@ where
     // before any path can fund a wallet or submit a voucher. A local write failure therefore costs
     // no SHELL, while a later chain failure leaves the exact key required to resume.
     crate::cli::progress::step(NOTE_DEPLOY_STEP_RECOVERY);
-    let mut recovery = ops.load_recovery().await?;
+    let recovery = ops.load_recovery().await?;
+    run_note_deploy_loaded(ops, recovery).await
+}
+
+async fn run_note_recover_resolved<O: NoteDeployResolvedOps>(ops: &mut O) -> Result<()> {
+    let recovery = ops.load_recovery().await?;
+    note_recover_require_paid(&recovery)?;
+    run_note_deploy_loaded(ops, recovery).await
+}
+
+async fn run_note_deploy_loaded<O: NoteDeployResolvedOps>(
+    ops: &mut O,
+    mut recovery: crate::cli::note::NoteDeployRecoveryState,
+) -> Result<()> {
     recovery.validate()?;
     crate::cli::progress::step(NOTE_DEPLOY_STEP_CHECKING);
     ops.preflight_doctor().await?;
@@ -4266,24 +4638,15 @@ impl NoteDeployResolvedOps for NoteDeployProductionOps<'_> {
         let pn_keys = self.pn_keys.as_ref().ok_or_else(|| {
             anyhow::anyhow!("note deploy recovery was not loaded before chain resume")
         })?;
-        run_note_deploy_with_wallet_busy_retry(
+        resume_note_deploy_chain(
+            self.client,
+            self.recovery_path,
+            recovery,
             self.funding_multisig_address,
-            async |_attempt| {
-                let multisig_address = dexdo_core::Address::parse(self.funding_multisig_address)
-                    .map_err(|e| anyhow::anyhow!("--multisig-address: {e}"))?;
-                deploy_private_note_from_multisig_recoverable(
-                    self.client,
-                    self.recovery_path,
-                    recovery,
-                    &multisig_address,
-                    self.args,
-                    pn_keys,
-                    self.halo2_paths,
-                    self.voucher_failpoints,
-                )
-                .await
-            },
-            async |duration| tokio::time::sleep(duration).await,
+            self.args,
+            pn_keys,
+            self.halo2_paths,
+            self.voucher_failpoints,
         )
         .await
     }
@@ -4493,6 +4856,9 @@ async fn run_note_deploy_with_wallet_store(
     let recovery_path = resolve_private_file_path(&recovery_path, "--recovery")?;
     note_deploy_recovery_pool_guard(&pool_path, &recovery_path)?;
 
+    // Shared with recover: serialize journal preparation, resume, pool write and retirement.
+    let _prover_serial_lock = acquire_note_deploy_serial_lock()?;
+
     // reserve the note owner key before the next call can enter wallet onboarding. With no
     // binding, onboarding may deploy/fund a wallet on chain, so starting inside the resolved-note
     // orchestration is too late. The temporary unbound form is valid only while it has no possible
@@ -4558,11 +4924,6 @@ async fn run_note_deploy_with_wallet_store(
     crate::cli::note::write_note_deploy_recovery(&recovery_path, &recovery)?;
 
     let client = ChainClient::connect(&endpoint)?;
-    // Held for the whole deploy, and deliberately not keyed to the wallet, the endpoint or the
-    // prover cache: what two concurrent deploys contend for is this machine's CPU, and losing that
-    // race costs the layer-0 history window. Taken before the first wallet spend, so a
-    // queued deploy waits with nothing paid rather than with a voucher whose window is expiring.
-    let _prover_serial_lock = acquire_note_deploy_serial_lock()?;
     // The wallet's turn, shared with `note topup`: both commands spend from this multisig,
     // so both take THIS lock under THIS key. Keyed on the manifest network read above -- the same
     // field `note topup` reads, so the two agree on which chain the wallet is being spent on, and
@@ -9870,9 +10231,7 @@ mod tests {
         }
     }
 
-    /// 403 and 137 sit next to each other and mean opposite things -- one is answered by
-    /// proving again, the other by never proving that voucher again -- so the operator must be able
-    /// to tell them apart from what the tool prints.
+    /// History expiry may reprove automatically; invalid proof needs explicit paid recovery.
 
     /// Neither is allowed to arrive as an undifferentiated "submit failed", and neither may be
     /// decided from message text: both are keyed on the exact finalized compute exit code, which is
@@ -9900,7 +10259,7 @@ mod tests {
             "{zkproof}"
         );
         assert!(
-            zkproof.contains("action=do_not_retry_this_voucher"),
+            zkproof.contains("action=inspect_paid_voucher_proof"),
             "{zkproof}"
         );
         assert!(
@@ -10160,8 +10519,16 @@ mod tests {
             proof: format!("fixture-proof-{fixture_digit}"),
             deposit_identifier_hash_hex: fixture_digit.to_string().repeat(64),
             final_layer_historical_hash_root_hex: "1".repeat(64),
-            voucher_nominal_fr_hex: "2".repeat(64),
-            token_type_fr_hex: "3".repeat(64),
+            voucher_nominal_fr_hex: {
+                let mut bytes = [0; 32];
+                bytes[..8].copy_from_slice(&raw_value.to_le_bytes());
+                hex::encode(bytes)
+            },
+            token_type_fr_hex: {
+                let mut bytes = [0; 32];
+                bytes[..4].copy_from_slice(&token_type.to_le_bytes());
+                hex::encode(bytes)
+            },
             ephemeral_pubkey_hex: owner_public_key_hex.to_string(),
             voucher_value: raw_value,
             voucher_token_type: token_type,
@@ -12744,3 +13111,11 @@ mod note_deploy_confirmation_2043_tests;
 #[cfg(test)]
 #[path = "note_deploy_confirmation_2043_review_tests.rs"]
 mod note_deploy_confirmation_2043_review_tests;
+
+#[cfg(test)]
+#[path = "note_deploy_paid_voucher_2088_tests.rs"]
+mod note_deploy_paid_voucher_2088_tests;
+
+#[cfg(test)]
+#[path = "note_recover_2110_tests.rs"]
+mod note_recover_2110_tests;

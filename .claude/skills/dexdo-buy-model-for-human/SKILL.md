@@ -311,6 +311,13 @@ seller substituted or defrauded, `dexdo dispute` freezes the contested amount an
 it is strictly stronger than `recover`, which still pays for what was delivered. If a deal was
 funded but never opened, `dexdo reclaim` recovers the escrow once the match-open timer has passed.
 
+A deal that opened but never received a request from you stays open with no time limit: the seller
+takes the probe only after your first request, and quitting the buyer process does not end the deal.
+Your deposit and bond stay locked in it until one side stops it. This is the intended behavior. Send
+a request to start using what you bought, or stop the deal with `dexdo recover`: before the probe is
+accepted, a STOP burns your probe `P` and `P` of the seller bond, and returns the rest of your escrow
+and your whole bond.
+
 When the cause is not obvious, run `dexdo doctor` first.
 
 ---

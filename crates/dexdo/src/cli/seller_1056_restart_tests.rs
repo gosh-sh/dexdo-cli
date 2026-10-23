@@ -138,6 +138,8 @@ fn issue_1056_seller_args(
     endpoints_file: std::path::PathBuf,
 ) -> crate::cli::args::SellerArgs {
     crate::cli::args::SellerArgs {
+        max_concurrent_requests_per_deal:
+            dexdo_core::params::SELLER_MAX_CONCURRENT_REQUESTS_PER_DEAL,
         mock: crate::cli::args::MockFlags {
             mock_model: true,
             mock_chain: true,
@@ -180,7 +182,10 @@ async fn issue_1056_restart_child() {
     let residual_ticks = 98 - matched_ticks;
     let root = tempfile::tempdir().expect(" restart directory");
     let seller_seed = [0x56; 32];
-    crate::cli::support::write_owner_only_key_fixture(&root.path().join("seller.key"), &hex::encode(seller_seed));
+    crate::cli::support::write_owner_only_key_fixture(
+        &root.path().join("seller.key"),
+        &hex::encode(seller_seed),
+    );
     let seller_owner = issue_1056_seller_owner(seller_seed);
     let parent_token_contract = issue_1056_parent_token_contract();
     let successor_token_contract = issue_1056_successor_token_contract(&seller_owner);
@@ -320,7 +325,9 @@ fn issue_1056_restart_after_terminal_settlement_queues_exact_residual_and_names_
     // the operator channel names a per-deal TokenContract canonically, and a TokenContract is a
     // self-DApp account, so its DApp half is its own account id. The fixture holds the chain form.
     let parent_chain_form = issue_1056_parent_token_contract();
-    let parent_account = parent_chain_form.strip_prefix("0:").expect(" chain form");
+    let parent_account = parent_chain_form
+        .strip_prefix("0:")
+        .expect(" chain form");
     let parent = format!("{parent_account}::{parent_account}");
     assert!(
         output.contains(&format!(
@@ -346,7 +353,8 @@ fn issue_1056_restart_after_terminal_settlement_queues_exact_residual_and_names_
 async fn issue_1056_in_process_residual_relist_is_unchanged() {
     let root = tempfile::tempdir().expect(" in-process directory");
     let relisted =
-        pool_run_after_parent_settled(root.path(), 2, None, false, false, false, false, false).await;
+        pool_run_after_parent_settled(root.path(), 2, None, false, false, false, false, false)
+            .await;
     relisted
         .outcome
         .expect("PR1055's in-process relist must remain healthy");
@@ -367,7 +375,9 @@ fn issue_1056_restart_after_full_fill_queues_nothing() {
     // the operator channel names a per-deal TokenContract canonically, and a TokenContract is a
     // self-DApp account, so its DApp half is its own account id. The fixture holds the chain form.
     let parent_chain_form = issue_1056_parent_token_contract();
-    let parent_account = parent_chain_form.strip_prefix("0:").expect(" chain form");
+    let parent_account = parent_chain_form
+        .strip_prefix("0:")
+        .expect(" chain form");
     let parent = format!("{parent_account}::{parent_account}");
     assert!(
         output.contains(&format!(

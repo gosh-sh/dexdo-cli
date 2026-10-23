@@ -40,6 +40,14 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
 use tvm_block::Deserializable;
 
+#[path = "buyer_usage_evidence.rs"]
+mod buyer_usage_evidence;
+pub use buyer_usage_evidence::{BuyerUsageOperation, BuyerUsageOperations};
+
+#[path = "seller_placement.rs"]
+mod seller_placement;
+pub(super) use seller_placement::SellerPlacement;
+
 #[cfg(test)]
 #[path = "client_issue_1120_tests.rs"]
 mod client_issue_1120_tests;
@@ -75,6 +83,14 @@ mod client_issue_1861_tests;
 #[cfg(test)]
 #[path = "client_issue_1998_tests.rs"]
 mod client_issue_1998_tests;
+
+#[cfg(test)]
+#[path = "client_issue_2122_tests.rs"]
+mod client_issue_2122_tests;
+
+#[cfg(test)]
+#[path = "client_producer_rate_limit_tests.rs"]
+mod client_producer_rate_limit_tests;
 
 // the fall-through step of `resolve_endpoint`. Declared beside the pair because it
 // pins the other half of the same rule -- refuses a label the endpoint contradicts, this one
@@ -1009,15 +1025,22 @@ impl GraphQlBodyError {
         }
     }
 
-    /// Did the server say its connection pool was exhausted?
-
-    /// Deliberately narrow: this one condition and no other body error. A predicate that treated
-    /// every `errors` entry as transient would start repeating reads the server refused on purpose.
-    fn is_pool_exhaustion(&self) -> bool {
-        self.messages
-            .iter()
-            .any(|message| message.to_ascii_lowercase().contains("pool timed out"))
+    /// Only known infrastructure failures are repeatable; schema and contract refusals are not.
+    fn is_transient_read(&self) -> bool {
+        self.messages.iter().any(|message| {
+            message.to_ascii_lowercase().contains("pool timed out")
+                || block_manager_account_read_unavailable(message)
+        })
     }
+}
+
+// GraphQL can answer HTTP 200 while its own account read cannot connect to the Block Manager.
+// This describes a read that got no chain answer, never a contract result or a money POST.
+fn block_manager_account_read_unavailable(message: &str) -> bool {
+    message.starts_with("failed to get account ")
+        && message.contains("error sending request to ")
+        && message.contains("/v2/account?")
+        && message.contains("client error (Connect): tcp connect error: Connection refused")
 }
 
 impl std::fmt::Display for GraphQlBodyError {
@@ -2682,16 +2705,32 @@ pub(super) fn is_transient_transport_failure(error: &anyhow::Error) -> bool {
 /// This is NOT a judgement about submits, money, or contract results -- only about a read that came
 /// back without an answer.
 pub fn is_transient_read_failure(error: &anyhow::Error) -> bool {
+    // Startup must retry every inconclusive provision-account response, including
+    // an unrelated 404. This marker belongs only to that read; submit policy is unchanged.
+    if error.downcast_ref::<ProvisionAccountReadError>().is_some() {
+        return true;
+    }
     if is_transient_transport_failure(error) {
         return true;
     }
     if read_request_got_no_response(error) {
         return true;
     }
-    error
-        .chain()
-        .find_map(|cause| cause.downcast_ref::<GraphQlBodyError>())
-        .is_some_and(GraphQlBodyError::is_pool_exhaustion)
+    error.chain().any(|cause| {
+        if let Some(body) = cause.downcast_ref::<GraphQlBodyError>() {
+            return body.is_transient_read();
+        }
+        // The pinned SDK's account reader flattens errors[] into this exact prefix. Inspect
+        // only that envelope, not arbitrary error prose, and keep submit retry unchanged.
+        let message = cause.to_string();
+        let Some(body) = message.strip_prefix("GraphQL errors: ") else {
+            return false;
+        };
+        match serde_json::from_str::<Value>(body) {
+            Ok(errors) => GraphQlBodyError::from_errors(&errors).is_transient_read(),
+            Err(_) => block_manager_account_read_unavailable(body),
+        }
+    })
 }
 
 /// A request that ended before any response existed: the connection was reset, closed or broken
@@ -2748,6 +2787,32 @@ impl std::fmt::Display for RetryAfter {
 
 impl std::error::Error for RetryAfter {}
 
+/// An account response that proves neither presence nor the specific shard-state absence.
+#[derive(Debug)]
+struct ProvisionAccountReadError {
+    status: reqwest::StatusCode,
+    body: String,
+    retry_after: Option<RetryAfter>,
+}
+
+impl std::fmt::Display for ProvisionAccountReadError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "provision account read returned HTTP {}: {}",
+            self.status, self.body
+        )
+    }
+}
+
+impl std::error::Error for ProvisionAccountReadError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        self.retry_after
+            .as_ref()
+            .map(|delay| delay as &(dyn std::error::Error + 'static))
+    }
+}
+
 /// Chain reads, retried when they got no answer.
 
 /// One policy for every read, whichever way it leaves the process -- the SDK's getter, our own
@@ -2781,10 +2846,10 @@ where
                 }
                 error
             }
-            Err(_) => anyhow::anyhow!(
+            Err(elapsed) => anyhow::Error::new(elapsed).context(format!(
                 "chain read exceeded {:?} on attempt {attempt}",
                 crate::params::TRANSIENT_READ_ATTEMPT_TIMEOUT
-            ),
+            )),
         };
 
         let wait = retry_after_delay(&error).unwrap_or(delay);
@@ -3240,19 +3305,19 @@ async fn read_deal_snapshot_round<S: DealSnapshotSource + Send>(
 async fn read_coherent_deal_snapshot<S: DealSnapshotSource + Send>(
     source: &mut S,
 ) -> Result<Option<DealChainSnapshot>> {
-    let mut last_reason = "no snapshot attempt completed".to_string();
+    let mut last_error = anyhow!("no snapshot attempt completed");
     for attempt in 1..=DEAL_SNAPSHOT_MAX_ATTEMPTS {
         match read_deal_snapshot_round(source).await {
             Ok(snapshot) => return Ok(snapshot),
             Err(error) => {
-                last_reason = format!("attempt {attempt}: bracketed read failed: {error}");
+                last_error = error.context(format!("attempt {attempt}: bracketed read failed"));
             }
         }
     }
-    Err(anyhow!(
+    Err(last_error.context(format!(
         "could not obtain a coherent TokenContract snapshot after \
-         {DEAL_SNAPSHOT_MAX_ATTEMPTS} attempts: {last_reason}"
-    ))
+         {DEAL_SNAPSHOT_MAX_ATTEMPTS} attempts"
+    )))
 }
 
 #[cfg(test)]
@@ -3262,6 +3327,7 @@ mod coherent_deal_snapshot_tests {
     #[derive(Clone, Copy)]
     enum Script {
         Stable,
+        SubscriptionTimeout,
         DestroyAfter(usize),
         MutateAfter(usize),
         MutateEveryRound,
@@ -3280,7 +3346,7 @@ mod coherent_deal_snapshot_tests {
         fn observe(&mut self) -> (bool, u64) {
             self.calls += 1;
             match self.script {
-                Script::Stable => (true, 0),
+                Script::Stable | Script::SubscriptionTimeout => (true, 0),
                 Script::DestroyAfter(last_alive) => (self.calls <= last_alive, 0),
                 Script::MutateAfter(last_old) => (true, u64::from(self.calls > last_old)),
                 Script::MutateEveryRound => (true, ((self.calls - 1) / 5) as u64),
@@ -3337,6 +3403,12 @@ mod coherent_deal_snapshot_tests {
 
         async fn subscription(&mut self) -> Result<Option<DealSubscription>> {
             let (alive, generation) = self.observe();
+            if matches!(self.script, Script::SubscriptionTimeout) {
+                return retry_transient_read(
+                    std::future::pending::<Result<Option<DealSubscription>>>,
+                )
+                .await;
+            }
             Ok(alive.then(|| Self::subscription(generation)))
         }
 
@@ -3424,6 +3496,29 @@ mod coherent_deal_snapshot_tests {
             .expect("active contract");
         assert_eq!(source.calls, 6);
         assert_eq!(snapshot.buyer_locked().unwrap(), 102);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn coherent_snapshot_2129_preserves_a_single_getter_timeout_then_recovers() {
+        let mut source = ScriptSource::new(Script::SubscriptionTimeout);
+        let error = read_coherent_deal_snapshot(&mut source).await.unwrap_err();
+        assert!(
+            error
+                .chain()
+                .any(|cause| cause.is::<tokio::time::error::Elapsed>()),
+            "the snapshot must retain the timeout's type: {error:#}"
+        );
+        assert!(format!("{error:#}").contains(crate::CHAIN_READ_EXHAUSTED_MESSAGE_PREFIX));
+        assert_eq!(
+            source.calls,
+            3 * DEAL_SNAPSHOT_MAX_ATTEMPTS,
+            "only subscription fails; account and state reads remain healthy"
+        );
+        source.script = Script::Stable;
+        assert!(read_coherent_deal_snapshot(&mut source)
+            .await
+            .unwrap()
+            .is_some());
     }
 
     #[tokio::test]
@@ -4069,17 +4164,22 @@ async fn send_message_routed_money_once(
         })
     })?;
     checked_submit_response(response).map_err(|source| {
-        // The manager timed out after forwarding the BOC. Its response is not proof that
-        // the producer rejected it; keep the original identity and reconcile without a new POST.
-        anyhow::Error::new(if is_block_producer_forwarding_timeout(&source) {
-            MoneySubmitError::Ambiguous { source }
-        } else {
-            MoneySubmitError::Rejected { source }
-        })
+        // A forwarding timeout or the manager's final 429 can hide an earlier accepted
+        // forwarding attempt. Neither proves rejection of the whole money operation;
+        // retain the original identity and reconcile without another POST.
+        anyhow::Error::new(
+            if is_block_producer_forwarding_timeout(&source)
+                || is_producer_rate_limit_submit(&source)
+            {
+                MoneySubmitError::Ambiguous { source }
+            } else {
+                MoneySubmitError::Rejected { source }
+            },
+        )
     })
 }
 
-fn is_block_producer_forwarding_timeout(error: &anyhow::Error) -> bool {
+pub(super) fn is_block_producer_forwarding_timeout(error: &anyhow::Error) -> bool {
     error
         .downcast_ref::<crate::onchain_diagnostics::OnchainSubmitError>()
         .is_some_and(|error| {
@@ -4099,8 +4199,48 @@ fn is_queue_overflow_submit(error: &anyhow::Error) -> bool {
         || message.contains("message queue is full")
 }
 
+fn is_producer_rate_limit_submit(error: &anyhow::Error) -> bool {
+    // The manager reports only its final producer HTTP 429, without forwarding history.
+    // Money submissions treat it as ambiguous; replay-protected provisioning may retry
+    // the same signed BOC. Arbitrary error text or a lost response does not match.
+    error
+        .chain()
+        .find_map(|cause| cause.downcast_ref::<OnchainSubmitError>())
+        .is_some_and(|error| {
+            let refusal = &error.sanitized_payload()["error"];
+            refusal["code"] == "INTERNAL_ERROR"
+                && refusal["message"].as_str().is_some_and(|message| {
+                    message.starts_with(
+                        "Block Producer returned non-success HTTP status 429 Too Many Requests:",
+                    )
+                })
+        })
+}
+
 fn is_transient_submit_failure(error: &anyhow::Error) -> bool {
-    is_queue_overflow_submit(error) || is_transient_transport_failure(error)
+    is_queue_overflow_submit(error)
+        || is_producer_rate_limit_submit(error)
+        || is_transient_transport_failure(error)
+}
+
+fn conclusive_sell_refusal(error: &anyhow::Error) -> bool {
+    if error
+        .downcast_ref::<reqwest::Error>()
+        .is_some_and(|error| error.is_builder() || error.is_connect())
+    {
+        return true;
+    }
+    error
+        .downcast_ref::<OnchainSubmitError>()
+        .is_some_and(|error| {
+            let refusal = &error.sanitized_payload()["error"];
+            matches!(
+                refusal["code"].as_str(),
+                Some("INVALID_ARGUMENT" | "QUEUE_OVERFLOW")
+            ) || refusal
+                .as_str()
+                .is_some_and(|text| text.starts_with("QUEUE_OVERFLOW:"))
+        })
 }
 
 fn is_decoded_transient_money_rejection(error: &anyhow::Error) -> bool {
@@ -4874,6 +5014,7 @@ pub(super) struct SellerOfferEvents {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PlaceInferenceBuyReceipt {
     pub message_id: String,
+    pub model_hash: String,
     pub created_at: u64,
     pub max_price_per_tick: u128,
     pub ticks: u128,
@@ -5314,22 +5455,32 @@ where
 {
     // Existing PR689 reader bound. R20-10 reuses the reader rather than defining a second pager.
     let mut before: Option<String> = None;
+    let mut visited_cursors = std::collections::HashSet::new();
     let mut pages = Vec::new();
     loop {
-        let page = fetch_ext_out_page(
-            gate,
-            http,
-            endpoint,
-            account_id,
-            dapp_id,
-            crate::params::EXT_OUT_PAGE_SIZE,
-            before.as_deref(),
-        )
+        // Bound/retry each page, retaining earlier pages while a later read retries.
+        // A valid lifetime history may take longer than one read-attempt timeout.
+        let page = retry_transient_read(|| {
+            fetch_ext_out_page(
+                gate,
+                http,
+                endpoint,
+                account_id,
+                dapp_id,
+                crate::params::EXT_OUT_PAGE_SIZE,
+                before.as_deref(),
+            )
+        })
         .await?;
         pages.push(page.messages);
         let Some(next) = page.previous_cursor else {
             break;
         };
+        if !visited_cursors.insert(next.clone()) {
+            return Err(anyhow!(
+                "account {account_id} ext-out pagination repeated a cursor"
+            ));
+        }
         before = Some(next);
     }
     // Pages are fetched newest first; edges inside each page already carry chain order. Reverse
@@ -5798,6 +5949,66 @@ pub fn parse_source_transaction_out_messages(
         .map(Some)
 }
 
+/// Bind a recovered admission event to the exact finalized submit receipt retained in a funding
+/// journal. Destination/amount matches in account history alone cannot identify a local attempt.
+pub async fn multisig_event_is_from_transaction(
+    http: &reqwest::Client,
+    endpoint: &str,
+    event_message_id: &str,
+    transaction_hash: &str,
+) -> Result<bool> {
+    let gql = format!("{}/graphql", endpoint.trim_end_matches('/'));
+    let response = post_message_query(
+        http,
+        &gql,
+        SOURCE_TRANSACTION_OUT_MESSAGES_QUERY,
+        event_message_id,
+        "multisig submission identity",
+    )
+    .await?;
+    multisig_event_transaction_matches(&response, event_message_id, transaction_hash)
+}
+
+fn multisig_event_transaction_matches(
+    response: &Value,
+    event_message_id: &str,
+    transaction_hash: &str,
+) -> Result<bool> {
+    let Some(out_messages) = parse_source_transaction_out_messages(response, event_message_id)?
+    else {
+        return Ok(false);
+    };
+    Ok(response
+        .pointer("/data/blockchain/message/src_transaction/id")
+        .and_then(Value::as_str)
+        .is_some_and(|id| bare_hex(id) == bare_hex(transaction_hash))
+        && out_messages
+            .iter()
+            .any(|id| bare_hex(id) == bare_hex(event_message_id)))
+}
+
+#[cfg(test)]
+mod funding_submit_identity_tests {
+    use super::*;
+
+    #[test]
+    fn an_admission_must_belong_to_the_exact_saved_submit_receipt() {
+        let response = json!({"data": {"blockchain": {"message": {
+            "id": "event", "src_transaction": {"id": "submit", "out_msgs": ["event"]}
+        }}}});
+        assert!(multisig_event_transaction_matches(&response, "event", "submit").unwrap());
+        assert!(!multisig_event_transaction_matches(&response, "event", "another-submit").unwrap());
+        assert!(multisig_event_transaction_matches(&response, "another-event", "submit").is_err());
+
+        let mut no_sibling = response.clone();
+        no_sibling["data"]["blockchain"]["message"]["src_transaction"]["out_msgs"] =
+            json!(["unrelated"]);
+        assert!(!multisig_event_transaction_matches(&no_sibling, "event", "submit").unwrap());
+        let pruned = json!({"data": {"blockchain": {"message": null}}});
+        assert!(!multisig_event_transaction_matches(&pruned, "event", "submit").unwrap());
+    }
+}
+
 /// One message's destination account, by exact hash. `None` when the index does not know it.
 pub fn parse_message_destination(
     response: &Value,
@@ -5956,9 +6167,8 @@ pub async fn prove_multisig_delivery_message(
 /// the retry only on the receipt read would have made the release note half true: the same money
 /// path would still die on a `502`, one step earlier.
 
-/// Pure, on the same terms as [`query_exact_destination_receipt`]: `query` is `&'static str` and its
-/// only two arguments are [`SOURCE_TRANSACTION_OUT_MESSAGES_QUERY`] and
-/// [`MESSAGE_DESTINATION_QUERY`], both GraphQL **queries** over `blockchain.message`. Nothing is
+/// Pure, on the same terms as [`query_exact_destination_receipt`]: `query` is `&'static str` and
+/// callers supply fixed GraphQL **queries** over `blockchain.message`. Nothing is
 /// submitted, so nothing can be submitted twice.
 
 /// The `errors` check below stays OUTSIDE the retry, deliberately. A GraphQL failure carried in a
@@ -7138,6 +7348,60 @@ impl RealChainBackend {
         &self.client
     }
 
+    /// Resolve a startup provision reservation from the REST account response.
+    /// Both a found account and the exact shard-state absence settle the pending flag.
+    /// Every other response is inconclusive and uses the existing bounded read retry policy.
+    pub async fn provision_account_exists(&self, token_contract: &Address) -> Result<bool> {
+        retry_transient_read(|| async {
+            self.client.gate().admit().await;
+            let response = self
+                .http
+                .get(format!("{}/v2/account", self.client.endpoint()))
+                .query(&[
+                    ("account_id", token_contract.bare()),
+                    ("dapp_id", token_contract.bare()),
+                ])
+                .send()
+                .await?;
+            let status = response.status();
+            let retry_after = response
+                .headers()
+                .get(reqwest::header::RETRY_AFTER)
+                .and_then(|value| value.to_str().ok())
+                .and_then(|value| value.parse().ok())
+                .map(|seconds| RetryAfter { seconds });
+            let body = response.text().await?;
+            if status == reqwest::StatusCode::NOT_FOUND
+                && matches!(
+                    body.trim(),
+                    "Original error: Can't find account in shard state"
+                        | "Can't find account in shard state"
+                )
+            {
+                return Ok(false);
+            }
+            if status.is_success() {
+                if let Ok(account) = serde_json::from_str::<Value>(&body) {
+                    if account.get("account_id").and_then(Value::as_str)
+                        == Some(token_contract.bare())
+                        && account
+                            .get("boc")
+                            .and_then(Value::as_str)
+                            .is_some_and(|boc| !boc.is_empty())
+                    {
+                        return Ok(true);
+                    }
+                }
+            }
+            Err(anyhow::Error::new(ProvisionAccountReadError {
+                status,
+                body,
+                retry_after,
+            }))
+        })
+        .await
+    }
+
     /// Read an account through the ceiling.
 
     /// Additive: this does not replace `client().get_account(..)`, it is the metered way to do the
@@ -7990,6 +8254,25 @@ impl RealChainBackend {
         Ok(Some((tick_size, price_per_tick, max_ticks)))
     }
 
+    /// The funded purchase volume and execution price, independent of remaining escrow.
+    pub async fn token_contract_purchase_terms(
+        &self,
+        tc: &Address,
+    ) -> Result<Option<(u128, u128)>> {
+        let Some((tick_size, price, _)) = self.token_contract_deal_terms(tc).await? else {
+            return Ok(None);
+        };
+        let Some(subscription) = self.token_contract_subscription(tc).await? else {
+            return Ok(None);
+        };
+        anyhow::ensure!(tick_size > 0 && price > 0, "invalid purchased deal terms");
+        anyhow::ensure!(
+            subscription.funded_tokens > 0 && subscription.funded_tokens.is_multiple_of(tick_size),
+            "funded purchase is not a positive whole number of ticks"
+        );
+        Ok(Some((subscription.funded_tokens / tick_size, price)))
+    }
+
     /// Read the **buyer's ed25519 pubkey** from `TokenContract` (`getBuyerPubkey`, uint256) -- the book
     /// records it on a match (`placeInferenceBuy`). From it the seller **reconstructs the x25519 handover**
     /// and encrypts the endpoint to
@@ -8335,9 +8618,23 @@ impl RealChainBackend {
     /// so only deploy-message sends get the funded-uninit `/v2/account` 404 tolerance.
     async fn retry_submit(&self, boc: &str, deploy: bool, dapp: Option<&str>) -> Result<Value> {
         self.clock_skew_preflight().await?;
+        self.retry_submit_preflighted(boc, deploy, dapp, &mut false)
+            .await
+    }
+
+    /// The caller has completed clock/signing preparation before recording an outstanding send.
+    async fn retry_submit_preflighted(
+        &self,
+        boc: &str,
+        deploy: bool,
+        dapp: Option<&str>,
+        possibly_dispatched: &mut bool,
+    ) -> Result<Value> {
         let mut delay = crate::params::TRANSIENT_SUBMIT_INITIAL_BACKOFF;
         for attempt in 1..=crate::params::TRANSIENT_SUBMIT_RETRIES_BEFORE_FINAL {
-            match self.submit_once(boc, deploy, dapp).await {
+            let result = self.submit_once(boc, deploy, dapp).await;
+            *possibly_dispatched |= !result.as_ref().is_err_and(conclusive_sell_refusal);
+            match result {
                 Ok(v) => return Ok(v),
                 Err(e) if is_transient_submit_failure(&e) => {
                     eprintln!(
@@ -8351,7 +8648,9 @@ impl RealChainBackend {
             }
         }
         // Final attempt -- pass the result through as-is (Ok or the final error).
-        self.submit_once(boc, deploy, dapp).await
+        let result = self.submit_once(boc, deploy, dapp).await;
+        *possibly_dispatched |= !result.as_ref().is_err_and(conclusive_sell_refusal);
+        result
     }
 
     /// Regular write without a known system-contract ABI: discover the destination dapp.
@@ -8419,50 +8718,20 @@ impl RealChainBackend {
         let want_ob = Address::parse(&order_book.with_workchain())
             .map(|a| a.with_workchain())
             .unwrap_or_else(|_| order_book.with_workchain());
-        let endpoint = self.client.endpoint();
-        let gql = format!("{}/graphql", endpoint.trim_end_matches('/'));
-        let query = r#"
-            query($accountId: String!, $dappId: String!, $last: Int!) {
-              blockchain {
-                account(account_id: $accountId, dapp_id: $dappId) {
-                  messages(msg_type: [ExtOut], last: $last) {
-                    edges { node { body created_at } }
-                  }
-                }
-              }
-            }
-        "#;
-        // Keep the bounded read retry policy for owner fill history after money was POSTed.
-        // PrivateNote belongs to the system dapp, so no account-id lookup is needed here.
-        let resp: Value = retry_transient_read(|| async {
-            // This inline GraphQL request takes the same gate as the history pager.
-            let dapp_id = crate::address::DEXDO_DAPP_ID;
-            self.client.gate().admit().await;
-            let response = self
-                .http
-                .post(&gql)
-                .json(&json!({
-                    "query": query,
-                    "variables": { "accountId": account_id, "dappId": dapp_id, "last": 200 },
-                }))
-                .send()
-                .await?;
-            Ok(chain_response_for_status(response).await?.json().await?)
-        })
+        // PrivateNote belongs to the system dapp. Reuse the history pager so recovery
+        // reaches fills older than the newest page without another dapp-id lookup.
+        let messages = fetch_all_ext_out_messages_routed(
+            self.client.gate(),
+            &self.http,
+            self.client.endpoint(),
+            &account_id,
+            crate::address::DEXDO_DAPP_ID,
+            |message| Ok(Some(message)),
+        )
         .await?;
-        let edges = resp["data"]["blockchain"]["account"]["messages"]["edges"]
-            .as_array()
-            .ok_or_else(|| anyhow!("note ext-out GraphQL shape changed: {resp}"))?;
         let mut matches = Vec::<(i64, MatchedFill)>::new();
-        for edge in edges {
-            let node = &edge["node"];
-            let created = node["created_at"]
-                .as_i64()
-                .or_else(|| node["created_at"].as_str().and_then(|s| s.parse().ok()));
-            let Some(body) = node["body"].as_str() else {
-                continue;
-            };
-            match super::note_events::decode_inference_filled(body) {
+        for message in messages {
+            match super::note_events::decode_inference_filled(&message.body) {
                 Ok(Some(fill)) => {
                     if fill.is_buy != want_is_buy {
                         continue;
@@ -8473,10 +8742,8 @@ impl RealChainBackend {
                     if got_ob != want_ob {
                         continue;
                     }
-                    let created_at = created.ok_or_else(|| {
-                        anyhow!(
-                            "InferenceFilledConfirmed ext-out on note {account_id} has no created_at cursor"
-                        )
+                    let created_at = message.created_at.try_into().map_err(|_| {
+                        anyhow!("InferenceFilledConfirmed ext-out on note {account_id} has created_at above i64")
                     })?;
                     let tc = Address::parse(&fill.token_contract)
                         .map_err(|e| {
@@ -8985,6 +9252,44 @@ impl RealChainBackend {
         .await
     }
 
+    /// Persist the exact signed message before submitting it. A missing acknowledgement must
+    /// never erase the identity needed to reconcile the note -> TC -> book execution.
+    pub(super) async fn post_sell_offer_with_identity(
+        &self,
+        note: &Address,
+        owner_keys: &KeyPair,
+        flags: u8,
+        nonce: u64,
+        ttl: u64,
+        before_post: &mut (dyn FnMut(String) -> Result<()> + Send),
+    ) -> Result<Value> {
+        let (_, boc, _, _) = self
+            .prepare_money_post(
+                note,
+                PRIVATENOTE_ABI,
+                "postSellOffer",
+                json!({ "flags": flags, "nonce": nonce.to_string(), "ttl": ttl.to_string() }),
+                owner_keys,
+            )
+            .await?;
+        before_post(external_message_hash(&boc)?)?;
+        let mut possibly_dispatched = false;
+        self.retry_submit_preflighted(
+            &boc,
+            false,
+            Some(crate::address::DEXDO_DAPP_ID),
+            &mut possibly_dispatched,
+        )
+        .await
+        .map_err(|source| {
+            anyhow::Error::new(if possibly_dispatched {
+                MoneySubmitError::Ambiguous { source }
+            } else {
+                MoneySubmitError::Rejected { source }
+            })
+        })
+    }
+
     /// Say WHICH pocket is short before the book answers `ERR_LOW_VALUE` for either.
 
     /// Read-only, and it fails OPEN: a balance that will not read is not evidence of a shortfall,
@@ -9051,7 +9356,7 @@ impl RealChainBackend {
         .await
     }
 
-    /// Prepare the exact signed buy BOC and route, prime the owner-fill cursor, persist its
+    /// Prime the owner-fill cursor and balance, prepare the exact signed buy BOC and route, persist its
     /// identity through `before_post`, then use the existing no-redirect money client once.
     #[allow(clippy::too_many_arguments)]
     pub async fn place_inference_buy_with_submit_identity(
@@ -9068,6 +9373,15 @@ impl RealChainBackend {
         cursor: &mut MatchWatchCursor,
         before_post: &mut (dyn FnMut(String, MatchWatchCursor, u128) -> Result<()> + Send),
     ) -> Result<Value> {
+        let mut final_cursor = MatchWatchCursor::new(0);
+        self.poll_inference_filled_tcs(note, order_book, true, &mut final_cursor)
+            .await
+            .map_err(|source| anyhow::Error::new(MoneySubmitError::Preparation { source }))?;
+        let note_shell_balance = self
+            .private_note_shell_balance(note)
+            .await
+            .map_err(|source| anyhow::Error::new(MoneySubmitError::Preparation { source }))?;
+        // Lifetime history reads must finish before the signed message's expiry starts.
         let (endpoint, boc, account_id, dapp_id) = self
             .prepare_money_post(
                 note,
@@ -9084,15 +9398,7 @@ impl RealChainBackend {
                 owner_keys,
             )
             .await?;
-        let mut final_cursor = MatchWatchCursor::new(0);
-        self.poll_inference_filled_tcs(note, order_book, true, &mut final_cursor)
-            .await
-            .map_err(|source| anyhow::Error::new(MoneySubmitError::Preparation { source }))?;
         *cursor = final_cursor;
-        let note_shell_balance = self
-            .private_note_shell_balance(note)
-            .await
-            .map_err(|source| anyhow::Error::new(MoneySubmitError::Preparation { source }))?;
         before_post(
             money_submit_identity(&boc),
             cursor.clone(),
@@ -9109,7 +9415,7 @@ impl RealChainBackend {
         .await
     }
 
-    /// Prepare one BUY money message, anchor its placement/fill cursors,
+    /// Anchor the placement/fill cursors, prepare one BUY money message,
     /// persist its identity through `before_post`, then POST exactly once.
     #[allow(clippy::too_many_arguments, clippy::type_complexity)]
     pub async fn place_inference_buy_with_identity_and_cursors(
@@ -9140,22 +9446,6 @@ impl RealChainBackend {
                 ));
             }
         }
-        let (endpoint, boc, account_id, dapp_id) = self
-            .prepare_money_post(
-                note,
-                PRIVATENOTE_ABI,
-                "placeInferenceBuy",
-                place_inference_buy_payload(
-                    model_hash,
-                    max_price_per_tick,
-                    ticks,
-                    escrow,
-                    flags,
-                    deadline,
-                ),
-                owner_keys,
-            )
-            .await?;
         let stats = self
             .inference_orderbook_stats(order_book)
             .await
@@ -9180,6 +9470,22 @@ impl RealChainBackend {
             .poll_inference_attributed_fills(note, order_book, fill_cursor)
             .await
             .map_err(|source| anyhow::Error::new(MoneySubmitError::Preparation { source }))?;
+        let (endpoint, boc, account_id, dapp_id) = self
+            .prepare_money_post(
+                note,
+                PRIVATENOTE_ABI,
+                "placeInferenceBuy",
+                place_inference_buy_payload(
+                    model_hash,
+                    max_price_per_tick,
+                    ticks,
+                    escrow,
+                    flags,
+                    deadline,
+                ),
+                owner_keys,
+            )
+            .await?;
         before_post(
             money_submit_identity(&boc),
             order_id_floor,
@@ -9312,7 +9618,7 @@ impl RealChainBackend {
         };
         read_coherent_deal_snapshot(&mut source)
             .await
-            .map_err(|error| anyhow!("TokenContract {}: {error}", display_token_contract(tc)))
+            .with_context(|| format!("TokenContract {}", display_token_contract(tc)))
     }
     /// The `getConfig` getter of the deal (`TokenContract`, 4.0.31 `view`):
     /// `platformFeeBps`, `minClaimInterval`, `minSecondsPerTick`, and `disputeWindow`.
@@ -9665,7 +9971,23 @@ impl RealChainBackend {
         &self,
         note: &Address,
     ) -> Result<Vec<PlaceInferenceBuyReceipt>> {
-        const PAGE_SIZE: u32 = 1_000;
+        self.place_inference_buy_receipts(note, false).await
+    }
+
+    /// Complete finalized BUY history for accounting; pending or undecodable successful calls
+    /// prevent a completeness claim instead of disappearing as an apparent zero expense.
+    pub async fn buyer_usage_buy_receipts(
+        &self,
+        note: &Address,
+    ) -> Result<Vec<PlaceInferenceBuyReceipt>> {
+        self.place_inference_buy_receipts(note, true).await
+    }
+
+    async fn place_inference_buy_receipts(
+        &self,
+        note: &Address,
+        require_complete: bool,
+    ) -> Result<Vec<PlaceInferenceBuyReceipt>> {
         let account_id = note.bare().to_string();
         let endpoint = self.client.endpoint().trim_end_matches('/');
         let dapp_id = crate::address::DEXDO_DAPP_ID;
@@ -9681,7 +10003,7 @@ impl RealChainBackend {
                       node {
                         id boc body created_at
                         dst_transaction {
-                          aborted
+                          status aborted
                           compute { exit_code success }
                           action { result_code success }
                         }
@@ -9707,7 +10029,7 @@ impl RealChainBackend {
                     "variables": {
                         "accountId": account_id.as_str(),
                         "dappId": dapp_id,
-                        "last": PAGE_SIZE,
+                        "last": crate::params::EXT_OUT_PAGE_SIZE,
                         "before": before.as_deref(),
                     },
                 }))
@@ -9733,17 +10055,38 @@ impl RealChainBackend {
                     .ok_or_else(|| anyhow!("PrivateNote {note} owner call has no cursor"))?;
                 let node = &edge["node"];
                 let message_id = node["id"].as_str().unwrap_or(cursor);
-                if !seen.insert(message_id.to_string()) || !successful_inbound_call(node) {
+                if !seen.insert(message_id.to_string()) {
                     continue;
                 }
-                let decoded = node["body"]
-                    .as_str()
-                    .and_then(|body| decode_external_abi_message(body, PRIVATENOTE_ABI, true))
-                    .or_else(|| {
-                        node["boc"].as_str().and_then(|boc| {
-                            decode_external_abi_message_boc(boc, PRIVATENOTE_ABI, true)
+                let finalized = node["dst_transaction"]["status"].as_i64() == Some(3)
+                    || node["dst_transaction"]["status"].as_str() == Some("Finalized");
+                if require_complete && !finalized {
+                    return Err(anyhow!(
+                        "buyer note owner-call history contains a non-finalized transaction"
+                    ));
+                }
+                if !successful_inbound_call(node) {
+                    if require_complete
+                        && node["dst_transaction"]["aborted"].as_bool() != Some(true)
+                    {
+                        return Err(anyhow!(
+                            "buyer note owner-call execution evidence incomplete"
+                        ));
+                    }
+                    continue;
+                }
+                let decoded = if require_complete {
+                    Some(buyer_usage_evidence::verified_buy_call(node, note)?)
+                } else {
+                    node["body"]
+                        .as_str()
+                        .and_then(|body| decode_external_abi_message(body, PRIVATENOTE_ABI, true))
+                        .or_else(|| {
+                            node["boc"].as_str().and_then(|boc| {
+                                decode_external_abi_message_boc(boc, PRIVATENOTE_ABI, true)
+                            })
                         })
-                    });
+                };
                 let Some(decoded) = decoded else {
                     continue;
                 };
@@ -9763,6 +10106,8 @@ impl RealChainBackend {
                 receipts.push(PlaceInferenceBuyReceipt {
                     message_id: message_id.to_string(),
                     created_at,
+                    model_hash: decoded_uint256_hex(&decoded.tokens, "modelHash")
+                        .context("placeInferenceBuy receipt has no modelHash")?,
                     max_price_per_tick: decoded_u128(&decoded.tokens, "maxPricePerTick")
                         .ok_or_else(|| {
                             anyhow!("placeInferenceBuy receipt has no maxPricePerTick")
@@ -13417,6 +13762,28 @@ fn place_inference_buy_payload(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn issue_2162_inconclusive_account_read_does_not_enable_submit_retries() {
+        for (seconds, expected_delay) in [
+            (None, None),
+            (Some(2), Some(std::time::Duration::from_secs(2))),
+            (
+                Some(crate::params::TRANSIENT_READ_MAX_RETRY_AFTER.as_secs() + 1),
+                None,
+            ),
+        ] {
+            let error = anyhow::Error::new(super::ProvisionAccountReadError {
+                status: reqwest::StatusCode::NOT_FOUND,
+                body: "unrelated route missing".to_string(),
+                retry_after: seconds.map(|seconds| super::RetryAfter { seconds }),
+            });
+            assert!(super::is_transient_read_failure(&error));
+            assert!(!super::is_transient_submit_failure(&error));
+            assert_eq!(super::retry_after_delay(&error), expected_delay);
+            assert!(format!("{error:#}").contains("unrelated route missing"));
+        }
+    }
+
     /// regression 1: a resting order is NAMED and PROVED.
 
     /// The pair comes out of the book's inbound `onInferencePlaced`, which is the only record that
@@ -19666,4 +20033,6 @@ mod tests {
 
     include!("client/issue_2064_tests.rs");
     include!("client/issue_2030_tests.rs");
+    include!("client/issue_2108_tests.rs");
+    include!("client/issue_2115_tests.rs");
 }

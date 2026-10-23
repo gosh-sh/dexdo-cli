@@ -501,6 +501,7 @@ async fn an_unreadable_queue_is_not_absence_and_forbids_a_second_request() {
 
     let chain2 = FakeChain::always(0);
     let provider2 = FakeProvider::ackinacki(RequestPresence::Unknown {
+        queue_transaction_id: None,
         reason: "502 from the gateway".to_string(),
     });
     let _ = run(dir.path(), &binding, &chain2, &provider2, tight_bounds()).await;
@@ -542,6 +543,7 @@ async fn an_executed_record_followed_by_contradictory_absence_never_submits() {
 
     provider.probe.borrow_mut().push(RequestPresence::Executed {
         evidence: FundingEvidence {
+            queue_transaction_id: None,
             verdict: "executed".to_string(),
             source: "history fallback".to_string(),
             observed_at_unix: Some(7),
@@ -696,11 +698,12 @@ async fn a_timeout_leaves_a_state_that_a_rerun_re_checks() {
     let chain2 = FakeChain::always(1_000);
     let provider2 = FakeProvider::ackinacki(RequestPresence::Executed {
         evidence: FundingEvidence {
+            queue_transaction_id: Some(7),
             verdict: "executed".to_string(),
             source: "finalized TransactionSent".to_string(),
             observed_at_unix: Some(1),
             detail: "the timed-out request executed".to_string(),
-            delivery_message_id: None,
+            delivery_message_id: Some("delivery-7".to_string()),
         },
     });
     let funded = run(dir.path(), &binding, &chain2, &provider2, patient_bounds())
@@ -770,11 +773,12 @@ async fn the_journal_closes_only_on_an_observed_balance_that_meets_the_requireme
     let chain = FakeChain::then_always(vec![0, 999], 1_000);
     let provider = FakeProvider::ackinacki(RequestPresence::Executed {
         evidence: FundingEvidence {
+            queue_transaction_id: Some(7),
             verdict: "executed".to_string(),
             source: "finalized TransactionSent".to_string(),
             observed_at_unix: Some(1),
             detail: "the accepted request executed".to_string(),
-            delivery_message_id: None,
+            delivery_message_id: Some("delivery-7".to_string()),
         },
     })
     .with_submit(vec![SubmitOutcome::Accepted {

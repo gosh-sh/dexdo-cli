@@ -3119,6 +3119,20 @@ impl ChainBackend for MockChainBackend {
         Ok(Some(snapshot))
     }
 
+    async fn deal_purchase_terms(
+        &self,
+        token_contract: &TokenContract,
+    ) -> Result<Option<(u128, u128)>, ChainError> {
+        let _guard = self.lock.lock().unwrap();
+        let state = self.load_state()?;
+        Ok(state.matched_offers.get(token_contract).and_then(|offer| {
+            state
+                .matched_ticks
+                .get(token_contract)
+                .map(|ticks| (u128::from(*ticks), u128::from(offer.price_per_tick)))
+        }))
+    }
+
     async fn snapshot(&self, token_contract: &TokenContract) -> Option<StreamSnapshot> {
         self.checked_snapshot(token_contract).await.ok().flatten()
     }

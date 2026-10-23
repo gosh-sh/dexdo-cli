@@ -27,6 +27,7 @@ pub(crate) mod admin;
 pub(crate) mod args;
 pub(crate) mod audit;
 pub(crate) mod buyer;
+pub(crate) mod buyer_usage;
 // Pick one row with the arrow keys, for the questions whose answer the client already holds.
 pub(crate) mod choose;
 pub(crate) mod close;

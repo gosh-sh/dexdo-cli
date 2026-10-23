@@ -641,7 +641,7 @@ async fn the_proven_delivery_is_recorded_as_its_own_journal_field() {
 
 /// A delivery read failure cannot authorize a duplicate of the same exact live amount.
 #[tokio::test]
-async fn a_delivery_read_that_failed_leaves_the_verdict_unknown_and_submits_nothing() {
+async fn a_delivery_read_that_failed_retains_execution_without_authorizing_another_submit() {
     let dir = temp();
     let vault = FakeVault::with_delivery(Delivery::Unreadable);
     generation_one(dir.path(), &vault).await;
@@ -659,7 +659,10 @@ async fn a_delivery_read_that_failed_leaves_the_verdict_unknown_and_submits_noth
     assert_eq!(after.generation, 1);
     assert_eq!(
         after.state,
-        FundingState::Submitted,
-        "an unknown verdict must not advance the record to a finalized one"
+        FundingState::Executed,
+        "the finalized Vault execution must survive a failed Hot delivery read"
     );
+    let evidence = after.evidence.expect("retain the proven execution");
+    assert_eq!(evidence.queue_transaction_id, Some(7));
+    assert!(evidence.delivery_message_id.is_none());
 }
