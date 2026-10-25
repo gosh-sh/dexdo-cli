@@ -33,6 +33,11 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           key: buyer-handover-185
+          cache-on-failure: true
+      - name: Check added test formatting and whitespace
+        run: |
+          rustfmt --check --edition 2021 crates/dexdo/src/cli/buyer/issue_185_test.rs
+          git diff --check 7dd507d4770996079c8f501945d2120defdb84b8 HEAD
       - name: Install build dependencies
         run: |
           sudo apt-get update
@@ -68,7 +73,7 @@ jobs:
                 uid=$1; gid=$2; cargo_bin=$3; target_arg=$4; target_name=$5; filter=$6
                 args=(test --offline --locked -p dexdo "$target_arg")
                 if [ -n "$target_name" ]; then args+=("$target_name"); fi
-                exec setpriv --reuid="$uid" --regid="$gid" --init-groups \
+                exec runuser -u "$(id -nu "$uid")" -- \
                   "$cargo_bin" "${args[@]}" "$filter" -- --test-threads=1
               ' _ "$runner_uid" "$runner_gid" "$cargo_bin" "$target_arg" "$target_name" "$filter" \
               2>&1 | tee "test-results/$target-$filter.log"
@@ -77,10 +82,6 @@ jobs:
               exit 1
             fi
           done
-      - name: Check added test formatting and whitespace
-        run: |
-          rustfmt --check --edition 2021 crates/dexdo/src/cli/buyer/issue_185_test.rs
-          git diff --check 7dd507d4770996079c8f501945d2120defdb84b8 HEAD
       - uses: actions/upload-artifact@v4
         if: always()
         with:
