@@ -485,20 +485,11 @@ async fn issue_185_keep_open_restart_adopts_original_without_shared_wait_memory(
     let seller = dexdo_core::LocalNote::generate();
     *chain.handover.lock().unwrap() =
         Some(seller.encrypt_to(&buyer.note.pubkey(), &handover.to_deal_bytes(&tc)));
-    let restarted = api_state_with_policy(
-        chain.clone(),
-        buyer,
-        &dir,
-        true,
-        Some(runtime_policy),
-    );
-    let route = tokio::time::timeout(
-        std::time::Duration::from_secs(5),
-        restarted.current_deal(),
-    )
-    .await
-    .expect("restart must adopt the original deal")
-    .unwrap();
+    let restarted = api_state_with_policy(chain.clone(), buyer, &dir, true, Some(runtime_policy));
+    let route = tokio::time::timeout(std::time::Duration::from_secs(5), restarted.current_deal())
+        .await
+        .expect("restart must adopt the original deal")
+        .unwrap();
     assert_eq!(route.route.token_contract, tc);
     assert_eq!(chain.pipeline.post_count.load(Ordering::SeqCst), 1);
     assert!(!money_lock.journal_path.exists());

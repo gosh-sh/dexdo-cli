@@ -82,6 +82,43 @@ jobs:
               exit 1
             fi
           done
+      - name: Confirm the repeated-request regression fails on v0.9.0 production
+        shell: bash
+        run: |
+          set -euo pipefail
+          source_file=crates/dexdo/src/cli/buyer.rs
+          cp "$source_file" test-results/patched-buyer.rs
+          trap 'cp test-results/patched-buyer.rs "$source_file"' EXIT
+          python3 - <<'PY'
+          import pathlib, subprocess
+          path = pathlib.Path("crates/dexdo/src/cli/buyer.rs")
+          marker = "#[cfg(test)]\nmod tests {"
+          original = subprocess.check_output(
+              ["git", "show", "7dd507d4770996079c8f501945d2120defdb84b8:" + str(path)],
+              text=True,
+          )
+          patched = path.read_text()
+          assert original.count(marker) == patched.count(marker) == 1
+          # Keep the regression fixtures, but use the exact v0.9.0 production prefix.
+          path.write_text(original.split(marker)[0] + marker + patched.split(marker)[1])
+          PY
+          export CARGO_NET_OFFLINE=true
+          runner_uid=$(id -u)
+          cargo_bin=$(command -v cargo)
+          set +e
+          sudo --preserve-env=PATH,CARGO_HOME,RUSTUP_HOME,CARGO_BUILD_JOBS,CARGO_PROFILE_DEV_DEBUG,CARGO_PROFILE_TEST_DEBUG,PROPTEST_CASES,PROPTEST_RNG_SEED,CARGO_NET_OFFLINE \
+            unshare --net -- bash -c '
+              set -euo pipefail
+              ip link set lo up
+              exec runuser -u "$(id -nu "$1")" -- "$2" test --offline --locked -p dexdo --bin dexdo \
+                issue_185_repeated_requests_and_restart_keep_one_funded_deal -- --test-threads=1
+            ' _ "$runner_uid" "$cargo_bin" 2>&1 | tee test-results/v09-negative-control.log
+          result=${PIPESTATUS[0]}
+          set -e
+          test "$result" = 101
+          grep -F "a second BUY would fund a distinct deal" test-results/v09-negative-control.log
+          grep -F "left: 2" test-results/v09-negative-control.log
+          echo "Negative control reproduced two simulated BUY POSTs on v0.9.0 production."
       - uses: actions/upload-artifact@v4
         if: always()
         with:
