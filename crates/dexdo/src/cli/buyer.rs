@@ -11037,6 +11037,17 @@ async fn prepare_lazy_buyer_api_deal_once(
     chain_preflight: BuyerChainPreflight,
 ) -> Result<dexdo::buyer::api::ApiDeal> {
     let requested_budget = buyer_fresh_buy_budget(args.ticks, args.max_price_per_tick, args.escrow);
+    // A retained journal must not hide keep_open's confirmed-closure stop signal.
+    // Check the already-held deal first; retain its journal and never submit a replacement.
+    if let Some(kept) = kept_open_handover_wait() {
+        let mut deal_check = KeptOpenDealCheck::new();
+        if let Some(reason) = deal_check
+            .closed_if_due(chain.as_ref(), &frame_model, &kept.token_contract)
+            .await
+        {
+            return Err(stop_kept_open_handover_wait(reason));
+        }
+    }
     let raised_money = if args.mock.mock_chain {
         raised_money
     } else {
