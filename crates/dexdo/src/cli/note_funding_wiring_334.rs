@@ -41,7 +41,10 @@ fn note_deploy_entry_body() -> String {
 }
 
 fn note_deploy_resolved_body() -> String {
-    crate::cli::source_probe::code_of(production_source(), "async fn run_note_deploy_resolved")
+    let resolved =
+        crate::cli::source_probe::code_of(production_source(), "async fn run_note_deploy_resolved");
+    assert!(resolved.contains("run_note_deploy_loaded(ops, recovery).await"));
+    crate::cli::source_probe::code_of(production_source(), "async fn run_note_deploy_loaded")
 }
 
 fn note_deploy_funding_body() -> String {

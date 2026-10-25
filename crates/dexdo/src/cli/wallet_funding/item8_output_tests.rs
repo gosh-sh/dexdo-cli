@@ -45,6 +45,7 @@ fn the_ackinacki_notice_is_drawn_as_a_call_to_act_only_where_colour_is_allowed()
 #[test]
 fn every_funding_notice_has_one_stable_secret_free_machine_event() {
     let evidence = FundingEvidence {
+        queue_transaction_id: None,
         verdict: "executed".to_string(),
         source: "secret-looking-provider-response".to_string(),
         observed_at_unix: Some(7),

@@ -127,6 +127,10 @@ pub trait ClaimStateObserver: Send + Sync {
         Ok(delivered)
     }
 
+    fn active_requests(&self, _token_contract: &TokenContract) -> u32 {
+        0
+    }
+
     fn observe_terminal(&self, _token_contract: &TokenContract) -> Result<(), ChainError> {
         Ok(())
     }
@@ -490,6 +494,11 @@ pub async fn drive_advance_with_observer(
         };
         let next = target.min(claimed.saturating_add(allowance));
         if next <= claimed {
+            continue;
+        }
+        // A final claim can be finalized permissionlessly and destroy the contract.
+        // Keep that exhausting claim local until every admitted request has terminated.
+        if next == token_budget && observer.active_requests(token_contract) > 0 {
             continue;
         }
         let claim_result = chain.claim_tokens(token_contract, seller_note, next).await;
@@ -2037,6 +2046,55 @@ mod tests {
             "claim landed before MIN_CLAIM_INTERVAL"
         );
         assert_eq!(b.claims(), vec![2 * TICK_SIZE]);
+    }
+    #[tokio::test]
+    async fn shared_budget_2091_exhausting_claim_waits_for_admitted_work() {
+        struct PendingRequest {
+            active: std::sync::atomic::AtomicU32,
+            checked: std::sync::Mutex<Option<tokio::sync::oneshot::Sender<()>>>,
+        }
+        impl ClaimStateObserver for PendingRequest {
+            fn observe(&self, _: &TokenContract, _: DealChainState) -> Result<(), ChainError> {
+                Ok(())
+            }
+            fn active_requests(&self, _: &TokenContract) -> u32 {
+                if let Some(tx) = self.checked.lock().unwrap().take() {
+                    let _ = tx.send(());
+                }
+                self.active.load(Ordering::Acquire)
+            }
+        }
+        let backend = Arc::new(RecordingBackend::resumed(TICK_SIZE, TICK_SIZE));
+        let (checked_tx, checked_rx) = tokio::sync::oneshot::channel();
+        let pending = Arc::new(PendingRequest {
+            active: std::sync::atomic::AtomicU32::new(1),
+            checked: std::sync::Mutex::new(Some(checked_tx)),
+        });
+        let driver_backend = backend.clone();
+        let driver_pending = pending.clone();
+        let mut driver = tokio::spawn(async move {
+            drive_advance_with_observer(
+                driver_backend.as_ref(),
+                &"tc-shared-drain".to_string(),
+                &LocalNote::generate(),
+                instant(),
+                2,
+                TICK_SIZE as u64,
+                true,
+                Arc::new(AtomicU64::new(TICK_SIZE as u64)),
+                Arc::new(AtomicBool::new(true)),
+                driver_pending.as_ref(),
+            )
+            .await
+        });
+        tokio::select! {
+            checked = checked_rx => checked.unwrap(),
+            result = &mut driver => panic!("exhausting claim completed before the active request: {result:?}"),
+        }
+        assert!(backend.claims().is_empty());
+        pending.active.store(0, Ordering::Release);
+        assert_eq!(driver.await.unwrap().unwrap(), 2 * TICK_SIZE);
+        assert_eq!(backend.claims(), vec![2 * TICK_SIZE]);
     }
 }
 

@@ -84,6 +84,78 @@ use dexdo_core::{
 use serde_json::{json, Map, Value};
 use std::sync::Arc;
 
+fn open_buyer_usage(
+    network: &str,
+    args: &BuyerArgs,
+) -> Result<Arc<dexdo::buyer::usage::UsageStore>> {
+    let path = crate::cli::data_dir::automatic_private_file(
+        dexdo_core::params::BUYER_USAGE_DATABASE_FILE,
+    )?;
+    let store = Arc::new(dexdo::buyer::usage::UsageStore::open(path, network)?);
+    // main holds the buyer instance lock for every real-chain run and every explicit data-dir.
+    // Legacy mock runs with custom mutable paths may share the default root without that lock.
+    if !args.mock.mock_chain || crate::cli::data_dir::explicit().is_some() {
+        store.recover_interrupted_requests()?;
+    }
+    if !args.mock.mock_chain {
+        if let Some(note) = args.identity.note_addr.as_deref() {
+            let note = dexdo_core::Address::parse(note)?.with_workchain();
+            store.mark_note_operations_incomplete(&note, "initial_reconciliation_pending")?;
+        }
+        let directory = deals::resolve_deals_dir(args.deals_dir.as_deref())?;
+        if directory.exists() {
+            for (_, handle) in deals::list_deal_handles_strict(&directory)? {
+                if handle.role == deals::DealHandleRole::Buyer && handle.network == network {
+                    store.register_deal(&handle.token_contract, &handle.frame_model)?;
+                    store.mark_operations_incomplete(
+                        &handle.token_contract,
+                        "initial_reconciliation_pending",
+                    )?;
+                    let note = dexdo_core::Address::parse(&handle.note_addr)?.with_workchain();
+                    store
+                        .mark_note_operations_incomplete(&note, "initial_reconciliation_pending")?;
+                }
+            }
+        }
+    }
+    Ok(store)
+}
+
+async fn reconcile_buyer_usage(store: &dexdo::buyer::usage::UsageStore, args: &BuyerArgs) {
+    if args.mock.mock_chain {
+        return;
+    }
+    let result = async {
+        let directory = deals::resolve_deals_dir(args.deals_dir.as_deref())?;
+        let handles = crate::cli::buyer_usage::reconcile(store, &directory).await;
+        if let Some(note) = args.identity.note_addr.as_deref() {
+            let manifest = crate::cli::commands::manifest_path()?;
+            let note = dexdo_core::Address::parse(note)?;
+            crate::cli::buyer_usage::reconcile_note(store, &manifest, &note).await?;
+        }
+        handles
+    }
+    .await;
+    if let Err(error) = result {
+        tracing::warn!(%error, "buyer usage: financial evidence is incomplete; will retry");
+    }
+}
+
+fn spawn_buyer_usage_reconciliation(
+    store: Arc<dexdo::buyer::usage::UsageStore>,
+    args: BuyerArgs,
+) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        let mut interval =
+            tokio::time::interval(dexdo_core::params::BUYER_USAGE_RECONCILE_INTERVAL);
+        interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        loop {
+            interval.tick().await;
+            reconcile_buyer_usage(&store, &args).await;
+        }
+    })
+}
+
 fn display_token_contract(value: impl std::fmt::Display) -> String {
     dexdo_core::address::display_self_dapp(&value.to_string())
 }
@@ -6250,6 +6322,182 @@ fn is_malformed_handover_error(error: &anyhow::Error) -> bool {
     msg.contains("malformed handover") || msg.contains("handover decrypt failed")
 }
 
+/// Whether a failed handover read is only polled again under `keep_open`: a malformed handover
+/// (`malformed_handover`) is re-read until a well-formed one appears, and a missing one
+/// (`no_handover_after_match`) is waited for with no deadline. Nothing is written to chain and
+/// the buyer does not exit.
+fn handover_wait_keeps_open(policy: Option<&policy::BuyerRuntimePolicy>, malformed: bool) -> bool {
+    policy.is_some_and(|policy| {
+        if malformed {
+            policy.malformed_handover == policy::MalformedHandoverAction::KeepOpen
+        } else {
+            policy.no_handover_after_match == policy::NoHandoverAfterMatchAction::KeepOpen
+        }
+    })
+}
+
+/// A deal an on-demand purchase bought and is still waiting on for its handover.
+#[derive(Clone)]
+struct KeptOpenHandoverWait {
+    token_contract: dexdo_core::TokenContract,
+    ticks: u128,
+    service_renewal: Option<(u128, u128, u128)>,
+}
+
+/// Shared by every run of one on-demand initializer.
+struct OnDemandKeptOpen {
+    /// Under `keep_open` the handover wait has no deadline, but each run is still ended by its
+    /// request's purchase budget; the next run waits on the deal recorded here instead of buying
+    /// another, whose escrow nothing would ever reclaim.
+    wait: std::sync::Mutex<Option<KeptOpenHandoverWait>>,
+    /// Set once the deal a kept-open wait holds is found closed on chain. The buyer process
+    /// watches it and stops: a closed deal can never be opened for this buyer, and buying another
+    /// in its place is not what `keep_open` was asked for.
+    stopped: tokio::sync::watch::Sender<Option<String>>,
+}
+
+impl OnDemandKeptOpen {
+    fn new() -> Arc<Self> {
+        Arc::new(Self {
+            wait: std::sync::Mutex::new(None),
+            stopped: tokio::sync::watch::channel(None).0,
+        })
+    }
+}
+
+tokio::task_local! {
+    static ON_DEMAND_KEPT_OPEN_WAIT: Arc<OnDemandKeptOpen>;
+}
+
+fn kept_open_handover_wait() -> Option<KeptOpenHandoverWait> {
+    ON_DEMAND_KEPT_OPEN_WAIT
+        .try_with(|shared| {
+            shared
+                .wait
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .clone()
+        })
+        .ok()
+        .flatten()
+}
+
+fn set_kept_open_handover_wait(wait: Option<KeptOpenHandoverWait>) {
+    let _ = ON_DEMAND_KEPT_OPEN_WAIT.try_with(|shared| {
+        *shared
+            .wait
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = wait;
+    });
+}
+
+/// End a kept-open wait whose deal was closed on chain: release the deal, tell an on-demand buyer
+/// process to stop, and hand back the one error line the process exits with.
+fn stop_kept_open_handover_wait(reason: String) -> anyhow::Error {
+    release_kept_open_handover_wait();
+    let _ = ON_DEMAND_KEPT_OPEN_WAIT.try_with(|shared| {
+        shared.stopped.send_replace(Some(reason.clone()));
+    });
+    anyhow::anyhow!(reason)
+}
+
+/// How often a kept-open handover wait reads its deal's on-chain state.
+#[cfg(not(test))]
+fn keep_open_deal_check_interval() -> std::time::Duration {
+    dexdo_core::params::BUYER_KEEP_OPEN_DEAL_CHECK_INTERVAL
+}
+
+#[cfg(test)]
+fn keep_open_deal_check_interval() -> std::time::Duration {
+    std::time::Duration::from_millis(300)
+}
+
+/// Under `keep_open` the handover wait has no deadline, so it watches the deal itself: every
+/// check interval it reads the deal's on-chain state. A deal that is no longer funded, or no longer
+/// exists, was closed (for example by `cleanupUnopened` after `MATCH_OPEN_TIMEOUT`) and can never
+/// be opened for this buyer. A read that fails is logged and tried again at the next check.
+struct KeptOpenDealCheck {
+    next: Option<std::time::Instant>,
+}
+
+impl KeptOpenDealCheck {
+    fn new() -> Self {
+        Self { next: None }
+    }
+
+    /// The error line the buyer stops with, when the check is due and finds the deal closed.
+    async fn closed_if_due(
+        &mut self,
+        chain: &dyn ChainBackend,
+        frame_model: &str,
+        token_contract: &dexdo_core::TokenContract,
+    ) -> Option<String> {
+        let now = std::time::Instant::now();
+        if self.next.is_some_and(|next| now < next) {
+            return None;
+        }
+        self.next = Some(now + keep_open_deal_check_interval());
+        let order_book = chain
+            .model_buy_order_book_identity()
+            .map(|address| display_dexdo_address(&address))
+            .unwrap_or_else(|| "unknown".to_string());
+        match chain.deal_state(token_contract).await {
+            Ok(state) => kept_open_deal_closed(state).map(|state| {
+                format!(
+                    "buyer: keep_open handover wait stopped: the deal is closed on chain; \
+                     model={frame_model} order_book={order_book} token_contract={} state={state}; \
+                     no new BUY was placed and nothing was submitted",
+                    display_token_contract(token_contract)
+                )
+            }),
+            Err(error) => {
+                tracing::error!(
+                    model = frame_model,
+                    order_book = %order_book,
+                    token_contract = %display_token_contract(token_contract),
+                    error = %error,
+                    "buyer: keep_open handover wait could not read the deal's on-chain state; \
+                     still waiting, checking again later"
+                );
+                None
+            }
+        }
+    }
+}
+
+/// `Some(state)` when the deal is closed: not found (destroyed) or no longer funded (cleaned up).
+fn kept_open_deal_closed(state: Option<dexdo_core::DealChainState>) -> Option<String> {
+    match state {
+        None => Some("not_found".to_string()),
+        Some(state) if !state.funded => Some(format!(
+            "not_funded opened={} deposit={}",
+            state.opened, state.deposit
+        )),
+        Some(_) => None,
+    }
+}
+
+/// Record the deal this wait is on, when a `keep_open` answer can make the wait outlast the run.
+fn hold_kept_open_handover_wait(
+    policy: Option<&policy::BuyerRuntimePolicy>,
+    token_contract: &dexdo_core::TokenContract,
+    ticks: u128,
+    service_renewal: Option<(u128, u128, u128)>,
+) {
+    if handover_wait_keeps_open(policy, false) || handover_wait_keeps_open(policy, true) {
+        set_kept_open_handover_wait(Some(KeptOpenHandoverWait {
+            token_contract: token_contract.clone(),
+            ticks,
+            service_renewal,
+        }));
+    }
+}
+
+/// The wait ended by a handover or by a closing answer: the next run buys afresh as before.
+fn release_kept_open_handover_wait() {
+    set_kept_open_handover_wait(None);
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn apply_malformed_handover_policy(
     chain: &dyn ChainBackend,
@@ -6299,6 +6547,8 @@ async fn apply_malformed_handover_policy(
                  state=funded/opened result=no_recovery_submitted"
             );
         }
+        // The handover wait re-reads instead of calling here (`handover_wait_keeps_open`).
+        policy::MalformedHandoverAction::KeepOpen => Ok(()),
     }
 }
 
@@ -6439,6 +6689,7 @@ fn oneshot_stream_policy_report(
             "recover_current_deal_before_failover",
         ),
         ("empty_stream", "fail_closed", _) => ("no_recovery_submitted", "operator_decision"),
+        (_, "keep_open", _) => ("deal_kept_open", "retry_on_same_deal"),
         _ => ("policy_action_reported", "operator_decision"),
     };
     format!(
@@ -6469,6 +6720,9 @@ async fn apply_oneshot_dead_gateway_policy(
     let submitted = session
         .settle_dead_gateway("dead-gateway", &heartbeat)
         .await;
+    if action == "keep_open" {
+        session.keep_open_after_drop();
+    }
     OneShotStreamPolicyOutcome::TerminalReport(oneshot_stream_policy_report(
         "dead_gateway",
         action,
@@ -6490,6 +6744,9 @@ async fn apply_oneshot_empty_stream_policy(
     let submitted = session
         .settle_empty_stream("empty-stream", &heartbeat)
         .await;
+    if action == "keep_open" {
+        session.keep_open_after_drop();
+    }
     oneshot_stream_policy_report("empty_stream", action, token_contract, submitted)
 }
 
@@ -6516,6 +6773,8 @@ async fn apply_no_handover_after_match_policy(
         );
     }
     match buyer_policy.no_handover_after_match {
+        // The handover wait has no deadline under this answer (`handover_wait_keeps_open`).
+        policy::NoHandoverAfterMatchAction::KeepOpen => Ok(NoHandoverPolicyOutcome::RetryCurrent),
         policy::NoHandoverAfterMatchAction::FailClosed => {
             bail!(
                 "{diagnostic}\npolicy_action failure_class=no_handover_after_match action=fail_closed \
@@ -10638,11 +10897,15 @@ fn require_stream_buy_ticks(ticks: u128) -> Result<()> {
         return Ok(());
     }
     let minimum_ticks = dexdo_core::params::MIN_STREAM_BUY_TICKS;
-    bail!(
-        "invalid buy ticks: --ticks {ticks} is below the {minimum_ticks}-tick stream minimum; \
+    Err(dexdo::buyer::api::DealInitError::with_code(
+        dexdo::buyer::api::ConsumerErrorCode::InvalidBuyTicks,
+        format!(
+            "invalid buy ticks: --ticks {ticks} is below the {minimum_ticks}-tick stream minimum; \
          TokenContract funding needs the probe tick plus at least one streaming tick. \
          Buy at least {minimum_ticks} ticks or wait for an ask with >= {minimum_ticks} ticks"
-    );
+        ),
+    )
+    .into())
 }
 
 fn is_replay_protection_error(err: &anyhow::Error) -> bool {
@@ -10659,6 +10922,7 @@ fn is_replay_protection_error(err: &anyhow::Error) -> bool {
 }
 
 fn buyer_deal_init_error(err: anyhow::Error) -> dexdo::buyer::api::DealInitError {
+    use dexdo::buyer::api::{ConsumerErrorCode, DealInitError};
     if let Some(error) = err
         .chain()
         .find_map(|cause| cause.downcast_ref::<DurableBuyerSubmitReconciliationError>())
@@ -10669,9 +10933,36 @@ fn buyer_deal_init_error(err: anyhow::Error) -> dexdo::buyer::api::DealInitError
         .chain()
         .find_map(|cause| cause.downcast_ref::<dexdo::buyer::api::DealInitError>())
     {
+        // Preserve the durable anchor even when the underlying failure was ambiguous.
+        if error.reconciliation().is_some() {
+            return error.clone();
+        }
+        if err.chain().any(|cause| {
+            matches!(
+                cause.downcast_ref::<ChainError>(),
+                Some(ChainError::AmbiguousSubmit(_))
+            )
+        }) {
+            return DealInitError::with_code(
+                ConsumerErrorCode::PurchaseReconciliationRequired,
+                format!("{err:#}"),
+            );
+        }
         return error.clone();
     }
-    dexdo::buyer::api::DealInitError::new(format!("{err:#}"))
+    let code = err
+        .chain()
+        .find_map(|cause| match cause.downcast_ref::<ChainError>() {
+            Some(ChainError::OrderUnavailable(_)) => Some(ConsumerErrorCode::OrderUnavailable),
+            Some(ChainError::AmbiguousSubmit(_)) => {
+                Some(ConsumerErrorCode::PurchaseReconciliationRequired)
+            }
+            _ => None,
+        });
+    match code {
+        Some(code) => DealInitError::with_code(code, format!("{err:#}")),
+        None => DealInitError::new(format!("{err:#}")),
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -10855,6 +11146,11 @@ async fn prepare_lazy_buyer_api_deal_once(
             .await?;
         }
         (outcome.token_contract, outcome.ticks)
+    } else if let Some(kept) = kept_open_handover_wait() {
+        // An earlier request bought this deal and its `keep_open` handover wait was ended by the
+        // request budget: wait on it again, never buy a second one.
+        service_renewal = kept.service_renewal;
+        (kept.token_contract, kept.ticks)
     } else {
         match explicit_tc.clone() {
             Some(tc) => {
@@ -11182,7 +11478,16 @@ async fn prepare_lazy_buyer_api_deal_once(
     record_buyer_token_contract_after_money_move(args.as_ref(), &token_contract);
 
     let mut handover_attempt = 1u64;
+    let keeps_waiting = handover_wait_keeps_open(buyer_policy.as_ref(), false)
+        || handover_wait_keeps_open(buyer_policy.as_ref(), true);
+    let mut deal_check = KeptOpenDealCheck::new();
     let handover = 'handover: loop {
+        hold_kept_open_handover_wait(
+            buyer_policy.as_ref(),
+            &token_contract,
+            buy_ticks,
+            service_renewal,
+        );
         // The seller's window to open a funded deal is the contract's, not ours. `TokenContract`
         // holds a funded-but-unopened deal for `MATCH_OPEN_TIMEOUT = 600s` before anyone may
         // `cleanupUnopened()` it, and until
@@ -11204,10 +11509,21 @@ async fn prepare_lazy_buyer_api_deal_once(
         // A retry re-enters this loop, so a `RetryNext` deal is measured against ITS funding, and a
         // retry of the SAME deal does not restart a window the contract is not restarting.
         let hv_deadline_unix =
-            match contract_handover_deadline_unix(chain.as_ref(), &token_contract).await? {
-                Some(deadline) => deadline,
+            match contract_handover_deadline_unix(chain.as_ref(), &token_contract).await {
+                Ok(Some(deadline)) => deadline,
                 // A backend that reports no deal state -- `--mock-chain` -- has no funding to read.
-                None => machine::now_unix()?.saturating_add(BUYER_HANDOVER_WAIT_SECS),
+                Ok(None) => machine::now_unix()?.saturating_add(BUYER_HANDOVER_WAIT_SECS),
+                Err(error) => {
+                    if keeps_waiting {
+                        if let Some(reason) = deal_check
+                            .closed_if_due(chain.as_ref(), &frame_model, &token_contract)
+                            .await
+                        {
+                            return Err(stop_kept_open_handover_wait(reason));
+                        }
+                    }
+                    return Err(error.into());
+                }
             };
         emit_shared_buyer_event(
             &events,
@@ -11232,7 +11548,10 @@ async fn prepare_lazy_buyer_api_deal_once(
             {
                 Ok(h) => break 'handover h,
                 Err(e) => {
-                    if is_malformed_handover_error(&e) {
+                    let malformed = is_malformed_handover_error(&e);
+                    let keep_open = handover_wait_keeps_open(buyer_policy.as_ref(), malformed);
+                    if malformed && !keep_open {
+                        release_kept_open_handover_wait();
                         if let Some(policy) = buyer_policy.as_ref() {
                             apply_malformed_handover_policy(
                                 chain.as_ref(),
@@ -11253,7 +11572,8 @@ async fn prepare_lazy_buyer_api_deal_once(
                     }
                     // One attempt always precedes this check, so a deal opened just before the
                     // window closed is still resolved rather than abandoned unread.
-                    if machine::now_unix()? >= hv_deadline_unix {
+                    if !keep_open && machine::now_unix()? >= hv_deadline_unix {
+                        release_kept_open_handover_wait();
                         let last_error = format!("{e:#}");
                         let diagnostic = handover_timeout_diagnostic(
                             chain.as_ref(),
@@ -11282,7 +11602,13 @@ async fn prepare_lazy_buyer_api_deal_once(
                             .await;
                             match policy_outcome {
                                 Err(policy_err) => {
-                                    return Err(e.context(format!("{policy_err:#}")));
+                                    let message = format!("{diagnostic}; {policy_err:#}");
+                                    return Err(policy_err.context(
+                                        dexdo::buyer::api::DealInitError::with_code(
+                                            dexdo::buyer::api::ConsumerErrorCode::DealNotOpened,
+                                            message,
+                                        ),
+                                    ));
                                 }
                                 Ok(NoHandoverPolicyOutcome::RetryCurrent) => {
                                     continue 'handover;
@@ -11303,7 +11629,18 @@ async fn prepare_lazy_buyer_api_deal_once(
                                 }
                             }
                         }
-                        return Err(e.context(diagnostic));
+                        return Err(e.context(dexdo::buyer::api::DealInitError::with_code(
+                            dexdo::buyer::api::ConsumerErrorCode::DealNotOpened,
+                            diagnostic,
+                        )));
+                    }
+                    if keep_open {
+                        if let Some(reason) = deal_check
+                            .closed_if_due(chain.as_ref(), &frame_model, &token_contract)
+                            .await
+                        {
+                            return Err(stop_kept_open_handover_wait(reason));
+                        }
                     }
                     wait_for_seller_handover_poll(
                         chain.as_ref(),
@@ -11316,6 +11653,7 @@ async fn prepare_lazy_buyer_api_deal_once(
             }
         }
     };
+    release_kept_open_handover_wait();
 
     let deal_handle = deals::make_handle_id(&token_contract, deals::DealHandleRole::Buyer);
     emit_shared_buyer_event(
@@ -11435,6 +11773,7 @@ fn subscription_weekly_budget(
     })
 }
 
+#[cfg(test)]
 #[allow(clippy::too_many_arguments)]
 fn build_on_demand_buyer_api_state(
     chain: Arc<dyn ChainBackend>,
@@ -11453,6 +11792,45 @@ fn build_on_demand_buyer_api_state(
     pre_adopted_deal: Option<dexdo::buyer::api::ApiDeal>,
     recover_terminal_model_deal: bool,
 ) -> dexdo::buyer::api::ApiState {
+    build_on_demand_buyer_api_state_with(
+        chain,
+        buyer,
+        args,
+        explicit_tc,
+        frame_model,
+        content_check,
+        models_cfg,
+        buyer_policy,
+        api_failure_policy,
+        events,
+        progress_display,
+        raised_money,
+        chain_preflight,
+        pre_adopted_deal,
+        recover_terminal_model_deal,
+        OnDemandKeptOpen::new(),
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn build_on_demand_buyer_api_state_with(
+    chain: Arc<dyn ChainBackend>,
+    buyer: Arc<dexdo::buyer::Buyer>,
+    args: Arc<BuyerArgs>,
+    explicit_tc: Option<String>,
+    frame_model: String,
+    content_check: dexdo::buyer::api::ContentCheck,
+    models_cfg: Arc<dexdo::seller::ModelsConfig>,
+    buyer_policy: Option<policy::BuyerRuntimePolicy>,
+    api_failure_policy: dexdo::buyer::api::BuyerApiFailurePolicy,
+    events: SharedBuyerEvents,
+    progress_display: Option<crate::cli::progress::ProgressHandle>,
+    raised_money: Option<BuyerQuoteSubmitOutcome>,
+    chain_preflight: BuyerChainPreflight,
+    pre_adopted_deal: Option<dexdo::buyer::api::ApiDeal>,
+    recover_terminal_model_deal: bool,
+    kept_open_wait: Arc<OnDemandKeptOpen>,
+) -> dexdo::buyer::api::ApiState {
     let raised_money = Arc::new(std::sync::Mutex::new(raised_money));
     let initializer = {
         let chain = chain.clone();
@@ -11465,6 +11843,7 @@ fn build_on_demand_buyer_api_state(
         let buyer_policy = buyer_policy.clone();
         let events = events.clone();
         let raised_money = raised_money.clone();
+        let kept_open_wait = kept_open_wait.clone();
         Arc::new(move || {
             let chain = chain.clone();
             let buyer = buyer.clone();
@@ -11480,24 +11859,26 @@ fn build_on_demand_buyer_api_state(
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner())
                 .take();
-            Box::pin(async move {
-                prepare_lazy_buyer_api_deal_with_replay_backoff(
-                    chain,
-                    buyer,
-                    args,
-                    explicit_tc,
-                    frame_model,
-                    content_check,
-                    models_cfg,
-                    buyer_policy,
-                    api_failure_policy,
-                    events,
-                    progress_display,
-                    raised_money,
-                    chain_preflight,
-                )
-                .await
-            }) as dexdo::buyer::api::DealInitFuture
+            Box::pin(
+                ON_DEMAND_KEPT_OPEN_WAIT.scope(kept_open_wait.clone(), async move {
+                    prepare_lazy_buyer_api_deal_with_replay_backoff(
+                        chain,
+                        buyer,
+                        args,
+                        explicit_tc,
+                        frame_model,
+                        content_check,
+                        models_cfg,
+                        buyer_policy,
+                        api_failure_policy,
+                        events,
+                        progress_display,
+                        raised_money,
+                        chain_preflight,
+                    )
+                    .await
+                }),
+            ) as dexdo::buyer::api::DealInitFuture
         }) as dexdo::buyer::api::DealInitializer
     };
     // The whole purchase is a match and then a handover, and each has its own budget: the match is
@@ -11507,7 +11888,7 @@ fn build_on_demand_buyer_api_state(
     // when what it was waiting for was still due.
     let initializer_timeout = std::time::Duration::from_secs(BUYER_ON_DEMAND_PURCHASE_SECS);
     let mock_model = args.mock.mock_model;
-    let state = match (pre_adopted_deal, recover_terminal_model_deal) {
+    let mut state = match (pre_adopted_deal, recover_terminal_model_deal) {
         (Some(active), true) => dexdo::buyer::api::ApiState::recoverable_lazy_with_active(
             buyer,
             frame_model,
@@ -11519,8 +11900,10 @@ fn build_on_demand_buyer_api_state(
             buyer,
             frame_model,
             mock_model: false,
+            renewal_enabled: false,
             deals: Arc::new(dexdo::buyer::api::RouteManager::new(active)),
             delivery_events: None,
+            usage: None,
         },
         (None, true) => dexdo::buyer::api::ApiState::recoverable_lazy(
             buyer,
@@ -11532,6 +11915,7 @@ fn build_on_demand_buyer_api_state(
             dexdo::buyer::api::ApiState::lazy(buyer, frame_model, initializer, initializer_timeout)
         }
     };
+    state.renewal_enabled = recover_terminal_model_deal;
     state.with_mock_model(mock_model)
 }
 
@@ -11705,6 +12089,7 @@ fn render_local_openai_handoff(
 #[allow(clippy::too_many_arguments)]
 async fn run_buyer_on_demand_local_api(
     args: BuyerArgs,
+    usage_store: Arc<dexdo::buyer::usage::UsageStore>,
     chain: Arc<dyn ChainBackend>,
     buyer: dexdo::buyer::Buyer,
     explicit_tc: Option<String>,
@@ -11801,7 +12186,18 @@ async fn run_buyer_on_demand_local_api(
     // and onto the JSONL surface below, so a request that renders less than it was granted leaves a
     // fact behind instead of only a `[DONE]`.
     let (delivery_tx, mut deliveries) = tokio::sync::mpsc::unbounded_channel();
-    let mut state = build_on_demand_buyer_api_state(
+    let kept_open = OnDemandKeptOpen::new();
+    let mut kept_open_stopped = kept_open.stopped.subscribe();
+    let shutdown: BuyerShutdownSignal = {
+        let mut stopped = kept_open.stopped.subscribe();
+        Box::pin(async move {
+            tokio::select! {
+                () = shutdown => {}
+                _ = stopped.wait_for(Option::is_some) => {}
+            }
+        })
+    };
+    let mut state = build_on_demand_buyer_api_state_with(
         chain.clone(),
         buyer.clone(),
         initializer_args,
@@ -11817,8 +12213,10 @@ async fn run_buyer_on_demand_local_api(
         chain_preflight,
         pre_adopted_deal,
         recover_terminal_model_deal,
+        kept_open,
     );
     state.delivery_events = Some(delivery_tx);
+    state.usage = Some(usage_store.clone());
     let deals = state.deals.clone();
     if let Some(budget) = continuation_budget {
         spawn_buyer_service_renewal(
@@ -11942,6 +12340,7 @@ async fn run_buyer_on_demand_local_api(
         anthropic_compat = args.anthropic_compat,
         "consumer API listening; on-demand purchase will run on first chat request"
     );
+    let usage_worker = spawn_buyer_usage_reconciliation(usage_store.clone(), args.as_ref().clone());
     let (claim_observer, mut claim_observations) = spawn_buyer_claim_observer(
         chain.clone(),
         Arc::downgrade(&deals),
@@ -11972,7 +12371,14 @@ async fn run_buyer_on_demand_local_api(
     };
     claim_observer.abort();
     let _ = claim_observer.await;
+    usage_worker.abort();
+    let _ = usage_worker.await;
+    reconcile_buyer_usage(&usage_store, args.as_ref()).await;
     task_result?;
+    // A kept-open wait found its deal closed on chain: the buyer stops with that one error line.
+    if let Some(reason) = kept_open_stopped.borrow_and_update().clone() {
+        return Err(anyhow::anyhow!(reason));
+    }
     while let Ok(observation) = claim_observations.try_recv() {
         emit_shared_buyer_claim_observation(&events, &observation).await;
     }
@@ -12488,6 +12894,11 @@ async fn run_buyer_inner(
         );
         validate_buyer_runtime_surface_policy(policy, args.local_listen)?;
     }
+    // Refuse unavailable history before a fresh BUY or recovery can move money.
+    let usage_store = args
+        .local_listen
+        .map(|_| open_buyer_usage(&runtime_network, &args))
+        .transpose()?;
     // The chain is selected by a flag: `--mock-chain` -> mock (as in D1, also requires `--mock-model`), otherwise
     // a real chain (per-role buyer backend behind a cargo feature that no longer exists; without the feature -> explicit failure).
     let (chain, note) = if let Some(backend) = backend {
@@ -12576,6 +12987,7 @@ async fn run_buyer_inner(
             .expect("local-listen buyer content policy is preflighted before on-demand");
         return run_buyer_on_demand_local_api(
             args,
+            usage_store.expect("local-listen usage history preflighted before money preparation"),
             chain,
             buyer,
             explicit_tc,
@@ -13183,14 +13595,28 @@ async fn run_buyer_inner(
     // Wait for the seller to open the stream and write the handover. Issue: fail-closed on the deadline instead of
     // waiting forever; do not swallow the `resolve_endpoint` error (diagnostics for the operator).
     let mut handover_attempt = 1u64;
+    let keeps_waiting = handover_wait_keeps_open(buyer_policy.as_ref(), false)
+        || handover_wait_keeps_open(buyer_policy.as_ref(), true);
+    let mut deal_check = KeptOpenDealCheck::new();
     let handover = 'handover: loop {
         // The seller's window to open a funded deal is the contract's, read from the deal itself --
         // see the identical wait on the `--local-listen` path for why `DEAL_WAIT_SECS` and
         // `Instant::now()` were both wrong here.
         let hv_deadline_unix =
-            match contract_handover_deadline_unix(chain.as_ref(), &token_contract).await? {
-                Some(deadline) => deadline,
-                None => machine::now_unix()?.saturating_add(BUYER_HANDOVER_WAIT_SECS),
+            match contract_handover_deadline_unix(chain.as_ref(), &token_contract).await {
+                Ok(Some(deadline)) => deadline,
+                Ok(None) => machine::now_unix()?.saturating_add(BUYER_HANDOVER_WAIT_SECS),
+                Err(error) => {
+                    if keeps_waiting {
+                        if let Some(reason) = deal_check
+                            .closed_if_due(chain.as_ref(), &frame_model, &token_contract)
+                            .await
+                        {
+                            return Err(stop_kept_open_handover_wait(reason));
+                        }
+                    }
+                    return Err(error.into());
+                }
             };
         if let Some(events) = machine_events.as_mut() {
             events.event(
@@ -13212,7 +13638,9 @@ async fn run_buyer_inner(
             {
                 Ok(h) => break 'handover h,
                 Err(e) => {
-                    if is_malformed_handover_error(&e) {
+                    let malformed = is_malformed_handover_error(&e);
+                    let keep_open = handover_wait_keeps_open(buyer_policy.as_ref(), malformed);
+                    if malformed && !keep_open {
                         if let Some(policy) = buyer_policy.as_ref() {
                             apply_malformed_handover_policy(
                                 chain.as_ref(),
@@ -13231,7 +13659,7 @@ async fn run_buyer_inner(
                             display_token_contract(&token_contract)
                         )));
                     }
-                    if machine::now_unix()? >= hv_deadline_unix {
+                    if !keep_open && machine::now_unix()? >= hv_deadline_unix {
                         let last_error = format!("{e:#}");
                         let diagnostic = handover_timeout_diagnostic(
                             chain.as_ref(),
@@ -13277,6 +13705,14 @@ async fn run_buyer_inner(
                             }
                         }
                         return Err(e.context(diagnostic));
+                    }
+                    if keep_open {
+                        if let Some(reason) = deal_check
+                            .closed_if_due(chain.as_ref(), &frame_model, &token_contract)
+                            .await
+                        {
+                            return Err(stop_kept_open_handover_wait(reason));
+                        }
                     }
                     wait_for_seller_handover_poll(
                         chain.as_ref(),
@@ -13419,8 +13855,12 @@ async fn run_buyer_inner(
             },
         );
         state.delivery_events = Some(delivery_tx);
+        let usage_store =
+            usage_store.expect("local-listen usage history preflighted before money preparation");
+        state.usage = Some(usage_store.clone());
         let deals = state.deals.clone();
         let fresh_continuation_enabled = service_renewal.is_some();
+        state.renewal_enabled = fresh_continuation_enabled;
         if let Some((ticks, max_price, escrow)) = service_renewal {
             spawn_buyer_service_renewal(
                 chain.clone(),
@@ -13507,6 +13947,7 @@ async fn run_buyer_inner(
             println!("{handoff}");
         }
         tracing::info!(%addr, anthropic_compat = args.anthropic_compat, "consumer API listening (loopback)");
+        let usage_worker = spawn_buyer_usage_reconciliation(usage_store.clone(), args.clone());
         let (claim_observer, mut claim_observations) = spawn_buyer_claim_observer(
             chain.clone(),
             Arc::downgrade(&deals),
@@ -13535,6 +13976,9 @@ async fn run_buyer_inner(
         };
         claim_observer.abort();
         let _ = claim_observer.await;
+        usage_worker.abort();
+        let _ = usage_worker.await;
+        reconcile_buyer_usage(&usage_store, &args).await;
         task_result?;
         while let Ok(observation) = claim_observations.try_recv() {
             emit_buyer_claim_observation(machine_events, &observation);
@@ -13711,6 +14155,8 @@ mod tests {
         include!("buyer/issue_185_test.rs");
     }
 
+    #[cfg(unix)]
+    mod consumer_errors_1450_live;
     use crate::cli::args::{NoteDeployArgs, RecoveryIdentityArgs};
 
     #[test]
@@ -17904,6 +18350,16 @@ mod tests {
 
     #[async_trait::async_trait]
     impl dexdo_core::ChainBackend for RecordingRecoveryChain {
+        async fn deal_purchase_terms(
+            &self,
+            _token_contract: &dexdo_core::TokenContract,
+        ) -> Result<Option<(u128, u128)>, dexdo_core::ChainError> {
+            Ok(Some((
+                self.model_buy_terms.map_or(1, |terms| terms.ticks),
+                self.model_buy_terms.map_or(1, |terms| terms.max_price),
+            )))
+        }
+
         async fn stop_if_heartbeat(
             &self,
             _token_contract: &dexdo_core::TokenContract,
@@ -18417,11 +18873,19 @@ mod tests {
             }
         );
         assert!(stop_report.chain_write_submitted());
+        // Automatic verification STOP uses the accounting guard; this fixture records
+        // stop_if_heartbeat in reclaim_calls, while stop_calls is the explicit STOP path.
+        assert_eq!(
+            stop_chain
+                .reclaim_calls
+                .load(std::sync::atomic::Ordering::SeqCst),
+            1
+        );
         assert_eq!(
             stop_chain
                 .stop_calls
                 .load(std::sync::atomic::Ordering::SeqCst),
-            1
+            0
         );
 
         let dispute_chain = std::sync::Arc::new(RecordingRecoveryChain::default());
@@ -18595,8 +19059,10 @@ mod tests {
             buyer: buyer.clone(),
             frame_model: "Qwen3-32B".to_string(),
             mock_model: false,
+            renewal_enabled: false,
             deals: routes.clone(),
             delivery_events: None,
+            usage: None,
         };
         super::spawn_buyer_service_renewal(
             chain,
@@ -19147,6 +19613,11 @@ mod tests {
             "tc-silent",
         )
         .await;
+        // This recovery scenario needs one pending request and a capacity refusal, regardless of
+        // the seller's default concurrency. Select the supported serial setting explicitly.
+        dead_seller
+            .state
+            .set_max_concurrent_requests_per_deal(std::num::NonZeroU32::MIN);
         let (fresh_seller, fresh_handover) = start_issue_547_gateway(
             dexdo::seller::UpstreamConfig::Mock,
             buyer.as_ref(),
@@ -19201,19 +19672,23 @@ mod tests {
         let anthropic =
             issue_547_http_request(client.clone(), api_addr, true, "silent Anthropic request")
                 .await;
-        assert_eq!(anthropic.status(), reqwest::StatusCode::SERVICE_UNAVAILABLE);
-        let anthropic_body = anthropic
-            .text()
+        assert_eq!(anthropic.status(), reqwest::StatusCode::TOO_MANY_REQUESTS);
+        let anthropic_body: serde_json::Value = anthropic
+            .json()
             .await
-            .expect("read local admission refusal");
-        assert!(
-            anthropic_body.contains("active deal budget exhausted"),
-            "second request must be refused by the one-in-flight admission gate: {anthropic_body}"
+            .expect("read seller capacity refusal");
+        assert_eq!(
+            anthropic_body["error"]["code"], "deal_busy",
+            "second request must be refused by the configured seller limit: {anthropic_body}"
+        );
+        assert_eq!(
+            anthropic_body["error"]["recovery_action"], "retry_with_backoff",
+            "seller concurrency refusal must remain retryable: {anthropic_body}"
         );
         assert_eq!(
             provider_calls.load(Ordering::SeqCst),
             1,
-            "the one-in-flight admission refusal must not reach the provider"
+            "the seller capacity refusal must not reach the provider"
         );
         chain.set_monitor_deal_state(dexdo_core::DealChainState {
             funded: true,
@@ -19295,6 +19770,11 @@ mod tests {
             "tc-handler-ambiguous",
         )
         .await;
+        // This recovery scenario needs one pending request and a capacity refusal, regardless of
+        // the seller's default concurrency. Select the supported serial setting explicitly.
+        dead_seller
+            .state
+            .set_max_concurrent_requests_per_deal(std::num::NonZeroU32::MIN);
         let (fresh_seller, fresh_handover) = start_issue_547_gateway(
             dexdo::seller::UpstreamConfig::Mock,
             buyer.as_ref(),
@@ -19355,22 +19835,31 @@ mod tests {
             "ambiguous Anthropic request",
         )
         .await;
-        assert_eq!(anthropic.status(), reqwest::StatusCode::SERVICE_UNAVAILABLE);
-        let anthropic_body = anthropic
-            .text()
+        assert_eq!(anthropic.status(), reqwest::StatusCode::TOO_MANY_REQUESTS);
+        let anthropic_body: serde_json::Value = anthropic
+            .json()
             .await
-            .expect("read local admission refusal");
-        assert!(
-            anthropic_body.contains("active deal budget exhausted"),
-            "second request must be refused by the one-in-flight admission gate: {anthropic_body}"
+            .expect("read seller capacity refusal");
+        assert_eq!(
+            anthropic_body["error"]["code"], "deal_busy",
+            "second request must be refused by the configured seller limit: {anthropic_body}"
+        );
+        assert_eq!(
+            anthropic_body["error"]["recovery_action"], "retry_with_backoff",
+            "seller concurrency refusal must remain retryable: {anthropic_body}"
         );
         assert_eq!(
             provider_calls.load(Ordering::SeqCst),
             1,
-            "the one-in-flight admission refusal must not reach the provider"
+            "the seller capacity refusal must not reach the provider"
         );
-        provider_release.release();
+        // Recovery is driven by an untyped local gateway failure. Provider failures before
+        // output are request-scoped, so an HTTP 500 must not trigger this STOP.
+        dead_seller
+            .state
+            .report_chain_unavailable("tc-handler-ambiguous");
         wait_for_counter(&chain.reclaim_calls, 1, "handler reclaim attempt").await;
+        provider_release.release();
         chain.set_monitor_deal_state(dexdo_core::DealChainState {
             funded: true,
             opened: true,
@@ -19627,6 +20116,37 @@ mod tests {
             deal_state(true, true, false, true)
         )
         .is_none());
+    }
+
+    #[test]
+    fn consumer_errors_1450_initialization_keeps_typed_causes() {
+        use dexdo::buyer::api::{ConsumerErrorCode, DealInitError};
+        use dexdo_core::ChainError;
+        let error = anyhow::Error::new(ChainError::OrderUnavailable("arbitrary wording".into()))
+            .context("outer diagnostic");
+        assert_eq!(
+            super::buyer_deal_init_error(error).code(),
+            ConsumerErrorCode::OrderUnavailable
+        );
+        let error =
+            anyhow::Error::new(ChainError::AmbiguousSubmit("arbitrary wording".into())).context(
+                DealInitError::with_code(ConsumerErrorCode::DealNotOpened, "no handover"),
+            );
+        assert_eq!(
+            super::buyer_deal_init_error(error).code(),
+            ConsumerErrorCode::PurchaseReconciliationRequired
+        );
+        let text_only = anyhow::anyhow!("order_unavailable invalid buy ticks opened=false");
+        assert_eq!(
+            super::buyer_deal_init_error(text_only).code(),
+            ConsumerErrorCode::DealUnavailable
+        );
+        let error = super::require_stream_buy_ticks(dexdo_core::params::MIN_STREAM_BUY_TICKS - 1)
+            .expect_err("below the canonical stream minimum");
+        assert_eq!(
+            super::buyer_deal_init_error(error).code(),
+            ConsumerErrorCode::InvalidBuyTicks
+        );
     }
 
     /// The deadline is a property of the deal, so two buyers who looked at one deal at different
@@ -26148,6 +26668,14 @@ mod tests {
 
     #[async_trait::async_trait]
     impl dexdo_core::ChainBackend for ResumeCommandChain {
+        async fn deal_purchase_terms(
+            &self,
+            token_contract: &dexdo_core::TokenContract,
+        ) -> Result<Option<(u128, u128)>, dexdo_core::ChainError> {
+            assert_eq!(token_contract, &self.fill.token_contract);
+            Ok(Some((self.fill.ticks, self.fill.price_per_tick)))
+        }
+
         async fn claim_tokens(
             &self,
             _: &dexdo_core::TokenContract,
@@ -26294,6 +26822,14 @@ mod tests {
 
     #[async_trait::async_trait]
     impl dexdo_core::ChainBackend for SubscriptionResumeCommandChain {
+        async fn deal_purchase_terms(
+            &self,
+            token_contract: &dexdo_core::TokenContract,
+        ) -> Result<Option<(u128, u128)>, dexdo_core::ChainError> {
+            assert_eq!(token_contract, &self.fill.token_contract);
+            Ok(Some((self.fill.ticks, self.fill.price_per_tick)))
+        }
+
         async fn claim_tokens(
             &self,
             _: &dexdo_core::TokenContract,
@@ -27236,6 +27772,10 @@ mod tests {
             super::BuyerChainPreflight::OfflineTest,
             None,
             true,
+        );
+        assert!(
+            state.renewal_enabled,
+            "authorized on-demand continuation is diagnostic state"
         );
         let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel::<()>();
         let (addr, task) =
@@ -28521,6 +29061,14 @@ mod tests {
 
     #[async_trait::async_trait]
     impl dexdo_core::ChainBackend for SpotHandleResumeChain {
+        async fn deal_purchase_terms(
+            &self,
+            token_contract: &dexdo_core::TokenContract,
+        ) -> Result<Option<(u128, u128)>, dexdo_core::ChainError> {
+            assert_eq!(token_contract, &self.token_contract);
+            Ok(Some((SPOT_RESUME_TEST_TICKS, dexdo_core::PRICE_STEP)))
+        }
+
         async fn claim_tokens(
             &self,
             _: &dexdo_core::TokenContract,
@@ -30344,6 +30892,25 @@ mod tests {
             .timeout(std::time::Duration::from_secs(5))
             .build()
             .unwrap();
+        let usage: serde_json::Value = client
+            .get(format!("http://{api_addr}/v1/usage"))
+            .send()
+            .await
+            .unwrap()
+            .error_for_status()
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        let limit: serde_json::Value = serde_json::from_str(&dexdo_core::params::shell_amount(
+            fill.ticks * fill.price_per_tick,
+        ))
+        .unwrap();
+        assert_eq!(
+            usage["quota"],
+            serde_json::json!({"limit":limit,"used":0,"remaining":limit,"unit":"SHELL"}),
+            "crash recovery restores the matched purchase quota before the first request"
+        );
         let response = client
             .post(format!("http://{api_addr}/v1/chat/completions"))
             .json(&serde_json::json!({
@@ -31509,4 +32076,5 @@ mod tests {
     }
 
     include!("buyer/issue_2064_test.rs");
+    include!("buyer/keep_open_2148_test.rs");
 }

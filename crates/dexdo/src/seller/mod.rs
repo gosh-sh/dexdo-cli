@@ -463,10 +463,10 @@ async fn start_gateway_with_note_and_capacity_dir(
     gw_tls: GatewayTls,
 ) -> Result<RunningSeller> {
     // this process is about to serve buyers, and a buyer that hangs up mid-stream must give
-    // this gateway an `EPIPE` to handle rather than a signal that kills it. `main` restores the
-    // default SIGPIPE disposition for one-shot printers; a gateway needs it ignored. Do not delete
-    // this as a duplicate of the entry policy -- it is the opposite decision, for the opposite kind
-    // of process, and the cost of losing it is a seller that dies mid-delivery.
+    // this gateway an `EPIPE` to handle rather than a signal that kills it. Since process entry
+    // already leaves SIGPIPE ignored; this states it again at the serving point so the gateway does
+    // not depend on the entry policy staying what it is. The cost of losing it is a seller that dies
+    // mid-delivery.
     crate::serving_process_ignores_sigpipe();
     let state = Arc::new(match deals_dir {
         Some(deals_dir) => GatewayState::with_upstream_and_deals_dir(upstream, deals_dir),
@@ -939,11 +939,18 @@ async fn poll_match(
 ) -> Result<(SellerMatchWatchCursor, Option<Match>)> {
     let mut cursor = SellerMatchWatchCursor::load_or_new(cursor_path, &cfg.token_contract)?;
     cursor.last_polled_unix = Some(now_unix()?);
-    if known_matched && cursor.fill.is_none() {
+    if known_matched {
         let state = chain.deal_state(&cfg.token_contract).await?;
-        if !state.is_some_and(|state| state.funded && !state.is_stopped()) {
+        // A saved fill can outlive the deal; its terminal receipt also outranks a lagging getter.
+        if state.is_some_and(DealChainState::is_stopped)
+            || ((cursor.fill.is_some() || state.is_none_or(|state| !state.funded))
+                && chain
+                    .terminal_settlement(&cfg.token_contract)
+                    .await?
+                    .is_some())
+        {
             cursor.save(cursor_path)?;
-            bail!("TokenContract {} ended before its authoritative fill was recovered; capacity remains unresolved", display_token_contract(&cfg.token_contract));
+            bail!("TokenContract {} ended before its authoritative match was recovered; capacity remains unresolved", display_token_contract(&cfg.token_contract));
         }
     }
     let fills = chain
@@ -1064,7 +1071,7 @@ pub async fn wait_for_match(
     wait_for_match_inner(seller, chain, cfg, watch, false).await
 }
 
-/// Resume a match that was already observed; absence/cleanup is terminal while its fill is missing.
+/// Resume an observed funded match until its buyer is readable or its terminal state is proven.
 pub async fn wait_for_known_match(
     seller: &RunningSeller,
     chain: &dyn ChainBackend,
@@ -1090,13 +1097,15 @@ async fn wait_for_match_inner(
                         .downcast_ref::<dexdo_core::ChainError>()
                         .is_some_and(|error| {
                             matches!(error, dexdo_core::ChainError::Transport(_))
+                                || matches!(error, dexdo_core::ChainError::NoMatch(tc)
+                                    if known_matched && tc.eq_ignore_ascii_case(&cfg.token_contract))
                         }) =>
                 {
                     tracing::warn!(
                         event = "seller_match_watch_network_error",
                         token_contract = %display_token_contract(&cfg.token_contract),
                         error = %error,
-                        "transient seller match-watch network error; keeping gateway alive"
+                        "transient seller match read; keeping gateway alive"
                     );
                     tokio::time::sleep(watch.poll_interval).await;
                     continue;
@@ -1178,11 +1187,13 @@ mod tests {
         let challenge = client
             .get_challenge(ChallengeRequest {
                 token_contract: token_contract.to_string(),
+                capabilities_only: false,
             })
             .await
             .unwrap()
             .into_inner();
         StreamRequest {
+            shared_budget: false,
             token_contract: token_contract.to_string(),
             signature: note
                 .sign(&crate::seller::auth::challenge_bytes(
@@ -1466,6 +1477,18 @@ mod tests {
                 last_claim_time: 0,
                 dispute_time: 0,
             }))
+        }
+
+        async fn terminal_settlement(
+            &self,
+            _: &TokenContract,
+        ) -> Result<Option<dexdo_core::DealTerminalSettlement>, ChainError> {
+            Ok(self.cleaned_up.load(Ordering::Relaxed).then_some(
+                dexdo_core::DealTerminalSettlement::StreamStopped {
+                    to_seller: 0,
+                    refund_to_buyer: 1_000,
+                },
+            ))
         }
 
         async fn deal_subscription(
@@ -2706,6 +2729,59 @@ mod tests {
         seller.state.auth.issue_challenge(tc, nonce.to_vec());
         let signature = buyer.sign(&crate::seller::auth::challenge_bytes(tc, nonce));
         assert!(seller.state.auth.verify_response(tc, nonce, &signature));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn issue_2108_recoverable_fill_read_preserves_legacy_cursor_and_capacity() {
+        let (_dir, cursor_path) = temp_cursor_path("2108-legacy-read-retry");
+        let seller = test_seller();
+        let tc = "tc-2108-legacy-retry";
+        let cfg = test_cfg(tc);
+        let buyer = LocalNote::generate();
+        let backend = PollBackend::with_state(sample_match(tc, buyer.pubkey()), true, true)
+            .with_matched_ticks(3)
+            .with_poll_failures(1);
+        let original = serde_json::to_vec(&serde_json::json!({
+            "version":1, "token_contract":tc,
+            "source":{"since_unix":0,"last_seen_created_at":1,"seen_token_contracts_at_last_seen":[tc]},
+            "last_polled_unix":1,"opened_at_unix":1,
+        })).unwrap();
+        std::fs::write(&cursor_path, &original).unwrap();
+        let watch = SellerMatchWatchConfig {
+            cursor_path: cursor_path.clone(),
+            poll_interval: dexdo_core::params::DEFAULT_MATCH_POLL_INTERVAL,
+        };
+        let recovery = watch_and_serve_match(&seller, &backend, &cfg, &watch);
+        tokio::pin!(recovery);
+        assert!(futures::poll!(recovery.as_mut()).is_pending());
+        assert_eq!(backend.polls.load(Ordering::Relaxed), 1);
+        assert_eq!(std::fs::read(&cursor_path).unwrap(), original);
+        assert!(!seller.server_task.is_finished());
+
+        let matched = recovery
+            .await
+            .expect("the existing watcher retries the same paid match");
+        assert_eq!(matched.token_contract, tc);
+        let saved = read_seller_fill_lineage(&cursor_path, &cfg.token_contract)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            (
+                saved.offered_ticks,
+                saved.matched_ticks,
+                saved.residual_ticks
+            ),
+            (8, 3, 5)
+        );
+        assert!(saved.replacement_nonce.is_none());
+        assert!(saved.replacement_token_contract.is_none());
+        assert_eq!(
+            backend.opens.load(Ordering::Relaxed),
+            0,
+            "never re-open the paid deal"
+        );
+        assert!(!seller.server_task.is_finished());
+        seller.server_task.abort();
     }
 
     #[tokio::test(start_paused = true)]

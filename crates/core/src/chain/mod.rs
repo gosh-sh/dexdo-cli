@@ -29,7 +29,6 @@ pub use book_events::{
     fold_book_event_pages, BookEventFold, BookEventMessage, BookEventPage, BookFillCandidate,
     LiveBookOrder,
 };
-pub use client::NoteDealCreditReceipt;
 pub use client::{
     chain_clock_skew_preflight, chain_http_client, endpoint_urls, external_message_hash,
     normalize_endpoint, note_transfer_amount_refusal, note_transfer_deposit_identifier_hash,
@@ -44,15 +43,17 @@ pub use client::{
     TokenContractSettlementReceipt, TokenContractSettlementReceipts, CHAIN_DOCTOR_CHECK_COUNT,
 };
 pub use client::{
-    chain_time_secs, decode_multisig_queue_event, parse_message_destination,
-    parse_source_transaction_out_messages, prove_multisig_delivery_message,
-    read_multisig_queue_history, sole_delivery_sibling, MultisigQueueEvent, MultisigQueueRecord,
+    chain_time_secs, decode_multisig_queue_event, multisig_event_is_from_transaction,
+    parse_message_destination, parse_source_transaction_out_messages,
+    prove_multisig_delivery_message, read_multisig_queue_history, sole_delivery_sibling,
+    MultisigQueueEvent, MultisigQueueRecord,
 };
 pub use client::{decode_tokens_withdrawn_event, TokensWithdrawnEvent};
 pub use client::{
     is_transient_read_failure, retry_transient_read, ChainRequestCeiling, LimitedChainClient,
     RetryingReads,
 };
+pub use client::{BuyerUsageOperation, BuyerUsageOperations, NoteDealCreditReceipt};
 pub use client::{PlaceInferenceBuyReceipt, TokenContractInboundCall};
 pub use contracts_provision::keypair_ed_pubkey;
 pub use contracts_provision::{

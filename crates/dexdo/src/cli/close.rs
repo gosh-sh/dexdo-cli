@@ -14,6 +14,31 @@ use crate::cli::recover::check_reclaimable_state;
 use anyhow::{bail, Result};
 use dexdo_core::ChainBackend;
 
+fn close_buyer_usage_quota(network: &str, token_contract: &str) -> Result<()> {
+    let persist = || -> Result<()> {
+        let path = super::data_dir::automatic(dexdo_core::params::BUYER_USAGE_DATABASE_FILE)?;
+        if !path.try_exists()? {
+            return Ok(());
+        }
+        // The journal shares the serving buyer's instance lock. An old close must never
+        // race a replacement purchase and overwrite its current quota.
+        let _lock =
+            super::data_dir::acquire_instance_lock(super::data_dir::InstanceRole::Buyer, true)?;
+        dexdo::buyer::usage::UsageStore::open(path, network)?.close_deal_quota(token_contract)
+    };
+    persist().map_err(|error| {
+        super::refusal::Refusal::breakage(
+            "The buyer deal is confirmed closed, but its local usage quota could not be saved.",
+            "After the serving buyer exits, retry close with the same data directory to repair \
+             local usage state.",
+            format!(
+                "buyer deal {token_contract} is confirmed closed; failed to save usage quota closure: {error:#}"
+            ),
+        )
+        .into_error()
+    })
+}
+
 async fn submit_then_observe_cleanup<S, SF, O, OF>(submit: S, observe: O) -> Result<()>
 where
     S: FnOnce() -> SF,
@@ -143,27 +168,25 @@ fn confirmed_buyer_stop_followup_error(
     receipt: &dexdo_core::SettlementActionReceipt,
     error: anyhow::Error,
 ) -> anyhow::Error {
-    anyhow::anyhow!(
+    error.context(format!(
         "buyer STOP is already confirmed on-chain; authoritative receipt={receipt}; \
-         ancillary {step} failed after the receipt was rendered: {error:#}"
-    )
+         ancillary {step} failed after the receipt was rendered"
+    ))
 }
 
 fn apply_confirmed_buyer_stop_marker<T>(
     receipt: &dexdo_core::SettlementActionReceipt,
     marker: impl FnOnce() -> Result<T>,
 ) -> Result<T> {
-    marker().map_err(|error| {
-        confirmed_buyer_stop_followup_error("local subscription marker", receipt, error)
-    })
+    marker()
+        .map_err(|error| confirmed_buyer_stop_followup_error("local buyer state", receipt, error))
 }
 
 fn apply_prior_stop_marker<T>(confirmation: &str, marker: impl FnOnce() -> Result<T>) -> Result<T> {
     marker().map_err(|error| {
-        anyhow::anyhow!(
-            "{confirmation}; local subscription marker failed during idempotent reconciliation: \
-             {error:#}"
-        )
+        error.context(format!(
+            "{confirmation}; local buyer state failed during idempotent reconciliation"
+        ))
     })
 }
 
@@ -519,6 +542,9 @@ async fn run_close_mock(args: CloseArgs) -> Result<()> {
     let snapshot = chain.checked_snapshot(&target.token_contract).await?;
     match snapshot {
         None => {
+            if role == DealRoleArg::Buyer {
+                close_buyer_usage_quota("mock", &target.token_contract)?;
+            }
             let response = close_response(
                 "mock",
                 handle,
@@ -541,6 +567,9 @@ async fn run_close_mock(args: CloseArgs) -> Result<()> {
             Ok(())
         }
         Some(snapshot) if snapshot.closed => {
+            if role == DealRoleArg::Buyer {
+                close_buyer_usage_quota("mock", &target.token_contract)?;
+            }
             let response = close_response(
                 "mock",
                 handle,
@@ -589,13 +618,14 @@ async fn run_close_mock(args: CloseArgs) -> Result<()> {
                         None,
                     )?;
                     if args.json {
-                        return machine::print_json(&response);
+                        machine::print_json(&response)?;
+                    } else {
+                        println!(
+                            "close submitted role=buyer action=streamStop token_contract={}",
+                            dexdo_core::address::display_self_dapp(&response.token_contract)
+                        );
                     }
-                    println!(
-                        "close submitted role=buyer action=streamStop token_contract={}",
-                        dexdo_core::address::display_self_dapp(&response.token_contract)
-                    );
-                    Ok(())
+                    close_buyer_usage_quota("mock", &response.token_contract)
                 }
                 DealRoleArg::Seller => {
                     let state = chain
@@ -718,6 +748,7 @@ pub(crate) async fn run_close(args: CloseArgs) -> Result<()> {
                 );
             }
             apply_prior_stop_marker(&confirmation, || {
+                close_buyer_usage_quota(chain.network(), &tc.with_workchain())?;
                 super::buyer::mark_buyer_subscription_terminal(
                     &note.with_workchain(),
                     &tc.with_workchain(),
@@ -727,6 +758,9 @@ pub(crate) async fn run_close(args: CloseArgs) -> Result<()> {
         }
     }
     let Some(snapshot) = chain.token_contract_deal_snapshot(&tc).await? else {
+        if role == deals::DealHandleRole::Buyer {
+            close_buyer_usage_quota(chain.network(), &tc.with_workchain())?;
+        }
         if args.json {
             return machine::print_json(&with_last_observed_usage(
                 with_last_observed_promotion(
@@ -891,6 +925,7 @@ pub(crate) async fn run_close(args: CloseArgs) -> Result<()> {
                 );
             }
             if s.kind == deals::DealStateKind::Stopped {
+                close_buyer_usage_quota(chain.network(), &tc.with_workchain())?;
                 super::buyer::mark_buyer_subscription_terminal(&note_addr, &tc.with_workchain())?;
                 if args.json {
                     return machine::print_json(&with_last_observed_usage(
@@ -987,6 +1022,7 @@ pub(crate) async fn run_close(args: CloseArgs) -> Result<()> {
                 }
 
                 apply_confirmed_buyer_stop_marker(&receipt, || {
+                    close_buyer_usage_quota(chain.network(), &tc.with_workchain())?;
                     super::buyer::mark_buyer_subscription_terminal(
                         &note.with_workchain(),
                         &tc.with_workchain(),
@@ -1027,12 +1063,8 @@ pub(crate) async fn run_close(args: CloseArgs) -> Result<()> {
                     || async { chain.wait_cleanup_unopened(&tc).await.map_err(Into::into) },
                 )
                 .await?;
-                super::buyer::mark_buyer_subscription_terminal(
-                    &note.with_workchain(),
-                    &tc.with_workchain(),
-                )?;
                 if args.json {
-                    return machine::print_json(&close_response(
+                    machine::print_json(&close_response(
                         chain.network(),
                         target.handle.as_ref().map(|h| h.handle.clone()),
                         role.as_str(),
@@ -1043,12 +1075,18 @@ pub(crate) async fn run_close(args: CloseArgs) -> Result<()> {
                         None,
                         s.kind.as_str(),
                         "closed",
-                    )?);
+                    )?)?;
+                } else {
+                    println!(
+                        "close confirmed role=buyer action=streamCleanup token_contract={} note={}",
+                        tc_display, note_display
+                    );
                 }
-                println!(
-                    "close confirmed role=buyer action=streamCleanup token_contract={} note={}",
-                    tc_display, note_display
-                );
+                close_buyer_usage_quota(chain.network(), &tc.with_workchain())?;
+                super::buyer::mark_buyer_subscription_terminal(
+                    &note.with_workchain(),
+                    &tc.with_workchain(),
+                )?;
                 return Ok(());
             }
             bail!("{}", close_hint(&target, &s, args.deals_dir.as_deref()));
@@ -1770,8 +1808,8 @@ mod tests {
             marker_calls.fetch_add(1, Ordering::SeqCst);
             Err::<(), _>(anyhow::anyhow!("durable marker write failed"))
         })
-        .expect_err("destroyed TC must not suppress the receipt-driven marker")
-        .to_string();
+        .expect_err("destroyed TC must not suppress the receipt-driven marker");
+        let error = format!("{error:#}");
         assert_eq!(marker_calls.load(Ordering::SeqCst), 1);
         for fact in [
             "already confirmed on-chain",
@@ -1781,7 +1819,7 @@ mod tests {
             "burnedProbe=11",
             "burnedBond=12",
             "refundToBuyer=22",
-            "local subscription marker",
+            "local buyer state",
             "durable marker write failed",
         ] {
             assert!(error.contains(fact), "missing {fact:?} in {error}");
@@ -1806,6 +1844,28 @@ mod tests {
             !tail[..marker].contains(".token_contract_deal_snapshot(&tc)"),
             "no redundant post-receipt getter may gate the terminal marker"
         );
+
+        // The operator-facing repair message must survive both post-receipt wrappers.
+        let repair_failure = || -> anyhow::Result<()> {
+            Err(crate::cli::refusal::Refusal::breakage(
+                "The buyer deal is confirmed closed, but its local usage quota could not be saved.",
+                "retry close with the same data directory",
+                "another buyer instance is already using data directory /tmp/shared",
+            )
+            .into_error())
+        };
+        for error in [
+            super::apply_confirmed_buyer_stop_marker(&receipt, repair_failure).unwrap_err(),
+            super::apply_prior_stop_marker("buyer STOP already confirmed", repair_failure)
+                .unwrap_err(),
+        ] {
+            let shown = crate::cli::refusal::shown_to_operator(&error)
+                .expect("confirmed closure must not become a pre-submit refusal");
+            let shown = shown.to_string();
+            assert!(shown.contains("confirmed closed"), "{shown}");
+            assert!(shown.contains("retry close"), "{shown}");
+            assert!(!shown.contains("nothing was sent"), "{shown}");
+        }
     }
 
     #[test]

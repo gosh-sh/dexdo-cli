@@ -165,6 +165,20 @@ fn api_state(
     dir: &std::path::Path,
     resume: bool,
 ) -> dexdo::buyer::api::ApiState {
+    api_state_with_policy(chain, buyer, dir, resume, None)
+}
+
+fn api_state_with_policy(
+    chain: Arc<WaitingChain>,
+    buyer: Arc<dexdo::buyer::Buyer>,
+    dir: &std::path::Path,
+    resume: bool,
+    runtime_policy: Option<crate::cli::policy::BuyerRuntimePolicy>,
+) -> dexdo::buyer::api::ApiState {
+    let failure_policy = runtime_policy
+        .as_ref()
+        .map(crate::cli::policy::BuyerRuntimePolicy::as_api_failure_policy)
+        .unwrap_or_default();
     let fixture = buyer_submit_test_journal();
     let mut args = spot_resume_buyer_args(dir, &fixture.note_addr, "Qwen3-32B");
     args.resume = resume;
@@ -181,8 +195,8 @@ fn api_state(
         "Qwen3-32B".into(),
         dexdo::buyer::api::ContentCheck::Skip,
         Arc::new(dexdo::seller::ModelsConfig::empty()),
-        None,
-        dexdo::buyer::api::BuyerApiFailurePolicy::default(),
+        runtime_policy,
+        failure_policy,
         None,
         None,
         None,
@@ -412,4 +426,83 @@ async fn issue_185_policy_successor_retains_guard_until_adopted() {
     )
     .unwrap();
     assert!(!money_lock.journal_path.exists());
+}
+
+#[allow(clippy::await_holding_lock)]
+#[tokio::test]
+async fn issue_185_keep_open_restart_adopts_original_without_shared_wait_memory() {
+    use crate::cli::policy::{
+        BadOutputScamAction, DeadGatewayAction, EmptyStreamAction, MalformedHandoverAction,
+        NoHandoverAfterMatchAction, SellerStallsMidStreamAction,
+    };
+
+    let _env_lock = dexdo_pn_pool_env_lock().lock().unwrap();
+    let (dir, _cleanup) = buyer_journal_test_dir("issue185-keep-open-restart");
+    let fixture = buyer_submit_test_journal();
+    let pool = write_spot_resume_pool(&dir, &fixture.note_addr);
+    let _env = EnvVarGuard::set("DEXDO_PN_POOL", pool.as_os_str());
+    let money_lock = command::BuyerMoneyLock::open(&fixture.note_addr).unwrap();
+    let _ = std::fs::remove_file(&money_lock.journal_path);
+    let chain = waiting_chain(&money_lock.journal_path);
+    let buyer = Arc::new(dexdo::buyer::Buyer::generate());
+    let runtime_policy = buyer_policy(
+        NoHandoverAfterMatchAction::KeepOpen,
+        MalformedHandoverAction::KeepOpen,
+        DeadGatewayAction::FailClosed,
+        EmptyStreamAction::FailClosed,
+        SellerStallsMidStreamAction::AcceptDeliveredThenReclaim,
+        BadOutputScamAction::Stop,
+    );
+
+    chain.block_handover.store(true, Ordering::SeqCst);
+    let state = api_state_with_policy(
+        chain.clone(),
+        buyer.clone(),
+        &dir,
+        false,
+        Some(runtime_policy.clone()),
+    );
+    let request = tokio::spawn(async move { state.current_deal().await });
+    tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        chain.handover_entered.notified(),
+    )
+    .await
+    .expect("funded request must enter the handover read");
+    request.abort();
+    assert!(matches!(request.await, Err(error) if error.is_cancelled()));
+    assert_eq!(chain.pipeline.post_count.load(Ordering::SeqCst), 1);
+    assert!(money_lock.journal_path.exists());
+
+    // A new initializer has a new OnDemandKeptOpen, so recovery cannot rely on
+    // v0.9.0's in-process kept-open wait state.
+    chain.block_handover.store(false, Ordering::SeqCst);
+    let tc = chain.pipeline.fill.as_ref().unwrap().token_contract.clone();
+    let handover = dexdo_core::Handover {
+        endpoint: "https://127.0.0.1:1".into(),
+        tls_fingerprint: "aa".repeat(32),
+    };
+    let seller = dexdo_core::LocalNote::generate();
+    *chain.handover.lock().unwrap() =
+        Some(seller.encrypt_to(&buyer.note.pubkey(), &handover.to_deal_bytes(&tc)));
+    let restarted = api_state_with_policy(
+        chain.clone(),
+        buyer,
+        &dir,
+        true,
+        Some(runtime_policy),
+    );
+    let route = tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        restarted.current_deal(),
+    )
+    .await
+    .expect("restart must adopt the original deal")
+    .unwrap();
+    assert_eq!(route.route.token_contract, tc);
+    assert_eq!(chain.pipeline.post_count.load(Ordering::SeqCst), 1);
+    assert!(!money_lock.journal_path.exists());
+    let handles = command::deals::list_deal_handles(&dir.join("deals")).unwrap();
+    assert_eq!(handles.len(), 1);
+    assert_eq!(handles[0].1.token_contract, tc);
 }

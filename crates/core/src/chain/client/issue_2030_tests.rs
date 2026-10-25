@@ -342,7 +342,10 @@ async fn issue_2030_note_fill_poll_uses_system_dapp_without_account_lookup() {
         listener,
         vec![(
             200,
-            json!({"data":{"blockchain":{"account":{"messages":{"edges":[]}}}}}),
+            json!({"data":{"blockchain":{"account":{
+                "info":{"id":"note"},
+                "messages":{"edges":[],"pageInfo":{"startCursor":null,"hasPreviousPage":false}}
+            }}}}),
         )],
     );
     let deployment = deployed("");

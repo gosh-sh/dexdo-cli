@@ -1600,7 +1600,9 @@ pub(crate) fn seller_real_backend_with_deal_gas_overhead(
         nonce,
         deal_gas_overhead_raw,
     )?;
-    let chain: Arc<dyn ChainBackend> = Arc::new(backend);
+    let chain: Arc<dyn ChainBackend> = Arc::new(backend.with_offer_journal_dir(
+        crate::cli::deals::resolve_deals_dir(args.deals_dir.as_deref())?.join("seller-watch"),
+    ));
     let note: Arc<dyn Note> = Arc::new(rn);
     Ok((chain, note))
 }
@@ -1921,18 +1923,23 @@ pub(crate) async fn provision_replacement_seller_with_deal_gas_overhead(
             }
         }
     };
-    let backend: Arc<dyn ChainBackend> = Arc::new(RealSellerBackend::new_with_deal_gas_overhead(
-        chain,
-        // The seller note is a shared-DApp account and the backend holds the chain address it reads
-        // and writes with, so only the chain half is handed over.
-        note.into_chain(),
-        keys,
-        dexdo_core::model_hash_for(frame_model),
-        frame_model.to_string(),
-        nonce,
-        TICK_SIZE,
-        supplied_deal_gas_overhead_raw,
-    ));
+    let backend: Arc<dyn ChainBackend> = Arc::new(
+        RealSellerBackend::new_with_deal_gas_overhead(
+            chain,
+            // The seller note is a shared-DApp account and the backend holds the chain address it reads
+            // and writes with, so only the chain half is handed over.
+            note.into_chain(),
+            keys,
+            dexdo_core::model_hash_for(frame_model),
+            frame_model.to_string(),
+            nonce,
+            TICK_SIZE,
+            supplied_deal_gas_overhead_raw,
+        )
+        .with_offer_journal_dir(
+            crate::cli::deals::resolve_deals_dir(args.deals_dir.as_deref())?.join("seller-watch"),
+        ),
+    );
     Ok((market, backend))
 }
 

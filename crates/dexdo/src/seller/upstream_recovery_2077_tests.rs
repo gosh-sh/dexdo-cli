@@ -4,12 +4,14 @@
 async fn issue_2077_any_upstream_error_recovers_the_cancelled_offer() {
     for (status, body) in [
         ("200 OK", "data: {\"error\":{\"message\":\"Our servers are currently overloaded. Please try again later.\"}}\n\n"),
-        ("429 Too Many Requests", "{\"error\":{\"message\":\"rate limited\"}}"),
-        ("503 Service Unavailable", "{\"error\":{\"message\":\"maintenance\"}}"),
+        ("503 Service Unavailable\r\nRetry-After: 1", "{\"error\":{\"message\":\"maintenance\"}}"),
         ("401 Unauthorized", "{\"error\":{\"message\":\"credential rejected\"}}"),
         ("200 OK", "data: {\"error\":{\"message\":\"an entirely different provider failure\"}}\n\n"),
     ] {
         // Retryable HTTP statuses first exhaust the existing timeout tolerance.
+        // The provider's explicit delay exceeds fast_timing().health_timeout, so each
+        // scripted 503 occupies a separate probe. Full jitter may otherwise consume
+        // both failures in one probe and recover without withdrawing the offer.
         let attempts = if status.starts_with("429") || status.starts_with("503") {
             SELLER_UPSTREAM_HEALTH_TIMEOUT_MAX_ATTEMPTS as usize
         } else {
@@ -374,5 +376,49 @@ proptest! {
             seller.server_task.abort();
             upstream.abort();
         });
+    }
+}
+
+
+#[tokio::test]
+async fn issue_2135_repeated_throttling_keeps_the_same_resting_offer() {
+    let (url, probes, upstream) = scripted_http_server(vec![
+        ("429 Too Many Requests", "{}".into(), Duration::ZERO),
+        ("429 Too Many Requests", "{}".into(), Duration::ZERO),
+        ("200 OK", healthy_sse(), Duration::ZERO),
+    ]);
+    let backend = issue_2077_backend();
+    let original = backend.resting_order_id().unwrap();
+    let seller = issue_2077_seller(url).await;
+    let (_, outcome) = issue_2077_run(&seller, &backend, async {
+        while probes.load(Ordering::SeqCst) < 4 {
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
+        assert_eq!(backend.resting_order_id(), Some(original));
+        assert!(backend.cancelled().is_empty(), "429 must not withdraw a resting SELL");
+        assert_eq!(backend.posts.load(Ordering::SeqCst), 0);
+        assert!(!seller.server_task.is_finished());
+    }).await;
+    assert!(matches!(outcome, RestingSellerOutcome::Stopped {
+        reason: RestingStopReason::Shutdown, ..
+    }), "{outcome:?}");
+    assert_eq!(backend.cancelled(), vec![original], "only operator shutdown cancels");
+    assert_eq!(backend.posts.load(Ordering::SeqCst), 0);
+    seller.server_task.abort();
+    upstream.abort();
+}
+
+
+#[test]
+fn issue_2135_throttling_never_overrides_gateway_or_untyped_health_failures() {
+    for component in [HealthComponent::UpstreamModel, HealthComponent::AdvertisedGateway, HealthComponent::GatewayTask] {
+        for http in [401, 429, 503] {
+            for typed in [false, true] {
+                let status = tonic::Status::unavailable(format!("upstream HTTP {http} failed"));
+                let status = if typed { dexdo_proto::retryable_upstream_status(status) } else { status };
+                let failure = HealthFailure::new(component, false, "failure").with_source(status);
+                assert_eq!(failure.is_upstream_throttled(), component == HealthComponent::UpstreamModel && http == 429 && typed);
+            }
+        }
     }
 }

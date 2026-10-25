@@ -38,6 +38,13 @@ const OWNER_NOTE: &str = "0:977936df3527a524516a796c619bfe4a40238a7bef76378d4f1a
 /// exactly that gap.
 #[derive(Default)]
 struct BookState {
+    pending: AtomicBool,
+    pending_read_fails: AtomicBool,
+    cancel_succeeds: AtomicBool,
+    cancelled: AtomicBool,
+    reads_fail: AtomicBool,
+    reads: AtomicUsize,
+    posts: AtomicUsize,
     /// Flipped mid-test: the ask was resting, and now a buyer has crossed it.
     matched: AtomicBool,
     /// The generation the BOOK holds. A relist advances it; the pool's captured copy does not.
@@ -87,13 +94,26 @@ struct StaleAskBackend {
 
 #[async_trait::async_trait]
 impl ChainBackend for StaleAskBackend {
+    async fn has_pending_sell_offer(&self, _: &TokenContract) -> Result<bool, ChainError> {
+        if self.book.pending_read_fails.load(Ordering::SeqCst) {
+            return Err(ChainError::Chain("fixture unreadable SELL journal".into()));
+        }
+        Ok(self.book.pending.load(Ordering::SeqCst))
+    }
     /// The book's own rows. Empty once crossed -- the row is gone -- and otherwise the CURRENT
     /// generation, which a relist has moved.
     async fn raw_resting_sell_orders_for_tc(
         &self,
         token_contract: &TokenContract,
     ) -> Result<Vec<OrderBookOrder>, ChainError> {
-        if token_contract != &self.token_contract || self.book.matched.load(Ordering::SeqCst) {
+        self.book.reads.fetch_add(1, Ordering::SeqCst);
+        if self.book.reads_fail.load(Ordering::SeqCst) {
+            return Err(ChainError::Transport("fixture getter outage".into()));
+        }
+        if token_contract != &self.token_contract
+            || self.book.matched.load(Ordering::SeqCst)
+            || self.book.cancelled.load(Ordering::SeqCst)
+        {
             return Ok(Vec::new());
         }
         Ok(vec![OrderBookOrder {
@@ -111,7 +131,7 @@ impl ChainBackend for StaleAskBackend {
     }
 
     /// Refused the way a full cancel queue refuses (`CANCEL_REJ_QUEUE_FULL`), and recorded so the
-    /// test can say WHICH generation was aimed at.
+    /// test can say WHICH generation was aimed at. Tests can also accept and remove the exact ask.
     async fn cancel_resting_sell_order(
         &self,
         _token_contract: &TokenContract,
@@ -122,6 +142,10 @@ impl ChainBackend for StaleAskBackend {
             .lock()
             .expect("cancel log")
             .push(order_id);
+        if self.book.cancel_succeeds.load(Ordering::SeqCst) {
+            self.book.cancelled.store(true, Ordering::SeqCst);
+            return Ok(());
+        }
         Err(ChainError::Chain(
             "order book cancel queue is full".to_string(),
         ))
@@ -139,6 +163,10 @@ impl ChainBackend for StaleAskBackend {
     }
 
     async fn deal_state(&self, _: &TokenContract) -> Result<Option<DealChainState>, ChainError> {
+        self.book.reads.fetch_add(1, Ordering::SeqCst);
+        if self.book.reads_fail.load(Ordering::SeqCst) {
+            return Err(ChainError::Transport("fixture state outage".into()));
+        }
         Ok(self
             .book
             .matched
@@ -178,6 +206,10 @@ impl ChainBackend for StaleAskBackend {
     }
 
     async fn sell_offer_terms(&self, _: &TokenContract) -> Result<Option<(u64, u64)>, ChainError> {
+        self.book.reads.fetch_add(1, Ordering::SeqCst);
+        if self.book.reads_fail.load(Ordering::SeqCst) {
+            return Err(ChainError::Transport("fixture terms outage".into()));
+        }
         Ok(Some((
             u64::try_from(dexdo_core::PRICE_STEP).expect("canonical price fits the getter"),
             2,
@@ -200,6 +232,7 @@ impl ChainBackend for StaleAskBackend {
         Ok(Vec::new())
     }
     async fn post_offer(&self, _offer: SellOffer, _note: &dyn Note) -> Result<(), ChainError> {
+        self.book.posts.fetch_add(1, Ordering::SeqCst);
         Ok(())
     }
     async fn place_buy(
@@ -587,11 +620,9 @@ fn an_unproven_start_plans_the_same_rearm_the_running_path_plans() {
     );
 }
 
-/// POINT 3. `Stopped { identity: None }` used to leave the gateway route registered -- the one branch
-/// that neither seated anything for the sweep nor released what it had taken. Nothing to sweep and
-/// nothing to watch means the route goes back, exactly as the isolated-failure branch releases it.
+/// An unknown submission retains pending mode independently of how its interruption was named.
 #[test]
-fn an_unproven_start_with_no_identity_releases_the_route_instead_of_leaking_it() {
+fn issue_2115_an_unproven_start_with_no_identity_keeps_pending_ownership() {
     let unproven = CancellationDisposition::UnknownFailure {
         known_result: String::new(),
     };
@@ -601,9 +632,61 @@ fn an_unproven_start_with_no_identity_releases_the_route_instead_of_leaking_it()
     ] {
         assert_eq!(
             plan_unproven_start(None, &reason, &unproven),
-            UnprovenStartAction::Release,
-            "with no identity there is nothing to keep: {reason:?}"
+            UnprovenStartAction::WatchPending,
+            "an unknown SELL remains an obligation: {reason:?}"
         );
+    }
+}
+
+#[test]
+fn issue_2115_an_unresolved_sell_without_order_id_gets_its_own_pool_watcher() {
+    assert_eq!(
+        plan_unproven_start(
+            None,
+            &RestingStopReason::OfferPost("exact submission remains unresolved".into()),
+            &CancellationDisposition::UnknownFailure {
+                known_result: "book vacant".into()
+            }
+        ),
+        UnprovenStartAction::WatchPending
+    );
+}
+
+#[tokio::test]
+async fn issue_2115_pending_watcher_shutdown_preserves_identity_or_reports_missing_one() {
+    let seller = test_seller();
+    for (current, pending) in [
+        (None, false),
+        (Some(identity(UNPROVEN_TC, 37)), false),
+        (Some(identity(UNPROVEN_TC, 37)), true),
+    ] {
+        let has_identity = current.is_some();
+        let book = BookState::resting(37);
+        book.pending.store(pending, Ordering::SeqCst);
+        let deal = deal_with(UNPROVEN_TC, book);
+        let mut resting = HashMap::new();
+        let mut error = None;
+        apply_drained_outcome(
+            &seller,
+            deal,
+            current,
+            Ok(dexdo::seller::liveness::RestingSellerOutcome::Stopped {
+                reason: RestingStopReason::Shutdown,
+                disposition: CancellationDisposition::UnknownFailure {
+                    known_result: "exact SELL submission still unreadable".into(),
+                },
+            }),
+            &mut resting,
+            &mut error,
+        )
+        .await;
+        if has_identity {
+            assert_eq!(resting[UNPROVEN_TC].1.order_id, 37);
+            assert_eq!(error.is_some(), pending);
+        } else {
+            assert!(resting.is_empty());
+            assert!(error.unwrap().to_string().contains("SELL submission"));
+        }
     }
 }
 
@@ -652,4 +735,389 @@ async fn the_sweep_cancels_every_entry_and_reports_only_the_first_failure() {
         !rendered.contains(bare_second),
         "only the first failure is reported, got: {rendered}"
     );
+}
+
+#[tokio::test(start_paused = true)]
+async fn issue_2115_pool_start_and_residual_start_preserve_pending_mode() {
+    use super::{
+        prepare_pool_deal, prepare_pool_deal_reporting_identity, watch_pool_deal, PoolDealStart,
+        SellerPoolContext,
+    };
+    use futures::FutureExt as _;
+    let seller = test_seller();
+    let book = BookState::resting(37);
+    book.pending.store(true, Ordering::SeqCst);
+    book.reads_fail.store(true, Ordering::SeqCst);
+    let deal = deal_with(UNPROVEN_TC, book.clone());
+    let root = tempfile::tempdir().unwrap();
+    let context = SellerPoolContext {
+        deals_dir: Some(root.path()),
+        contracts: std::path::Path::new("unused-manifest.json"),
+        note_addr: OWNER_NOTE,
+        frame_model: "mock",
+        gateway_advertise: "127.0.0.1:0",
+        advertise_probe: dexdo::seller::liveness::AdvertiseProbePolicy::default(),
+    };
+    let shutdown = futures::future::pending::<()>().fuse();
+    tokio::pin!(shutdown);
+    let mut stopped = false;
+    let produced = tokio::time::timeout(
+        std::time::Duration::from_secs(1),
+        prepare_pool_deal_reporting_identity(
+            &seller,
+            &deal,
+            &context,
+            false,
+            shutdown.as_mut(),
+            &mut stopped,
+        ),
+    )
+    .await
+    .expect("pending journal cannot block another deal's startup")
+    .unwrap();
+    assert!(matches!(
+        produced,
+        PoolDealStart::StoppedUnproven {
+            identity: None,
+            disposition: CancellationDisposition::UnknownFailure { .. },
+            ..
+        }
+    ));
+    assert_eq!(
+        book.reads.load(Ordering::SeqCst),
+        0,
+        "journal phase precedes failing inspection"
+    );
+    let healthy = deal_with(PROVEN_TC, BookState::resting(38));
+    assert!(matches!(
+        prepare_pool_deal_reporting_identity(
+            &seller,
+            &healthy,
+            &context,
+            true,
+            shutdown.as_mut(),
+            &mut stopped
+        )
+        .await
+        .unwrap(),
+        PoolDealStart::Watching(None)
+    ));
+    let (identity, pending_owner) = prepare_pool_deal(
+        &seller,
+        &deal,
+        &context,
+        false,
+        shutdown.as_mut(),
+        &mut stopped,
+    )
+    .await
+    .unwrap();
+    assert!(identity.is_none());
+    assert_eq!(pending_owner.as_deref(), Some(OWNER_NOTE));
+    let (fills, mut fill_rx) = tokio::sync::mpsc::unbounded_channel();
+    let (stop_tx, stop_rx) = tokio::sync::watch::channel(false);
+    let watcher = watch_pool_deal(
+        &seller,
+        deal,
+        identity,
+        pending_owner,
+        fills,
+        context.advertise_probe,
+        stop_rx,
+    );
+    tokio::pin!(watcher);
+    tokio::select! {
+        result = &mut watcher => panic!("getter outage must retain pending phase: {:?}", result.2),
+        _ = tokio::time::sleep(std::time::Duration::from_secs(1)) => {}
+    }
+    assert!(book.reads.load(Ordering::SeqCst) > 0);
+    assert!(fill_rx.try_recv().is_err());
+    stop_tx.send(true).unwrap();
+    let (_, identity, result) = watcher.await;
+    assert!(identity.is_none());
+    assert!(matches!(
+        result.unwrap(),
+        dexdo::seller::liveness::RestingSellerOutcome::Stopped {
+            reason: RestingStopReason::Shutdown,
+            disposition: CancellationDisposition::UnknownFailure { .. }
+        }
+    ));
+}
+
+#[tokio::test(start_paused = true)]
+async fn issue_2115_all_pool_startup_entries_keep_pending_before_getter_errors() {
+    use super::{
+        admit_seller_startup_deals, load_seller_pool_deals_with_scope, run_seller_pool,
+        save_pool_deal_handle, seller_deal_capacity, sweep_seller_startup_offers,
+        SellerPoolContext,
+    };
+    use futures::FutureExt as _;
+    let mut seller = test_seller();
+    seller.server_task.abort();
+    seller.server_task = tokio::spawn(std::future::pending());
+    let root = tempfile::tempdir().unwrap();
+    let context = SellerPoolContext {
+        deals_dir: Some(root.path()),
+        contracts: std::path::Path::new("unused-manifest.json"),
+        note_addr: OWNER_NOTE,
+        frame_model: "mock",
+        gateway_advertise: "127.0.0.1:0",
+        advertise_probe: dexdo::seller::liveness::AdvertiseProbePolicy::default(),
+    };
+    let books = [BookState::resting(37), BookState::resting(38)];
+    let mut deals = Vec::new();
+    let mut backends = HashMap::new();
+    for (index, (tc, book)) in [UNPROVEN_TC, PROVEN_TC].into_iter().zip(&books).enumerate() {
+        book.pending.store(true, Ordering::SeqCst);
+        book.reads_fail.store(true, Ordering::SeqCst);
+        let mut deal = deal_with(tc, book.clone());
+        deal.nonce += index as u64;
+        deal.market = Some(dexdo_core::MarketManifest {
+            network: deal.chain.network().into(),
+            frame_model: "mock".into(),
+            model_hash: dexdo_core::model_hash_for("mock"),
+            inference_order_book: OWNER_NOTE.into(),
+            root_model: OWNER_NOTE.into(),
+            token_contract: tc.into(),
+            seller_note: OWNER_NOTE.into(),
+            nonce: deal.nonce,
+            price_per_tick: dexdo_core::PRICE_STEP,
+            max_ticks: 2,
+        });
+        save_pool_deal_handle(&context, &deal).unwrap();
+        backends.insert(super::deals::normalize_addr(tc), deal.chain.clone());
+        deals.push(deal);
+    }
+    let backend = |market: &dexdo_core::MarketManifest| -> anyhow::Result<Arc<dyn ChainBackend>> {
+        Ok(backends[&super::deals::normalize_addr(&market.token_contract)].clone())
+    };
+    let retained = sweep_seller_startup_offers(&context, &deals[0].chain, UNPROVEN_TC, backend)
+        .await
+        .unwrap();
+    assert_eq!(retained.len(), 2);
+    let capacity = seller_deal_capacity(context.deals_dir, OWNER_NOTE, backend)
+        .await
+        .unwrap();
+    assert_eq!((capacity.working, capacity.candidates), (2, 0));
+    let loaded = load_seller_pool_deals_with_scope(
+        &context,
+        deals.remove(0),
+        0,
+        Some(&retained),
+        |market| Ok((backend(market)?, dexdo::seller::UpstreamConfig::Mock)),
+    )
+    .await
+    .unwrap();
+    let policy = super::policy::SellerRuntimePolicy {
+        after_deal_done: super::policy::SellerAfterDealDoneAction::Retire,
+        buyer_no_show: super::policy::SellerBuyerNoShowAction::RetireGateway,
+        dispute_against_me: super::policy::SellerDisputeAgainstMeAction::ReleaseIfClean,
+        max_open_deals: 2,
+    };
+    let admitted = admit_seller_startup_deals(loaded, &context, &policy)
+        .await
+        .unwrap();
+    assert_eq!(admitted.len(), 2);
+    assert!(books
+        .iter()
+        .all(|book| book.reads.load(Ordering::SeqCst) == 0));
+    let stop = tokio::time::sleep(std::time::Duration::from_secs(1)).fuse();
+    tokio::pin!(stop);
+    let mut observed_stop = false;
+    let provisions = AtomicUsize::new(0);
+    let counter = &provisions;
+    let mut no_provision = move |_: String, _: u64, _: u64, _: u64| async move {
+        counter.fetch_add(1, Ordering::SeqCst);
+        Err(anyhow::anyhow!("unexpected provision"))
+    };
+    let result = run_seller_pool(
+        &seller,
+        admitted,
+        context,
+        &policy,
+        &mut no_provision,
+        stop.as_mut(),
+        &mut observed_stop,
+    )
+    .await;
+    assert!(
+        result.unwrap_err().to_string().contains("SELL submission"),
+        "shutdown must report unresolved submissions"
+    );
+    assert_eq!(provisions.load(Ordering::SeqCst), 0);
+    assert!(observed_stop);
+    assert!(books
+        .iter()
+        .all(|book| book.reads.load(Ordering::SeqCst) > 0));
+    assert!(books
+        .iter()
+        .all(|book| book.posts.load(Ordering::SeqCst) == 0));
+    seller.server_task.abort();
+}
+
+#[tokio::test]
+async fn issue_2115_gateway_start_without_order_cannot_report_pending_sell_absent() {
+    for unreadable in [false, true] {
+        for shutdown in [true, false] {
+            let book = BookState::resting(37);
+            book.pending.store(!unreadable, Ordering::SeqCst);
+            book.pending_read_fails.store(unreadable, Ordering::SeqCst);
+            book.reads_fail.store(true, Ordering::SeqCst);
+            let deal = deal_with(UNPROVEN_TC, book.clone());
+            let gateway = async {
+                if shutdown {
+                    std::future::pending::<()>().await;
+                }
+                Err(anyhow::anyhow!("fixture gateway cannot start"))
+            };
+            let stop = async {
+                if !shutdown {
+                    std::future::pending::<()>().await;
+                }
+            };
+            let result = super::start_seller_gateway_with_liveness(
+                gateway,
+                deal.chain.as_ref(),
+                &deal.cfg,
+                None,
+                stop,
+            )
+            .await;
+            match result {
+                Ok(super::SellerGatewayStartup::Stopped { disposition, .. }) => {
+                    assert!(
+                        matches!(disposition, CancellationDisposition::UnknownFailure { .. }),
+                        "an outstanding/unreadable SELL cannot become absent: {disposition:?}"
+                    );
+                }
+                Err(_) => assert!(!shutdown, "shutdown must report its unresolved disposition"),
+                Ok(super::SellerGatewayStartup::Ready(_)) => panic!("interrupted startup"),
+            }
+            assert_eq!(book.reads.load(Ordering::SeqCst), 0);
+            assert_eq!(book.posts.load(Ordering::SeqCst), 0);
+            assert_eq!(book.pending.load(Ordering::SeqCst), !unreadable);
+        }
+    }
+}
+
+#[tokio::test]
+async fn issue_2115_gateway_start_exact_cancel_cannot_release_pending_execution() {
+    for unreadable in [false, true] {
+        for shutdown in [true, false] {
+            let book = BookState::resting(37);
+            book.pending.store(!unreadable, Ordering::SeqCst);
+            book.pending_read_fails.store(unreadable, Ordering::SeqCst);
+            book.cancel_succeeds.store(true, Ordering::SeqCst);
+            let deal = deal_with(UNPROVEN_TC, book.clone());
+            let exact = identity(UNPROVEN_TC, 37);
+            let gateway = async {
+                if shutdown {
+                    std::future::pending::<()>().await;
+                }
+                Err(anyhow::anyhow!("fixture gateway cannot start"))
+            };
+            let stop = async {
+                if !shutdown {
+                    std::future::pending::<()>().await;
+                }
+            };
+            let result = super::start_seller_gateway_with_liveness(
+                gateway,
+                deal.chain.as_ref(),
+                &deal.cfg,
+                Some(&exact),
+                stop,
+            )
+            .await
+            .unwrap();
+            assert!(
+                matches!(
+                    result,
+                    super::SellerGatewayStartup::Stopped {
+                        disposition: CancellationDisposition::UnknownFailure { .. },
+                        ..
+                    }
+                ),
+                "removing one ask cannot prove its outstanding execution is terminal"
+            );
+            assert_eq!(book.cancels(), vec![exact.order_id]);
+            assert!(book.cancelled.load(Ordering::SeqCst));
+            assert_eq!(book.pending.load(Ordering::SeqCst), !unreadable);
+            assert_eq!(book.posts.load(Ordering::SeqCst), 0);
+        }
+    }
+}
+
+#[tokio::test]
+async fn issue_2115_gateway_start_proven_submission_keeps_clean_shutdown() {
+    for has_identity in [false, true] {
+        let book = BookState::resting(37);
+        book.cancel_succeeds.store(true, Ordering::SeqCst);
+        book.cancelled.store(!has_identity, Ordering::SeqCst);
+        let deal = deal_with(UNPROVEN_TC, book.clone());
+        let exact = identity(UNPROVEN_TC, 37);
+        let result = super::start_seller_gateway_with_liveness(
+            std::future::pending::<anyhow::Result<dexdo::seller::RunningSeller>>(),
+            deal.chain.as_ref(),
+            &deal.cfg,
+            has_identity.then_some(&exact),
+            std::future::ready(()),
+        )
+        .await
+        .unwrap();
+        let super::SellerGatewayStartup::Stopped { disposition, .. } = result else {
+            panic!("interrupted startup")
+        };
+        if has_identity {
+            assert!(matches!(disposition, CancellationDisposition::Cancelled));
+            assert_eq!(book.cancels(), vec![exact.order_id]);
+        } else {
+            assert!(matches!(
+                disposition,
+                CancellationDisposition::AlreadyAbsent
+            ));
+            assert!(book.cancels().is_empty());
+        }
+        assert_eq!(book.posts.load(Ordering::SeqCst), 0);
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn issue_2115_gateway_start_cancel_race_retains_the_funded_buyer() {
+    for unreadable in [false, true] {
+        let book = BookState::resting(37);
+        book.pending.store(true, Ordering::SeqCst);
+        book.pending_read_fails.store(unreadable, Ordering::SeqCst);
+        let deal = deal_with(UNPROVEN_TC, book.clone());
+        let exact = identity(UNPROVEN_TC, 37);
+        let startup = super::start_seller_gateway_with_liveness(
+            std::future::pending::<anyhow::Result<dexdo::seller::RunningSeller>>(),
+            deal.chain.as_ref(),
+            &deal.cfg,
+            Some(&exact),
+            std::future::ready(()),
+        );
+        let buyer = async {
+            while book.cancels().is_empty() {
+                tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+            }
+            book.cross();
+        };
+        let (result, ()) = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            tokio::join!(startup, buyer)
+        })
+        .await
+        .expect("the funded cancel race must resolve within the existing cancel poll cadence");
+        let super::SellerGatewayStartup::Stopped {
+            disposition: CancellationDisposition::AlreadyMatched(matched),
+            ..
+        } = result.unwrap()
+        else {
+            panic!("a funded buyer must retain its existing recovery obligation")
+        };
+        assert_eq!(matched.token_contract, exact.token_contract);
+        assert_eq!(book.cancels(), vec![exact.order_id]);
+        assert!(book.pending.load(Ordering::SeqCst));
+        assert_eq!(book.posts.load(Ordering::SeqCst), 0);
+    }
 }

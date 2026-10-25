@@ -16,10 +16,11 @@ use dexdo_core::{DealChainState, DealSubscription};
 use dexdo_proto::{CanonChunk, Challenge, ChallengeRequest, Gateway, GatewayServer, StreamRequest};
 use std::net::SocketAddr;
 use std::pin::Pin;
-use std::sync::Arc;
-use tokio::sync::{mpsc, Semaphore};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex};
+use tokio::sync::{mpsc, Notify, Semaphore};
 use tokio_stream::wrappers::{ReceiverStream, TcpListenerStream};
-use tokio_stream::Stream;
+use tokio_stream::{Stream, StreamExt};
 use tonic::transport::{Identity, Server, ServerTlsConfig};
 use tonic::{Request, Response, Status};
 
@@ -30,9 +31,41 @@ pub(super) struct RunningFixtureSeller {
     pub(super) listen_addr: SocketAddr,
     pub(super) tls_fingerprint: String,
     delayed_eof_release: Arc<Semaphore>,
+    held_open: Arc<Notify>,
+    hide_reasoning_capability: Arc<AtomicBool>,
+    probe_output_fixture: Arc<Mutex<Option<(bool, &'static str)>>>,
+    calls: Arc<AtomicUsize>,
 }
 
 impl RunningFixtureSeller {
+    pub(super) async fn recv_upstream_failure(&self) -> crate::seller::gateway::UpstreamFailure {
+        self.state.recv_upstream_failure().await.unwrap()
+    }
+
+    pub(super) async fn wait_for_held_open(&self) {
+        self.held_open.notified().await;
+    }
+
+    pub(super) fn billed_tokens(&self, token_contract: &str) -> u64 {
+        self.state
+            .delivery(token_contract)
+            .count
+            .load(Ordering::SeqCst)
+    }
+
+    pub(super) fn calls(&self) -> usize {
+        self.calls.load(Ordering::SeqCst)
+    }
+
+    pub(super) fn set_probe_output_fixture(&self, greedy: bool, marker: &'static str) {
+        *self.probe_output_fixture.lock().unwrap() = Some((greedy, marker));
+    }
+    pub(super) fn set_concurrency(&self, limit: std::num::NonZeroU32) {
+        self.state.set_max_concurrent_requests_per_deal(limit);
+    }
+    pub(super) fn use_legacy_challenge(&self) {
+        self.hide_reasoning_capability.store(true, Ordering::SeqCst);
+    }
     pub(super) fn register_stream(
         &self,
         token_contract: &str,
@@ -61,6 +94,10 @@ struct FixtureGateway {
     production: GatewayService,
     fixture_auth: Arc<AuthRegistry>,
     delayed_eof_release: Arc<Semaphore>,
+    held_open: Arc<Notify>,
+    hide_reasoning_capability: Arc<AtomicBool>,
+    probe_output_fixture: Arc<Mutex<Option<(bool, &'static str)>>>,
+    calls: Arc<AtomicUsize>,
 }
 
 type ChunkStream = Pin<Box<dyn Stream<Item = Result<CanonChunk, Status>> + Send>>;
@@ -69,12 +106,25 @@ type ChunkStream = Pin<Box<dyn Stream<Item = Result<CanonChunk, Status>> + Send>
 impl Gateway for FixtureGateway {
     async fn get_challenge(
         &self,
-        request: Request<ChallengeRequest>,
+        mut request: Request<ChallengeRequest>,
     ) -> Result<Response<Challenge>, Status> {
+        self.calls.fetch_add(1, Ordering::SeqCst);
+        let legacy = self.hide_reasoning_capability.load(Ordering::SeqCst);
+        if legacy {
+            // An old seller ignores the additive request flag and still issues a normal nonce.
+            request.get_mut().capabilities_only = false;
+        }
         let token_contract = request.get_ref().token_contract.clone();
-        let response = self.production.get_challenge(request).await?;
-        self.fixture_auth
-            .issue_challenge(&token_contract, response.get_ref().nonce.clone());
+        let capabilities_only = request.get_ref().capabilities_only;
+        let mut response = self.production.get_challenge(request).await?;
+        if legacy {
+            // False is omitted by protobuf encoding, exactly the legacy two-field reply.
+            response.get_mut().supports_reasoning_disable = false;
+        }
+        if !capabilities_only {
+            self.fixture_auth
+                .issue_challenge(&token_contract, response.get_ref().nonce.clone());
+        }
         Ok(response)
     }
 
@@ -84,11 +134,79 @@ impl Gateway for FixtureGateway {
         &self,
         request: Request<StreamRequest>,
     ) -> Result<Response<Self::OpenStreamStream>, Status> {
-        let adversarial_output = is_adversarial_output_request(request.get_ref());
+        self.calls.fetch_add(1, Ordering::SeqCst);
+        let greedy = request
+            .get_ref()
+            .request
+            .as_ref()
+            .and_then(|canon| canon.params.as_ref())
+            .is_some_and(|params| params.greedy);
+        let probe_marker = self
+            .probe_output_fixture
+            .lock()
+            .unwrap()
+            .filter(|(target, _)| *target == greedy)
+            .map(|(_, marker)| marker);
+        let adversarial_output =
+            probe_marker.is_some() || is_adversarial_output_request(request.get_ref());
         authorize_fixture_request(&self.fixture_auth, request.get_ref())
             .map_err(|status| *status)?;
+        if matches!(
+            probe_marker,
+            Some("DEXDO_FIXTURE_ERROR_BEFORE_OUTPUT" | "DEXDO_FIXTURE_TRANSPORT_BEFORE_OUTPUT")
+        ) {
+            let status = Status::unavailable("fixture failure before output");
+            let status = if probe_marker == Some("DEXDO_FIXTURE_ERROR_BEFORE_OUTPUT") {
+                dexdo_proto::upstream_failure_status(status, false)
+            } else {
+                status
+            };
+            return Ok(Response::new(Box::pin(tokio_stream::once(Err(status)))));
+        }
         if !adversarial_output {
+            let hold_open = request.get_ref().request.as_ref().is_some_and(|canon| {
+                canon
+                    .messages
+                    .iter()
+                    .any(|message| message.content.contains("DEXDO_FIXTURE_HOLD_STREAM_OPEN"))
+            });
+            let hold_response = request.get_ref().request.as_ref().is_some_and(|canon| {
+                canon.messages.iter().any(|message| {
+                    message
+                        .content
+                        .contains("DEXDO_FIXTURE_HOLD_SHARED_RESPONSE")
+                })
+            });
             let response = self.production.open_stream(request).await?;
+            if hold_open {
+                self.held_open.notify_one();
+                self.delayed_eof_release
+                    .acquire()
+                    .await
+                    .map_err(|_| Status::cancelled("fixture release closed"))?
+                    .forget();
+            }
+            if hold_response {
+                let mut stream = response.into_inner();
+                let release = self.delayed_eof_release.clone();
+                let (tx, rx) = mpsc::channel(GATEWAY_CLIENT_CHANNEL_CAPACITY);
+                tokio::spawn(async move {
+                    let mut first = true;
+                    while let Some(chunk) = stream.next().await {
+                        if tx.send(chunk).await.is_err() {
+                            break;
+                        }
+                        if first {
+                            first = false;
+                            match release.acquire().await {
+                                Ok(permit) => permit.forget(),
+                                Err(_) => break,
+                            }
+                        }
+                    }
+                });
+                return Ok(Response::new(Box::pin(ReceiverStream::new(rx))));
+            }
             return Ok(Response::new(Box::pin(response.into_inner())));
         }
 
@@ -110,10 +228,14 @@ impl Gateway for FixtureGateway {
             .find(|message| message.role == "user")
             .map(|message| message.content.as_str())
             .unwrap_or("");
+        let prompt = probe_marker.unwrap_or(prompt);
+        let zero_charge = prompt.contains("DEXDO_FIXTURE_ZERO_CHARGE");
+        let partial_charge = prompt.contains("DEXDO_FIXTURE_PARTIAL_CHARGE");
         let reasoning_only = prompt.contains("DEXDO_FIXTURE_REASONING_ONLY");
         let mixed_reasoning = prompt.contains("DEXDO_FIXTURE_MIXED_REASONING");
         let delayed_eof = prompt.contains("DEXDO_FIXTURE_DELAY_EOF");
         let usage_then_error = prompt.contains("DEXDO_FIXTURE_USAGE_THEN_ERROR");
+        let error_before_usage = prompt.contains("DEXDO_FIXTURE_ERROR_BEFORE_USAGE");
         let hold_after_content = prompt.contains("DEXDO_FIXTURE_HOLD_AFTER_CONTENT");
         let chunks = if reasoning_only {
             wire_max
@@ -141,6 +263,17 @@ impl Gateway for FixtureGateway {
                         if client_tx.send(Ok(chunk)).await.is_err() {
                             break;
                         }
+                        if error_before_usage {
+                            let _ = client_tx
+                                .send(Err(dexdo_proto::upstream_failure_status(
+                                    Status::unavailable(
+                                        "fixture transport error before terminal usage",
+                                    ),
+                                    true,
+                                )))
+                                .await;
+                            break;
+                        }
                         if hold_after_content {
                             match delayed_eof_release.acquire().await {
                                 Ok(permit) => permit.forget(),
@@ -148,7 +281,12 @@ impl Gateway for FixtureGateway {
                             }
                         }
                     }
-                    Ok(UpstreamEvent::Usage(usage)) => {
+                    Ok(UpstreamEvent::Usage(mut usage)) => {
+                        if zero_charge {
+                            usage.charged_tokens = Some(0);
+                        } else if partial_charge {
+                            usage.charged_tokens = Some(1);
+                        }
                         let terminal = dexdo_proto::CanonChunk {
                             seq: chunks,
                             usage: Some(usage),
@@ -198,7 +336,9 @@ fn is_adversarial_output_request(request: &StreamRequest) -> bool {
                 .find(|message| message.role == "user")
         })
         .is_some_and(|message| {
-            message.content.contains("DEXDO_FIXTURE_FATCHUNK")
+            message.content.contains("DEXDO_FIXTURE_ZERO_CHARGE")
+                || message.content.contains("DEXDO_FIXTURE_PARTIAL_CHARGE")
+                || message.content.contains("DEXDO_FIXTURE_FATCHUNK")
                 || message.content.contains("DEXDO_FIXTURE_STRADDLE")
                 || message.content.contains("DEXDO_FIXTURE_REASONING_ONLY")
                 || message.content.contains("DEXDO_FIXTURE_MIXED_REASONING")
@@ -236,10 +376,18 @@ pub(super) async fn start_gateway_with(
     let state = Arc::new(GatewayState::with_upstream(upstream));
     let fixture_auth = Arc::new(AuthRegistry::new());
     let delayed_eof_release = Arc::new(Semaphore::new(0));
+    let held_open = Arc::new(Notify::new());
+    let hide_reasoning_capability = Arc::new(AtomicBool::new(false));
+    let probe_output_fixture = Arc::new(Mutex::new(None));
+    let calls = Arc::new(AtomicUsize::new(0));
     let service = GatewayServer::new(FixtureGateway {
         production: GatewayService::new(state.clone()),
         fixture_auth: fixture_auth.clone(),
         delayed_eof_release: delayed_eof_release.clone(),
+        held_open: held_open.clone(),
+        hide_reasoning_capability: hide_reasoning_capability.clone(),
+        probe_output_fixture: probe_output_fixture.clone(),
+        calls: calls.clone(),
     });
     let tls = GatewayTls::generate()?;
 
@@ -274,5 +422,9 @@ pub(super) async fn start_gateway_with(
         listen_addr,
         tls_fingerprint,
         delayed_eof_release,
+        held_open,
+        hide_reasoning_capability,
+        probe_output_fixture,
+        calls,
     })
 }

@@ -381,8 +381,8 @@ fn the_top_up_instruction_names_the_chain_it_wants_the_money_on() {
 /// The request explains the conversion the code performs, instead of asserting it happens by itself.
 
 /// This text used to say the SHELL "lands as native gas" on an address with no contract yet. The
-/// repository's own measurements say otherwise: `ledger.md` records ECC[2] sent at flag 1 arriving
-/// as ECC[2] and only flag 16 arriving as native vmshell, and states the same rule.
+/// repository's own measurements say otherwise: ECC[2] sent at flag 1 arrives as ECC[2] and only
+/// flag 16 arrives as native vmshell, and states the same rule.
 /// Being uninit is not what converts. The QR now carries `flag=16` and the wallet ticks the
 /// auto-convert box from it -- but the address is printed whole precisely so it can be typed by
 /// hand, and that path converts nothing. The sentence has to cover both, because the failure is
@@ -408,7 +408,7 @@ fn the_request_says_what_makes_the_shell_arrive_as_gas() {
     );
     assert!(
         !said.contains("no contract yet it lands as native gas"),
-        "the claim that being uninit is what converts is measured false in ledger.md: {shown}"
+        "the claim that being uninit is what converts is measured false: {shown}"
     );
 }
 

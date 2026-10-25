@@ -294,6 +294,15 @@ Prints the lifecycle `state=` (`placed`, `funded-but-never-opened`, `probe`, `st
 `disputed`), the flags (`funded`, `opened`, `probe_accepted`, `disputed`) and the accounting
 (`finalized_owed`, `buyer_locked`, `deposit`).
 
+`state=probe`, with `seller_waiting_for_first_billable_usage` in the gateway log (written once per
+gateway start), means the deal is open and the buyer has not sent a request yet. Your gateway takes
+the probe only after the first billable usage, so the deal can wait like this with no time limit
+while your `2P` bond and the buyer's deposit and bond stay locked in it. This is the intended
+behavior. Keep the gateway running to serve the buyer if it comes back, or run `dexdo close
+<DEAL-HANDLE>` to stop the deal yourself: that burns `P` of your bond, returns the other `P`, and
+gives the buyer everything back. If the buyer stops first, its probe `P` and `P` of your bond burn,
+and the rest returns to both of you.
+
 ```sh
 dexdo monitor --market market.json
 ```

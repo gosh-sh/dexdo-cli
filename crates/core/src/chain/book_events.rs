@@ -479,6 +479,19 @@ fn decode_book_fill_candidate(
     }))
 }
 
+pub(super) fn decode_seller_placement(body: &str, note: &str, tc: &str) -> Result<Option<u128>> {
+    Ok(match decode_book_event(body)? {
+        Some(BookEvent::Placed(order))
+            if !order.is_buy
+                && order.note.eq_ignore_ascii_case(note)
+                && order.token_contract.eq_ignore_ascii_case(tc) =>
+        {
+            Some(order.order_id)
+        }
+        _ => None,
+    })
+}
+
 fn decode_book_event(body_b64: &str) -> Result<Option<BookEvent>> {
     let Some((event_name, tokens)) = decode_book_event_input(
         body_b64,

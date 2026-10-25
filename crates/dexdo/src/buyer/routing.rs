@@ -486,10 +486,11 @@ where
             if let Err(error) = usage.validate() {
                 return Err(DealOutcome::Scam(error.to_string()));
             }
-            if usage.total_tokens > billing_grant_tokens {
+            if usage.billable_tokens() > billing_grant_tokens {
                 return Err(DealOutcome::Scam(format!(
                     "terminal billable usage {} exceeds billing grant {}",
-                    usage.total_tokens, billing_grant_tokens
+                    usage.billable_tokens(),
+                    billing_grant_tokens
                 )));
             }
             let output_matches = if mock_model {
@@ -610,7 +611,7 @@ impl DealRunner for GatewayDealRunner<'_> {
         }
         let mut remaining_grant = match self
             .billing_grant_tokens
-            .checked_sub(terminal_usage.total_tokens)
+            .checked_sub(terminal_usage.billable_tokens())
         {
             Some(remaining) => remaining,
             None => {
@@ -626,12 +627,11 @@ impl DealRunner for GatewayDealRunner<'_> {
             let b7_output_limit = self.output_limit_tokens.min(b7_grant);
             let b7_result = {
                 let mut charge = |usage: BillingUsage| -> Result<(), String> {
-                    remaining_grant =
-                        remaining_grant
-                            .checked_sub(usage.total_tokens)
-                            .ok_or_else(|| {
-                                "identity verification exceeded route billing grant".to_string()
-                            })?;
+                    remaining_grant = remaining_grant
+                        .checked_sub(usage.billable_tokens())
+                        .ok_or_else(|| {
+                            "identity verification exceeded route billing grant".to_string()
+                        })?;
                     Ok(())
                 };
                 self.buyer
@@ -660,12 +660,11 @@ impl DealRunner for GatewayDealRunner<'_> {
             let b8_output_limit = self.output_limit_tokens.min(b8_grant);
             let b8_result = {
                 let mut charge = |usage: BillingUsage| -> Result<(), String> {
-                    remaining_grant =
-                        remaining_grant
-                            .checked_sub(usage.total_tokens)
-                            .ok_or_else(|| {
-                                "identity verification exceeded route billing grant".to_string()
-                            })?;
+                    remaining_grant = remaining_grant
+                        .checked_sub(usage.billable_tokens())
+                        .ok_or_else(|| {
+                            "identity verification exceeded route billing grant".to_string()
+                        })?;
                     Ok(())
                 };
                 self.buyer

@@ -249,6 +249,21 @@ impl VaultChain for RealVaultChain<'_> {
             .collect())
     }
 
+    async fn submitted_in_transaction(
+        &self,
+        message_id: &str,
+        transaction_hash: &str,
+    ) -> Result<bool> {
+        let http = dexdo_core::chain_http_client()?;
+        dexdo_core::chain::multisig_event_is_from_transaction(
+            &http,
+            &self.endpoint,
+            message_id,
+            transaction_hash,
+        )
+        .await
+    }
+
     async fn delivery_message_id(
         &self,
         sent_event_message_id: &str,

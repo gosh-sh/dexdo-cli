@@ -318,6 +318,15 @@ subcommand takes only the order id:
 | take the money out of a closed deal | `dexdo withdraw-shell`, then `dexdo destroy` |
 | what was sold and for how much | `dexdo history`, `dexdo monitor` |
 
+A deal in `state=probe` whose log shows `seller_waiting_for_first_billable_usage` (written once per
+seller start) is open, and its buyer has not sent a request yet. The seller accepts the probe only
+after the first billable usage, so such a deal can stay open with no time limit, holding this deal's
+`2P` seller bond and the buyer's deposit and bond. This is the intended behavior. Keep the seller
+running to serve the buyer if it comes back. To release the bond instead, `dexdo close
+<DEAL-HANDLE>` stops the deal from the seller side: it burns `P` of the bond, returns the other `P`
+to the note, and gives the buyer everything back. If the buyer stops first, its probe `P` and `P` of
+the seller bond burn, and the rest returns to both sides.
+
 `dexdo orders` is the one command that still needs its note written out: it filters the book by that
 note and offers no list to pick from. The key that signs a cancel is not written out -- it comes
 from the pool entry for that address.

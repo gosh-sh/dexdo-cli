@@ -426,7 +426,7 @@ impl ErrorCode {
             }
             Self::ChainRevert => "chain returned a non-success contract result",
             Self::AmbiguousSubmit => "money submit outcome is unknown and must not be retried",
-            Self::NoteDeployUnconfirmed => "PrivateNote creation is not confirmed; resume the same note deploy command with the same recovery file, without another wallet payment",
+            Self::NoteDeployUnconfirmed => "PrivateNote creation is not confirmed; run note recover with the same recovery file, without another wallet payment",
             Self::SettlementFailed => "settlement submission failed",
             Self::NotRecoverableYet => "deal is not recoverable yet",
             Self::DisputedDeal => "deal is disputed and needs dispute resolution",

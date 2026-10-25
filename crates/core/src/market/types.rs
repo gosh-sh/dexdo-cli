@@ -259,7 +259,7 @@ pub fn ensure_pre_submit_quote_unchanged(
     }) {
         return Ok(());
     }
-    Err(ChainError::Chain(
+    Err(ChainError::OrderUnavailable(
         "buyer pre-submit matcher head differs from the rendered quote; no escrow was sent"
             .to_string(),
     ))
@@ -760,6 +760,9 @@ impl MatchWatchCursor {
 /// Backend errors.
 #[derive(Debug, thiserror::Error)]
 pub enum ChainError {
+    /// The executable ask disappeared or changed before the buyer submitted payment.
+    #[error("{0}")]
+    OrderUnavailable(String),
     #[error(
         "no match for token_contract {display}",
         display = crate::address::display_self_dapp(.0)

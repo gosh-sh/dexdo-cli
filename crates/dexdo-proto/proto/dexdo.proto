@@ -16,12 +16,18 @@ service Gateway {
 
 message ChallengeRequest {
   string token_contract = 1;
+  // Query capabilities without issuing an authorization nonce. Absent = normal challenge.
+  bool capabilities_only = 2;
 }
 
 message Challenge {
   // A nonce bound to the deal's token_contract: cannot be replayed on another session.
   bytes nonce = 1;
   string token_contract = 2;
+  // Additive, per-deal capability. Absent on older sellers = unsupported.
+  bool supports_reasoning_disable = 3;
+  // Explicit supported levels for this deal. Absent on older sellers = no effort support.
+  repeated string supported_reasoning_efforts = 4;
 }
 
 message StreamRequest {
@@ -36,6 +42,8 @@ message StreamRequest {
   CanonRequest request = 4;
   // Maximum provider-native input + output tokens this request may bill.
   uint64 billing_grant_tokens = 5;
+  // Opt in to concurrent requests drawing from one shared deal budget.
+  bool shared_budget = 6;
 }
 
 // The buyer's canonical request -- OpenAI chat-completions form.
@@ -44,6 +52,9 @@ message CanonRequest {
   repeated ChatMessage messages = 1;
   // Sampling parameters.
   SamplingParams params = 2;
+  // Optional upstream routing/cache hints; never added to the prompt or billing.
+  optional string session_id = 3;
+  optional string prompt_cache_key = 4;
 }
 
 message ChatMessage {
@@ -63,6 +74,10 @@ message SamplingParams {
   // decodes deterministically and reconciles against the reference endpoint. Separate from `temperature`,
   // because there 0 = "not set" (the upstream default), whereas here temp=0 must be FORCED.
   bool greedy = 4;
+  // Explicit consumer opt-in. False/absent preserves provider defaults and old peers.
+  bool disable_reasoning = 5;
+  // Explicit effort level; absent preserves provider defaults. Mutually exclusive with disable.
+  optional string reasoning_effort = 6;
 }
 
 // Declaration of the available subset of verification signals: the gateway EXPLICITLY states what
@@ -104,4 +119,11 @@ message BillingUsage {
   uint64 input_tokens = 1;
   uint64 output_tokens = 2;
   uint64 total_tokens = 3;
+  // Accepted payment from the deal budget, separate from provider-native counts.
+  // Absent means total_tokens.
+  // Zero is valid even when the provider delivered a nonempty answer.
+  optional uint64 charged_tokens = 4;
+  // Cache counts are subsets of input_tokens, never additional billable tokens.
+  uint64 cache_read_tokens = 5;
+  uint64 cache_write_tokens = 6;
 }

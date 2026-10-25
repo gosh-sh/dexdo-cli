@@ -21,6 +21,7 @@ pub async fn run(
     scammer: bool,
     claimed_model: Option<&str>,
 ) {
+    crate::telemetry::attempt(None);
 
     // claims a DIFFERENT (real) model than the market's frame model -> the buyer's verification (B7) rejects it.
     // `scammer` makes the substitution UNCONDITIONAL -- a seller instance that always
@@ -71,7 +72,7 @@ pub async fn run(
     let input_tokens = match mock_input_tokens(req) {
         Ok(tokens) => tokens,
         Err(error) => {
-            let _ = tx.send(Err(Status::data_loss(error))).await;
+            let _ = super::send_event(&tx, Err(Status::data_loss(error))).await;
             return;
         }
     };
@@ -129,37 +130,40 @@ pub async fn run(
         let chunk_tokens = match u64::try_from(chunk.token_ids.len()) {
             Ok(tokens) => tokens,
             Err(_) => {
-                let _ = tx
-                    .send(Err(Status::data_loss(
-                        "mock token-id count does not fit u64",
-                    )))
-                    .await;
+                let _ = super::send_event(
+                    &tx,
+                    Err(Status::data_loss("mock token-id count does not fit u64")),
+                )
+                .await;
                 return;
             }
         };
         output_tokens = match output_tokens.checked_add(chunk_tokens) {
             Some(tokens) => tokens,
             None => {
-                let _ = tx
-                    .send(Err(Status::data_loss(
-                        "mock output-token total overflows u64",
-                    )))
-                    .await;
+                let _ = super::send_event(
+                    &tx,
+                    Err(Status::data_loss("mock output-token total overflows u64")),
+                )
+                .await;
                 return;
             }
         };
-        if tx.send(Ok(UpstreamEvent::Chunk(chunk))).await.is_err() {
+        if super::send_event(&tx, Ok(UpstreamEvent::Chunk(chunk)))
+            .await
+            .is_err()
+        {
             return; // buyer disconnected before terminal usage
         }
     }
     let usage = match BillingUsage::new(input_tokens, output_tokens, None) {
         Ok(usage) => usage,
         Err(error) => {
-            let _ = tx.send(Err(Status::data_loss(error))).await;
+            let _ = super::send_event(&tx, Err(Status::data_loss(error))).await;
             return;
         }
     };
-    let _ = tx.send(Ok(UpstreamEvent::Usage(usage))).await;
+    let _ = super::send_event(&tx, Ok(UpstreamEvent::Usage(usage))).await;
 }
 
 fn mock_input_tokens(req: Option<&CanonRequest>) -> Result<u64, &'static str> {
@@ -216,6 +220,7 @@ mod tests {
                 content: "ping pong".into(),
             }],
             params: None,
+            ..Default::default()
         };
         let (tx, mut rx) = mpsc::channel(16);
         run(8, Some(&req), tx, false, None).await;
@@ -257,6 +262,7 @@ mod tests {
                 },
             ],
             params: None,
+            ..Default::default()
         };
         let (tx, mut rx) = mpsc::channel(8);
         run(2, Some(&req), tx, false, None).await;
@@ -280,6 +286,7 @@ mod tests {
                 content: "ping".into(),
             }],
             params: None,
+            ..Default::default()
         };
         assert_eq!(derive_tokens(&req, 5).len(), 5);
     }

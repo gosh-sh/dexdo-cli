@@ -606,13 +606,21 @@ dexdo recover --token-contract <DAPP-ID>::<ACCOUNT-ID>
 Replace `recover` with `reclaim` or `dispute` for those situations. Resolve a disputed TC with the
 seller's `release-dispute` path or arbitration; no whole-note unlock or force-clear step exists.
 
+A deal that opened but never received a request stays open with no time limit: the seller takes the
+probe only after the first request, and quitting the buyer process does not end the deal. The
+buyer's deposit and bond stay locked in it until one side stops it. This is the intended behavior;
+report it to the user as such. Send a request to start using the deal, or run `dexdo recover` only
+when the user decides to stop it: before the probe is accepted, a STOP burns the buyer's probe `P`
+and `P` of the seller bond, and returns the rest of the escrow and the whole buyer bond.
+
 ## Wrap-up
 
-Stop `dexdo buyer` (Ctrl-C) when the session is done -- the deal closes cleanly and leftover escrow
-returns to the note. Your on-chain exposure per open deal never exceeds 2 ticks. Qualifier: under the
-default `proactive` continuity, a `--local-listen` buyer left running idle may keep pre-buying fresh
-deals (extra probe/idle spend beyond that 2-tick lock), so stop it -- or use `--continuity-mode
-on-demand` -- when you are not actively sending requests.
+Stop `dexdo buyer` (Ctrl-C) when the session is done. A deal that has delivered tokens closes
+cleanly and leftover escrow returns to the note; a deal that never received a request stays open, as
+described above, and needs `dexdo recover` to end it. Your on-chain exposure per open deal never
+exceeds 2 ticks. Qualifier: under the default `proactive` continuity, a `--local-listen` buyer left
+running idle may keep pre-buying fresh deals (extra probe/idle spend beyond that 2-tick lock), so
+stop it -- or use `--continuity-mode on-demand` -- when you are not actively sending requests.
 
 ---
 

@@ -6,12 +6,13 @@
 use crate::buyer::api::stream::{CanonStreamDriver, CanonStreamNext};
 use crate::buyer::api::{
     accounted_tokens, aggregate_body_response, attach_request_id, cap_canon_to_grant,
-    consumer_request_id, handle_stream_error_policy, is_capacity_backpressure,
-    report_pre_answer_failure, ApiDeal, ApiState, ConsumerRequestGuard, DeadGatewayAction,
-    DealInitError, RequestDelivery, RouteBudget, StreamErrorPolicyAction,
+    capacity_rejection, consumer_request_id, handle_stream_error_policy, is_capacity_backpressure,
+    report_pre_answer_failure, ApiDeal, ApiState, ClosureCategory, ConsumerError,
+    ConsumerErrorCode, ConsumerRequestGuard, DeadGatewayAction, DealInitError, RequestDelivery,
+    RouteBudget, StreamErrorPolicyAction,
 };
 use crate::buyer::render::{self, AnthropicRequest};
-use axum::extract::State;
+use axum::extract::{rejection::JsonRejection, State};
 use axum::response::sse::{Event, Sse};
 use axum::response::{IntoResponse, Response};
 use axum::Json;
@@ -27,8 +28,12 @@ use std::time::{SystemTime, UNIX_EPOCH};
 /// (`message_start` -> `content_block_*` -> `message_delta` -> `message_stop`).
 pub async fn messages(
     State(state): State<ApiState>,
-    Json(req): Json<AnthropicRequest>,
+    req: Result<Json<AnthropicRequest>, JsonRejection>,
 ) -> Response {
+    let req = match req {
+        Ok(Json(req)) => req,
+        Err(error) => return super::error::json_rejection(error, true),
+    };
     let request_id = consumer_request_id();
     let response = messages_with_id(state, req, request_id.clone()).await;
     attach_request_id(response, &request_id)
@@ -45,20 +50,17 @@ async fn messages_with_id(state: ApiState, req: AnthropicRequest, request_id: St
     };
     let mut request_guard = deal.begin_request(message_started_secs());
     // Session-scoped lifecycle: no new request once the local deal is closed.
-    if deal.session.is_closed() {
-        return reject(StatusCode::GONE, "deal session closed; open a new session");
+    if let Some(response) = deal.session.closed_rejection(&request_id, true) {
+        return response;
     }
     let serving_state = match deal.session.ensure_open_for_serving().await {
         Ok(state) => state,
-        Err(reason) => return reject(StatusCode::BAD_GATEWAY, &reason),
+        Err(error) => return error.response(StatusCode::BAD_GATEWAY, true),
     };
     let stream = req.stream;
     let requested_max_tokens = req.max_tokens;
-    // admission reserves the route's entire free billable remainder before the model is
-    // contacted, so two concurrent requests can never share an unknown provider-native input bill. For a
-    // subscription it first books any due week boundary through the permissionless path and recomputes
-    // from the coherent state that comes back -- an under-used week is never carried across it, and a
-    // finished term is never served from a stale positive remainder.
+    // Authorize payment from the shared remainder; the seller enforces per-deal concurrency
+    // and allocates actual charges atomically. Subscription boundary reconciliation stays here.
     match deal
         .admit_with_probe_observation(requested_max_tokens, serving_state.probe_accepted)
         .await
@@ -66,16 +68,19 @@ async fn messages_with_id(state: ApiState, req: AnthropicRequest, request_id: St
         RouteBudget::Admitted(reservation) => {
             request_guard.hold(reservation);
         }
-        RouteBudget::Exhausted(reason) => return reject(StatusCode::SERVICE_UNAVAILABLE, &reason),
+        RouteBudget::Exhausted(error) => return state.budget_rejection(error, true),
     }
-    request_guard.arm_delivery(
+    if let Err(error) = request_guard.arm_delivery(
         state.delivery_events.clone(),
         &deal,
         request_id.clone(),
         "anthropic",
         stream,
         requested_max_tokens.map(u64::from).unwrap_or(0),
-    );
+    ) {
+        tracing::error!(%error, "buyer usage: could not bind admitted request");
+        return super::usage::unavailable("usage history could not be bound to this deal");
+    }
     // one-per-deal content-identity gate (B8 + B7-full), run ONCE before the first paid stream -- the same
     // gate as the OpenAI path. The inline StreamVerifier only runs B5/B6 + the cheap declared-NAME B7; a seller
     // serving a cheaper model under the correct NAME is caught only here. On a bail the gate closes the deal and
@@ -87,8 +92,24 @@ async fn messages_with_id(state: ApiState, req: AnthropicRequest, request_id: St
     let verdict = deal
         .content_gate
         .ensure_verified(&state.buyer, &deal, &mut request_guard)
-        .await;
+        .await
+        .and_then(|()| {
+            deal.session
+                .ensure_paid_phase()
+                .map_err(anyhow::Error::from)
+        });
+    request_guard.usage_phase = "answer";
     if let Err(reason) = verdict {
+        let response = if let Some(error) = reason.downcast_ref::<ConsumerError>() {
+            deal.session
+                .closed_rejection(&request_id, true)
+                .unwrap_or_else(|| error.response(StatusCode::SERVICE_UNAVAILABLE, true))
+        } else {
+            reject(
+                StatusCode::BAD_GATEWAY,
+                &format!("model identity verification failed (content check): {reason}"),
+            )
+        };
         report_pre_answer_failure(
             &deal,
             &mut request_guard,
@@ -96,13 +117,10 @@ async fn messages_with_id(state: ApiState, req: AnthropicRequest, request_id: St
             "anthropic",
             stream,
             requested_max_tokens.map(u64::from).unwrap_or(0),
-            StatusCode::BAD_GATEWAY.as_u16(),
+            response.status().as_u16(),
             "content_verification",
         );
-        return reject(
-            StatusCode::BAD_GATEWAY,
-            &format!("model identity verification failed (content check): {reason}"),
-        );
+        return response;
     }
     let billing_grant_tokens = request_guard.remaining_grant();
     if billing_grant_tokens == 0 {
@@ -116,11 +134,12 @@ async fn messages_with_id(state: ApiState, req: AnthropicRequest, request_id: St
             StatusCode::SERVICE_UNAVAILABLE.as_u16(),
             "content_verification_budget",
         );
-        return reject(
-            StatusCode::SERVICE_UNAVAILABLE,
+        return ConsumerError::new(
+            ConsumerErrorCode::VerificationGrantConsumed,
             "the identity verification this deal owed consumed the whole admitted grant; the \
              request was not sent and the next one starts from a verified deal",
-        );
+        )
+        .response(StatusCode::SERVICE_UNAVAILABLE, true);
     }
     let mut canon = render::anthropic_to_canon(req);
     // the grant may still hold what verification did not spend. The answer is bounded by what
@@ -178,13 +197,7 @@ async fn messages_with_id(state: ApiState, req: AnthropicRequest, request_id: St
                     StatusCode::TOO_MANY_REQUESTS.as_u16(),
                     "upstream_open",
                 );
-                return reject(
-                    StatusCode::TOO_MANY_REQUESTS,
-                    &format!(
-                        "the deal has no delivery capacity for this request yet; retry after seller \
-                         capacity reconciliation: {error}"
-                    ),
-                );
+                return capacity_rejection(&error).response(StatusCode::TOO_MANY_REQUESTS, true);
             }
             // the retry above logs at WARN, and until now the DEFINITIVE refusal logged
             // nothing at all -- a run that ended in a dead gateway had no ERROR line for an
@@ -197,6 +210,7 @@ async fn messages_with_id(state: ApiState, req: AnthropicRequest, request_id: St
                 retries,
                 "consumer API: upstream open failed definitively; settling the deal as a dead gateway"
             );
+            request_guard.observe_policy_failure(ClosureCategory::DeadGateway);
             deal.session
                 .settle_dead_gateway("dead-gateway", &reclaim_heartbeat)
                 .await;
@@ -359,14 +373,17 @@ fn sse_response(
             }
         }
         if bailed {
+            request_guard.observe_policy_failure(ClosureCategory::VerificationBail);
             deal.session.settle_verification_bail("verify-bail").await;
         } else if let Some(e) = &stream_error {
-            if handle_stream_error_policy(&deal, received, e.policy_message()).await
+            request_guard.observe_upstream_failure();
+            if handle_stream_error_policy(&deal, provider_output_tokens, e, &mut request_guard).await
                 == StreamErrorPolicyAction::RequestScoped
             {
                 request_guard.complete();
             }
         } else if received == 0 && !capped {
+            request_guard.observe_policy_failure(ClosureCategory::EmptyStream);
             let heartbeat = deal.accepted_output_guard();
             deal.session
                 .settle_empty_stream("empty-stream", &heartbeat)
@@ -379,8 +396,11 @@ fn sse_response(
         } else {
             None
         };
-        let billing_exhausted = accepted_usage
-            .is_some_and(|usage| usage.total_tokens == billing_grant_tokens);
+        // Legacy sellers use their full grant as the exhaustion signal. Shared-budget payment
+        // allocation does not describe whether generation ended or hit its output cap.
+        let billing_exhausted = accepted_usage.is_some_and(|usage| {
+            usage.charged_tokens.is_none() && usage.total_tokens == billing_grant_tokens
+        });
         // stop_reason does NOT pass off a bail/error as an honest `end_turn` -- bail -> `refusal`,
         // transport error -> `error`, otherwise `end_turn`.
 
@@ -431,6 +451,11 @@ fn sse_response(
                 ended_before_output_limit: provider_output_tokens < max_tokens,
             },
         );
+        if received == 0 {
+            if let Some(error) = stream_error.as_ref().filter(|error| error.is_retryable_upstream()) {
+                yield Ok((Event::default().event("error").data(error.retryable_rejection().body(true).to_string()), false));
+            }
+        }
         yield Ok((event(render::anthropic_content_block_stop()), false));
         yield Ok((event(render::anthropic_message_delta(stop_reason)), false));
         yield Ok((event(render::anthropic_message_stop()), true));
@@ -551,8 +576,9 @@ async fn aggregate_response(
     } else {
         None
     };
-    let billing_exhausted =
-        accepted_usage.is_some_and(|usage| usage.total_tokens == billing_grant_tokens);
+    let billing_exhausted = accepted_usage.is_some_and(|usage| {
+        usage.charged_tokens.is_none() && usage.total_tokens == billing_grant_tokens
+    });
     // every terminal below records the same three figures, including the two that answer 502.
     let delivery = |request_guard: &ConsumerRequestGuard,
                     stop_reason: &'static str,
@@ -585,9 +611,11 @@ async fn aggregate_response(
         }
     };
     if bailed {
+        request_guard.observe_policy_failure(ClosureCategory::VerificationBail);
         deal.session.settle_verification_bail("verify-bail").await;
     } else if let Some(e) = stream_error {
-        if handle_stream_error_policy(&deal, received, e.policy_message()).await
+        request_guard.observe_upstream_failure();
+        if handle_stream_error_policy(&deal, received, &e, &mut request_guard).await
             == StreamErrorPolicyAction::RequestScoped
         {
             request_guard.complete();
@@ -600,8 +628,14 @@ async fn aggregate_response(
             0,
         );
         request_guard.report_delivery(terminal);
+        if received == 0 && e.is_retryable_upstream() {
+            return e
+                .retryable_rejection()
+                .response(StatusCode::BAD_GATEWAY, true);
+        }
         return reject(StatusCode::BAD_GATEWAY, &format!("stream error: {e}"));
     } else if received == 0 && !capped {
+        request_guard.observe_policy_failure(ClosureCategory::EmptyStream);
         let heartbeat = deal.accepted_output_guard();
         deal.session
             .settle_empty_stream("empty-stream", &heartbeat)
@@ -656,17 +690,7 @@ fn reject(status: StatusCode, message: &str) -> Response {
 }
 
 fn deal_init_rejection(error: &DealInitError) -> Response {
-    let mut body = serde_json::json!({
-        "type": "error",
-        "error": {
-            "type": "invalid_request_error",
-            "message": error.message()
-        }
-    });
-    if let Some(reconciliation) = error.reconciliation() {
-        body["error"]["submit_reconciliation"] = serde_json::json!(reconciliation);
-    }
-    (StatusCode::SERVICE_UNAVAILABLE, Json(body)).into_response()
+    error.response(true)
 }
 
 fn message_id() -> String {

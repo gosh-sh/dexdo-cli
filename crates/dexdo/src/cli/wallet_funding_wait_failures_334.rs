@@ -182,11 +182,12 @@ impl HotFundingProvider for ScriptedProvider {
 fn executed() -> RequestPresence {
     RequestPresence::Executed {
         evidence: FundingEvidence {
+            queue_transaction_id: Some(7),
             verdict: "executed".to_string(),
             source: "finalized transaction".to_string(),
             observed_at_unix: Some(1_700_000_000),
             detail: "queue transaction 7 executed".to_string(),
-            delivery_message_id: None,
+            delivery_message_id: Some("delivery-7".to_string()),
         },
     }
 }
@@ -322,8 +323,8 @@ async fn a_read_that_got_no_answer_keeps_waiting_inside_the_funding_window() {
     );
     assert_eq!(
         chain.reads.get(),
-        5,
-        "every read must be repeated inside the funding window, not just the first"
+        6,
+        "retry each unanswered read, then refresh the funded balance after the delivery receipt"
     );
     assert_eq!(
         provider.submits.get(),

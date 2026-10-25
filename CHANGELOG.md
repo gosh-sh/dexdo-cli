@@ -1,3 +1,251 @@
+## v0.9.0
+
+### Breaking Changes
+
+- `/v1/usage/facts` now returns bounded pages: `limit` defaults to 100 and accepts
+  1 through 1000. Follow `next_cursor` with the same time filters until it is null.
+  Financial changes between pages return HTTP 400; discard the partial traversal
+  and restart. Page exhaustion is independent of financial `complete`.
+  Existing schema-3 and schema-4 usage databases migrate automatically to schema 5,
+  preserving history and retaining deal prices; earlier binaries cannot reopen it.
+- `/v1/usage` now uses `quota_limited` and reports the current purchased deal's
+  `quota.limit`, `quota.used` and `quota.remaining` in SHELL, with `remaining` and
+  `unit` also at the response root. Quota usage excludes previous deals and BUY fees;
+  historical expense summaries keep them. Usage follows accepted billable tokens past
+  the first tick. After STOP or closure, remaining quota is
+  zero while usage retains consumed work, including observed external
+  closure. Purchase metadata survives a failed SQLite write; an unavailable initial state
+  or unavailable terms return `503 usage_unavailable` instead of a previous deal's quota.
+  A confirmed funded but unopened candidate keeps the previous quota (or zero before the
+  first purchase) readable without restarting; inference still refuses the unopened candidate.
+  Keep the buyer's data directory across restarts to retain its quota and history.
+- `/v1/usage` replaces `actual_cost` with `cost` and `overhead_cost`, both in SHELL.
+  `cost` grows after every accepted model billing response at the deal's execution
+  price, including verification work, without waiting for payment or settlement.
+  `overhead_cost` includes separately proven fees, burns and unused paid capacity;
+  unclassified financial amounts remain internal. Their sum is not settled cash spending.
+  `/v1/usage/facts` keeps confirmed financial expenses and can lag live consumption;
+  use `/v1/usage` for current cost and usable remaining quota.
+  Token counters are integers, with zero for unreported
+  values; `input_tokens` excludes separately reported cache tokens. Update integrations
+  to read both expense fields and count each token category once.
+- `/v1/usage` now returns only the documented Gateway fields; the `buyer` extension
+  is removed. Use `/v1/usage/facts` for exact expenses and financial completeness.
+- Chat Completions now rejects unsupported reasoning controls and effort values
+  instead of silently ignoring them. Use the documented reasoning-disable option
+  with a compatible seller, or omit reasoning settings to retain provider defaults.
+
+### New / Improvements
+
+- Buyers can request `minimal`, `low`, `medium`, `high`, `xhigh`, or `max` reasoning
+  effort in Chat Completions and Responses when the seller declares the level in
+  `capabilities.reasoning_effort` in `models.json`. Sellers choose either the direct
+  `reasoning_effort` field or nested `reasoning.effort` profile. Both peers must
+  update. Unsupported levels are rejected before inference; explicit `none` keeps
+  its existing disable control, and requests without the setting keep provider defaults.
+- `/v1/usage/facts` now includes required `cost` as an exact SHELL string for the
+  identifiable consumption within each expense's `amount`. Deduplicate by network
+  and source ID before summing confirmed consumption; `amount - cost` can include
+  unclassified expenses and is not the live summary's `overhead_cost`. When merging
+  repeated exports, preserve a confirmed nonzero cost over a zero observation and
+  reject unequal fixed nonzero splits. Paid-probe facts include `paid_probe` with
+  accepted tokens and tick size: validate its exact cost formula and keep the largest
+  valid bound for the same payment, without adding it again. Refresh cached classifications
+  from a new traversal after upgrading. Missing `cost` must not fall back to `amount`.
+- The buyer retains local request usage in SQLite and serves `/v1/usage` with
+  Gateway daily/model summaries and confirmed SHELL expenses. The separate
+  `/v1/usage/facts` exports exact expenses with stable source IDs, network, chain
+  time, model and completeness so consumers can deduplicate shared-note expenses
+  across buyer instances. BUY fees recover their original model from its order book
+  even without a filled deal. Known open-deal expenses remain visible during incomplete
+  reconciliation; confirmed accruals retain their identities and are subtracted from the
+  terminal fact to avoid double counting. Inclusive dates and precise ranges are supported.
+- Sellers can opt in to OTLP/gRPC metrics for availability, upstream requests,
+  offer recovery and deal lifecycle. Metrics are independent of log verbosity;
+  disabled telemetry and collector failures do not interrupt inference. Set
+  `OTEL_METRICS_EXPORTER=otlp` and point `OTEL_EXPORTER_OTLP_METRICS_ENDPOINT` at
+  the collector (default `http://localhost:4317`); the README lists every
+  variable and what every label value means. New metrics:
+  | Metric | Type | Value | Collected at |
+  |---|---|---|---|
+  | `dexdo.seller.heartbeat` | observable gauge, f64, `s` | Unix time of the collection; no `model` label. | On every export (every `OTEL_METRIC_EXPORT_INTERVAL`, 15 s by default). If it stops advancing, the seller is down, hung, or cannot reach the collector. |
+  | `dexdo.seller.health.checks` | counter, u64 | Completed readiness checks. Labels `model`, `component` (`gateway_task`, `advertised_gateway`, `upstream_authentication_and_model`), `outcome` (`pass`, `fail`, `timeout`). | On every readiness check: every 20 s for each watched deal, once per component. |
+  | `dexdo.seller.health.duration` | histogram, f64, `s` | Time one readiness check took. Same labels as `health.checks`. Not recorded for `gateway_task`, which is a status flag read with no duration. | On every `advertised_gateway` and `upstream_authentication_and_model` check, every 20 s per watched deal. |
+  | `dexdo.seller.health.last_check` | observable gauge, f64, `s` | Unix time of the oldest latest check across the watched deals of a `model` and `component`. | From the latest readiness checks, on every export. |
+  | `dexdo.seller.health.last_success` | observable gauge, f64, `s` | Unix time of the oldest latest success across those deals; `0` while any of them has never passed. | From the latest readiness checks, on every export. |
+  | `dexdo.seller.health.status` | observable gauge, u64 | `1` on the current `state` (`pass`, `fail`, `unknown`), `0` on the other two. `unknown` when a check of a watched deal is older than 120 s; `fail` when any latest outcome is not `pass`. Once the last watched deal of a model has ended, its last result stays. | From the latest readiness checks, on every export. |
+  | `dexdo.seller.offer.executable` | observable gauge, f64, `1` | Seller asks seen live on the order book (deadline still ahead) within the last 120 s. `NaN` while any ask of the `model` is unknown. | From the seller's reads of its own asks on the order book, on every export. |
+  | `dexdo.seller.offer.remaining_ticks` | observable gauge, f64, `1` | Ticks left in those live asks. `NaN` under the same condition. | From the seller's reads of its own asks on the order book, on every export. |
+  | `dexdo.seller.offer.unknown` | observable gauge, f64, `1` | Asks with no fresh read: the last read failed or is older than 120 s. A matched ask is final and never counts here. | From the seller's reads of its own asks on the order book, on every export. |
+  | `dexdo.seller.offer.recovery_age` | observable gauge, f64, `s` | Seconds since the oldest unresolved offer recovery started; `0` when none. | From the moment an offer post fails until a live ask is seen again, on every export. |
+  | `dexdo.seller.offer.isolated` | observable gauge, f64, `1` | Local deal watchers isolated after an error. | When a deal watcher stops on an error or its listener is removed. |
+  | `dexdo.seller.offer.events` | counter, u64 | Offer lifecycle transitions. Label `outcome`: `matched`, `expired`, `relisted`, `recovering`, `isolated`. | On each transition of a seller ask. |
+  | `dexdo.seller.upstream.requests` | counter, u64 | Logical upstream requests, counted once at the end. Labels `model`, `purpose` (`inference`, `probe`), `backend` (`mock`, `openai`, `anthropic`), `outcome` (`success`, `error`, `cancelled`), `error_class` (`none`, `timeout`, `authentication`, `rate_limit`, `stream_protocol`, `unavailable`, `configuration`, `other`). | When an upstream call ends: buyer inference and readiness probes alike. |
+  | `dexdo.seller.upstream.duration` | histogram, f64, `s` | Duration of one logical request. Same labels as `upstream.requests`. | When an upstream call ends. |
+  | `dexdo.seller.upstream.attempts` | counter, u64 | HTTP attempts started, retries included. Labels `model`, `purpose`, `backend`, `status_class=started`. | On every HTTP attempt to the provider; the mock backend counts one per request. |
+  | `dexdo.seller.upstream.responses` | counter, u64 | HTTP responses received. Labels `model`, `purpose`, `backend`, `status_class` (`2xx`, `4xx`, `5xx`, `other`), `status_code`. | On every HTTP response from the provider; the mock backend records none. |
+  | `dexdo.seller.upstream.time_to_first_token` | histogram, f64, `s` | Time from request start to the first non-empty output chunk delivered to the buyer. Labels `model`, `purpose`, `backend`. | When the first output chunk reaches the buyer. |
+  | `dexdo.seller.telemetry.export_failures` | observable counter, u64 | Failed exports to the collector, cumulative; visible after the next successful export. | On each failed export; visible after the next successful one. |
+- Seller adapters now pass OpenAI-compatible cache-read/write counts and Anthropic cache-read
+  and cache-creation counts through to the buyer's persistent usage summaries. Both peers
+  must update to report cache usage; missing cache counts are returned as zero.
+- Buyers can explicitly disable reasoning with `reasoning_effort: "none"` in Chat
+  Completions or `reasoning: {"effort": "none"}` in Responses when the seller declares
+  one of five verified controls: either chat-template switch, `reasoning_effort`,
+  OpenRouter reasoning disable, or native thinking disable. This covers compatible
+  OpenAI-shaped endpoints and supported native Anthropic models. OpenRouter disable
+  requires parameter support during routing. Unsupported requests fail before inference
+  without consuming deal tokens or closing the deal. Requests without the setting
+  retain existing behavior, including with older sellers.
+- A seller can serve concurrent inference requests on the same purchased deal. Set
+  `dexdo seller --max-concurrent-requests-per-deal N` to choose a positive per-deal limit
+  (default: 2; use 1 for sequential requests). Requests share the purchased budget. Once it
+  is exhausted, new requests are refused and already admitted requests finish; buyers are
+  never charged beyond the authorized capacity, and sellers cover excess provider work.
+  Provider usage can therefore exceed the tokens paid from the deal. A request overrun
+  also stops new admission before accepted work drains, even with paid capacity left.
+  Complete shared-budget Messages answers report `end_turn`, including zero-charge
+  answers; actual output truncation still reports `max_tokens`. Both participants
+  must update to use shared-budget concurrency; older buyers retain exclusive reservations.
+- Every `buyer.on.*` policy field now accepts `keep_open`. On that failure the buyer
+  sends no STOP, reclaim, cleanup or dispute, keeps the local endpoint open and keeps
+  running: the failed request gets an error and the next request reconnects to the same
+  deal. A missing handover is awaited with no deadline, a malformed one is re-read
+  until it is well-formed, and a verification failure refuses only the request that saw
+  it, so the model-substitution check no longer protects the rest of the deal. Nothing
+  reclaims the escrow on that failure; close the deal with `dexdo close` when you no
+  longer want it. Accounting is unchanged. While it waits for a handover, a `keep_open`
+  buyer checks the deal on chain once a minute; if the deal was closed meanwhile (for
+  example cleaned up after the seller's open window), the buyer stops with an error
+  naming the model, market and deal, and buys nothing new.
+
+### Fixes
+
+- Sellers now forward buyer API requests up to 32 MiB to the model provider
+  instead of rejecting requests above 4 MiB at the gateway. Update the seller
+  as well as the buyer; the provider's own request and context limits still apply.
+- Buyer API requests now accept JSON bodies up to 32 MiB (33,554,432 bytes),
+  including large prompts and conversation histories. Larger bodies return
+  HTTP 413 with the size limit before opening a deal.
+- Buyer `close` preserves its confirmed cleanup result if saving local usage fails,
+  and reports how to retry local recovery instead of claiming nothing was sent.
+- Standalone buyer `close` now closes the saved usage quota in SQLite and its
+  recovery journal after confirmed closure, retaining consumed cost across
+  restarts and repeated closes without affecting a replacement purchase.
+- Buyer consumption cost grows and remaining quota decreases after each accepted
+  billing response across all purchased ticks, including after restart. Later
+  settlement does not count the same work again. Deal prices and usage history
+  survive automatic database migration and replacement of the current purchase.
+- Confirmed paid-probe consumption in `/v1/usage/facts` includes accepted work after probe
+  acceptance within the already paid tick, including accepted work followed by an
+  HTTP failure. Token claims beyond paid capacity do not create estimated expenses;
+  confirmed spending and original financial identities remain unchanged.
+- Sellers retry temporary provider failures without `Retry-After` using short,
+  randomized delays with exponential backoff, avoiding synchronized 20-second
+  pauses after HTTP 429 throttling. Provider-specified retry delays are still honored.
+- Seller startup clears stale pending deal reservations after the network confirms
+  the account exists or reports the specific missing-account response. Inconclusive
+  reads are retried; if they still fail, startup stops and identifies the deal file
+  and contract without changing pending reservations. Read retries honor server
+  retry delays, and shutdown can interrupt this startup check.
+- Network commands, including wallet onboarding, no longer exit silently with
+  SIGPIPE when a peer closes its connection. Closing a pipe that receives CLI output
+  still ends the command without a panic message.
+- Sellers no longer refuse every later request on a deal after one shared-budget
+  request is cut off mid-answer, even with paid capacity left. The interrupted
+  request is still not billed; repeated interruptions can therefore produce unpaid
+  provider work. Restarting the updated seller restores seller admission for deals
+  already stuck this way. A buyer paused with `upstream_usage_unresolved` still
+  requires reconciliation; this change does not automatically resume that buyer.
+- Sellers keep serving existing deals when a new or residual offer fails its
+  readiness checks. The rejected offer stays off the order book and retains
+  its recovery state. Startup readiness also retries a temporary provider HTTP 429
+  before refusing a new offer.
+- Provider request errors no longer close a live buyer deal. Output interrupted
+  without final usage pauses further requests with `503 upstream_usage_unresolved`
+  and `read_only_reconciliation`, including paid verification and restart. The
+  pause also survives accounting write failures and prevents automatic deal
+  replacement. Reconcile the failed request and phase before resuming; incomplete
+  accounting history needs repair, and restarting alone does not clear the pause.
+  Requests whose usage history cannot be linked to the deal return
+  `503 usage_unavailable` before paid work starts. Automatic verification and
+  shutdown STOPs recheck the pause immediately before submission. Verification
+  failure immediately blocks new paid requests while settlement is pending;
+  waiting requests recheck before starting another paid phase. An accounting
+  veto keeps the quota open and serving blocked for reconciliation.
+  Update both peers. Recovery for an unreachable seller gateway is unchanged.
+- Temporary provider throttling and exhausted retries before any output no longer
+  close a buyer's deal. Retryable failures return `upstream_retryable` with
+  `retry_with_backoff`; later requests can use the same deal. Sellers also keep
+  their existing offer during provider HTTP 429 throttling. Update both peers.
+- Cancelling one buyer API request no longer closes the whole local deal session.
+  Later requests can use the same live deal; previously accepted usage is retained.
+- Temporary chain-read failures no longer close an otherwise active buyer API
+  session. The affected request returns HTTP 502 with `error.code` set to
+  `deal_state_unavailable` and `error.recovery_action: "retry_with_backoff"`.
+  Retry on the same deal after reads recover; no restart or new BUY is needed.
+  Requests remain blocked until authoritative deal state can be confirmed.
+- `note deploy` builds a voucher's proof from the exact payment event it proves. A block
+  holding several note payments could previously yield a proof assembled from another
+  payment, which RootPN rejects with error 137. Recovery of an already paid voucher whose
+  saved event data is empty or unreadable now stops with an explicit error instead of
+  building such a proof; keep the recovery file and do not fund a new voucher.
+- Sellers keep supervising their existing offer when GraphQL temporarily cannot
+  connect to the Block Manager. After reads recover, they resume the same offer,
+  recover a buyer match, or renew an expired offer without posting duplicates.
+- Provisioning retries temporary producer rate limits with bounded backoff and
+  the original signed message. A buyer treats a manager-wrapped rate limit as an
+  unknown money outcome and retains its recovery journal without resubmitting BUY.
+- Sellers preserve an unconfirmed SELL submission across recovery attempts and
+  restarts. Delayed placement is reconciled before another offer is sent; an empty
+  market alone no longer permits a duplicate submission. Keep the seller's data
+  directory when restarting so recovery can retain the original message identity.
+  Renewing an expired offer also checks and replenishes the deal's existing gas
+  reserve before posting, using the same reserve policy as other seller writes.
+- Sellers recover paid purchases after restart even when their match events are
+  on older history pages. Temporary history-server failures keep the paid deal
+  available for recovery instead of abandoning it. Long history reads keep the
+  seller pool responsive to active deals and shutdown.
+- Purchase preparation reads history before signing, so a long history scan does
+  not expire the first purchase message before it is sent.
+- Vault-to-Hot funding retains confirmed request IDs and delivery receipts across
+  restarts, so recovery can continue after the node prunes its history. Older
+  journal evidence is reused only when it identifies the recorded request;
+  ambiguous records remain protected against duplicate transfers and explain
+  which confirmation is missing. Keep the original funding journal when upgrading.
+- Closed buyer API sessions now return `error.code: "deal_session_closed"` with
+  the deal address, request ID, first closure category, and known recovery state.
+  Clients can distinguish pending or ambiguous recovery, confirmed terminal state,
+  disputes, and planned preservation before choosing their next action. Reading
+  this diagnostic does not submit a recovery transaction or create a new purchase.
+- Buyer API refusals now include stable `error.code` and `error.recovery_action`
+  fields across Chat Completions, Responses, and Messages. Integrations can distinguish
+  unavailable orders, unopened deals, weekly or fixed-purchase exhaustion, verification
+  budget refusals, pending purchases, and temporary per-deal concurrency limits without
+  parsing English messages. Fixed purchases ask for explicit authorization of a new
+  purchase; authorized on-demand and proactive services retain renewal guidance.
+  A temporary trial-tick limit remains retryable when paid capacity awaits probe
+  acceptance on the same deal. Update both peers to distinguish
+  `deal_busy`; older sellers retain generic capacity-reconciliation guidance.
+- The buyer's Chat Completions and Responses endpoints now forward the `session_id`
+  header (or `conversation_id` when absent) and the `prompt_cache_key` body field to
+  OpenAI-compatible providers. Reuse these values across steps of an agent session
+  and use separate values for subagents to preserve prompt cache routing. Sellers
+  log provider-reported `cached_tokens` when available.
+- Sellers retry after temporary failures while renewing an expired SELL offer,
+  including after safely cancelling a submitted offer whose acknowledgement was
+  lost. Recovery checks existing orders before retrying to avoid duplicate offers.
+- Sellers keep serving a paid deal when its SELL disappears before the purchase
+  is visible to the match watcher. Delayed fill history is recovered before
+  service and partial-fill remainder accounting, without reposting the paid deal.
+- `note deploy` checks the proof's nominal and token type before submitting it.
+  Error 137 now explains that either the inputs or ZK verification can have failed.
+  Use `dexdo note recover --recovery <file>` to continue an already paid deploy,
+  automatically rebuild a proof after a confirmed 137 rejection or expired history,
+  and finish pool registration without another wallet payment. The separate
+  `note deploy --reprove-paid-voucher` flag is removed. Keep the original recovery
+  file; recovery still requires the original event's history to be available.
+
 ## v0.8.0
 
 ### Breaking Changes

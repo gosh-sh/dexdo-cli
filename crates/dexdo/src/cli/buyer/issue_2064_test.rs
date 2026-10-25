@@ -773,8 +773,13 @@ async fn issue_2064_policy_entrypoint_adoption(lazy: bool, fail_save: bool) {
         serde_json::json!(policy.total_spend_cap_shells);
     std::fs::write(policy_path, serde_json::to_vec(&policy_json).unwrap()).unwrap();
     let deals_dir = args.deals_dir.as_ref().unwrap().clone();
+    // Keep history preflight readable; fail only B's later handle publication.
+    let blocked_lock = deals_dir.join(format!(
+        ".{}.json.lock",
+        crate::cli::deals::make_handle_id(&b, crate::cli::deals::DealHandleRole::Buyer)
+    ));
     if fail_save {
-        std::fs::write(&deals_dir, "not a directory").unwrap();
+        std::fs::create_dir_all(&blocked_lock).unwrap();
     }
     let result = if lazy {
         super::prepare_lazy_buyer_api_deal_once(
@@ -836,7 +841,11 @@ async fn issue_2064_policy_entrypoint_adoption(lazy: bool, fail_save: bool) {
         "A and B each get one BUY, recovered B is never resubmitted"
     );
     if fail_save {
-        result.expect_err("handle persistence must fail");
+        let error = result.expect_err("handle persistence must fail");
+        assert!(
+            format!("{error:#}").contains("open deal-record lock"),
+            "{error:#}"
+        );
         let retained = super::load_buyer_submit_journal(&lock.journal_path, &note)
             .unwrap()
             .unwrap();
@@ -845,7 +854,7 @@ async fn issue_2064_policy_entrypoint_adoption(lazy: bool, fail_save: bool) {
             super::BuyerSubmitIntentKind::PolicyNextSeller
         );
         assert_eq!(retained.resolved_matches[0].token_contract, b);
-        std::fs::remove_file(&deals_dir).unwrap();
+        std::fs::remove_dir(&blocked_lock).unwrap();
         issue_2064_restart_retained_successor(
             lazy,
             chain.clone(),

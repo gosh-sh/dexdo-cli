@@ -640,7 +640,7 @@ pub(crate) fn ensure_onchain_owner_matches_pool_key(
 
 /// crash-safe state for wallet-funded note deploy. This file carries the randomly generated note owner
 /// secret and is written before any wallet spend. Later deploy steps add the on-chain note identifiers so
-/// `dexdo note recover` can finalize the pool without repeating an already completed deploy.
+/// `dexdo note recover` can resume the paid deploy and finalize the pool without another payment.
 #[derive(Serialize, Deserialize)]
 pub(crate) struct NoteDeployRecoveryState {
     pub version: u32,
@@ -696,7 +696,8 @@ impl NoteDeploySubmission {
             bail!("deploy submission addresses must retain canonical DApp identities");
         }
         let pinned_root =
-            dexdo_core::Address::parse(dexdo_core::private_note::artifacts::ROOT_PN_ADDRESS)?;
+            dexdo_core::address::parse_chain_address(dexdo_core::params::ROOT_PN_ADDRESS)?
+                .into_chain();
         if root.account_id() != pinned_root.bare() || root.dapp_id() != expected.dapp_id() {
             bail!("deploy submission has a different RootPN identity");
         }
@@ -1405,8 +1406,8 @@ impl NoteDeployRecoveryState {
         if !self.shell_funded || !self.sanity_checked {
             bail!(
                 "note deploy recovery state is not finalized for pooling (shell_funded={}, sanity_checked={}); \
-                 re-run the original `dexdo note deploy` command unchanged -- it resumes from this file -- \
-                 before using `dexdo note recover`.",
+                 continue the paid deploy with `dexdo note recover` using the original recovery file \
+                 with --recovery before pooling.",
                 self.shell_funded,
                 self.sanity_checked
             );
@@ -1740,9 +1741,9 @@ pub(crate) fn recovery_owner_key_written_message(path: &Path) -> String {
          preflight. Before a note spend, this recovery is also bound to the exact funding wallet selected \
          by the command. If interrupted before recovery is finalized, re-run this same `dexdo note deploy` \
          command unchanged -- same wallet inputs, same `--nominal`, same `--pool`, and the same `--recovery` \
-         path if you passed one: it resumes from this file instead of spending again. If recovery is already \
-         finalized but the pool file was never written, finalize it with `dexdo note recover`, passing this \
-         file to `--recovery` and that pool path to `--pool`.",
+         path if you passed one: it resumes from this file instead of spending again. After a voucher payment \
+         was submitted, continue it with `dexdo note recover`, passing this file to `--recovery` and that \
+         pool path to `--pool`; it resumes deploy and automatically reproves when safe without another payment.",
         path.display()
     )
 }
@@ -4277,7 +4278,7 @@ mod note_deploy_tests {
     }
 
     /// regression: voucher-level recovery may contain a wallet-submitted deposit voucher, but without a
-    /// deployed PrivateNote it must resume through `note deploy`, not be folded into a pool.
+    /// deployed PrivateNote it must resume the paid deploy before being folded into a pool.
     #[test]
     fn voucher_submitted_recovery_refuses_pool_finalize_without_note_deploy() {
         let mut state = complete_recovery_state();

@@ -12,7 +12,12 @@ path = "src/main.rs"
 name = "dexdo"
 path = "src/lib.rs"
 
+# Run each global signal/panic-hook probe in its own process, with a real main-thread panic.
 [dependencies]
+opentelemetry = { version = "0.27", default-features = false, features = ["metrics"] }
+opentelemetry_sdk = { version = "0.27", default-features = false, features = ["metrics", "rt-tokio"] }
+opentelemetry-otlp = { version = "0.27", default-features = false, features = ["metrics", "grpc-tonic", "tls-roots"] }
+
 dexdo-core = { path = "../core" }
 dexdo-proto = { path = "../dexdo-proto" }
 tokio.workspace = true
@@ -27,7 +32,11 @@ tokio-stream.workspace = true
 fs2 = "0.4"
 rand.workspace = true
 serde.workspace = true
-serde_json.workspace = true
+serde_json = { workspace = true, features = ["raw_value"] }
+rusqlite = { version = "0.38", features = ["bundled"] }
+chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
+chrono-tz = "0.10"
+iana-time-zone = "0.1"
 dexdo-wallet-onboarding = { path = "wallet-onboarding" }
 # `svg` (PR1362): the opt-in `--qr-file` export of the same invitation QR.
 qrcode = { version = "0.14", default-features = false, features = ["svg"] }
@@ -107,6 +116,8 @@ windows-sys = { version = "0.59", features = [
 ] }
 
 [dev-dependencies]
+opentelemetry-proto = { version = "0.27", default-features = false, features = ["gen-tonic", "metrics"] }
+
 # invariant property tests for routing/frame.
 proptest.workspace = true
 # qr_display's pure halves compile under `any(chain, test)` (the wallet_manual pattern), so the

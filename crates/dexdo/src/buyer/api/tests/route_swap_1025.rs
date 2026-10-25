@@ -69,7 +69,7 @@ async fn delivering_swap_makes_exactly_one_settle_call_and_installs_next_route()
         .await
         .expect("a delivering route is settled before replacement");
 
-    assert_eq!(chain.stop_calls.load(Ordering::SeqCst), 1);
+    assert_eq!(chain.recovery_stop_calls.load(Ordering::SeqCst), 1);
     assert!(previous_session.is_settled());
     assert!(!next_session.is_settled());
     assert_eq!(
@@ -81,7 +81,7 @@ async fn delivering_swap_makes_exactly_one_settle_call_and_installs_next_route()
 #[tokio::test]
 async fn delivering_swap_propagates_settle_failure_and_keeps_previous_route() {
     let chain = Arc::new(RecordingSettleChain::default());
-    chain.fail_stop.store(true, Ordering::SeqCst);
+    chain.fail_recovery_stop.store(true, Ordering::SeqCst);
     let (previous_session, next_session) = sessions(chain.clone());
     let routes = RouteManager::new(deal("tc-previous", previous_session.clone()));
     deliver_one_request(&routes, 1).await;
@@ -100,10 +100,10 @@ async fn delivering_swap_propagates_settle_failure_and_keeps_previous_route() {
         .expect_err("a failed settlement must prevent route replacement");
 
     assert!(
-        error.to_string().contains("injected stop failure"),
+        error.to_string().contains("injected recovery stop failure"),
         "{error}"
     );
-    assert_eq!(chain.stop_calls.load(Ordering::SeqCst), 1);
+    assert_eq!(chain.recovery_stop_calls.load(Ordering::SeqCst), 1);
     assert!(!previous_session.is_settled());
     assert!(!next_session.is_settled());
     assert!(!next_factory_called.load(Ordering::SeqCst));

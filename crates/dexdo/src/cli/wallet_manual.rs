@@ -280,11 +280,11 @@ enum PaymentFlag {
 /// The wallet's scan-only payment form for the gas this command is waiting on.
 
 /// `token=2` is SHELL, and `flag=16` is what turns it into the native vmshell the deploy spends.
-/// That flag is not decoration and not a hint: measured in `ledger.md`, ECC[2] sent at flag 1
-/// arrives as ECC[2], and only flag 16 arrives as native vmshell. `manual_onboard_step` waits on
-/// the NATIVE balance, so a transfer without it leaves this command waiting until timeout with the
-/// operator's money already gone. Amount is human decimal, as the protocol requires -- not raw
-/// units.
+/// That flag is not decoration and not a hint: measured on chain, ECC[2] sent at flag 1 arrives
+/// as ECC[2], and only flag 16 arrives as native vmshell. `manual_onboard_step`
+/// waits on the NATIVE balance, so a transfer without it leaves this command waiting until timeout
+/// with the operator's money already gone. Amount is human decimal, as the protocol requires --
+/// not raw units.
 pub(crate) fn manual_deploy_payment_link(address: &str, network: &str) -> String {
     payment_link(
         address,

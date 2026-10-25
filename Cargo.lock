@@ -1281,6 +1281,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "chrono-tz"
+version = "0.10.4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "a6139a8597ed92cf816dfb33f5dd6cf0bb93a6adc938f11039f371bc5bcd26c3"
+dependencies = [
+ "chrono",
+ "phf",
+]
+
+[[package]]
 name = "cipher"
 version = "0.4.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1886,8 +1896,8 @@ dependencies = [
 
 [[package]]
 name = "dark_dex_halo2_private_witness_export_lib"
-version = "0.1.0"
-source = "git+https://github.com/gosh-sh/dexdo-halo2-kit?rev=89e93466637334c195fa0640ece74ec4eb549de7#89e93466637334c195fa0640ece74ec4eb549de7"
+version = "0.2.0"
+source = "git+https://github.com/gosh-sh/dexdo-halo2-kit?tag=dark_dex_halo2_private_witness_export_lib-v0.2.0#965d462a6c8497f936b6d9cbee5ef0a703d48c8f"
 dependencies = [
  "anyhow",
  "clap",
@@ -1901,6 +1911,7 @@ dependencies = [
  "tokio",
  "tracing",
  "tracing-subscriber 0.3.23",
+ "tvm_types",
  "typed-builder",
 ]
 
@@ -1956,7 +1967,7 @@ dependencies = [
 [[package]]
 name = "dense-balanced-tree"
 version = "0.1.0"
-source = "git+https://github.com/gosh-sh/dense-balanced-tree#51e7386f4383b925b7f34e213b9ea38819ae0fa7"
+source = "git+https://github.com/gosh-sh/dense-balanced-tree#2747147cc3f2533880369c7b4278e36510e28aa9"
 dependencies = [
  "hex",
  "monotree",
@@ -2044,7 +2055,7 @@ dependencies = [
 [[package]]
 name = "dex-halo2-circuit"
 version = "0.1.0"
-source = "git+https://github.com/gosh-sh/dexdo-halo2-kit?rev=89e93466637334c195fa0640ece74ec4eb549de7#89e93466637334c195fa0640ece74ec4eb549de7"
+source = "git+https://github.com/gosh-sh/dexdo-halo2-kit?tag=dark_dex_halo2_private_witness_export_lib-v0.2.0#965d462a6c8497f936b6d9cbee5ef0a703d48c8f"
 dependencies = [
  "clap",
  "dense-balanced-tree",
@@ -2069,13 +2080,15 @@ dependencies = [
 
 [[package]]
 name = "dexdo"
-version = "0.8.0"
+version = "0.9.0"
 dependencies = [
  "anyhow",
  "async-stream",
  "async-trait",
  "axum 0.7.9",
  "base64",
+ "chrono",
+ "chrono-tz",
  "clap",
  "dexdo-core",
  "dexdo-proto",
@@ -2089,9 +2102,14 @@ dependencies = [
  "http",
  "httpdate",
  "hyper-util",
+ "iana-time-zone",
  "k256",
  "keyring",
  "libc",
+ "opentelemetry",
+ "opentelemetry-otlp",
+ "opentelemetry-proto",
+ "opentelemetry_sdk",
  "pbkdf2",
  "png",
  "proptest",
@@ -2101,6 +2119,7 @@ dependencies = [
  "reqwest 0.12.28",
  "rpassword",
  "rqrr",
+ "rusqlite",
  "serde",
  "serde_json",
  "sha2 0.10.9",
@@ -2120,7 +2139,7 @@ dependencies = [
 
 [[package]]
 name = "dexdo-core"
-version = "0.8.0"
+version = "0.9.0"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -2150,7 +2169,7 @@ dependencies = [
 
 [[package]]
 name = "dexdo-e2e"
-version = "0.8.0"
+version = "0.9.0"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -2161,6 +2180,8 @@ dependencies = [
  "http-body-util",
  "hyper",
  "hyper-util",
+ "proptest",
+ "prost",
  "reqwest 0.12.28",
  "serde_json",
  "tempfile",
@@ -2171,7 +2192,7 @@ dependencies = [
 
 [[package]]
 name = "dexdo-proto"
-version = "0.8.0"
+version = "0.9.0"
 dependencies = [
  "prost",
  "protoc-bin-vendored",
@@ -2181,7 +2202,7 @@ dependencies = [
 
 [[package]]
 name = "dexdo-wallet-onboarding"
-version = "0.8.0"
+version = "0.9.0"
 dependencies = [
  "ackinacki-kit",
  "anyhow",
@@ -2542,6 +2563,12 @@ name = "fallible-iterator"
 version = "0.3.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "2acce4a10f12dc2fb14a218589d4f1f62ef011b2d0cc4b3cb1bba8e94da14649"
+
+[[package]]
+name = "fallible-streaming-iterator"
+version = "0.1.9"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "7360491ce676a36bf9bb3c56c1aa791658183a54d2744120f27285738d90465a"
 
 [[package]]
 name = "fastbloom"
@@ -3015,8 +3042,8 @@ checksum = "0cc23270f6e1808e30a928bdc84dea0b9b4136a8bc82338574f23baf47bbd280"
 
 [[package]]
 name = "gosh-ackinacki"
-version = "0.4.0"
-source = "git+https://github.com/gosh-dot-ai/gosh.ackinacki?tag=gosh-ackinacki-v0.4.1#47c0341ba79651de8d6693a2cc5a79c1b107292f"
+version = "0.11.0"
+source = "git+https://github.com/gosh-dot-ai/gosh.ackinacki?tag=gosh-ackinacki-v0.11.0#d6f490cdda5b6fca15214d8e1fab5c2a93b82341"
 dependencies = [
  "aes-gcm",
  "anyhow",
@@ -3057,7 +3084,7 @@ dependencies = [
 [[package]]
 name = "gosh-dense-balanced-tree"
 version = "0.1.0"
-source = "git+https://github.com/gosh-sh/gosh-halo2-crypto-lib?branch=bump-halo2-lib-v0.4.1#a79a0c71e80d307a99dd47f713b4342ea4b9cbd6"
+source = "git+https://github.com/gosh-sh/gosh-halo2-crypto-lib?branch=bump-halo2-lib-v0.4.1#4aa56cc8e27d678c30cd581d338bd4a9d88d0801"
 dependencies = [
  "halo2-base 0.4.1",
  "pse-poseidon",
@@ -3066,7 +3093,7 @@ dependencies = [
 [[package]]
 name = "gosh-sha256-chip"
 version = "0.1.0"
-source = "git+https://github.com/gosh-sh/gosh-halo2-crypto-lib?branch=bump-halo2-lib-v0.4.1#a79a0c71e80d307a99dd47f713b4342ea4b9cbd6"
+source = "git+https://github.com/gosh-sh/gosh-halo2-crypto-lib?branch=bump-halo2-lib-v0.4.1#4aa56cc8e27d678c30cd581d338bd4a9d88d0801"
 dependencies = [
  "halo2-base 0.4.1",
  "halo2-ecc",
@@ -3232,7 +3259,7 @@ dependencies = [
 [[package]]
 name = "halo2-proover"
 version = "0.3.0"
-source = "git+https://github.com/gosh-sh/dexdo-halo2-kit?rev=89e93466637334c195fa0640ece74ec4eb549de7#89e93466637334c195fa0640ece74ec4eb549de7"
+source = "git+https://github.com/gosh-sh/dexdo-halo2-kit?tag=dark_dex_halo2_private_witness_export_lib-v0.2.0#965d462a6c8497f936b6d9cbee5ef0a703d48c8f"
 dependencies = [
  "clap",
  "dex-halo2-circuit",
@@ -3359,6 +3386,15 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "bbbba678b6567f27ce22870d951f4208e1dc2fef64993bd4521b1d497ef8a3aa"
 dependencies = [
  "tiny-keccak",
+]
+
+[[package]]
+name = "hashlink"
+version = "0.11.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "824e001ac4f3012dd16a264bec811403a67ca9deb6c102fc5049b32c4574b35f"
+dependencies = [
+ "hashbrown 0.16.1",
 ]
 
 [[package]]
@@ -4057,6 +4093,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "libsqlite3-sys"
+version = "0.36.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "95b4103cffefa72eb8428cb6b47d6627161e51c2739fc5e3b734584157bc642a"
+dependencies = [
+ "cc",
+ "pkg-config",
+ "vcpkg",
+]
+
+[[package]]
 name = "linux-raw-sys"
 version = "0.4.15"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -4525,6 +4572,67 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7c87def4c32ab89d880effc9e097653c8da5d6ef28e6b539d313baaacfbafcbe"
 
 [[package]]
+name = "opentelemetry"
+version = "0.27.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "ab70038c28ed37b97d8ed414b6429d343a8bbf44c9f79ec854f3a643029ba6d7"
+dependencies = [
+ "futures-core",
+ "futures-sink",
+ "js-sys",
+ "pin-project-lite",
+ "thiserror 1.0.69",
+ "tracing",
+]
+
+[[package]]
+name = "opentelemetry-otlp"
+version = "0.27.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "91cf61a1868dacc576bf2b2a1c3e9ab150af7272909e80085c3173384fe11f76"
+dependencies = [
+ "async-trait",
+ "futures-core",
+ "http",
+ "opentelemetry",
+ "opentelemetry-proto",
+ "opentelemetry_sdk",
+ "prost",
+ "thiserror 1.0.69",
+ "tokio",
+ "tonic",
+]
+
+[[package]]
+name = "opentelemetry-proto"
+version = "0.27.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "a6e05acbfada5ec79023c85368af14abd0b307c015e9064d249b2a950ef459a6"
+dependencies = [
+ "opentelemetry",
+ "opentelemetry_sdk",
+ "prost",
+ "tonic",
+]
+
+[[package]]
+name = "opentelemetry_sdk"
+version = "0.27.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "231e9d6ceef9b0b2546ddf52335785ce41252bc7474ee8ba05bfad277be13ab8"
+dependencies = [
+ "async-trait",
+ "futures-channel",
+ "futures-executor",
+ "futures-util",
+ "glob",
+ "opentelemetry",
+ "thiserror 1.0.69",
+ "tokio",
+ "tokio-stream",
+]
+
+[[package]]
 name = "option-ext"
 version = "0.2.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -4702,6 +4810,24 @@ checksum = "3672b37090dbd86368a4145bc067582552b29c27377cad4e0a306c97f9bd7772"
 dependencies = [
  "fixedbitset",
  "indexmap 2.14.0",
+]
+
+[[package]]
+name = "phf"
+version = "0.12.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "913273894cec178f401a31ec4b656318d95473527be05c0752cc41cdc32be8b7"
+dependencies = [
+ "phf_shared",
+]
+
+[[package]]
+name = "phf_shared"
+version = "0.12.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "06005508882fb681fd97892ecff4b7fd0fee13ef1aa569f8695dae7ab9099981"
+dependencies = [
+ "siphasher",
 ]
 
 [[package]]
@@ -5552,6 +5678,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "rsqlite-vfs"
+version = "0.1.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "c51c9ae4df8a7fba42103df5c621fa3c37eccf3a3c650879e90fc48b11cc192c"
+dependencies = [
+ "hashbrown 0.16.1",
+ "thiserror 2.0.18",
+]
+
+[[package]]
 name = "rtoolbox"
 version = "0.0.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -5559,6 +5695,21 @@ checksum = "50a0e551c1e27e1731aba276dbeaeac73f53c7cd34d1bda485d02bd1e0f36844"
 dependencies = [
  "libc",
  "windows-sys 0.59.0",
+]
+
+[[package]]
+name = "rusqlite"
+version = "0.38.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "f1c93dd1c9683b438c392c492109cb702b8090b2bfc8fed6f6e4eb4523f17af3"
+dependencies = [
+ "bitflags 2.13.0",
+ "fallible-iterator",
+ "fallible-streaming-iterator",
+ "hashlink",
+ "libsqlite3-sys",
+ "smallvec",
+ "sqlite-wasm-rs",
 ]
 
 [[package]]
@@ -6301,6 +6452,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "sqlite-wasm-rs"
+version = "0.5.5"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "dc3efc0da82635d7e1ced0053bbbfa8c7ab9645d0bf36ceb4f7127bb85315d75"
+dependencies = [
+ "cc",
+ "js-sys",
+ "rsqlite-vfs",
+ "wasm-bindgen",
+]
+
+[[package]]
 name = "stable_deref_trait"
 version = "1.2.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -6799,6 +6962,7 @@ dependencies = [
  "percent-encoding",
  "pin-project",
  "prost",
+ "rustls-native-certs",
  "rustls-pemfile",
  "socket2 0.5.10",
  "tokio",
@@ -7432,6 +7596,12 @@ name = "valuable"
 version = "0.1.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "ba73ea9cf16a25df0c8caa16c51acb937d5712a8429db78a3ee29d5dcacd3a65"
+
+[[package]]
+name = "vcpkg"
+version = "0.2.15"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "accd4ea62f7bb7a82fe23066fb0957d48ef677f6eeb8215f372f52e48bb32426"
 
 [[package]]
 name = "version_check"

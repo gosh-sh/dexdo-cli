@@ -500,7 +500,18 @@ dexdo status <DAPP-ID>::<ACCOUNT-ID>
 
 It prints the lifecycle `state=` (`placed`/`funded-but-never-opened`/`probe`/`streaming`/`stopped`/
 `disputed`), the boolean flags (`funded`/`opened`/`probe_accepted`/`disputed`), and accounting
-(`finalized_owed`, `buyer_locked`, `deposit`, ...). For a revenue roll-up across one or more markets:
+(`finalized_owed`, `buyer_locked`, `deposit`, ...).
+
+`state=probe`, with `seller_waiting_for_first_billable_usage` in the seller log (written once per
+seller start), means the deal is open and the buyer has not sent a request yet. The seller accepts
+the probe only after the first billable usage, so the deal can wait like this with no time limit
+while the `2P` seller bond and the buyer's deposit and bond stay locked in it. This is the intended
+behavior; report it to the user as such. Keep the seller running to serve the buyer if it comes
+back. Run `dexdo close <DEAL-HANDLE>` only when the user decides to stop the deal: it burns `P` of
+the seller bond, returns the other `P`, and gives the buyer everything back. If the buyer stops
+first, its probe `P` and `P` of the seller bond burn, and the rest returns to both sides.
+
+For a revenue roll-up across one or more markets:
 
 ```sh
 dexdo monitor --market market.json

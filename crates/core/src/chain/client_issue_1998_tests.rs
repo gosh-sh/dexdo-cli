@@ -126,14 +126,21 @@ async fn the_submit_predicate_is_not_widened() {
 #[test]
 fn both_post_money_readers_go_through_the_read_policy() {
     let source = include_str!("client.rs");
-    for (reader, next_item) in [
+    for (reader, next_item, policy) in [
         (
             "pub async fn poll_inference_filled_tcs(",
             "pub(super) async fn seller_offer_events_since(",
+            "fetch_all_ext_out_messages_routed",
         ),
         (
             "pub async fn token_contract_settlement_receipts(",
             "/// Read current getters when active and immutable ext-out history for one TokenContract.",
+            "retry_transient_read",
+        ),
+        (
+            "async fn fetch_all_ext_out_messages_routed<",
+            "fn filter_map_ext_out_messages_in_order<",
+            "retry_transient_read",
         ),
     ] {
         let start = source.find(reader).expect("reader present");
@@ -143,7 +150,7 @@ fn both_post_money_readers_go_through_the_read_policy() {
             .expect("reader boundary present");
         let body = &source[start..end];
         assert!(
-            body.contains("retry_transient_read"),
+            body.contains(policy),
             "{reader} reads the chain after money moved and must go through the read policy"
         );
     }
