@@ -1,9 +1,10 @@
 //! Crash-safe seller delivery capacity for one funded TokenContract.
 
 //! The chain is authoritative for the funded total, the current no-rollover subscription cap and the
-//! cumulative `tokensPending` high-water. The gateway persists only the delivery debt that the chain cannot
-//! know yet: exact authoritative tokens forwarded after that high-water and request capacity reserved before
-//! contacting an upstream. Prompts, responses, keys and provider credentials never enter this file.
+//! cumulative `tokensPending` high-water. The gateway persists the deal's exact authoritative usage -- the
+//! part that high-water already covers and the delivery debt the chain cannot know yet -- and request
+//! capacity reserved before contacting an upstream. Prompts, responses, keys and provider credentials never
+//! enter this file.
 
 use anyhow::{anyhow, bail, Result};
 use dexdo_core::{
@@ -46,8 +47,12 @@ struct DurableCapacityRecord {
     funded_tokens: u128,
     #[serde(with = "decimal_u128")]
     authoritative_cap: u128,
+    /// Accepted usage covered by the last reconciled `tokensPending`: `min(tokensPending, usage)`. It sits
+    /// below `tokensPending` only while usage has not yet filled the paid probe tick.
     #[serde(with = "decimal_u128")]
     tokens_pending_anchor: u128,
+    /// Accepted usage beyond that coverage, not yet claimed. With the anchor it sums to the deal's whole
+    /// accepted usage, which a restarted gateway resumes counting from.
     #[serde(with = "decimal_u128")]
     local_delivered_after_anchor: u128,
     #[serde(with = "decimal_u128")]
@@ -57,7 +62,8 @@ struct DurableCapacityRecord {
     /// this availability policy on 2026-10-21; interrupted-request billing remains in.
     #[serde(default, skip_serializing_if = "no_shared_requests")]
     shared_requests: u32,
-    /// Exact delivered prefix absorbed by acceptProbe, saved before submitting it. Bounded by one tick.
+    /// Accepted usage at the probe decision, saved before acceptProbe is submitted so a retry reports the
+    /// same boundary. Bounded by one tick; dropped once the probe is accepted.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     probe_delivery_at_decision: Option<u64>,
 }
@@ -270,51 +276,33 @@ impl CapacityManager {
                 cap
             );
         }
-        let acknowledged = state.tokens_pending - old.tokens_pending_anchor;
+        let delivered = old
+            .tokens_pending_anchor
+            .checked_add(old.local_delivered_after_anchor)
+            .ok_or_else(|| anyhow!("seller capacity durable delivery overflows uint128"))?;
         // An accepted probe is one tick credited AND paid, per the single statement of that rule on
-        // `PROBE_SEED_TOKENS`: the buyer bought the trial tick whatever the model actually produced for it,
-        // and the claim driver already starts its cumulative high-water from it. So the seed is a
-        // protocol-owned credit, not an unbacked delivery advance. Exclude exactly that seed from the
-        // delivery-backed comparison on the single observation that crosses into `probeAccepted`; every
-        // token beyond it keeps the strict comparison below. `validate_live_deal_shape` pins a pre-probe
-        // anchor to exactly zero and an accepted-probe anchor to at least one tick, and the durable anchor
-        // never regresses, so the crossing is credited at most once per deal -- re-observing the same state,
-        // and restarting from a record already carrying the crossed anchor, both leave the anchor at or
-        // above the seed.
-        let probe_seed = if state.probe_accepted && old.tokens_pending_anchor == 0 {
-            PROBE_SEED_TOKENS.min(acknowledged)
+        // `PROBE_SEED_TOKENS`: `tokensPending` may stand on that floor above the delivered usage, which then
+        // fills the paid tick before anything is claimed beyond it. Beyond the floor every claimed
+        // token must be backed by durable local delivery.
+        let backed = if state.probe_accepted {
+            delivered.max(PROBE_SEED_TOKENS)
         } else {
-            0
+            delivered
         };
-        let backed_by_delivery = acknowledged - probe_seed;
-        // The protocol credits a full tick, but absorbs only the prefix at the decision boundary.
-        // Delivery arriving while acceptProbe awaits its response belongs to subsequent claims.
-        // Records predating the boundary field retain their original seed reconciliation.
-        let probe_delivery = if probe_seed > 0 {
-            old.probe_delivery_at_decision
-                .map(u128::from)
-                .unwrap_or_else(|| probe_seed.min(old.local_delivered_after_anchor))
-        } else {
-            0
-        };
-        let claimable_delivery = old.local_delivered_after_anchor - probe_delivery;
-        if backed_by_delivery > claimable_delivery && !subscription_term_ended {
+        if state.tokens_pending > backed && !subscription_term_ended {
             bail!(
-                "TokenContract {token_contract_display} tokensPending advanced by {acknowledged} \
-                 ({backed_by_delivery} beyond the protocol probe seed), beyond durable local delivery {}",
-                claimable_delivery
+                "TokenContract {token_contract_display} tokensPending {} is beyond durable local \
+                 delivery {delivered} and the protocol probe seed",
+                state.tokens_pending
             );
         }
-        let local_delivered_after_anchor = old
-            .local_delivered_after_anchor
-            .saturating_sub(probe_delivery + backed_by_delivery);
+        let tokens_pending_anchor = state.tokens_pending.min(delivered);
+        let local_delivered_after_anchor = delivered - tokens_pending_anchor;
         if subscription_term_ended {
             // The final claim grace keeps the deal open but must not expose a fifth weekly quota. Keep
             // every amount already durably committed before the boundary, then make new availability zero.
-            cap = state
-                .tokens_pending
-                .checked_add(local_delivered_after_anchor)
-                .and_then(|value| value.checked_add(old.outstanding_reservation))
+            cap = delivered
+                .checked_add(old.outstanding_reservation)
                 .ok_or_else(|| anyhow!("post-term seller capacity commitment overflows uint128"))?;
         }
         let candidate = DurableCapacityRecord {
@@ -322,11 +310,11 @@ impl CapacityManager {
             token_contract: token_contract.clone(),
             funded_tokens: deal.funded_tokens,
             authoritative_cap: cap,
-            tokens_pending_anchor: state.tokens_pending,
+            tokens_pending_anchor,
             local_delivered_after_anchor,
             outstanding_reservation: old.outstanding_reservation,
             shared_requests: 0,
-            probe_delivery_at_decision: if probe_seed > 0 {
+            probe_delivery_at_decision: if state.probe_accepted {
                 None
             } else {
                 old.probe_delivery_at_decision
@@ -340,8 +328,8 @@ impl CapacityManager {
         Ok(Some(CapacitySnapshot::from(&locked.record)))
     }
 
-    /// Persist the exact probe prefix before acceptProbe can change the chain. A retry or restart
-    /// reuses the saved boundary, so newly delivered usage is never absorbed into the probe twice.
+    /// Persist the usage at the probe decision before acceptProbe can change the chain, refusing a
+    /// decision that durable delivery does not back. A retry or restart reuses the saved boundary.
     pub fn prepare_probe(&self, token_contract: &TokenContract, delivered: u64) -> Result<u64> {
         let entry = self
             .entries
@@ -1493,8 +1481,9 @@ mod tests {
             .reconcile_deal(&tc, state(true, TICK_SIZE), ordinary(2 * TICK_SIZE))
             .unwrap()
             .unwrap();
-        assert_eq!(accepted.tokens_pending_anchor, TICK_SIZE);
-        assert_eq!(accepted.local_delivered_after_anchor, 2);
+        // all seven delivered tokens sit inside the paid probe tick.
+        assert_eq!(accepted.tokens_pending_anchor, 7);
+        assert_eq!(accepted.local_delivered_after_anchor, 0);
         assert_eq!(accepted.outstanding_reservation, 30);
         assert_invariant(accepted);
     }
@@ -1593,14 +1582,16 @@ mod tests {
     proptest! {
         #![proptest_config(ProptestConfig::with_cases(32))]
 
+        /// boundary kept across restarts, under the rule: usage on both sides of the probe
+        /// decision fills the paid tick, no claim above the tick is backed until usage passes it, and
+        /// usage beyond it is claimable token for token.
         #[test]
         fn probe_decision_preserves_later_delivery_across_restarts_2046(
             prefix in 1_u64..=TICK_SIZE as u64,
             later in 0_u64..10_000,
-            acknowledged in 0_u64..10_000,
+            beyond in 1_u64..10_000,
         ) {
             let later = later.min(TICK_SIZE as u64 - prefix);
-            let acknowledged = acknowledged.min(later);
             for (label, deal, cap) in probe_shapes() {
                 let directory = tempfile::tempdir().unwrap();
                 let tc = format!("0:probe-boundary-2046-{label}");
@@ -1617,24 +1608,38 @@ mod tests {
                 manager.reconcile_deal(&tc, state(false, 0), deal).unwrap();
                 prop_assert_eq!(manager.prepare_probe(&tc, prefix + later).unwrap(), prefix);
                 let before = manager.snapshot(&tc).unwrap().unwrap();
-                // A credited probe must never conceal even one unbacked post-probe token.
+                // Usage inside the paid tick backs no claim above it.
                 prop_assert!(manager.reconcile_deal(
-                    &tc, state(true, TICK_SIZE + u128::from(later) + 1), deal,
+                    &tc, state(true, TICK_SIZE + 1), deal,
                 ).is_err());
                 prop_assert_eq!(manager.snapshot(&tc).unwrap().unwrap(), before);
 
-                let pending = TICK_SIZE + u128::from(acknowledged);
-                let accepted = manager.reconcile_deal(&tc, state(true, pending), deal).unwrap().unwrap();
-                prop_assert_eq!(accepted.local_delivered_after_anchor, u128::from(later - acknowledged));
-                prop_assert_eq!(accepted.available().unwrap(), cap - TICK_SIZE - u128::from(later));
-                prop_assert_eq!(manager.reconcile_deal(&tc, state(true, pending), deal).unwrap().unwrap(), accepted);
+                let usage = u128::from(prefix + later);
+                let accepted = manager.reconcile_deal(&tc, state(true, TICK_SIZE), deal).unwrap().unwrap();
+                prop_assert_eq!(accepted.tokens_pending_anchor, usage);
+                prop_assert_eq!(accepted.local_delivered_after_anchor, 0);
+                prop_assert_eq!(accepted.available().unwrap(), cap - usage);
+                prop_assert_eq!(manager.reconcile_deal(&tc, state(true, TICK_SIZE), deal).unwrap().unwrap(), accepted);
                 drop(manager);
 
                 let manager = CapacityManager::in_deals_dir(directory.path().to_path_buf());
-                prop_assert_eq!(manager.reconcile_deal(&tc, state(true, pending), deal).unwrap().unwrap(), accepted);
+                prop_assert_eq!(manager.reconcile_deal(&tc, state(true, TICK_SIZE), deal).unwrap().unwrap(), accepted);
+                let to_tick = TICK_SIZE - usage;
+                let served = u128::from(beyond) + to_tick;
+                manager
+                    .reserve(&tc, served as u64)
+                    .unwrap()
+                    .finish_with_delivery(served as u64)
+                    .unwrap();
+                let unclaimed = manager.snapshot(&tc).unwrap().unwrap();
+                prop_assert_eq!(unclaimed.local_delivered_after_anchor, served);
+                prop_assert!(manager.reconcile_deal(
+                    &tc, state(true, TICK_SIZE + u128::from(beyond) + 1), deal,
+                ).is_err());
                 let claimed = manager.reconcile_deal(
-                    &tc, state(true, TICK_SIZE + u128::from(later)), deal,
+                    &tc, state(true, TICK_SIZE + u128::from(beyond)), deal,
                 ).unwrap().unwrap();
+                prop_assert_eq!(claimed.tokens_pending_anchor, TICK_SIZE + u128::from(beyond));
                 prop_assert_eq!(claimed.local_delivered_after_anchor, 0);
                 assert_invariant(claimed);
             }
@@ -1748,11 +1753,21 @@ mod tests {
                 .reconcile_deal(&tc, state(true, TICK_SIZE), deal)
                 .unwrap()
                 .unwrap();
-            assert_eq!(accepted.tokens_pending_anchor, TICK_SIZE, "{label}");
+            // the trial output is covered by the paid tick, and the tick's unused part is
+            // still the buyer's to receive.
+            assert_eq!(
+                accepted.tokens_pending_anchor,
+                u128::from(PROBE_OUTPUT),
+                "{label}"
+            );
             assert_eq!(accepted.local_delivered_after_anchor, 0, "{label}");
             assert_eq!(accepted.outstanding_reservation, 0, "{label}");
             assert_eq!(accepted.authoritative_cap, cap, "{label}");
-            assert_eq!(accepted.available().unwrap(), cap - TICK_SIZE, "{label}");
+            assert_eq!(
+                accepted.available().unwrap(),
+                cap - u128::from(PROBE_OUTPUT),
+                "{label}"
+            );
             assert_invariant(accepted);
 
             // Serving continues past the acceptance instead of the deal dying on it.
@@ -1781,23 +1796,35 @@ mod tests {
                 .unwrap()
                 .unwrap();
 
-            let served = manager.reserve(&tc, 5_000).unwrap();
-            served.record_delivered(5_000).unwrap();
+            // usage inside the paid tick backs no claim above it.
+            let inside_tick = manager
+                .reconcile_deal(&tc, state(true, TICK_SIZE + 1), deal)
+                .unwrap_err();
+            assert!(
+                inside_tick
+                    .to_string()
+                    .contains(&format!("beyond durable local delivery {PROBE_OUTPUT}")),
+                "{label}: {inside_tick:#}"
+            );
+
+            let served = manager.reserve(&tc, TICK_SIZE as u64).unwrap();
+            served.record_delivered(TICK_SIZE as u64).unwrap();
             served.finish_exact().unwrap();
+            let usage = u128::from(PROBE_OUTPUT) + TICK_SIZE;
 
             let error = manager
-                .reconcile_deal(&tc, state(true, TICK_SIZE + 5_001), deal)
+                .reconcile_deal(&tc, state(true, usage + 1), deal)
                 .unwrap_err();
             assert!(
                 error
                     .to_string()
-                    .contains("beyond durable local delivery 5000"),
+                    .contains(&format!("beyond durable local delivery {usage}")),
                 "{label}: {error:#}"
             );
 
             // Exactly what was delivered is still acknowledged without complaint.
             let exact = manager
-                .reconcile_deal(&tc, state(true, TICK_SIZE + 5_000), deal)
+                .reconcile_deal(&tc, state(true, usage), deal)
                 .unwrap()
                 .unwrap();
             assert_eq!(exact.local_delivered_after_anchor, 0, "{label}");
@@ -1828,9 +1855,17 @@ mod tests {
                 .reconcile_deal(&tc, state(true, TICK_SIZE), deal)
                 .unwrap()
                 .unwrap();
-            assert_eq!(crossed.tokens_pending_anchor, TICK_SIZE, "{label}");
+            assert_eq!(
+                crossed.tokens_pending_anchor,
+                u128::from(PROBE_OUTPUT),
+                "{label}"
+            );
             assert_eq!(crossed.local_delivered_after_anchor, 0, "{label}");
-            assert_eq!(crossed.available().unwrap(), cap - TICK_SIZE, "{label}");
+            assert_eq!(
+                crossed.available().unwrap(),
+                cap - u128::from(PROBE_OUTPUT),
+                "{label}"
+            );
 
             // The same observation again is a no-op, not a second seed.
             let repeated = manager
@@ -1855,7 +1890,7 @@ mod tests {
             assert!(
                 error
                     .to_string()
-                    .contains("beyond durable local delivery 0"),
+                    .contains(&format!("beyond durable local delivery {PROBE_OUTPUT}")),
                 "{label}: {error:#}"
             );
         }
@@ -1949,10 +1984,11 @@ mod tests {
             )
             .unwrap()
             .unwrap();
-        assert_eq!(final_snapshot.tokens_pending_anchor, post_term_pending);
+        // The anchor covers usage, and the chain stands above it here.
+        assert_eq!(final_snapshot.tokens_pending_anchor, pending + 100);
         assert_eq!(final_snapshot.local_delivered_after_anchor, 0);
         assert_eq!(final_snapshot.outstanding_reservation, 200);
-        assert_eq!(final_snapshot.authoritative_cap, post_term_pending + 200);
+        assert_eq!(final_snapshot.authoritative_cap, pending + 300);
         assert_eq!(final_snapshot.available().unwrap(), 0);
         assert!(matches!(
             manager.reserve(&tc, 1),
@@ -2545,12 +2581,10 @@ mod tests {
         upstream: impl FnOnce(String) -> crate::seller::OpenAiConfig,
         body: String,
     ) -> (
-        Vec<std::result::Result<dexdo_proto::CanonChunk, tonic::Status>>,
+        Vec<std::result::Result<dexdo_proto::StreamFrame, tonic::Status>>,
         Option<crate::seller::gateway::AuthoritativeDeliveryFinish>,
         DurableCapacityRecord,
     ) {
-        use dexdo_proto::{CanonRequest, ChatMessage, SamplingParams};
-
         const GRANT: u64 = 8;
 
         let (address, provider) = provider_serving(body).await;
@@ -2568,26 +2602,22 @@ mod tests {
             finish: std::sync::Arc::new(std::sync::Mutex::new(None)),
         };
 
-        let request = CanonRequest {
-            messages: vec![ChatMessage {
-                role: "user".to_string(),
-                content: "hello".to_string(),
-            }],
-            params: Some(SamplingParams {
-                temperature: 0.0,
-                max_tokens: GRANT as u32,
-                stop: Vec::new(),
-                greedy: false,
-                disable_reasoning: false,
-                reasoning_effort: None,
-            }),
-            ..Default::default()
+        let mut body = crate::api_format::RequestBody::parse(
+            br#"{"messages":[{"role":"user","content":"hello"}],"stream":true}"#,
+        )
+        .unwrap();
+        body.set_model(&cfg.model);
+        body.require_stream_usage();
+        let request = crate::seller::upstream::ProviderRequest {
+            format: crate::api_format::ApiFormat::ChatCompletions,
+            body,
+            headers: Vec::new(),
         };
         let (up_tx, up_rx) = tokio::sync::mpsc::channel(8);
         let (tx, mut rx) = tokio::sync::mpsc::channel(8);
         let adapter = tokio::spawn(async move {
             crate::seller::UpstreamConfig::OpenAi(cfg)
-                .run(GRANT, Some(request), up_tx)
+                .run(request, 0, up_tx)
                 .await;
         });
         crate::seller::gateway::relay_counting(up_rx, tx, recorder.clone(), None).await;
@@ -2600,6 +2630,34 @@ mod tests {
         }
         let finish = *recorder.finish.lock().unwrap();
         (received, finish, load_record(&path).unwrap().unwrap())
+    }
+
+    /// The answer text the buyer received, frame by frame; any relay error fails the test with `why`.
+    fn delivered_text(
+        received: &[std::result::Result<dexdo_proto::StreamFrame, tonic::Status>],
+        why: &str,
+    ) -> Vec<String> {
+        let mut frames = crate::api_format::SseFrames::default();
+        let mut delivered = Vec::new();
+        for item in received {
+            let frame = item
+                .as_ref()
+                .unwrap_or_else(|status| panic!(": {why}: {status:?}"));
+            for complete in frames.push(&frame.data).unwrap() {
+                if let crate::api_format::Frame::Event { facts, .. } =
+                    crate::api_format::parse_frame(
+                        crate::api_format::ApiFormat::ChatCompletions,
+                        &complete.text,
+                    )
+                    .unwrap()
+                {
+                    if !facts.text.is_empty() {
+                        delivered.push(facts.text);
+                    }
+                }
+            }
+        }
+        delivered
     }
 
     /// The seller's committed identity in the shipped configuration: the Groq slug it sends upstream, the
@@ -2641,17 +2699,10 @@ mod tests {
         )
         .await;
 
-        let delivered: Vec<String> = received
-            .iter()
-            .filter_map(|item| match item {
-                Ok(chunk) if chunk.usage.is_none() => Some(chunk.text.clone()),
-                Ok(_) => None,
-                Err(status) => panic!(
-                    ": a provider that renamed itself after the first delivered chunk tore the \
-                     stream down: {status:?}"
-                ),
-            })
-            .collect();
+        let delivered = delivered_text(
+            &received,
+            "a provider that renamed itself after the first delivered chunk tore the stream down",
+        );
         assert_eq!(delivered, vec!["first ".to_string(), "second".to_string()]);
         assert_eq!(
             finish, None,
@@ -2684,7 +2735,6 @@ mod tests {
                 frame_model: "alibaba--qwen3--32b".to_string(),
                 api_key_env: "PATH".to_string(),
                 identity_aliases: vec!["Qwen/Qwen3-32B".to_string()],
-                ..crate::seller::OpenAiConfig::default()
             },
             "data: {\"model\":\"Qwen/Qwen3-32B\",\"choices\":[{\"delta\":{\"content\":\"served\"}}]}\n\n\
              data: {\"choices\":[],\"usage\":{\"prompt_tokens\":1,\"completion_tokens\":1,\"total_tokens\":2}}\n\n\
@@ -2693,17 +2743,10 @@ mod tests {
         )
         .await;
 
-        let delivered: Vec<String> = received
-            .iter()
-            .filter_map(|item| match item {
-                Ok(chunk) if chunk.usage.is_none() => Some(chunk.text.clone()),
-                Ok(_) => None,
-                Err(status) => panic!(
-                    ": a model declared through identity_aliases was refused as a substitution: \
-                     {status:?}"
-                ),
-            })
-            .collect();
+        let delivered = delivered_text(
+            &received,
+            "a model declared through identity_aliases was refused as a substitution",
+        );
         assert_eq!(delivered, vec!["served".to_string()]);
         assert_eq!(
             finish, None,

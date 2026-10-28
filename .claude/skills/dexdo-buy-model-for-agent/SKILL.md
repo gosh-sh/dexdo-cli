@@ -385,8 +385,7 @@ using the shape below.
           "probe_prompt": "Reply with exactly: QWEN38",
           "expected_contains": "QWEN38"
         }
-      ],
-      "capabilities": { "max_output_tokens": 16384 }
+      ]
     }
   }
 }
@@ -524,9 +523,11 @@ Escrow is computed automatically as `ticks x max-price-per-tick` plus the book f
 over-funding a resting buy can strand the surplus. Wait for the line
 `consumer API listening (loopback)` -- the endpoint is ready.
 
-The same server accepts text-only `POST /v1/responses` (JSON or streaming SSE). Non-empty
-`tools` and other unsupported Responses features are rejected explicitly; tool calling is
-not available through this route. `/v1/chat/completions` remains available.
+The same server forwards `POST /v1/chat/completions`, `POST /v1/responses` and `POST /v1/messages` to the
+seller as sent -- tools, tool results and every other field included -- and returns the provider's answer as
+produced. An OpenAI-compatible seller serves Chat Completions and Responses; an Anthropic seller serves
+Messages. A request on a path the seller does not serve is refused with `unsupported_api_path` before any
+money moves.
 
 Two flags worth knowing:
 
@@ -540,7 +541,8 @@ Two flags worth knowing:
 
 ## Phase 9. Use the model
 
-The request `model` field must equal the deal's frame model (`Qwen3.8-27B`) or be omitted.
+The request `model` field must equal the deal's frame model (`Qwen3.8-27B`); a request without it is
+refused.
 
 ```sh
 curl http://127.0.0.1:8080/v1/chat/completions \
@@ -653,7 +655,7 @@ stop it -- or use `--continuity-mode on-demand` -- when you are not actively sen
 
   (`--resume` also accepts `--market`/`--token-contract`.) If no match happened at all, check the
   seller is up on the same manifest and that your `--max-price-per-tick` was >= the ask (Phase 6).
-- request rejected as `outside the configured frame` -- send `model` as `Qwen3.8-27B` (or omit it).
+- request rejected as `outside the configured frame` -- send `model` as `Qwen3.8-27B`; a request without `model` is refused too.
 
 ## Hard rules
 

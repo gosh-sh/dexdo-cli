@@ -12,7 +12,7 @@ use dexdo_core::params::{
     BUYER_USAGE_SQLITE_INIT_RETRY_INTERVAL, SHELL_UNIT,
 };
 use dexdo_proto::BillingUsage;
-use rusqlite::{params, Connection, ErrorCode, OptionalExtension, TransactionBehavior};
+use rusqlite::{params, Connection, ErrorCode, OpenFlags, OptionalExtension, TransactionBehavior};
 use serde::Deserialize;
 use serde_json::{json, Value};
 use std::{
@@ -34,6 +34,23 @@ mod consumption;
 #[cfg(test)]
 #[path = "usage_quota_tests.rs"]
 mod quota_tests;
+
+// Start from exceptional states, never from the completed request history. The pending
+// usage lookup visits only unresolved markers, then seeks their exact request by primary key.
+const UNRESOLVED_OUTPUT_USAGE_SQL: &str =
+    "SELECT EXISTS(SELECT 1 FROM requests r WHERE r.network=?1 AND r.deal_id=?2
+        AND r.history_complete=0)
+     OR EXISTS(SELECT 1 FROM requests r WHERE r.network=?1 AND r.deal_id=?2
+        AND r.finished_at IS NULL AND r.runtime_id<>?3)
+     OR EXISTS(SELECT 1 FROM request_usage u WHERE u.network=?1 AND u.deal_id=?2
+        AND u.call_id='in_progress' AND u.accepted=0
+        AND EXISTS(SELECT 1 FROM requests r WHERE r.network=u.network
+            AND r.request_id=u.request_id AND r.deal_id=?2
+            AND (u.phase='answer' OR r.finished_at IS NOT NULL OR r.runtime_id<>?3)))";
+
+#[cfg(test)]
+#[path = "usage_admission_tests.rs"]
+mod admission_tests;
 
 #[derive(Debug, Clone, Default, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -246,6 +263,7 @@ impl ExpenseBreakdown {
 #[derive(Clone)]
 pub struct UsageStore {
     connection: Arc<Mutex<Connection>>,
+    history_connection: Arc<Mutex<Connection>>,
     network: Arc<str>,
     runtime_id: Arc<str>,
     quota_journal: Arc<PathBuf>,
@@ -326,7 +344,7 @@ impl UsageStore {
         let version: u32 =
             transaction.pragma_query_value(None, "user_version", |row| row.get(0))?;
         ensure!(
-            matches!(version, 0 | 3 | 4) || version == BUYER_USAGE_SCHEMA_VERSION,
+            matches!(version, 0 | 3..=5) || version == BUYER_USAGE_SCHEMA_VERSION,
             "unsupported buyer usage schema version {version}"
         );
         transaction.execute_batch(
@@ -343,7 +361,7 @@ impl UsageStore {
                 call_id TEXT NOT NULL, input_tokens TEXT NOT NULL, output_tokens TEXT NOT NULL,
                 total_tokens TEXT NOT NULL, charged_tokens TEXT NOT NULL, accepted INTEGER NOT NULL,
                 cache_read_tokens TEXT NOT NULL, cache_write_tokens TEXT NOT NULL,
-                accepted_at INTEGER,
+                accepted_at INTEGER, deal_id TEXT,
                 PRIMARY KEY(network, request_id, phase, call_id),
                 FOREIGN KEY(network, request_id) REFERENCES requests(network, request_id)
             );
@@ -381,6 +399,10 @@ impl UsageStore {
                 ON money_facts(network, deal_id) WHERE kind = 'settlement';
             CREATE INDEX IF NOT EXISTS requests_finished
                 ON requests(network, finished_at);
+            CREATE INDEX IF NOT EXISTS requests_incomplete_usage
+                ON requests(network, deal_id) WHERE history_complete=0;
+            CREATE INDEX IF NOT EXISTS requests_unfinished_usage
+                ON requests(network, deal_id, runtime_id) WHERE finished_at IS NULL;
             CREATE INDEX IF NOT EXISTS facts_occurred
                 ON money_facts(network, occurred_at);
             CREATE INDEX IF NOT EXISTS facts_page_order
@@ -418,6 +440,20 @@ impl UsageStore {
                     AND r.request_id=request_usage.request_id) WHERE accepted=1;",
             )?;
         }
+        if matches!(version, 3..=5) {
+            transaction.execute_batch(
+                "ALTER TABLE request_usage ADD COLUMN deal_id TEXT;
+                 UPDATE request_usage SET deal_id=(SELECT r.deal_id FROM requests r
+                    WHERE r.network=request_usage.network AND r.request_id=request_usage.request_id);",
+            )?;
+        }
+        // Keep the request's immutable deal binding on its usage rows so the pending index
+        // can seek one deal without walking unresolved history from the rest of the network.
+        transaction.execute_batch(
+            "CREATE INDEX IF NOT EXISTS request_usage_pending
+                ON request_usage(network, deal_id, request_id, phase)
+                WHERE call_id='in_progress' AND accepted=0;",
+        )?;
         // Quota terms and a verified one-tick probe payment both prove the execution price.
         // Keep every recovered price after the current purchase is replaced or destroyed.
         let prices = {
@@ -451,8 +487,14 @@ impl UsageStore {
             hex::encode(network.as_bytes()),
             dexdo_core::params::BUYER_USAGE_QUOTA_JOURNAL_EXTENSION
         ));
+        // WAL lets history snapshots run without holding the request accounting mutex.
+        let history_connection =
+            Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_ONLY)
+                .context("open buyer usage history reader")?;
+        history_connection.busy_timeout(BUYER_USAGE_SQLITE_BUSY_TIMEOUT)?;
         let store = Self {
             connection: Arc::new(Mutex::new(connection)),
+            history_connection: Arc::new(Mutex::new(history_connection)),
             network: network.into(),
             runtime_id: format!("{:032x}", rand::random::<u128>()).into(),
             quota_journal: Arc::new(quota_journal),
@@ -474,6 +516,12 @@ impl UsageStore {
         self.connection
             .lock()
             .map_err(|_| anyhow!("buyer usage database lock is poisoned"))
+    }
+
+    fn lock_history(&self) -> Result<MutexGuard<'_, Connection>> {
+        self.history_connection
+            .lock()
+            .map_err(|_| anyhow!("buyer usage history lock is poisoned"))
     }
 
     pub fn start_request(
@@ -532,8 +580,9 @@ impl UsageStore {
     }
 
     pub fn link_deal(&self, request_id: &str, deal_id: &str) -> Result<()> {
-        let connection = self.lock()?;
-        let previous: Option<Option<String>> = connection
+        let mut connection = self.lock()?;
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let previous: Option<Option<String>> = transaction
             .query_row(
                 "SELECT deal_id FROM requests WHERE network=?1 AND request_id=?2",
                 params![self.network(), request_id],
@@ -545,10 +594,15 @@ impl UsageStore {
             previous.as_deref().is_none_or(|id| id == deal_id),
             "usage request deal changed"
         );
-        connection.execute(
+        transaction.execute(
             "UPDATE requests SET deal_id=?3 WHERE network=?1 AND request_id=?2",
             params![self.network(), request_id, deal_id],
         )?;
+        transaction.execute(
+            "UPDATE request_usage SET deal_id=?3 WHERE network=?1 AND request_id=?2",
+            params![self.network(), request_id, deal_id],
+        )?;
+        transaction.commit()?;
         Ok(())
     }
 
@@ -606,8 +660,9 @@ impl UsageStore {
             }
         } else {
             connection.execute(
-                "INSERT INTO request_usage(network,request_id,phase,call_id,input_tokens,output_tokens,total_tokens,charged_tokens,accepted,cache_read_tokens,cache_write_tokens,accepted_at)
-                 VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12)",
+                "INSERT INTO request_usage(network,request_id,phase,call_id,input_tokens,output_tokens,total_tokens,charged_tokens,accepted,cache_read_tokens,cache_write_tokens,accepted_at,deal_id)
+                 VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,
+                    (SELECT deal_id FROM requests WHERE network=?1 AND request_id=?2))",
                 params![self.network(), request_id, phase, call_id, input, output, total, charged, accepted,cache_read,cache_write,
                     accepted.then(|| Utc::now().timestamp_millis())],
             )?;
@@ -627,16 +682,12 @@ impl UsageStore {
     /// Missing state writes fall back to incomplete history or an older runtime's unfinished request.
     /// A live verification call's initial state row alone does not pause concurrent waiters.
     pub(crate) fn has_unresolved_output_usage(&self, deal_id: &str) -> Result<bool> {
-        Ok(self.lock()?.query_row(
-            "SELECT EXISTS(SELECT 1 FROM requests r WHERE r.network=?1 AND r.deal_id=?2
-             AND (r.history_complete=0 OR (r.finished_at IS NULL AND r.runtime_id<>?3)
-              OR EXISTS(SELECT 1 FROM request_usage u
-                WHERE u.network=r.network AND u.request_id=r.request_id
-                AND u.call_id='in_progress' AND u.accepted=0
-                AND (u.phase='answer' OR r.finished_at IS NOT NULL OR r.runtime_id<>?3))))",
-            params![self.network(), deal_id, &*self.runtime_id],
-            |row| row.get(0),
-        )?)
+        Ok(self
+            .lock()?
+            .prepare_cached(UNRESOLVED_OUTPUT_USAGE_SQL)?
+            .query_row(params![self.network(), deal_id, &*self.runtime_id], |row| {
+                row.get(0)
+            })?)
     }
 
     /// Persist a write failure before the request is completed, so a missing paid phase cannot
@@ -919,7 +970,7 @@ impl UsageStore {
     /// Completed accepted work may consume already paid capacity after its payment event.
     /// HTTP failures retain accepted work; unfinished and merely observed work are excluded.
     pub fn accepted_tokens(&self, deal_id: &str) -> Result<u128> {
-        let connection = self.lock()?;
+        let connection = self.lock_history()?;
         let mut statement = connection.prepare(
             "SELECT u.charged_tokens FROM request_usage u JOIN requests r
              ON u.network=r.network AND u.request_id=r.request_id
@@ -1240,8 +1291,11 @@ impl UsageStore {
         let mut last_recorded = None::<i64>;
         let mut unfinished = 0_u64;
         let mut interrupted = 0_u64;
-        let mut connection = self.lock()?;
-        self.restore_quota(&mut connection, true)?;
+        {
+            let mut connection = self.lock()?;
+            self.restore_quota(&mut connection, true)?;
+        }
+        let mut connection = self.lock_history()?;
         let transaction = connection.transaction()?;
         let mut requests = transaction.prepare(
             "SELECT request_id,model,started_at,finished_at,outcome,deal_id,history_complete FROM requests WHERE network=?1",

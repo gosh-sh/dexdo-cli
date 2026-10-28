@@ -17,7 +17,7 @@ async fn accepted_answers_advance_http_cost_and_quota_without_a_payment_or_new_k
         dexdo_core::params::MATCH_OPEN_TIMEOUT,
     )
     .with_usage(store.clone());
-    let app = super::super::router(state, true);
+    let app = super::super::router(state);
     for (id, tokens, expected, remaining) in [
         ("first", TICK_SIZE / 2, 6, 102),
         ("second", TICK_SIZE, 18, 90),

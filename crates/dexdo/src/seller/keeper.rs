@@ -1404,7 +1404,8 @@ mod tests {
             4,
             TICK_SIZE as u64,
             false,
-            Arc::new(std::sync::atomic::AtomicU64::new(TICK_SIZE as u64)),
+            // The deal's whole usage: the two ticks already pending plus one more.
+            Arc::new(std::sync::atomic::AtomicU64::new(3 * TICK_SIZE as u64)),
             Arc::new(std::sync::atomic::AtomicBool::new(true)),
         )
         .await

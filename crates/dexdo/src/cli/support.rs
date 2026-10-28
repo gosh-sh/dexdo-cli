@@ -2329,10 +2329,10 @@ pub(crate) fn consumer_api_token_budget(ticks: u128) -> u64 {
     ticks.saturating_mul(tick_size).min(u64::MAX as u128) as u64
 }
 
-/// the one-shot `dexdo buyer` path (no `--local-listen`) opens the seller stream with NO canonical
-/// request -- it is promptless by design (`connect_and_stream` sends `None`). A **real** seller upstream
-/// cannot serve a prompt-less stream (`"real upstream requires a canonical request"`), and fabricating a
-/// default prompt would run+bill a synthetic inference the buyer never asked for (money-safety). So one-shot
+/// the one-shot `dexdo buyer` path (no `--local-listen`) opens the seller stream with NO consumer
+/// prompt -- it is promptless by design (`connect_and_stream` sends an empty conversation). A **real**
+/// seller upstream would answer an empty conversation with a provider error, and fabricating a default
+/// prompt would run+bill a synthetic inference the buyer never asked for (money-safety). So one-shot
 /// only drives a `--mock-model` seller; real-provider inference must go through `--local-listen` + the consumer
 /// API, which supplies the prompt per request. Fail closed EARLY
 /// (before the on-chain buy) with an actionable error instead of a deep gateway `InvalidArgument`.
@@ -2878,7 +2878,6 @@ mod buyer_backend_settle_week_tests {
             local_listen: None,
             continuity_mode: ContinuityModeArg::OnDemand,
             json: false,
-            anthropic_compat: false,
             frame_model: Some("qwen--qwen3--32b".to_string()),
             allow_unverified_model: true,
             models: dir.path().join("models.json"),

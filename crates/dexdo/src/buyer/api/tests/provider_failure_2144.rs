@@ -4,37 +4,110 @@ use axum::{response::IntoResponse, routing::post, Router};
 use std::sync::atomic::AtomicU8;
 use tower::ServiceExt;
 
+/// The provider's answer in `mode`: 3 answers, 0 and 4 fail before any output, 1 stops after
+/// partial text without usage, 2 stops after partial reasoning without usage, 5 sends partial text
+/// and then an oversized frame.
+fn provider_answer(mode: u8, path: &str, stream: bool) -> axum::response::Response {
+    let sse = |frames: &[&str]| {
+        let body: String = frames.iter().map(|frame| format!("{frame}\n\n")).collect();
+        ([("content-type", "text/event-stream")], body).into_response()
+    };
+    let json =
+        |body: &str| ([("content-type", "application/json")], body.to_string()).into_response();
+    if !stream && matches!(mode, 0 | 4) {
+        let mut response = json(r#"{"error":{"message":"provider overloaded"}}"#);
+        *response.status_mut() = http::StatusCode::SERVICE_UNAVAILABLE;
+        return response;
+    }
+    match (path, stream, mode) {
+        ("/chat/completions", true, 0 | 4) => sse(&[r#"data: {"error":{"message":"provider overloaded"}}"#]),
+        ("/chat/completions", true, 1 | 5) => sse(&[r#"data: {"choices":[{"delta":{"content":"partial"}}]}"#]),
+        ("/chat/completions", true, 2) => sse(&[r#"data: {"choices":[{"delta":{"reasoning_content":"hidden"}}]}"#]),
+        ("/chat/completions", true, _) => sse(&[
+            r#"data: {"choices":[{"delta":{"content":"OK"}}]}"#,
+            r#"data: {"choices":[],"usage":{"prompt_tokens":1,"completion_tokens":1,"total_tokens":2}}"#,
+            "data: [DONE]",
+        ]),
+        ("/chat/completions", false, 1) => json(r#"{"choices":[{"message":{"content":"partial"}}]}"#),
+        ("/chat/completions", false, 2) => json(r#"{"choices":[{"message":{"reasoning_content":"hidden"}}]}"#),
+        ("/chat/completions", false, _) => json(
+            r#"{"choices":[{"message":{"role":"assistant","content":"OK"},"finish_reason":"stop"}],"usage":{"prompt_tokens":1,"completion_tokens":1,"total_tokens":2}}"#,
+        ),
+        ("/responses", true, 0 | 4) => sse(&["event: error\ndata: {\"type\":\"error\",\"message\":\"provider overloaded\"}"]),
+        ("/responses", true, 1 | 5) => sse(&["event: response.output_text.delta\ndata: {\"type\":\"response.output_text.delta\",\"delta\":\"partial\"}"]),
+        ("/responses", true, 2) => sse(&["event: response.reasoning_text.delta\ndata: {\"type\":\"response.reasoning_text.delta\",\"delta\":\"hidden\"}"]),
+        ("/responses", true, _) => sse(&[
+            "event: response.output_text.delta\ndata: {\"type\":\"response.output_text.delta\",\"delta\":\"OK\"}",
+            "event: response.completed\ndata: {\"type\":\"response.completed\",\"response\":{\"status\":\"completed\",\"usage\":{\"input_tokens\":1,\"output_tokens\":1,\"total_tokens\":2}}}",
+        ]),
+        ("/responses", false, 1) => json(
+            r#"{"status":"completed","output":[{"type":"message","content":[{"type":"output_text","text":"partial"}]}]}"#,
+        ),
+        ("/responses", false, 2) => json(
+            r#"{"status":"completed","output":[{"type":"reasoning","content":[{"type":"reasoning_text","text":"hidden"}]}]}"#,
+        ),
+        ("/responses", false, _) => json(
+            r#"{"status":"completed","output":[{"type":"message","content":[{"type":"output_text","text":"OK"}]}],"usage":{"input_tokens":1,"output_tokens":1,"total_tokens":2}}"#,
+        ),
+        (_, true, 0 | 4) => sse(&["event: error\ndata: {\"type\":\"error\",\"error\":{\"type\":\"overloaded_error\",\"message\":\"provider overloaded\"}}"]),
+        (_, true, 1 | 5) => sse(&[
+            r#"data: {"type":"message_start","message":{"usage":{"input_tokens":1,"output_tokens":0}}}"#,
+            r#"data: {"type":"content_block_delta","delta":{"type":"text_delta","text":"partial"}}"#,
+        ]),
+        (_, true, 2) => sse(&[
+            r#"data: {"type":"message_start","message":{"usage":{"input_tokens":1,"output_tokens":0}}}"#,
+            r#"data: {"type":"content_block_delta","delta":{"type":"thinking_delta","thinking":"hidden"}}"#,
+        ]),
+        (_, true, _) => sse(&[
+            r#"data: {"type":"message_start","message":{"usage":{"input_tokens":1,"output_tokens":0}}}"#,
+            r#"data: {"type":"content_block_delta","delta":{"type":"text_delta","text":"OK"}}"#,
+            r#"data: {"type":"message_delta","usage":{"output_tokens":1}}"#,
+            r#"data: {"type":"message_stop"}"#,
+        ]),
+        (_, false, 1) => json(r#"{"type":"message","content":[{"type":"text","text":"partial"}]}"#),
+        (_, false, 2) => json(r#"{"type":"message","content":[{"type":"thinking","thinking":"hidden"}]}"#),
+        (_, false, _) => json(
+            r#"{"type":"message","content":[{"type":"text","text":"OK"}],"stop_reason":"end_turn","usage":{"input_tokens":1,"output_tokens":1}}"#,
+        ),
+    }
+}
+
 async fn provider(
     mode: Arc<AtomicU8>,
     native: bool,
 ) -> (crate::seller::UpstreamConfig, tokio::task::JoinHandle<()>) {
     let concurrent_failures = Arc::new(tokio::sync::Barrier::new(3));
-    let handler = move || {
+    let handler = move |uri: http::Uri, body: axum::body::Bytes| {
         let mode = mode.clone();
         let concurrent_failures = concurrent_failures.clone();
         async move {
             let mode = mode.load(Ordering::SeqCst);
+            let path = uri.path().trim_start_matches("/v1").to_string();
+            let stream = serde_json::from_slice::<serde_json::Value>(&body)
+                .is_ok_and(|body| body["stream"] == true);
             if mode == 4 {
                 concurrent_failures.wait().await;
             }
-            if mode == 5 {
+            if mode == 5 && stream {
+                let partial = match path.as_str() {
+                    "/chat/completions" => {
+                        "data: {\"choices\":[{\"delta\":{\"content\":\"partial\"}}]}\n\n"
+                    }
+                    "/responses" => {
+                        "event: response.output_text.delta\ndata: {\"type\":\"response.output_text.delta\",\"delta\":\"partial\"}\n\n"
+                    }
+                    _ => {
+                        "data: {\"type\":\"message_start\",\"message\":{\"usage\":{\"input_tokens\":1,\"output_tokens\":0}}}\n\ndata: {\"type\":\"content_block_delta\",\"delta\":{\"type\":\"text_delta\",\"text\":\"partial\"}}\n\n"
+                    }
+                };
                 let body = axum::body::Body::from_stream(async_stream::stream! {
-                    yield Ok::<_, std::io::Error>(axum::body::Bytes::from_static(b"data: {\"choices\":[{\"delta\":{\"content\":\"partial\"}}]}\n\n"));
+                    yield Ok::<_, std::io::Error>(axum::body::Bytes::from_static(partial.as_bytes()));
                     tokio::time::sleep(Duration::from_millis(20)).await;
                     yield Ok(axum::body::Bytes::from(vec![b'x'; dexdo_core::params::UPSTREAM_SSE_FRAME_MAX_BYTES + 1]));
                 });
                 return ([("content-type", "text/event-stream")], body).into_response();
             }
-            let body = match (mode, native) {
-                (0 | 4, _) => "event: error\ndata: {\"error\":{\"message\":\"provider overloaded\"}}\n\n",
-                (1, false) => "data: {\"choices\":[{\"delta\":{\"content\":\"partial\"}}]}\n\n",
-                (1, true) => "data: {\"type\":\"message_start\",\"message\":{\"usage\":{\"input_tokens\":1,\"output_tokens\":0}}}\n\ndata: {\"type\":\"content_block_delta\",\"delta\":{\"type\":\"text_delta\",\"text\":\"partial\"}}\n\n",
-                (2, false) => "data: {\"choices\":[{\"delta\":{\"reasoning_content\":\"hidden\"}}]}\n\n",
-                (2, true) => "data: {\"type\":\"message_start\",\"message\":{\"usage\":{\"input_tokens\":1,\"output_tokens\":0}}}\n\ndata: {\"type\":\"content_block_delta\",\"delta\":{\"type\":\"thinking_delta\",\"thinking\":\"hidden\"}}\n\n",
-                (_, false) => "data: {\"choices\":[{\"delta\":{\"content\":\"OK\"}}]}\n\ndata: {\"choices\":[],\"usage\":{\"prompt_tokens\":1,\"completion_tokens\":1,\"total_tokens\":2}}\n\ndata: [DONE]\n\n",
-                (_, true) => "data: {\"type\":\"message_start\",\"message\":{\"usage\":{\"input_tokens\":1,\"output_tokens\":0}}}\n\ndata: {\"type\":\"content_block_delta\",\"delta\":{\"type\":\"text_delta\",\"text\":\"OK\"}}\n\ndata: {\"type\":\"message_delta\",\"usage\":{\"output_tokens\":1}}\n\ndata: {\"type\":\"message_stop\"}\n\n",
-            };
-            ([("content-type", "text/event-stream")], body).into_response()
+            provider_answer(mode, &path, stream)
         }
     };
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -44,6 +117,7 @@ async fn provider(
             listener,
             Router::new()
                 .route("/chat/completions", post(handler.clone()))
+                .route("/responses", post(handler.clone()))
                 .route("/v1/messages", post(handler)),
         )
         .await
@@ -57,9 +131,6 @@ async fn provider(
             model: "dexdo-mock".into(),
             frame_model: "dexdo-mock".into(),
             api_key_env: key,
-            max_output_tokens: Some(8),
-            tokenizer_family: String::new(),
-            reasoning_disable: Default::default(),
         })
     } else {
         crate::seller::UpstreamConfig::OpenAi(crate::seller::OpenAiConfig {
@@ -67,14 +138,19 @@ async fn provider(
             model: "dexdo-mock".into(),
             frame_model: "dexdo-mock".into(),
             api_key_env: key,
-            capabilities: crate::seller::Capabilities {
-                max_output_tokens: Some(8),
-                ..Default::default()
-            },
             ..Default::default()
         })
     };
     (upstream, task)
+}
+
+/// The consumer paths each provider's seller serves.
+fn served_paths(native: bool) -> &'static [&'static str] {
+    if native {
+        &["/v1/messages"]
+    } else {
+        &["/v1/chat/completions", "/v1/responses"]
+    }
 }
 
 async fn harness(
@@ -107,7 +183,7 @@ async fn ask(
     } else {
         serde_json::json!({"model":"dexdo-mock","messages":[{"role":"user","content":"question"}],"max_tokens":4,"stream":stream})
     };
-    let response = router(state, true)
+    let response = router(state)
         .oneshot(
             http::Request::post(path)
                 .header(http::header::CONTENT_TYPE, "application/json")
@@ -138,8 +214,11 @@ async fn issue_2144_provider_error_preserves_prior_usage_and_concurrent_requests
                 UsageStore::open(dir.path().join("usage.sqlite3"), "test-network").unwrap(),
             );
             let deal = harness.deals.current().await.unwrap();
+            let paths = served_paths(native);
+            // Three requests over the paths this seller serves, so three reach the provider at once.
+            let three = || (0..3).map(|index| paths[index % paths.len()]);
             assert_eq!(
-                ask(&harness, &store, "/v1/responses", true).await.0,
+                ask(&harness, &store, paths[paths.len() - 1], true).await.0,
                 http::StatusCode::OK
             );
             let before = deal.billable_tokens();
@@ -150,11 +229,7 @@ async fn issue_2144_provider_error_preserves_prior_usage_and_concurrent_requests
             mode.store(4, Ordering::SeqCst);
             let failures = tokio::time::timeout(
                 Duration::from_secs(5),
-                futures::future::join_all(
-                    ["/v1/chat/completions", "/v1/responses", "/v1/messages"]
-                        .into_iter()
-                        .map(|path| ask(&harness, &store, path, true)),
-                ),
+                futures::future::join_all(three().map(|path| ask(&harness, &store, path, true))),
             )
             .await
             .expect("all three requests reach the provider concurrently");
@@ -170,13 +245,18 @@ async fn issue_2144_provider_error_preserves_prior_usage_and_concurrent_requests
             assert_eq!(harness.chain.foreign_money_calls(), 0);
             assert_eq!(deal.billable_tokens(), before);
             mode.store(0, Ordering::SeqCst);
-            for path in ["/v1/chat/completions", "/v1/responses", "/v1/messages"] {
+            for path in paths {
                 let (status, body) = ask(&harness, &store, path, false).await;
-                assert_eq!(status, http::StatusCode::BAD_GATEWAY, "{body}");
+                assert_eq!(
+                    status,
+                    http::StatusCode::SERVICE_UNAVAILABLE,
+                    "the provider's own error reaches the client: {body}"
+                );
+                assert!(body.contains("provider overloaded"), "{body}");
                 assert!(!deal.session.is_closed());
             }
             mode.store(3, Ordering::SeqCst);
-            for path in ["/v1/chat/completions", "/v1/responses", "/v1/messages"] {
+            for path in three() {
                 assert_eq!(
                     ask(&harness, &store, path, false).await.0,
                     http::StatusCode::OK
@@ -189,6 +269,9 @@ async fn issue_2144_provider_error_preserves_prior_usage_and_concurrent_requests
     }
 }
 
+/// Streamed output the client already holds, with no usage record behind it, leaves the bill
+/// uncertain: every path pauses and no implicit STOP may land. A whole answer that arrives without
+/// usage never reaches the buyer, so it stays a request-scoped failure.
 #[tokio::test]
 async fn issue_2144_partial_output_without_usage_blocks_every_api_and_implicit_stop() {
     for native in [false, true] {
@@ -202,12 +285,14 @@ async fn issue_2144_partial_output_without_usage_blocks_every_api_and_implicit_s
                     UsageStore::open(dir.path().join("usage.sqlite3"), "test-network").unwrap(),
                 );
                 let deal = harness.deals.current().await.unwrap();
+                let paths = served_paths(native);
+                let path = paths[paths.len() - 1];
                 assert_eq!(
-                    ask(&harness, &store, "/v1/responses", false).await.0,
+                    ask(&harness, &store, path, false).await.0,
                     http::StatusCode::OK
                 );
                 mode.store(failure, Ordering::SeqCst);
-                let (status, body) = ask(&harness, &store, "/v1/responses", stream).await;
+                let (status, body) = ask(&harness, &store, path, stream).await;
                 assert_eq!(
                     status,
                     if stream {
@@ -226,23 +311,29 @@ async fn issue_2144_partial_output_without_usage_blocks_every_api_and_implicit_s
                 assert_eq!(harness.chain.foreign_money_calls(), 0);
                 mode.store(3, Ordering::SeqCst);
                 let calls = harness.seller.calls();
-                for path in ["/v1/chat/completions", "/v1/responses", "/v1/messages"] {
+                for path in paths {
                     let (status, body) = ask(&harness, &store, path, false).await;
-                    assert_eq!(
-                        status,
-                        http::StatusCode::SERVICE_UNAVAILABLE,
-                        "{path}: {body}"
-                    );
-                    assert!(body.contains("upstream_usage_unresolved"), "{body}");
-                    assert!(body.contains("read_only_reconciliation"), "{body}");
+                    if stream {
+                        assert_eq!(
+                            status,
+                            http::StatusCode::SERVICE_UNAVAILABLE,
+                            "{path}: {body}"
+                        );
+                        assert!(body.contains("upstream_usage_unresolved"), "{body}");
+                        assert!(body.contains("read_only_reconciliation"), "{body}");
+                    } else {
+                        assert_eq!(status, http::StatusCode::OK, "{path}: {body}");
+                    }
                 }
-                assert_eq!(
-                    harness.seller.calls(),
-                    calls,
-                    "paused requests must not reach the gateway"
-                );
-                assert!(!deal.session.settle_on_exit("test-shutdown").await.unwrap());
-                assert_eq!(harness.chain.foreign_money_calls(), 0);
+                if stream {
+                    assert_eq!(
+                        harness.seller.calls(),
+                        calls,
+                        "paused requests must not reach the gateway"
+                    );
+                    assert!(!deal.session.settle_on_exit("test-shutdown").await.unwrap());
+                    assert_eq!(harness.chain.foreign_money_calls(), 0);
+                }
                 harness.shutdown().await;
                 task.abort();
             }
@@ -359,7 +450,7 @@ proptest::proptest! {
         let status = dexdo_proto::upstream_failure_status(status, started);
         proptest::prop_assert_eq!(status.code(), tonic::Code::DataLoss);
         proptest::prop_assert_eq!(dexdo_proto::is_retryable_upstream(&status), retryable);
-        let error = if typed { stream::CanonStreamError::Upstream(status) } else { stream::CanonStreamError::Local("dexdo-upstream-output: none".into()) };
+        let error = if typed { stream::StreamError::Upstream(status) } else { stream::StreamError::Local("dexdo-upstream-output: none".into()) };
         let expected = if typed {
             if started || received > 0 { StreamErrorPolicyAction::ReconcileUsage } else { StreamErrorPolicyAction::RequestScoped }
         } else if received == 0 { StreamErrorPolicyAction::DeadGateway } else { StreamErrorPolicyAction::SellerStallsMidStream };
@@ -545,47 +636,40 @@ async fn review_2146_continuity_pause_during_stop_preflight_keeps_previous_route
 
 #[tokio::test]
 async fn review_2146_upstream_resource_exhausted_after_output_must_pause() {
+    // A whole answer is forwarded only once it is complete, so only a stream can stop after output.
     for path in ["/v1/chat/completions", "/v1/responses"] {
-        for streamed in [false, true] {
-            let mode = Arc::new(AtomicU8::new(3));
-            let (upstream, task) = provider(mode.clone(), false).await;
-            let harness = harness(upstream, SessionLifetimePolicy::SettleOnExit).await;
-            let deal = harness.deals.current().await.unwrap();
-            let dir = tempfile::tempdir().unwrap();
-            let store = Arc::new(
-                UsageStore::open(dir.path().join("usage.sqlite3"), "test-network").unwrap(),
-            );
-            assert_eq!(
-                ask(&harness, &store, path, false).await.0,
-                http::StatusCode::OK
-            );
-            mode.store(5, Ordering::SeqCst);
-            let (status, body) = ask(&harness, &store, path, streamed).await;
-            if streamed {
-                assert!(
-                    body.contains("partial"),
-                    "must render before oversized frame: {body}"
-                );
-                assert!(body.contains("error") || body.contains("response.failed"));
-            } else {
-                assert_eq!(status, http::StatusCode::BAD_GATEWAY, "{body}");
-            }
-            assert!(deal.session.unresolved_usage_rejection().is_some());
-            assert!(!body.contains("\"capacity\""), "{body}");
-            let calls = harness.seller.calls();
-            mode.store(3, Ordering::SeqCst);
-            let (status, body) = ask(&harness, &store, path, streamed).await;
-            assert_eq!(status, http::StatusCode::SERVICE_UNAVAILABLE, "{body}");
-            assert!(body.contains("upstream_usage_unresolved"));
-            assert_eq!(harness.seller.calls(), calls);
-            assert_eq!(harness.chain.foreign_money_calls(), 0);
-            assert!(!deal.session.is_closed());
-            harness.shutdown().await;
-            task.abort();
-        }
+        let mode = Arc::new(AtomicU8::new(3));
+        let (upstream, task) = provider(mode.clone(), false).await;
+        let harness = harness(upstream, SessionLifetimePolicy::SettleOnExit).await;
+        let deal = harness.deals.current().await.unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let store =
+            Arc::new(UsageStore::open(dir.path().join("usage.sqlite3"), "test-network").unwrap());
+        assert_eq!(
+            ask(&harness, &store, path, false).await.0,
+            http::StatusCode::OK
+        );
+        mode.store(5, Ordering::SeqCst);
+        let (_, body) = ask(&harness, &store, path, true).await;
+        assert!(
+            body.contains("partial"),
+            "must render before oversized frame: {body}"
+        );
+        assert!(body.contains("error") || body.contains("response.failed"));
+        assert!(deal.session.unresolved_usage_rejection().is_some());
+        assert!(!body.contains("\"capacity\""), "{body}");
+        let calls = harness.seller.calls();
+        mode.store(3, Ordering::SeqCst);
+        let (status, body) = ask(&harness, &store, path, true).await;
+        assert_eq!(status, http::StatusCode::SERVICE_UNAVAILABLE, "{body}");
+        assert!(body.contains("upstream_usage_unresolved"));
+        assert_eq!(harness.seller.calls(), calls);
+        assert_eq!(harness.chain.foreign_money_calls(), 0);
+        assert!(!deal.session.is_closed());
+        harness.shutdown().await;
+        task.abort();
     }
-    let capacity =
-        stream::CanonStreamError::Upstream(tonic::Status::resource_exhausted("seller busy"));
+    let capacity = stream::StreamError::Upstream(tonic::Status::resource_exhausted("seller busy"));
     assert!(
         capacity.is_capacity(),
         "genuine seller capacity remains request scoped"
@@ -736,9 +820,13 @@ async fn review_2146_remaining_automatic_stop_preflight_and_control() {
 #[tokio::test]
 async fn review_2146_remaining_binding_failure_rejects_before_paid_work() {
     for verification in [false, true] {
-        for endpoint in ["/v1/chat/completions", "/v1/responses", "/v1/messages"] {
+        for (endpoint, native) in [
+            ("/v1/chat/completions", false),
+            ("/v1/responses", false),
+            ("/v1/messages", true),
+        ] {
             let mode = Arc::new(AtomicU8::new(1));
-            let (upstream, task) = provider(mode, false).await;
+            let (upstream, task) = provider(mode, native).await;
             let harness = if verification {
                 weekly_route_harness_gated(
                     0,
@@ -823,9 +911,20 @@ async fn review_2146_remaining_binding_failure_rejects_before_paid_work() {
             assert!(harness.seller.calls() > 0);
             let recovered = Arc::new(UsageStore::open(&path, "test-network").unwrap());
             recovered.recover_interrupted_requests().unwrap();
-            assert!(recovered
-                .has_unresolved_output_usage(&deal.route.token_contract)
-                .unwrap());
+            // The probe is a whole request, and the seller withholds a whole answer without usage:
+            // the failed verification delivered nothing, so nothing is left unresolved.
+            assert_eq!(
+                recovered
+                    .has_unresolved_output_usage(&deal.route.token_contract)
+                    .unwrap(),
+                !verification,
+                "{endpoint}"
+            );
+            if verification {
+                harness.shutdown().await;
+                task.abort();
+                continue;
+            }
             let resumed = Arc::new(SessionSettle::new(
                 harness.chain.clone(),
                 deal.route.token_contract.clone(),
@@ -1172,7 +1271,7 @@ async fn review_2146_admitted_verification_waiters_recheck_before_paid_work() {
             ));
             let (sender, _receiver) = tokio::sync::mpsc::unbounded_channel();
             let state = direct_state_with_deliveries(&harness, sender).with_usage(store.clone());
-            let mut waiter = Box::pin(router(state, true).oneshot(http::Request::post("/v1/chat/completions")
+            let mut waiter = Box::pin(router(state).oneshot(http::Request::post("/v1/chat/completions")
                 .header(http::header::CONTENT_TYPE, "application/json")
                 .body(Body::from(serde_json::json!({"model":"dexdo-mock","messages":[{"role":"user","content":"question"}],"max_tokens":4}).to_string())).unwrap()));
             assert!(matches!(

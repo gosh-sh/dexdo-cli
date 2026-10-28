@@ -101,7 +101,7 @@ async fn issue_2030_review_getters_route_both_metered_and_raw_system_contracts()
 async fn issue_2030_review_activation_and_gas_reads_use_system_dapp() {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let endpoint = format!("http://{}", listener.local_addr().unwrap());
-    let (requests, task) = issue_2030_producer_server(listener, (0..7).map(|_| (
+    let (requests, task) = issue_2030_producer_server(listener, (0..6).map(|_| (
         200, json!({"data":{"blockchain":{"account":{"info":{
             "acc_type_name":"Active", "balance":"10", "balance_other":[{"currency":2,"value":"20"}]
         }}}}}),
@@ -117,11 +117,7 @@ async fn issue_2030_review_activation_and_gas_reads_use_system_dapp() {
             )
             .await
     );
-    assert_eq!(backend.active_native_balance(&account).await.unwrap(), 0x10);
-    backend
-        .wait_ecc_balance_at_least(&account, 0x20)
-        .await
-        .unwrap();
+    assert_eq!(backend.active_deal_reserve_ecc(&account).await.unwrap(), 0x20);
     assert!(backend
         .client()
         .get_system_account_retrying(&account)

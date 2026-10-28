@@ -5,7 +5,6 @@ use dexdo_core::{
     Note, OfferListing, SellOffer, Settlement, StreamSnapshot, CHAIN_READ_EXHAUSTED_MESSAGE_PREFIX,
     TICK_SIZE,
 };
-use dexdo_proto::SamplingParams;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -118,12 +117,22 @@ async fn fail_required_read(state: Arc<GatewayState>, failure: ReadFailure) {
     );
 }
 
-fn chunk(text: &str, seq: u64) -> UpstreamEvent {
-    UpstreamEvent::Chunk(CanonChunk {
-        text: text.to_string(),
-        seq,
-        ..CanonChunk::default()
+fn chunk(text: &str) -> UpstreamEvent {
+    UpstreamEvent::Data {
+        bytes: text.as_bytes().to_vec(),
+        output: true,
+    }
+}
+
+fn head() -> UpstreamEvent {
+    UpstreamEvent::Head(dexdo_proto::ResponseHead {
+        status: 200,
+        headers: Vec::new(),
     })
+}
+
+fn text(frame: StreamFrame) -> String {
+    String::from_utf8(frame.data).unwrap()
 }
 
 async fn controlled_relay(
@@ -131,7 +140,7 @@ async fn controlled_relay(
     token_contract: &str,
 ) -> (
     mpsc::Sender<Result<UpstreamEvent, Status>>,
-    mpsc::Receiver<Result<CanonChunk, Status>>,
+    mpsc::Receiver<Result<StreamFrame, Status>>,
     tokio::task::JoinHandle<()>,
 ) {
     let delivery = state.delivery(token_contract);
@@ -145,9 +154,8 @@ async fn controlled_relay(
         None,
         Some(unavailable),
         u64::MAX,
-        u64::MAX,
-        false,
     ));
+    up_tx.send(Ok(head())).await.unwrap();
     (up_tx, buyer_rx, relay)
 }
 
@@ -157,10 +165,12 @@ async fn exhausted_read_budget_stop_terminates_inflight_stream_as_buyer_error() 
     let (up_tx, mut buyer_rx, relay) = controlled_relay(&state, TC).await;
     let (other_up_tx, mut other_buyer_rx, other_relay) =
         controlled_relay(&state, "0:other-open-deal").await;
-    up_tx.send(Ok(chunk("first", 0))).await.unwrap();
-    other_up_tx.send(Ok(chunk("other", 0))).await.unwrap();
-    assert_eq!(buyer_rx.recv().await.unwrap().unwrap().text, "first");
-    assert_eq!(other_buyer_rx.recv().await.unwrap().unwrap().text, "other");
+    assert!(buyer_rx.recv().await.unwrap().unwrap().head.is_some());
+    assert!(other_buyer_rx.recv().await.unwrap().unwrap().head.is_some());
+    up_tx.send(Ok(chunk("first"))).await.unwrap();
+    other_up_tx.send(Ok(chunk("other"))).await.unwrap();
+    assert_eq!(text(buyer_rx.recv().await.unwrap().unwrap()), "first");
+    assert_eq!(text(other_buyer_rx.recv().await.unwrap().unwrap()), "other");
 
     fail_required_read(state, ReadFailure::ExhaustedBudget).await;
     drop(up_tx);
@@ -197,11 +207,12 @@ async fn exhausted_read_budget_stop_terminates_inflight_stream_as_buyer_error() 
 async fn one_failed_attempt_inside_the_budget_does_not_stop_serving() {
     let state = Arc::new(GatewayState::new());
     let (up_tx, mut buyer_rx, relay) = controlled_relay(&state, TC).await;
-    up_tx.send(Ok(chunk("first", 0))).await.unwrap();
-    assert_eq!(buyer_rx.recv().await.unwrap().unwrap().text, "first");
+    assert!(buyer_rx.recv().await.unwrap().unwrap().head.is_some());
+    up_tx.send(Ok(chunk("first"))).await.unwrap();
+    assert_eq!(text(buyer_rx.recv().await.unwrap().unwrap()), "first");
 
     fail_required_read(state, ReadFailure::OneAttempt).await;
-    up_tx.send(Ok(chunk("second", 1))).await.unwrap();
+    up_tx.send(Ok(chunk("second"))).await.unwrap();
     up_tx
         .send(Ok(UpstreamEvent::Usage(
             BillingUsage::new(0, 2, None).unwrap(),
@@ -210,7 +221,7 @@ async fn one_failed_attempt_inside_the_budget_does_not_stop_serving() {
         .unwrap();
     drop(up_tx);
 
-    assert_eq!(buyer_rx.recv().await.unwrap().unwrap().text, "second");
+    assert_eq!(text(buyer_rx.recv().await.unwrap().unwrap()), "second");
     assert_eq!(
         buyer_rx.recv().await.unwrap().unwrap().usage,
         Some(BillingUsage::new(0, 2, None).unwrap())
@@ -224,11 +235,12 @@ async fn keep_serving_preserves_the_existing_clean_relay_behavior() {
     let state = Arc::new(GatewayState::new());
     state.set_chain_unavailable_action(ChainUnavailableAction::KeepServing);
     let (up_tx, mut buyer_rx, relay) = controlled_relay(&state, TC).await;
-    up_tx.send(Ok(chunk("first", 0))).await.unwrap();
-    assert_eq!(buyer_rx.recv().await.unwrap().unwrap().text, "first");
+    assert!(buyer_rx.recv().await.unwrap().unwrap().head.is_some());
+    up_tx.send(Ok(chunk("first"))).await.unwrap();
+    assert_eq!(text(buyer_rx.recv().await.unwrap().unwrap()), "first");
 
     fail_required_read(state, ReadFailure::ExhaustedBudget).await;
-    up_tx.send(Ok(chunk("second", 1))).await.unwrap();
+    up_tx.send(Ok(chunk("second"))).await.unwrap();
     up_tx
         .send(Ok(UpstreamEvent::Usage(
             BillingUsage::new(0, 2, None).unwrap(),
@@ -237,7 +249,7 @@ async fn keep_serving_preserves_the_existing_clean_relay_behavior() {
         .unwrap();
     drop(up_tx);
 
-    assert_eq!(buyer_rx.recv().await.unwrap().unwrap().text, "second");
+    assert_eq!(text(buyer_rx.recv().await.unwrap().unwrap()), "second");
     assert_eq!(
         buyer_rx.recv().await.unwrap().unwrap().usage,
         Some(BillingUsage::new(0, 2, None).unwrap())
@@ -259,15 +271,10 @@ fn authorized_request(
         token_contract: token_contract.to_string(),
         nonce,
         signature: signature.0.to_vec(),
-        request: Some(CanonRequest {
-            messages: Vec::new(),
-            params: Some(SamplingParams {
-                max_tokens: 1,
-                ..SamplingParams::default()
-            }),
-            ..Default::default()
-        }),
         billing_grant_tokens: 8,
+        path: "/v1/chat/completions".to_string(),
+        body: br#"{"model":"mock-model","messages":[],"max_tokens":1}"#.to_vec(),
+        headers: Vec::new(),
     })
 }
 
@@ -381,6 +388,7 @@ async fn chain_unavailable_refusal_stays_distinct_from_capacity_auth_and_upstrea
         .await
         .unwrap();
     drop(up_tx);
+    assert!(buyer_rx.recv().await.unwrap().unwrap().head.is_some());
     let upstream_status = buyer_rx
         .recv()
         .await

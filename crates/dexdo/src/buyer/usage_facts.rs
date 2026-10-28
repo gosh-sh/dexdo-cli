@@ -156,7 +156,7 @@ impl UsageStore {
         let (from, to) = query.bounds()?;
         let limit = query.page_limit()?;
         let cursor = query.decoded_cursor()?;
-        let mut connection = self.lock()?;
+        let mut connection = self.lock_history()?;
         let transaction = connection.transaction()?;
         let (store, revision): (String, i64) = transaction.query_row(
             "SELECT store_id,revision FROM facts_revision WHERE network=?1",
@@ -656,7 +656,7 @@ mod tests {
         let s = store(&dir, "network-a");
         s.apply_operational_expense(operation(None)).unwrap();
         let before = serde_json::to_value(s.facts(&Default::default()).unwrap()).unwrap();
-        s.lock().unwrap().execute_batch("ALTER TABLE money_facts DROP COLUMN probe_consumption_tokens; ALTER TABLE request_usage DROP COLUMN accepted_at; DROP TABLE deal_prices; PRAGMA user_version=3;").unwrap();
+        s.lock().unwrap().execute_batch("ALTER TABLE money_facts DROP COLUMN probe_consumption_tokens; ALTER TABLE request_usage DROP COLUMN accepted_at; DROP INDEX request_usage_pending; ALTER TABLE request_usage DROP COLUMN deal_id; DROP TABLE deal_prices; PRAGMA user_version=3;").unwrap();
         drop(s);
         for _ in 0..2 {
             let upgraded = store(&dir, "network-a");

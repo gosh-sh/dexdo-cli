@@ -272,6 +272,21 @@ pub(crate) fn for_operator(error: &anyhow::Error) -> Option<Refusal> {
     let lower = text.to_ascii_lowercase();
     let detail = text.clone();
 
+    // Preserve known TC submissions even when the diagnostic receipt read itself fails.
+    if lower.contains("tokencontract")
+        && (lower.contains("ecc[2]/shell reserve")
+            || (lower.contains("message_hash=")
+                && (lower.contains("was rejected") || lower.contains("was submitted")))
+            || (lower.contains("sell submission") && lower.contains("preserving its journal")))
+    {
+        return Some(Refusal::new(
+            text,
+            "Keep this deal's recovery files. Inspect the failed operation and its receipt before \
+             retrying; settlement remains unconfirmed until the chain proves a terminal outcome.",
+            detail,
+        ));
+    }
+
     // A buy this note already sent and nobody has confirmed yet. The remedy is a command, and the
     // operator has no way to guess it from a lock file name.
     if lower.contains("money submission awaiting by-fact reconciliation")
@@ -672,6 +687,105 @@ mod tests {
                 for_operator(&anyhow::anyhow!("{left_alone}")).is_none(),
                 "this refusal is printed as it was written, not rewritten: {left_alone}"
             );
+        }
+    }
+
+    #[test]
+    fn issue_2199_tc_reserve_rejection_is_not_rewritten_as_an_unsent_wallet_shortage() {
+        let error = anyhow::anyhow!("insufficient ECC[2]").context(
+            "TokenContract 0:tc2199: claimTokens failed because its ECC[2]/SHELL reserve could not \
+             cover the operation; finalized rejection transaction_hash=tx2199; settlement is unconfirmed"
+        ).context("seller advance failed");
+        let refusal = for_operator(&error).unwrap();
+        let shown = refusal.render_with(crate::cli::style::Palette::None);
+        for fact in [
+            "0:tc2199",
+            "claimTokens",
+            "ECC[2]/SHELL reserve",
+            "tx2199",
+            "unconfirmed",
+        ] {
+            assert!(shown.contains(fact), "{shown}");
+        }
+        assert!(!shown.contains("nothing was sent"), "{shown}");
+        assert!(!shown.contains("wallet"), "{shown}");
+        assert!(shown.contains("recovery files"), "{shown}");
+    }
+
+    #[test]
+    fn issue_2199_known_tc_rejection_survives_unavailable_receipt() {
+        for receipt in [
+            "finalized receipt unavailable: GraphQL errors: pool timed out while waiting for an open connection",
+            "no finalized destination receipt matched",
+            "foreign receipt destination/account/dapp mismatch",
+        ] {
+            let error = anyhow::anyhow!("aborted=true").context(format!(
+                "TokenContract 0:tc2199: claimTokens was rejected; message_hash=msg2199; \
+                 {receipt}; reserve cause unproven"
+            ));
+            let shown = for_operator(&error)
+                .expect("known rejection must be retained")
+                .render_with(crate::cli::style::Palette::None);
+            for fact in ["0:tc2199", "claimTokens", "msg2199", "was rejected", "unproven", "unconfirmed", "recovery files"] {
+                assert!(shown.contains(fact), "{shown}");
+            }
+            assert!(!shown.contains("nothing was sent"), "{shown}");
+            assert!(!shown.contains("wallet"), "{shown}");
+            assert!(!shown.contains("failed because its ECC[2]/SHELL reserve"), "{shown}");
+        }
+    }
+
+    #[test]
+    fn issue_2199_submitted_internal_call_does_not_become_a_note_or_network_shortage() {
+        for operation in ["fundDeal", "postFromNote"] {
+            let error = anyhow::anyhow!("pool timed out while waiting for an open connection")
+                .context(format!(
+                    "TokenContract 0:tc2199: {operation} was submitted via seller note 0:note; \
+                 note_message_hash=note2199; reserve cause unproven"
+                ));
+            let shown = for_operator(&error)
+                .unwrap()
+                .render_with(crate::cli::style::Palette::None);
+            for fact in [
+                operation,
+                "0:tc2199",
+                "note2199",
+                "was submitted",
+                "unproven",
+                "unconfirmed",
+                "recovery files",
+            ] {
+                assert!(shown.contains(fact), "{shown}");
+            }
+            assert!(!shown.contains("nothing was sent"), "{shown}");
+            assert!(!shown.contains("wallet"), "{shown}");
+            assert!(!shown.contains("Top up"), "{shown}");
+        }
+    }
+
+    #[test]
+    fn issue_2199_sell_deadline_preserves_known_submission_and_observed_rejection() {
+        for detail in [
+            "execution read timed out",
+            "execution read timed out; TokenContract 0:tc2199: postFromNote was rejected; message_hash=internal2199 transaction_hash=tx2199 note_message_hash=note2199; reserve cause unproven; settlement is unconfirmed",
+        ] {
+            let error = anyhow::Error::new(dexdo_core::ChainError::AmbiguousSubmit(format!(
+                "SELL submission note2199 for TokenContract 0:tc2199 remains unresolved: {detail}; \
+                 preserving its journal; reconcile this exact message and its destination transactions before another SELL"
+            )));
+            let shown = for_operator(&error).unwrap().render_with(crate::cli::style::Palette::None);
+            for fact in ["0:tc2199", "note2199", "execution read timed out", "recovery files", "unconfirmed"] {
+                assert!(shown.contains(fact), "{shown}");
+            }
+            if detail.contains("postFromNote") {
+                for fact in ["postFromNote", "was rejected", "internal2199", "tx2199", "reserve cause unproven"] {
+                    assert!(shown.contains(fact), "{shown}");
+                }
+            }
+            assert!(!shown.contains("nothing was sent"), "{shown}");
+            assert!(!shown.contains("wallet"), "{shown}");
+            assert!(!shown.contains("Re-mint"), "{shown}");
+            assert!(!shown.contains("failed because its ECC[2]/SHELL reserve"), "{shown}");
         }
     }
 

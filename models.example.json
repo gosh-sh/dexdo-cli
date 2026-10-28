@@ -17,9 +17,7 @@
         }
       ],
       "capabilities": {
-        "max_output_tokens": 4096,
-        "sample_algorithm": "NONE",
-        "reasoning_disable": "unsupported"
+        "sample_algorithm": "NONE"
       }
     }
   }

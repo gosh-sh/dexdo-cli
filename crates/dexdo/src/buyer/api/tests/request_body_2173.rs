@@ -19,15 +19,18 @@ fn lazy_router() -> (axum::Router, Arc<AtomicUsize>) {
         }),
         MATCH_OPEN_TIMEOUT,
     );
-    (router(state, true), calls)
+    (router(state), calls)
 }
 
 fn json_body(path: &str, size: usize) -> Vec<u8> {
     let (prefix, suffix) = if path == "/v1/responses" {
-        (r#"{"input":""#, r#"","max_output_tokens":1}"#)
+        (
+            r#"{"model":"dexdo-mock","input":""#,
+            r#"","max_output_tokens":1}"#,
+        )
     } else {
         (
-            r#"{"messages":[{"role":"user","content":""#,
+            r#"{"model":"dexdo-mock","messages":[{"role":"user","content":""#,
             r#""}],"max_tokens":1}"#,
         )
     };

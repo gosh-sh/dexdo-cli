@@ -97,6 +97,7 @@ pub fn serving_process_ignores_sigpipe() {
 #[cfg(not(unix))]
 pub fn serving_process_ignores_sigpipe() {}
 
+pub mod api_format;
 pub mod buyer;
 pub mod registry;
 pub mod runtime_events;

@@ -56,9 +56,12 @@ async fn cancelled_request_keeps_prior_usage_and_serves_the_next_request() {
                 let prior_usage = deal.billable_tokens();
                 let remaining = deal.remaining_tokens();
                 assert!(prior_usage > 0);
+                // Registered past the probe with no capacity file, the seller's claim counter starts at
+                // the deal's `tokensPending`.
+                let registered = u64::try_from(PROBE_CLAIM).unwrap();
                 assert_eq!(
                     harness.seller.billed_tokens(&deal.route.token_contract),
-                    prior_usage
+                    registered + prior_usage
                 );
 
                 let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
@@ -105,7 +108,9 @@ async fn cancelled_request_keeps_prior_usage_and_serves_the_next_request() {
                 // terminal usage still spends capacity; the buyer never guesses missing usage.
                 harness.seller.release_delayed_eof();
                 tokio::time::timeout(Duration::from_secs(5), async {
-                    while harness.seller.billed_tokens(&deal.route.token_contract) <= prior_usage {
+                    while harness.seller.billed_tokens(&deal.route.token_contract)
+                        <= registered + prior_usage
+                    {
                         tokio::task::yield_now().await;
                     }
                 })

@@ -309,7 +309,6 @@ fn issue_1446_on_demand_first_request_updates_command_progress_across_thread() {
         local_listen: Some("127.0.0.1:0".parse().unwrap()),
         continuity_mode: super::ContinuityModeArg::OnDemand,
         json: false,
-        anthropic_compat: false,
         frame_model: Some("Qwen3-32B".to_string()),
         allow_unverified_model: true,
         models: std::path::PathBuf::from("unused-models.json"),
@@ -369,7 +368,6 @@ fn issue_1446_on_demand_first_request_updates_command_progress_across_thread() {
                 let (addr, task) = dexdo::buyer::api::serve(
                     "127.0.0.1:0".parse().unwrap(),
                     state,
-                    false,
                     async move {
                         let _ = shutdown_rx.await;
                     },

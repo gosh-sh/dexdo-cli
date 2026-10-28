@@ -1,5 +1,5 @@
-//! `dexdo-proto` -- the canonical stream format and the gateway's gRPC service.
-//! In the canonical chunk carries fake tokens (mock model).
+//! `dexdo-proto` -- the gateway's gRPC service: the consumer request travels to the
+//! seller as received, and the provider response returns to the buyer as produced.
 
 /// Generated tonic/prost types for the `dexdo.v1` package.
 
@@ -12,8 +12,7 @@ pub mod v1 {
 pub use v1::{
     gateway_client::GatewayClient,
     gateway_server::{Gateway, GatewayServer},
-    BillingUsage, CanonChunk, CanonRequest, Challenge, ChallengeRequest, ChatMessage,
-    SamplingParams, SignalManifest, StreamRequest,
+    BillingUsage, Challenge, ChallengeRequest, Header, ResponseHead, StreamFrame, StreamRequest,
 };
 
 /// A transient provider failure before output; the gateway is still alive.
@@ -106,21 +105,6 @@ impl BillingUsage {
     }
 }
 
-impl CanonChunk {
-    /// Lower bound on visible output tokens proved by one normalized content chunk.
-    /// Structured token IDs are exact; a textual/reasoning delta without IDs proves one token;
-    /// metadata-only and terminal-usage frames prove no output tokens.
-    pub fn visible_output_tokens(&self) -> u64 {
-        if !self.token_ids.is_empty() {
-            self.token_ids.len() as u64
-        } else if !self.text.is_empty() || !self.reasoning.is_empty() {
-            1
-        } else {
-            0
-        }
-    }
-}
-
 #[cfg(test)]
 mod billing_usage_tests {
     use super::BillingUsage;
@@ -173,113 +157,118 @@ mod billing_usage_tests {
 }
 
 #[cfg(test)]
-mod reasoning_wire_compatibility_tests {
-    use super::{Challenge, ChallengeRequest, SamplingParams};
+mod version_mismatch_wire_tests {
+    use super::{Challenge, ChallengeRequest, StreamRequest};
     use prost::Message;
 
+    /// The request an older buyer sends: its prompt travels in field 4, which this schema leaves unused.
     #[derive(Clone, PartialEq, Message)]
-    struct LegacyChallengeRequest {
+    struct OlderBuyerStreamRequest {
         #[prost(string, tag = "1")]
         token_contract: String,
+        #[prost(bytes = "vec", tag = "2")]
+        nonce: Vec<u8>,
+        #[prost(bytes = "vec", tag = "3")]
+        signature: Vec<u8>,
+        #[prost(bytes = "vec", tag = "4")]
+        request: Vec<u8>,
+        #[prost(uint64, tag = "5")]
+        billing_grant_tokens: u64,
+        #[prost(bool, tag = "6")]
+        shared_budget: bool,
     }
 
+    /// The challenge an older seller answers with: fields 3 and 4 are unused here.
     #[derive(Clone, PartialEq, Message)]
-    struct LegacyChallenge {
+    struct OlderSellerChallenge {
+        #[prost(bytes = "vec", tag = "1")]
+        nonce: Vec<u8>,
+        #[prost(string, tag = "2")]
+        token_contract: String,
+        #[prost(bool, tag = "3")]
+        flag: bool,
+        #[prost(string, repeated, tag = "4")]
+        levels: Vec<String>,
+    }
+
+    #[test]
+    fn an_older_buyer_request_decodes_without_a_path_or_body() {
+        let older = OlderBuyerStreamRequest {
+            token_contract: "deal".into(),
+            nonce: vec![1, 2],
+            signature: vec![3; 64],
+            request: vec![10, 3, 10, 1, 120],
+            billing_grant_tokens: 64,
+            shared_budget: true,
+        };
+        let decoded = StreamRequest::decode(older.encode_to_vec().as_slice()).unwrap();
+        assert_eq!(decoded.token_contract, "deal");
+        assert_eq!(decoded.billing_grant_tokens, 64);
+        assert!(decoded.shared_budget);
+        assert!(decoded.path.is_empty());
+        assert!(decoded.body.is_empty());
+        assert!(decoded.headers.is_empty());
+    }
+
+    /// The challenge an older buyer reads: only the nonce and the deal.
+    #[derive(Clone, PartialEq, Message)]
+    struct OlderBuyerChallenge {
         #[prost(bytes = "vec", tag = "1")]
         nonce: Vec<u8>,
         #[prost(string, tag = "2")]
         token_contract: String,
     }
 
+    /// The challenge request an older buyer sends: only the deal.
     #[derive(Clone, PartialEq, Message)]
-    struct LegacySamplingParams {
-        #[prost(double, tag = "1")]
-        temperature: f64,
-        #[prost(uint32, tag = "2")]
-        max_tokens: u32,
-        #[prost(string, repeated, tag = "3")]
-        stop: Vec<String>,
-        #[prost(bool, tag = "4")]
-        greedy: bool,
+    struct OlderBuyerChallengeRequest {
+        #[prost(string, tag = "1")]
+        token_contract: String,
     }
 
+    /// An older buyer still authorizes against a new seller: the declared paths are a field it
+    /// skips, and the nonce and deal read as before. Its later request is what the seller refuses.
+    #[test]
+    fn an_older_buyer_reads_a_new_seller_challenge() {
+        let new = Challenge {
+            nonce: vec![1, 2, 3],
+            token_contract: "deal".into(),
+            api_paths: vec!["/v1/chat/completions".into(), "/v1/responses".into()],
+        };
+        let older = OlderBuyerChallenge::decode(new.encode_to_vec().as_slice()).unwrap();
+        assert_eq!(older.nonce, new.nonce);
+        assert_eq!(older.token_contract, new.token_contract);
+    }
+
+    /// `capabilities_only` is additive: an older request decodes as an ordinary challenge with
+    /// unchanged bytes, and an older seller reads a capability query as an ordinary one.
     #[test]
     fn capabilities_only_is_an_additive_challenge_request() {
-        let old = LegacyChallengeRequest {
+        let older = OlderBuyerChallengeRequest {
             token_contract: "deal".into(),
         };
-        let new = ChallengeRequest::decode(old.encode_to_vec().as_slice()).unwrap();
+        let new = ChallengeRequest::decode(older.encode_to_vec().as_slice()).unwrap();
         assert!(!new.capabilities_only);
-        assert_eq!(new.encode_to_vec(), old.encode_to_vec());
+        assert_eq!(new.encode_to_vec(), older.encode_to_vec());
         let query = ChallengeRequest {
             capabilities_only: true,
             ..new
         };
-        let ignored = LegacyChallengeRequest::decode(query.encode_to_vec().as_slice()).unwrap();
-        assert_eq!(ignored, old);
+        let read_by_older =
+            OlderBuyerChallengeRequest::decode(query.encode_to_vec().as_slice()).unwrap();
+        assert_eq!(read_by_older, older);
     }
 
     #[test]
-    fn old_seller_reply_declares_no_reasoning_support() {
-        let old = LegacyChallenge {
-            nonce: vec![1, 2, 3],
+    fn an_older_seller_challenge_declares_no_api_paths() {
+        let older = OlderSellerChallenge {
+            nonce: vec![7],
             token_contract: "deal".into(),
+            flag: true,
+            levels: vec!["high".into()],
         };
-        let new = Challenge::decode(old.encode_to_vec().as_slice()).unwrap();
-        assert!(!new.supports_reasoning_disable);
-        assert!(new.supported_reasoning_efforts.is_empty());
-        assert_eq!(new.nonce, old.nonce);
-        assert_eq!(new.token_contract, old.token_contract);
-    }
-
-    #[test]
-    fn old_buyer_reads_new_seller_reply() {
-        let new = Challenge {
-            nonce: vec![1, 2, 3],
-            token_contract: "deal".into(),
-            supports_reasoning_disable: true,
-            supported_reasoning_efforts: vec!["high".into()],
-        };
-        let old = LegacyChallenge::decode(new.encode_to_vec().as_slice()).unwrap();
-        assert_eq!(old.nonce, new.nonce);
-        assert_eq!(old.token_contract, new.token_contract);
-    }
-
-    #[test]
-    fn reasoning_2172_effort_survives_the_wire_without_disabling_reasoning() {
-        for effort in ["minimal", "low", "medium", "high", "xhigh", "max"] {
-            let params = SamplingParams {
-                reasoning_effort: Some(effort.into()),
-                ..Default::default()
-            };
-            let decoded = SamplingParams::decode(params.encode_to_vec().as_slice()).unwrap();
-            assert_eq!(decoded.reasoning_effort.as_deref(), Some(effort));
-            assert!(!decoded.disable_reasoning);
-            let legacy = LegacySamplingParams::decode(params.encode_to_vec().as_slice()).unwrap();
-            assert_eq!(legacy, LegacySamplingParams::default());
-        }
-    }
-
-    #[test]
-    fn omitted_reasoning_preserves_the_legacy_request_bytes() {
-        let old = LegacySamplingParams {
-            temperature: 0.5,
-            max_tokens: 8,
-            stop: vec!["END".into()],
-            greedy: false,
-        };
-        let new = SamplingParams::decode(old.encode_to_vec().as_slice()).unwrap();
-        assert!(!new.disable_reasoning);
-        assert!(new.reasoning_effort.is_none());
-        assert_eq!(new.encode_to_vec(), old.encode_to_vec());
-        let disabled = SamplingParams {
-            disable_reasoning: true,
-            ..new
-        };
-        let ignored = LegacySamplingParams::decode(disabled.encode_to_vec().as_slice()).unwrap();
-        assert_eq!(
-            ignored, old,
-            "old sellers ignore the new field: buyer capability gating is essential"
-        );
+        let decoded = Challenge::decode(older.encode_to_vec().as_slice()).unwrap();
+        assert_eq!(decoded.nonce, vec![7]);
+        assert!(decoded.api_paths.is_empty());
     }
 }

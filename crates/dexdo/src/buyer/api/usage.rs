@@ -127,7 +127,7 @@ pub(super) fn finish_delivery(
         if let Err(error) = store.finish_request(
             &delivery.request_id,
             delivery.http_status,
-            Some(delivery.finish_reason),
+            Some(delivery.finish_reason.as_str()),
             delivery.failure_stage,
         ) {
             tracing::error!(%error, "buyer usage: could not persist request completion");
@@ -734,7 +734,7 @@ mod tests {
             dexdo_core::params::MATCH_OPEN_TIMEOUT,
         )
         .with_usage(store.clone());
-        let response = super::super::router(state, true)
+        let response = super::super::router(state)
             .oneshot(
                 http::Request::get("/v1/usage")
                     .body(axum::body::Body::empty())
@@ -792,7 +792,7 @@ mod tests {
             dexdo_core::params::MATCH_OPEN_TIMEOUT,
         )
         .with_usage(store.clone());
-        let app = super::super::router(state, true);
+        let app = super::super::router(state);
         for suffix in [
             "limit=0".to_string(),
             format!(

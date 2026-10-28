@@ -279,7 +279,6 @@ mod keep_open_2148 {
             let (addr, task) = dexdo::buyer::api::serve(
                 "127.0.0.1:0".parse().unwrap(),
                 state,
-                false,
                 async move {
                     let _ = shutdown_rx.await;
                 },
@@ -754,7 +753,7 @@ mod keep_open_2148 {
             .find("_ = stopped.wait_for(Option::is_some) => {}")
             .unwrap();
         let serve = body
-            .find("api::serve(bind, state, args.anthropic_compat, shutdown)")
+            .find("api::serve(bind, state, shutdown)")
             .unwrap();
         let exit = body
             .find("if let Some(reason) = kept_open_stopped.borrow_and_update().clone() {")

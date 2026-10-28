@@ -5,19 +5,20 @@
 //! The deal+verification itself (stream, D4) lives behind the [`DealRunner`] seam (real -- gateway; test -- script).
 
 use super::api::content_check_policy;
-use super::verify::{reference_endpoint_for, StreamVerifier, Verdict};
+use super::verify::{reference_endpoint_for, ModelCheck, Verdict};
 use super::Buyer;
+use crate::api_format::{inspect_body, parse_frame, ApiFormat, Frame, RequestBody, SseFrames};
 use crate::seller::ModelsConfig;
 use async_trait::async_trait;
 pub use dexdo_core::params::DEFAULT_SPOT_CHECK_RATE;
 use dexdo_core::{
     params::{
-        SELLER_SCORE_BAIL_DELTA, SELLER_SCORE_PASS_DELTA, SPOT_CHECK_POSITIVE_SCORE_DECAY,
-        SPOT_CHECK_UNKNOWN_SCORE_MULTIPLIER,
+        CONTENT_PROBE_MAX_TOKENS, SELLER_SCORE_BAIL_DELTA, SELLER_SCORE_PASS_DELTA,
+        SPOT_CHECK_POSITIVE_SCORE_DECAY, SPOT_CHECK_UNKNOWN_SCORE_MULTIPLIER,
     },
     ChainBackend, Note, OfferListing,
 };
-use dexdo_proto::{BillingUsage, CanonChunk, CanonRequest};
+use dexdo_proto::{BillingUsage, StreamFrame};
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use tokio_stream::{Stream, StreamExt};
@@ -212,8 +213,8 @@ pub enum DealOutcome {
 }
 
 /// Deal+verification with one candidate -- the seam between routing orchestration and the gateway stream.
-/// Real: read the handover from the chain, open an authorized TLS gRPC stream, run `StreamVerifier`
-/// (D4) over the chunks. Returns the outcome; the on-chain reaction (`stop`/`dispute`) and blacklist are applied by
+/// Real: read the handover from the chain, open an authorized TLS gRPC stream, check the model the answer
+/// names (D4). Returns the outcome; the on-chain reaction (`stop`/`dispute`) and blacklist are applied by
 /// the **routing loop**, not the runner (the runner does not know the frame policy).
 #[async_trait]
 pub trait DealRunner: Send + Sync {
@@ -360,25 +361,24 @@ pub async fn route_capped_buy(
 }
 
 /// Production [`DealRunner`]: executes the deal via the buyer's gateway stream. Resolves the handover
-/// from the chain (absent -> `NoShow`), opens an authorized TLS gRPC canonical stream with
-/// the user's request, and runs `StreamVerifier` (D4, B5-B9) over the chunks BEFORE accepting: `Bail` -> `Scam`
-/// (B10 bail), a clean finish with >=1 accepted chunk -> `Delivered`, an empty/severed stream -> `NoShow`.
+/// from the chain (absent -> `NoShow`), opens an authorized TLS gRPC stream carrying the
+/// user's request, and checks the model the answer names BEFORE accepting it: `Bail` -> `Scam` (B10 bail),
+/// a clean finish with accepted output -> `Delivered`, an empty/severed stream -> `NoShow`.
 /// The on-chain reaction (`stop`/`dispute`) and blacklist on top of this are applied by [`route_capped_buy`].
 pub struct GatewayDealRunner<'a> {
     buyer: &'a Buyer,
     chain: &'a dyn ChainBackend,
-    /// The user's canonical request (B19); the model is forced by the frame, so it is the same for all.
-    request: CanonRequest,
-    /// The expected frame model (B7): checked against the one declared by the seller in the manifest.
+    /// The user's Chat Completions request body (B19); the model is forced by the frame, so it is the same
+    /// for all.
+    request: Vec<u8>,
+    /// The expected frame model (B7): the model the answer names is checked against it.
     expected_model: String,
-    /// Provider output cap for each ordinary/audit request.
-    output_limit_tokens: u64,
     /// Total input+output budget available to this route execution.
     billing_grant_tokens: u64,
-    /// Loaded model config -- B5/B8/B7 verification data is data-driven from it, and the pre-`Delivered`
+    /// Loaded model config -- B8/B7 verification data is data-driven from it, and the pre-`Delivered`
     /// content-identity gate (Path A fail-closed) mirrors the consumer-API `content_check_policy`.
     models: Arc<ModelsConfig>,
-    /// `--mock-model`: mock tokens are fake by design -> the content gate is skipped.
+    /// `--mock-model`: mock output is fake by design -> the content gate is skipped.
     mock_model: bool,
     /// `--allow-unverified-model`: opt into paying a model with no content-identity check (name-only).
     allow_unverified: bool,
@@ -389,9 +389,8 @@ impl<'a> GatewayDealRunner<'a> {
     pub fn new(
         buyer: &'a Buyer,
         chain: &'a dyn ChainBackend,
-        request: CanonRequest,
+        request: Vec<u8>,
         expected_model: String,
-        output_limit_tokens: u64,
         billing_grant_tokens: u64,
         models: Arc<ModelsConfig>,
         mock_model: bool,
@@ -402,7 +401,6 @@ impl<'a> GatewayDealRunner<'a> {
             chain,
             request,
             expected_model,
-            output_limit_tokens,
             billing_grant_tokens,
             models,
             mock_model,
@@ -442,47 +440,44 @@ pub(crate) fn gateway_content_refusal(
     .map(|e| e.to_string())
 }
 
-async fn receive_gateway_stream<S>(
+/// Read one answer: a successful head, output, and one validated terminal usage within the grant.
+/// Returns the usage and the number of output-carrying frames.
+async fn receive_gateway_answer<S>(
     stream: &mut S,
-    verifier: &mut StreamVerifier,
-    output_limit_tokens: u64,
+    format: ApiFormat,
+    streamed: bool,
+    check: &ModelCheck,
     billing_grant_tokens: u64,
-    mock_model: bool,
 ) -> Result<(BillingUsage, u64), DealOutcome>
 where
-    S: Stream<Item = Result<CanonChunk, tonic::Status>> + Unpin,
+    S: Stream<Item = Result<StreamFrame, tonic::Status>> + Unpin,
 {
+    let mut success = None;
+    let mut frames = SseFrames::default();
+    let mut whole = Vec::new();
     let mut received_output = 0u64;
-    let mut saw_output = false;
-    let mut next_seq = 0u64;
     let mut terminal_usage: Option<BillingUsage> = None;
     while let Some(item) = stream.next().await {
-        let chunk = match item {
-            Ok(c) => c,
-            Err(_) if !saw_output => return Err(DealOutcome::NoShow),
+        let frame = match item {
+            Ok(frame) => frame,
+            Err(_) if received_output == 0 => return Err(DealOutcome::NoShow),
             Err(error) => return Err(DealOutcome::Scam(format!("gateway stream error: {error}"))),
         };
         if terminal_usage.is_some() {
             return Err(DealOutcome::Scam(
-                "canonical content followed terminal billing usage".to_string(),
+                "response content followed terminal billing usage".to_string(),
             ));
         }
-        if let Some(usage) = chunk.usage.as_ref() {
-            if !chunk.text.is_empty()
-                || !chunk.reasoning.is_empty()
-                || !chunk.token_ids.is_empty()
-                || chunk.manifest.is_some()
-            {
+        if let Some(head) = frame.head {
+            if success.is_some() {
                 return Err(DealOutcome::Scam(
-                    "terminal billing usage frame also carries content".to_string(),
+                    "the seller stated a second response head".to_string(),
                 ));
             }
-            if chunk.seq != next_seq {
-                return Err(DealOutcome::Scam(format!(
-                    "terminal billing usage sequence {} is not next expected {}",
-                    chunk.seq, next_seq
-                )));
-            }
+            success = Some((200..300).contains(&head.status));
+            continue;
+        }
+        if let Some(usage) = frame.usage {
             if let Err(error) = usage.validate() {
                 return Err(DealOutcome::Scam(error.to_string()));
             }
@@ -493,73 +488,70 @@ where
                     billing_grant_tokens
                 )));
             }
-            let output_matches = if mock_model {
-                usage.output_tokens == received_output
-            } else {
-                usage.output_tokens >= received_output
-            };
-            if !output_matches {
-                return Err(DealOutcome::Scam(format!(
-                    "terminal output usage {} does not match visible output {}",
-                    usage.output_tokens, received_output
-                )));
-            }
-            if !saw_output || usage.output_tokens == 0 {
+            if streamed && (received_output == 0 || usage.output_tokens == 0) {
                 return Err(DealOutcome::Scam(
                     "terminal billing usage has no preceding delivered output".to_string(),
                 ));
             }
-            terminal_usage = Some(*usage);
+            terminal_usage = Some(usage);
             continue;
         }
-        if let Verdict::Bail(reason) = verifier.verify(&chunk) {
+        match success {
+            None => {
+                return Err(DealOutcome::Scam(
+                    "response content arrived before its response head".to_string(),
+                ))
+            }
+            Some(false) => continue,
+            Some(true) => {}
+        }
+        if !streamed {
+            whole.extend_from_slice(&frame.data);
+            continue;
+        }
+        let complete = frames
+            .push(&frame.data)
+            .map_err(|error| DealOutcome::Scam(error.to_string()))?;
+        for complete in complete {
+            let Frame::Event { facts, .. } =
+                parse_frame(format, &complete.text).map_err(DealOutcome::Scam)?
+            else {
+                continue;
+            };
+            if let Some(Verdict::Bail(reason)) = facts.model.as_deref().map(|m| check.verify(m)) {
+                return Err(DealOutcome::Scam(reason));
+            }
+            received_output += u64::from(facts.has_output());
+        }
+    }
+    if success != Some(true) {
+        return Err(DealOutcome::NoShow);
+    }
+    if !streamed {
+        let value = serde_json::from_slice::<serde_json::Value>(&whole).map_err(|error| {
+            DealOutcome::Scam(format!("provider response is not JSON: {error}"))
+        })?;
+        let facts = inspect_body(format, &value);
+        if let Some(Verdict::Bail(reason)) = facts.model.as_deref().map(|m| check.verify(m)) {
             return Err(DealOutcome::Scam(reason));
         }
-        if chunk.seq != next_seq {
-            return Err(DealOutcome::Scam(format!(
-                "canonical content sequence {} is not next expected {}",
-                chunk.seq, next_seq
-            )));
-        }
-        next_seq = match chunk.seq.checked_add(1) {
-            Some(next) => next,
-            None => return Err(DealOutcome::Scam("canonical sequence overflow".to_string())),
-        };
-        let has_output =
-            !chunk.text.is_empty() || !chunk.reasoning.is_empty() || !chunk.token_ids.is_empty();
-        let chunk_output_tokens = if mock_model || !chunk.token_ids.is_empty() {
-            chunk.visible_output_tokens()
-        } else {
-            0
-        };
-        received_output = match received_output
-            .checked_add(chunk_output_tokens)
-            .filter(|received| *received <= output_limit_tokens)
-        {
-            Some(received) => received,
-            None => {
-                return Err(DealOutcome::Scam(format!(
-                    "canonical output exceeded limit {output_limit_tokens}"
-                )))
-            }
-        };
-        saw_output |= has_output;
+        received_output = u64::from(facts.has_output());
     }
     let Some(terminal_usage) = terminal_usage else {
-        return if !saw_output {
+        return if received_output == 0 {
             Err(DealOutcome::NoShow)
         } else {
             Err(DealOutcome::Scam(
-                "canonical stream ended without terminal billing usage".to_string(),
+                "response stream ended without terminal billing usage".to_string(),
             ))
         };
     };
-    let accepted_output = if mock_model {
-        received_output
-    } else {
-        terminal_usage.output_tokens
-    };
-    Ok((terminal_usage, accepted_output))
+    if received_output == 0 || terminal_usage.output_tokens == 0 {
+        return Err(DealOutcome::Scam(
+            "terminal billing usage has no preceding delivered output".to_string(),
+        ));
+    }
+    Ok((terminal_usage, received_output))
 }
 
 #[async_trait]
@@ -574,13 +566,16 @@ impl DealRunner for GatewayDealRunner<'_> {
             Ok(h) => h,
             Err(_) => return DealOutcome::NoShow,
         };
-        // Authorized canonical stream (B18); a connection/authorization failure is also a no-show.
+        let streamed = RequestBody::parse(&self.request).is_ok_and(|body| body.stream());
+        // Authorized stream (B18); a connection/authorization failure is also a no-show.
         let mut stream = match self
             .buyer
-            .open_canon_stream(
+            .open_request_stream(
                 &handover,
                 &candidate.token_contract,
+                ApiFormat::ChatCompletions.path(),
                 self.request.clone(),
+                Vec::new(),
                 self.billing_grant_tokens,
             )
             .await
@@ -588,18 +583,14 @@ impl DealRunner for GatewayDealRunner<'_> {
             Ok(s) => s,
             Err(_) => return DealOutcome::NoShow,
         };
-        // D4: verification BEFORE accepting; Bail -> Scam (bail, exposure <= 2 ticks). B5 vocab is data-driven
-        // from the loaded config (falls back to the family mapping for unconfigured families).
-        let mut verifier = StreamVerifier::with_expected_model_and_models(
-            self.expected_model.clone(),
-            self.models.clone(),
-        );
-        let (terminal_usage, received_output) = match receive_gateway_stream(
+        // D4: verification BEFORE accepting; Bail -> Scam (bail, exposure <= 2 ticks).
+        let check = ModelCheck::new(&self.expected_model, Some(&self.models));
+        let (terminal_usage, received_output) = match receive_gateway_answer(
             &mut stream,
-            &mut verifier,
-            self.output_limit_tokens,
+            ApiFormat::ChatCompletions,
+            streamed,
+            &check,
             self.billing_grant_tokens,
-            self.mock_model,
         )
         .await
         {
@@ -624,7 +615,7 @@ impl DealRunner for GatewayDealRunner<'_> {
         // degradation (Pass) inside the methods. Extra tick budget is spent only on the sample (1-5%).
         if spot_check {
             let b7_grant = remaining_grant;
-            let b7_output_limit = self.output_limit_tokens.min(b7_grant);
+            let b7_output_limit = CONTENT_PROBE_MAX_TOKENS.min(b7_grant);
             let b7_result = {
                 let mut charge = |usage: BillingUsage| -> Result<(), String> {
                     remaining_grant = remaining_grant
@@ -638,6 +629,7 @@ impl DealRunner for GatewayDealRunner<'_> {
                     .reference_spotcheck(
                         &handover,
                         &candidate.token_contract,
+                        &self.expected_model,
                         &self.expected_model,
                         b7_output_limit,
                         b7_grant,
@@ -657,7 +649,7 @@ impl DealRunner for GatewayDealRunner<'_> {
                 Ok(Verdict::Pass) => {}
             }
             let b8_grant = remaining_grant;
-            let b8_output_limit = self.output_limit_tokens.min(b8_grant);
+            let b8_output_limit = CONTENT_PROBE_MAX_TOKENS.min(b8_grant);
             let b8_result = {
                 let mut charge = |usage: BillingUsage| -> Result<(), String> {
                     remaining_grant = remaining_grant
@@ -671,6 +663,7 @@ impl DealRunner for GatewayDealRunner<'_> {
                     .behavioral_probe(
                         &handover,
                         &candidate.token_contract,
+                        &self.expected_model,
                         &self.expected_model,
                         b8_output_limit,
                         b8_grant,
@@ -693,7 +686,7 @@ impl DealRunner for GatewayDealRunner<'_> {
         // Path A fail-closed: mirror Path B `content_check_policy`. If this frame model has NO content
         // check available (no B8 fingerprint AND no B7 reference key) and the operator did not opt into
         // name-only (`--allow-unverified-model`), REFUSE -- do not pay a model whose identity no layer can
-        // verify. The inline B5-B7 name layers above cannot catch a same-name cheaper-model substitution.
+        // verify. The model check above cannot catch a same-name cheaper-model substitution.
         if let Some(reason) = gateway_content_refusal(
             &self.expected_model,
             &self.models,
@@ -707,25 +700,63 @@ impl DealRunner for GatewayDealRunner<'_> {
 }
 
 #[cfg(test)]
+#[allow(clippy::result_large_err)]
 mod tests {
     use super::*;
 
+    fn head() -> Result<StreamFrame, tonic::Status> {
+        Ok(StreamFrame {
+            head: Some(dexdo_proto::ResponseHead {
+                status: 200,
+                headers: Vec::new(),
+            }),
+            ..StreamFrame::default()
+        })
+    }
+
+    fn content(text: &str) -> Result<StreamFrame, tonic::Status> {
+        Ok(StreamFrame {
+            data: format!(
+                "data: {}\n\n",
+                serde_json::json!({"model":"m","choices":[{"delta":{"content":text}}]})
+            )
+            .into_bytes(),
+            ..StreamFrame::default()
+        })
+    }
+
+    fn usage(input: u64, output: u64) -> Result<StreamFrame, tonic::Status> {
+        Ok(StreamFrame {
+            usage: Some(BillingUsage::new(input, output, None).unwrap()),
+            ..StreamFrame::default()
+        })
+    }
+
+    async fn receive(
+        frames: Vec<Result<StreamFrame, tonic::Status>>,
+        grant: u64,
+    ) -> Result<(BillingUsage, u64), DealOutcome> {
+        let mut stream = tokio_stream::iter(frames);
+        receive_gateway_answer(
+            &mut stream,
+            ApiFormat::ChatCompletions,
+            true,
+            &ModelCheck::new("m", None),
+            grant,
+        )
+        .await
+    }
+
     #[tokio::test]
     async fn gateway_empty_or_severed_stream_before_output_remains_a_noshow() {
-        let mut verifier = StreamVerifier::new();
-        let mut empty = tokio_stream::iter(Vec::<Result<CanonChunk, tonic::Status>>::new());
-        let empty_outcome = receive_gateway_stream(&mut empty, &mut verifier, 8, 16, true)
-            .await
-            .expect_err("clean EOF before output is incomplete");
-        assert_eq!(empty_outcome, DealOutcome::NoShow);
-
-        let mut verifier = StreamVerifier::new();
-        let mut severed = tokio_stream::iter(vec![Err(tonic::Status::unavailable("severed"))]);
-        let severed_outcome = receive_gateway_stream(&mut severed, &mut verifier, 8, 16, true)
-            .await
-            .expect_err("transport failure before output is incomplete");
         assert_eq!(
-            severed_outcome,
+            receive(Vec::new(), 16).await.unwrap_err(),
+            DealOutcome::NoShow
+        );
+        assert_eq!(
+            receive(vec![head(), Err(tonic::Status::unavailable("severed"))], 16)
+                .await
+                .unwrap_err(),
             DealOutcome::NoShow,
             "an empty or severed stream preserves the established no-show/refund path"
         );
@@ -733,18 +764,9 @@ mod tests {
 
     #[tokio::test]
     async fn gateway_missing_terminal_usage_after_output_is_a_scam() {
-        let mut verifier = StreamVerifier::new();
-        let mut stream = tokio_stream::iter(vec![Ok(CanonChunk {
-            text: "accepted".to_string(),
-            reasoning: String::new(),
-            token_ids: vec![0],
-            seq: 0,
-            manifest: None,
-            usage: None,
-        })]);
-        let outcome = receive_gateway_stream(&mut stream, &mut verifier, 8, 16, true)
+        let outcome = receive(vec![head(), content("accepted")], 16)
             .await
-            .expect_err("accepted output without terminal usage is incomplete");
+            .unwrap_err();
         assert!(
             matches!(outcome, DealOutcome::Scam(reason) if reason.contains("without terminal billing usage")),
             "accepted output without authoritative terminal usage must fail closed"
@@ -753,52 +775,48 @@ mod tests {
 
     #[tokio::test]
     async fn gateway_real_text_then_transport_error_is_a_scam() {
-        let mut verifier = StreamVerifier::new();
-        let mut stream = tokio_stream::iter(vec![
-            Ok(CanonChunk {
-                text: "accepted".to_string(),
-                seq: 0,
-                ..CanonChunk::default()
-            }),
-            Err(tonic::Status::unavailable("severed")),
-        ]);
-        let outcome = receive_gateway_stream(&mut stream, &mut verifier, 8, 16, false)
-            .await
-            .expect_err("transport failure after real text output is incomplete");
+        let outcome = receive(
+            vec![
+                head(),
+                content("accepted"),
+                Err(tonic::Status::unavailable("severed")),
+            ],
+            16,
+        )
+        .await
+        .unwrap_err();
         assert!(
-            matches!(outcome, DealOutcome::Scam(reason) if reason.contains("gateway stream error")),
-            "real text already reached the buyer, so a severed stream must take the scam path"
+            matches!(outcome, DealOutcome::Scam(reason) if reason.contains("gateway stream error"))
         );
     }
 
     #[tokio::test]
-    async fn gateway_accepts_reasoning_inclusive_billing_above_the_output_limit() {
-        let mut chunks = Vec::with_capacity(66);
-        for seq in 0..65 {
-            chunks.push(Ok(CanonChunk {
-                text: "x".to_string(),
-                seq,
-                ..CanonChunk::default()
-            }));
-        }
-        chunks.push(Ok(CanonChunk {
-            seq: 65,
-            usage: Some(BillingUsage::new(1, 65, None).unwrap()),
-            ..CanonChunk::default()
-        }));
-        let mut stream = tokio_stream::iter(chunks);
-        let mut verifier = StreamVerifier::new();
-
-        let (usage, accepted_output_tokens) =
-            receive_gateway_stream(&mut stream, &mut verifier, 64, 66, false)
-                .await
-                .expect("billing output can include reasoning above the visible-output limit");
-
-        assert_eq!(usage, BillingUsage::new(1, 65, None).unwrap());
-        assert_eq!(accepted_output_tokens, 65);
+    async fn gateway_accepts_reasoning_inclusive_billing_above_the_visible_text() {
+        let mut frames = vec![head()];
+        frames.extend((0..3).map(|_| content("x")));
+        frames.push(usage(1, 65));
+        let (usage, outputs) = receive(frames, 66).await.unwrap();
+        assert_eq!(usage.output_tokens, 65);
+        assert_eq!(outputs, 3);
     }
 
-    // ---- Path A fail-closed content-identity gate ----
+    #[tokio::test]
+    async fn gateway_bills_within_the_grant_and_bails_on_another_model() {
+        let over = receive(vec![head(), content("x"), usage(10, 10)], 16)
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(over, DealOutcome::Scam(reason) if reason.contains("exceeds billing grant"))
+        );
+        let foreign = Ok(StreamFrame {
+            data: b"data: {\"model\":\"cheap/other\",\"choices\":[{\"delta\":{\"content\":\"x\"}}]}\n\n".to_vec(),
+            ..StreamFrame::default()
+        });
+        let bail = receive(vec![head(), foreign, usage(1, 1)], 16)
+            .await
+            .unwrap_err();
+        assert!(matches!(bail, DealOutcome::Scam(reason) if reason.contains("cheap/other")));
+    }
 
     fn qwen_models_for_routing() -> ModelsConfig {
         ModelsConfig::from_json(

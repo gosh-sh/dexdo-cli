@@ -20,23 +20,25 @@ request refused before its answer starts receives the same JSON error body.
 | `verification_grant_consumed` | Completed identity verification used the request's whole grant. No answer request was sent. | `retry`: the deal is now verified; a later request can still be refused if the shared budget is spent. |
 | `deal_busy` | The seller's per-deal concurrent request limit is occupied. | `retry_with_backoff`: retry after an active request finishes. |
 | `deal_capacity_unavailable` | Paid remainder is temporarily behind the pre-acceptance trial ceiling, or the seller refused capacity without a specific busy indication. | `retry_after_reconciliation`: wait for authoritative probe acceptance or seller capacity reconciliation on this deal. |
-| `upstream_retryable` | The provider throttled the request or exhausted transient retries before any output. The deal remains open. | `retry_with_backoff`: retry this request on the same deal. |
+| `upstream_retryable` | The provider failed temporarily before any output: its stream or body ended before the answer, or the connection dropped. The deal remains open. | `retry_with_backoff`: retry this request on the same deal. |
+| `unsupported_api_path` | The seller's provider does not serve this path: an OpenAI-compatible seller serves Chat Completions and Responses, an Anthropic seller serves Messages. No money moved and the deal remains open. | `change_request`: send the request on a path the seller serves. |
+| `seller_update_required` | The seller runs a version that does not forward requests as sent. No money moved and the deal remains open. | `wait_for_seller_update`: retry after the seller updates. |
 | `invalid_buy_ticks` | The requested purchase is below the stream minimum. | `change_request`: correct the purchase parameters. |
-| `deal_state_unavailable` | A temporary chain-read failure prevented confirmation of the deal's open/accounting state. The local session stays available. | `retry_with_backoff`: retry on the same deal; each request must obtain fresh authoritative state before contacting the seller. |
-| `deal_unavailable` | Deal initialization or an authoritative serving-state read failed without one of the specific causes above. | `operator_action`: inspect the diagnostic before deciding whether to retry. |
+| `deal_unavailable` | Deal initialization or serving failed without one of the specific causes above. | `operator_action`: inspect the diagnostic before deciding whether to retry. |
 
-Busy and seller capacity refusals use HTTP 429. Buyer admission refusals, including
+Busy and seller capacity refusals use HTTP 429. `unsupported_api_path` uses HTTP 400 and
+`seller_update_required` HTTP 502. Buyer admission refusals, including
 the temporary trial ceiling, and initialization refusals use HTTP 503.
 Invalid purchase ticks retain HTTP 400 on the OpenAI
-endpoints and HTTP 503 on Messages. An authoritative serving check that finds
-a funded but unopened deal uses 502. Machine causes are identical across all
+endpoints and HTTP 503 on Messages. Machine causes are identical across all
 three endpoints; existing HTTP status policies are preserved.
 
-`deal_state_unavailable` also uses HTTP 502, including for streaming requests refused
-before the answer starts. It does not submit a chain write or authorize a new BUY.
-After reads recover, the next request rechecks state and existing accounting gates
-on the same session. Contradictory, missing, terminal or unsafe state keeps its
-existing fail-closed behavior; this retry does not reopen a separately closed session.
+A request does not read the deal from the chain before it reaches the seller. The
+buyer's background observer reads immediately, then pauses for 60 seconds after
+each read; read time and retries add to the interval. Once a read finds the deal
+ended or not open, requests are refused with HTTP 410 `deal_session_closed`. A
+request that reaches a seller no longer serving the deal fails at the seller and
+follows the configured dead-gateway policy.
 
 Spending the trial tick does not imply that the purchase or current week is spent.
 When usable paid capacity remains beyond that ceiling, acceptance can admit another
@@ -55,12 +57,21 @@ The seller carries the typed busy cause as additive `dexdo-error-code: deal_busy
 gRPC metadata. Both peers must update for that distinction. A seller without this
 metadata yields `deal_capacity_unavailable`; buyers never infer busy from prose.
 
-Transient provider failures carry `dexdo-error-code: upstream_retryable` gRPC
-metadata while retaining their original gRPC status and diagnostic. Before any
-output, buyers return HTTP 502 with this code and preserve the deal. If the SSE
-response has already opened, the same code and recovery action appear in an error
-event; the request finishes as an error. Both peers must update. Untyped transport
-failures and failures after accepted output retain their configured recovery policy.
+A provider's own error answer -- for example HTTP 429 with `retry-after`, or a 5xx -- reaches the
+caller with the provider's status and body. Every provider header arrives prefixed
+`llm_provider-`; `retry-after`, `retry-after-ms`, `x-ratelimit-*` and `anthropic-ratelimit-*` also
+arrive under their own names, so a client retries by them as it would against the provider. The
+answer carries no dexdo code, moves no money and leaves the deal open; the seller does not repeat
+the request. The exception is HTTP 401 and 403, a refused seller key: the caller receives HTTP 502
+without the provider's body. A provider redirect (3xx) is likewise HTTP 502, without `Location`, and
+so is any provider error whose text contains the seller's key: such an answer never leaves the seller.
+
+Temporary provider failures that produced no answer carry `dexdo-error-code: upstream_retryable`
+gRPC metadata while retaining their original gRPC status and diagnostic. Before any output, buyers
+return HTTP 502 with this code and preserve the deal. If the SSE response has already opened, the
+same code and recovery action appear in an error event; the request finishes as an error. Both
+peers must update. Untyped transport failures and failures after accepted output retain their
+configured recovery policy.
 
 Unknown codes must be handled conservatively, without automatic new purchases.
 HTTP 410 reports a closed serving session. These pre-answer codes do not replace

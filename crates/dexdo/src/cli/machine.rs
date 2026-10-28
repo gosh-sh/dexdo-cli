@@ -1385,7 +1385,7 @@ mod tests {
     fn stable_schema_constants_match_contract() {
         assert_eq!(MARKETS_SCHEMA, "dexdo.markets.v3");
         assert_eq!(QUOTE_SCHEMA, "dexdo.quote.v2");
-        assert_eq!(BUYER_EVENT_SCHEMA, "dexdo.buyer.event.v2");
+        assert_eq!(BUYER_EVENT_SCHEMA, "dexdo.buyer.event.v3");
         assert_eq!(STATUS_SCHEMA, "dexdo.status.v3");
         assert_eq!(DEALS_SCHEMA, "dexdo.deals.v1");
         assert_eq!(CLOSE_SCHEMA, "dexdo.close.v1");

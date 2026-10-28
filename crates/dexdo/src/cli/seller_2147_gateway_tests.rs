@@ -56,13 +56,7 @@ impl Issue2147Fixture {
                 base_url: url.clone(),
                 model: model.to_string(),
                 frame_model: "vendor--exact--v1".to_string(),
-                claimed_model_override: None,
                 api_key_env: "PATH".to_string(),
-                tokenizer_family: "exact".to_string(),
-                capabilities: dexdo::seller::Capabilities {
-                    max_output_tokens: Some(1024),
-                    ..Default::default()
-                },
                 identity_aliases: Vec::new(),
             })
         };
@@ -161,27 +155,22 @@ impl Issue2147Fixture {
             .await
             .unwrap();
         // Buyer creates a fresh pinned-TLS connection and validates the terminal usage through EOF.
+        let body = serde_json::json!({
+            "model": "vendor--exact--v1",
+            "messages": [{ "role": "user", "content": "Say OK" }],
+            "max_tokens": 8,
+            "stream": true,
+        });
         let answer = self
             .buyer
-            .connect_and_stream_request(
+            .exchange(
                 &handover,
                 &self.active_tc,
+                dexdo::api_format::ApiFormat::ChatCompletions,
+                serde_json::to_vec(&body).unwrap(),
                 8,
-                8,
-                Some(dexdo_proto::CanonRequest {
-                    messages: vec![dexdo_proto::ChatMessage {
-                        role: "user".to_string(),
-                        content: "Say OK".to_string(),
-                    }],
-                    params: Some(dexdo_proto::SamplingParams {
-                        max_tokens: 8,
-                        ..Default::default()
-                    }),
-                    ..Default::default()
-                }),
                 None,
                 None,
-                false,
             )
             .await
             .expect("A must still serve after B's admission failure");
@@ -343,7 +332,7 @@ async fn issue_2147_genuinely_stopped_gateway_still_fails_readiness_and_buyer_di
         .unwrap();
     let error = fixture
         .buyer
-        .connect_and_stream(&handover, &fixture.active_tc, 8)
+        .connect_and_stream(&handover, &fixture.active_tc, "vendor--exact--v1", 8)
         .await
         .unwrap_err();
     assert!(

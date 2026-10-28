@@ -448,9 +448,6 @@ pub(crate) struct BuyerArgs {
     /// Emit machine-readable JSONL lifecycle events on stdout.
     #[arg(long)]
     pub(crate) json: bool,
-    /// Additionally bring up an Anthropic-compatible `/v1/messages` via transcoding (B20).
-    #[arg(long)]
-    pub(crate) anthropic_compat: bool,
     /// Model id of the configured frame/market (B2/B19) -- the only served model. Alias: --model.
     /// **Required** (review Y2): it used to silently default to `dexdo-mock`, which on a real deal made
     /// B7 verify substitution against the wrong model (a silent no-op / false positive). Now the operator
@@ -463,8 +460,8 @@ pub(crate) struct BuyerArgs {
     /// preflight.
     #[arg(long)]
     pub(crate) allow_unverified_model: bool,
-    /// path to the models config (JSON) providing the **per-model verification data** (B5 vocab, B8
-    /// fingerprints, B7-full reference via base_url/served_model/api_key_env). Defaults to
+    /// path to the models config (JSON) providing the **per-model verification data** (B8
+    /// fingerprints, B7-full reference via base_url/served_model/api_key_env, identity aliases). Defaults to
     /// `<data-dir>/models.json` when selected, otherwise to `models.json` in the working directory. A model
     /// absent from this config has no verification data -> the buyer fails closed (unless
     /// `--allow-unverified-model`).

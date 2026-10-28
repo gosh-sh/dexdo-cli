@@ -1,21 +1,18 @@
-//! Local consumer interface: an OpenAI-compatible HTTP endpoint
-//! (`/v1/chat/completions`, `/v1/responses`, `/v1/models`) and an optional Anthropic-compatible transcode
-//! (`/v1/messages`). The endpoint listens on **loopback** by default.
+//! Local consumer interface: HTTP endpoints `/v1/chat/completions`,
+//! `/v1/responses` and `/v1/messages`, plus `/v1/models`. The endpoint listens on **loopback** by
+//! default.
 
-//! Request path (B19): receive -> build `CanonRequest` -> route to the (mock) seller ->
-//! authorized TLS gRPC stream -> receive `CanonChunk` -> re-render to SSE in the desired format.
-//! Canonical verification and the visible-output cap are enforced BEFORE re-rendering
-//! ([`crate::buyer::verify::StreamVerifier`]); monetary accounting waits for validated terminal
-//! input-plus-output usage and clean EOF.
+//! Request path (B19): receive -> route the path, body and headers to the deal's seller over an
+//! authorized TLS gRPC stream -> return the provider's answer to the client as produced. The model
+//! check of the answer runs BEFORE its bytes are released ([`crate::buyer::verify::ModelCheck`]);
+//! monetary accounting waits for validated terminal input-plus-output usage and clean EOF.
 
-//! The model is forced by the market/frame (B2, B19): the request's `model` field is NOT trusted;
-//! a request outside the configured model frame is rejected. Any API key is accepted: this is a
-//! loopback endpoint.
+//! The model is forced by the market/frame (B2, B19): a request must name the configured frame
+//! model. The client's credentials never leave this endpoint: this is a loopback endpoint.
 
-pub mod anthropic;
 mod closure;
 mod error;
-pub mod openai;
+pub mod forward;
 mod stream;
 mod usage;
 
@@ -39,7 +36,7 @@ use dexdo_core::{
     },
     ChainBackend, Handover, Note, TokenContract, MATCH_OPEN_TIMEOUT_SECS,
 };
-use dexdo_proto::{BillingUsage, CanonChunk};
+use dexdo_proto::{BillingUsage, Header};
 use futures::StreamExt;
 use std::fmt;
 use std::future::Future;
@@ -367,7 +364,7 @@ enum RouteBudget {
 
 /// An admitted request's claim on the route's remaining tokens.
 
-/// `granted` bounds this request's accepted payment, separately from the output cap.
+/// `granted` bounds this request's accepted payment.
 /// Authorizations overlap; the seller atomically allocates the shared paid capacity at completion.
 struct RouteReservation {
     granted: u64,
@@ -391,37 +388,6 @@ impl RouteReservation {
                 )
             })
     }
-}
-
-/// Tell the seller the request's output-only limit.
-
-/// Admission authorizes payment up to the current remainder; shared requests may overlap.
-/// The billing grant is sent separately. This function only clamps canonical `max_tokens` to the
-/// consumer's requested output and the available grant, and returns the output cap enforced on reply.
-fn cap_canon_to_grant(canon: &mut dexdo_proto::CanonRequest, granted: u64) -> u64 {
-    let granted = u32::try_from(granted).unwrap_or(u32::MAX);
-    let capped = match canon.params.as_mut() {
-        Some(params) => {
-            params.max_tokens = match params.max_tokens {
-                // `0` is "unset" on the wire, so an unset caller limit becomes the grant itself.
-                0 => granted,
-                asked => asked.min(granted),
-            };
-            params.max_tokens
-        }
-        None => {
-            canon.params = Some(dexdo_proto::SamplingParams {
-                temperature: 0.0,
-                max_tokens: granted,
-                stop: Vec::new(),
-                greedy: false,
-                disable_reasoning: false,
-                reasoning_effort: None,
-            });
-            granted
-        }
-    };
-    u64::from(capped)
 }
 
 const ORDINARY_BUDGET_EXHAUSTED: &str =
@@ -632,8 +598,7 @@ impl SubscriptionWeeklyBudget {
             ));
         }
         if !snapshot.state.opened {
-            // Not latched: only the terminal paths clear `_opened` for good, and the serving gate
-            // refuses an unopened deal on its own terms.
+            // Not latched: only the terminal paths clear `_opened` for good.
             return Err(format!(
                 "subscription {} is not open; no weekly quota is servable",
                 token_contract
@@ -770,9 +735,8 @@ pub struct ApiDeal {
     pub session: Arc<SessionSettle>,
     pub content_gate: Arc<ContentGate>,
     billable_tokens: Arc<AtomicU64>,
-    /// Cumulative accepted content kept with the stable v2 accounting rule
-    /// (`max(token_ids.len(), 1)` per accepted chunk). It remains the implicit-terminal
-    /// delivery witness; monetary accounting uses `billable_tokens` instead.
+    /// Cumulative accepted output-carrying provider frames, one each. It remains the
+    /// implicit-terminal delivery witness; monetary accounting uses `billable_tokens` instead.
     route_visible_output_tokens: Arc<AtomicU64>,
     /// Live ceiling on the CUMULATIVE `billable_tokens` counter. An ordinary deal pins it to
     /// `route.max_tokens` for the life of the deal; a subscription republishes it from the contract's
@@ -784,6 +748,9 @@ pub struct ApiDeal {
     active_requests: Arc<AtomicU64>,
     last_request_started_unix_secs: Arc<AtomicU64>,
     purchase_terms: Arc<OnceCell<(u128, u128)>>,
+    /// Whether a chain read of this deal has shown its trial tick accepted. Set by
+    /// [`Self::observe_deal_state`], never cleared: the request path reads no chain state.
+    probe_accepted: Arc<AtomicBool>,
 }
 
 impl ApiDeal {
@@ -809,7 +776,28 @@ impl ApiDeal {
             active_requests: Arc::new(AtomicU64::new(0)),
             last_request_started_unix_secs: Arc::new(AtomicU64::new(0)),
             purchase_terms: Arc::new(OnceCell::new()),
+            probe_accepted: Arc::new(AtomicBool::new(false)),
         }
+    }
+
+    /// Take one background chain read of this deal: it gives the route its trial-tick
+    /// acceptance, and closes local serving when the deal is not safely open
+    /// ([`SessionSettle::check_open_for_serving`]). Acceptance is final on the contract, so a read
+    /// that shows it unaccepted leaves an earlier observation in place.
+    pub async fn observe_deal_state(
+        &self,
+        read: &Result<Option<dexdo_core::DealChainState>, dexdo_core::ChainError>,
+    ) {
+        if let Ok(Some(state)) = read {
+            if state.probe_accepted {
+                self.probe_accepted.store(true, Ordering::SeqCst);
+            }
+        }
+        let _ = self.session.check_open_for_serving(read).await;
+    }
+
+    pub(crate) fn probe_accepted(&self) -> bool {
+        self.probe_accepted.load(Ordering::SeqCst)
     }
 
     /// Attach the live weekly allowance of a subscription route. Without it the deal keeps the
@@ -826,7 +814,7 @@ impl ApiDeal {
         self.billable_tokens.load(Ordering::SeqCst)
     }
 
-    /// Record one accepted legacy-accounted output chunk for the stable buyer-event v2 high-water.
+    /// Record accepted output-carrying provider frames for the buyer-event delivery high-water.
     /// This counter is deliberately independent of the terminal input+output monetary counter.
     pub(crate) fn record_visible_output(&self, tokens: u64) -> Result<(), String> {
         self.route_visible_output_tokens
@@ -846,9 +834,8 @@ impl ApiDeal {
         if self.weekly.as_ref().is_some_and(|w| w.is_terminal()) {
             return 0;
         }
-        // This public snapshot has no fresh chain observation. Use the post-probe ordinary ceiling;
-        // request admission applies the authoritative pre-probe clamp immediately after its required
-        // chain read.
+        // This public snapshot ignores the probe phase. Use the post-probe ordinary ceiling; request
+        // admission applies the pre-probe clamp until acceptance has been observed.
         self.admission_ceiling(true)
             .saturating_sub(self.billable_tokens.load(Ordering::SeqCst))
     }
@@ -898,8 +885,8 @@ impl ApiDeal {
 
     /// Authorize payment from the route's shared paid remainder, or say why not.
 
-    /// An ordinary deal exposes one tick until the authoritative open-state read observes an accepted
-    /// probe, then answers from its fixed funded budget. A subscription reconciles against the chain
+    /// An ordinary deal exposes one tick until a chain read of the deal observes an accepted probe,
+    /// then answers from its fixed funded budget. A subscription reconciles against the chain
     /// first whenever its published week is spent OR has run out on the wall clock -- the second is what
     /// stops an under-used week being carried across its boundary, and what makes the end of the term
     /// reachable at all rather than leaving a stale positive remainder servable forever.
@@ -907,22 +894,17 @@ impl ApiDeal {
     /// coherent state that comes back; a booking that is not due, or a read that fails, authorizes
     /// nothing.
     #[cfg(test)]
-    async fn admit(&self, requested: Option<u32>) -> RouteBudget {
-        self.admit_with_probe_observation(requested, true).await
+    async fn admit(&self) -> RouteBudget {
+        self.admit_with_probe_observation(true).await
     }
 
-    /// Admit using the probe fact returned by the handler's mandatory authoritative open-state read.
-    async fn admit_with_probe_observation(
-        &self,
-        _requested: Option<u32>,
-        probe_accepted: bool,
-    ) -> RouteBudget {
+    /// Admit using the trial-tick acceptance observed for this deal ([`Self::observe_deal_state`]).
+    async fn admit_with_probe_observation(&self, probe_accepted: bool) -> RouteBudget {
         if let Some(error) = self.session.unresolved_usage_rejection() {
             return RouteBudget::Exhausted(error);
         }
         // Provider-native input is known only at terminal usage. The grant limits this request's
         // authorized payment; the shared seller ledger allocates the paid remainder exactly once.
-        // Canonical max_tokens remains an independent output-only cap.
         let Some(weekly) = self.weekly.as_ref() else {
             return match self.try_reserve(probe_accepted) {
                 Some(reservation) => RouteBudget::Admitted(reservation),
@@ -1095,7 +1077,6 @@ struct PendingRequestDelivery {
     streamed: bool,
     http_status: u16,
     billing_grant_tokens: u64,
-    output_limit_tokens: u64,
     provider_output_tokens: u64,
     visible_output_tokens: u64,
     rendered_tokens: u64,
@@ -1229,19 +1210,6 @@ impl RequestDeliveryFinalizer {
             .answer_usage_committed
             .then_some(pending.observed_answer_usage)
             .flatten();
-        let (truncated_by_output_limit, ended_before_output_limit) = pending
-            .prepared_delivery
-            .as_ref()
-            .map(|delivery| {
-                (
-                    delivery.truncated_by_output_limit,
-                    delivery.ended_before_output_limit,
-                )
-            })
-            .unwrap_or((
-                false,
-                pending.provider_output_tokens < pending.output_limit_tokens,
-            ));
         let store = pending.usage.clone();
         let events = pending.events.clone();
         let delivery = RequestDelivery {
@@ -1252,7 +1220,6 @@ impl RequestDeliveryFinalizer {
             http_status: pending.http_status,
             failure_stage: Some("consumer_disconnect"),
             billing_grant_tokens: pending.billing_grant_tokens,
-            output_limit_tokens: pending.output_limit_tokens,
             visible_output_tokens: pending.visible_output_tokens,
             rendered_tokens: pending.rendered_tokens,
             route_delivered_tokens,
@@ -1263,9 +1230,7 @@ impl RequestDeliveryFinalizer {
             request_output_tokens: request_usage.output_tokens,
             request_billable_tokens: request_usage.total_tokens,
             route_billable_tokens,
-            finish_reason: "cancelled",
-            truncated_by_output_limit,
-            ended_before_output_limit,
+            finish_reason: "cancelled".to_string(),
         };
         usage::finish_delivery(store.as_deref(), &delivery, pending.usage_history_complete);
         report_request_delivery(events.as_ref(), delivery);
@@ -1325,7 +1290,6 @@ impl ConsumerRequestGuard {
         request_id: String,
         protocol: &'static str,
         streamed: bool,
-        output_limit_tokens: u64,
     ) -> Result<()> {
         debug_assert!(self.delivery_finalizer.is_none());
         let usage = usage::arm_request(&request_id, &deal.route.token_contract, streamed)?;
@@ -1339,7 +1303,6 @@ impl ConsumerRequestGuard {
             streamed,
             http_status: CLIENT_CLOSED_REQUEST_STATUS,
             billing_grant_tokens: self.granted(),
-            output_limit_tokens,
             provider_output_tokens: 0,
             visible_output_tokens: 0,
             rendered_tokens: 0,
@@ -1349,14 +1312,6 @@ impl ConsumerRequestGuard {
             prepared_delivery: None,
         }));
         Ok(())
-    }
-
-    fn set_delivery_output_limit(&mut self, output_limit_tokens: u64) {
-        if let Some(finalizer) = self.delivery_finalizer.as_ref() {
-            finalizer.with_pending(|pending| {
-                pending.output_limit_tokens = output_limit_tokens;
-            });
-        }
     }
 
     fn mark_response_started(&mut self) {
@@ -1580,7 +1535,8 @@ impl ConsumerRequestGuard {
 pub(crate) fn aggregate_body_response(
     mut request_guard: ConsumerRequestGuard,
     delivery: RequestDelivery,
-    body: String,
+    headers: Vec<Header>,
+    body: Vec<u8>,
 ) -> Response {
     let status = http::StatusCode::from_u16(delivery.http_status)
         .expect("request delivery carries a valid HTTP status");
@@ -1597,12 +1553,15 @@ pub(crate) fn aggregate_body_response(
             Ok::<Bytes, std::convert::Infallible>(body)
         },
     );
-    Response::builder()
+    let mut response = Response::builder()
         .status(status)
-        .header(http::header::CONTENT_TYPE, "application/json")
-        .header(http::header::CONTENT_LENGTH, content_length)
         .body(Body::from_stream(body))
-        .expect("aggregated response is valid")
+        .expect("aggregated response is valid");
+    *response.headers_mut() = forward::response_headers(&headers, "application/json");
+    response
+        .headers_mut()
+        .insert(http::header::CONTENT_LENGTH, content_length.into());
+    response
 }
 
 impl Drop for ConsumerRequestGuard {
@@ -1812,12 +1771,6 @@ impl RouteManager {
     }
 }
 
-/// Stable v2 output-delivery count for one accepted content chunk. Structured token ids retain
-/// their exact count; an accepted chunk without them retains the pre- one-token fallback.
-pub(crate) fn accounted_tokens(chunk: &CanonChunk) -> u64 {
-    (chunk.token_ids.len() as u64).max(1)
-}
-
 /// What one finished or cancelled consumer request rendered and, on clean protocol completion,
 /// was billed.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1826,7 +1779,7 @@ pub struct RequestDelivery {
     pub token_contract: TokenContract,
     /// Correlates this terminal record with the `x-dexdo-request-id` HTTP response header.
     pub request_id: String,
-    /// Which consumer protocol rendered the answer: `openai`, `openai_responses`, or `anthropic`.
+    /// Which consumer API served the answer: `openai`, `openai_responses`, or `anthropic`.
     pub protocol: &'static str,
     /// `true` for SSE, `false` for the aggregated single response.
     pub streamed: bool,
@@ -1838,15 +1791,13 @@ pub struct RequestDelivery {
     pub failure_stage: Option<&'static str>,
     /// Total input+output capacity held for the request and sent on the wire.
     pub billing_grant_tokens: u64,
-    /// Provider output cap sent independently in `CanonRequest.params.max_tokens`.
-    pub output_limit_tokens: u64,
-    /// Visible output-token lower bound rendered to the local caller.
+    /// Provider frames with visible output (answer text or a tool call) delivered to the caller.
     pub visible_output_tokens: u64,
-    /// The request's stable v2 accepted-content count (`max(token_ids.len(), 1)` per chunk),
-    /// retained independently of provider-native billing usage and visibility.
+    /// Provider frames with any output, reasoning included, delivered for this request --
+    /// independently of provider-native billing usage and visibility.
     pub rendered_tokens: u64,
-    /// The deal's cumulative stable v2 accepted-content witness: every verification or answer chunk
-    /// contributes `max(token_ids.len(), 1)`, including hidden reasoning and metadata-only chunks.
+    /// The deal's cumulative delivery witness: every output-carrying frame of a verification or
+    /// answer response contributes one.
     pub route_delivered_tokens: Option<u64>,
     /// Provider-native input usage of the answer stream, present only after its clean terminal.
     pub input_tokens: Option<u64>,
@@ -1863,18 +1814,10 @@ pub struct RequestDelivery {
     pub request_billable_tokens: u64,
     /// The deal's cumulative buyer-committed billable usage after clean EOF.
     pub route_billable_tokens: Option<u64>,
-    /// The terminal value that went out on the wire
-    /// (`stop`/`length`/`capacity`/`error`/`empty_output`/`content_filter`, or
-    /// `end_turn`/`max_tokens`/`error`/`refusal` on the Anthropic transcode). `cancelled` means the
-    /// handler or streaming response body disappeared before such a terminal.
-    pub finish_reason: &'static str,
-    /// The render stopped because the next content chunk did not fit the remaining output cap. Reaching
-    /// the cap exactly while the seller then ends cleanly does not by itself mark the answer truncated.
-    pub truncated_by_output_limit: bool,
-    /// The stream ended with part of the output cap unspent. On its own this is not a fault - a model
-    /// that finishes early does exactly this - but it is also the shape a stream that dies in
-    /// flight has, and without the figure on record the two cannot be told apart afterwards.
-    pub ended_before_output_limit: bool,
+    /// How the answer ended: the provider's own end reason; `error`, `content_filter` or `refusal`
+    /// when the buyer ended a broken or bailed answer; `empty_output` when it carried no visible
+    /// output; `cancelled` when the handler or streaming response body disappeared first.
+    pub finish_reason: String,
 }
 
 /// Which cumulative chain boundary a buyer-side delivery measurement observed.
@@ -1989,13 +1932,9 @@ pub(crate) fn report_request_delivery(events: Option<&DeliveryEvents>, delivery:
         streamed = delivery.streamed,
         http_status = delivery.http_status,
         failure_stage = delivery.failure_stage,
-        grant_tokens = delivery.output_limit_tokens,
         rendered_tokens = delivery.rendered_tokens,
         route_delivered_tokens = delivery.route_delivered_tokens,
-        truncated_by_grant = delivery.truncated_by_output_limit,
-        ended_before_grant = delivery.ended_before_output_limit,
         billing_grant_tokens = delivery.billing_grant_tokens,
-        output_limit_tokens = delivery.output_limit_tokens,
         visible_output_tokens = delivery.visible_output_tokens,
         input_tokens = delivery.input_tokens,
         output_tokens = delivery.output_tokens,
@@ -2004,9 +1943,7 @@ pub(crate) fn report_request_delivery(events: Option<&DeliveryEvents>, delivery:
         request_output_tokens = delivery.request_output_tokens,
         request_billable_tokens = delivery.request_billable_tokens,
         route_billable_tokens = delivery.route_billable_tokens,
-        finish_reason = delivery.finish_reason,
-        truncated_by_output_limit = delivery.truncated_by_output_limit,
-        ended_before_output_limit = delivery.ended_before_output_limit,
+        finish_reason = %delivery.finish_reason,
         "consumer API: request delivery"
     );
     if let Some(events) = events {
@@ -2024,7 +1961,6 @@ pub(crate) fn report_pre_answer_failure(
     request_id: &str,
     protocol: &'static str,
     streamed: bool,
-    output_limit_tokens: u64,
     http_status: u16,
     failure_stage: &'static str,
 ) {
@@ -2037,7 +1973,6 @@ pub(crate) fn report_pre_answer_failure(
         http_status,
         failure_stage: Some(failure_stage),
         billing_grant_tokens: request_guard.granted(),
-        output_limit_tokens,
         visible_output_tokens: 0,
         rendered_tokens: 0,
         route_delivered_tokens: Some(deal.route_visible_output_tokens()),
@@ -2048,9 +1983,7 @@ pub(crate) fn report_pre_answer_failure(
         request_output_tokens: request_usage.output_tokens,
         request_billable_tokens: request_usage.total_tokens,
         route_billable_tokens: deal.session.route_billable_tokens(),
-        finish_reason: "error",
-        truncated_by_output_limit: false,
-        ended_before_output_limit: output_limit_tokens > 0,
+        finish_reason: "error".to_string(),
     });
 }
 
@@ -2075,7 +2008,7 @@ pub(crate) fn stream_error_policy_action(error: &str, received: u64) -> StreamEr
 async fn handle_stream_error_policy(
     deal: &ApiDeal,
     received: u64,
-    error: &stream::CanonStreamError,
+    error: &stream::StreamError,
     request_guard: &mut ConsumerRequestGuard,
 ) -> StreamErrorPolicyAction {
     let action = error.policy_action(received);
@@ -2185,11 +2118,11 @@ pub fn content_check_policy(
     )
 }
 
-/// One-per-deal content-identity gate. The inline [`StreamVerifier`](crate::buyer::verify::StreamVerifier)
-/// on the consumer-API path only runs B5/B6 + the cheap declared-NAME B7; the strong **content** layers (B8
+/// One-per-deal content-identity gate. The inline [`ModelCheck`](crate::buyer::verify::ModelCheck)
+/// on the consumer-API path only compares the model each response names; the strong **content** layers (B8
 /// fingerprint + B7-full reference spot-check) were never invoked there, so a seller serving a cheaper model
 /// under the correct NAME was paid undetected. This gate runs those layers ONCE, before the first paid stream on
-/// each renderer, and caches the **definitive** verdict so later requests do not re-probe. A transport error is
+/// each path, and caches the **definitive** verdict so later requests do not re-probe. A transport error is
 /// NOT cached (the next request retries). On a bail the deal is closed to later requests and policy recovery is
 /// attempted.
 pub struct ContentGate {
@@ -2266,11 +2199,19 @@ impl ContentGate {
     /// zero. Dropping the handler while B7 is pending cannot return B8's already accepted terminal bill.
     /// `OnceCell` waiters do not run the
     /// initializer, so only the request whose guard is passed into that initializer pays.
+    /// The buyer's models config, when this gate carries one.
+    pub(crate) fn models(&self) -> Option<&ModelsConfig> {
+        self.models.as_deref()
+    }
+
+    /// Run the deal's content-identity probes once. `wire_model` is the model the probes name -- the
+    /// frame model every request on this deal must name.
     pub(crate) async fn ensure_verified(
         &self,
         buyer: &Buyer,
         deal: &ApiDeal,
         request_guard: &mut ConsumerRequestGuard,
+        wire_model: &str,
     ) -> Result<()> {
         match &self.check {
             ContentCheck::Skip => Ok(()),
@@ -2312,6 +2253,7 @@ impl ContentGate {
                                         &deal.route.handover,
                                         &deal.route.token_contract,
                                         model_id,
+                                        wire_model,
                                         b8_output_limit,
                                         b8_grant,
                                         models,
@@ -2355,6 +2297,7 @@ impl ContentGate {
                                         &deal.route.handover,
                                         &deal.route.token_contract,
                                         model_id,
+                                        wire_model,
                                         b7_output_limit,
                                         b7_grant,
                                         models,
@@ -2438,10 +2381,9 @@ pub struct SessionSettle {
     lifetime: SessionLifetimePolicy,
     terminal_action: AtomicU8,
     client_stop_recorder: OnceLock<ClientStopRecorder>,
-    /// The consumer route's cumulative stable v2 delivery witness. Every accepted verification or
-    /// answer content chunk contributes its legacy count, including hidden reasoning and
-    /// metadata-only chunks. This retains the implicit-terminal veto and the buyer-event v2
-    /// `route_delivered_tokens` meaning.
+    /// The consumer route's cumulative delivery witness. Every accepted output-carrying frame of a
+    /// verification or answer response contributes one, reasoning included. This retains the
+    /// implicit-terminal veto and the buyer-event `route_delivered_tokens` meaning.
     route_delivery: OnceLock<Arc<AtomicU64>>,
     /// The consumer route's own cumulative accepted billable-usage counter, shared by
     /// [`ApiDeal::new`].
@@ -3030,15 +2972,27 @@ impl SessionSettle {
         self.drop_backup_enabled.store(false, Ordering::SeqCst);
     }
 
-    /// Fail closed before any user-visible response is rendered unless the chain proves this deal is open.
-
-    /// A decrypted handover and a reachable gateway are not enough: showed that a stale handover can let the
-    /// local endpoint serve a response while the TokenContract remains funded-but-never-opened and unaccounted.
+    /// [`Self::check_open_for_serving`] on a fresh read, as the background deal observer runs it.
+    #[cfg(test)]
     pub async fn ensure_open_for_serving(
         &self,
     ) -> Result<dexdo_core::DealChainState, ConsumerError> {
-        let state = match self.chain.deal_state(&self.token_contract).await {
-            Ok(Some(state)) => state,
+        let read = self.chain.deal_state(&self.token_contract).await;
+        self.check_open_for_serving(&read).await
+    }
+
+    /// Close local serving unless this chain read of the deal proves it open.
+
+    /// A decrypted handover and a reachable gateway are not enough: showed that a stale handover can let the
+    /// local endpoint serve a response while the TokenContract remains funded-but-never-opened and unaccounted.
+    /// The buyer's background deal observer feeds every read it makes here; the request path reads no chain
+    /// state and refuses through [`Self::closed_rejection`] once this has closed serving.
+    pub async fn check_open_for_serving(
+        &self,
+        read: &Result<Option<dexdo_core::DealChainState>, dexdo_core::ChainError>,
+    ) -> Result<dexdo_core::DealChainState, ConsumerError> {
+        let state = match read {
+            Ok(Some(state)) => *state,
             Ok(None) => {
                 // Once this session's purchase was observed open, absent code is terminal
                 // knowledge even if the financial refund is still being reconciled.
@@ -3059,12 +3013,6 @@ impl SessionSettle {
             Err(dexdo_core::ChainError::Transport(error)) => {
                 let reason = format!(
                     "deal state temporarily unreadable before serving user response: {error}"
-                );
-                tracing::warn!(
-                    %reason,
-                    token_contract = %display_token_contract(&self.token_contract),
-                    result = "request_fail_closed",
-                    "consumer API: refusing request until authoritative deal state is readable"
                 );
                 return Err(ConsumerError::new(
                     ConsumerErrorCode::DealStateUnavailable,
@@ -3120,13 +3068,14 @@ impl SessionSettle {
         if self.settled.load(Ordering::SeqCst) {
             return;
         }
-        self.close_local_api(ClosureCategory::ChainStateUnavailable, None);
-        tracing::error!(
-            %reason,
-            token_contract = %display_token_contract(&self.token_contract),
-            result = "policy_fail_closed",
-            "consumer API: refusing to serve user-visible response without by-fact open/accounting"
-        );
+        if self.close_local_api(ClosureCategory::ChainStateUnavailable, None) {
+            tracing::error!(
+                %reason,
+                token_contract = %display_token_contract(&self.token_contract),
+                result = "policy_fail_closed",
+                "consumer API: refusing to serve user-visible response without by-fact open/accounting"
+            );
+        }
     }
 
     async fn fail_closed_unopened_before_serving(
@@ -3163,13 +3112,14 @@ impl SessionSettle {
             if self.settled.load(Ordering::SeqCst) {
                 return;
             }
-            self.close_local_api(category, None);
-            tracing::error!(
-                %reason,
-                token_contract = %display_token_contract(&self.token_contract),
-                result = "policy_fail_closed",
-                "consumer API: refusing to serve user-visible response without by-fact open/accounting"
-            );
+            if self.close_local_api(category, None) {
+                tracing::error!(
+                    %reason,
+                    token_contract = %display_token_contract(&self.token_contract),
+                    result = "policy_fail_closed",
+                    "consumer API: refusing to serve user-visible response without by-fact open/accounting"
+                );
+            }
         }
     }
 
@@ -4049,37 +3999,32 @@ impl ApiState {
         Ok(deal)
     }
 
-    /// The model is forced by the market (B2/B19): an empty/None `model` is ok (there is a single
-    /// frame), otherwise we require a match with `frame_model`. Returns `Err` with a
-    /// human-readable reject reason.
-    pub fn check_model(&self, requested: Option<&str>) -> Result<(), String> {
-        match requested {
-            None => Ok(()),
-            Some("") => Ok(()),
-            Some(m) if m == self.frame_model => Ok(()),
-            Some(m) => Err(format!(
-                "model `{m}` is outside the configured frame `{}` (B2)",
+    /// The model is forced by the market (B2/B19): a request must name `frame_model`. Returns `Err`
+    /// with a human-readable reject reason.
+    pub fn check_model(&self, requested: &str) -> Result<(), String> {
+        if requested == self.frame_model {
+            Ok(())
+        } else {
+            Err(format!(
+                "model `{requested}` is outside the configured frame `{}` (B2)",
                 self.frame_model
-            )),
+            ))
         }
     }
 }
 
-/// Build the consumer-interface axum router. The Anthropic transcode (B20) is mounted only
-/// when `anthropic_compat = true`.
-pub fn router(state: ApiState, anthropic_compat: bool) -> axum::Router {
+/// Build the consumer-interface axum router.
+pub fn router(state: ApiState) -> axum::Router {
     state.deals.bind_usage(&state);
     use axum::routing::{get, post};
-    let mut app = axum::Router::new()
-        .route("/v1/chat/completions", post(openai::chat_completions))
-        .route("/v1/responses", post(openai::responses))
-        .route("/v1/models", get(openai::models))
+    axum::Router::new()
+        .route("/v1/chat/completions", post(forward::chat_completions))
+        .route("/v1/responses", post(forward::responses))
+        .route("/v1/messages", post(forward::messages))
+        .route("/v1/models", get(forward::models))
         .route("/v1/usage", get(usage::get_usage))
-        .route("/v1/usage/facts", get(usage::get_facts));
-    if anthropic_compat {
-        app = app.route("/v1/messages", post(anthropic::messages));
-    }
-    app.layer(DefaultBodyLimit::max(BUYER_API_REQUEST_BODY_MAX_BYTES))
+        .route("/v1/usage/facts", get(usage::get_facts))
+        .layer(DefaultBodyLimit::max(BUYER_API_REQUEST_BODY_MAX_BYTES))
         .layer(axum::middleware::from_fn_with_state(
             state.clone(),
             usage::track_request,
@@ -4095,7 +4040,6 @@ pub fn router(state: ApiState, anthropic_compat: bool) -> axum::Router {
 pub async fn serve(
     bind: SocketAddr,
     state: ApiState,
-    anthropic_compat: bool,
     shutdown: impl std::future::Future<Output = ()> + Send + 'static,
 ) -> Result<(SocketAddr, tokio::task::JoinHandle<()>)> {
     // same reason as the seller gateway. `dexdo buyer --local-listen 127.0.0.1:0
@@ -4108,7 +4052,7 @@ pub async fn serve(
     let listener = tokio::net::TcpListener::bind(bind).await?;
     let local_addr = listener.local_addr()?;
     let deals = state.deals.clone();
-    let app = router(state, anthropic_compat);
+    let app = router(state);
     let task = tokio::spawn(async move {
         let server = axum::serve(listener, app).with_graceful_shutdown(shutdown);
         if let Err(e) = server.await {
@@ -4137,12 +4081,25 @@ mod tests {
     mod closure_2092;
     mod consumer_cancel_2127;
     mod keep_open_2148;
+    mod pass_through_2176;
     mod provider_failure_2144;
     mod read_recovery_2129;
-    mod reasoning_2090;
     mod request_body_2173;
+    mod request_path_2187;
     mod route_swap_1025;
     mod upstream_retry_2135;
+
+    /// One tick of the buyer's background deal observer (`spawn_buyer_claim_observer`), which the
+    /// API fixtures do not run.
+    async fn observe_deal(deals: &RouteManager) {
+        let deal = deals.current().await.expect("an active deal");
+        let read = deal
+            .session
+            .chain
+            .deal_state(&deal.route.token_contract)
+            .await;
+        deal.observe_deal_state(&read).await;
+    }
 
     #[test]
     fn default_failure_policy_uses_canonical_parameters() {
@@ -4226,7 +4183,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn reasoning_2172_malformed_efforts_never_start_lazy_purchase() {
+    async fn refused_requests_never_start_a_lazy_purchase() {
         use std::sync::atomic::{AtomicUsize, Ordering};
         let calls = Arc::new(AtomicUsize::new(0));
         let init_calls = calls.clone();
@@ -4245,37 +4202,47 @@ mod tests {
             Duration::from_secs(1),
         );
         let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel::<()>();
-        let (addr, task) = serve("127.0.0.1:0".parse().unwrap(), state, false, async move {
+        let (addr, task) = serve("127.0.0.1:0".parse().unwrap(), state, async move {
             let _ = shutdown_rx.await;
         })
         .await
         .unwrap();
-        for path in ["/v1/chat/completions", "/v1/responses"] {
-            for effort in [
-                serde_json::json!("invalid"),
-                serde_json::json!(false),
-                serde_json::json!(0),
-                serde_json::json!([]),
-                serde_json::json!({}),
+        for path in ["/v1/chat/completions", "/v1/responses", "/v1/messages"] {
+            for body in [
+                serde_json::json!({"messages":[{"role":"user","content":"hello"}]}),
+                serde_json::json!({"model":"","input":"hello"}),
+                serde_json::json!({"model":"another-model","input":"hello"}),
+                serde_json::json!([1, 2]),
             ] {
-                let body = if path == "/v1/responses" {
-                    serde_json::json!({"input":"hello", "reasoning":{"effort":effort}})
-                } else {
-                    serde_json::json!({"messages":[{"role":"user","content":"hello"}], "reasoning_effort":effort})
-                };
                 let response = reqwest::Client::new()
                     .post(format!("http://{addr}{path}"))
                     .json(&body)
                     .send()
                     .await
                     .unwrap();
-                assert_eq!(response.status(), reqwest::StatusCode::BAD_REQUEST);
+                assert_eq!(
+                    response.status(),
+                    reqwest::StatusCode::BAD_REQUEST,
+                    "{path} {body}"
+                );
             }
+            let response = reqwest::Client::new()
+                .post(format!("http://{addr}{path}"))
+                .header("content-type", "application/json")
+                .body("{not json")
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(
+                response.status(),
+                reqwest::StatusCode::BAD_REQUEST,
+                "{path}"
+            );
         }
         assert_eq!(
             calls.load(Ordering::SeqCst),
             0,
-            "malformed controls must not reach quote/place_buy/handover work"
+            "a refused request must not reach quote/place_buy/handover work"
         );
         let _ = shutdown_tx.send(());
         task.await.unwrap();
@@ -4302,7 +4269,7 @@ mod tests {
             Duration::from_millis(50),
         );
         let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel::<()>();
-        let (addr, task) = serve("127.0.0.1:0".parse().unwrap(), state, false, async move {
+        let (addr, task) = serve("127.0.0.1:0".parse().unwrap(), state, async move {
             let _ = shutdown_rx.await;
         })
         .await
@@ -4351,7 +4318,7 @@ mod tests {
             Duration::from_millis(50),
         );
         let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel::<()>();
-        let (addr, task) = serve("127.0.0.1:0".parse().unwrap(), state, false, async move {
+        let (addr, task) = serve("127.0.0.1:0".parse().unwrap(), state, async move {
             let _ = shutdown_rx.await;
         })
         .await
@@ -4451,27 +4418,6 @@ mod tests {
         assert!(!deal.has_active_or_recent_request(131, 30));
     }
 
-    #[test]
-    fn legacy_delivery_count_stays_distinct_from_visible_output_lower_bound() {
-        let structured = CanonChunk {
-            token_ids: vec![1, 2, 3],
-            ..CanonChunk::default()
-        };
-        assert_eq!(accounted_tokens(&structured), 3);
-        assert_eq!(structured.visible_output_tokens(), 3);
-        let metadata_only = CanonChunk::default();
-        assert_eq!(
-            accounted_tokens(&metadata_only),
-            1,
-            "the stable v2 delivery field retains its one-token fallback"
-        );
-        assert_eq!(
-            metadata_only.visible_output_tokens(),
-            0,
-            "the new billing verifier does not manufacture visible provider output"
-        );
-    }
-
     fn heartbeat_test_deal() -> ApiDeal {
         ApiDeal::new(
             Route {
@@ -4491,32 +4437,31 @@ mod tests {
         )
     }
 
+    /// The accepted-output heartbeat is recorded before the client reads the output it covers.
     #[tokio::test]
-    async fn openai_content_poll_records_heartbeat_before_returning_event() {
+    async fn streamed_output_records_the_heartbeat_before_the_client_reads_it() {
         use futures::StreamExt;
-        let deal = heartbeat_test_deal();
-        let stream = super::openai::heartbeat_poll_test_stream(deal.clone());
-        futures::pin_mut!(stream);
-        assert_eq!(deal.accepted_output_generation(), 0);
-        assert!(stream.next().await.is_some());
-        assert_eq!(deal.accepted_output_generation(), 1);
-    }
-
-    #[tokio::test]
-    async fn anthropic_content_poll_records_heartbeat_before_returning_event() {
-        use futures::StreamExt;
-        let deal = heartbeat_test_deal();
-        let stream = super::anthropic::heartbeat_poll_test_stream(deal.clone());
-        futures::pin_mut!(stream);
-        assert_eq!(deal.accepted_output_generation(), 0);
-        assert!(stream.next().await.is_some());
-        assert_eq!(deal.accepted_output_generation(), 1);
+        for path in ["/v1/chat/completions", "/v1/responses", "/v1/messages"] {
+            let harness = weekly_route_harness(0, false).await;
+            let deal = harness.deals.current().await.unwrap();
+            assert_eq!(deal.accepted_output_generation(), 0);
+            let response = harness.send_full(path, 2, "hello", true).await;
+            assert_eq!(response.status(), reqwest::StatusCode::OK, "{path}");
+            let mut body = response.bytes_stream();
+            let mut seen = String::new();
+            while !seen.contains("mock-reply") {
+                let chunk = body.next().await.expect("the answer streams").unwrap();
+                seen.push_str(&String::from_utf8_lossy(&chunk));
+            }
+            assert!(deal.accepted_output_generation() >= 1, "{path}");
+            drop(body);
+            harness.shutdown().await;
+        }
     }
 
     #[tokio::test]
     async fn accepted_openai_and_anthropic_output_never_turns_old_idle_age_into_stop() {
         use crate::buyer::continuity::{BuyerAction, BuyerContinuity, ContinuityConfig, DealFacts};
-        use futures::StreamExt;
         use std::sync::atomic::Ordering;
 
         let chain = Arc::new(RecordingSettleChain::default());
@@ -4529,14 +4474,9 @@ mod tests {
         };
 
         let openai_deal = deal("tc-openai-idle");
-        let openai = super::openai::heartbeat_poll_test_stream(openai_deal.clone());
-        futures::pin_mut!(openai);
-        assert!(openai.next().await.is_some());
-
+        openai_deal.record_accepted_output(1);
         let anthropic_deal = deal("tc-anthropic-idle");
-        let anthropic = super::anthropic::heartbeat_poll_test_stream(anthropic_deal.clone());
-        futures::pin_mut!(anthropic);
-        assert!(anthropic.next().await.is_some());
+        anthropic_deal.record_accepted_output(1);
 
         for deal in [openai_deal, anthropic_deal] {
             assert_eq!(deal.accepted_output_generation(), 1);
@@ -5150,7 +5090,7 @@ mod tests {
     /// Put a route through the accounting a SERVED request performs: begin the request, take an
     /// admitted reservation, charge terminal billing usage against it, and record the output heartbeat --
     /// the same `begin_request` -> `admit` -> `record_billing` -> `record_accepted_output`
-    /// sequence `openai::chat_completions` runs (`openai.rs:48`, `:228`, `:289`).
+    /// sequence the consumer handlers in `forward.rs` run.
 
     /// The routes in these tests point at a dead endpoint (`https://127.0.0.1:1`) and this crate's
     /// unit tests have no mock seller, so this is how a request delivers here. The end-to-end proof
@@ -5162,7 +5102,7 @@ mod tests {
             .await
             .expect("the shutdown test state carries one active deal");
         let mut request = deal.begin_request(unix_now_secs());
-        match deal.admit(Some(tokens as u32)).await {
+        match deal.admit().await {
             RouteBudget::Admitted(reservation) => request.hold(reservation),
             RouteBudget::Exhausted(reason) => panic!("route refused admission: {reason}"),
         }
@@ -5211,7 +5151,6 @@ mod tests {
         let (_, subscription_task) = serve(
             "127.0.0.1:0".parse().unwrap(),
             subscription_state,
-            false,
             async move {
                 let _ = subscription_shutdown_rx.await;
             },
@@ -5238,16 +5177,12 @@ mod tests {
             "tc-ordinary",
         );
         let ordinary_deals = ordinary_state.deals.clone();
-        let (_, ordinary_task) = serve(
-            "127.0.0.1:0".parse().unwrap(),
-            ordinary_state,
-            false,
-            async move {
+        let (_, ordinary_task) =
+            serve("127.0.0.1:0".parse().unwrap(), ordinary_state, async move {
                 let _ = ordinary_shutdown_rx.await;
-            },
-        )
-        .await
-        .unwrap();
+            })
+            .await
+            .unwrap();
         deliver_one_request(&ordinary_deals, 4).await;
         ordinary_shutdown_tx.send(()).unwrap();
         ordinary_task.await.unwrap();
@@ -5950,14 +5885,14 @@ mod tests {
     }
 
     /// The first ordinary request must fit the seller's authoritative one-tick pre-probe capacity;
-    /// the next request after `acceptProbe` must immediately regain the funded route remainder.
+    /// the first request after `acceptProbe` is observed regains the funded route remainder, and a
+    /// later read showing the probe unaccepted does not take it back.
     #[tokio::test]
-    async fn ordinary_admission_tracks_the_authoritative_probe_phase() {
+    async fn ordinary_admission_tracks_the_observed_probe_phase() {
         let tick = u64::try_from(dexdo_core::TICK_SIZE).expect("canonical tick fits u64");
         let route_budget = tick.checked_mul(3).expect("fixture route budget");
         let chain = Arc::new(RecordingSettleChain::default());
         let funded_time = unix_now_secs();
-        chain.set_deal_state(opened_deal_state(u128::from(route_budget), funded_time));
         let session = Arc::new(SessionSettle::new(
             chain.clone(),
             "tc-ordinary-probe-phase".to_string(),
@@ -5976,14 +5911,13 @@ mod tests {
             Arc::new(ContentGate::skip()),
         );
 
-        let before_probe = session
-            .ensure_open_for_serving()
-            .await
-            .expect("opened pre-probe deal is servable");
+        let before_probe = opened_deal_state(u128::from(route_budget), funded_time);
         assert!(!before_probe.probe_accepted);
+        deal.observe_deal_state(&Ok(Some(before_probe))).await;
+        assert!(!deal.probe_accepted());
         let mut first_request = deal.begin_request(funded_time);
         let RouteBudget::Admitted(first) = deal
-            .admit_with_probe_observation(Some(8), before_probe.probe_accepted)
+            .admit_with_probe_observation(deal.probe_accepted())
             .await
         else {
             panic!("the trial-tick request must be admitted");
@@ -5998,16 +5932,16 @@ mod tests {
             .expect("complete trial usage fits the one-tick grant");
         drop(first_request);
 
-        let mut accepted = opened_deal_state(u128::from(route_budget), funded_time);
+        let mut accepted = before_probe;
         accepted.probe_accepted = true;
-        chain.set_deal_state(accepted);
-        let after_probe = session
-            .ensure_open_for_serving()
-            .await
-            .expect("accepted deal remains servable");
-        assert!(after_probe.probe_accepted);
+        deal.observe_deal_state(&Ok(Some(accepted))).await;
+        deal.observe_deal_state(&Ok(Some(before_probe))).await;
+        assert!(
+            deal.probe_accepted(),
+            "observed acceptance is never cleared"
+        );
         let RouteBudget::Admitted(reopened) = deal
-            .admit_with_probe_observation(Some(8), after_probe.probe_accepted)
+            .admit_with_probe_observation(deal.probe_accepted())
             .await
         else {
             panic!("accepted ordinary deal must expose its funded remainder");
@@ -6035,9 +5969,7 @@ mod tests {
             )),
             Arc::new(ContentGate::skip()),
         );
-        let RouteBudget::Admitted(short) = short_deal
-            .admit_with_probe_observation(Some(1), false)
-            .await
+        let RouteBudget::Admitted(short) = short_deal.admit_with_probe_observation(false).await
         else {
             panic!("a funded sub-tick route remains fully usable pre-probe");
         };
@@ -6176,9 +6108,8 @@ mod tests {
 
     #[test]
     fn request_gate_uses_local_api_closed_state() {
-        let openai = include_str!("openai.rs");
-        let anthropic = include_str!("anthropic.rs");
-        for source in [openai, anthropic] {
+        {
+            let source = include_str!("forward.rs");
             assert!(
                 source.contains("deal.session.closed_rejection("),
                 "request gate must reject locally closed recovery-pending sessions"
@@ -6190,36 +6121,28 @@ mod tests {
         }
     }
 
+    /// the request handler reaches no chain backend; the deal is read by the background
+    /// observer only.
     #[test]
-    fn request_gate_checks_chain_open_before_content_probe_and_upstream() {
-        let openai = include_str!("openai.rs");
-        let anthropic = include_str!("anthropic.rs");
-        for source in [openai, anthropic] {
-            let open_gate = source
-                .find("ensure_open_for_serving")
-                .expect("handler gates by-fact open/accounting before serving");
-            let content_gate = source
-                .find(".content_gate")
-                .expect("handler has content-identity probe");
-            let upstream_open = source
-                .find(".open_canon_stream")
-                .expect("handler opens seller upstream");
+    fn request_handler_reads_no_deal_state() {
+        let source = include_str!("forward.rs");
+        for chain_read in [
+            "ensure_open_for_serving",
+            "deal_state(",
+            "deal_snapshot(",
+            ".chain.",
+        ] {
             assert!(
-                open_gate < content_gate,
-                "by-fact open gate must run before content probe can consume gateway tokens"
-            );
-            assert!(
-                open_gate < upstream_open,
-                "by-fact open gate must run before user-visible upstream stream"
+                !source.contains(chain_read),
+                "the request handler must not read the deal from the chain: {chain_read}"
             );
         }
     }
 
     #[test]
     fn valid_consumer_request_marks_demand_before_closed_session_reject() {
-        let openai = include_str!("openai.rs");
-        let anthropic = include_str!("anthropic.rs");
-        for source in [openai, anthropic] {
+        {
+            let source = include_str!("forward.rs");
             let model_check = source
                 .find("state.check_model")
                 .expect("handler validates model before demand");
@@ -6242,13 +6165,11 @@ mod tests {
 
     #[test]
     fn every_verification_bail_path_uses_policy_settlement() {
-        let openai = include_str!("openai.rs");
-        let anthropic = include_str!("anthropic.rs");
+        let forward = include_str!("forward.rs");
         let api = include_str!("mod.rs");
-        assert!(openai.contains("settle_verification_bail(\"verify-bail\")"));
-        assert!(anthropic.contains("settle_verification_bail(\"verify-bail\")"));
+        assert!(forward.contains("settle_verification_bail(\"verify-bail\")"));
         assert!(api.contains("settle_verification_bail(\"content-identity-bail\")"));
-        assert!(!anthropic.contains("settle(\"verify-bail\")"));
+        assert!(!forward.contains("settle(\"verify-bail\")"));
         assert!(!api.contains("settle(\"content-identity-bail\")"));
     }
 
@@ -6311,13 +6232,14 @@ mod tests {
             "the classification is the gRPC code, never the message text"
         );
 
-        for source in [include_str!("openai.rs"), include_str!("anthropic.rs")] {
+        {
+            let source = include_str!("forward.rs");
             let classified = source
                 .find("if is_capacity_backpressure(&error) {")
-                .expect("both consumer surfaces classify the failed stream open");
+                .expect("the consumer surface classifies the failed stream open");
             let settled = source
                 .find("settle_dead_gateway(\"dead-gateway\", &reclaim_heartbeat)")
-                .expect("both consumer surfaces keep the dead-gateway reclaim");
+                .expect("the consumer surface keeps the dead-gateway reclaim");
             assert!(
                 classified < settled,
                 "a capacity refusal must be answered before the deal is settled"
@@ -6326,19 +6248,18 @@ mod tests {
     }
 
     #[test]
-    fn issue_547_recovery_policy_is_shared_by_openai_and_anthropic() {
-        let openai = include_str!("openai.rs");
-        let anthropic = include_str!("anthropic.rs");
-        for source in [openai, anthropic] {
+    fn issue_547_recovery_policy_is_shared_by_every_consumer_path() {
+        {
+            let source = include_str!("forward.rs");
             assert!(
-                source.contains("handle_stream_error_policy(&deal, received"),
-                "both consumer surfaces must route stream errors through the shared  classifier"
+                source.contains("handle_stream_error_policy("),
+                "every consumer path must route stream errors through the shared  classifier"
             );
             assert!(
                 source.contains("let reclaim_heartbeat = deal.accepted_output_guard();")
                     && source
                         .contains("settle_dead_gateway(\"dead-gateway\", &reclaim_heartbeat)",),
-                "both consumer surfaces must use the same guarded dead-gateway reclaim path"
+                "every consumer path must use the same guarded dead-gateway reclaim path"
             );
         }
         let api = include_str!("mod.rs");
@@ -6392,6 +6313,9 @@ mod tests {
         /// What the last read would have returned had it not been served stale.
         pre_booking: std::sync::Mutex<Option<dexdo_core::DealChainSnapshot>>,
         snapshot_reads: std::sync::atomic::AtomicUsize,
+        /// `deal_state` reads, answered or refused. The production backend admits every one of
+        /// them through the per-process chain request ceiling.
+        deal_state_reads: std::sync::atomic::AtomicUsize,
         transient_deal_state: std::sync::atomic::AtomicBool,
         settle_calls: std::sync::atomic::AtomicUsize,
         settle_bookings: std::sync::atomic::AtomicUsize,
@@ -6427,6 +6351,7 @@ mod tests {
                 stale_reads: std::sync::atomic::AtomicUsize::new(0),
                 pre_booking: std::sync::Mutex::new(None),
                 snapshot_reads: std::sync::atomic::AtomicUsize::new(0),
+                deal_state_reads: std::sync::atomic::AtomicUsize::new(0),
                 transient_deal_state: std::sync::atomic::AtomicBool::new(false),
                 settle_calls: std::sync::atomic::AtomicUsize::new(0),
                 settle_bookings: std::sync::atomic::AtomicUsize::new(0),
@@ -6437,6 +6362,10 @@ mod tests {
 
         fn reads(&self) -> usize {
             self.snapshot_reads.load(Ordering::SeqCst)
+        }
+
+        fn deal_state_reads(&self) -> usize {
+            self.deal_state_reads.load(Ordering::SeqCst)
         }
 
         fn settle_calls(&self) -> usize {
@@ -6506,11 +6435,8 @@ mod tests {
 
         /// The counterparty disputes the deal while the buyer's boundary booking is in flight.
 
-        /// This is the only ordering in which a request can reach the reconciliation with a
-        /// disputed deal at all: the serving gate ([`SessionSettle::ensure_open_for_serving`]) reads
-        /// the deal a moment earlier and refuses a disputed one on its own terms, so what the
-        /// reconciliation defends against is precisely a dispute that lands inside the submission
-        /// window it is already past.
+        /// The request path reads no deal state, so the reconciliation is where a dispute
+        /// meets a request; this one lands inside the submission window it is already past.
         fn disputes_while_booking(&self) {
             self.dispute_on_settle
                 .store(true, std::sync::atomic::Ordering::SeqCst);
@@ -6742,6 +6668,7 @@ mod tests {
             token_contract: &TokenContract,
         ) -> Result<Option<dexdo_core::DealChainState>, dexdo_core::ChainError> {
             assert_eq!(token_contract, &self.token_contract);
+            self.deal_state_reads.fetch_add(1, Ordering::SeqCst);
             if self.transient_deal_state.load(Ordering::SeqCst) {
                 return Err(dexdo_core::ChainError::Transport("read timed out".into()));
             }
@@ -6959,34 +6886,35 @@ mod tests {
             "max_tokens": max_tokens,
             "stream": stream
         });
+        let body = if path == "/v1/responses" {
+            serde_json::json!({
+                "model": "dexdo-mock",
+                "input": prompt,
+                "max_output_tokens": max_tokens,
+                "stream": stream
+            })
+        } else {
+            body
+        };
+        direct_consumer_body(state, path, body).await
+    }
+
+    async fn direct_consumer_body(
+        state: ApiState,
+        path: &str,
+        body: serde_json::Value,
+    ) -> Response {
+        let bytes = Ok(axum::body::Bytes::from(serde_json::to_vec(&body).unwrap()));
+        let state = axum::extract::State(state);
+        let mut headers = http::HeaderMap::new();
+        headers.insert(
+            http::header::CONTENT_TYPE,
+            http::HeaderValue::from_static("application/json"),
+        );
         match path {
-            "/v1/chat/completions" => {
-                let request = serde_json::from_value(body).expect("valid Chat Completions request");
-                openai::chat_completions(
-                    axum::extract::State(state),
-                    http::HeaderMap::new(),
-                    Ok(axum::Json(request)),
-                )
-                .await
-            }
-            "/v1/responses" => {
-                let body = serde_json::json!({
-                    "model": "dexdo-mock",
-                    "input": prompt,
-                    "max_output_tokens": max_tokens,
-                    "stream": stream
-                });
-                openai::responses(
-                    axum::extract::State(state),
-                    http::HeaderMap::new(),
-                    Ok(axum::Json(body)),
-                )
-                .await
-            }
-            "/v1/messages" => {
-                let request = serde_json::from_value(body).expect("valid Anthropic request");
-                anthropic::messages(axum::extract::State(state), Ok(axum::Json(request))).await
-            }
+            "/v1/chat/completions" => forward::chat_completions(state, headers, bytes).await,
+            "/v1/responses" => forward::responses(state, headers, bytes).await,
+            "/v1/messages" => forward::messages(state, headers, bytes).await,
             other => panic!("unsupported direct consumer path {other}"),
         }
     }
@@ -7251,6 +7179,9 @@ mod tests {
             lifetime,
         ));
         let deal = ApiDeal::new(route, session, Arc::new(content_gate));
+        // The fixture runs no background deal observer; give the route what its first poll reads.
+        deal.observe_deal_state(&Ok(Some(weekly_state(claimed))))
+            .await;
         let deal = if subscription {
             deal.with_weekly_budget(Arc::new(SubscriptionWeeklyBudget::new(
                 chain.clone(),
@@ -7280,7 +7211,7 @@ mod tests {
         });
 
         let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel::<()>();
-        let (addr, task) = serve("127.0.0.1:0".parse().unwrap(), state, true, async move {
+        let (addr, task) = serve("127.0.0.1:0".parse().unwrap(), state, async move {
             let _ = shutdown_rx.await;
         })
         .await
@@ -7467,10 +7398,10 @@ mod tests {
     }
 
     /// A dispute that lands while the booking is in flight is what the reconciliation's
-    /// disputed/stopped branch is for: the request is already past the serving gate, which read a
-    /// clean deal a moment earlier. The reconciliation is then the last reader of authoritative
-    /// state before anything is served, and what it latches is forever - a boundary the chain
-    /// crosses afterwards is the strongest revival there is, and it must republish nothing.
+    /// disputed/stopped branch is for. The request path reads no deal state before it, so
+    /// the reconciliation is the only reader of authoritative state before anything is served,
+    /// and what it latches is forever - a boundary the chain crosses afterwards is the strongest
+    /// revival there is, and it must republish nothing.
     #[tokio::test]
     async fn terminal_subscription_is_never_revived_by_a_reconciliation() {
         // The recorded week is spent, so the request goes to the chain rather than serving from a
@@ -7492,7 +7423,7 @@ mod tests {
             .current()
             .await
             .expect("the harness route is published");
-        let RouteBudget::Exhausted(reason) = deal.admit(Some(1)).await else {
+        let RouteBudget::Exhausted(reason) = deal.admit().await else {
             panic!("a terminal subscription may not admit a request");
         };
         assert!(reason.message.contains("terminal"), "{reason}");
@@ -7761,248 +7692,11 @@ mod tests {
         harness.shutdown().await;
     }
 
-    /// A seller decides how many tokens a chunk holds, and the grant must hold anyway.
-
-    /// Every chunk here carries four token ids. With three tokens of quota left, the first chunk
-    /// already overshoots it - so it must never be rendered at all, on either protocol and whether
-    /// the answer is streamed or aggregated. Accounting after rendering would hand the consumer four
-    /// tokens against a reservation of three, and the excess would never appear in the next ceiling.
+    /// The provider's usage record reaches the client unchanged. A streamed Chat Completions request
+    /// gets it whether or not the client asked: the seller turns `include_usage` on because ticks are
+    /// counted from it.
     #[tokio::test]
-    async fn a_fat_chunk_cannot_deliver_past_the_grant() {
-        for path in ["/v1/chat/completions", "/v1/messages"] {
-            for stream in [true, false] {
-                let harness = weekly_route_harness(WEEK_QUOTA - 3, true).await;
-                assert_eq!(harness.remaining().await, 3);
-
-                let (status, body) = harness
-                    .ask_full(path, 3, "DEXDO_FIXTURE_FATCHUNK weekly quota", stream)
-                    .await;
-                assert_eq!(
-                    status,
-                    reqwest::StatusCode::OK,
-                    "{path} stream={stream}: {body}"
-                );
-                let delivered = harness.delivered().await;
-                assert!(
-                    delivered <= 3,
-                    "{path} stream={stream}: delivered {delivered} past a grant of 3"
-                );
-                // The chunk is four tokens against three of grant, so nothing at all is exposed and
-                // the whole reservation returns to the week.
-                assert_eq!(delivered, 0, "{path} stream={stream}: {body}");
-                assert_eq!(harness.remaining().await, 3, "{path} stream={stream}");
-                harness.shutdown().await;
-            }
-        }
-    }
-
-    /// Two fat chunks fit the output cap and the third does not. Without a terminal usage record the
-    /// visible prefix remains unbilled and the whole billing reservation returns.
-    #[tokio::test]
-    async fn fat_chunks_stop_exactly_at_the_grant() {
-        for path in ["/v1/chat/completions", "/v1/messages"] {
-            for stream in [true, false] {
-                let harness = weekly_route_harness(WEEK_QUOTA - 9, true).await;
-                assert_eq!(harness.remaining().await, 9);
-
-                let (status, body) = harness
-                    .ask_full(path, 9, "DEXDO_FIXTURE_FATCHUNK weekly quota", stream)
-                    .await;
-                assert_eq!(
-                    status,
-                    reqwest::StatusCode::OK,
-                    "{path} stream={stream}: {body}"
-                );
-                assert_eq!(harness.delivered().await, 0, "{path} stream={stream}");
-                assert_eq!(harness.remaining().await, 9, "{path} stream={stream}");
-                harness.shutdown().await;
-            }
-        }
-    }
-
-    /// The output cap must reach the WIRE, and hold even when the seller ignores it.
-
-    /// Admission holds the two-token billing remainder for a request that asked for eight output
-    /// tokens. Two things must then be
-    /// true, on both consumer protocols and whether the answer is streamed or aggregated:
-
-    /// 1. the seller is TOLD two - the outbound output-only `CanonRequest.params.max_tokens` is
-    /// clamped to available capacity, not left at the caller's larger figure;
-    /// 2. and if the seller ignores it anyway, the buyer still refuses. This one is deliberately
-    /// noncompliant: it answers with a one-token chunk and then a two-token chunk, straddling the
-    /// remaining allowance. The second chunk is never rendered, and without an accepted terminal
-    /// usage record the complete billing reservation returns to the week.
-    #[tokio::test]
-    async fn the_grant_reaches_the_wire_and_holds_against_a_noncompliant_seller() {
-        for path in ["/v1/chat/completions", "/v1/messages"] {
-            for stream in [true, false] {
-                let harness = weekly_route_harness(WEEK_QUOTA - 2, true).await;
-                assert_eq!(harness.remaining().await, 2);
-
-                let (status, body) = harness
-                    .ask_full(
-                        path,
-                        8,
-                        "DEXDO_FIXTURE_STRADDLE DEXDO_FIXTURE_ECHOLIMIT weekly quota",
-                        stream,
-                    )
-                    .await;
-                assert_eq!(
-                    status,
-                    reqwest::StatusCode::OK,
-                    "{path} stream={stream}: {body}"
-                );
-
-                // 1. What the SELLER was told, read straight off the wire: the seller echoes the
-                // output limit it received, and it is the available two - not the caller's eight.
-                assert!(
-                    body.contains("limit=2"),
-                    "{path} stream={stream}: the outbound max_tokens must be the grant, not the \
-                     caller's limit: {body}"
-                );
-
-                // 2. One output token was visible, but the stream ended before an accepted terminal
-                // usage record, so atomic accounting charges neither the prefix nor the overrun.
-                assert_eq!(
-                    harness.delivered().await,
-                    0,
-                    "{path} stream={stream}: a straddling stream without terminal usage must not bill: \
-                     {body}"
-                );
-                assert_eq!(
-                    harness.remaining().await,
-                    2,
-                    "{path} stream={stream}: the whole billing reservation returns"
-                );
-                harness.shutdown().await;
-            }
-        }
-    }
-
-    /// An answer cut by the grant is not a clean stop, and it says so on the wire.
-
-    /// A stream can expose a prefix and then cross the output cap before reaching terminal usage.
-    /// Such an incomplete response cannot move money, but the local protocol must still report the
-    /// truncation it can see: `length` previously required `received == 0`, so a stream that stopped
-    /// at 1,972,000 of a 2,000,000 output cap rendered `stop` and was byte-identical to a finished
-    /// answer.
-
-    /// This drives the real path with the real noncompliant-seller fixture rather than fabricating
-    /// the end state: the seller is told two tokens and answers 1 + 2, so the second chunk cannot
-    /// fit and the render genuinely stops at one of a grant of two - short of the grant, with a
-    /// token already delivered, which is exactly the shape that used to be indistinguishable.
-    #[tokio::test]
-    async fn a_stream_cut_by_the_grant_is_not_reported_as_a_clean_stop() {
-        for (path, cut, clean) in [
-            ("/v1/chat/completions", "length", "stop"),
-            ("/v1/messages", "max_tokens", "end_turn"),
-        ] {
-            for stream in [true, false] {
-                let harness = weekly_route_harness(WEEK_QUOTA - 2, true).await;
-                assert_eq!(harness.remaining().await, 2);
-
-                let (status, body) = harness
-                    .ask_full(
-                        path,
-                        8,
-                        "DEXDO_FIXTURE_STRADDLE DEXDO_FIXTURE_ECHOLIMIT weekly quota",
-                        stream,
-                    )
-                    .await;
-                assert_eq!(
-                    status,
-                    reqwest::StatusCode::OK,
-                    "{path} stream={stream}: {body}"
-                );
-                assert_eq!(harness.delivered().await, 0, "{path} stream={stream}");
-
-                let reason = terminal_reason(&body);
-                assert_ne!(
-                    reason.as_deref(),
-                    Some(clean),
-                    "{path} stream={stream}: a cut answer reported as a clean finish is \
-                     indistinguishable from a complete one: {body}"
-                );
-                assert_eq!(
-                    reason.as_deref(),
-                    Some(cut),
-                    "{path} stream={stream}: the grant ended this answer, which is what `{cut}` \
-                     means: {body}"
-                );
-
-                // And the counts that make the loss attributable afterwards.
-                let delivery = harness.last_delivery().await;
-                assert_eq!(delivery.billing_grant_tokens, 2, "{path} stream={stream}");
-                assert_eq!(delivery.visible_output_tokens, 1, "{path} stream={stream}");
-                assert_eq!(delivery.billable_tokens, None, "{path} stream={stream}");
-                assert_eq!(delivery.finish_reason, cut, "{path} stream={stream}");
-                assert!(delivery.truncated_by_output_limit, "{path} stream={stream}");
-                assert!(
-                    delivery.ended_before_output_limit,
-                    "{path} stream={stream}: one token of a grant of two leaves the grant unspent"
-                );
-                assert_eq!(delivery.streamed, stream, "{path} stream={stream}");
-                // The quantity a claim may be reconciled against: the deal's cumulative ACCOUNTED
-                // delivery, not a count of the frames the renderer emitted.
-                assert_eq!(
-                    delivery.route_billable_tokens,
-                    Some(0),
-                    "{path} stream={stream}: incomplete output cannot move the monetary counter"
-                );
-                harness.shutdown().await;
-            }
-        }
-    }
-
-    /// A complete answer preserves its full text and accepted usage even when it spends the grant.
-    /// OpenAI retains its capacity signal; Anthropic's end_turn describes generation, not
-    /// shared-budget payment allocation. An exact output-cap fit alone is not truncation.
-    #[tokio::test]
-    async fn a_complete_render_that_spends_the_whole_grant_reports_capacity_exhaustion() {
-        for (path, terminal) in [
-            ("/v1/chat/completions", "capacity"),
-            ("/v1/messages", "end_turn"),
-        ] {
-            for stream in [true, false] {
-                let harness = weekly_route_harness(WEEK_QUOTA - 6, true).await;
-                assert_eq!(harness.remaining().await, 6);
-
-                let (status, body) = harness.ask_full(path, 4, "weekly quota", stream).await;
-                assert_eq!(
-                    status,
-                    reqwest::StatusCode::OK,
-                    "{path} stream={stream}: {body}"
-                );
-                assert_eq!(harness.delivered().await, 6, "{path} stream={stream}");
-                assert_eq!(
-                    terminal_reason(&body).as_deref(),
-                    Some(terminal),
-                    "{path} stream={stream}: the full answer is present, but its accepted billing \
-                     usage consumed the paid grant: {body}"
-                );
-
-                let delivery = harness.last_delivery().await;
-                assert_eq!(delivery.billing_grant_tokens, 6, "{path} stream={stream}");
-                assert_eq!(delivery.output_limit_tokens, 4, "{path} stream={stream}");
-                assert_eq!(delivery.visible_output_tokens, 4, "{path} stream={stream}");
-                assert_eq!(delivery.input_tokens, Some(2), "{path} stream={stream}");
-                assert_eq!(delivery.output_tokens, Some(4), "{path} stream={stream}");
-                assert_eq!(delivery.billable_tokens, Some(6), "{path} stream={stream}");
-                assert!(
-                    !delivery.truncated_by_output_limit,
-                    "{path} stream={stream}: exact cap alone is not truncation"
-                );
-                assert!(
-                    !delivery.ended_before_output_limit,
-                    "{path} stream={stream}: the grant was spent to the last token"
-                );
-                harness.shutdown().await;
-            }
-        }
-    }
-
-    #[tokio::test]
-    async fn openai_responses_return_accepted_provider_usage_with_standard_stream_opt_in() {
+    async fn the_provider_usage_record_reaches_the_client_unchanged() {
         let non_stream = weekly_route_harness(WEEK_QUOTA - 16, true).await;
         let (status, body) = non_stream
             .ask_openai_usage(4, "weekly quota", false, None)
@@ -8014,46 +7708,31 @@ mod tests {
         assert_eq!(json["usage"]["total_tokens"], 6);
         non_stream.shutdown().await;
 
-        let opted_in = weekly_route_harness(WEEK_QUOTA - 16, true).await;
-        let (status, body) = opted_in
-            .ask_openai_usage(4, "weekly quota", true, Some(true))
-            .await;
-        assert_eq!(status, reqwest::StatusCode::OK, "{body}");
-        let chunks = openai_stream_chunks(&body);
-        let usage_chunks: Vec<_> = chunks
-            .iter()
-            .filter(|chunk| chunk["usage"].is_object())
-            .collect();
-        assert_eq!(usage_chunks.len(), 1, "{body}");
-        assert_eq!(usage_chunks[0]["choices"], serde_json::json!([]));
-        assert_eq!(usage_chunks[0]["usage"]["prompt_tokens"], 2);
-        assert_eq!(usage_chunks[0]["usage"]["completion_tokens"], 4);
-        assert_eq!(usage_chunks[0]["usage"]["total_tokens"], 6);
-        assert!(chunks
-            .iter()
-            .filter(|chunk| !chunk["choices"].as_array().is_some_and(Vec::is_empty))
-            .all(|chunk| chunk.as_object().unwrap().contains_key("usage")
-                && chunk["usage"].is_null()));
-        opted_in.shutdown().await;
-
-        for include_usage in [None, Some(false)] {
-            let no_opt_in = weekly_route_harness(WEEK_QUOTA - 16, true).await;
-            let (status, body) = no_opt_in
+        for include_usage in [Some(true), None, Some(false)] {
+            let harness = weekly_route_harness(WEEK_QUOTA - 16, true).await;
+            let (status, body) = harness
                 .ask_openai_usage(4, "weekly quota", true, include_usage)
                 .await;
             assert_eq!(status, reqwest::StatusCode::OK, "{body}");
-            assert!(
-                openai_stream_chunks(&body)
-                    .iter()
-                    .all(|chunk| !chunk.as_object().unwrap().contains_key("usage")),
-                "stream usage must be opt-in: {body}"
-            );
-            no_opt_in.shutdown().await;
+            let chunks = openai_stream_chunks(&body);
+            let usage_chunks: Vec<_> = chunks
+                .iter()
+                .filter(|chunk| chunk["usage"].is_object())
+                .collect();
+            assert_eq!(usage_chunks.len(), 1, "{include_usage:?}: {body}");
+            assert_eq!(usage_chunks[0]["choices"], serde_json::json!([]));
+            assert_eq!(usage_chunks[0]["usage"]["prompt_tokens"], 2);
+            assert_eq!(usage_chunks[0]["usage"]["completion_tokens"], 4);
+            assert_eq!(usage_chunks[0]["usage"]["total_tokens"], 6);
+            harness.shutdown().await;
         }
     }
 
+    /// An answer with reasoning and no answer text reaches the client as the provider sent it when
+    /// streamed, and is refused locally when whole; either way it is the empty-output policy's case,
+    /// and the provider's clean usage stays billable.
     #[tokio::test]
-    async fn reasoning_only_output_fails_locally_but_keeps_clean_terminal_billing() {
+    async fn reasoning_only_output_is_empty_output_but_keeps_clean_terminal_billing() {
         for path in ["/v1/chat/completions", "/v1/responses", "/v1/messages"] {
             for stream in [false, true] {
                 let harness = weekly_route_harness_gated_with_policy(WeeklyRouteScenario {
@@ -8085,52 +7764,38 @@ mod tests {
 
                 if stream {
                     assert_eq!(status, reqwest::StatusCode::OK, "{path}: {body}");
+                    assert!(
+                        body.contains("DEXDO_FIXTURE_REASONING_ONLY"),
+                        "provider reasoning reaches the client as sent: {body}"
+                    );
                     if path == "/v1/responses" {
-                        assert!(body.contains("event: response.failed"), "{body}");
-                        assert!(body.contains("\"code\":\"empty_output\""), "{body}");
+                        assert!(body.contains("event: response.completed"), "{body}");
                     } else {
                         assert_eq!(
                             terminal_reason(&body).as_deref(),
                             Some(if path == "/v1/messages" {
-                                "error"
+                                "end_turn"
                             } else {
-                                "empty_output"
+                                "stop"
                             }),
-                            "{body}"
+                            "the provider's own end is not rewritten: {body}"
                         );
                     }
                 } else {
                     assert_eq!(status, reqwest::StatusCode::BAD_GATEWAY, "{path}: {body}");
-                    assert!(
-                        body.contains(if path == "/v1/messages" {
-                            "empty stream"
-                        } else {
-                            "no assistant text"
-                        }),
-                        "{body}"
-                    );
+                    assert!(body.contains("no assistant text"), "{body}");
                 }
 
-                assert!(
-                    !body.contains("DEXDO_FIXTURE_REASONING_ONLY"),
-                    "provider reasoning must not leak through the text-only API: {body}"
-                );
+                let rendered = if stream { 2 } else { 1 };
                 let delivery = harness.last_delivery().await;
                 assert_eq!(delivery.visible_output_tokens, 0, "{path} stream={stream}");
-                assert_eq!(delivery.rendered_tokens, 8, "{path} stream={stream}");
+                assert_eq!(delivery.rendered_tokens, rendered, "{path} stream={stream}");
+                assert_eq!(delivery.failure_stage, Some("empty_output"));
                 let input_tokens = delivery
                     .input_tokens
                     .expect("clean terminal input usage must remain attributable");
-                let billable_tokens = input_tokens.checked_add(8).expect("fixture usage fits u64");
-                assert_eq!(delivery.output_tokens, Some(8), "{path} stream={stream}");
-                assert!(
-                    !delivery.truncated_by_output_limit,
-                    "an exact provider-output fit is not a truncation: {path} stream={stream}"
-                );
-                assert!(
-                    !delivery.ended_before_output_limit,
-                    "authoritative provider output consumed the exact cap: {path} stream={stream}"
-                );
+                let billable_tokens = input_tokens.checked_add(2).expect("fixture usage fits u64");
+                assert_eq!(delivery.output_tokens, Some(2), "{path} stream={stream}");
                 assert_eq!(
                     delivery.billable_tokens,
                     Some(billable_tokens),
@@ -8140,7 +7805,7 @@ mod tests {
                     delivery.request_input_tokens, input_tokens,
                     "{path} stream={stream}"
                 );
-                assert_eq!(delivery.request_output_tokens, 8, "{path} stream={stream}");
+                assert_eq!(delivery.request_output_tokens, 2, "{path} stream={stream}");
                 assert_eq!(
                     delivery.request_billable_tokens, billable_tokens,
                     "{path} stream={stream}"
@@ -8152,21 +7817,16 @@ mod tests {
                 );
                 assert_eq!(
                     delivery.route_delivered_tokens,
-                    Some(8),
-                    "the stable route witness keeps every accepted content chunk: {path} stream={stream}"
+                    Some(rendered),
+                    "the stable route witness keeps every accepted output frame: {path} stream={stream}"
                 );
                 assert_eq!(
                     session.route_delivered_tokens(),
-                    Some(8),
-                    "hidden reasoning must not change the stable implicit-terminal contract: {path} stream={stream}"
+                    Some(rendered),
+                    "reasoning output keeps the stable implicit-terminal contract: {path} stream={stream}"
                 );
                 assert_eq!(
-                    delivery.finish_reason,
-                    if path == "/v1/messages" {
-                        "error"
-                    } else {
-                        "empty_output"
-                    },
+                    delivery.finish_reason, "empty_output",
                     "{path} stream={stream}"
                 );
                 assert_eq!(
@@ -8183,12 +7843,12 @@ mod tests {
                 assert_eq!(
                     session.terminal_action(),
                     Some(SessionTerminalAction::StreamStop),
-                    "the legacy accepted-content witness must still permit implicit STOP: {path} stream={stream}"
+                    "the accepted-output witness still permits implicit STOP: {path} stream={stream}"
                 );
                 assert_eq!(
                     chain.foreign_money_calls(),
                     1,
-                    "preserving the legacy witness also preserves the existing STOP write: {path} stream={stream}"
+                    "the witness also keeps the existing STOP write: {path} stream={stream}"
                 );
             }
         }
@@ -8219,23 +7879,20 @@ mod tests {
                     "{path} stream={stream}: {body}"
                 );
                 assert!(
-                    !body.contains("mock-reply"),
-                    "the hidden first chunk must not cross the consumer surface: {body}"
-                );
-                assert!(
                     body.contains("DEXDO_FIXTURE_MIXED_REASONING"),
-                    "the visible second chunk must reach the consumer: {body}"
+                    "the answer text reaches the consumer: {body}"
                 );
 
+                let rendered = if stream { 2 } else { 1 };
                 let delivery = harness.last_delivery().await;
                 assert_eq!(delivery.visible_output_tokens, 1, "{path} stream={stream}");
-                assert_eq!(delivery.rendered_tokens, 2, "{path} stream={stream}");
+                assert_eq!(delivery.rendered_tokens, rendered, "{path} stream={stream}");
                 assert_eq!(delivery.output_tokens, Some(2), "{path} stream={stream}");
                 assert_eq!(delivery.request_output_tokens, 2, "{path} stream={stream}");
                 assert_eq!(
                     delivery.route_delivered_tokens,
-                    Some(2),
-                    "both accepted chunks remain in the stable route witness: {path} stream={stream}"
+                    Some(rendered),
+                    "every accepted output frame remains in the stable route witness: {path} stream={stream}"
                 );
                 assert!(
                     delivery.billable_tokens.is_some(),
@@ -8270,16 +7927,18 @@ mod tests {
                     "only streamed content crosses the consumer boundary: {path} stream={stream}: {body}"
                 );
 
+                // A whole answer arrives as one output-carrying body; a stream as one frame per word.
+                let rendered = if stream { 2 } else { 1 };
                 let delivery = harness.last_delivery().await;
                 assert_eq!(
                     delivery.visible_output_tokens,
                     if stream { 2 } else { 0 },
                     "{path} stream={stream}"
                 );
-                assert_eq!(delivery.rendered_tokens, 2, "{path} stream={stream}");
+                assert_eq!(delivery.rendered_tokens, rendered, "{path} stream={stream}");
                 assert_eq!(
                     delivery.route_delivered_tokens,
-                    Some(2),
+                    Some(rendered),
                     "{path} stream={stream}"
                 );
                 assert_eq!(delivery.input_tokens, None, "clean EOF was not observed");
@@ -8439,125 +8098,6 @@ mod tests {
         }
     }
 
-    /// Accounted tokens and rendered frames are DIFFERENT quantities, and only the first one is
-    /// money.
-
-    /// A seller decides how many tokens a chunk holds. Four token ids in one chunk is four tokens
-    /// charged and one SSE frame emitted, so counting frames off the response body and calling the
-    /// result "delivered" understates what was paid for - by a factor the seller chooses. The gap
-    /// is always in the same direction, and nothing in the renderer enforces the equality.
-
-    /// The endpoint therefore publishes the accounted figure. Anything reconciling a seller's claim
-    /// against delivery reads that, never a count of frames.
-    #[tokio::test]
-    async fn accounted_delivery_is_not_the_number_of_rendered_frames() {
-        let harness = weekly_route_harness(WEEK_QUOTA - 9, true).await;
-        assert_eq!(harness.remaining().await, 9);
-
-        let (status, body) = harness
-            .ask_full(
-                "/v1/chat/completions",
-                8,
-                "DEXDO_FIXTURE_FATCHUNK_COMPLETE",
-                true,
-            )
-            .await;
-        assert_eq!(status, reqwest::StatusCode::OK, "{body}");
-
-        // What a frame-counter off the body sees.
-        let frames = body
-            .lines()
-            .filter_map(|line| line.strip_prefix("data:").map(str::trim_start))
-            .filter(|data| *data != "[DONE]")
-            .filter_map(|data| serde_json::from_str::<serde_json::Value>(data).ok())
-            .filter(|chunk| {
-                chunk["choices"][0]["delta"]["content"]
-                    .as_str()
-                    .is_some_and(|content| !content.is_empty())
-            })
-            .count() as u64;
-
-        // What the money path charged: one input token plus eight output tokens.
-        let billable = harness.delivered().await;
-        let delivery = harness.last_delivery().await;
-
-        assert_eq!(delivery.visible_output_tokens, 8, "{body}");
-        assert_eq!(delivery.input_tokens, Some(1));
-        assert_eq!(delivery.output_tokens, Some(8));
-        assert_eq!(delivery.billable_tokens, Some(9));
-        assert_eq!(
-            delivery.route_billable_tokens,
-            Some(billable),
-            "the deal's cumulative billable usage reaches the event"
-        );
-        assert!(
-            frames < delivery.visible_output_tokens,
-            "a four-token chunk is one frame: frames={frames}, output={}: {body}",
-            delivery.visible_output_tokens
-        );
-        assert_eq!(delivery.visible_output_tokens, frames * 4);
-        assert_eq!(billable, 9);
-        harness.shutdown().await;
-    }
-
-    /// An answer the seller finished on its own is still a clean stop, and the record says how much
-    /// of the grant went unused.
-
-    /// The counterpart to the two above: making a cut answer visible must not relabel every short
-    /// answer as truncated. A model that stops early is the normal case, it keeps `stop`/`end_turn`,
-    /// and `ended_before_output_limit` records that the provider stopped below the output cap.
-    #[tokio::test]
-    async fn an_answer_the_seller_finished_stays_a_clean_stop() {
-        for (path, clean) in [
-            ("/v1/chat/completions", "stop"),
-            ("/v1/messages", "end_turn"),
-        ] {
-            for stream in [true, false] {
-                // The seller emits three tokens against a grant of sixteen, so the stream ends well
-                // before the cap without anything having gone wrong.
-                let harness = weekly_route_harness_with_upstream(
-                    WEEK_QUOTA - 16,
-                    true,
-                    SUB_WEEK_LEN.as_secs(),
-                    3,
-                )
-                .await;
-                assert_eq!(harness.remaining().await, 16);
-
-                let (status, body) = harness.ask_full(path, 16, "weekly quota", stream).await;
-                assert_eq!(
-                    status,
-                    reqwest::StatusCode::OK,
-                    "{path} stream={stream}: {body}"
-                );
-                assert_eq!(harness.delivered().await, 5, "{path} stream={stream}");
-                assert_eq!(
-                    terminal_reason(&body).as_deref(),
-                    Some(clean),
-                    "{path} stream={stream}: a model that finished early has not been truncated: \
-                     {body}"
-                );
-
-                let delivery = harness.last_delivery().await;
-                assert_eq!(delivery.billing_grant_tokens, 16, "{path} stream={stream}");
-                assert_eq!(delivery.visible_output_tokens, 3, "{path} stream={stream}");
-                assert_eq!(delivery.input_tokens, Some(2), "{path} stream={stream}");
-                assert_eq!(delivery.output_tokens, Some(3), "{path} stream={stream}");
-                assert_eq!(delivery.billable_tokens, Some(5), "{path} stream={stream}");
-                assert!(
-                    !delivery.truncated_by_output_limit,
-                    "{path} stream={stream}"
-                );
-                assert!(
-                    delivery.ended_before_output_limit,
-                    "{path} stream={stream}: thirteen tokens of the grant were never spent, and \
-                     that is the figure a billed-but-not-received gap shows up in"
-                );
-                harness.shutdown().await;
-            }
-        }
-    }
-
     /// A route built before the trial tick was accepted must not keep a tick of authorization the
     /// term never sold it.
 
@@ -8592,7 +8132,7 @@ mod tests {
             .current()
             .await
             .expect("the harness route is published");
-        let RouteBudget::Admitted(_) = deal.admit(Some(1)).await else {
+        let RouteBudget::Admitted(_) = deal.admit().await else {
             panic!("the booked week must be servable");
         };
         assert_eq!(harness.chain.bookings(), 1);
@@ -8635,7 +8175,7 @@ mod tests {
             .current()
             .await
             .expect("the harness route is published");
-        let RouteBudget::Admitted(_) = deal.admit(Some(1)).await else {
+        let RouteBudget::Admitted(_) = deal.admit().await else {
             panic!("the current week is still servable after acceptance");
         };
 
@@ -8684,7 +8224,7 @@ mod tests {
         let rebase_barrier = Arc::new(std::sync::Barrier::new(2));
         *weekly.rebase_barrier.lock().unwrap() = Some(rebase_barrier.clone());
         let first_deal = deal.clone();
-        let first = tokio::spawn(async move { first_deal.admit(Some(1)).await });
+        let first = tokio::spawn(async move { first_deal.admit().await });
         rebase_barrier.wait();
         assert!(
             weekly.anchored_before_probe(),
@@ -8692,7 +8232,7 @@ mod tests {
         );
 
         let second_deal = deal.clone();
-        let second = tokio::spawn(async move { second_deal.admit(Some(1)).await });
+        let second = tokio::spawn(async move { second_deal.admit().await });
         rebase_barrier.wait();
         let first = first.await.expect("first admission task");
         let second = second.await.expect("second admission task");
@@ -8710,10 +8250,10 @@ mod tests {
         harness.shutdown().await;
     }
 
-    /// A pre-acceptance request holds the whole trial-tick billing remainder but keeps the caller's
-    /// output-only cap independent on the wire.
+    /// A pre-acceptance request holds the whole trial-tick billing remainder, and the caller's own
+    /// output limit reaches the provider unchanged.
     #[tokio::test]
-    async fn pre_probe_admission_and_wire_shape_are_capped_to_the_trial_tick() {
+    async fn pre_probe_admission_is_capped_to_the_trial_tick() {
         let harness = weekly_route_harness_before_probe(SUB_WEEK_LEN.as_secs()).await;
         let quota = u64::try_from(WEEK_QUOTA).unwrap();
         let probe = u64::try_from(PROBE_CLAIM).unwrap();
@@ -8733,17 +8273,11 @@ mod tests {
             "pre-probe admission is one tick"
         );
         let (status, body) = harness
-            .ask_full("/v1/chat/completions", 2, "DEXDO_FIXTURE_ECHOLIMIT", false)
+            .ask_full("/v1/chat/completions", 2, "trial", false)
             .await;
         assert_eq!(status, reqwest::StatusCode::OK, "{body}");
-        assert!(
-            body.contains("limit=2"),
-            "the seller must observe the independent CanonRequest.params.max_tokens=2: \
-             {body}"
-        );
         let delivery = harness.last_delivery().await;
         assert_eq!(delivery.billing_grant_tokens, probe);
-        assert_eq!(delivery.output_limit_tokens, 2);
         assert_eq!(delivery.input_tokens, Some(1));
         assert_eq!(delivery.output_tokens, Some(2));
         assert_eq!(delivery.billable_tokens, Some(3));
@@ -8767,7 +8301,7 @@ mod tests {
         let weekly = deal.weekly.as_ref().expect("subscription budget").clone();
 
         let mut in_flight = deal.begin_request(unix_now_secs());
-        let RouteBudget::Admitted(reservation) = deal.admit(Some(2)).await else {
+        let RouteBudget::Admitted(reservation) = deal.admit().await else {
             panic!("the pre-probe trial reservation is available");
         };
         in_flight.hold(reservation);
@@ -8777,7 +8311,7 @@ mod tests {
         let cutover_barrier = Arc::new(std::sync::Barrier::new(2));
         *weekly.rebase_barrier.lock().unwrap() = Some(cutover_barrier.clone());
         let cutover_deal = deal.clone();
-        let cutover = tokio::spawn(async move { cutover_deal.admit(Some(1)).await });
+        let cutover = tokio::spawn(async move { cutover_deal.admit().await });
         cutover_barrier.wait();
 
         // Start one real guard charge while the cutover owns that same mutex. With no shared lock it
@@ -8840,7 +8374,7 @@ mod tests {
         assert_eq!(deal.remaining_tokens(), probe, "Q=T before acceptance");
 
         let mut old_request = deal.begin_request(unix_now_secs());
-        let RouteBudget::Admitted(reservation) = deal.admit(None).await else {
+        let RouteBudget::Admitted(reservation) = deal.admit().await else {
             panic!("the pre-probe request reserves R=T");
         };
         assert_eq!(reservation.remaining(), probe, "R=T");
@@ -8853,7 +8387,7 @@ mod tests {
         let cutover_barrier = Arc::new(std::sync::Barrier::new(2));
         *weekly.rebase_barrier.lock().unwrap() = Some(cutover_barrier.clone());
         let cutover_deal = deal.clone();
-        let cutover = tokio::spawn(async move { cutover_deal.admit(Some(1)).await });
+        let cutover = tokio::spawn(async move { cutover_deal.admit().await });
         cutover_barrier.wait();
 
         let delivery_barrier = Arc::new(std::sync::Barrier::new(2));
@@ -8948,30 +8482,20 @@ mod tests {
         )
     }
 
-    /// Provider-native input on B8 can leave B7 less than its canonical output cap. The exact pair
-    /// passed to the second wire call must remain `(min(64, grant), grant)`, rather than asking the
-    /// gateway for an output cap larger than the request can pay in total.
-    #[test]
-    fn second_probe_limits_clamp_output_to_the_remaining_billing_grant() {
-        const FREE: u64 = VERIFICATION_DEBT + 1;
-        const B8_INPUT_TOKENS: u64 = 70;
-        const B8_BILLABLE: u64 = B8_INPUT_TOKENS + 1;
-        const REMAINING_AFTER_B8: u64 = FREE - B8_BILLABLE;
-        const B7_BILLABLE: u64 = 9 + 1;
-        const _: () = assert!(REMAINING_AFTER_B8 < CONTENT_PROBE_MAX_TOKENS);
-        const _: () = assert!(B7_BILLABLE <= REMAINING_AFTER_B8);
-
-        assert_eq!(
-            verification_stream_limits(REMAINING_AFTER_B8),
-            (REMAINING_AFTER_B8, REMAINING_AFTER_B8),
-            "the second output-only cap is clamped while the independent total grant is preserved"
-        );
+    /// One provider answer as fixed bytes: the SSE stream for a streamed request and the JSON body
+    /// for a whole one.
+    struct ProviderBytes {
+        stream: String,
+        whole: String,
     }
 
     /// A transport-only endpoint for provider-adapter acceptance rows. It reads one complete HTTP
-    /// request and returns the same fixed SSE bytes on every connection; provider semantics remain
-    /// entirely in the real OpenAI/Anthropic adapters under test.
-    async fn fixed_provider_bytes(body: String) -> (SocketAddr, tokio::task::JoinHandle<()>) {
+    /// request and returns the same fixed bytes on every connection, streamed or whole as the
+    /// request asks; provider semantics remain entirely in the real adapters under test.
+    async fn fixed_provider_bytes(
+        bytes: &ProviderBytes,
+    ) -> (SocketAddr, tokio::task::JoinHandle<()>) {
+        let (stream_body, whole_body) = (bytes.stream.clone(), bytes.whole.clone());
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
@@ -9017,8 +8541,16 @@ mod tests {
                     request.extend_from_slice(&chunk[..read]);
                 }
 
+                let streamed =
+                    serde_json::from_slice::<serde_json::Value>(&request[header_end + 4..])
+                        .is_ok_and(|request| request["stream"] == true);
+                let (content_type, body) = if streamed {
+                    ("text/event-stream", &stream_body)
+                } else {
+                    ("application/json", &whole_body)
+                };
                 let headers = format!(
-                    "HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\ncontent-length: {}\r\nconnection: close\r\n\r\n",
+                    "HTTP/1.1 200 OK\r\ncontent-type: {content_type}\r\ncontent-length: {}\r\nconnection: close\r\n\r\n",
                     body.len()
                 );
                 if socket.write_all(headers.as_bytes()).await.is_ok() {
@@ -9032,7 +8564,10 @@ mod tests {
     /// The two real adapters' wire encodings for one row-owned visible payload and one
     /// provider-native usage count. The fixture deliberately sends no tokenizer or logprob signal:
     /// only the joined visible text and native usage cross the buyer boundary.
-    fn ups_visible_usage_fixtures(visible_payload: &str, native_usage: u64) -> (String, String) {
+    fn ups_visible_usage_fixtures(
+        visible_payload: &str,
+        native_usage: u64,
+    ) -> (ProviderBytes, ProviderBytes) {
         let billable_total = native_usage.checked_add(1).unwrap();
         let openai_content = serde_json::json!({
             "choices": [{ "delta": { "content": visible_payload } }]
@@ -9063,20 +8598,45 @@ mod tests {
             "usage": { "output_tokens": native_usage }
         });
 
+        let openai_whole = serde_json::json!({
+            "choices": [{
+                "message": { "role": "assistant", "content": visible_payload },
+                "finish_reason": "stop",
+            }],
+            "usage": {
+                "prompt_tokens": 1,
+                "completion_tokens": native_usage,
+                "total_tokens": billable_total,
+            },
+        });
+        let anthropic_whole = serde_json::json!({
+            "type": "message",
+            "role": "assistant",
+            "content": [{ "type": "text", "text": visible_payload }],
+            "stop_reason": "end_turn",
+            "usage": { "input_tokens": 1, "output_tokens": native_usage },
+        });
+
         (
-            format!(
-                "data: {openai_content}\n\ndata: {openai_usage}\n\ndata: [DONE]\n\n"
-            ),
-            format!(
-                "event: message_start\ndata: {anthropic_start}\n\nevent: content_block_delta\ndata: {anthropic_content}\n\nevent: message_delta\ndata: {anthropic_usage}\n\nevent: message_stop\ndata: {{\"type\":\"message_stop\"}}\n\n"
-            ),
+            ProviderBytes {
+                stream: format!(
+                    "data: {openai_content}\n\ndata: {openai_usage}\n\ndata: [DONE]\n\n"
+                ),
+                whole: openai_whole.to_string(),
+            },
+            ProviderBytes {
+                stream: format!(
+                    "event: message_start\ndata: {anthropic_start}\n\nevent: content_block_delta\ndata: {anthropic_content}\n\nevent: message_delta\ndata: {anthropic_usage}\n\nevent: message_stop\ndata: {{\"type\":\"message_stop\"}}\n\n"
+                ),
+                whole: anthropic_whole.to_string(),
+            },
         )
     }
 
     /// Mechanical OpenAI arm launcher: real adapter + real gate + existing chain counters.
     /// The calling row owns the provider bytes and every expected outcome.
     async fn observe_ups_openai_content_gate_arm(
-        body: &str,
+        body: &ProviderBytes,
         subscription: bool,
         models: Arc<ModelsConfig>,
         api_key_env: &str,
@@ -9089,19 +8649,21 @@ mod tests {
             api_key_env,
             prompts,
             1024,
+            false,
         )
         .await
     }
 
     async fn observe_ups_openai_content_gate_arm_with_max_tokens(
-        body: &str,
+        body: &ProviderBytes,
         subscription: bool,
         models: Arc<ModelsConfig>,
         api_key_env: &str,
         prompts: &[&str],
         max_tokens: u64,
+        stream: bool,
     ) -> (Vec<(reqwest::StatusCode, String)>, usize, usize, u64) {
-        let (addr, task) = fixed_provider_bytes(body.to_string()).await;
+        let (addr, task) = fixed_provider_bytes(body).await;
         let harness = weekly_route_harness_gated_with_policy(WeeklyRouteScenario {
             claimed: PROBE_CLAIM,
             subscription,
@@ -9112,13 +8674,7 @@ mod tests {
                 base_url: format!("http://{addr}"),
                 model: "dexdo-mock".to_string(),
                 frame_model: "dexdo-mock".to_string(),
-                claimed_model_override: None,
                 api_key_env: api_key_env.to_string(),
-                tokenizer_family: "mock".to_string(),
-                capabilities: crate::seller::Capabilities {
-                    max_output_tokens: Some(1024),
-                    ..crate::seller::Capabilities::default()
-                },
                 identity_aliases: Vec::new(),
             }),
             failure_policy: BuyerApiFailurePolicy {
@@ -9136,7 +8692,7 @@ mod tests {
         for prompt in prompts {
             responses.push(
                 harness
-                    .ask_full("/v1/chat/completions", max_tokens, prompt, false)
+                    .ask_full("/v1/chat/completions", max_tokens, prompt, stream)
                     .await,
             );
         }
@@ -9150,10 +8706,10 @@ mod tests {
     }
 
     /// SSE text fragments are transport units, not provider-native output tokens. The
-    /// provider may split a valid 64-token answer across more than 64 non-empty events; both the
-    /// verification probe and the caller's request must accept the answer from terminal usage.
+    /// provider may split a valid 64-token answer across more than 64 non-empty events; the caller's
+    /// streamed request is billed from terminal usage, as is the whole verification answer.
     #[tokio::test]
-    async fn fragmented_real_stream_uses_terminal_output_usage_for_the_cap() {
+    async fn fragmented_real_stream_is_billed_from_terminal_output_usage() {
         const API_KEY: &str = "DEXDO_ISSUE1988_OPENAI_KEY";
         std::env::set_var(API_KEY, "test-key");
 
@@ -9179,6 +8735,21 @@ mod tests {
             } }
         });
         body.push_str(&format!("data: {usage}\n\ndata: [DONE]\n\n"));
+        let whole = serde_json::json!({
+            "choices": [{
+                "message": { "role": "assistant", "content": "mock-reply" },
+                "finish_reason": "stop",
+            }],
+            "usage": {
+                "prompt_tokens": 1,
+                "completion_tokens": CONTENT_PROBE_MAX_TOKENS,
+                "total_tokens": CONTENT_PROBE_MAX_TOKENS + 1,
+            },
+        });
+        let body = ProviderBytes {
+            stream: body,
+            whole: whole.to_string(),
+        };
 
         let (responses, disputes, money, delivered) =
             observe_ups_openai_content_gate_arm_with_max_tokens(
@@ -9192,6 +8763,7 @@ mod tests {
                 API_KEY,
                 &["issue 1988"],
                 CONTENT_PROBE_MAX_TOKENS,
+                true,
             )
             .await;
         std::env::remove_var(API_KEY);
@@ -9211,13 +8783,13 @@ mod tests {
     /// Mechanical Anthropic arm launcher: real adapter + real gate + existing chain counters.
     /// The calling row owns the provider bytes and every expected outcome.
     async fn observe_ups_anthropic_content_gate_arm(
-        body: &str,
+        body: &ProviderBytes,
         subscription: bool,
         models: Arc<ModelsConfig>,
         api_key_env: &str,
         prompts: &[&str],
     ) -> (Vec<(reqwest::StatusCode, String)>, usize, usize, u64) {
-        let (addr, task) = fixed_provider_bytes(body.to_string()).await;
+        let (addr, task) = fixed_provider_bytes(body).await;
         let harness = weekly_route_harness_gated_with_policy(WeeklyRouteScenario {
             claimed: PROBE_CLAIM,
             subscription,
@@ -9229,9 +8801,6 @@ mod tests {
                 model: "dexdo-mock".to_string(),
                 frame_model: "dexdo-mock".to_string(),
                 api_key_env: api_key_env.to_string(),
-                tokenizer_family: "mock".to_string(),
-                max_output_tokens: Some(1024),
-                reasoning_disable: Default::default(),
             }),
             failure_policy: BuyerApiFailurePolicy {
                 verification_bail: VerificationBailAction::Dispute,
@@ -9246,11 +8815,7 @@ mod tests {
         .await;
         let mut responses = Vec::new();
         for prompt in prompts {
-            responses.push(
-                harness
-                    .ask_full("/v1/chat/completions", 1024, prompt, false)
-                    .await,
-            );
+            responses.push(harness.ask_full("/v1/messages", 1024, prompt, false).await);
         }
         let disputes = harness.chain.dispute_calls();
         let money = harness.chain.foreign_money_calls();
@@ -9395,20 +8960,34 @@ mod tests {
         std::env::set_var(OPENAI_KEY, "test-key");
         std::env::set_var(ANTHROPIC_KEY, "test-key");
 
-        let openai_empty = concat!(
-            "data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}],\"usage\":{\"prompt_tokens\":1,\"completion_tokens\":3,\"total_tokens\":4},\"x_groq\":{\"usage\":{\"prompt_tokens\":1,\"completion_tokens\":3,\"total_tokens\":4}}}\n\n",
-            "data: [DONE]\n\n"
-        )
-        .to_string();
-        let anthropic_empty = concat!(
-            "event: message_start\n",
-            "data: {\"type\":\"message_start\",\"message\":{\"usage\":{\"input_tokens\":1,\"output_tokens\":0}}}\n\n",
-            "event: message_delta\n",
-            "data: {\"type\":\"message_delta\",\"usage\":{\"output_tokens\":3}}\n\n",
-            "event: message_stop\n",
-            "data: {\"type\":\"message_stop\"}\n\n"
-        )
-        .to_string();
+        let openai_empty = ProviderBytes {
+            stream: concat!(
+                "data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}],\"usage\":{\"prompt_tokens\":1,\"completion_tokens\":3,\"total_tokens\":4},\"x_groq\":{\"usage\":{\"prompt_tokens\":1,\"completion_tokens\":3,\"total_tokens\":4}}}\n\n",
+                "data: [DONE]\n\n"
+            )
+            .to_string(),
+            whole: concat!(
+                "{\"choices\":[{\"message\":{\"role\":\"assistant\",\"content\":\"\"},\"finish_reason\":\"stop\"}],",
+                "\"usage\":{\"prompt_tokens\":1,\"completion_tokens\":3,\"total_tokens\":4}}"
+            )
+            .to_string(),
+        };
+        let anthropic_empty = ProviderBytes {
+            stream: concat!(
+                "event: message_start\n",
+                "data: {\"type\":\"message_start\",\"message\":{\"usage\":{\"input_tokens\":1,\"output_tokens\":0}}}\n\n",
+                "event: message_delta\n",
+                "data: {\"type\":\"message_delta\",\"usage\":{\"output_tokens\":3}}\n\n",
+                "event: message_stop\n",
+                "data: {\"type\":\"message_stop\"}\n\n"
+            )
+            .to_string(),
+            whole: concat!(
+                "{\"type\":\"message\",\"role\":\"assistant\",\"content\":[],\"stop_reason\":\"end_turn\",",
+                "\"usage\":{\"input_tokens\":1,\"output_tokens\":3}}"
+            )
+            .to_string(),
+        };
         let empty_models = Arc::new(
             ModelsConfig::from_json(
                 &serde_json::json!({
@@ -9475,13 +9054,9 @@ mod tests {
         }
 
         // Embedded negative: the same real gate must not dispute a plainly nonempty honest response.
-        let honest = concat!(
-            "data: {\"choices\":[{\"delta\":{\"content\":\"mock-reply\"},\"logprobs\":{\"content\":[{\"token\":\"mock-reply\",\"logprob\":-0.1,\"top_logprobs\":[]}]}}]}\n\n",
-            "data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}],\"usage\":{\"prompt_tokens\":1,\"completion_tokens\":1,\"total_tokens\":2},\"x_groq\":{\"usage\":{\"prompt_tokens\":1,\"completion_tokens\":1,\"total_tokens\":2}}}\n\n",
-            "data: [DONE]\n\n"
-        );
+        let (honest, _) = ups_visible_usage_fixtures("mock-reply", 1);
         let (responses, disputes, money, delivered) = observe_ups_openai_content_gate_arm(
-            honest,
+            &honest,
             false,
             probe_models(
                 "identity probe",
@@ -9762,22 +9337,18 @@ mod tests {
         assert!(budget > verification + 5, "the deal itself can afford both");
 
         let (status, body) = harness
-            .ask_full(
-                "/v1/chat/completions",
-                2,
-                "DEXDO_FIXTURE_ECHOLIMIT fresh deal",
-                false,
-            )
+            .ask_full("/v1/chat/completions", 2, "first fresh deal", false)
             .await;
         assert_eq!(
             status,
             reqwest::StatusCode::OK,
             "a fresh deal must reach its first inference: {body}"
         );
-        assert!(
-            body.contains("limit=2"),
-            "the seller is asked for the CALLER's two tokens - never for the verification headroom \
-             left in the grant, and never for an unset limit: {body}"
+        let answer: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(
+            answer["usage"]["completion_tokens"], 2,
+            "the provider is asked for the CALLER's two tokens - never for the verification \
+             headroom left in the grant: {body}"
         );
         assert_eq!(
             harness.delivered().await,
@@ -9792,7 +9363,7 @@ mod tests {
              not spend came back when the request ended"
         );
         let first_delivery = harness.last_delivery().await;
-        assert_eq!(first_delivery.rendered_tokens, 2);
+        assert_eq!(first_delivery.rendered_tokens, 1, "one whole answer body");
         assert_eq!(
             first_delivery.request_billable_tokens,
             verification + 5,
@@ -9800,21 +9371,18 @@ mod tests {
         );
         assert_eq!(
             first_delivery.route_delivered_tokens,
-            Some(2 * CONTENT_PROBE_MAX_TOKENS + 2),
-            "the stable route-delivery witness includes both verification probes and the answer"
+            Some(3),
+            "the stable route-delivery witness includes both whole verification answers and the \
+             answer itself"
         );
 
         // The deal is verified now, so the next request owes nothing on top of its own ask.
         let (status, body) = harness
-            .ask_full(
-                "/v1/chat/completions",
-                2,
-                "DEXDO_FIXTURE_ECHOLIMIT verified deal",
-                false,
-            )
+            .ask_full("/v1/chat/completions", 2, "now verified deal", false)
             .await;
         assert_eq!(status, reqwest::StatusCode::OK, "{body}");
-        assert!(body.contains("limit=2"), "{body}");
+        let answer: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(answer["usage"]["completion_tokens"], 2, "{body}");
         assert_eq!(
             harness.delivered().await,
             verification + 10,
@@ -9955,46 +9523,42 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn responses_terminal_cancellation_preserves_partial_output_and_truncation() {
-        let harness = weekly_route_harness(WEEK_QUOTA - 2, true).await;
+    async fn responses_cancellation_before_the_terminal_frames_preserves_partial_output() {
+        let harness = weekly_route_harness(PROBE_CLAIM, false).await;
         let (delivery_tx, mut delivery_rx) = tokio::sync::mpsc::unbounded_channel();
-        let response = openai::responses(
-            axum::extract::State(direct_state_with_deliveries(&harness, delivery_tx)),
-            http::HeaderMap::new(),
-            Ok(axum::Json(serde_json::json!({
+        let response = direct_consumer_body(
+            direct_state_with_deliveries(&harness, delivery_tx),
+            "/v1/responses",
+            serde_json::json!({
                 "model": "dexdo-mock",
-                "input": "DEXDO_FIXTURE_STRADDLE DEXDO_FIXTURE_ECHOLIMIT terminal cutover",
-                "max_output_tokens": 8,
+                "input": "terminal cutover",
+                "max_output_tokens": 4,
                 "stream": true
-            }))),
+            }),
         )
         .await;
         assert_eq!(response.status(), http::StatusCode::OK);
 
         let request_id = drop_sse_body_after(
             response,
-            "response.output_item.done",
+            "response.output_text.delta",
             "response.output_text.delta",
         )
         .await;
         let delivery = delivery_rx
             .recv()
             .await
-            .expect("dropping before the Responses terminal publishes cancellation");
+            .expect("dropping before the seller's usage record publishes cancellation");
         assert_eq!(delivery.request_id, request_id);
         assert_eq!(delivery.protocol, "openai_responses");
         assert_eq!(delivery.failure_stage, Some("consumer_disconnect"));
         assert_eq!(delivery.finish_reason, "cancelled");
-        assert_eq!(delivery.visible_output_tokens, 1);
-        assert_eq!(delivery.rendered_tokens, 1);
+        assert!(delivery.visible_output_tokens > 0);
+        assert!(delivery.rendered_tokens > 0);
         assert_eq!(delivery.input_tokens, None);
         assert_eq!(delivery.output_tokens, None);
         assert_eq!(delivery.billable_tokens, None);
         assert_eq!(delivery.request_billable_tokens, 0);
-        assert!(
-            delivery.truncated_by_output_limit,
-            "cancellation after a known output-cap cut must preserve the prepared truncation fact"
-        );
         assert!(matches!(
             delivery_rx.try_recv(),
             Err(tokio::sync::mpsc::error::TryRecvError::Disconnected)
@@ -10003,19 +9567,18 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn anthropic_terminal_sequence_stays_armed_and_preserves_partial_output() {
+    async fn a_client_gone_at_the_terminal_frames_leaves_the_bill_recorded() {
         let harness = weekly_route_harness(PROBE_CLAIM, false).await;
         let (delivery_tx, mut delivery_rx) = tokio::sync::mpsc::unbounded_channel();
-        let request = serde_json::from_value(serde_json::json!({
-            "model": "dexdo-mock",
-            "messages": [{"role": "user", "content": "terminal cutover"}],
-            "max_tokens": 4,
-            "stream": true
-        }))
-        .expect("valid Anthropic request");
-        let response = anthropic::messages(
-            axum::extract::State(direct_state_with_deliveries(&harness, delivery_tx)),
-            Ok(axum::Json(request)),
+        let response = direct_consumer_body(
+            direct_state_with_deliveries(&harness, delivery_tx),
+            "/v1/messages",
+            serde_json::json!({
+                "model": "dexdo-mock",
+                "messages": [{"role": "user", "content": "terminal cutover"}],
+                "max_tokens": 4,
+                "stream": true
+            }),
         )
         .await;
         assert_eq!(response.status(), http::StatusCode::OK);
@@ -10029,11 +9592,14 @@ mod tests {
         let delivery = delivery_rx
             .recv()
             .await
-            .expect("dropping before message_stop publishes cancellation");
+            .expect("the answer's delivery is published once");
         assert_eq!(delivery.request_id, request_id);
         assert_eq!(delivery.protocol, "anthropic");
-        assert_eq!(delivery.failure_stage, Some("consumer_disconnect"));
-        assert_eq!(delivery.finish_reason, "cancelled");
+        // The provider's terminal frames reach the client only once the seller's bill is
+        // recorded: a client gone at `message_delta` already has the answer, and the bill stays
+        // on the record.
+        assert_eq!(delivery.failure_stage, None);
+        assert_ne!(delivery.finish_reason, "cancelled");
         assert!(delivery.visible_output_tokens > 0);
         assert!(delivery.rendered_tokens > 0);
         assert!(delivery.input_tokens.is_some());
@@ -10052,15 +9618,15 @@ mod tests {
 
         let harness = weekly_route_harness(PROBE_CLAIM, false).await;
         let (delivery_tx, mut delivery_rx) = tokio::sync::mpsc::unbounded_channel();
-        let response = openai::responses(
-            axum::extract::State(direct_state_with_deliveries(&harness, delivery_tx)),
-            http::HeaderMap::new(),
-            Ok(axum::Json(serde_json::json!({
+        let response = direct_consumer_body(
+            direct_state_with_deliveries(&harness, delivery_tx),
+            "/v1/responses",
+            serde_json::json!({
                 "model": "dexdo-mock",
                 "input": "DEXDO_FIXTURE_DELAY_EOF",
                 "max_output_tokens": 4,
                 "stream": true
-            }))),
+            }),
         )
         .await;
         assert_eq!(response.status(), http::StatusCode::OK);
@@ -10099,10 +9665,6 @@ mod tests {
                             .expect("SSE body frame");
                         let frame = std::str::from_utf8(&frame).expect("SSE is UTF-8");
                         saw_content |= frame.contains("response.output_text.delta");
-                        assert!(
-                            !frame.contains("response.output_text.done"),
-                            "delayed EOF must hold the protocol terminal"
-                        );
                     }
                 }
             }
@@ -10140,19 +9702,18 @@ mod tests {
 
         let harness = weekly_route_harness(PROBE_CLAIM, false).await;
         let (delivery_tx, mut delivery_rx) = tokio::sync::mpsc::unbounded_channel();
-        let request = serde_json::from_value(serde_json::json!({
-            "model": "dexdo-mock",
-            "messages": [{
-                "role": "user",
-                "content": "DEXDO_FIXTURE_REASONING_ONLY DEXDO_FIXTURE_DELAY_EOF"
-            }],
-            "max_tokens": 8,
-            "stream": true
-        }))
-        .expect("valid Anthropic request");
-        let response = anthropic::messages(
-            axum::extract::State(direct_state_with_deliveries(&harness, delivery_tx)),
-            Ok(axum::Json(request)),
+        let response = direct_consumer_body(
+            direct_state_with_deliveries(&harness, delivery_tx),
+            "/v1/messages",
+            serde_json::json!({
+                "model": "dexdo-mock",
+                "messages": [{
+                    "role": "user",
+                    "content": "DEXDO_FIXTURE_REASONING_ONLY DEXDO_FIXTURE_DELAY_EOF"
+                }],
+                "max_tokens": 8,
+                "stream": true
+            }),
         )
         .await;
         assert_eq!(response.status(), http::StatusCode::OK);
@@ -10162,6 +9723,7 @@ mod tests {
             .expect("unit-test response exposes its delivery finalizer")
             .clone();
         let mut body = response.into_body().into_data_stream();
+        let mut saw_reasoning = false;
         tokio::time::timeout(Duration::from_secs(5), async {
             loop {
                 let next_frame = body.next();
@@ -10182,16 +9744,18 @@ mod tests {
                             .expect("Anthropic stream reaches terminal usage")
                             .expect("SSE body frame");
                         let frame = std::str::from_utf8(&frame).expect("SSE is UTF-8");
-                        assert!(
-                            !frame.contains("event: content_block_delta"),
-                            "hidden reasoning must not cross the text-only response: {frame}"
-                        );
+                        assert!(!frame.contains("\"text_delta\""), "{frame}");
+                        saw_reasoning |= frame.contains("\"thinking_delta\"");
                     }
                 }
             }
         })
         .await
         .expect("buyer observes reasoning-only usage while EOF remains held");
+        assert!(
+            saw_reasoning,
+            "the provider's reasoning reaches the client as sent"
+        );
 
         drop(body);
         harness.seller.release_delayed_eof();
@@ -10203,21 +9767,16 @@ mod tests {
         assert_eq!(delivery.failure_stage, Some("consumer_disconnect"));
         assert_eq!(delivery.finish_reason, "cancelled");
         assert_eq!(delivery.visible_output_tokens, 0);
-        assert_eq!(delivery.rendered_tokens, 8);
+        assert_eq!(delivery.rendered_tokens, 2);
         assert_eq!(
             delivery.route_delivered_tokens,
-            Some(8),
-            "the stable route witness includes hidden accepted chunks"
+            Some(2),
+            "the stable route witness includes reasoning output frames"
         );
         assert_eq!(delivery.input_tokens, None, "clean EOF was not observed");
         assert_eq!(delivery.output_tokens, None, "clean EOF was not observed");
-        assert_eq!(delivery.request_output_tokens, 8);
-        assert!(delivery.request_billable_tokens > 8);
-        assert!(!delivery.truncated_by_output_limit);
-        assert!(
-            !delivery.ended_before_output_limit,
-            "observed provider usage consumed the exact output cap"
-        );
+        assert_eq!(delivery.request_output_tokens, 2);
+        assert!(delivery.request_billable_tokens > 2);
         assert!(matches!(
             delivery_rx.try_recv(),
             Err(tokio::sync::mpsc::error::TryRecvError::Disconnected)
@@ -10284,12 +9843,7 @@ mod tests {
             assert_eq!(harness.remaining().await, free);
 
             let (status, body) = harness
-                .ask_full(
-                    "/v1/chat/completions",
-                    ASK,
-                    "DEXDO_FIXTURE_ECHOLIMIT resumed deal",
-                    false,
-                )
+                .ask_full("/v1/chat/completions", ASK, "this resumed deal", false)
                 .await;
 
             match answered {
@@ -10338,10 +9892,11 @@ mod tests {
                         reqwest::StatusCode::OK,
                         "free={free}: complete terminal usage fits the held remainder: {body}"
                     );
-                    assert!(
-                        body.contains(&format!("limit={answered}")),
-                        "free={free}: the seller is told what the ANSWER may be - the clamp falls \
-                         on the answer, never on the verification floor: {body}"
+                    let answer: serde_json::Value = serde_json::from_str(&body).unwrap();
+                    assert_eq!(
+                        answer["usage"]["completion_tokens"], answered,
+                        "free={free}: the provider is asked for the ANSWER's own limit, never for \
+                         the verification floor: {body}"
                     );
                     assert_eq!(
                         harness.delivered().await,
@@ -10400,7 +9955,7 @@ mod tests {
                 let start = start.clone();
                 tokio::spawn(async move {
                     start.wait().await;
-                    deal.admit(Some(ASK as u32)).await
+                    deal.admit().await
                 })
             })
             .collect();
@@ -10493,12 +10048,7 @@ mod tests {
         // The first real request, through the real handler: this is what pays the gate and caches
         // the verdict. It is also's own headline case -- a fresh deal must be SERVED.
         let (status, body) = harness
-            .ask_full(
-                "/v1/chat/completions",
-                ASK,
-                "DEXDO_FIXTURE_ECHOLIMIT first request",
-                false,
-            )
+            .ask_full("/v1/chat/completions", ASK, "the first request", false)
             .await;
         assert_eq!(
             status,
@@ -10519,7 +10069,7 @@ mod tests {
         deal.token_ceiling.store(spent + ASK, Ordering::SeqCst);
         assert_eq!(deal.remaining_tokens(), ASK, "the tail is the fixture");
 
-        let RouteBudget::Admitted(reservation) = deal.admit(Some(ASK as u32)).await else {
+        let RouteBudget::Admitted(reservation) = deal.admit().await else {
             panic!(
                 "a deal that has already paid for its verification was refused a remainder it can \
                  serve in full; the admission floor did not drop once the debt was discharged"
@@ -10535,88 +10085,6 @@ mod tests {
             "unused authorization remains available to concurrent requests"
         );
         harness.shutdown().await;
-    }
-
-    /// Verification headroom is never served to the caller as answer tokens.
-
-    /// Admission reserves the deal's unpaid verification on top of the ask, so the grant a handler
-    /// still HOLDS when it caps the answer can be far larger than the caller's own limit. Here the
-    /// fingerprint layer is the only one that spends - B7 has no reference key and degrades without
-    /// spending - so its complete usage is 66 tokens and the rest is still held.
-    /// `cap_canon_to_grant`
-    /// returns the caller's figure and BOTH handlers must enforce THAT on the way back. A handler
-    /// that reached for `request_guard.remaining_grant()` instead would be indistinguishable against
-    /// a compliant seller, which is why this one is not compliant: told 2, it answers with a
-    /// one-token chunk and then a two-token chunk, straddling the ask. Only the first may be shown;
-    /// without a valid terminal usage record neither answer chunk is charged, and unused headroom
-    /// comes back.
-    #[tokio::test]
-    async fn verification_headroom_is_never_served_as_answer_tokens() {
-        const ASK: u64 = 2;
-        const GRANT: u64 = ASK + VERIFICATION_DEBT;
-        // B8 probes for the canonical budget; B7 degrades on a missing reference key without
-        // spending, so exactly half of the reserved debt is still held when the answer is capped.
-        const VERIFICATION_SPEND: u64 = CONTENT_PROBE_MAX_TOKENS + 2;
-        const HELD_AT_CAP: u64 = GRANT - VERIFICATION_SPEND;
-        // The divergence this test exists to catch, made a property of the fixture rather than of
-        // the run: the two candidate caps are different numbers, so a handler that binds the held
-        // grant instead of the returned caller cap cannot pass here by coincidence.
-        const _: () = assert!(
-            HELD_AT_CAP > ASK,
-            "the held grant must exceed the caller's ask at the cap, or the wrong cap is invisible"
-        );
-
-        for path in ["/v1/chat/completions", "/v1/messages"] {
-            let harness = weekly_route_harness_gated(
-                WEEK_QUOTA - GRANT as u128,
-                false,
-                SUB_WEEK_LEN.as_secs(),
-                UNCONSTRAINED_UPSTREAM,
-                ContentGate::probe(
-                    "dexdo-mock".to_string(),
-                    probe_models(
-                        "identity probe",
-                        "https://reference.invalid/v1",
-                        "DEXDO_FIXTURE_ABSENT_KEY",
-                    ),
-                ),
-                crate::seller::UpstreamConfig::Mock,
-            )
-            .await;
-            assert_eq!(harness.remaining().await, GRANT);
-
-            let (status, body) = harness
-                .ask_full(
-                    path,
-                    ASK,
-                    "overrun DEXDO_FIXTURE_STRADDLE DEXDO_FIXTURE_ECHOLIMIT",
-                    false,
-                )
-                .await;
-            assert_eq!(status, reqwest::StatusCode::OK, "{path}: {body}");
-            assert!(
-                body.contains("limit=2"),
-                "{path}: the seller is told the caller's ask, never the held grant: {body}"
-            );
-            assert!(
-                !body.contains("overrun"),
-                "{path}: the straddling chunk crosses the caller's cap and may not be rendered, \
-                 however much verification headroom the grant still holds: {body}"
-            );
-            assert_eq!(
-                harness.delivered().await,
-                VERIFICATION_SPEND,
-                "{path}: the complete probe usage is charged, but the answer has no accepted \
-                 terminal usage after its straddling chunk: {body}"
-            );
-            assert_eq!(
-                harness.remaining().await,
-                GRANT - VERIFICATION_SPEND,
-                "{path}: unused verification headroom and the incomplete answer both return to the \
-                 route"
-            );
-            harness.shutdown().await;
-        }
     }
 
     /// A one-token remainder is refused before verification can burn it ( blocker 2, as
@@ -10688,55 +10156,6 @@ mod tests {
         harness.shutdown().await;
     }
 
-    /// A noncompliant probe chunk cannot cross the verification cap it was issued.
-
-    /// An admitted grant now covers the whole verification a deal owes, so the probe's own
-    /// budget is always the canonical one - which a four-token chunk divides exactly and can no
-    /// longer straddle. A seller that chunks 1, 2, 2,... still can: it reaches 63 of the 64 and then
-    /// offers two more. That chunk is refused before rendering; because the stream cannot then
-    /// reach an accepted terminal usage record, the visible prefix remains unbilled and the whole
-    /// reservation comes back.
-    #[tokio::test]
-    #[ignore = "EXPECTED TO FAIL until a seller harness exists that does not route through \
-                cap_canon_to_grant (). Same cause as \
-                fat_chunks_stop_exactly_at_the_grant, one level down: the probe's wire limit is \
-                CONTENT_PROBE_MAX_TOKENS and our seller reserves exactly that, so after  it \
-                refuses the straddling chunk before the buyer's cap can. The buyer's refusal is \
-                still the property; it is untested here, not false."]
-    async fn a_noncompliant_probe_chunk_cannot_cross_the_verification_cap() {
-        const ASK: u64 = 2;
-        const GRANT: u64 = ASK + VERIFICATION_DEBT;
-        let models = probe_models(
-            "DEXDO_FIXTURE_STRADDLE identity probe",
-            "https://reference.invalid/v1",
-            "DEXDO_FIXTURE_ABSENT_KEY",
-        );
-        let harness = weekly_route_harness_gated(
-            WEEK_QUOTA - GRANT as u128,
-            true,
-            SUB_WEEK_LEN.as_secs(),
-            UNCONSTRAINED_UPSTREAM,
-            ContentGate::probe("dexdo-mock".to_string(), models),
-            crate::seller::UpstreamConfig::Mock,
-        )
-        .await;
-
-        let (status, body) = harness.ask(ASK).await;
-        let delivered = harness.delivered().await;
-        let remaining = harness.remaining().await;
-        // Red-by-design reporting shape (ci/run_red_by_design_tests.sh): the probe is refused as a
-        // noncompliant chunk, no content-only prefix moves money, and the grant returns.
-        let complete = status == reqwest::StatusCode::BAD_GATEWAY
-            && body.contains("noncompliant chunk")
-            && delivered == 0
-            && remaining == GRANT;
-        harness.shutdown().await;
-        if !complete {
-            eprintln!("status={status} delivered={delivered} remaining={remaining} body={body}");
-            panic!("E2E-UPS-39B the probe fixture cannot build a noncompliant seller; it needs a harness that does not route through cap_canon_to_grant ()");
-        }
-    }
-
     /// Handler cancellation during B7 returns only the unused part of its held reservation.
 
     /// The grant is the caller's eight tokens plus the verification the deal owes; the seller
@@ -10792,21 +10211,9 @@ mod tests {
             delivery_events: Some(delivery_tx),
             usage: None,
         };
-        let request =
-            serde_json::from_value::<crate::buyer::render::OpenAiChatRequest>(serde_json::json!({
-                "model": "dexdo-mock",
-                "messages": [{"role": "user", "content": "ordinary answer"}],
-                "max_tokens": 8,
-                "stream": false
-            }))
-            .expect("OpenAI request");
         let mut handler = tokio::spawn(async move {
-            openai::chat_completions(
-                axum::extract::State(state),
-                http::HeaderMap::new(),
-                Ok(axum::Json(request)),
-            )
-            .await
+            direct_consumer_response(state, "/v1/chat/completions", 8, "ordinary answer", false)
+                .await
         });
 
         // which of the two outcomes happened is decided by facts, not by a clock. Reaching the
@@ -10918,8 +10325,10 @@ mod tests {
                 assert!(read > 0, "B8 request headers ended early");
                 request.extend_from_slice(&chunk[..read]);
             }
-            let event = b"data: {\"choices\":[{\"delta\":{\"content\":\"mock-reply: \"},\"logprobs\":{\"content\":[{\"token\":\"mock-reply\",\"logprob\":-0.1,\"top_logprobs\":[]}]}}]}\n\n";
-            let headers = b"HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\ntransfer-encoding: chunked\r\nconnection: close\r\n\r\n";
+            // The whole B8 answer is cut off after its first bytes.
+            let event =
+                b"{\"choices\":[{\"message\":{\"role\":\"assistant\",\"content\":\"mock-reply: \"";
+            let headers = b"HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ntransfer-encoding: chunked\r\nconnection: close\r\n\r\n";
             socket
                 .write_all(headers)
                 .await
@@ -10936,13 +10345,7 @@ mod tests {
             base_url: format!("http://{upstream_addr}"),
             model: "dexdo-mock".to_string(),
             frame_model: "dexdo-mock".to_string(),
-            claimed_model_override: None,
             api_key_env: UPSTREAM_KEY.to_string(),
-            tokenizer_family: "mock".to_string(),
-            capabilities: crate::seller::Capabilities {
-                max_output_tokens: Some(64),
-                ..crate::seller::Capabilities::default()
-            },
             identity_aliases: Vec::new(),
         });
         let harness = weekly_route_harness_gated(
@@ -11008,18 +10411,18 @@ mod tests {
             .await
             .expect("the harness route is published");
 
-        let first = match deal.admit(Some(ASK as u32)).await {
+        let first = match deal.admit().await {
             RouteBudget::Admitted(reservation) => reservation,
             RouteBudget::Exhausted(reason) => panic!("first request was refused: {reason}"),
         };
         assert_eq!(first.granted, FREE);
         assert_eq!(deal.remaining_tokens(), FREE);
-        let RouteBudget::Admitted(second) = deal.admit(Some(ASK as u32)).await else {
+        let RouteBudget::Admitted(second) = deal.admit().await else {
             panic!("a second request must not wait for the first authorization");
         };
         assert_eq!(second.granted, FREE);
 
-        let reopened = match deal.admit(Some(ASK as u32)).await {
+        let reopened = match deal.admit().await {
             RouteBudget::Admitted(reservation) => reservation,
             RouteBudget::Exhausted(reason) => panic!("unused grant did not reopen: {reason}"),
         };
@@ -11104,38 +10507,12 @@ mod tests {
                     assert_eq!(delivery.output_tokens, Some(2));
                     assert_eq!(delivery.billable_tokens, Some(3));
                     assert_eq!(delivery.request_billable_tokens, 3);
-                    assert_eq!(delivery.visible_output_tokens, 2);
+                    assert_eq!(delivery.visible_output_tokens, if stream { 2 } else { 1 });
                     assert_eq!(delivery.route_billable_tokens, Some(charge));
                     assert_eq!(harness.delivered().await, charge);
-                    assert!(!delivery.truncated_by_output_limit);
-                    assert_eq!(delivery.ended_before_output_limit, output_cap > 2);
                     harness.shutdown().await;
                 }
             }
-            // Actual output clipping still reports max_tokens and cannot accept a terminal bill.
-            let harness = weekly_route_harness(WEEK_QUOTA - 2, true).await;
-            let (status, body) = harness
-                .ask_full(
-                    "/v1/messages",
-                    8,
-                    "DEXDO_FIXTURE_STRADDLE DEXDO_FIXTURE_ZERO_CHARGE",
-                    stream,
-                )
-                .await;
-            assert_eq!(status, reqwest::StatusCode::OK, "{body}");
-            assert_eq!(
-                terminal_reason(&body).as_deref(),
-                Some("max_tokens"),
-                "{body}"
-            );
-            let delivery = harness.last_delivery().await;
-            assert_eq!(delivery.finish_reason, "max_tokens");
-            assert!(delivery.truncated_by_output_limit);
-            assert_eq!(delivery.visible_output_tokens, 1);
-            assert_eq!(delivery.billable_tokens, None);
-            assert_eq!(delivery.route_billable_tokens, Some(0));
-            assert_eq!(harness.delivered().await, 0);
-            harness.shutdown().await;
         }
     }
     #[tokio::test]

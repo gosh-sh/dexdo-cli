@@ -51,19 +51,23 @@ impl dexdo_proto::Gateway for HeldGateway {
         self.production.get_challenge(request).await
     }
     type OpenStreamStream = std::pin::Pin<
-        Box<dyn tokio_stream::Stream<Item = Result<dexdo_proto::CanonChunk, tonic::Status>> + Send>,
+        Box<
+            dyn tokio_stream::Stream<Item = Result<dexdo_proto::StreamFrame, tonic::Status>> + Send,
+        >,
     >;
     async fn open_stream(
         &self,
         request: tonic::Request<dexdo_proto::StreamRequest>,
     ) -> Result<tonic::Response<Self::OpenStreamStream>, tonic::Status> {
         use tokio_stream::StreamExt;
-        let hold = request
-            .get_ref()
-            .request
-            .as_ref()
-            .and_then(|r| r.params.as_ref())
-            .is_some_and(|p| p.max_tokens > 1);
+        let hold = serde_json::from_slice::<serde_json::Value>(&request.get_ref().body)
+            .ok()
+            .and_then(|body| {
+                body["max_tokens"]
+                    .as_u64()
+                    .or_else(|| body["max_output_tokens"].as_u64())
+            })
+            .is_some_and(|max_tokens| max_tokens > 1);
         let mut stream = self.production.open_stream(request).await?.into_inner();
         if hold {
             self.entered.add_permits(1);
@@ -127,7 +131,7 @@ async fn http(state: ApiState) -> (String, tokio::task::JoinHandle<()>) {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let url = format!("http://{}", listener.local_addr().unwrap());
     let task = tokio::spawn(async move {
-        axum::serve(listener, router(state, true)).await.unwrap();
+        axum::serve(listener, router(state)).await.unwrap();
     });
     (url, task)
 }

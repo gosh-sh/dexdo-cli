@@ -238,10 +238,11 @@ What the numbers mean:
 **This command holds the terminal.** Wait for `consumer API listening (loopback)` -- that line is
 how you know the endpoint is up. Close the terminal and the endpoint goes with it.
 
-The same local server accepts text-only OpenAI Responses requests at `POST /v1/responses`:
-`input` can be a string or text messages, and `stream:true` returns Responses SSE events.
-The endpoint does not support tool calls; requests with non-empty `tools` are rejected by name.
-Keep using `/v1/chat/completions` for Chat Completions clients.
+The same local server forwards `POST /v1/chat/completions`, `POST /v1/responses` and
+`POST /v1/messages` to the seller exactly as your client sent them, tools included, and returns the
+provider's answer as produced. An OpenAI-compatible seller serves Chat Completions and Responses; an
+Anthropic seller serves Messages. A request on a path the seller does not serve is refused with
+`unsupported_api_path` before any money moves.
 
 Two flags worth knowing before you meet them:
 
@@ -257,7 +258,7 @@ Two flags worth knowing before you meet them:
 
 ## 9. Use it like any OpenAI endpoint
 
-The `model` field must be the deal's frame model, or omitted:
+The `model` field must be the deal's frame model; a request without it is refused:
 
 ```sh
 curl http://127.0.0.1:8080/v1/chat/completions \

@@ -159,7 +159,6 @@ async fn initialization_codes_survive_http_and_message_changes() {
             let (addr, task) = serve(
                 "127.0.0.1:0".parse().unwrap(),
                 state,
-                true,
                 std::future::pending(),
             )
             .await
@@ -190,14 +189,14 @@ async fn initialization_codes_survive_http_and_message_changes() {
     }
 }
 
+/// the background deal observer, not the request, reads the unopened state and closes
+/// serving; every request after it is refused before any provider request.
 #[tokio::test]
 async fn funded_never_opened_is_typed_before_any_provider_request() {
     for path in ["/v1/chat/completions", "/v1/responses", "/v1/messages"] {
         let harness = weekly_route_harness(0, false).await;
         harness.chain.snapshot.lock().unwrap().state.opened = false;
-        let (status, body) = harness.ask_full(path, 1, "", false).await;
-        assert_eq!(status, reqwest::StatusCode::BAD_GATEWAY, "{body}");
-        assert_refusal(&body, "deal_not_opened", "read_only_reconciliation", path);
+        observe_deal(&harness.deals).await;
         let (status, body) = harness.ask_full(path, 1, "", false).await;
         assert_eq!(status, reqwest::StatusCode::GONE, "{body}");
         assert_refusal(&body, "deal_session_closed", "operator_action", path);
@@ -340,7 +339,7 @@ async fn ask_router(state: ApiState, path: &str) -> (http::StatusCode, String) {
     } else {
         serde_json::json!({"model":"dexdo-mock", "messages":[{"role":"user","content":"hello"}], "max_tokens":1})
     };
-    let response = router(state, true)
+    let response = router(state)
         .oneshot(
             http::Request::post(path)
                 .header(http::header::CONTENT_TYPE, "application/json")
@@ -364,8 +363,7 @@ async fn trial_ceiling_refusal_then_readmission(subscription: bool) {
         let token_contract = deal.route.token_contract.clone();
         let week = harness.chain.week_index();
         let mut request = deal.begin_request(unix_now_secs());
-        let RouteBudget::Admitted(reservation) =
-            deal.admit_with_probe_observation(None, false).await
+        let RouteBudget::Admitted(reservation) = deal.admit_with_probe_observation(false).await
         else {
             panic!("the canonical trial tick must be available");
         };
@@ -386,6 +384,7 @@ async fn trial_ceiling_refusal_then_readmission(subscription: bool) {
         assert_eq!(deal.billable_tokens(), trial);
         assert!(!deal.session.is_closed());
         harness.chain.accepts_probe();
+        observe_deal(&harness.deals).await;
         let (status, body) = harness.ask_full(path, 1, "", false).await;
         assert_eq!(status, reqwest::StatusCode::OK, "{body}");
         assert!(deal.billable_tokens() > trial);
@@ -424,8 +423,7 @@ async fn minimum_weekly_quota_is_truly_exhausted_even_before_acceptance() {
         }
         deal.token_ceiling.store(trial, Ordering::SeqCst);
         let mut request = deal.begin_request(unix_now_secs());
-        let RouteBudget::Admitted(reservation) =
-            deal.admit_with_probe_observation(None, false).await
+        let RouteBudget::Admitted(reservation) = deal.admit_with_probe_observation(false).await
         else {
             panic!("the whole minimum weekly quota is available");
         };

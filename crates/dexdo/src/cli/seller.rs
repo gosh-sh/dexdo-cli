@@ -5852,14 +5852,15 @@ mod tests {
                 token_contract,
                 nonce,
                 signature: signature.0.to_vec(),
-                request: Some(dexdo_proto::CanonRequest {
-                    messages: Vec::new(),
-                    params: Some(dexdo_proto::SamplingParams {
-                        max_tokens: 1,
-                        ..dexdo_proto::SamplingParams::default()
-                    }),
-                    ..Default::default()
-                }),
+                path: "/v1/chat/completions".to_string(),
+                body: serde_json::to_vec(&serde_json::json!({
+                    "model": "dexdo-mock",
+                    "messages": [],
+                    "max_tokens": 1,
+                    "stream": true,
+                }))
+                .unwrap(),
+                headers: Vec::new(),
                 billing_grant_tokens: 1,
             }),
         )
@@ -7370,6 +7371,135 @@ mod tests {
             OpenedDealPlan::RetireSettled => {}
             other => panic!("a destroyed TokenContract must retire the deal: {other:?}"),
         }
+    }
+
+    #[tokio::test]
+    async fn issue_2199_reserve_failure_preserves_durable_capacity_until_terminal_proof() {
+        let root = tempfile::tempdir().unwrap();
+        let mut seller = dexdo::seller::start_gateway_with_note_and_deals_dir(
+            "127.0.0.1:0".parse().unwrap(),
+            dexdo::seller::UpstreamConfig::Mock,
+            Arc::new(LocalNote::generate()),
+            root.path().to_path_buf(),
+        )
+        .await
+        .unwrap();
+        let tc = format!("0:{}", "c".repeat(64));
+        let backend = Arc::new(PoolTestBackend::new(
+            Arc::new(Mutex::new(Vec::new())),
+            tc.clone(),
+            8,
+            3,
+            true,
+            1,
+        ));
+        backend.matched.store(true, Ordering::Relaxed);
+        backend.opened.store(true, Ordering::Relaxed);
+        backend.probe_accepted.store(true, Ordering::Relaxed);
+        let mut snapshot = backend.deal_snapshot(&tc).await.unwrap().unwrap();
+        // The strict gateway view starts at the canonical already-paid probe anchor.
+        snapshot.state.tokens_pending = dexdo_core::TICK_SIZE;
+        snapshot.state.tokens_final = dexdo_core::TICK_SIZE;
+        snapshot.subscription.tokens_paid = dexdo_core::TICK_SIZE;
+        let durable =
+            dexdo::seller::capacity::CapacityManager::in_deals_dir(root.path().to_path_buf());
+        durable
+            .reconcile_deal(&tc, snapshot.state, snapshot.subscription)
+            .unwrap();
+        durable
+            .reserve(&tc, 1)
+            .unwrap()
+            .finish_with_delivery(1)
+            .unwrap();
+        seller
+            .state
+            .register_stream(
+                &tc,
+                backend.buyer_pubkey.clone(),
+                1,
+                snapshot.state,
+                snapshot.subscription,
+            )
+            .unwrap();
+        let capacity_path = std::fs::read_dir(root.path().join("seller-capacity"))
+            .unwrap()
+            .next()
+            .unwrap()
+            .unwrap()
+            .path();
+        let before = std::fs::read(&capacity_path).unwrap();
+        let error = || {
+            ChainError::Chain(format!(
+            "TokenContract {tc}: claimTokens failed because its ECC[2]/SHELL reserve could not \
+             cover the operation; finalized rejection transaction_hash=tx2199; settlement is unconfirmed"
+        ))
+        };
+        let mut terminal_receipts = JoinSet::new();
+        let mut first_error = None;
+        record_advance_result(
+            &seller,
+            Ok((
+                tc.clone(),
+                backend.clone(),
+                seller.state.delivery(&tc),
+                false,
+                Err(error()),
+            )),
+            &mut terminal_receipts,
+            &pool_test_policy(4),
+            &mut first_error,
+        )
+        .await;
+        let shown = first_error.unwrap().to_string();
+        assert!(
+            shown.contains("tx2199") && shown.contains("unconfirmed"),
+            "{shown}"
+        );
+        assert!(
+            terminal_receipts.is_empty(),
+            "no terminal receipt may be invented"
+        );
+        assert_eq!(std::fs::read(&capacity_path).unwrap(), before);
+        let restarted = dexdo::seller::gateway::GatewayState::with_upstream_and_deals_dir(
+            dexdo::seller::UpstreamConfig::Mock,
+            root.path().to_path_buf(),
+        );
+        assert!(
+            restarted
+                .reconcile_deal_capacity(&tc, snapshot.state, snapshot.subscription)
+                .unwrap()
+                .is_some(),
+            "the same durable deal remains recoverable"
+        );
+
+        backend.exists.store(false, Ordering::Relaxed);
+        *backend.terminal_settlement.lock().unwrap() =
+            Some(dexdo_core::DealTerminalSettlement::StreamStopped {
+                to_seller: 1,
+                refund_to_buyer: 2,
+            });
+        let mut first_error = None;
+        record_advance_result(
+            &seller,
+            Ok((
+                tc.clone(),
+                backend,
+                seller.state.delivery(&tc),
+                false,
+                Err(error()),
+            )),
+            &mut terminal_receipts,
+            &pool_test_policy(4),
+            &mut first_error,
+        )
+        .await;
+        assert!(
+            first_error.is_none(),
+            "an authoritative terminal fact resolves the failure"
+        );
+        terminal_receipts.abort_all();
+        seller.server_task.abort();
+        let _ = (&mut seller.server_task).await;
     }
 
     /// every terminal takes the per-deal TokenContract account with it. The immutable receipt
@@ -10313,7 +10443,7 @@ mod tests {
             .expect("buyer handover");
             assert_eq!(
                 buyer_client
-                    .connect_and_stream(&handover, &token_contract, 2)
+                    .connect_and_stream(&handover, &token_contract, "mock", 2)
                     .await
                     .unwrap()
                     .received,
@@ -10741,7 +10871,7 @@ mod tests {
             .expect("buyer B handover");
             assert_eq!(
                 buyer_a_client
-                    .connect_and_stream(&handover_a, &initial_tc, 2)
+                    .connect_and_stream(&handover_a, &initial_tc, "mock", 2)
                     .await
                     .unwrap()
                     .received,
@@ -10750,7 +10880,7 @@ mod tests {
             chain.stop(&initial_tc, buyer_a.as_ref()).await.unwrap();
             assert_eq!(
                 buyer_b_client
-                    .connect_and_stream(&handover_b, &residual_tc, 2)
+                    .connect_and_stream(&handover_b, &residual_tc, "mock", 2)
                     .await
                     .unwrap()
                     .received,
@@ -10921,7 +11051,7 @@ mod tests {
             .expect("production entry must resume linked descendant");
             assert_eq!(
                 buyer_client
-                    .connect_and_stream(&handover, &descendant_tc, 2)
+                    .connect_and_stream(&handover, &descendant_tc, "mock", 2)
                     .await
                     .unwrap()
                     .received,

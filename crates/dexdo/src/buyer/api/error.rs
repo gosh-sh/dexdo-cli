@@ -2,8 +2,8 @@
 use super::*;
 use axum::response::IntoResponse;
 
-pub(super) fn json_rejection(
-    error: axum::extract::rejection::JsonRejection,
+pub(super) fn bytes_rejection(
+    error: axum::extract::rejection::BytesRejection,
     anthropic: bool,
 ) -> Response {
     let status = error.status();
@@ -40,6 +40,8 @@ pub enum ConsumerErrorCode {
     DealCapacityUnavailable,
     UpstreamRetryable,
     UpstreamUsageUnresolved,
+    UnsupportedApiPath,
+    SellerUpdateRequired,
 }
 
 impl ConsumerErrorCode {
@@ -57,7 +59,8 @@ impl ConsumerErrorCode {
             | Self::SubscriptionStateUnavailable => "read_only_reconciliation",
             Self::DealCapacityUnavailable => "retry_after_reconciliation",
             Self::UpstreamUsageUnresolved => "read_only_reconciliation",
-            Self::InvalidBuyTicks => "change_request",
+            Self::InvalidBuyTicks | Self::UnsupportedApiPath => "change_request",
+            Self::SellerUpdateRequired => "wait_for_seller_update",
             Self::DealUnavailable
             | Self::VerificationBudgetInsufficient
             | Self::SubscriptionTerminal => "operator_action",

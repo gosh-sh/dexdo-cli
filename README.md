@@ -267,7 +267,7 @@ table below the metrics says what each label value means.
 | | `unavailable` | The provider could not be reached, the connection broke, or it answered with an HTTP error status. Provider rate limits (`429`) and rejected keys (`401`, `403`) land here too. |
 | | `timeout` | The provider produced no output before the seller's supervision deadline. |
 | | `stream_protocol` | The provider's stream was malformed or ended without its usage record. |
-| | `configuration` | A seller-side setup problem: missing key, unsupported request parameter, output cap. |
+| | `configuration` | A seller-side setup problem or a request the seller refuses: missing key, another model, a path it does not serve. |
 | | `rate_limit` | A single stream frame from the provider exceeded the seller's buffer cap. |
 | | `authentication` | Reserved; the adapters do not produce it today. |
 | | `other` | Any other failure. |
@@ -286,8 +286,7 @@ that stops does not mean the offer was cancelled.
 * [DEX.DO glossary](docs/glossary.md),
 * [Registered AI models](docs/registered-models.md),
 * [Wallets and fund flows](docs/wallets-and-funds.md),
-* [Withdrawing PrivateNote funds to a wallet](docs/withdraw-private-note-to-wallet.md),
-* [Disable reasoning for text generation](docs/reasoning-control.md)
+* [Withdrawing PrivateNote funds to a wallet](docs/withdraw-private-note-to-wallet.md)
 
 ## License
 

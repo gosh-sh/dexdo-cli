@@ -3491,7 +3491,7 @@ mod tests {
     }
 
     use super::*;
-    use crate::seller::{Capabilities, OpenAiConfig, SampleAlgorithm, UpstreamConfig};
+    use crate::seller::{OpenAiConfig, UpstreamConfig};
     use dexdo_core::{
         ChainError, DealBuyerBond, DealChainSnapshot, DealChainState, DealOfferLatch,
         DealSellerBond, DealSubscription, LocalNote, Note, NotePubkey, OfferListing,
@@ -4054,25 +4054,11 @@ mod tests {
     }
 
     fn openai(base_url: String) -> UpstreamConfig {
-        openai_with_sample_algorithm(base_url, SampleAlgorithm::None)
-    }
-
-    fn openai_with_sample_algorithm(
-        base_url: String,
-        sample_algorithm: SampleAlgorithm,
-    ) -> UpstreamConfig {
         UpstreamConfig::OpenAi(OpenAiConfig {
             base_url,
             model: "exact-model".to_string(),
             frame_model: "vendor--exact--v1".to_string(),
-            claimed_model_override: None,
             api_key_env: "PATH".to_string(),
-            tokenizer_family: "exact".to_string(),
-            capabilities: Capabilities {
-                max_output_tokens: Some(1024),
-                sample_algorithm,
-                ..Default::default()
-            },
             identity_aliases: Vec::new(),
         })
     }
@@ -4255,18 +4241,16 @@ mod tests {
         frame_model: &str,
         first_response: String,
     ) -> CapabilityStartupResult {
-        run_capability_startup_with_algorithm(frame_model, first_response, SampleAlgorithm::None)
-            .await
+        run_capability_startup_with(frame_model, first_response).await
     }
 
-    async fn run_capability_startup_with_algorithm(
+    async fn run_capability_startup_with(
         frame_model: &str,
         first_response: String,
-        sample_algorithm: SampleAlgorithm,
     ) -> CapabilityStartupResult {
         let (base_url, requests, upstream_server) =
             recording_http_server(vec![first_response, capability_plain_sse()], true);
-        let mut upstream = openai_with_sample_algorithm(base_url, sample_algorithm);
+        let mut upstream = openai(base_url);
         let UpstreamConfig::OpenAi(config) = &mut upstream else {
             unreachable!("capability fixture is OpenAI-compatible")
         };
@@ -4334,9 +4318,9 @@ mod tests {
             capability["tool_choice"]["function"]["name"],
             "dexdo_capability_probe"
         );
-        // the capability probe's ceiling is the model's OWN declared output cap
-        // (`Capabilities { max_output_tokens: Some(1024) }` in this fixture), not a constant of ours.
-        assert_eq!(capability["max_tokens"], 1024);
+        // the capability probe is unbounded, so a model that thinks before it answers is
+        // never cut off and reported as incapable.
+        assert!(capability.get("max_tokens").is_none());
         let after_post = capability_request(&result.request_bodies[1]);
         assert!(after_post.get("tools").is_none());
         assert!(after_post.get("tool_choice").is_none());
@@ -4403,9 +4387,9 @@ mod tests {
         let capability = capability_request(&result.request_bodies[0]);
         assert_eq!(capability["reasoning"]["enabled"], true);
         assert_eq!(capability["reasoning"]["exclude"], false);
-        // the capability probe's ceiling is the model's OWN declared output cap
-        // (`Capabilities { max_output_tokens: Some(1024) }` in this fixture), not a constant of ours.
-        assert_eq!(capability["max_tokens"], 1024);
+        // the capability probe is unbounded, so a model that thinks before it answers is
+        // never cut off and reported as incapable.
+        assert!(capability.get("max_tokens").is_none());
         let after_post = capability_request(&result.request_bodies[1]);
         assert!(after_post.get("reasoning").is_none());
     }
@@ -4469,33 +4453,6 @@ mod tests {
         );
     }
 
-    #[tokio::test]
-    async fn issue_1951_readiness_ignores_b7_determinism_capability() {
-        let result = run_capability_startup_with_algorithm(
-            "vendor--exact--v1",
-            capability_plain_sse(),
-            SampleAlgorithm::Seed,
-        )
-        .await;
-        let rendered = render_startup(&result.outcome);
-        assert!(
-            matches!(result.outcome, Ok(SellerStartupOutcome::Ready(_))),
-            "readiness must not send the B7 determinism field: {rendered}"
-        );
-        assert_eq!(result.posts, 1, "the accepted profile did not post SELL");
-        assert_eq!(result.order_ids, vec![1227]);
-        assert_eq!(result.request_bodies.len(), 2);
-        for body in &result.request_bodies {
-            let request = capability_request(body);
-            for field in ["seed", "random_seed", "do_sample", "top_k"] {
-                assert!(
-                    request.get(field).is_none(),
-                    "readiness leaked B7 field {field}: {request}"
-                );
-            }
-        }
-    }
-
     /// pin the CAPABILITY probe body the way
     /// `issue_1227_plain_id_uses_one_readiness_shape_and_no_extra_probe` pins the plain
     /// one, so a future edit cannot silently change what we ask a provider to prove.
@@ -4509,7 +4466,7 @@ mod tests {
     /// `tool_choice` are what the provider is actually asked to honour, and they were proven
     /// innocent of precisely by being byte-identical between the failing and passing runs.
     #[tokio::test]
-    async fn issue_1278_capability_probe_asks_for_the_call_with_its_own_prompt_and_budget() {
+    async fn issue_1278_capability_probe_asks_for_the_call_with_its_own_prompt_and_no_limit() {
         let result =
             run_capability_startup("vendor--exact--v1--tools", capability_tool_sse()).await;
         assert!(
@@ -4528,7 +4485,6 @@ mod tests {
                 }],
                 "stream": true,
                 "stream_options": {"include_usage": true},
-                "max_tokens": 1024,
                 "tools": [{
                     "type": "function",
                     "function": {
@@ -4552,10 +4508,11 @@ mod tests {
             serde_json::json!(dexdo_core::params::CAPABILITY_PROBE_PROMPT),
             "the pinned body must be the shipped constant, not a copy of its text"
         );
-        assert_eq!(
-            capability_request(&result.request_bodies[0])["max_tokens"],
-            serde_json::json!(1024),
-            "the pinned budget must be the model's own declared output cap"
+        assert!(
+            capability_request(&result.request_bodies[0])
+                .get("max_tokens")
+                .is_none(),
+            "the capability probe is unbounded"
         );
     }
 
@@ -4601,10 +4558,9 @@ mod tests {
     /// markets unstartable -- the same class of outage is fixing. So the prompt is chosen by
     /// whether a tool is OFFERED, and this pins both halves of that choice: the readiness prompt
     /// here, the capability prompt in
-    /// `issue_1278_capability_probe_asks_for_the_call_with_its_own_prompt_and_budget`.
+    /// `issue_1278_capability_probe_asks_for_the_call_with_its_own_prompt_and_no_limit`.
 
-    /// The budget is still the capability one: reasoning needs the room even when no tool is asked
-    /// for.
+    /// It is still unbounded: reasoning needs the room even when no tool is asked for.
     #[tokio::test]
     async fn issue_1278_think_only_probe_keeps_the_readiness_prompt_and_offers_no_tool() {
         let result =
@@ -4622,7 +4578,6 @@ mod tests {
                 "messages": [{"role": "user", "content": "Reply with OK."}],
                 "stream": true,
                 "stream_options": {"include_usage": true},
-                "max_tokens": 1024,
                 "reasoning": {"enabled": true, "exclude": false},
             }),
             "a --think-only probe must ask for reasoning and offer no tool"

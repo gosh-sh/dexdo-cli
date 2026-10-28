@@ -1174,7 +1174,7 @@ mod tests {
         validate_seller_resume_state, ChainError, DealBuyerBond, DealChainSnapshot, DealChainState,
         DealSellerBond, LocalNote, NotePubkey, OfferListing, SellOffer, Settlement, StreamSnapshot,
     };
-    use dexdo_proto::{CanonRequest, ChallengeRequest, GatewayClient, StreamRequest};
+    use dexdo_proto::{ChallengeRequest, GatewayClient, StreamRequest};
     use proptest::prelude::*;
     use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
     use std::sync::Mutex;
@@ -1183,6 +1183,7 @@ mod tests {
         client: &mut GatewayClient<tonic::transport::Channel>,
         note: &dyn Note,
         token_contract: &str,
+        model: &str,
     ) -> StreamRequest {
         let challenge = client
             .get_challenge(ChallengeRequest {
@@ -1203,14 +1204,16 @@ mod tests {
                 .0
                 .to_vec(),
             nonce: challenge.nonce,
-            request: Some(CanonRequest {
-                params: Some(dexdo_proto::SamplingParams {
-                    max_tokens: 1,
-                    ..Default::default()
-                }),
-                ..Default::default()
-            }),
             billing_grant_tokens: 1,
+            path: "/v1/chat/completions".to_string(),
+            body: serde_json::to_vec(&serde_json::json!({
+                "model": model,
+                "messages": [],
+                "max_tokens": 1,
+                "stream": true,
+            }))
+            .unwrap(),
+            headers: Vec::new(),
         }
     }
 
@@ -3430,24 +3433,30 @@ mod tests {
             .await
             .unwrap();
         let mut client = GatewayClient::new(channel);
-        let request_a = gateway_request(&mut client, &buyer_a, tc_a).await;
+        let request_a = gateway_request(&mut client, &buyer_a, tc_a, "model-a").await;
         let mut stream_a = client.open_stream(request_a).await.unwrap().into_inner();
-        let chunk_a = stream_a.message().await.unwrap().unwrap();
-        assert_eq!(chunk_a.manifest.unwrap().claimed_model, "model-a");
+        assert!(stream_a.message().await.unwrap().unwrap().head.is_some());
+        let frame_a = stream_a.message().await.unwrap().unwrap();
+        assert!(String::from_utf8(frame_a.data)
+            .unwrap()
+            .contains("\"model\":\"model-a\""));
         drop(stream_a);
         seller.state.unregister_stream(tc_a);
 
-        let cleaned_a = gateway_request(&mut client, &buyer_a, tc_a).await;
+        let cleaned_a = gateway_request(&mut client, &buyer_a, tc_a, "model-a").await;
         let rejected = client
             .open_stream(cleaned_a)
             .await
             .expect_err("cleaned deal A must no longer authorize");
         assert_eq!(rejected.code(), tonic::Code::Unauthenticated);
 
-        let request_b = gateway_request(&mut client, &buyer_b, tc_b).await;
+        let request_b = gateway_request(&mut client, &buyer_b, tc_b, "model-b").await;
         let mut stream_b = client.open_stream(request_b).await.unwrap().into_inner();
-        let chunk_b = stream_b.message().await.unwrap().unwrap();
-        assert_eq!(chunk_b.manifest.unwrap().claimed_model, "model-b");
+        assert!(stream_b.message().await.unwrap().unwrap().head.is_some());
+        let frame_b = stream_b.message().await.unwrap().unwrap();
+        assert!(String::from_utf8(frame_b.data)
+            .unwrap()
+            .contains("\"model\":\"model-b\""));
         assert!(!seller.server_task.is_finished());
         seller.server_task.abort();
     }

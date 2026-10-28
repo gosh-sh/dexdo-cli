@@ -633,7 +633,7 @@ pub(crate) async fn run_provision_with_deal_gas_overhead(
         eprintln!(
             "note deposit: {deposit_shells} SHELL; ~{} SHELL for the per-deal TokenContract \
              deploy after fundDeployShell (the RootModel is deployed by SuperRoot and needs no note funding). This \
-             {}-tick deal needs {} raw nanovmshell over its whole life, so its floor is {} SHELL. Unused deploy \
+             {}-tick deal needs {} raw nanoSHELL ECC[2] over its whole life, so its floor is {} SHELL. Unused deploy \
              remainder burns at destroy.",
             per_deploy / SHELL_UNIT,
             args.max_ticks,

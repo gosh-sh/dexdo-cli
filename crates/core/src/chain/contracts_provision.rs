@@ -16,16 +16,6 @@ use tvm_block::{Deserializable, Serializable, StateInit};
 /// The version is taken from the crate so this identifier cannot go stale.
 pub(super) const DEXDO_USER_AGENT: &str = concat!("dexdo/", env!("CARGO_PKG_VERSION"));
 
-pub(super) fn gas_health_top_up_amount(balance: u128, min: u128, target: u128) -> Option<u128> {
-    debug_assert!(target >= min);
-    if balance <= min {
-        let amount = target.saturating_sub(balance);
-        (amount > 0).then_some(amount)
-    } else {
-        None
-    }
-}
-
 /// ABI of the deployed contracts (`contracts/compiled`), embedded for on-chain getters.
 pub(super) const SUPERROOT_ABI: &str =
     include_str!("../../../../contracts/compiled/airegistry/SuperRoot.abi.json");

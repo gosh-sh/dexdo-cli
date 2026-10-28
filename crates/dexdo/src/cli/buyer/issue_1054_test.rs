@@ -190,7 +190,6 @@ async fn issue_1054_default_proactive_model_only_refusal_is_framed_before_money_
         local_listen: Some("127.0.0.1:0".parse().unwrap()),
         continuity_mode: ContinuityModeArg::Proactive,
         json: false,
-        anthropic_compat: false,
         frame_model: Some(frame_model.to_string()),
         allow_unverified_model: true,
         models: models.clone(),

@@ -42,6 +42,13 @@ impl SellerPlacement {
         }
     }
 
+    pub(in crate::chain) fn tc_rejection(&self) -> Option<&str> {
+        self.rejection.as_deref().filter(|reason| {
+            reason.contains("postFromNote was submitted")
+                || reason.contains("postFromNote was rejected")
+        })
+    }
+
     pub fn load(path: &Path) -> Result<Option<Self>> {
         match std::fs::read(path) {
             Ok(bytes) => Ok(Some(serde_json::from_slice(&bytes).with_context(|| {
@@ -125,6 +132,78 @@ impl RealChainBackend {
         Ok(node.clone())
     }
 
+    /// Read-only diagnosis after a note call failed to produce the expected TC state.
+    pub(in crate::chain) async fn diagnose_note_tc_failure(
+        &self,
+        note: &Address,
+        tc: &Address,
+        operation: &str,
+        note_message_hash: &str,
+        error: anyhow::Error,
+    ) -> anyhow::Error {
+        let observation: Result<_> = async {
+            let root = self.seller_placement_message(note_message_hash).await?;
+            let transaction = &root["dst_transaction"];
+            if root["dst"].as_str().map(bare_hex) != Some(bare_hex(note.bare()))
+                || transaction["id"].as_str().is_none_or(str::is_empty)
+                || !(transaction["status"].as_i64() == Some(3)
+                    || transaction["status"].as_str() == Some("Finalized"))
+                || !successful_inbound_call(&root)
+            {
+                return Err(anyhow!("successful finalized note submission is unproven"));
+            }
+            let outputs = transaction["out_msgs"]
+                .as_array()
+                .ok_or_else(|| anyhow!("note transaction has no outgoing message identities"))?;
+            let mut matched = None;
+            for output in outputs {
+                let id = output
+                    .as_str()
+                    .filter(|id| !id.is_empty())
+                    .ok_or_else(|| anyhow!("invalid note outgoing message identity"))?;
+                let child = self.seller_placement_message(id).await?;
+                if child["src"].as_str().map(bare_hex) == Some(bare_hex(note.bare()))
+                    && child["dst"].as_str().map(bare_hex) == Some(bare_hex(tc.bare()))
+                    && child["body"]
+                        .as_str()
+                        .and_then(|body| decode_internal_abi_call(body, TOKENCONTRACT_ABI))
+                        .is_some_and(|call| call.function_name == operation)
+                {
+                    if matched.is_some() {
+                        return Err(anyhow!("multiple matching internal TC calls"));
+                    }
+                    matched = Some(id.to_string());
+                }
+            }
+            let id = matched.ok_or_else(|| anyhow!("no correlated note -> TC {operation} call"))?;
+            let receipt = poll_finalized_destination_receipt(
+                &self.http,
+                self.client.endpoint(),
+                tc.bare(),
+                crate::address::DEXDO_DAPP_ID,
+                &id,
+            )
+            .await?;
+            Ok((id, receipt))
+        }
+        .await;
+        let error = error.context(format!(
+            "TokenContract {}: {operation} was submitted via seller note {}; \
+             note_message_hash={note_message_hash}; required_operation_charge_raw={}; \
+             recovery state must be retained; settlement is unconfirmed until an authoritative terminal fact",
+            display_token_contract(tc), display_dexdo_address(note),
+            tc_operation_charge(operation).map_or_else(|| "unavailable".to_string(), |value| value.to_string()),
+        ));
+        match observation {
+            Ok((id, Some(receipt))) if receipt.aborted == Some(true) => {
+                tc_reserve_receipt_error(error, tc, operation, &id, Some(&receipt))
+            }
+            observation => error.context(format!(
+                "reserve cause unproven; internal receipt evidence={observation:?}"
+            )),
+        }
+    }
+
     /// Follow only the submitted note call, its TC dispatch and book continuations. A successful
     /// ingress is not acceptance: the book can enqueue work for a later self-call.
     pub(in crate::chain) async fn reconcile_seller_placement(
@@ -135,6 +214,9 @@ impl RealChainBackend {
         // A prior save may have failed after advancing the in-memory cursor or terminal fact.
         // Retry that checkpoint before skipping terminal work or reading any newer receipts.
         post.save(path)?;
+        if let Some(reason) = post.tc_rejection() {
+            return Err(anyhow!("{reason}"));
+        }
         while post.terminal.is_none() {
             let Some((id, expected_source)) = post.pending.last().cloned() else {
                 post.terminal =
@@ -203,8 +285,41 @@ impl RealChainBackend {
                     .as_array()
                     .ok_or_else(|| anyhow!("SELL transaction for {id} has no out_msgs"))?;
                 if transaction["aborted"].as_bool() == Some(true) && outputs.is_empty() {
-                    post.rejection = Some(format!("rejected message_id={id} transaction_id={} compute_exit={} action_result={}",
-                        transaction["id"], transaction["compute"]["exit_code"], transaction["action"]["result_code"]));
+                    let reason = format!("rejected message_id={id} transaction_id={} compute_exit={} action_result={}",
+                        transaction["id"], transaction["compute"]["exit_code"], transaction["action"]["result_code"]);
+                    post.rejection = Some(
+                        if source.eq_ignore_ascii_case(&post.note)
+                            && destination.eq_ignore_ascii_case(&post.token_contract)
+                            && transaction["compute"]["exit_code"].as_i64() == Some(0)
+                            && transaction["action"]["result_code"].as_i64() == Some(38)
+                        {
+                            // Preserve the finalized rejection before cancellable enrichment.
+                            post.rejection = Some(format!(
+                                "TokenContract {}: postFromNote was rejected; \
+                                 note_message_hash={} message_hash={id} transaction_hash={}; \
+                                 finalized aborted=true compute_exit=0 action_result=38; \
+                                 reserve cause unproven; observed_reserve_raw=unavailable \
+                                 required_operation_charge_raw={}; recovery state must be retained; \
+                                 settlement is unconfirmed until an authoritative terminal fact",
+                                display_token_contract(&post.token_contract), post.message_id,
+                                transaction["id"].as_str().expect("validated above"),
+                                crate::params::DEAL_BURN_POST_FROM_NOTE_RAW,
+                            ));
+                            post.save(path)?;
+                            let error = self
+                                .diagnose_note_tc_failure(
+                                    &Address::parse(&post.note)?,
+                                    &Address::parse(&post.token_contract)?,
+                                    "postFromNote",
+                                    &post.message_id,
+                                    anyhow!(reason),
+                                )
+                                .await;
+                            format!("{error:#}")
+                        } else {
+                            reason
+                        },
+                    );
                 } else if !successful_inbound_call(&node) {
                     return Err(anyhow!(
                         "SELL transaction execution is unproven for message {id}: {transaction}"
@@ -227,6 +342,11 @@ impl RealChainBackend {
             post.seen.insert(id);
             post.pending.extend(children);
             post.save(path)?;
+        }
+        if let Some(reason) = post.tc_rejection() {
+            // The execution rejection is terminal, but the deal/recovery identity remains live.
+            // Keep reporting it on resume instead of silently submitting another SELL.
+            return Err(anyhow!("{reason}"));
         }
         Ok(())
     }

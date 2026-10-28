@@ -1,7 +1,6 @@
 use super::*;
 use crate::seller::upstream::anthropic::AnthropicConfig;
 use dexdo_core::{LocalNote, Note, TICK_SIZE};
-use dexdo_proto::{ChatMessage, SamplingParams};
 use std::panic::{self, AssertUnwindSafe};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio_stream::StreamExt;
@@ -48,23 +47,21 @@ fn authorized_request(
     let nonce = vec![0x46; 32];
     state.auth.issue_challenge(token_contract, nonce.clone());
     let signature = buyer.sign(&challenge_bytes(token_contract, &nonce));
+    let body = serde_json::json!({
+        "model": "fixture-frame",
+        "max_tokens": max_tokens,
+        "messages": [{ "role": "user", "content": "hello" }],
+        "stream": true,
+    });
     Request::new(StreamRequest {
         shared_budget: false,
         token_contract: token_contract.to_string(),
         nonce,
         signature: signature.0.to_vec(),
-        request: Some(CanonRequest {
-            messages: vec![ChatMessage {
-                role: "user".into(),
-                content: "hello".into(),
-            }],
-            params: Some(SamplingParams {
-                max_tokens,
-                ..SamplingParams::default()
-            }),
-            ..Default::default()
-        }),
         billing_grant_tokens: u64::from(max_tokens).saturating_add(1),
+        path: "/v1/messages".to_string(),
+        body: serde_json::to_vec(&body).unwrap(),
+        headers: Vec::new(),
     })
 }
 
@@ -97,9 +94,6 @@ async fn anthropic_fixture() -> (AnthropicConfig, tokio::task::JoinHandle<()>) {
         model: "fixture-model".into(),
         frame_model: "fixture-frame".into(),
         api_key_env: "PATH".into(),
-        tokenizer_family: "fixture-tokenizer".into(),
-        max_output_tokens: Some(8),
-        reasoning_disable: Default::default(),
     };
     (config, server)
 }
@@ -138,7 +132,9 @@ async fn old_auth_before_limits_window_is_refused_as_unregistered() {
             let mut observed = Vec::new();
             while let Some(item) = stream.next().await {
                 match item {
-                    Ok(chunk) => observed.push(format!("chunk:{}", chunk.text)),
+                    Ok(frame) => {
+                        observed.push(format!("frame:{}", String::from_utf8_lossy(&frame.data)))
+                    }
                     Err(status) => {
                         observed.push(format!("error:{:?}:{}", status.code(), status.message()))
                     }
@@ -177,23 +173,23 @@ async fn registered_deal_keeps_reservation_and_delivery_numbers() {
         .await
         .unwrap()
         .into_inner();
-    let mut delivered_chunks = 0;
+    let mut delivered_deltas = 0;
     let mut terminal_usage = None;
     while let Some(item) = stream.next().await {
-        let chunk = item.unwrap();
-        if let Some(usage) = chunk.usage {
+        let frame = item.unwrap();
+        if let Some(usage) = frame.usage {
             terminal_usage = Some(usage);
-        } else {
-            assert_eq!(chunk.token_ids.len(), 1);
-            delivered_chunks += 1;
+        } else if String::from_utf8_lossy(&frame.data).contains("\"text_delta\"") {
+            delivered_deltas += 1;
         }
     }
 
-    assert_eq!(delivered_chunks, 3);
+    assert_eq!(delivered_deltas, 3);
     assert_eq!(terminal_usage, Some(BillingUsage::new(1, 3, None).unwrap()));
     assert_eq!(
         state.delivery(token_contract).count.load(Ordering::Acquire),
-        4
+        TICK_SIZE as u64 + 4,
+        "registered at one tick with no durable file, the counter starts at that tick ()"
     );
     let after = state.capacity_snapshot(token_contract).unwrap().unwrap();
     assert_eq!(after.local_delivered_after_anchor, 4);
@@ -224,13 +220,10 @@ async fn registered_mock_zero_output_limit_is_rejected_without_a_reservation() {
         Err(status) => status,
     };
     assert_eq!(status.code(), tonic::Code::InvalidArgument);
-    assert_eq!(
-        status.message(),
-        "canonical request output limit must be nonzero"
-    );
+    assert_eq!(status.message(), "this mock seller delivers no output");
     assert_eq!(
         state.delivery(token_contract).count.load(Ordering::Acquire),
-        0
+        TICK_SIZE as u64
     );
     let snapshot = state.capacity_snapshot(token_contract).unwrap().unwrap();
     assert_eq!(snapshot.local_delivered_after_anchor, 0);

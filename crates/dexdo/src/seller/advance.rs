@@ -24,7 +24,8 @@
 //! driver from what the chain will accept; tests inject short bounds.
 
 use dexdo_core::params::{
-    MAX_CLAIM_DELTA, SELLER_TERMINAL_RECEIPT_POLL_INTERVAL, SELLER_TERMINAL_RECEIPT_TIMEOUT,
+    MAX_CLAIM_DELTA, PROBE_SEED_TOKENS, SELLER_TERMINAL_RECEIPT_POLL_INTERVAL,
+    SELLER_TERMINAL_RECEIPT_TIMEOUT,
 };
 use dexdo_core::{
     ChainBackend, ChainError, ClaimBounds, DealChainState, Note, TokenContract,
@@ -83,8 +84,8 @@ impl AdvanceWindows {
 pub struct ClaimDeliveryMeasurement {
     /// The exact [`crate::seller::gateway::DealDelivery::count`] load used at this decision.
     pub deal_delivery_count: u64,
-    /// The fresh-process probe snapshot. `None` on a resumed process because the historical snapshot was
-    /// never persisted; reporting the driver's restart anchor `0` as if it were that snapshot would lie.
+    /// The fresh-process probe snapshot. `None` on a resumed process: the snapshot is not kept once the
+    /// probe is accepted, and it plays no part in the claim.
     pub delivery_at_probe: Option<u128>,
     /// The exact cumulative argument passed to `claim_tokens`; absent at the probe decision.
     pub cumulative_tokens: Option<u128>,
@@ -117,7 +118,7 @@ pub trait ClaimStateObserver: Send + Sync {
         state: DealChainState,
     ) -> Result<(), ChainError>;
 
-    /// Save the delivered prefix absorbed by the paid probe before submitting acceptProbe.
+    /// Save the delivered usage at the probe decision before submitting acceptProbe.
     /// Retries may return an already durable boundary; failure must prevent the chain write.
     fn prepare_probe(
         &self,
@@ -237,14 +238,11 @@ fn validated_claim_high_water(
     Ok(state.tokens_pending)
 }
 
-fn delivery_target_from_probe_anchor(
-    probe_high_water: u128,
-    delivery_at_probe: u128,
-    delivered: u64,
-    token_budget: u128,
-) -> u128 {
-    probe_high_water
-        .saturating_add(u128::from(delivered).saturating_sub(delivery_at_probe))
+/// The cumulative claim the deal's accepted usage supports: the paid probe tick is the floor, and usage
+/// fills that tick before anything beyond it is claimed.
+fn claim_target(delivered: u64, token_budget: u128) -> u128 {
+    u128::from(delivered)
+        .max(PROBE_SEED_TOKENS)
         .min(token_budget)
 }
 
@@ -252,11 +250,12 @@ fn delivery_target_from_probe_anchor(
 /// usage, then `finalize()` so the final claim becomes payable. Returns the cumulative tokens
 /// successfully claimed.
 
-/// After the paid probe seeds the first full tick, later claims never exceed accepted checked
-/// input-plus-output usage: a timer firing does not manufacture billable usage. They
-/// are additionally clamped to the on-chain rate bound, because the contract rejects an over-rate
-/// claim outright -- an unclamped driver would lose the whole batch instead of claiming the permitted
-/// part of it.
+/// `delivered` is the deal's whole accepted checked input-plus-output usage, including what a previous
+/// process of this seller recorded. The claim is `max(one tick, delivered)`: usage first fills the
+/// paid probe tick, and beyond it no claim exceeds accepted usage -- a timer firing does
+/// not manufacture billable usage. Claims are additionally clamped to the on-chain rate bound, because
+/// the contract rejects an over-rate claim outright -- an unclamped driver would lose the whole batch
+/// instead of claiming the permitted part of it.
 
 /// The loop ends on a clean external close (buyer STOP / self-destruct), on the deal's ceiling
 /// (`ChainError::Limit`), or once the usage stream is complete and all accepted usage has been claimed and
@@ -322,7 +321,7 @@ pub async fn drive_advance_with_observer(
     // repeats `acceptProbe`, then seed the local cumulative cursor from the authoritative on-chain value.
     let before_probe = required_claim_state(chain, token_contract, observer).await?;
     let resumed_after_probe = before_probe.probe_accepted;
-    let (delivery_at_probe, measured_delivery_at_probe) = if !resumed_after_probe {
+    let measured_delivery_at_probe = if !resumed_after_probe {
         if !before_probe.opened || before_probe.disputed || before_probe.tokens_pending != 0 {
             return Err(ChainError::Chain(format!(
                 "TokenContract {token_contract_display}: malformed pre-probe claim state \
@@ -373,8 +372,8 @@ pub async fn drive_advance_with_observer(
                 return Ok(0);
             }
         }
-        // This is the seller's probe decision boundary. Usage already accepted is absorbed by the
-        // full protocol probe tick; later accepted usage extends its cumulative high-water.
+        // This is the seller's probe decision boundary. The accepted probe is the deal's first, already
+        // paid tick: usage before and after this point fills it, and only usage beyond it is claimed.
         let deal_delivery_count = delivered.load(Ordering::Acquire);
         let delivery_at_probe = u128::from(
             observer.prepare_probe(token_contract, deal_delivery_count.min(TICK_SIZE as u64))?,
@@ -408,14 +407,13 @@ pub async fn drive_advance_with_observer(
                 ))
             }));
         }
-        (delivery_at_probe, Some(delivery_at_probe))
+        Some(delivery_at_probe)
     } else {
-        (0, None)
+        None
     };
 
     let claim_state = required_claim_state(chain, token_contract, observer).await?;
     let mut claimed = validated_claim_high_water(token_contract, claim_state, token_budget)?;
-    let delivery_base = claimed;
     let mut needs_finalize = claim_state.tokens_pending > claim_state.tokens_final;
     if claimed > TICK_SIZE {
         tracing::info!(
@@ -437,21 +435,11 @@ pub async fn drive_advance_with_observer(
         // Acquire ordering: the producer publishes `delivered` then `delivery_done` with Release, so a
         // `done` observed here implies the matching `delivered` count is visible (no stale under-read).
         let deal_delivery_count = delivered.load(Ordering::Acquire);
-        let target = delivery_target_from_probe_anchor(
-            delivery_base,
-            delivery_at_probe,
-            deal_delivery_count,
-            token_budget,
-        );
+        let target = claim_target(deal_delivery_count, token_budget);
         if claimed >= target {
             if delivery_done.load(Ordering::Acquire) {
                 // Re-read after observing `done`: tokens delivered just before it must still be claimed.
-                let refreshed = delivery_target_from_probe_anchor(
-                    delivery_base,
-                    delivery_at_probe,
-                    delivered.load(Ordering::Acquire),
-                    token_budget,
-                );
+                let refreshed = claim_target(delivered.load(Ordering::Acquire), token_budget);
                 if claimed >= refreshed {
                     break;
                 }
@@ -475,12 +463,7 @@ pub async fn drive_advance_with_observer(
         // Wait out the minimum interval, which is also what accrues the rate allowance.
         tokio::time::sleep(windows.claim_interval).await;
         let deal_delivery_count = delivered.load(Ordering::Acquire);
-        let target = delivery_target_from_probe_anchor(
-            delivery_base,
-            delivery_at_probe,
-            deal_delivery_count,
-            token_budget,
-        );
+        let target = claim_target(deal_delivery_count, token_budget);
         // Claim as much of the delivered backlog as BOTH the elapsed-time rate and hard per-call cap permit.
         // Anything above the combined allowance stays for the next round rather than being asserted and
         // rejected.
@@ -828,7 +811,8 @@ mod tests {
             4,
             TICK_SIZE as u64,
             true,
-            Arc::new(AtomicU64::new(4)),
+            // The deal's whole usage: four tokens past the tick the chain already holds.
+            Arc::new(AtomicU64::new(TICK_SIZE as u64 + 4)),
             Arc::new(AtomicBool::new(false)),
         )
         .await;
@@ -1700,14 +1684,93 @@ mod tests {
         )
         .await
         .unwrap();
-        assert_eq!(claimed, TICK_SIZE + 196);
-        assert_eq!(backend.claims(), vec![TICK_SIZE + 196]);
+        // usage on both sides of the decision fills the paid probe tick; nothing is claimed on top.
+        assert_eq!(claimed, TICK_SIZE);
+        assert!(backend.claims().is_empty());
         assert_eq!(backend.accepts.load(Ordering::Relaxed), 1);
-        assert_eq!(backend.finalized.load(Ordering::Relaxed), 1);
+        assert_eq!(backend.finalized.load(Ordering::Relaxed), 0);
         let snapshot = observer.capacity.snapshot(&tc).unwrap().unwrap();
-        assert_eq!(snapshot.tokens_pending_anchor, TICK_SIZE + 196);
+        assert_eq!(snapshot.tokens_pending_anchor, 57 + 196);
         assert_eq!(snapshot.local_delivered_after_anchor, 0);
         assert!(observer.capacity.reserve(&tc, 1).is_ok());
+    }
+
+    /// regression, the shellnet deal of 2026-10-25: 21 977 tokens at the probe decision, 2 280 217 in
+    /// all. The seller claimed 3 258 240 -- the probe tick plus everything after it -- and the buyer paid for
+    /// 978 023 tokens never received. The claim must end on the buyer's own usage.
+    #[tokio::test]
+    async fn usage_after_the_probe_fills_the_paid_tick_before_it_is_claimed_2185() {
+        const AT_PROBE: u64 = 21_977;
+        const DELIVERED: u64 = 2_280_217;
+        struct LaterUsage {
+            delivered: Arc<AtomicU64>,
+        }
+        impl ClaimStateObserver for LaterUsage {
+            fn observe(&self, _: &TokenContract, _: DealChainState) -> Result<(), ChainError> {
+                Ok(())
+            }
+            fn observe_probe_decision(
+                &self,
+                _: &TokenContract,
+                measurement: ClaimDeliveryMeasurement,
+            ) {
+                assert_eq!(measurement.delivery_at_probe, Some(u128::from(AT_PROBE)));
+                self.delivered.store(DELIVERED, Ordering::Release);
+            }
+        }
+        let backend = RecordingBackend::new();
+        let observer = LaterUsage {
+            delivered: Arc::new(AtomicU64::new(AT_PROBE)),
+        };
+        let claimed = drive_advance_with_observer(
+            &backend,
+            &"tc-2185".to_string(),
+            &LocalNote::generate(),
+            instant(),
+            10,
+            TICK_SIZE as u64,
+            true,
+            observer.delivered.clone(),
+            Arc::new(AtomicBool::new(true)),
+            &observer,
+        )
+        .await
+        .unwrap();
+        assert_eq!(claimed, u128::from(DELIVERED));
+        assert_eq!(backend.claims(), vec![2 * TICK_SIZE, u128::from(DELIVERED)]);
+        assert!(backend
+            .attempts()
+            .iter()
+            .all(|claim| *claim <= u128::from(DELIVERED)));
+    }
+
+    /// on restart: the gateway restores the deal's whole usage, and the resumed driver bills it by
+    /// the same rule as a fresh one -- never on top of the probe tick the chain already holds, and never
+    /// below what the chain already holds.
+    #[tokio::test]
+    async fn resumed_claim_is_the_same_whole_usage_rule_2185() {
+        let cases: [(u128, u64, Vec<u128>); 5] = [
+            (TICK_SIZE, 600_000, vec![]),
+            (TICK_SIZE, TICK_SIZE as u64, vec![]),
+            (TICK_SIZE, 1_500_000, vec![1_500_000]),
+            (2 * TICK_SIZE, 2_280_217, vec![2_280_217]),
+            (2 * TICK_SIZE, 0, vec![]),
+        ];
+        for (on_chain, usage, expected_claims) in cases {
+            let backend = RecordingBackend::resumed(on_chain, on_chain);
+            let claimed = drive_recording(&backend, instant(), 4, usage).await;
+            assert_eq!(
+                backend.claims(),
+                expected_claims,
+                "usage {usage} over {on_chain}"
+            );
+            assert_eq!(
+                claimed,
+                on_chain.max(u128::from(usage)),
+                "usage {usage} over {on_chain}"
+            );
+            assert_eq!(backend.accepts.load(Ordering::Relaxed), 0);
+        }
     }
 
     #[tokio::test]
@@ -1865,19 +1928,39 @@ mod tests {
     }
 
     #[test]
-    fn short_pre_probe_prefix_is_absorbed_once_then_post_probe_delivery_advances() {
-        let pre_probe = 40_799;
-        let budget = 3 * TICK_SIZE;
+    fn claim_is_one_tick_until_usage_passes_it_then_the_usage_2185() {
+        let budget = 10 * TICK_SIZE;
+        assert_eq!(claim_target(0, budget), TICK_SIZE);
         assert_eq!(
-            delivery_target_from_probe_anchor(TICK_SIZE, pre_probe, pre_probe as u64, budget),
+            claim_target(21_977, budget),
             TICK_SIZE,
-            "the protocol probe tick absorbs the already delivered prefix"
+            "usage below one tick is billed as the paid probe tick"
         );
+        assert_eq!(claim_target(TICK_SIZE as u64, budget), TICK_SIZE);
         assert_eq!(
-            delivery_target_from_probe_anchor(TICK_SIZE, pre_probe, 2_100_000, budget),
-            budget,
-            "post-probe delivery must extend the probe-seeded cumulative high-water"
+            claim_target(2_280_217, budget),
+            2_280_217,
+            "usage beyond one tick is billed as itself, not on top of the probe tick"
         );
+        assert_eq!(claim_target(11 * TICK_SIZE as u64, budget), budget);
+    }
+
+    proptest::proptest! {
+        /// invariant: the claim is `max(one tick, usage)` within the budget -- never the probe tick
+        /// plus the usage, never below the paid tick, and never decreasing as usage grows.
+        #[test]
+        fn claim_never_bills_the_probe_tick_on_top_of_usage(
+            usage in 0u64..=20 * TICK_SIZE as u64,
+            more in 0u64..=TICK_SIZE as u64,
+            ticks in 2u128..=10,
+        ) {
+            let budget = ticks * TICK_SIZE;
+            let claim = claim_target(usage, budget);
+            proptest::prop_assert_eq!(claim, u128::from(usage).max(TICK_SIZE).min(budget));
+            proptest::prop_assert!(claim >= TICK_SIZE);
+            proptest::prop_assert!(claim <= u128::from(usage).max(TICK_SIZE));
+            proptest::prop_assert!(claim_target(usage + more, budget) >= claim);
+        }
     }
 
     /// Consumption beyond the probe stays in raw tokens: a partial next tick is not rounded up.
@@ -1945,13 +2028,13 @@ mod tests {
         );
     }
 
-    /// Combined R20-03/R20-09 restart regression: an already-accepted high-water H is the local base, newly
-    /// delivered N is added exactly once, and even a backlog above one tick is submitted as one-tick-or-smaller
-    /// cumulative increments.
+    /// Combined R20-03/R20-09 restart regression: an already-accepted high-water H is the local base, the
+    /// restored whole usage H+N is the target, and even a backlog above one tick is submitted as
+    /// one-tick-or-smaller cumulative increments.
     #[tokio::test]
     async fn restart_at_h_plus_delivered_n_preserves_the_per_call_cap() {
         let b = RecordingBackend::resumed(TICK_SIZE, 2 * TICK_SIZE);
-        let claimed = drive_recording(&b, instant(), 4, (TICK_SIZE + 17) as u64).await;
+        let claimed = drive_recording(&b, instant(), 4, (3 * TICK_SIZE + 17) as u64).await;
         assert_eq!(claimed, 3 * TICK_SIZE + 17);
         assert_eq!(b.claims(), vec![3 * TICK_SIZE, 3 * TICK_SIZE + 17]);
         assert_eq!(b.attempts(), b.claims());
@@ -2081,7 +2164,7 @@ mod tests {
                 2,
                 TICK_SIZE as u64,
                 true,
-                Arc::new(AtomicU64::new(TICK_SIZE as u64)),
+                Arc::new(AtomicU64::new(2 * TICK_SIZE as u64)),
                 Arc::new(AtomicBool::new(true)),
                 driver_pending.as_ref(),
             )

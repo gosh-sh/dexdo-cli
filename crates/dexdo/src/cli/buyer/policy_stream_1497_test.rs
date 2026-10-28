@@ -97,7 +97,7 @@ mod policy_stream_1497 {
     fn a_policy_refusal_reaches_the_report_as_its_class_not_as_a_parse_error() {
         let log = recorded_cleanup_path();
         // What production leaves on the machine stream for this path: its events, and nothing else.
-        let machine_stream = [r#"{"schema":"dexdo.buyer.event.v2","seq":1,"event":"endpoint_ready"}"#];
+        let machine_stream = [r#"{"schema":"dexdo.buyer.event.v3","seq":1,"event":"endpoint_ready"}"#];
         let report = report(&machine_stream, &log);
 
         assert!(

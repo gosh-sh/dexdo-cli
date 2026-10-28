@@ -9,7 +9,7 @@ use crate::seller::ClaimDeliveryMeasurement;
 use serde_json::{json, Value};
 
 pub const SELLER_EVENT_SCHEMA: &str = "dexdo.seller.event.v1";
-pub const BUYER_EVENT_SCHEMA: &str = "dexdo.buyer.event.v2";
+pub const BUYER_EVENT_SCHEMA: &str = "dexdo.buyer.event.v3";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SellerClaimEventKind {

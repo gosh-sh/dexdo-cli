@@ -3954,6 +3954,72 @@ fn fund_deploy_shell_receipt_error(
     }
 }
 
+fn tc_operation_charge(operation: &str) -> Option<u128> {
+    match operation {
+        "fundDeal" => Some(crate::params::DEAL_BURN_FUND_DEAL_RAW),
+        "postFromNote" => Some(crate::params::DEAL_BURN_POST_FROM_NOTE_RAW),
+        "open" => Some(crate::params::DEAL_BURN_OPEN_RAW),
+        "acceptProbe" => Some(crate::params::DEAL_BURN_ACCEPT_PROBE_RAW),
+        "claimTokens" => Some(crate::params::DEAL_BURN_CLAIM_RAW),
+        "finalize" | "settleWeek" => Some(crate::params::DEAL_BURN_SETTLE_RAW),
+        "sellerStop" | "releaseDispute" | "resolveDisputeTimeout" | "close" | "destroy" => {
+            Some(crate::params::DEAL_BURN_TERMINAL_RAW)
+        }
+        "withdrawShell" => Some(crate::params::DEAL_BURN_LIGHT_RAW),
+        _ => None,
+    }
+}
+
+fn tc_reserve_receipt_error(
+    error: anyhow::Error,
+    tc: &Address,
+    operation: &str,
+    message_hash: &str,
+    receipt: Option<&CorrelatedActionReceipt>,
+) -> anyhow::Error {
+    let correlated = receipt.filter(|receipt| {
+        bare_hex(&receipt.message_hash) == bare_hex(message_hash)
+            && receipt.transaction_hash.is_some()
+    });
+    let observed_reserve = correlated
+        .and_then(|receipt| receipt.account_ecc_balances.as_ref())
+        .map(|balances| {
+            balances
+                .iter()
+                .find(|(currency, _)| *currency == crate::params::SHELL_CURRENCY_ID)
+                .map_or(0, |(_, amount)| *amount)
+        });
+    let charge = tc_operation_charge(operation);
+    let Some(receipt) = correlated.filter(|receipt| {
+        receipt.aborted == Some(true)
+            && receipt.compute_exit_code == Some(0)
+            && receipt.action_success == Some(false)
+            && receipt.result_code == Some(38)
+            && receipt.no_funds == Some(true)
+    }) else {
+        return error.context(format!(
+            "TokenContract {}: {operation} was rejected; message_hash={message_hash}; \
+             reserve cause unproven; observed_reserve_raw={} required_operation_charge_raw={}; \
+             receipt_evidence={correlated:?}; recovery state must be retained; settlement is unconfirmed \
+             until an authoritative terminal fact",
+            display_token_contract(tc),
+            observed_reserve.map_or_else(|| "unavailable".to_string(), |value| value.to_string()),
+            charge.map_or_else(|| "unavailable".to_string(), |value| value.to_string()),
+        ));
+    };
+    error.context(format!(
+        "TokenContract {}: {operation} failed because its ECC[2]/SHELL reserve could not cover \
+         the operation; observed_reserve_raw={} required_operation_charge_raw={}; \
+         finalized rejection message_hash={message_hash} transaction_hash={} \
+         aborted=true action_success=false action_result_code=38 no_funds=true; \
+         recovery state must be retained; settlement is unconfirmed until an authoritative terminal fact",
+        display_token_contract(tc),
+        observed_reserve.map_or_else(|| "unavailable".to_string(), |value| value.to_string()),
+        charge.map_or_else(|| "unavailable".to_string(), |value| value.to_string()),
+        receipt.transaction_hash.as_deref().expect("checked above"),
+    ))
+}
+
 /// The single place `DEXDO_USER_AGENT` is attached to an outgoing client. Every http client that
 /// talks to the chain edge is built from this - a header set in N places is a header the N+1th
 /// site will not set, and the edge 403s a request that arrives without one.
@@ -4433,7 +4499,14 @@ fn parse_exact_destination_receipt(
         balances
             .iter()
             .map(|balance| {
-                let currency = u32::try_from(value_u128(&balance["currency"])?).ok()?;
+                // Live GraphQL also serializes integral currency IDs as floats (e.g. 2.0).
+                let currency = value_u128(&balance["currency"])
+                    .and_then(|id| u32::try_from(id).ok())
+                    .or_else(|| {
+                        let id = balance["currency"].as_f64()?;
+                        ((0.0..=f64::from(u32::MAX)).contains(&id) && id.fract() == 0.0)
+                            .then_some(id as u32)
+                    })?;
                 let value = value_u128(&balance["value"])?;
                 Some((currency, value))
             })
@@ -8513,10 +8586,66 @@ impl RealChainBackend {
     ) -> Result<Value> {
         let boc = Self::encode_signed_call_boc(addr, abi_json, method, args, keys).await?;
         if abi_json == TOKENCONTRACT_ABI || abi_json == PRIVATENOTE_ABI {
-            self.retry_submit(&boc, false, Some(crate::address::DEXDO_DAPP_ID))
+            match self
+                .retry_submit(&boc, false, Some(crate::address::DEXDO_DAPP_ID))
                 .await
+            {
+                Err(error) if abi_json == TOKENCONTRACT_ABI => Err(self
+                    .tc_reserve_submit_error(addr, method, &boc, error)
+                    .await),
+                result => result,
+            }
         } else {
             self.send_with_retry(&boc).await
+        }
+    }
+
+    // Post-failure diagnosis only: never gate a seller operation on its remaining reserve.
+    async fn tc_reserve_submit_error(
+        &self,
+        tc: &Address,
+        operation: &str,
+        boc: &str,
+        error: anyhow::Error,
+    ) -> anyhow::Error {
+        let payload = error
+            .chain()
+            .find_map(|cause| cause.downcast_ref::<OnchainSubmitError>())
+            .map(OnchainSubmitError::sanitized_payload);
+        let Some(result) = payload.and_then(|payload| payload.get("result")) else {
+            return error;
+        };
+        if result["aborted"].as_bool() != Some(true)
+            || result
+                .get("exit_code")
+                .or_else(|| result.pointer("/compute/exit_code"))
+                .and_then(Value::as_i64)
+                .is_some_and(|exit| exit != 0)
+        {
+            return error;
+        }
+        let Ok(message_hash) = external_message_hash(boc) else {
+            return error;
+        };
+        match poll_finalized_destination_receipt(
+            &self.http,
+            self.client.endpoint(),
+            tc.bare(),
+            crate::address::DEXDO_DAPP_ID,
+            &message_hash,
+        )
+        .await
+        {
+            Ok(receipt) => {
+                tc_reserve_receipt_error(error, tc, operation, &message_hash, receipt.as_ref())
+            }
+            Err(receipt_error) => tc_reserve_receipt_error(
+                error.context(format!("finalized receipt unavailable: {receipt_error:#}")),
+                tc,
+                operation,
+                &message_hash,
+                None,
+            ),
         }
     }
 
@@ -10710,7 +10839,20 @@ impl RealChainBackend {
                     )
                     .await
                 };
-                submitted.map(|_| ())
+                match submitted {
+                    Err(error) if account_id == token_contract.bare() => {
+                        let operation = match action {
+                            SettlementAction::SellerStop => "sellerStop",
+                            SettlementAction::ReleaseDispute => "releaseDispute",
+                            SettlementAction::ResolveDisputeTimeout => "resolveDisputeTimeout",
+                            _ => return Err(error),
+                        };
+                        Err(self
+                            .tc_reserve_submit_error(token_contract, operation, &boc, error)
+                            .await)
+                    }
+                    result => result.map(|_| ()),
+                }
             },
             || self.token_contract_settlement_receipts(token_contract),
             || self.token_contract_deal_snapshot(token_contract),
@@ -10891,21 +11033,7 @@ impl RealChainBackend {
         .await
     }
 
-    /// A deal's ECC[2] RESERVE -- the plane its charges come out of.
-
-    /// Distinct from [`active_native_balance`](Self::active_native_balance) in the way that matters:
-    /// a deal mints its own native floor and cannot mint this. Confusing the two is what made the
-    /// pre-`fundDeal` reserve gate unable to fire.
-    pub(super) async fn deal_reserve_ecc(&self, addr: &Address) -> Result<u128> {
-        let account = self
-            .client
-            .get_system_account_retrying(addr)
-            .await?
-            .ok_or_else(|| anyhow!("contract {addr} is missing; cannot read its ECC[2] reserve"))?;
-        Ok(account.ecc_balance(crate::params::SHELL_CURRENCY_ID))
-    }
-
-    pub(super) async fn active_native_balance(&self, addr: &Address) -> Result<u128> {
+    pub(super) async fn active_deal_reserve_ecc(&self, addr: &Address) -> Result<u128> {
         let account = self
             .client
             .get_system_account_retrying(addr)
@@ -10917,7 +11045,7 @@ impl RealChainBackend {
                 account.status
             ));
         }
-        Ok(account.balance)
+        Ok(account.ecc_balance(crate::params::SHELL_CURRENCY_ID))
     }
 
     async fn account_snapshot(&self, addr: &Address, system_dapp: bool) -> String {
@@ -10957,153 +11085,6 @@ impl RealChainBackend {
         );
     }
 
-    /// before an active per-deal TC write, ensure the deal still has native vmshell gas.
-    /// `fundDeployShell` is seller-note-owned and derives the target from `(seller pubkey, nonce)`, so
-    /// only call this from paths that hold the seller note/key/nonce.
-
-    /// **THE DEAL ONLY.** This used to top the `RootModel` up as well, on the same message. Both halves
-    /// of that are gone in 4.0.34 and for the same reason: `fundDeployShell` no longer has a RootModel
-    /// leg (`contracts/dex/PrivateNote.sol:1143`), and the RootModel no longer needs one -- deployed by
-    /// SuperRoot it lives in SuperRoot's configured dapp, where its own `ensureBalance() ->
-    /// gosh.mintshellq` mints what it needs. A deal cannot do that: it is deployed by an external
-    /// message into a dapp of its own with no configuration, which is why this step survives for it.
-    /// ** -- SIZED TO THE DEAL, NOT TO A CONSTANT.** The floor and target used to be the flat
-    /// `ACTIVE_CONTRACT_GAS_HEALTH_*` pair, 5 and 10 vmshell. That made the deposit decision
-    /// meaningless: whatever the seller funded, a deal below 5 was refilled to 10 out of the same
-    /// note, so a cheap deal spent ten SHELL either way and the surplus burnt at `destroy`. The
-    /// figures here are the deal's own, read from the deal -- which states its `maxTicks`.
-    pub async fn ensure_deal_contract_gas(
-        &self,
-        note: &Address,
-        owner_keys: &KeyPair,
-        nonce: u64,
-        token_contract: Option<&Address>,
-    ) -> Result<()> {
-        let deal_gas_overhead_raw =
-            crate::params::resolve_deal_gas_overhead_raw(self.network(), None)
-                .map_err(anyhow::Error::msg)?;
-        self.ensure_deal_contract_gas_with_overhead(
-            note,
-            owner_keys,
-            nonce,
-            token_contract,
-            deal_gas_overhead_raw,
-        )
-        .await
-    }
-
-    /// Top the deal's ECC[2] RESERVE up to what its whole life is charged, out of the seller's note.
-
-    /// **This was a no-op for one build, and the contracts answered the question that made it one.**
-    /// It used to read the deal's NATIVE balance and top that up, which was right while a deal could
-    /// not mint: deployed by an external message into a dapp with no config, every vmshell it would
-    /// spend had to be put there. Since 4.0.36 the note deploys it into the note's dapp and
-    /// `ensureBalance` mints its own native floor, so the native plane needs nothing -- and for one
-    /// build there was no other plane to fund either, because every leg pointed at the deal
-    /// converted its ECC to native on arrival.
-
-    /// `PrivateNote.fundDeployShell` sends ECC[2] under `flag: 1` now, so the money arrives as
-    /// ECC[2] and lands in the reserve the burns come out of. That is the leg this function was
-    /// waiting for.
-
-    /// **Why top up at all when `deployDeal` already seeded the reserve.** The seed is one figure
-    /// chosen before the deal exists; the charges are real and arrive over its life. A deal whose
-    /// reserve runs dry does not stall quietly -- `gosh.burnecc` fails the ACTION phase
-    /// (`RESULT_CODE_NOT_ENOUGH_EXTRA`) and the whole transaction reverts, so the entry simply does
-    /// not happen. The entries that cannot be rescued any other way are the seller's own external
-    /// ones: `onlyOwnerPubkey(_sellerPubkey) accept` takes an external message and an external
-    /// message carries no currency, so `claimTokens`, `sellerStop`, `withdrawShell` and `destroy`
-    /// have no way to pay for themselves, ever. Topping up here is what keeps them reachable.
-
-    /// Reads before it writes and sends nothing when the reserve already covers the requirement: a
-    /// top-up is a spend from the seller's note, and spending to restore a balance that is already
-    /// there is the kind of thing an operator only finds out about from a receipt.
-
-    /// `deal_gas_overhead_raw` is the operator's EXTRA on top of the contract's own figure, honoured
-    /// exactly as supplied -- see [`crate::params::resolve_deal_gas_overhead_raw`].
-    pub async fn ensure_deal_contract_gas_with_overhead(
-        &self,
-        note: &Address,
-        owner_keys: &KeyPair,
-        nonce: u64,
-        token_contract: Option<&Address>,
-        deal_gas_overhead_raw: u128,
-    ) -> Result<()> {
-        let Some(deal) = token_contract else {
-            // No deal address yet means nothing to top up: `deployDeal` seeds the reserve, and it
-            // has not run. Not an error -- the seller's funding order reaches here before and after.
-            return Ok(());
-        };
-        let Some(account) = self.client.get_system_account_retrying(deal).await? else {
-            return Ok(());
-        };
-        if !account.is_active() {
-            // An inactive deal is either not deployed yet or already destroyed. Both are somebody
-            // else's decision, and sending ECC[2] to either is money that lands where nothing spends it.
-            return Ok(());
-        }
-        // `maxTicks` comes from the DEAL, not from a caller: the deal states its own terms, and a
-        // figure passed in could disagree with the contract that will do the charging. A deal that
-        // does not answer its terms is not one this can size, so it is left alone rather than
-        // funded against a guess.
-        let Some((_, _, max_ticks)) = self.token_contract_deal_terms(deal).await? else {
-            return Ok(());
-        };
-        let have = account.ecc_balance(crate::params::SHELL_CURRENCY_ID);
-        // HYSTERESIS, and it is not a nicety. This runs before EVERY write into the deal -- including
-        // `claimTokens`, which is once per tick -- so a rule of "top up to the whole life's charge
-        // whenever anything is missing" tops up after every burn. On a 1024-tick deal that is a
-        // thousand external messages on the critical path of delivering ticks, and the seller ends
-        // up paying about twice what the deal burns, because the reserve is held full right up to
-        // `destroy`, where the remainder burns. Below the floor, refill to the target; above it,
-        // send nothing.
-        let Some(short) = crate::chain::contracts_provision::gas_health_top_up_amount(
-            have,
-            crate::params::deal_gas_health_floor_raw_with_overhead(
-                max_ticks,
-                deal_gas_overhead_raw,
-            ),
-            crate::params::deal_gas_health_target_raw_with_overhead(
-                max_ticks,
-                deal_gas_overhead_raw,
-            ),
-        ) else {
-            return Ok(());
-        };
-        self.note_fund_deploy_shell(note, owner_keys, nonce, 0, short)
-            .await
-            .map_err(|error| {
-                anyhow!(
-                    "deal {deal} holds {have} raw ECC[2], below the floor its life is charged; \
-                     topping {short} up from note {note} failed: {error}"
-                )
-            })?;
-        // Wait for the credit before returning. Without this the next entry -- and there is one
-        // immediately, this runs before every write -- reads the balance from before the transfer
-        // landed and tops up again for the same shortfall.
-        self.wait_ecc_balance_at_least(deal, have.saturating_add(short))
-            .await
-    }
-
-    /// Poll until an account's ECC[2] reaches `min`, or say it did not.
-
-    /// The native twin of this exists for the plane a deal no longer needs funded; this is the one
-    /// that matters now, because ECC[2] is what the burns come out of and what a top-up moves.
-    async fn wait_ecc_balance_at_least(&self, addr: &Address, min: u128) -> Result<()> {
-        for _ in 0..crate::params::GAS_BALANCE_CONFIRM_MAX_READS {
-            if let Ok(Some(account)) = self.client.get_system_account_retrying(addr).await {
-                if account.ecc_balance(crate::params::SHELL_CURRENCY_ID) >= min {
-                    return Ok(());
-                }
-            }
-            tokio::time::sleep(crate::params::GAS_BALANCE_CONFIRM_POLL_INTERVAL).await;
-        }
-        Err(anyhow!(
-            "deal {addr} ECC[2] reserve did not reach {min} after the top-up was submitted; \
-             a second entry would top up again for the same shortfall"
-        ))
-    }
-
     /// Directive -- the note funds its own nonce-derived per-deal `TokenContract` with the exact
     /// `2P` seller bond, with no operator multisig in the path (replaces the operator
     /// multisig's [`fund_seller_bond`](Self::fund_seller_bond)). External owner-signed message.
@@ -11122,9 +11103,8 @@ impl RealChainBackend {
     /// and passed as a call argument, which `TokenContract.fundDeal(amount)` adds to the deal's own
     /// record after re-deriving the caller as the canonical seller note. The bond is that figure.
 
-    /// The gas leg is left where it already is: [`ensure_deal_contract_gas`](Self::ensure_deal_contract_gas)
-    /// tops the `TokenContract` up through `fundDeployShell` before this call, so the production
-    /// seller path passes `gas_shell = 0` and this message moves money only.
+    /// Initial provisioning funds the reserve. The production seller path passes `gas_shell = 0`
+    /// here, posting only the bond without replenishing the TC reserve.
     pub async fn note_fund_deal(
         &self,
         note: &Address,
@@ -11133,14 +11113,32 @@ impl RealChainBackend {
         gas_shell: u128,
         amount: u128,
     ) -> Result<Value> {
-        self.submit(
+        self.note_fund_deal_with_identity(note, owner_keys, nonce, gas_shell, amount)
+            .await
+            .map(|(response, _)| response)
+    }
+
+    pub(super) async fn note_fund_deal_with_identity(
+        &self,
+        note: &Address,
+        owner_keys: &KeyPair,
+        nonce: u64,
+        gas_shell: u128,
+        amount: u128,
+    ) -> Result<(Value, String)> {
+        let boc = Self::encode_signed_call_boc(
             note,
             PRIVATENOTE_ABI,
             NOTE_FUND_DEAL_METHOD,
             note_fund_deal_params(nonce, gas_shell, amount),
             owner_keys,
         )
-        .await
+        .await?;
+        let message_hash = external_message_hash(&boc)?;
+        let response = self
+            .retry_submit(&boc, false, Some(crate::address::DEXDO_DAPP_ID))
+            .await?;
+        Ok((response, message_hash))
     }
 
     /// The seller opens a stream session: `open(endpointCipher)` (external signature `_sellerPubkey`).
@@ -11598,9 +11596,7 @@ impl RealChainBackend {
 
     /// Poll until the note's ECC[2] pocket falls below `before`, and report where it settled.
 
-    /// The mirror of [`wait_ecc_balance_at_least`](Self::wait_ecc_balance_at_least) and reusing its
-    /// two bounds rather than adding a third pair: the question is the same one asked in the other
-    /// direction, and a second set of numbers for it would be another timer.
+    /// Uses the existing canonical gas-balance confirmation bounds.
 
     /// A pocket that has not moved after the bound is NOT reported as success. It returns the last
     /// reading and the caller states plainly that nothing was confirmed, because "submitted" and
@@ -11702,7 +11698,7 @@ impl RealChainBackend {
     /// Read-only, and it fails OPEN on an unreadable balance: a chain that will not answer is not
     /// evidence that money is missing, and refusing a buyer's exit on a failed read would take the
     /// exit away for the wrong reason.
-    async fn refuse_terminal_call_neither_side_can_pay(
+    pub(super) async fn refuse_terminal_call_neither_side_can_pay(
         &self,
         buyer_note: &Address,
         tc: &Address,
@@ -12070,7 +12066,7 @@ impl RealChainBackend {
         price_per_tick: u128,
         max_ticks: u128,
         gas: u128,
-        deal_gas_overhead_raw: u128,
+        _deal_gas_overhead_raw: u128,
         before_deal_submit: F,
     ) -> Result<crate::MarketManifest>
     where
@@ -12248,16 +12244,6 @@ impl RealChainBackend {
                 }));
             }
         }
-        // The deal only. The RootModel used to be topped up here too; it mints its own gas now that
-        // SuperRoot's deploy puts it in SuperRoot's configured dapp.
-        self.ensure_deal_contract_gas_with_overhead(
-            note,
-            seed_keys,
-            nonce,
-            Some(&tc),
-            deal_gas_overhead_raw,
-        )
-        .await?;
         Ok(market)
     }
 
@@ -20035,4 +20021,5 @@ mod tests {
     include!("client/issue_2030_tests.rs");
     include!("client/issue_2108_tests.rs");
     include!("client/issue_2115_tests.rs");
+    include!("client/issue_2199_tests.rs");
 }

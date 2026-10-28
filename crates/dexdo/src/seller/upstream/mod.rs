@@ -1,36 +1,48 @@
-//! Gateway upstream token source. Adapters:
-//! - [`mock`] -- mock model (`--mock-model`): deterministic fake tokens from the prompt
+//! Gateway upstream. Adapters:
+//! - [`mock`] -- mock model (`--mock-model`): deterministic fake output from the prompt, in the
+//! format of the requested path;
+//! - [`openai`] -- a real OpenAI-compatible provider: Chat Completions and Responses;
+//! - [`anthropic`] -- the native Anthropic Messages API.
 
-//! - [`openai`] -- **real OpenAI-compatible upstream**: Groq,
-//! streaming SSE -> normalization into `CanonChunk` (R1/R2/R5/R6).
-//! - [`anthropic`] -- native Anthropic Messages API, streaming SSE -> the same canon.
-
-//! All branches normalize output into canonical content chunks followed by one validated terminal
-//! billing record. Real adapters use provider-native input + output usage; the deterministic mock
-//! applies the same two-part accounting contract. Chunk framing is never itself money.
+//! Every adapter relays the provider's status, headers and bytes as they are, followed by one
+//! validated terminal billing record read from the provider's own usage ([`meter`]).
 
 pub mod anthropic;
+mod forward;
+mod meter;
 pub mod mock;
 pub mod openai;
 
+use crate::api_format::{ApiFormat, RequestBody};
 use anyhow::{bail, Result};
 use dexdo_core::params::{
-    SampleAlgorithm, CAPABILITY_PROBE_PROMPT, UPSTREAM_HEALTH_CHANNEL_CAPACITY,
-    UPSTREAM_HEALTH_PROBE_MAX_TOKENS, UPSTREAM_HEALTH_PROBE_PROMPT,
+    CAPABILITY_PROBE_PROMPT, UPSTREAM_HEALTH_CHANNEL_CAPACITY, UPSTREAM_HEALTH_PROBE_MAX_TOKENS,
+    UPSTREAM_HEALTH_PROBE_PROMPT,
 };
-use dexdo_proto::{BillingUsage, CanonChunk, CanonRequest, ChatMessage, SamplingParams};
+use dexdo_proto::{BillingUsage, Header, ResponseHead};
 use tokio::sync::mpsc;
 use tonic::Status;
 
-/// Seller-internal upstream event. Accounting is kept separate from the buyer-facing canon so
-/// providers that report authoritative usage without token ids do not have to invent token data.
+/// Seller-internal upstream event.
 pub enum UpstreamEvent {
-    Chunk(CanonChunk),
-    /// One provider-native terminal input/output/total record for the preceding content.
+    /// Provider HTTP status and the response headers that may reach the client.
+    Head(ResponseHead),
+    /// Provider response bytes; `output` says whether they carry answer text, reasoning or a tool call.
+    Data { bytes: Vec<u8>, output: bool },
+    /// One provider-native terminal input/output/total record for the preceding output.
     Usage(BillingUsage),
 }
 
 pub type UpstreamResult = Result<UpstreamEvent, Status>;
+
+/// One consumer request as the provider receives it.
+#[derive(Clone, Debug)]
+pub struct ProviderRequest {
+    pub format: ApiFormat,
+    pub body: RequestBody,
+    /// Client headers that may reach the provider ([`crate::api_format::forwards_request_header`]).
+    pub headers: Vec<Header>,
+}
 
 /// Observe the existing send, without extra buffering or changing stream semantics. `Err` means the
 /// receiver is gone; callers only test for it, so the undelivered event is not handed back.
@@ -41,7 +53,7 @@ pub(crate) async fn send_event(
     if let Err(status) = &event {
         crate::telemetry::failed(status.code());
     }
-    let content = matches!(&event, Ok(UpstreamEvent::Chunk(chunk)) if !chunk.text.is_empty() || !chunk.reasoning.is_empty() || !chunk.token_ids.is_empty());
+    let content = matches!(&event, Ok(UpstreamEvent::Data { output: true, .. }));
     let terminal = matches!(&event, Ok(UpstreamEvent::Usage(_)));
     tx.send(event).await.map_err(|_| ())?;
     if content {
@@ -51,13 +63,6 @@ pub(crate) async fn send_event(
         crate::telemetry::completed();
     }
     Ok(())
-}
-
-/// Fixed native thinking-off payload, shared by compatible Chat and Messages APIs.
-#[derive(serde::Serialize)]
-#[serde(tag = "type", rename_all = "snake_case")]
-pub(crate) enum ThinkingRequest {
-    Disabled,
 }
 
 /// The two canonical model-id flags this startup probe can prove from an upstream response.
@@ -129,89 +134,17 @@ impl StartupCapabilityRequirements {
     }
 }
 
-/// Resolve the model's own maximum output length -- the third
-/// bound on the outbound generation limit next to the buyer's request and the deal budget.
-
-/// **Fail closed**: an undeclared cap is UNKNOWN, not "unbounded". A deal budget is `ticks * TICK_SIZE`
-/// tokens and a request without `max_tokens` used to become `u32::MAX`; both exceed every real provider's
-/// output limit, so the provider answered `400` and no delivery ever succeeded. Refusing here happens
-/// BEFORE the provider is contacted and names the concrete remediation.
-#[allow(clippy::result_large_err)]
-pub(crate) fn resolve_model_output_cap(
-    declared: Option<u32>,
-    frame_model: &str,
-    served_model: &str,
-) -> Result<u32, Status> {
-    match declared {
-        Some(cap) if cap > 0 => Ok(cap),
-        _ => Err(Status::failed_precondition(format!(
-            "model \"{frame_model}\" (served \"{served_model}\") has no known output cap: refusing to \
-             send an unbounded max_tokens to the provider; set \"capabilities\": \
-             {{ \"max_output_tokens\": <the provider's maximum completion length> }} for this model in \
-             the models config (models.json)"
-        ))),
-    }
-}
-
-/// Is this provider HTTP status a **seller-side configuration** fault?
-
-/// The seller constructs the whole upstream request: the market forces the model and the gateway bounds the
-/// sampling params, so the buyer cannot shape it. A `4xx` rejection therefore means the seller's own model
-/// config/request is wrong, not that the upstream is transiently down. `401/403` keep the dedicated `auth`
-/// class and `408/429` are genuinely transient, so both are excluded.
-pub(crate) fn is_seller_config_http_status(code: u16) -> bool {
-    (400..500).contains(&code) && !matches!(code, 401 | 403 | 408 | 429)
-}
-
-/// Annotate a provider `4xx` that is a seller configuration fault with the concrete subject: which model was
-/// served, which generation limit was sent, and which optional greedy field was present.
-/// The `Status` code and the `upstream HTTP <code>` prefix are preserved verbatim -- stream-error policy and the
-/// failure classifier both parse them -- so this only enriches the message the operator (and the relayed buyer
-/// error body) actually reads.
-pub(crate) fn annotate_seller_config_fault(
-    status: Status,
-    http_status: u16,
-    served_model: &str,
-    sent_max_tokens: u32,
-    configured_output_cap: u32,
-    sample_algorithm: Option<SampleAlgorithm>,
-) -> Status {
-    if !is_seller_config_http_status(http_status) {
-        return status;
-    }
-    let sample_hint = sample_algorithm.map_or_else(String::new, |algorithm| {
-        let field = algorithm
-            .wire_field()
-            .expect("NONE is never attached to a request");
-        format!(
-            "; request also sent optional field \"{field}\" selected by \
-             capabilities.sample_algorithm={}; choose the provider's supported sample_algorithm \
-             if it refuses that field",
-            algorithm.profile_value()
-        )
-    });
-    Status::new(
-        status.code(),
-        format!(
-            "{} [seller configuration fault: model \"{served_model}\" sent max_tokens={sent_max_tokens} \
-             at capabilities.max_output_tokens={configured_output_cap}; correct this model's \
-             max_output_tokens in the models config{sample_hint}]",
-            status.message()
-        ),
-    )
-}
-
 /// Gateway upstream choice (`--mock-model` vs the real adapter). Configured at seller startup
 /// and **immutable** for the gateway's lifetime. The real branch carries base-url + model id;
 /// the key is read from the environment at runtime (see [`openai`]) and is not stored here.
 #[derive(Clone)]
 pub enum UpstreamConfig {
-    /// Mock model: deterministic fake tokens from the prompt.
+    /// Mock model: deterministic fake output from the prompt.
     Mock,
-    /// The same mock model, declaring the exact on-chain registry identity.
+    /// The same mock model, answering as the exact on-chain registry identity.
     MockWithClaimedModel(String),
-    /// Instance scammer: a mock that UNCONDITIONALLY substitutes the model (claims one other than
-    /// the frame's) -- a seller that client-side verification (B7) is obligated to catch. For the failover e2e.
+    /// Instance scammer: a mock that UNCONDITIONALLY answers as another model -- a seller
+    /// that client-side verification is obligated to catch. For the failover e2e.
     MockScammer,
     /// Real OpenAI-compatible upstream (Groq, etc.): API base + market model id.
     OpenAi(openai::OpenAiConfig),
@@ -220,54 +153,35 @@ pub enum UpstreamConfig {
 }
 
 impl UpstreamConfig {
-    pub(crate) fn supported_reasoning_efforts(&self) -> Vec<String> {
+    /// Consumer API paths this upstream serves, as declared in the challenge.
+    pub(crate) fn api_formats(&self) -> &'static [ApiFormat] {
         match self {
-            Self::OpenAi(cfg) => cfg
-                .capabilities
-                .reasoning_effort
-                .as_ref()
-                .map(|cfg| {
-                    cfg.supported
-                        .iter()
-                        .map(|effort| effort.as_str().to_owned())
-                        .collect()
-                })
-                .unwrap_or_default(),
-            _ => Vec::new(),
+            Self::OpenAi(_) => &[ApiFormat::ChatCompletions, ApiFormat::Responses],
+            Self::Anthropic(_) => &[ApiFormat::Messages],
+            Self::Mock | Self::MockWithClaimedModel(_) | Self::MockScammer => &[
+                ApiFormat::ChatCompletions,
+                ApiFormat::Responses,
+                ApiFormat::Messages,
+            ],
         }
     }
 
-    #[allow(clippy::result_large_err)]
-    pub(crate) fn validate_reasoning(&self, params: Option<&SamplingParams>) -> Result<(), Status> {
-        if let Self::OpenAi(cfg) = self {
-            return cfg.capabilities.validate_reasoning(params);
+    /// The deal model a request must name, and the provider model id sent in its place.
+    /// `None` = a mock without a market identity, which serves whatever model is named.
+    pub(crate) fn request_model(&self) -> Option<(&str, &str)> {
+        match self {
+            Self::OpenAi(cfg) => Some((&cfg.frame_model, &cfg.model)),
+            Self::Anthropic(cfg) => Some((&cfg.frame_model, &cfg.model)),
+            Self::MockWithClaimedModel(model) => Some((model, model)),
+            Self::Mock | Self::MockScammer => None,
         }
-        if params.is_some_and(|p| p.reasoning_effort.is_some()) {
-            return Err(Status::invalid_argument(
-                "unsupported_parameter: this seller/model does not support reasoning effort",
-            ));
-        }
-        if params.is_some_and(|p| p.disable_reasoning) && !self.supports_reasoning_disable() {
-            return Err(Status::invalid_argument(
-                "unsupported_parameter: this seller/model cannot disable reasoning",
-            ));
-        }
-        Ok(())
     }
 
-    /// Per-deal declaration, read before any paid inference. Old/undeclared profiles stay unsupported.
-    pub(crate) fn supports_reasoning_disable(&self) -> bool {
-        match self {
-            Self::OpenAi(cfg) => {
-                cfg.capabilities.reasoning_disable
-                    != dexdo_core::params::ReasoningDisableControl::Unsupported
-            }
-            Self::Anthropic(cfg) => {
-                cfg.reasoning_disable
-                    == dexdo_core::params::ReasoningDisableControl::ThinkingDisabled
-            }
-            _ => false,
-        }
+    pub(crate) fn is_mock(&self) -> bool {
+        matches!(
+            self,
+            Self::Mock | Self::MockWithClaimedModel(_) | Self::MockScammer
+        )
     }
 
     /// **Provider health.** Prove that the configured endpoint accepts the configured credentials and
@@ -348,205 +262,124 @@ impl UpstreamConfig {
         market: Option<&str>,
         requirements: Option<StartupCapabilityRequirements>,
     ) -> Result<()> {
-        if matches!(
-            self,
-            Self::Mock | Self::MockWithClaimedModel(_) | Self::MockScammer
-        ) {
+        if self.is_mock() {
             return Ok(());
         }
-
-        // two questions with two shapes. Plain readiness asks "can you deliver at all?"; a
-        // capability probe asks the provider to PROVE a declared `--tools`/`--think`. Only the
-        // branch carrying `StartupCapabilityRequirements` moves here -- the plain readiness request
-        // below is byte-identical to what it has always sent, and
-        // `issue_1227_plain_id_uses_the_unchanged_readiness_request_and_no_extra_probe` fails if
-        // this leaks into it.
-
-        // The PROMPT is chosen by whether a tool is actually OFFERED, not by whether this is a
-        // capability probe. `build_request_with_startup_capabilities` builds `tools`/`tool_choice`
-        // from `requirements.tools` alone, so a `--think`-only market sends a body with no tool in
-        // it; asking THAT body to call `dexdo_capability_probe` would name a tool the request does
-        // not carry -- the same self-contradiction, mirrored. A `--think`-only probe therefore keeps
-        // the readiness prompt.
-
-        // The BUDGET is the model's OWN declared output cap, not a number of ours. A capability
-        // probe has to fit whatever the model does before it can answer -- under a forced
-        // `tool_choice` the provider buffers the generation to parse the call, so a model cut off
-        // mid-reasoning is reported as having refused. How long that takes is a property of the
-        // model, it varies between samples of the SAME model, and there are more models and more
-        // providers than we can measure: any constant we pick here is fitted to whatever we last
-        // measured and wrong for the next one. `resolve_model_output_cap` already holds the model's
-        // own statement about itself, so we use that and stop guessing.
-
-        // This costs nothing. `max_tokens` is a CEILING, not a spend: a model that calls the tool
-        // spends what it needs and stops, and the provider bills the tokens produced, not the
-        // ceiling offered. Raising the ceiling buys headroom for free.
-
-        // An unknown cap FAILS CLOSED here, naming the model and the fix, exactly as the serving
-        // path does -- never a fallback number, which is the habit this change exists to break.
-        let (prompt, max_tokens) = match requirements {
-            Some(requirements) => {
-                let declared = match self {
-                    Self::OpenAi(cfg) => resolve_model_output_cap(
-                        cfg.capabilities.max_output_tokens,
-                        &cfg.frame_model,
-                        &cfg.model,
-                    ),
-                    Self::Anthropic(cfg) => resolve_model_output_cap(
-                        cfg.max_output_tokens,
-                        &cfg.frame_model,
-                        &cfg.model,
-                    ),
-                    Self::Mock | Self::MockWithClaimedModel(_) | Self::MockScammer => {
-                        unreachable!("capability probes are refused for mock upstreams above")
-                    }
-                };
-                let cap = match declared {
-                    Ok(cap) => cap,
-                    Err(status) => {
-                        let status = requirements.wrap_status(status);
-                        let detail = format!(
-                            "upstream readiness failed ({:?}): {}",
-                            status.code(),
-                            status.message()
-                        );
-                        return Err(anyhow::Error::new(status).context(detail));
-                    }
-                };
-                let prompt = if requirements.tools {
-                    CAPABILITY_PROBE_PROMPT
-                } else {
-                    UPSTREAM_HEALTH_PROBE_PROMPT
-                };
-                (prompt, cap)
-            }
-            None => (
-                UPSTREAM_HEALTH_PROBE_PROMPT,
-                UPSTREAM_HEALTH_PROBE_MAX_TOKENS,
-            ),
+        // two questions with two shapes. Plain readiness asks "can you deliver at all?" in a
+        // bounded probe; a capability probe asks the provider to PROVE a declared `--tools`/`--think`
+        // and is left unbounded, so a model that thinks before calling the tool is never cut off and
+        // reported as incapable. The PROMPT follows whether a tool is actually OFFERED: a
+        // `--think`-only market sends no tool and keeps the readiness prompt.
+        let prompt = if requirements.is_some_and(|requirements| requirements.tools) {
+            CAPABILITY_PROBE_PROMPT
+        } else {
+            UPSTREAM_HEALTH_PROBE_PROMPT
         };
-
-        let request = CanonRequest {
-            messages: vec![ChatMessage {
-                role: "user".to_string(),
-                content: prompt.to_string(),
-            }],
-            params: Some(SamplingParams {
-                temperature: 0.0,
-                max_tokens,
-                stop: Vec::new(),
-                // Readiness asks only whether the provider can answer. B7's provider-specific greedy
-                // control is irrelevant here and may itself be rejected by an otherwise healthy endpoint.
-                greedy: false,
-                disable_reasoning: false,
-                reasoning_effort: None,
-            }),
-            ..Default::default()
+        let max_tokens = requirements
+            .is_none()
+            .then_some(UPSTREAM_HEALTH_PROBE_MAX_TOKENS);
+        let request = match self {
+            Self::OpenAi(cfg) => openai::probe_request(cfg, prompt, max_tokens, requirements),
+            Self::Anthropic(cfg) => anthropic::probe_request(cfg, prompt, max_tokens),
+            Self::Mock | Self::MockWithClaimedModel(_) | Self::MockScammer => {
+                unreachable!("mock upstreams return above")
+            }
         };
         let (tx, mut rx) = mpsc::channel(UPSTREAM_HEALTH_CHANNEL_CAPACITY);
-        // Readiness has its own outer deadline and cadence. Return a typed throttle now,
-        // rather than hiding it inside a longer request retry until readiness calls it a timeout.
         let (model, backend) = self.metric_labels();
         let run = crate::telemetry::request(model, "probe", backend, async {
             match self {
-                Self::OpenAi(cfg) => {
-                    openai::run_probe(
-                        cfg,
-                        market,
-                        requirements,
-                        u64::from(max_tokens),
-                        Some(request),
-                        tx,
-                    )
-                    .await
-                }
-                _ => {
-                    self.dispatch(u64::from(max_tokens), Some(request), tx)
-                        .await
+                Self::OpenAi(cfg) => openai::run_for_market(cfg, market, &request, tx).await,
+                Self::Anthropic(cfg) => anthropic::run(cfg, &request, tx).await,
+                Self::Mock | Self::MockWithClaimedModel(_) | Self::MockScammer => {
+                    unreachable!("mock upstreams return above")
                 }
             }
         });
         tokio::pin!(run);
+        let mut capability = requirements.map(openai::CapabilityObservation::new);
+        let mut ran = false;
 
         loop {
-            tokio::select! {
-                item = rx.recv() => match item {
-                    // visible content is not a complete provider billing record. Read the
-                    // stream through its validated terminal usage before declaring readiness.
-                    Some(Ok(UpstreamEvent::Chunk(_))) => continue,
-                    Some(Ok(UpstreamEvent::Usage(usage))) if usage.output_tokens > 0 => return Ok(()),
-                    Some(Ok(_)) => continue,
-                    Some(Err(status)) => {
-                        let status = match requirements {
-                            Some(requirements) => requirements.wrap_status(status),
-                            None => status,
-                        };
-                        // The status CARRIES the remediation -- the missing output cap, the
-                        // absent key, the substituted model -- and printing the code alone
-                        // threw it away: the operator saw `FailedPrecondition` and nothing to
-                        // act on, with the seller refusing to post and no way to tell why.
-
-                        // the message stays IN the context string, because the caller in
-                        // `seller::liveness` renders this with `error.to_string()` -- which shows
-                        // only the outermost context -- and stores it in a `HealthFailure` with no
-                        // source. The `Status` is ALSO attached as the typed cause, so a renderer
-                        // that walks the chain can still downcast to it.
-                        let detail = format!(
-                            "upstream readiness failed ({:?}): {}",
-                            status.code(),
-                            status.message()
-                        );
-                        return Err(anyhow::Error::new(status).context(detail));
+            let item = if ran {
+                rx.try_recv().ok()
+            } else {
+                tokio::select! {
+                    item = rx.recv() => item,
+                    _ = &mut run => {
+                        ran = true;
+                        continue;
                     }
-                    None => bail!("upstream readiness produced no authoritative model-token usage"),
-                },
-                _ = &mut run => {
-                    while let Ok(item) = rx.try_recv() {
-                        match item {
-                            Ok(UpstreamEvent::Chunk(_)) => {}
-                            Ok(UpstreamEvent::Usage(usage)) if usage.output_tokens > 0 => return Ok(()),
-                            Ok(_) => {}
-                            Err(status) => {
-                                let status = match requirements {
-                                    Some(requirements) => requirements.wrap_status(status),
-                                    None => status,
-                                };
-                                // same as above -- the provider's message stays in the
-                                // context string (the caller renders only the outermost one) and
-                                // the typed `Status` is attached as the cause.
-                                let detail = format!(
-                                    "upstream readiness failed ({:?}): {}",
-                                    status.code(),
-                                    status.message()
-                                );
-                                return Err(anyhow::Error::new(status).context(detail));
-                            }
+                }
+            };
+            let Some(item) = item else {
+                bail!("upstream readiness produced no authoritative model-token usage");
+            };
+            match item {
+                Ok(UpstreamEvent::Data { bytes, .. }) => {
+                    if let Some(observation) = capability.as_mut() {
+                        if let Err(status) = observation.observe(&bytes) {
+                            return Err(readiness_failure(status, requirements));
                         }
                     }
-                    bail!("upstream readiness produced no authoritative model-token usage");
                 }
+                Ok(UpstreamEvent::Head(head)) if !(200..300).contains(&head.status) => {
+                    let status = u16::try_from(head.status)
+                        .ok()
+                        .and_then(|status| reqwest::StatusCode::from_u16(status).ok())
+                        .map_or_else(
+                            || Status::unavailable(format!("upstream HTTP {}", head.status)),
+                            forward::http_failure,
+                        );
+                    return Err(readiness_failure(status, requirements));
+                }
+                Ok(UpstreamEvent::Head(_)) => {}
+                // visible content is not a complete provider billing record. Read the
+                // stream through its validated terminal usage before declaring readiness.
+                Ok(UpstreamEvent::Usage(usage)) if usage.output_tokens > 0 => {
+                    if let Some(observation) = capability.as_ref() {
+                        observation
+                            .validate(usage.output_tokens)
+                            .map_err(|status| readiness_failure(status, requirements))?;
+                    }
+                    return Ok(());
+                }
+                Ok(UpstreamEvent::Usage(_)) => {}
+                Err(status) => return Err(readiness_failure(status, requirements)),
             }
         }
     }
 
-    /// Run the upstream: normalize its output into `CanonChunk` and send it incrementally into
-    /// `tx` (R6). `output_limit` is the provider/model output cap; total billing is carried only by
-    /// terminal usage and checked against the separate gateway reservation. `req` is
-    /// the buyer's canonical request (R1). Finishes on upstream
-    /// exhaustion, on reaching `count`, or when the buyer disconnected (`tx` closed = STOP).
+    /// Relay one consumer request to the provider (R6): the response's status, headers and bytes
+    /// travel into `tx` as they arrive, followed by its terminal usage. Finishes on upstream
+    /// exhaustion or when the buyer disconnected (`tx` closed = STOP). `mock_token_count` bounds the
+    /// mock model's output and is ignored by real providers.
     pub async fn run(
         &self,
-        output_limit: u64,
-        req: Option<CanonRequest>,
+        request: ProviderRequest,
+        mock_token_count: u64,
         tx: mpsc::Sender<UpstreamResult>,
     ) {
         let (model, backend) = self.metric_labels();
-        crate::telemetry::request(
-            model,
-            "inference",
-            backend,
-            self.dispatch(output_limit, req, tx),
-        )
+        crate::telemetry::request(model, "inference", backend, async {
+            match self {
+                Self::Mock => mock::run(&request, mock_token_count, None, tx).await,
+                Self::MockWithClaimedModel(claimed) => {
+                    mock::run(&request, mock_token_count, Some(claimed), tx).await
+                }
+                Self::MockScammer => {
+                    mock::run(
+                        &request,
+                        mock_token_count,
+                        Some(mock::SUBSTITUTED_MODEL),
+                        tx,
+                    )
+                    .await
+                }
+                Self::OpenAi(cfg) => openai::run_for_market(cfg, None, &request, tx).await,
+                Self::Anthropic(cfg) => anthropic::run(cfg, &request, tx).await,
+            }
+        })
         .await
     }
 
@@ -559,33 +392,33 @@ impl UpstreamConfig {
         };
         (self.startup_market_model().unwrap_or("mock"), backend)
     }
+}
 
-    /// One upstream call without request metrics: [`Self::run`] and the readiness probe each
-    /// measure it once under their own `purpose`.
-    async fn dispatch(
-        &self,
-        output_limit: u64,
-        req: Option<CanonRequest>,
-        tx: mpsc::Sender<UpstreamResult>,
-    ) {
-        match self {
-            UpstreamConfig::Mock => mock::run(output_limit, req.as_ref(), tx, false, None).await,
-            UpstreamConfig::MockWithClaimedModel(claimed_model) => {
-                mock::run(
-                    output_limit,
-                    req.as_ref(),
-                    tx,
-                    false,
-                    Some(claimed_model.as_str()),
-                )
-                .await
-            }
-            UpstreamConfig::MockScammer => {
-                mock::run(output_limit, req.as_ref(), tx, true, None).await
-            }
-            UpstreamConfig::OpenAi(cfg) => openai::run(cfg, None, output_limit, req, tx).await,
-            UpstreamConfig::Anthropic(cfg) => anthropic::run(cfg, output_limit, req, tx).await,
-        }
+/// the provider's message stays IN the context string, because the caller in
+/// `seller::liveness` renders this with `error.to_string()` -- which shows only the outermost
+/// context. The `Status` is ALSO attached as the typed cause, so a renderer that walks the chain
+/// can still downcast to it.
+fn readiness_failure(
+    status: Status,
+    requirements: Option<StartupCapabilityRequirements>,
+) -> anyhow::Error {
+    let status = match requirements {
+        Some(requirements) => requirements.wrap_status(status),
+        None => status,
+    };
+    let detail = format!(
+        "upstream readiness failed ({:?}): {}",
+        status.code(),
+        status.message()
+    );
+    anyhow::Error::new(status).context(detail)
+}
+
+/// A request body for a seller-built probe.
+fn probe_body(fields: serde_json::Value) -> RequestBody {
+    match fields {
+        serde_json::Value::Object(object) => RequestBody(object),
+        _ => unreachable!("probe bodies are JSON objects"),
     }
 }
 
@@ -598,14 +431,12 @@ mod tests {
     fn seller_runtime_policy_is_owned_by_core_params() {
         use dexdo_core::params::{
             GATEWAY_CLIENT_CHANNEL_CAPACITY, GATEWAY_UPSTREAM_CHANNEL_CAPACITY,
-            UPSTREAM_ERROR_BODY_MAX_BYTES, UPSTREAM_ERROR_DETAIL_MAX_BYTES,
-            UPSTREAM_ERROR_ECHO_PREFIX_CHARS, UPSTREAM_SSE_FRAME_MAX_BYTES,
+            UPSTREAM_RESPONSE_BODY_MAX_BYTES, UPSTREAM_SSE_FRAME_MAX_BYTES,
+            UPSTREAM_UNSTREAMED_RESPONSE_TIMEOUT,
         };
 
         assert_eq!(UPSTREAM_HEALTH_PROBE_PROMPT, "Reply with OK.");
-        // the pin moved from 1 to the canonical content-probe budget. What this test owns is
-        // that the knob lives in core params and is stated exactly here -- not the number itself, and
-        // the number is still pinned exactly, not loosened.
+        // the readiness budget is the canonical content-probe budget, pinned exactly.
         assert_eq!(
             UPSTREAM_HEALTH_PROBE_MAX_TOKENS,
             dexdo_core::params::CONTENT_PROBE_MAX_TOKENS as u32
@@ -614,15 +445,22 @@ mod tests {
         assert_eq!(UPSTREAM_HEALTH_CHANNEL_CAPACITY, 4);
         assert_eq!(GATEWAY_UPSTREAM_CHANNEL_CAPACITY, 16);
         assert_eq!(GATEWAY_CLIENT_CHANNEL_CAPACITY, 16);
-        assert_eq!(UPSTREAM_ERROR_BODY_MAX_BYTES, 4_096);
-        assert_eq!(UPSTREAM_ERROR_DETAIL_MAX_BYTES, 1_024);
-        assert_eq!(UPSTREAM_ERROR_ECHO_PREFIX_CHARS, 32);
-        assert_eq!(UPSTREAM_SSE_FRAME_MAX_BYTES, 1_048_576);
+        assert_eq!(
+            UPSTREAM_SSE_FRAME_MAX_BYTES,
+            UPSTREAM_RESPONSE_BODY_MAX_BYTES
+        );
+        assert_eq!(UPSTREAM_RESPONSE_BODY_MAX_BYTES, 32 * 1024 * 1024);
+        assert_eq!(
+            UPSTREAM_UNSTREAMED_RESPONSE_TIMEOUT,
+            std::time::Duration::from_secs(180)
+        );
 
-        let upstream = include_str!("mod.rs")
-            .split_once("#[cfg(test)]\nmod tests")
-            .expect("upstream unit-test module boundary")
-            .0;
+        let production = |source: &'static str| {
+            source
+                .split_once("#[cfg(test)]\nmod tests")
+                .map_or(source, |(production, _)| production)
+        };
+        let upstream = production(include_str!("mod.rs"));
         for name in [
             "UPSTREAM_HEALTH_PROBE_PROMPT",
             "UPSTREAM_HEALTH_PROBE_MAX_TOKENS",
@@ -633,56 +471,21 @@ mod tests {
                 "upstream must consume params::{name}"
             );
         }
-        for literal in [
-            "content: \"Reply with OK.\"",
-            "max_tokens: 1",
-            "mpsc::channel(4)",
-            "self.run(1,",
-        ] {
+        for literal in ["\"Reply with OK.\"", "mpsc::channel(4)"] {
             assert!(
                 !upstream.contains(literal),
                 "upstream production policy must not copy {literal}"
             );
         }
-
-        let gateway = include_str!("../gateway.rs")
-            .split_once("#[cfg(test)]\nmod tests")
-            .expect("gateway unit-test module boundary")
-            .0;
+        let gateway = production(include_str!("../gateway.rs"));
         assert!(gateway.contains("GATEWAY_UPSTREAM_CHANNEL_CAPACITY"));
         assert!(gateway.contains("GATEWAY_CLIENT_CHANNEL_CAPACITY"));
         assert!(!gateway.contains("mpsc::channel(16)"));
-
-        let openai = include_str!("openai.rs")
-            .split_once("#[cfg(test)]\nmod tests")
-            .expect("OpenAI unit-test module boundary")
-            .0;
-        for name in [
-            "UPSTREAM_ERROR_BODY_MAX_BYTES",
-            "UPSTREAM_ERROR_DETAIL_MAX_BYTES",
-            "UPSTREAM_ERROR_ECHO_PREFIX_CHARS",
-            "UPSTREAM_SSE_FRAME_MAX_BYTES",
-        ] {
-            assert!(openai.contains(name), "OpenAI must consume params::{name}");
-        }
-        for alias in [
-            "MAX_UPSTREAM_ERROR_BODY_BYTES",
-            "MAX_UPSTREAM_ERROR_DETAIL_BYTES",
-            "PARTIAL_ECHO_PREFIX_CHARS",
-            "MAX_SSE_FRAME_BYTES",
-        ] {
-            assert!(
-                !openai.contains(alias),
-                "OpenAI must not own local alias {alias}"
-            );
-        }
-
-        let anthropic = include_str!("anthropic.rs")
-            .split_once("#[cfg(test)]\nmod tests")
-            .expect("Anthropic unit-test module boundary")
-            .0;
-        assert!(anthropic.contains("UPSTREAM_SSE_FRAME_MAX_BYTES"));
-        assert!(!anthropic.contains("MAX_SSE_FRAME_BYTES"));
+        let forward = production(include_str!("forward.rs"));
+        assert!(forward.contains("UPSTREAM_RESPONSE_BODY_MAX_BYTES"));
+        assert!(forward.contains("UPSTREAM_UNSTREAMED_RESPONSE_TIMEOUT"));
+        assert!(production(include_str!("../../api_format.rs"))
+            .contains("UPSTREAM_SSE_FRAME_MAX_BYTES"));
     }
 
     fn model(base_url: &str, served_model: &str) -> ModelConfig {
@@ -693,10 +496,7 @@ mod tests {
             api_key_env: "PROVIDER_API_KEY".to_string(),
             tokenizer_family: "qwen".to_string(),
             price_per_tick: 1,
-            capabilities: Capabilities {
-                max_output_tokens: Some(openai::DEFAULT_MAX_OUTPUT_TOKENS),
-                ..Capabilities::default()
-            },
+            capabilities: Capabilities::default(),
             identity_aliases: Vec::new(),
             vocab_size: None,
             fingerprints: Vec::new(),
@@ -713,7 +513,6 @@ mod tests {
         assert_eq!(openai.model, openai_model.served_model);
         assert_eq!(openai.base_url, openai_model.base_url);
         assert_eq!(openai.api_key_env, openai_model.api_key_env);
-        assert_eq!(openai.capabilities, openai_model.capabilities);
         assert_eq!(
             openai::OpenAiConfig::from_model(&openai_model, None).frame_model,
             openai_model.frame_model
@@ -731,25 +530,47 @@ mod tests {
         );
     }
 
-    async fn first_claimed_model(upstream: UpstreamConfig) -> String {
-        let (tx, mut rx) = mpsc::channel(2);
-        upstream.run(1, None, tx).await;
-        match rx.recv().await.unwrap().unwrap() {
-            UpstreamEvent::Chunk(chunk) => chunk.manifest.unwrap().claimed_model,
-            UpstreamEvent::Usage(_) => panic!("mock must emit a chunk first"),
+    async fn answering_model(upstream: UpstreamConfig) -> String {
+        let request = ProviderRequest {
+            format: ApiFormat::ChatCompletions,
+            body: RequestBody::parse(br#"{"model":"requested","messages":[],"stream":true}"#)
+                .unwrap(),
+            headers: Vec::new(),
+        };
+        let (tx, mut rx) = mpsc::channel(16);
+        upstream.run(request, 1, tx).await;
+        while let Some(event) = rx.recv().await {
+            if let UpstreamEvent::Data {
+                bytes,
+                output: true,
+            } = event.unwrap()
+            {
+                let frame = String::from_utf8(bytes).unwrap();
+                let crate::api_format::Frame::Event { facts, .. } =
+                    crate::api_format::parse_frame(ApiFormat::ChatCompletions, &frame).unwrap()
+                else {
+                    panic!("an output frame is an event");
+                };
+                return facts.model.unwrap();
+            }
         }
+        panic!("mock must emit output");
     }
 
     #[tokio::test]
-    async fn registry_enabled_mock_claims_exact_name_and_disabled_mock_stays_legacy() {
+    async fn the_mock_answers_as_its_registry_identity_the_request_or_a_substitute() {
         assert_eq!(
-            first_claimed_model(UpstreamConfig::MockWithClaimedModel(
+            answering_model(UpstreamConfig::MockWithClaimedModel(
                 "Qwen/Qwen3-32B".to_string()
             ))
             .await,
             "Qwen/Qwen3-32B"
         );
-        assert_eq!(first_claimed_model(UpstreamConfig::Mock).await, "mock");
+        assert_eq!(answering_model(UpstreamConfig::Mock).await, "requested");
+        assert_eq!(
+            answering_model(UpstreamConfig::MockScammer).await,
+            mock::SUBSTITUTED_MODEL
+        );
     }
 
     #[test]
@@ -768,124 +589,6 @@ mod tests {
             assert_eq!(rejected.code(), tonic::Code::Unauthenticated);
             assert!(!dexdo_proto::is_retryable_upstream(&rejected));
             assert!(rejected.message().contains(requirements.flags()));
-        }
-    }
-
-    #[test]
-    fn unknown_model_output_cap_is_refused_with_an_actionable_message() {
-        // unknown != unbounded. The refusal names the model, the missing capability and where to set it.
-        for declared in [None, Some(0)] {
-            let status = resolve_model_output_cap(declared, "qwen--qwen3--32b", "qwen/qwen3-32b")
-                .unwrap_err();
-            assert_eq!(status.code(), tonic::Code::FailedPrecondition);
-            let message = status.message();
-            assert!(message.contains("qwen--qwen3--32b"), "{message}");
-            assert!(message.contains("qwen/qwen3-32b"), "{message}");
-            assert!(message.contains("max_output_tokens"), "{message}");
-            assert!(message.contains("models.json"), "{message}");
-        }
-        assert_eq!(
-            resolve_model_output_cap(Some(40_960), "frame", "served").unwrap(),
-            40_960
-        );
-    }
-
-    /// the capability probe's budget is the model's own declared output cap, and an
-    /// undeclared cap FAILS CLOSED here rather than falling back to a number of ours.
-
-    /// The fallback is the habit this change exists to break: any constant we pick is fitted to the
-    /// models we happened to measure and wrong for the next one. The refusal must still name the
-    /// model and the fix, and it must happen before the provider is contacted -- the base URL below
-    /// is a closed port, so a probe that tried to connect would fail with a transport error instead.
-    #[tokio::test]
-    async fn issue_1278_capability_probe_refuses_an_undeclared_output_cap_before_contacting_anyone()
-    {
-        use crate::seller::OpenAiConfig;
-
-        let upstream = UpstreamConfig::OpenAi(OpenAiConfig {
-            base_url: "http://127.0.0.1:9".to_string(),
-            model: "qwen/qwen3-32b".to_string(),
-            frame_model: "qwen--qwen3--32b--tools".to_string(),
-            claimed_model_override: None,
-            api_key_env: "PATH".to_string(),
-            tokenizer_family: "exact".to_string(),
-            capabilities: Capabilities {
-                max_output_tokens: None,
-                ..Capabilities::default()
-            },
-            identity_aliases: Vec::new(),
-        });
-
-        let error = upstream
-            .check_startup_market_readiness()
-            .await
-            .expect_err("an undeclared output cap must refuse the capability probe")
-            .to_string();
-
-        assert!(error.contains("qwen--qwen3--32b--tools"), "{error}");
-        assert!(error.contains("qwen/qwen3-32b"), "{error}");
-        assert!(error.contains("max_output_tokens"), "{error}");
-        assert!(error.contains("models.json"), "{error}");
-        assert!(
-            !error.contains("connect") && !error.contains("transport"),
-            "the refusal must precede any provider contact: {error}"
-        );
-    }
-
-    #[test]
-    fn provider_request_rejections_are_seller_configuration_faults() {
-        // The seller builds the whole upstream request, so a `4xx` request rejection is its own config fault.
-        for code in [400, 404, 413, 422] {
-            assert!(is_seller_config_http_status(code), "{code}");
-        }
-        // `401/403` keep the dedicated auth class; `408/429` and every `5xx` are transient upstream trouble.
-        for code in [401, 403, 408, 429, 500, 502, 503] {
-            assert!(!is_seller_config_http_status(code), "{code}");
-        }
-    }
-
-    #[test]
-    fn seller_configuration_annotation_keeps_the_parsed_prefix_and_code() {
-        let original =
-            Status::unavailable("upstream HTTP 400 Bad Request: unsupported field: random_seed");
-        let annotated = annotate_seller_config_fault(
-            original,
-            400,
-            "qwen/qwen3-32b",
-            40_961,
-            40_961,
-            Some(SampleAlgorithm::RandomSeed),
-        );
-        assert_eq!(annotated.code(), tonic::Code::Unavailable);
-        let message = annotated.message();
-        assert!(
-            message.starts_with("upstream HTTP 400 Bad Request"),
-            "the classifier and the buyer stream-error policy parse this prefix: {message}"
-        );
-        assert!(message.contains("seller configuration fault"), "{message}");
-        assert!(message.contains("qwen/qwen3-32b"), "{message}");
-        assert!(message.contains("sent max_tokens=40961"), "{message}");
-        assert!(
-            message.contains("capabilities.max_output_tokens=40961"),
-            "{message}"
-        );
-        assert!(
-            message.contains("optional field \"random_seed\""),
-            "{message}"
-        );
-        assert!(
-            message.contains("capabilities.sample_algorithm=RANDOM_SEED"),
-            "{message}"
-        );
-
-        // Transient/auth statuses are left byte-for-byte alone.
-        for code in [401, 429, 503] {
-            let untouched = Status::unavailable("upstream HTTP x");
-            assert_eq!(
-                annotate_seller_config_fault(untouched, code, "m", 1, 1, None).message(),
-                "upstream HTTP x",
-                "{code}"
-            );
         }
     }
 
@@ -930,10 +633,6 @@ mod tests {
         let upstream = UpstreamConfig::OpenAi(openai::OpenAiConfig {
             base_url: format!("http://{address}"),
             api_key_env: KEY_ENV.into(),
-            capabilities: Capabilities {
-                max_output_tokens: Some(openai::DEFAULT_MAX_OUTPUT_TOKENS),
-                ..Capabilities::default()
-            },
             ..openai::OpenAiConfig::default()
         });
         let readiness =
@@ -1002,10 +701,6 @@ mod tests {
                 model: SERVED_MODEL.to_string(),
                 frame_model: FRAME_MODEL.to_string(),
                 api_key_env: "PATH".to_string(),
-                capabilities: Capabilities {
-                    max_output_tokens: Some(openai::DEFAULT_MAX_OUTPUT_TOKENS),
-                    ..Capabilities::default()
-                },
                 ..openai::OpenAiConfig::default()
             });
             let readiness =
@@ -1085,10 +780,6 @@ mod tests {
                 // Production's own shape: the market id is what this upstream sells under.
                 frame_model: market_model.to_string(),
                 api_key_env: "PATH".to_string(),
-                capabilities: Capabilities {
-                    max_output_tokens: Some(openai::DEFAULT_MAX_OUTPUT_TOKENS),
-                    ..Capabilities::default()
-                },
                 ..openai::OpenAiConfig::default()
             });
 

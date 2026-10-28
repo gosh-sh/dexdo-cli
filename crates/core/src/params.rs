@@ -267,7 +267,8 @@ pub const SELLER_MAX_CONCURRENT_REQUESTS_PER_DEAL: std::num::NonZeroU32 =
 /// transaction: `_finalizedOwed += _probeTick` (:674, and `_probeTick == _pricePerTick` since `open()`
 /// 640) pays it, while `_tokensPaid = TICK_SIZE` (:690) and `_tokensFinal = _tokensPend1 = _tokensPend2 =
 /// TICK_SIZE` (:697-699) credit it. Claims are cumulative from zero and the probe is their first tick, not
-/// something claimed on top.
+/// something claimed on top: a seller's cumulative claim is `max(PROBE_SEED_TOKENS, accepted usage)`, so usage
+/// fills the paid tick before anything beyond it is claimed.
 
 /// So the seed is NEVER an unbacked delivery advance for a capacity observer to refuse -- the buyer
 /// bought the trial tick whatever the model actually produced for it -- and NEVER "nothing paid yet".
@@ -440,8 +441,8 @@ pub const POOL_LOCK_TIMEOUT_SECS: u64 = 30;
 /// Interval between private-note pool lock acquisition attempts.
 pub const POOL_LOCK_POLL_INTERVAL: Duration = Duration::from_millis(10);
 
-/// Production interval between buyer continuity-monitor iterations.
-pub const BUYER_MONITOR_POLL_INTERVAL: Duration = Duration::from_secs(1);
+/// Production interval between buyer claim-observer and continuity-monitor iterations.
+pub const BUYER_MONITOR_POLL_INTERVAL: Duration = Duration::from_secs(60);
 
 /// Production delay before retrying a failed buyer recovery action.
 pub const BUYER_MONITOR_RECOVERY_BACKOFF: Duration = Duration::from_secs(30);
@@ -658,76 +659,6 @@ pub enum SampleAlgorithm {
 /// opt into a deterministic B7 reference only by declaring the provider's supported spelling.
 pub const OPENAI_COMPATIBLE_SAMPLE_ALGORITHM_DEFAULT: SampleAlgorithm = SampleAlgorithm::None;
 
-/// Operator-verified wire control for disabling reasoning on the exact provider/model.
-/// Units: one request mode. Undeclared support must never be inferred from a model name.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum ReasoningDisableControl {
-    Unsupported,
-    ChatTemplate,
-    ChatTemplateThinking,
-    ReasoningEffort,
-    #[serde(rename = "openrouter")]
-    OpenRouter,
-    ThinkingDisabled,
-}
-
-pub const REASONING_DISABLE_CONTROL_DEFAULT: ReasoningDisableControl =
-    ReasoningDisableControl::Unsupported;
-
-impl Default for ReasoningDisableControl {
-    fn default() -> Self {
-        REASONING_DISABLE_CONTROL_DEFAULT
-    }
-}
-
-/// Explicit effort levels understood by the CLI. Omission retains provider defaults;
-/// disabling reasoning remains the separate `ReasoningDisableControl` capability.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum ReasoningEffort {
-    Minimal,
-    Low,
-    Medium,
-    High,
-    #[serde(rename = "xhigh")]
-    XHigh,
-    Max,
-}
-
-impl ReasoningEffort {
-    pub fn parse(value: &str) -> Option<Self> {
-        match value {
-            "minimal" => Some(Self::Minimal),
-            "low" => Some(Self::Low),
-            "medium" => Some(Self::Medium),
-            "high" => Some(Self::High),
-            "xhigh" => Some(Self::XHigh),
-            "max" => Some(Self::Max),
-            _ => None,
-        }
-    }
-
-    pub fn as_str(self) -> &'static str {
-        match self {
-            Self::Minimal => "minimal",
-            Self::Low => "low",
-            Self::Medium => "medium",
-            Self::High => "high",
-            Self::XHigh => "xhigh",
-            Self::Max => "max",
-        }
-    }
-}
-
-/// Fixed outbound effort shapes, selected for an operator-verified endpoint/model.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum ReasoningEffortControl {
-    ReasoningEffort,
-    ReasoningEffortNested,
-}
-
 /// Fixed RNG seed carried by both supported seed spellings.
 pub const REFERENCE_SAMPLE_SEED: u32 = 0;
 
@@ -847,17 +778,26 @@ pub const GATEWAY_UPSTREAM_CHANNEL_CAPACITY: usize = 16;
 /// Buffered buyer-facing chunk capacity for one seller gateway stream.
 pub const GATEWAY_CLIENT_CHANNEL_CAPACITY: usize = 16;
 
-/// Maximum upstream error-response body retained for safe parsing.
-pub const UPSTREAM_ERROR_BODY_MAX_BYTES: usize = 4_096;
+/// Maximum buffered incomplete upstream SSE frame, in bytes: as large as a whole provider answer,
+/// since one frame can carry a whole image or document, or repeat the request's `instructions` and
+/// `tools`.
+pub const UPSTREAM_SSE_FRAME_MAX_BYTES: usize = UPSTREAM_RESPONSE_BODY_MAX_BYTES;
 
-/// Maximum sanitized upstream error detail exposed to callers.
-pub const UPSTREAM_ERROR_DETAIL_MAX_BYTES: usize = 1_024;
+/// Shortest leading part of the seller's provider key, in characters, that counts as the key when
+/// a provider error body echoes it cut short.
+pub const UPSTREAM_ERROR_KEY_ECHO_PREFIX_CHARS: usize = 32;
 
-/// Maximum Unicode-scalar prefix retained when detecting echoed secrets.
-pub const UPSTREAM_ERROR_ECHO_PREFIX_CHARS: usize = 32;
+/// Maximum non-streamed provider response body the seller reads before forwarding it, in bytes
+/// (32 MiB), inclusive.
+pub const UPSTREAM_RESPONSE_BODY_MAX_BYTES: usize = 32 * 1024 * 1024;
 
-/// Maximum buffered incomplete upstream SSE frame.
-pub const UPSTREAM_SSE_FRAME_MAX_BYTES: usize = 1_048_576;
+/// How long the seller waits for a whole non-streamed (`"stream": false`) provider response.
+pub const UPSTREAM_UNSTREAMED_RESPONSE_TIMEOUT: Duration = Duration::from_secs(180);
+
+/// Largest gateway protobuf frame the buyer accepts from the seller, in bytes (33 MiB), inclusive:
+/// a whole provider response ([`UPSTREAM_RESPONSE_BODY_MAX_BYTES`]) plus 1 MiB for its response
+/// head and framing.
+pub const GATEWAY_RESPONSE_MAX_BYTES: usize = UPSTREAM_RESPONSE_BODY_MAX_BYTES + 1024 * 1024;
 
 /// GraphQL history page size for order-book event reads.
 pub const BOOK_EVENT_PAGE_SIZE: u32 = 50;
@@ -1961,6 +1901,20 @@ pub fn deal_gas_reserve_raw(max_ticks: u128) -> u128 {
     once.saturating_add(DEAL_BURN_CLAIM_RAW.saturating_mul(max_ticks.max(1)))
 }
 
+/// ECC[2] still reserved when a fresh SELL rests. The constructor and `postFromNote`
+/// have already burned their charges; the seller bond may also have been posted.
+/// Use constructor `getDeal().maxTicks`, never the buyer's requested fill size.
+pub fn deal_buy_reserve_raw(max_ticks: u128, seller_bond_funded: bool) -> u128 {
+    let spent = DEAL_BURN_DEPLOY_RAW
+        + DEAL_BURN_POST_FROM_NOTE_RAW
+        + if seller_bond_funded {
+            DEAL_BURN_FUND_DEAL_RAW
+        } else {
+            0
+        };
+    deal_gas_reserve_raw(max_ticks).saturating_sub(spent)
+}
+
 /// Historical, and kept only because [`deal_gas_requirement_raw_with_overhead`] still names it in
 /// the paragraph explaining what replaced it: the 4.0.34 native fixed part, measured overhead plus
 /// the `value:` the deal attached to its eight outgoing sends. Nothing sizes a deal from it now.
@@ -2340,13 +2294,6 @@ impl Default for ProtocolConsts {
 /// Initial SELL readiness shares this cap between timeouts and typed HTTP 429 throttling;
 /// the latter waits `SellerLivenessParams::health_interval` before its one retry.
 pub const SELLER_UPSTREAM_HEALTH_TIMEOUT_MAX_ATTEMPTS: u32 = 2;
-
-/// Initial full-jitter ceiling for pre-output upstream retries without `Retry-After`.
-pub const UPSTREAM_RETRY_INITIAL_BACKOFF: Duration = Duration::from_secs(1);
-/// Growth factor for each successive retry without a provider-specified delay.
-pub const UPSTREAM_RETRY_BACKOFF_MULTIPLIER: u32 = 2;
-/// Maximum full-jitter ceiling; the original request retry deadline still applies.
-pub const UPSTREAM_RETRY_MAX_BACKOFF: Duration = Duration::from_secs(20);
 
 /// Seller CLI liveness timings for a resting SELL.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -3312,6 +3259,11 @@ mod tests {
     }
 
     #[test]
+    fn buyer_background_monitors_poll_once_per_minute_2189() {
+        assert_eq!(super::BUYER_MONITOR_POLL_INTERVAL, Duration::from_secs(60));
+    }
+
+    #[test]
     fn cli_runtime_parameters_have_exactly_one_source_owner() {
         let owner = include_str!("params.rs");
         let consumers = [
@@ -3496,7 +3448,7 @@ pub const BUYER_USAGE_SQLITE_BUSY_TIMEOUT: Duration = Duration::from_secs(5);
 /// Delay between transient WAL-initialization retries, within the SQLite busy wait budget.
 pub const BUYER_USAGE_SQLITE_INIT_RETRY_INTERVAL: Duration = Duration::from_millis(10);
 /// SQLite format version of the persistent buyer usage history.
-pub const BUYER_USAGE_SCHEMA_VERSION: u32 = 5;
+pub const BUYER_USAGE_SCHEMA_VERSION: u32 = 6;
 /// Default number of financial facts per HTTP page (rows).
 pub const BUYER_USAGE_FACTS_DEFAULT_LIMIT: u32 = 100;
 /// Minimum financial-facts page size (rows).
@@ -3518,3 +3470,27 @@ pub const SELLER_METRICS_FRESHNESS: Duration = Duration::from_secs(120);
 pub const SELLER_METRICS_DEFAULT_ENDPOINT: &str = "http://localhost:4317";
 /// `service.name` resource attribute when `OTEL_SERVICE_NAME` is unset.
 pub const SELLER_METRICS_SERVICE_NAME: &str = "dexdo-seller";
+
+#[cfg(test)]
+mod buy_reserve_2196_tests {
+    use super::*;
+    use proptest::prelude::*;
+
+    #[test]
+    fn gas_2196_reserve_units_match_the_incident() {
+        assert_eq!(deal_gas_reserve_raw(57_500), 862_800_000_000);
+        assert_eq!(deal_buy_reserve_raw(57_500, false), 862_675_000_000);
+        assert_eq!(deal_buy_reserve_raw(57_500, true), 862_665_000_000);
+        assert_eq!(deal_buy_reserve_raw(875, false), 13_300_000_000);
+    }
+
+    proptest! {
+        #[test]
+        fn gas_2196_remaining_reserve_removes_only_already_paid_entries(ticks in 2u128..1_000_000, bond in any::<bool>()) {
+            let spent = DEAL_BURN_DEPLOY_RAW + DEAL_BURN_POST_FROM_NOTE_RAW
+                + if bond { DEAL_BURN_FUND_DEAL_RAW } else { 0 };
+            prop_assert_eq!(deal_buy_reserve_raw(ticks, bond) + spent, deal_gas_reserve_raw(ticks));
+            prop_assert_eq!(deal_buy_reserve_raw(ticks + 1, bond) - deal_buy_reserve_raw(ticks, bond), DEAL_BURN_CLAIM_RAW);
+        }
+    }
+}

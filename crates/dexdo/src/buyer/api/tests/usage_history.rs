@@ -87,10 +87,7 @@ async fn b8_and_b7_transport_failures_preserve_observations_without_accepting_pa
                 Arc::new(UsageStore::open(dir.path().join("usage.sqlite3"), "shellnet").unwrap());
             let (sender, _receiver) = tokio::sync::mpsc::unbounded_channel();
             let state = direct_state_with_deliveries(&harness, sender).with_usage(store.clone());
-            let response = router(state, true)
-                .oneshot(inference_request())
-                .await
-                .unwrap();
+            let response = router(state).oneshot(inference_request()).await.unwrap();
             assert_eq!(response.status(), http::StatusCode::BAD_GATEWAY);
             let body = axum::body::to_bytes(response.into_body(), usize::MAX)
                 .await
@@ -154,7 +151,7 @@ async fn b8_and_b7_cancellation_before_or_after_terminal_remains_incomplete_afte
             let (sender, _receiver) = tokio::sync::mpsc::unbounded_channel();
             let state = direct_state_with_deliveries(&harness, sender).with_usage(store.clone());
             let deal = harness.deals.current().await.unwrap();
-            let request = tokio::spawn(router(state, true).oneshot(inference_request()));
+            let request = tokio::spawn(router(state).oneshot(inference_request()));
             let paid = if b7 { 3 } else { 0 };
             let observed = if after_terminal {
                 if b7 {
@@ -245,7 +242,7 @@ async fn lost_phase_and_marker_writes_keep_b8_and_b7_unknown_after_recovery() {
             let (sender, _receiver) = tokio::sync::mpsc::unbounded_channel();
             let state = direct_state_with_deliveries(&harness, sender).with_usage(store.clone());
             let deal = harness.deals.current().await.unwrap();
-            let request = tokio::spawn(router(state, true).oneshot(inference_request()));
+            let request = tokio::spawn(router(state).oneshot(inference_request()));
             let paid = if b7 { 3 } else { 0 };
             let observed = if terminal_preserved {
                 if b7 {
@@ -355,7 +352,7 @@ async fn skipped_and_cached_verification_keep_complete_zero_for_unperformed_call
         let (sender, _receiver) = tokio::sync::mpsc::unbounded_channel();
         let state = direct_state_with_deliveries(&harness, sender).with_usage(store.clone());
         for _ in 0..2 {
-            let response = router(state.clone(), true)
+            let response = router(state.clone())
                 .oneshot(inference_request())
                 .await
                 .unwrap();
@@ -397,10 +394,7 @@ async fn review_2146_uncertain_verification_output_blocks_resume() {
             let store = Arc::new(UsageStore::open(&path, "shellnet").unwrap());
             let (sender, _receiver) = tokio::sync::mpsc::unbounded_channel();
             let state = direct_state_with_deliveries(&harness, sender).with_usage(store.clone());
-            let response = router(state, true)
-                .oneshot(inference_request())
-                .await
-                .unwrap();
+            let response = router(state).oneshot(inference_request()).await.unwrap();
             assert_eq!(response.status(), http::StatusCode::BAD_GATEWAY);
             let body = axum::body::to_bytes(response.into_body(), usize::MAX)
                 .await
@@ -415,13 +409,11 @@ async fn review_2146_uncertain_verification_output_blocks_resume() {
             );
             let calls = harness.seller.calls();
             let (sender, _receiver) = tokio::sync::mpsc::unbounded_channel();
-            let response = router(
-                direct_state_with_deliveries(&harness, sender).with_usage(store.clone()),
-                true,
-            )
-            .oneshot(inference_request())
-            .await
-            .unwrap();
+            let response =
+                router(direct_state_with_deliveries(&harness, sender).with_usage(store.clone()))
+                    .oneshot(inference_request())
+                    .await
+                    .unwrap();
             assert_eq!(response.status(), http::StatusCode::SERVICE_UNAVAILABLE);
             assert_eq!(harness.seller.calls(), calls);
             assert!(!deal.session.settle_on_exit("shutdown").await.unwrap());
@@ -520,13 +512,11 @@ async fn review_2146_verification_provider_refusal_without_output_allows_retry()
         let store = Arc::new(UsageStore::open(&path, "shellnet").unwrap());
         for _ in 0..2 {
             let (sender, _receiver) = tokio::sync::mpsc::unbounded_channel();
-            let response = router(
-                direct_state_with_deliveries(&harness, sender).with_usage(store.clone()),
-                true,
-            )
-            .oneshot(inference_request())
-            .await
-            .unwrap();
+            let response =
+                router(direct_state_with_deliveries(&harness, sender).with_usage(store.clone()))
+                    .oneshot(inference_request())
+                    .await
+                    .unwrap();
             assert_eq!(response.status(), http::StatusCode::BAD_GATEWAY);
             let deal = harness.deals.current().await.unwrap();
             assert!(deal.session.ensure_open_for_serving().await.is_ok());
@@ -555,7 +545,7 @@ async fn review_2146_pause_between_paid_b8_and_b7_preserves_b8_without_starting_
     let store = Arc::new(UsageStore::open(dir.path().join("usage.sqlite3"), "shellnet").unwrap());
     let (sender, _receiver) = tokio::sync::mpsc::unbounded_channel();
     let state = direct_state_with_deliveries(&harness, sender).with_usage(store.clone());
-    let request = tokio::spawn(router(state, true).oneshot(inference_request()));
+    let request = tokio::spawn(router(state).oneshot(inference_request()));
     tokio::time::timeout(Duration::from_secs(5), async {
         loop {
             if snapshot(&store)["usage"]["total"]["verification"]["observed_total_tokens"] == 4 {

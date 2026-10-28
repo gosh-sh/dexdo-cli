@@ -44,12 +44,26 @@ mod backends_issue_2108_tests;
 #[path = "backends_issue_2122_tests.rs"]
 mod backends_issue_2122_tests;
 
+#[cfg(all(test, unix))]
+#[path = "backends_issue_2196_live.rs"]
+mod backends_issue_2196_live;
+
 fn display_dexdo_address(address: impl ToString) -> String {
     crate::address::display(&address.to_string())
 }
 
 fn display_token_contract(address: impl ToString) -> String {
     crate::address::display_self_dapp(&address.to_string())
+}
+
+/// The charge source depends on the operation, not on the native balance.
+#[derive(Clone, Copy)]
+enum TcGasOperation<'a> {
+    Buy,
+    SettleWeek,
+    Stop(&'a Address),
+    Dispute(&'a Address),
+    CleanupUnopened,
 }
 
 fn now_secs_at(now: std::time::SystemTime) -> Result<u64, ChainError> {
@@ -589,18 +603,6 @@ impl RealDealBackend {
     async fn wait_state_bool(&self, tc: &Address, key: &str, want: bool) -> Result<(), ChainError> {
         wait_tc_bool(&self.chain, tc, key, want).await
     }
-
-    async fn ensure_tc_gas(&self, tc: &Address) -> Result<(), ChainError> {
-        self.chain
-            .ensure_deal_contract_gas(
-                &self.ctx.seller_note,
-                &self.ctx.seller_keys,
-                self.ctx.nonce,
-                Some(tc),
-            )
-            .await
-            .map_err(map_err)
-    }
 }
 
 /// Pre-settlement view of a deal (`getState` + `getSellerBond`) -- enough to validate a terminal write
@@ -1013,7 +1015,7 @@ mod settle_week_fail_closed_tests {
     }
 
     #[test]
-    fn both_real_settle_week_paths_preflight_before_gas_and_write() {
+    fn both_real_settle_week_paths_preflight_before_write() {
         let source = include_str!("backends.rs");
         for adapter in ["RealDealBackend", "RealSellerBackend"] {
             let marker = format!("impl ChainBackend for {adapter} {{");
@@ -1030,15 +1032,14 @@ mod settle_week_fail_closed_tests {
                 .map(|(body, _)| body)
                 .expect("next adapter method");
             let pre = body.find("required_subscription_week_index(").unwrap();
-            let gas = body.find("self.ensure_tc_gas(&tc)").unwrap();
             let write = body.find("self.chain.settle_week(&tc)").unwrap();
             let post = body[write + 1..]
                 .find("settle_week_post_confirmed(")
                 .map(|index| write + 1 + index)
                 .expect("strict post-read");
             assert!(
-                pre < gas && gas < write && write < post,
-                "{adapter} must read strictly before gas/write and after the write"
+                pre < write && write < post,
+                "{adapter} must read strictly before and after the write"
             );
             assert!(!body.contains("unwrap_or(0)"));
             assert!(body.contains("ClaimConfirmationParams::canonical()"));
@@ -1094,7 +1095,7 @@ fn seller_bond_not_funded_after_post_reason(
     token_contract: &TokenContract,
     seller_note: &Address,
     post_amount: u128,
-    note_spendable_shell: u128,
+    note_spendable_shell: Option<u128>,
     state: Option<&Value>,
     bond: Option<&Value>,
 ) -> String {
@@ -1103,28 +1104,11 @@ fn seller_bond_not_funded_after_post_reason(
     format!(
         "TokenContract {display_tc}: fundDeal submitted but getSellerBond().bondFunded stayed false; \
          refusing TokenContract.open because open() would revert with airegistry::ERR_BOND_NOT_FUNDED (332). \
-         seller note {display_note} getDetails.balance[2] SHELL after submit={note_spendable_shell}, \
+         seller note {display_note} getDetails.balance[2] SHELL after submit={}, \
          exact_seller_bond_2P={post_amount}, state={state:?}, seller_bond={bond:?}. \
-         Re-mint/fund the seller note with enough nominal SHELL for the bond."
+         Keep the recovery files and reconcile the submitted note and TC transactions; settlement is unconfirmed.",
+         note_spendable_shell.map_or_else(|| "unavailable".to_string(), |value| value.to_string()),
     )
-}
-
-async fn seller_note_physical_shell(
-    chain: &RealChainBackend,
-    seller_note: &Address,
-) -> Result<u128, ChainError> {
-    let display_note = display_dexdo_address(seller_note);
-    let acc = chain
-        .client()
-        .get_system_account_retrying(seller_note)
-        .await
-        .map_err(map_err)?
-        .ok_or_else(|| {
-            ChainError::Chain(format!(
-                "seller note {display_note} disappeared before the seller-bond fundDeal"
-            ))
-        })?;
-    Ok(acc.ecc_balance(2))
 }
 
 async fn seller_note_spendable_shell(
@@ -1160,69 +1144,6 @@ fn validate_seller_bond_note_record(
         )));
     }
     Ok(())
-}
-
-fn validate_seller_bond_note_reserve(
-    token_contract: &TokenContract,
-    seller_note: &Address,
-    note_spendable_shell: u128,
-    note_physical_shell: u128,
-    post_amount: u128,
-    tc_reserve_ecc: u128,
-    max_ticks: u128,
-) -> Result<u128, ChainError> {
-    validate_seller_bond_note_reserve_with_overhead(
-        token_contract,
-        seller_note,
-        note_spendable_shell,
-        note_physical_shell,
-        post_amount,
-        tc_reserve_ecc,
-        max_ticks,
-        // ZERO surplus (contracts 4.0.36). This used to pass the measured native remainder, which is
-        // now a historical constant: adding it here would hold back 0.135 SHELL of the seller's note
-        // against a plane the seller no longer funds.
-        0,
-    )
-}
-
-#[allow(clippy::too_many_arguments)]
-fn validate_seller_bond_note_reserve_with_overhead(
-    token_contract: &TokenContract,
-    seller_note: &Address,
-    note_spendable_shell: u128,
-    note_physical_shell: u128,
-    post_amount: u128,
-    tc_reserve_ecc: u128,
-    max_ticks: u128,
-    deal_gas_overhead_raw: u128,
-) -> Result<u128, ChainError> {
-    let display_tc = display_token_contract(token_contract);
-    let display_note = display_dexdo_address(seller_note);
-    // the reserve must be for the top-up that will actually happen, and that one is sized to
-    // this deal's `maxTicks` (`ensure_deal_contract_gas`). Holding back a flat ten vmshell here
-    // refuses a note that can perfectly well afford the deal in front of it.
-    let pending_tc_top_up = gas_health_top_up_amount(
-        tc_reserve_ecc,
-        crate::params::deal_gas_health_floor_raw_with_overhead(max_ticks, deal_gas_overhead_raw),
-        crate::params::deal_gas_health_target_raw_with_overhead(max_ticks, deal_gas_overhead_raw),
-    )
-    .unwrap_or(0);
-    validate_seller_bond_note_record(
-        token_contract,
-        seller_note,
-        note_spendable_shell,
-        post_amount,
-        "gas top-up and fundDeal",
-    )?;
-    if note_physical_shell < pending_tc_top_up {
-        return Err(ChainError::Chain(format!(
-            "seller note {display_note} has physical ECC[2] gas raw units {note_physical_shell}, below \
-             pending TokenContract gas top-up {pending_tc_top_up} for TokenContract {display_tc}; \
-             refusing gas top-up and fundDeal before money moves."
-        )));
-    }
-    Ok(pending_tc_top_up)
 }
 
 /// E2E-ADV-14 -- "the note covers the `2P` security deposit before the offer is posted". The same record
@@ -1272,22 +1193,15 @@ async fn assert_note_record_covers_seller_bond(
     )
 }
 
-async fn post_seller_bond_and_wait(
+pub(super) async fn post_seller_bond_and_wait(
     chain: &RealChainBackend,
     seller_note: &Address,
     seller_keys: &KeyPair,
     nonce: u64,
     token_contract: &TokenContract,
     tc: &Address,
-    supplied_deal_gas_overhead_raw: Option<u128>,
 ) -> Result<(), ChainError> {
-    let deal_gas_overhead_raw = crate::params::resolve_deal_gas_overhead_raw(
-        chain.network(),
-        supplied_deal_gas_overhead_raw,
-    )
-    .map_err(ChainError::Chain)?;
     let display_tc = display_token_contract(token_contract);
-    let display_note = display_dexdo_address(seller_note);
     let bond_before = chain
         .token_contract_seller_bond(tc)
         .await
@@ -1297,11 +1211,8 @@ async fn post_seller_bond_and_wait(
                 "TokenContract {display_tc}: getSellerBond() returned no data before the seller-bond fundDeal"
             ))
         })?;
-    // One `getDeal` read for both terms this step needs: the price the bond derives from, and the
-    // `maxTicks` the deal's own gas requirement derives from ( -- the top-up below is sized to
-    // THIS deal, so its preflight has to reserve for the same figure).
-    let (_, price_per_tick, max_ticks) = chain
-        .token_contract_deal_terms(tc)
+    let price_per_tick = chain
+        .token_contract_price_per_tick(tc)
         .await
         .map_err(map_err)?
         .ok_or_else(|| {
@@ -1316,93 +1227,62 @@ async fn post_seller_bond_and_wait(
         return Ok(());
     }
 
-    // The deal's ECC[2] RESERVE, not its native balance. Reading native here made the guard below
-    // dead: since 4.0.36 the deal mints its own native floor to `MIN_BALANCE = 100 vmshell`, which is
-    // ~90x the largest requirement this gate computes, so `balance <= floor` was never true, the
-    // pending top-up came out zero, and "does the note cover it" was never asked. Two planes, and
-    // the one that empties is ECC[2].
-    let tc_reserve_ecc = chain.deal_reserve_ecc(tc).await.map_err(map_err)?;
     let note_spendable_shell = seller_note_spendable_shell(chain, seller_note).await?;
-    let note_physical_shell = seller_note_physical_shell(chain, seller_note).await?;
-    if supplied_deal_gas_overhead_raw.is_none() {
-        validate_seller_bond_note_reserve(
-            token_contract,
-            seller_note,
-            note_spendable_shell,
-            note_physical_shell,
-            post_amount,
-            tc_reserve_ecc,
-            max_ticks,
-        )?;
-        chain
-            .ensure_deal_contract_gas(seller_note, seller_keys, nonce, Some(tc))
-            .await
-            .map_err(map_err)?;
-    } else {
-        validate_seller_bond_note_reserve_with_overhead(
-            token_contract,
-            seller_note,
-            note_spendable_shell,
-            note_physical_shell,
-            post_amount,
-            tc_reserve_ecc,
-            max_ticks,
-            deal_gas_overhead_raw,
-        )?;
-        chain
-            .ensure_deal_contract_gas_with_overhead(
-                seller_note,
-                seller_keys,
-                nonce,
-                Some(tc),
-                deal_gas_overhead_raw,
-            )
-            .await
-            .map_err(map_err)?;
-    }
-    let note_spendable_shell = seller_note_spendable_shell(chain, seller_note).await?;
-    if note_spendable_shell < post_amount {
-        return Err(ChainError::Chain(format!(
-            "seller note {display_note} has getDetails.balance[2] SHELL raw units {note_spendable_shell} \
-             after the TokenContract gas-health step, below required seller bond 2P = {post_amount} for \
-             TokenContract {display_tc}; refusing fundDeal"
-        )));
-    }
-    // 4.0.33 funding door: `fundDeal(nonce, gasShell, amount)`. The gas leg stays a separate step --
-    // `ensure_deal_contract_gas` above already topped the TokenContract up through `fundDeployShell`
-    // -- so this message carries `gasShell = 0` and moves the bond figure only.
-    chain
-        .note_fund_deal(seller_note, seller_keys, nonce, 0, post_amount)
-        .await
-        .map_err(map_err)?;
-    for _ in 0..crate::params::SELLER_BOND_CONFIRM_MAX_READS {
-        if chain
-            .token_contract_deal_seller_bond(tc)
-            .await
-            .map_err(map_err)?
-            .is_some_and(|bond| bond.bond_funded)
-        {
-            return Ok(());
-        }
-        tokio::time::sleep(crate::params::SELLER_BOND_CONFIRM_POLL_INTERVAL).await;
-    }
-
-    let state = chain.token_contract_state(tc).await.map_err(map_err)?;
-    let bond = chain
-        .token_contract_seller_bond(tc)
-        .await
-        .map_err(map_err)?;
-    let note_spendable_shell = seller_note_spendable_shell(chain, seller_note)
-        .await
-        .unwrap_or(0);
-    Err(ChainError::Chain(seller_bond_not_funded_after_post_reason(
+    validate_seller_bond_note_record(
         token_contract,
         seller_note,
-        post_amount,
         note_spendable_shell,
-        state.as_ref(),
-        bond.as_ref(),
-    )))
+        post_amount,
+        "fundDeal",
+    )?;
+    // Initial provisioning funded the TC reserve. This message posts only the 2P bond.
+    let (_, message_hash) = chain
+        .note_fund_deal_with_identity(seller_note, seller_keys, nonce, 0, post_amount)
+        .await
+        .map_err(map_err)?;
+    let confirmation = async {
+        for _ in 0..crate::params::SELLER_BOND_CONFIRM_MAX_READS {
+            if chain
+                .token_contract_deal_seller_bond(tc)
+                .await
+                .map_err(map_err)?
+                .is_some_and(|bond| bond.bond_funded)
+            {
+                return Ok(());
+            }
+            tokio::time::sleep(crate::params::SELLER_BOND_CONFIRM_POLL_INTERVAL).await;
+        }
+
+        let state = chain.token_contract_state(tc).await.map_err(map_err)?;
+        let bond = chain
+            .token_contract_seller_bond(tc)
+            .await
+            .map_err(map_err)?;
+        let note_spendable_shell = seller_note_spendable_shell(chain, seller_note).await.ok();
+        Err(ChainError::Chain(seller_bond_not_funded_after_post_reason(
+            token_contract,
+            seller_note,
+            post_amount,
+            note_spendable_shell,
+            state.as_ref(),
+            bond.as_ref(),
+        )))
+    }
+    .await;
+    match confirmation {
+        Ok(()) => Ok(()),
+        Err(error) => Err(map_err(
+            chain
+                .diagnose_note_tc_failure(
+                    seller_note,
+                    tc,
+                    "fundDeal",
+                    &message_hash,
+                    anyhow::Error::new(error),
+                )
+                .await,
+        )),
+    }
 }
 
 #[cfg(test)]
@@ -1427,203 +1307,12 @@ mod seller_bond_open_guard_tests {
             .map(|offset| validation + offset)
             .expect("tuple validation propagates errors");
 
-        for write in ["ensure_deal_contract_gas(", "note_fund_deal("] {
-            let write = body.find(write).expect("seller-bond money write");
-            assert!(
-                validation < validation_error_return && validation_error_return < write,
-                "malformed/inconsistent getSellerBond tuples must return before {write}"
-            );
-        }
-    }
-
-    fn assert_separate_reserves_and_recheck_precede_money_writes() {
-        let source = include_str!("backends.rs");
-        let start = source
-            .find("async fn post_seller_bond_and_wait(")
-            .expect("seller-bond pre-write path");
-        let end = source[start..]
-            .find("\n#[cfg(test)]")
-            .map(|offset| start + offset)
-            .expect("end of seller-bond pre-write path");
-        let body = &source[start..end];
-        let reserve = body
-            .find("validate_seller_bond_note_reserve(")
-            .expect("separate seller-note reserve validation");
-        let gas_write = body
-            .find("ensure_deal_contract_gas(")
-            .expect("TokenContract gas top-up write");
-        let recheck = body[gas_write..]
-            .find("seller_note_spendable_shell(")
-            .map(|offset| gas_write + offset)
-            .expect("seller-note spendable-balance recheck after gas top-up");
-        let bond_write = body
-            .find("note_fund_deal(")
-            .expect("seller-bond post write");
+        let write = body
+            .find("note_fund_deal_with_identity(")
+            .expect("seller-bond money write");
         assert!(
-            reserve < gas_write && gas_write < recheck && recheck < bond_write,
-            "separate bond/gas reserves must precede either write, and the 2P reserve must be \
-             rechecked before fundDeal"
-        );
-    }
-
-    /// the gate has to be given the plane it guards, or it cannot refuse anything.
-
-    /// It was reading the deal's NATIVE balance against an ECC-sized floor. Since 4.0.36 a deal mints
-    /// its own native to `MIN_BALANCE = 100 vmshell` -- about ninety times the largest floor this gate
-    /// computes -- so `balance <= floor` was never true, the pending top-up came out zero, and the
-    /// question "can the note cover it" was never asked. A check that is present, reads as a
-    /// protection, and cannot fail by construction.
-
-    /// Pinned as the property rather than the number: whatever a deal's own native floor is, feeding
-    /// it here must not silence the gate.
-    #[test]
-    fn the_bond_gate_reads_the_reserve_and_not_the_plane_a_deal_mints_for_itself() {
-        let max_ticks = 8;
-        let note =
-            Address::parse("0:9754c903354dfba45c66898e5fcb840c23a892e0829906bea1b554c15b6d7c8c")
-                .unwrap();
-        let floor = crate::params::deal_gas_health_floor_raw(max_ticks);
-        let target = crate::params::deal_gas_health_target_raw(max_ticks);
-        let post_amount = 50;
-
-        // A dry reserve and a note that cannot cover the refill: the gate must refuse.
-        let refused = validate_seller_bond_note_reserve(
-            &"0:tc".to_string(),
-            &note,
-            post_amount,
-            0,
-            post_amount,
-            0,
-            max_ticks,
-        )
-        .expect_err("an empty reserve and an empty note is exactly what this gate is for");
-        assert!(
-            format!("{refused:?}").contains("physical ECC[2]"),
-            "{refused:?}"
-        );
-
-        // The defect, stated as a number the deal really holds: a deal mints native to 100 vmshell.
-        // Feeding that figure as the reserve must NOT make the gate pass -- and it does not, because
-        // 100e9 is far above the floor, which is the point: it was being read as if it were the
-        // reserve, and the reserve is a different pocket that starts near zero.
-        let deal_native_floor = 100 * crate::params::SHELL_UNIT;
-        assert!(
-            deal_native_floor > target,
-            "a deal's minted native floor sits above this gate's whole target, which is why reading \
-             it here silenced the gate rather than loosening it",
-        );
-
-        // And the boundary still behaves: one below the floor asks for a refill to the target.
-        let pending = validate_seller_bond_note_reserve(
-            &"0:tc".to_string(),
-            &note,
-            post_amount,
-            target,
-            post_amount,
-            floor - 1,
-            max_ticks,
-        )
-        .expect("a covered note passes");
-        assert_eq!(pending, target - (floor - 1));
-    }
-
-    #[test]
-    fn seller_bond_reserve_checks_nominal_and_gas_pockets_separately_before_writes() {
-        assert_separate_reserves_and_recheck_precede_money_writes();
-        let post_amount = 50;
-        // the gas pocket is reserved for the top-up THIS deal will take, so the boundary is
-        // the deal's own floor/target -- eight ticks, the shape reports.
-        let max_ticks = 8;
-        let tc_reserve_ecc = crate::params::deal_gas_health_floor_raw(max_ticks) - 1;
-        let pending_top_up = crate::params::deal_gas_health_target_raw(max_ticks) - tc_reserve_ecc;
-        let note =
-            Address::parse("0:9754c903354dfba45c66898e5fcb840c23a892e0829906bea1b554c15b6d7c8c")
-                .unwrap();
-        let nominal_error = validate_seller_bond_note_reserve(
-            &"0:tc".to_string(),
-            &note,
-            post_amount - 1,
-            pending_top_up,
-            post_amount,
-            tc_reserve_ecc,
-            max_ticks,
-        )
-        .expect_err("gas cannot substitute for a missing nominal bond")
-        .to_string();
-        assert!(
-            nominal_error.contains("getDetails.balance[2]"),
-            "{nominal_error}"
-        );
-
-        let gas_error = validate_seller_bond_note_reserve(
-            &"0:tc".to_string(),
-            &note,
-            post_amount,
-            pending_top_up - 1,
-            post_amount,
-            tc_reserve_ecc,
-            max_ticks,
-        )
-        .expect_err("nominal cannot substitute for missing deploy gas")
-        .to_string();
-        assert!(gas_error.contains("physical ECC[2] gas"), "{gas_error}");
-    }
-
-    /// the reserve follows the deal. The same note, the same TC balance and the same bond, on
-    /// two deals of different length, must reserve two different amounts of gas -- otherwise the
-    /// preflight is holding back a flat figure again, and a note that can afford the deal in front
-    /// of it gets refused for a deal it is not doing.
-    #[test]
-    fn seller_bond_reserve_holds_back_this_deal_s_gas_not_a_flat_figure() {
-        let post_amount = 50;
-        let note =
-            Address::parse("0:9754c903354dfba45c66898e5fcb840c23a892e0829906bea1b554c15b6d7c8c")
-                .unwrap();
-        let tc_reserve_ecc = 0;
-        let reserve_for = |max_ticks: u128| {
-            validate_seller_bond_note_reserve(
-                &"0:tc".to_string(),
-                &note,
-                post_amount,
-                u128::MAX,
-                post_amount,
-                tc_reserve_ecc,
-                max_ticks,
-            )
-            .unwrap()
-        };
-        let short = reserve_for(8);
-        let long = reserve_for(1_000);
-        assert!(
-            short < long,
-            "an eight-tick deal reserved {short} and a thousand-tick deal reserved {long}; a reserve \
-             that does not grow with the deal is the flat figure  reports"
-        );
-        assert_eq!(short, crate::params::deal_gas_health_target_raw(8));
-        assert_eq!(long, crate::params::deal_gas_health_target_raw(1_000));
-    }
-
-    #[test]
-    fn seller_bond_reserve_accepts_exact_separate_boundaries() {
-        let post_amount = 50;
-        let max_ticks = 8;
-        let tc_reserve_ecc = crate::params::deal_gas_health_floor_raw(max_ticks) - 1;
-        let pending_top_up = crate::params::deal_gas_health_target_raw(max_ticks) - tc_reserve_ecc;
-        assert_eq!(
-            validate_seller_bond_note_reserve(
-                &"0:tc".to_string(),
-                &Address::parse(
-                    "0:9754c903354dfba45c66898e5fcb840c23a892e0829906bea1b554c15b6d7c8c"
-                )
-                .unwrap(),
-                post_amount,
-                pending_top_up,
-                post_amount,
-                tc_reserve_ecc,
-                max_ticks,
-            )
-            .unwrap(),
-            pending_top_up
+            validation < validation_error_return && validation_error_return < write,
+            "malformed/inconsistent getSellerBond tuples must return before {write}"
         );
     }
 
@@ -1807,7 +1496,7 @@ mod seller_bond_open_guard_tests {
             &"0:9754c903354dfba45c66898e5fcb840c23a892e0829906bea1b554c15b6d7c8c".to_string(),
             &seller_note,
             1_000_000,
-            0,
+            Some(0),
             Some(&state),
             Some(&bond),
         );
@@ -2659,7 +2348,8 @@ mod offer_rested_match_tests {
         orderbook_order_from_getter, orderbook_orders_from_storage, resting_ask_from_order,
         resting_sell_for_tc, selected_model_buy_ask,
         selected_model_buy_ask_matching_executable_depth, submit_safe_executable_book_asks,
-        RealChainBackend, TOKENCONTRACT_ABI, TOKENCONTRACT_TVC,
+        Address, KeyPair, RealBuyerBackend, RealChainBackend, TcGasOperation, TICK_SIZE,
+        TOKENCONTRACT_ABI, TOKENCONTRACT_TVC,
     };
     use base64::Engine as _;
     use serde_json::{json, Value};
@@ -2734,6 +2424,8 @@ mod offer_rested_match_tests {
         boc: String,
         code_hash: String,
         native_balance: u128,
+        ecc_balance: u128,
+        active: bool,
     }
 
     struct ExecutableFilterServer(tokio::task::JoinHandle<()>);
@@ -2748,6 +2440,9 @@ mod offer_rested_match_tests {
         address: &str,
         getter_state: &Value,
         native_balance: u128,
+        ecc_balance: u128,
+        max_ticks: u128,
+        seller_bond_funded: bool,
     ) -> TokenContractAccountFixture {
         use tvm_block::{
             Account as TvmAccount, CurrencyCollection, Deserializable, MsgAddressInt, Serializable,
@@ -2771,7 +2466,7 @@ mod offer_rested_match_tests {
             "_modelName": model_name,
             "_modelHash": crate::manifest::model_hash_for(model_name),
             "_pricePerTick": "10",
-            "_maxTicks": "2",
+            "_maxTicks": max_ticks.to_string(),
             "_buyer": format!("0:{}", "2".repeat(64)),
             "_buyerPubkey": "0x0",
             "_sellerNote": format!("0:{}", "3".repeat(64)),
@@ -2785,7 +2480,7 @@ mod offer_rested_match_tests {
             "_probeAccepted": state.probe_accepted,
             "_probeTick": state.probe_tick.to_string(),
             "_probeTime": state.probe_time.to_string(),
-            "_sellerBondFunded": state.funded,
+            "_sellerBondFunded": seller_bond_funded,
             "_buyerBondFunded": state.funded,
             "_sellerBond": "0",
             "_buyerBond": "0",
@@ -2867,6 +2562,8 @@ mod offer_rested_match_tests {
             ),
             code_hash: code_hash(TOKENCONTRACT_TVC).expect("TokenContract fixture code hash"),
             native_balance,
+            ecc_balance,
+            active: true,
         }
     }
 
@@ -2905,18 +2602,31 @@ mod offer_rested_match_tests {
         states: &BTreeMap<String, Value>,
         balances: &BTreeMap<String, u128>,
     ) -> (RealChainBackend, ExecutableFilterServer) {
-        let fixtures: BTreeMap<String, TokenContractAccountFixture> = states
+        let fixtures = states
             .iter()
             .map(|(address, state)| {
                 let address = address.to_ascii_lowercase();
-                let balance = balances
+                let ecc = balances
                     .get(&address)
                     .copied()
                     .unwrap_or(crate::params::ACTIVE_CONTRACT_GAS_HEALTH_MIN_NANOVMSHELL + 1);
-                let fixture = token_contract_account_fixture(&address, state, balance);
+                let fixture = token_contract_account_fixture(
+                    &address,
+                    state,
+                    crate::params::ACTIVE_CONTRACT_GAS_HEALTH_MIN_NANOVMSHELL + 1,
+                    ecc,
+                    2,
+                    false,
+                );
                 (address.trim_start_matches("0:").to_string(), fixture)
             })
             .collect();
+        executable_fixture_backend(fixtures).await
+    }
+
+    async fn executable_fixture_backend(
+        fixtures: BTreeMap<String, TokenContractAccountFixture>,
+    ) -> (RealChainBackend, ExecutableFilterServer) {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
             .await
             .expect("bind executable-filter endpoint");
@@ -2938,11 +2648,11 @@ mod offer_rested_match_tests {
                     .map(|(account_id, fixture)| {
                         json!({
                             "address": account_id,
-                            "acc_type_name": "Active",
+                            "acc_type_name": if fixture.active { "Active" } else { "Frozen" },
                             "boc": fixture.boc,
                             "code_hash": fixture.code_hash,
                             "balance": format!("0x{:x}", fixture.native_balance),
-                            "balance_other": [],
+                            "balance_other": [{"currency": crate::params::SHELL_CURRENCY_ID, "value": format!("0x{:x}", fixture.ecc_balance)}],
                         })
                     })
                     .unwrap_or(Value::Null);
@@ -2960,6 +2670,202 @@ mod offer_rested_match_tests {
         let backend = RealChainBackend::connect_with_endpoint(manifest(), Some(&endpoint))
             .expect("backend against executable-filter endpoint");
         (backend, ExecutableFilterServer(task))
+    }
+
+    async fn gas_2196_backend(
+        max_ticks: u128,
+        ecc: u128,
+        note_ecc: u128,
+        bond: bool,
+    ) -> (RealBuyerBackend, Address, ExecutableFilterServer) {
+        let tc = Address::parse(&format!("0:{}", "6".repeat(64))).unwrap();
+        let note = Address::parse(&format!("0:{}", "7".repeat(64))).unwrap();
+        let fixtures = [(&tc, ecc), (&note, note_ecc)]
+            .into_iter()
+            .map(|(address, balance)| {
+                (
+                    address.bare().to_string(),
+                    token_contract_account_fixture(
+                        &address.with_workchain(),
+                        &fresh_tc_state(),
+                        112_879_119_000,
+                        balance,
+                        max_ticks,
+                        bond,
+                    ),
+                )
+            })
+            .collect();
+        let (chain, server) = executable_fixture_backend(fixtures).await;
+        let buyer = RealBuyerBackend::new(
+            chain,
+            note,
+            KeyPair::generate(),
+            "0".repeat(64),
+            TICK_SIZE,
+            crate::params::SHELL_UNIT,
+            2,
+            0,
+        );
+        (buyer, tc, server)
+    }
+
+    #[tokio::test]
+    async fn gas_2196_large_buy_uses_ecc_not_native_on_all_production_seams() {
+        let (buyer, tc, _server) = gas_2196_backend(57_500, 862_850_000_000, 0, false).await;
+        let ask = parsed_ask(15, &tc.with_workchain(), crate::params::SHELL_UNIT, 57_500);
+        let book = executable_filter_snapshot(&[ask]);
+        assert_eq!(
+            buyer
+                .chain
+                .executable_resting_asks(&book)
+                .await
+                .unwrap()
+                .len(),
+            1
+        );
+        for requested in [875, 57_500] {
+            assert_eq!(
+                buyer
+                    .chain
+                    .submit_safe_model_buy_ask(&book, requested, crate::params::SHELL_UNIT)
+                    .await
+                    .unwrap()
+                    .order_id,
+                15
+            );
+            let (listed, reason) = buyer
+                .chain
+                .submit_safe_executable_book_asks(&book, requested, crate::params::SHELL_UNIT)
+                .await
+                .unwrap();
+            assert!(reason.is_none(), "{reason:?}");
+            assert_eq!(listed.len(), 1);
+        }
+        buyer
+            .require_tc_gas(&tc, TcGasOperation::Buy)
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn gas_2196_buy_boundaries_and_setup_burns_use_constructor_terms() {
+        for max_ticks in [2, 875, 57_500] {
+            for bond in [false, true] {
+                let required = crate::params::deal_buy_reserve_raw(max_ticks, bond);
+                for have in [required - 1, required, required + 1] {
+                    let (buyer, tc, _server) = gas_2196_backend(max_ticks, have, 0, bond).await;
+                    let book = executable_filter_snapshot(&[parsed_ask(
+                        15,
+                        &tc.with_workchain(),
+                        crate::params::SHELL_UNIT,
+                        max_ticks,
+                    )]);
+                    let expected = have >= required;
+                    assert_eq!(
+                        buyer.require_tc_gas(&tc, TcGasOperation::Buy).await.is_ok(),
+                        expected
+                    );
+                    assert_eq!(
+                        buyer
+                            .chain
+                            .executable_resting_asks(&book)
+                            .await
+                            .unwrap()
+                            .len(),
+                        usize::from(expected)
+                    );
+                    // A small requested fill must not lower a large constructor's requirement.
+                    let result = buyer
+                        .chain
+                        .submit_safe_model_buy_ask(&book, 2, crate::params::SHELL_UNIT)
+                        .await;
+                    assert_eq!(result.is_ok(), expected);
+                    if let Err(error) = result {
+                        assert!(error.to_string().contains("ECC[2] reserve"), "{error}");
+                        assert_eq!(
+                            buy_refusal_class(&error.to_string()),
+                            crate::params::NO_EXECUTABLE_ASK_CLASS
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn gas_2196_exit_checks_operation_charge_and_both_sources() {
+        let charge = crate::params::DEAL_BURN_TERMINAL_RAW;
+        for (tc_ecc, note_ecc, expected) in [
+            (0, charge, true),
+            (charge, 0, true),
+            (charge - 1, charge - 1, false),
+            (0, 0, false),
+        ] {
+            let (buyer, tc, _server) = gas_2196_backend(57_500, tc_ecc, note_ecc, false).await;
+            for operation in [
+                TcGasOperation::Stop(&buyer.note),
+                TcGasOperation::Dispute(&buyer.note),
+            ] {
+                let result = buyer.require_tc_gas(&tc, operation).await;
+                assert_eq!(
+                    result.is_ok(),
+                    expected,
+                    "TC={tc_ecc} note={note_ecc}: {result:?}"
+                );
+                if let Err(error) = result {
+                    assert!(error.to_string().contains("raw ECC[2]"), "{error}");
+                }
+            }
+            buyer
+                .require_tc_gas(&tc, TcGasOperation::CleanupUnopened)
+                .await
+                .unwrap();
+        }
+        let charge = crate::params::DEAL_BURN_SETTLE_RAW;
+        for have in [charge - 1, charge, charge + 1] {
+            let (buyer, tc, _server) = gas_2196_backend(57_500, have, charge, false).await;
+            assert_eq!(
+                buyer
+                    .require_tc_gas(&tc, TcGasOperation::SettleWeek)
+                    .await
+                    .is_ok(),
+                have >= charge
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn gas_2196_unreadable_inactive_and_invalid_terms_still_refuse() {
+        let (buyer, tc, _server) = gas_2196_backend(0, 1_000_000_000_000, 0, false).await;
+        assert!(buyer
+            .require_tc_gas(&tc, TcGasOperation::Buy)
+            .await
+            .unwrap_err()
+            .to_string()
+            .contains("invalid getDeal"));
+        let mut fixture = token_contract_account_fixture(
+            &tc.with_workchain(),
+            &fresh_tc_state(),
+            1_000_000_000_000,
+            1_000_000_000_000,
+            57_500,
+            false,
+        );
+        fixture.active = false;
+        let (chain, _inactive_server) =
+            executable_fixture_backend(BTreeMap::from([(tc.bare().to_string(), fixture)])).await;
+        assert!(chain
+            .require_tc_gas(&tc, TcGasOperation::CleanupUnopened)
+            .await
+            .unwrap_err()
+            .to_string()
+            .contains("not Active"));
+        let missing = Address::parse(&format!("0:{}", "8".repeat(64))).unwrap();
+        assert!(buyer
+            .require_tc_gas(&missing, TcGasOperation::Buy)
+            .await
+            .is_err());
     }
 
     fn executable_filter_snapshot(
@@ -3825,7 +3731,7 @@ mod offer_rested_match_tests {
         states.insert(starved.to_ascii_lowercase(), fresh_tc_state());
         let balances = BTreeMap::from([(
             starved.to_ascii_lowercase(),
-            crate::params::deal_gas_health_floor_raw(2) - 1,
+            crate::params::deal_buy_reserve_raw(2, false) - 1,
         )]);
 
         let (chain, _server) = executable_filter_backend(&states, &balances).await;
@@ -4787,7 +4693,7 @@ mod expired_ask_selection_wiring_tests {
             .find("\n        let now = buy_deadline_now_secs()?;")
             .expect("a selection-time clock sample");
         let selection = body
-            .find("\n        selected_model_buy_ask_matching_executable_depth(")
+            .find("\n        let error = match selected_model_buy_ask_matching_executable_depth(")
             .expect("the final selection");
 
         assert!(
@@ -8056,6 +7962,59 @@ impl RealChainBackend {
             .await
     }
 
+    /// Keep new-money reserve checks separate from the charge for an existing deal's exit.
+    async fn require_tc_gas(&self, tc: &Address, operation: TcGasOperation<'_>) -> Result<()> {
+        let have = self.active_deal_reserve_ecc(tc).await?;
+        let (required, action) = match operation {
+            TcGasOperation::Buy => {
+                let (tick_size, price, max_ticks) =
+                    self.token_contract_deal_terms(tc).await?.ok_or_else(|| {
+                        anyhow!(
+                            "TokenContract {}: unreadable getDeal; refusing BUY",
+                            display_token_contract(tc)
+                        )
+                    })?;
+                anyhow::ensure!(
+                    tick_size == TICK_SIZE
+                        && price > 0
+                        && max_ticks >= crate::params::MIN_STREAM_BUY_TICKS,
+                    "TokenContract {}: invalid getDeal terms; refusing BUY",
+                    display_token_contract(tc)
+                );
+                let bond = self
+                    .token_contract_deal_seller_bond(tc)
+                    .await?
+                    .ok_or_else(|| {
+                        anyhow!(
+                            "TokenContract {}: unreadable getSellerBond; refusing BUY",
+                            display_token_contract(tc)
+                        )
+                    })?;
+                (
+                    crate::params::deal_buy_reserve_raw(max_ticks, bond.bond_funded),
+                    "BUY",
+                )
+            }
+            TcGasOperation::SettleWeek => (crate::params::DEAL_BURN_SETTLE_RAW, "settleWeek"),
+            TcGasOperation::Stop(note) | TcGasOperation::Dispute(note) => {
+                let call = if matches!(operation, TcGasOperation::Stop(_)) {
+                    "streamStop"
+                } else {
+                    "streamDispute"
+                };
+                return self
+                    .refuse_terminal_call_neither_side_can_pay(note, tc, call)
+                    .await;
+            }
+            // Recovery burns only attached ECC, which may be zero.
+            TcGasOperation::CleanupUnopened => return Ok(()),
+        };
+        anyhow::ensure!(have >= required,
+            "TokenContract {} ECC[2] reserve {have} raw nanoSHELL is below {required} raw nanoSHELL required for {action}; seller-side ECC[2] top-up is required",
+            display_token_contract(tc));
+        Ok(())
+    }
+
     pub async fn executable_resting_asks(
         &self,
         snapshot: &OrderBookSnapshot,
@@ -8098,32 +8057,46 @@ impl RealChainBackend {
             let state = self.token_contract_deal_state(&tc).await?;
             let non_executable = token_contract_non_executable_reason(state);
             if non_executable.is_none() {
-                let balance = self.active_native_balance(&tc).await?;
-                // The floor is the DEAL's, not the generic one. `ACTIVE_CONTRACT_GAS_HEALTH_MIN_NANOVMSHELL`
-                // says so itself: "A per-deal `TokenContract` is held to its OWN floor
-                // (`deal_gas_health_floor_raw`), because a deal's gas need follows from its `maxTicks` and a
-                // flat floor closes the cheap end of the market". This seam kept the flat number and
-                // so re-closed that end here, where it is least visible: the ask rests, the book shows it,
-                // and only the executable half drops it -- the buyer is told the matcher "would hit a
-                // non-executable order", never that the deal is merely small.
-
-                // The CLI's own default funds a deal to `min_deploy_shells`, which for two ticks is 1 SHELL
-                // -> ~0.86 vmshell after fees. Measured against 5 vmshell that deal is unbuyable, and a
-                // seller reposting residual capacity produced exactly it: order rested, TokenContract
-                // healthy by its own requirement (0.24 vmshell), nobody could take it. `getDeal` is
-                // constructor-bound, so use its authoritative `maxTicks`, as the buyer-side write check
-                // does. If the deal does not answer, fall back to the generic floor rather than guess a
-                // cheaper one.
-                let floor = match self.token_contract_deal_terms(&tc).await? {
-                    Some((_, _, max_ticks)) => crate::params::deal_gas_health_floor_raw(max_ticks),
-                    None => crate::params::ACTIVE_CONTRACT_GAS_HEALTH_MIN_NANOVMSHELL,
-                };
-                if balance > floor {
-                    executable.push(ask);
+                match self.require_tc_gas(&tc, TcGasOperation::Buy).await {
+                    Ok(()) => executable.push(ask),
+                    Err(error) => tracing::warn!(
+                        order_id = %ask.order_id,
+                        token_contract = %display_token_contract(&tc),
+                        reason = %error,
+                        "excluding sell order: ECC[2] reserve preflight failed"
+                    ),
                 }
             }
         }
         Ok(executable)
+    }
+
+    async fn explain_buy_reserve_refusal(
+        &self,
+        reason: String,
+        raw_asks: &[OrderBookOrder],
+        ticks: u128,
+        max_price_per_tick: u128,
+        now: u64,
+    ) -> String {
+        if let Ok(ask) = selected_model_buy_ask(raw_asks, max_price_per_tick, ticks, now) {
+            if let Some(tc) = ask
+                .token_contract
+                .as_deref()
+                .and_then(|tc| Address::parse(tc).ok())
+            {
+                // A used/unreadable row is not repaired by topping up its ECC pocket.
+                if !matches!(self.token_contract_deal_state(&tc).await,
+                    Ok(Some(state)) if token_contract_non_executable_reason(Some(state)).is_none())
+                {
+                    return reason;
+                }
+                if let Err(error) = self.require_tc_gas(&tc, TcGasOperation::Buy).await {
+                    return format!("{reason}; {}: {error}", describe_buy_ask(&ask));
+                }
+            }
+        }
+        reason
     }
 
     pub async fn submit_safe_model_buy_ask(
@@ -8150,24 +8123,28 @@ impl RealChainBackend {
         // `fetch_now` here would accept an ask that expired while the TC state and balance were
         // being read -- the original incident through a narrower window.
         let now = buy_deadline_now_secs()?;
-        selected_model_buy_ask_matching_executable_depth(
+        let error = match selected_model_buy_ask_matching_executable_depth(
             &raw_asks,
             &executable_asks,
             max_price_per_tick,
             ticks,
             now,
-        )
-        .map_err(|e| {
-            anyhow!(ChainError::OrderUnavailable(format!(
-                "{}: no executable matching ask for InferenceOrderBook {} at max_price_per_tick {}, \
-                 requested ticks {}: {e}. IOB stats {}",
-                buy_refusal_class(&e),
-                display_dexdo_address(&snapshot.order_book),
-                max_price_per_tick,
-                ticks,
-                orderbook_stats_for_error(snapshot)
-            )))
-        })
+        ) {
+            Ok(ask) => return Ok(ask),
+            Err(error) => error,
+        };
+        let error = self
+            .explain_buy_reserve_refusal(error, &raw_asks, ticks, max_price_per_tick, now)
+            .await;
+        Err(anyhow!(ChainError::OrderUnavailable(format!(
+            "{}: no executable matching ask for InferenceOrderBook {} at max_price_per_tick {}, \
+             requested ticks {}: {error}. IOB stats {}",
+            buy_refusal_class(&error),
+            display_dexdo_address(&snapshot.order_book),
+            max_price_per_tick,
+            ticks,
+            orderbook_stats_for_error(snapshot)
+        ))))
     }
 
     pub async fn submit_safe_executable_book_asks(
@@ -8178,19 +8155,28 @@ impl RealChainBackend {
     ) -> Result<(Vec<OrderBookOrder>, Option<String>)> {
         let raw_asks: Vec<OrderBookOrder> = snapshot.resting_asks().cloned().collect();
         let executable_asks = self.executable_resting_asks(snapshot).await?;
-        submit_safe_executable_book_asks(
+        let now = now_secs()?;
+        let (asks, reason) = submit_safe_executable_book_asks(
             &raw_asks,
             &executable_asks,
             max_price_per_tick,
             ticks,
-            now_secs()?,
+            now,
         )
         .map_err(|e| {
             anyhow!(
                 "InferenceOrderBook {} exposes unsafe executable-book depth: {e}",
                 display_dexdo_address(&snapshot.order_book)
             )
-        })
+        })?;
+        let reason = match reason {
+            Some(reason) => Some(
+                self.explain_buy_reserve_refusal(reason, &raw_asks, ticks, max_price_per_tick, now)
+                    .await,
+            ),
+            None => None,
+        };
+        Ok((asks, reason))
     }
 }
 
@@ -8312,11 +8298,9 @@ impl ChainBackend for RealDealBackend {
             self.ctx.nonce,
             token_contract,
             &tc,
-            None,
         )
         .await?;
         // the enc endpoint (handover) is written to the TC. Wait for open() to apply (opened==true).
-        self.ensure_tc_gas(&tc).await?;
         self.chain
             .open_stream(&tc, &self.ctx.seller_keys, &enc_endpoint)
             .await
@@ -8334,7 +8318,6 @@ impl ChainBackend for RealDealBackend {
 
     async fn accept_probe(&self, token_contract: &TokenContract) -> Result<(), ChainError> {
         let tc = parse_tc(token_contract)?;
-        self.ensure_tc_gas(&tc).await?;
         self.chain
             .accept_probe(&tc, &self.ctx.seller_keys)
             .await
@@ -8349,7 +8332,6 @@ impl ChainBackend for RealDealBackend {
         cumulative_tokens: u128,
     ) -> Result<(), ChainError> {
         let tc = parse_tc(token_contract)?;
-        self.ensure_tc_gas(&tc).await?;
         submit_claim_confirmed(&self.chain, &tc, &self.ctx.seller_keys, cumulative_tokens).await
     }
 
@@ -8369,7 +8351,6 @@ impl ChainBackend for RealDealBackend {
         if before.tokens_final >= before.tokens_pending {
             return Ok(()); // nothing pending to promote
         }
-        self.ensure_tc_gas(&tc).await?;
         submit_finalize_confirmed(&self.chain, &tc, token_contract, before).await
     }
 
@@ -8383,7 +8364,6 @@ impl ChainBackend for RealDealBackend {
                 .await
                 .map_err(map_err)?,
         )?;
-        self.ensure_tc_gas(&tc).await?;
         self.chain.settle_week(&tc).await.map_err(map_err)?;
         let confirmation = ClaimConfirmationParams::canonical();
         for _ in 0..confirmation.max_reads {
@@ -8444,7 +8424,7 @@ impl ChainBackend for RealDealBackend {
             &self.ctx.buyer_note,
             &self.ctx.buyer_keys,
             &tc,
-            || self.ensure_tc_gas(&tc),
+            || async { Ok(()) },
         )
         .await
     }
@@ -8462,7 +8442,6 @@ impl ChainBackend for RealDealBackend {
         {
             return Ok(Some(settlement));
         }
-        self.ensure_tc_gas(&tc).await?;
         let mut heartbeat_unchanged = || heartbeat.unchanged();
         let submitted = match self
             .chain
@@ -8520,7 +8499,6 @@ impl ChainBackend for RealDealBackend {
         _note: &dyn Note,
     ) -> Result<Settlement, ChainError> {
         let tc = parse_tc(token_contract)?;
-        self.ensure_tc_gas(&tc).await?;
         let receipt = self
             .chain
             .stream_dispute(&self.ctx.buyer_note, &self.ctx.buyer_keys, &tc)
@@ -8534,7 +8512,6 @@ impl ChainBackend for RealDealBackend {
         token_contract: &TokenContract,
     ) -> Result<Settlement, ChainError> {
         let tc = parse_tc(token_contract)?;
-        self.ensure_tc_gas(&tc).await?;
         let receipt = self
             .chain
             .release_dispute(&tc, &self.ctx.seller_keys)
@@ -8549,7 +8526,6 @@ impl ChainBackend for RealDealBackend {
     ) -> Result<Settlement, ChainError> {
         let tc = parse_tc(token_contract)?;
         let state = tc_settle_state(&self.chain, &tc).await.map_err(map_err)?;
-        self.ensure_tc_gas(&tc).await?;
         self.chain
             .stream_cleanup(&self.ctx.buyer_note, &self.ctx.buyer_keys, &tc)
             .await
@@ -8597,9 +8573,6 @@ pub struct RealSellerBackend {
     /// nonce passed to the 4.0.26 `note.postSellOffer(flags, nonce)` call.
     nonce: u64,
     tick_size: u128,
-    /// Optional operator measurement; without one, funding requires the runtime network to match
-    /// [`crate::params::DEAL_GAS_OVERHEAD_RAW`]'s provenance.
-    supplied_deal_gas_overhead_raw: Option<u128>,
     offer_post_started_at: std::sync::Mutex<Option<u64>>,
     offer_journal_dir: Option<std::path::PathBuf>,
     pending_offer: tokio::sync::Mutex<Option<super::client::SellerPlacement>>,
@@ -8630,7 +8603,7 @@ impl RealSellerBackend {
         model_name: String,
         nonce: u64,
         tick_size: u128,
-        supplied_deal_gas_overhead_raw: Option<u128>,
+        _supplied_deal_gas_overhead_raw: Option<u128>,
     ) -> Self {
         Self {
             chain,
@@ -8640,7 +8613,6 @@ impl RealSellerBackend {
             model_name,
             nonce,
             tick_size,
-            supplied_deal_gas_overhead_raw,
             offer_post_started_at: std::sync::Mutex::new(None),
             offer_journal_dir: None,
             pending_offer: tokio::sync::Mutex::new(None),
@@ -8701,7 +8673,13 @@ impl RealSellerBackend {
         match trace {
             Ok(Ok(())) => {}
             Ok(Err(error)) => return Err(unresolved(format!("{error:#}"))),
-            Err(_) => return Err(unresolved("execution read timed out".into())),
+            Err(_) => {
+                let detail = post.tc_rejection().map_or_else(
+                    || "execution read timed out".to_string(),
+                    |rejection| format!("execution read timed out; {rejection}"),
+                );
+                return Err(unresolved(detail));
+            }
         }
         let state = self
             .chain
@@ -8809,27 +8787,6 @@ impl RealSellerBackend {
             supplied_deal_gas_overhead_raw,
         );
         Ok((backend, rn))
-    }
-
-    async fn ensure_tc_gas(&self, tc: &Address) -> Result<(), ChainError> {
-        match self.supplied_deal_gas_overhead_raw {
-            Some(deal_gas_overhead_raw) => self
-                .chain
-                .ensure_deal_contract_gas_with_overhead(
-                    &self.note,
-                    &self.keys,
-                    self.nonce,
-                    Some(tc),
-                    deal_gas_overhead_raw,
-                )
-                .await
-                .map_err(map_err),
-            None => self
-                .chain
-                .ensure_deal_contract_gas(&self.note, &self.keys, self.nonce, Some(tc))
-                .await
-                .map_err(map_err),
-        }
     }
 
     async fn read_openable_match_once(
@@ -9122,10 +9079,6 @@ impl ChainBackend for RealSellerBackend {
                 max_ticks
             );
         }
-        // postFromNote burns the deal's ECC[2] reserve even when it only renews an expired ask.
-        // Reuse the same measured reserve check as the other seller writes, after reconciling any
-        // older submission so an unread execution never authorizes another funding operation.
-        self.ensure_tc_gas(&tc).await?;
         *self.offer_post_started_at.lock().map_err(|_| {
             ChainError::Chain("seller offer submission marker lock poisoned".to_string())
         })? = Some(now_secs()?.saturating_sub(crate::params::SELLER_OFFER_EVENT_LOOKBACK_SECS));
@@ -9590,10 +9543,8 @@ impl ChainBackend for RealSellerBackend {
             self.nonce,
             token_contract,
             &tc,
-            self.supplied_deal_gas_overhead_raw,
         )
         .await?;
-        self.ensure_tc_gas(&tc).await?;
         self.chain
             .open_stream(&tc, &self.keys, &enc_endpoint)
             .await
@@ -9619,7 +9570,6 @@ impl ChainBackend for RealSellerBackend {
 
     async fn accept_probe(&self, token_contract: &TokenContract) -> Result<(), ChainError> {
         let tc = parse_tc(token_contract)?;
-        self.ensure_tc_gas(&tc).await?;
         self.chain
             .accept_probe(&tc, &self.keys)
             .await
@@ -9636,7 +9586,6 @@ impl ChainBackend for RealSellerBackend {
         cumulative_tokens: u128,
     ) -> Result<(), ChainError> {
         let tc = parse_tc(token_contract)?;
-        self.ensure_tc_gas(&tc).await?;
         submit_claim_confirmed(&self.chain, &tc, &self.keys, cumulative_tokens).await
     }
 
@@ -9656,7 +9605,6 @@ impl ChainBackend for RealSellerBackend {
         if before.tokens_final >= before.tokens_pending {
             return Ok(()); // nothing pending to promote
         }
-        self.ensure_tc_gas(&tc).await?;
         submit_finalize_confirmed(&self.chain, &tc, token_contract, before).await
     }
 
@@ -9670,7 +9618,6 @@ impl ChainBackend for RealSellerBackend {
                 .await
                 .map_err(map_err)?,
         )?;
-        self.ensure_tc_gas(&tc).await?;
         self.chain.settle_week(&tc).await.map_err(map_err)?;
         let confirmation = ClaimConfirmationParams::canonical();
         for _ in 0..confirmation.max_reads {
@@ -9708,7 +9655,6 @@ impl ChainBackend for RealSellerBackend {
                 display_token_contract(&tc)
             )));
         }
-        self.ensure_tc_gas(&tc).await?;
         self.chain
             .seller_stop(&tc, &self.keys)
             .await
@@ -9827,7 +9773,6 @@ impl ChainBackend for RealSellerBackend {
         token_contract: &TokenContract,
     ) -> Result<Settlement, ChainError> {
         let tc = parse_tc(token_contract)?;
-        self.ensure_tc_gas(&tc).await?;
         let receipt = self
             .chain
             .release_dispute(&tc, &self.keys)
@@ -10042,38 +9987,15 @@ impl RealBuyerBackend {
         Ok((backend, rn))
     }
 
-    async fn require_tc_gas(&self, tc: &Address) -> Result<(), ChainError> {
-        let balance = self
-            .chain
-            .active_native_balance(tc)
+    async fn require_tc_gas(
+        &self,
+        tc: &Address,
+        operation: TcGasOperation<'_>,
+    ) -> Result<(), ChainError> {
+        self.chain
+            .require_tc_gas(tc, operation)
             .await
-            .map_err(map_err)?;
-        // Same rule the seller's own top-up seam already follows: the deal is the authority on its own
-        // terms, so a per-deal TokenContract is held to `deal_gas_health_floor_raw(maxTicks)` and not to
-        // the generic flat floor -- a flat floor closes the cheap end of the market. `getDeal` is
-        // constructor-bound, so this is the same `maxTicks` the provision funded against. A deal that does
-        // not answer is not one this check can size for: fall back to the generic floor rather than guess
-        // a cheaper one.
-
-        // Left flat, this refused every buyer-side write on a small deal funded by the CLI's OWN default:
-        // `min_deploy_shells(2)` is 1 SHELL -> ~0.86 vmshell after fees, against a flat 5.
-        let floor = match self
-            .chain
-            .token_contract_deal_terms(tc)
-            .await
-            .map_err(map_err)?
-        {
-            Some((_, _, max_ticks)) => crate::params::deal_gas_health_floor_raw(max_ticks),
-            None => crate::params::ACTIVE_CONTRACT_GAS_HEALTH_MIN_NANOVMSHELL,
-        };
-        if balance <= floor {
-            return Err(ChainError::Chain(format!(
-                "TokenContract {} native balance {balance} is at/below its gas-health floor \
-                 {floor}; seller-side top-up is required before this buyer-only write",
-                display_token_contract(tc)
-            )));
-        }
-        Ok(())
+            .map_err(map_err)
     }
 
     async fn orderbook_snapshot(&self) -> Result<OrderBookSnapshot, ChainError> {
@@ -10240,7 +10162,7 @@ impl ChainBackend for RealBuyerBackend {
             )
         })?;
         let expected = parse_tc(token_contract)?;
-        self.require_tc_gas(&expected).await?;
+        self.require_tc_gas(&expected, TcGasOperation::Buy).await?;
         // (branch-3 guard): fail closed if this note's on-chain owner key (`getDetails().ephemeralPubkey`)
         // is not the `--note-key` we sign `placeInferenceBuy` with -- otherwise `onlyOwnerPubkey` reverts
         // pre-accept (ERR_INVALID_SENDER 101) and the buyer silently 300s-times out in `read_match`.
@@ -10306,7 +10228,7 @@ impl ChainBackend for RealBuyerBackend {
         max_price_per_tick: u128,
     ) -> Result<(), ChainError> {
         let expected = parse_tc(token_contract)?;
-        self.require_tc_gas(&expected).await?;
+        self.require_tc_gas(&expected, TcGasOperation::Buy).await?;
         self.chain
             .assert_note_owner_matches(
                 "buyer explicit-token quote preflight",
@@ -10330,7 +10252,7 @@ impl ChainBackend for RealBuyerBackend {
         max_price_per_tick: u128,
     ) -> Result<Option<OrderBookOrder>, ChainError> {
         let expected = parse_tc(token_contract)?;
-        self.require_tc_gas(&expected).await?;
+        self.require_tc_gas(&expected, TcGasOperation::Buy).await?;
         self.chain
             .assert_note_owner_matches(
                 "buyer explicit-token quote preflight",
@@ -10633,7 +10555,7 @@ impl ChainBackend for RealBuyerBackend {
                 .await
                 .map_err(map_err)?,
         )?;
-        self.require_tc_gas(&tc).await?;
+        self.require_tc_gas(&tc, TcGasOperation::SettleWeek).await?;
         self.chain.settle_week(&tc).await.map_err(map_err)?;
         let confirmation = ClaimConfirmationParams::canonical();
         for _ in 0..confirmation.max_reads {
@@ -10837,7 +10759,7 @@ impl ChainBackend for RealBuyerBackend {
     ) -> Result<Settlement, ChainError> {
         let tc = parse_tc(token_contract)?;
         explicit_buyer_stop_with(&self.chain, &self.note, &self.keys, &tc, || {
-            self.require_tc_gas(&tc)
+            self.require_tc_gas(&tc, TcGasOperation::Stop(&self.note))
         })
         .await
     }
@@ -10854,7 +10776,8 @@ impl ChainBackend for RealBuyerBackend {
         {
             return Ok(Some(settlement));
         }
-        self.require_tc_gas(&tc).await?;
+        self.require_tc_gas(&tc, TcGasOperation::Stop(&self.note))
+            .await?;
         let mut heartbeat_unchanged = || heartbeat.unchanged();
         let submitted = match self
             .chain
@@ -10906,7 +10829,8 @@ impl ChainBackend for RealBuyerBackend {
         _note: &dyn Note,
     ) -> Result<Settlement, ChainError> {
         let tc = parse_tc(token_contract)?;
-        self.require_tc_gas(&tc).await?;
+        self.require_tc_gas(&tc, TcGasOperation::Dispute(&self.note))
+            .await?;
         let receipt = self
             .chain
             .stream_dispute(&self.note, &self.keys, &tc)
@@ -10929,7 +10853,8 @@ impl ChainBackend for RealBuyerBackend {
     ) -> Result<Settlement, ChainError> {
         let tc = parse_tc(token_contract)?;
         let state = tc_settle_state(&self.chain, &tc).await.map_err(map_err)?;
-        self.require_tc_gas(&tc).await?;
+        self.require_tc_gas(&tc, TcGasOperation::CleanupUnopened)
+            .await?;
         self.chain
             .stream_cleanup(&self.note, &self.keys, &tc)
             .await
@@ -11166,42 +11091,6 @@ mod codecell_tests {
             "transport error: connection refused"
         ));
         assert!(!is_uninit_account_404(""));
-    }
-
-    /// regression: an active contract at or below the gas-health floor must get topped up before the
-    /// next RootModel/TC poke; above the floor it is left alone.
-    #[test]
-    fn gas_health_top_up_is_thresholded_and_targets_working_level() {
-        assert_eq!(
-            gas_health_top_up_amount(
-                crate::params::ACTIVE_CONTRACT_GAS_HEALTH_MIN_NANOVMSHELL - 1,
-                crate::params::ACTIVE_CONTRACT_GAS_HEALTH_MIN_NANOVMSHELL,
-                crate::params::ACTIVE_CONTRACT_GAS_HEALTH_TARGET_NANOVMSHELL,
-            ),
-            Some(
-                crate::params::ACTIVE_CONTRACT_GAS_HEALTH_TARGET_NANOVMSHELL
-                    - (crate::params::ACTIVE_CONTRACT_GAS_HEALTH_MIN_NANOVMSHELL - 1)
-            )
-        );
-        assert_eq!(
-            gas_health_top_up_amount(
-                crate::params::ACTIVE_CONTRACT_GAS_HEALTH_MIN_NANOVMSHELL,
-                crate::params::ACTIVE_CONTRACT_GAS_HEALTH_MIN_NANOVMSHELL,
-                crate::params::ACTIVE_CONTRACT_GAS_HEALTH_TARGET_NANOVMSHELL,
-            ),
-            Some(
-                crate::params::ACTIVE_CONTRACT_GAS_HEALTH_TARGET_NANOVMSHELL
-                    - crate::params::ACTIVE_CONTRACT_GAS_HEALTH_MIN_NANOVMSHELL
-            )
-        );
-        assert_eq!(
-            gas_health_top_up_amount(
-                crate::params::ACTIVE_CONTRACT_GAS_HEALTH_MIN_NANOVMSHELL + 1,
-                crate::params::ACTIVE_CONTRACT_GAS_HEALTH_MIN_NANOVMSHELL,
-                crate::params::ACTIVE_CONTRACT_GAS_HEALTH_TARGET_NANOVMSHELL,
-            ),
-            None
-        );
     }
 
     /// (offline): the `RealNote` x25519 handover is derived from its ed25519 -- the seller **reconstructs
@@ -12334,12 +12223,9 @@ mod codecell_tests {
         let reconciled = body
             .find("reconcile_pending_offer(&tc, &ob)")
             .expect("pending SELL is reconciled before another write");
-        let gas = body
-            .find("ensure_tc_gas(&tc)")
-            .expect("postFromNote burn is covered before posting");
         assert!(
-            reconciled < gas && terms < gas && gas < submit,
-            "reconcile first, then use the existing authoritative gas reserve check before SELL"
+            reconciled < submit,
+            "reconcile a pending SELL before submitting another"
         );
         assert!(
             withdrawn < submit,
@@ -12571,9 +12457,9 @@ mod codecell_tests {
             assert!(!body.contains("settle_stop("), "{label} projected STOP");
             assert!(
                 body.contains(if label == "RealDealBackend" {
-                    "|| self.ensure_tc_gas(&tc)"
+                    "|| async { Ok(()) }"
                 } else {
-                    "self.require_tc_gas(&tc)"
+                    "self.require_tc_gas(&tc, TcGasOperation::Stop(&self.note))"
                 }),
                 "{label} must supply its existing gas preflight to the shared transaction"
             );
@@ -12673,13 +12559,9 @@ mod codecell_tests {
                 "{label} explicit operator/user STOP must not be heartbeat-vetoed"
             );
 
-            let gas = guarded
-                .find(if label == "RealDealBackend" {
-                    "self.ensure_tc_gas("
-                } else {
-                    "self.require_tc_gas("
-                })
-                .expect("guarded gas preflight");
+            if label == "RealBuyerBackend" {
+                assert!(guarded.contains("self.require_tc_gas("));
+            }
             let heartbeat = guarded
                 .find("let mut heartbeat_unchanged = || heartbeat.unchanged();")
                 .expect("guard snapshot comparison callback");
@@ -12695,8 +12577,8 @@ mod codecell_tests {
                 "{label} automatic policy STOP must have exactly one submit seam"
             );
             assert!(
-                gas < heartbeat && heartbeat < submit && submit < receipt,
-                "{label} must finish gas preflight before the heartbeat-aware, receipt-confirming submit"
+                heartbeat < submit && submit < receipt,
+                "{label} must check the heartbeat before the receipt-confirming submit"
             );
             assert!(!guarded.contains("settle_stop("));
             assert!(!guarded.contains("wait_state_bool("));

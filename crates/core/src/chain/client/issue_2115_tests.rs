@@ -132,9 +132,11 @@ async fn issue_2115_action_38_without_book_dispatch_is_rejected_not_unknown() {
     transaction["action"] = json!({"success":false,"result_code":38});
     let (_, server) = issue_2030_producer_server(listener, vec![
         (200, issue_2115_message('1', None, Some('a'), &['2'])), (200, refusal),
+        (200, issue_2115_message('1', None, Some('a'), &['2'])),
+        (200, issue_2115_message('2', Some('a'), Some('c'), &[])),
     ]);
     let mut post = issue_2115_post();
-    issue_2030_backend(&endpoint).reconcile_seller_placement(&mut post, None).await.unwrap();
+    issue_2030_backend(&endpoint).reconcile_seller_placement(&mut post, None).await.unwrap_err();
     let terminal = post.terminal.unwrap();
     assert!(terminal.contains("rejected message_id=2222"), "{terminal}");
     assert!(terminal.contains("compute_exit=0 action_result=38"), "{terminal}");

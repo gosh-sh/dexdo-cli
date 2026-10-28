@@ -296,23 +296,24 @@ the deal deploy (Phase 6, whole SHELL) plus runtime gas. If it is short, deploy 
       "served_model": "qwen/qwen3.8-27b",
       "api_key_env": "GROQ_API_KEY",
       "tokenizer_family": "qwen",
-      "price_per_tick": 1,
-      "capabilities": { "max_output_tokens": 16384 }
+      "price_per_tick": 1
     }
   }
 }
 ```
 
-`capabilities.max_output_tokens` is the model's own maximum completion length at that provider (Groq
-answers `400` above `16384` for `qwen/qwen3.8-27b`). The seller clamps every outbound request to it, so the
-field is REQUIRED: a model entry without it is refused before the provider is contacted rather than served
-with an unbounded limit. Take the number from your provider's model card.
+The seller forwards each buyer request to the provider as sent, except for what it must change: the
+provider's model name (`served_model`) in place of the deal model, its own key in place of the buyer's
+credentials, and, on a streamed Chat Completions request, `stream_options.include_usage` set and
+`stream_options.continuous_usage_stats` removed, so the answer carries one usage record. A request
+naming another model is refused before the provider is contacted. Payment never exceeds the deal's
+authorized remainder; any provider usage above it is the seller's cost.
 
 `capabilities.logprobs` and `capabilities.top_logprobs` are RETIRED. The client no longer requests, parses or
 verifies log probabilities anywhere, so setting either key changes nothing about what the seller sends or how
 it is paid. An existing `models.json` that still carries them keeps working: the keys are **ignored, not
 rejected** -- deliberately, so an upgrade does not take a live seller off the market. Do not add them to a new
-config; `max_output_tokens` is the only capability the seller reads.
+config.
 
 The `price_per_tick` here is decorative metadata -- it does NOT set the live deal price. The price
 buyers pay is whatever you set at `dexdo provision --price-per-tick` (Phase 6); editing this field
@@ -324,8 +325,7 @@ Export the upstream key (not written to logs): `export GROQ_API_KEY=<your-key>`
 
 Dexdo selects `seller/upstream/anthropic.rs` when the model entry points to `api.anthropic.com`. The seller
 calls the Anthropic Messages API directly; do not put a LiteLLM/OpenAI-compatible proxy between them. Keep the
-real key in the environment named by `api_key_env`, never in `models.json`. Its `capabilities` need only the
-model's own output limit:
+real key in the environment named by `api_key_env`, never in `models.json`:
 
 ```json
 {
@@ -336,16 +336,15 @@ model's own output limit:
       "base_url": "https://api.anthropic.com",
       "api_key_env": "ANTHROPIC_API_KEY",
       "tokenizer_family": "claude",
-      "price_per_tick": 1,
-      "capabilities": { "max_output_tokens": 64000 }
+      "price_per_tick": 1
     }
   }
 }
 ```
 
-Set `ANTHROPIC_API_KEY`, then run the seller with `--model claude-sonnet --models models.json`. The adapter
-streams text immediately and reconciles billing to Anthropic's cumulative `usage.output_tokens`, not SSE
-content-delta count.
+Set `ANTHROPIC_API_KEY`, then run the seller with `--model claude-sonnet --models models.json`. The seller
+serves buyers' `POST /v1/messages` and returns Anthropic's answer as received; billing follows Anthropic's
+cumulative `usage.output_tokens`, not the SSE content-delta count.
 
 ## Phase 5. Read the price, then answer the failure policy
 
@@ -614,5 +613,6 @@ answer the terminal prompt, so add `--acknowledge-note-retirement` only after th
 
 - Never print, log, or commit the wallet seed/key, the note owner secret (`owner_secret_key_hex`),
   the pool file, or `GROQ_API_KEY`.
-- Do not trust the buyer request's `model` field -- the market forces the model from `--model`.
+- A buyer request must name the `--model` deal model; a request naming another model is refused before
+  the provider is contacted.
 - `dexdo destroy` is destructive: run it only on a closed (stopped) deal.

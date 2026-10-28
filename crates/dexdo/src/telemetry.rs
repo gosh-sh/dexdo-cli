@@ -1093,16 +1093,18 @@ mod tests {
             api_key_env: "DEXDO_METRICS_TEST_ONLY_KEY".into(),
             ..Default::default()
         });
-        let request = dexdo_proto::CanonRequest {
-            messages: vec![dexdo_proto::ChatMessage {
-                role: "user".into(),
-                content: "PRIVATE_PROMPT_CANARY".into(),
-            }],
-            ..Default::default()
+        let request = crate::seller::upstream::ProviderRequest {
+            format: crate::api_format::ApiFormat::ChatCompletions,
+            body: crate::api_format::RequestBody::parse(
+                br#"{"model":"telemetry-wire-test-model","messages":[{"role":"user","content":"PRIVATE_PROMPT_CANARY"}],"stream":true}"#,
+            )
+            .unwrap(),
+            headers: Vec::new(),
         };
-        for fails in [false, true] {
+        // A provider error answer is relayed, a complete stream bills, a truncated one fails.
+        for (fails, billed) in [(false, false), (false, true), (true, false)] {
             let (tx, mut rx) = tokio::sync::mpsc::channel(16);
-            upstream.run(8, Some(request.clone()), tx).await;
+            upstream.run(request.clone(), 0, tx).await;
             let mut failed = false;
             let mut usage = false;
             while let Some(event) = rx.recv().await {
@@ -1113,11 +1115,11 @@ mod tests {
                 }
             }
             assert_eq!(failed, fails);
-            assert_eq!(usage, !fails);
+            assert_eq!(usage, billed);
         }
         let (tx, rx) = tokio::sync::mpsc::channel(1);
         drop(rx);
-        upstream.run(8, Some(request), tx).await;
+        upstream.run(request, 0, tx).await;
         server.abort();
         let _ = server.await;
         std::env::remove_var("DEXDO_METRICS_TEST_ONLY_KEY");
@@ -1210,7 +1212,7 @@ mod tests {
                 "backend",
                 "openai"
             ),
-            3
+            4
         );
         assert_eq!(
             sum(

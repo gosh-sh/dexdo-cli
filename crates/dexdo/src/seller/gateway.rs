@@ -1,23 +1,22 @@
 //! Seller gateway: accepting buyer connections, stream-session
-//! authorization and incremental yielding of the canonical fake-token stream.
+//! authorization, and relaying each consumer request to the upstream and its response back.
 
+use crate::api_format::{forwarded_request_headers, ApiFormat, RequestBody};
 use crate::seller::auth::{challenge_bytes, AuthRegistry, HEALTH_CHALLENGE_TC};
 use crate::seller::capacity::{
     lock_or_recover, CapacityManager, CapacityReservation, CapacitySnapshot, ReserveError,
     POISONED_LOCK_MESSAGE,
 };
-use crate::seller::upstream::is_seller_config_http_status;
-use crate::seller::upstream::UpstreamConfig;
-use crate::seller::upstream::UpstreamEvent;
+use crate::seller::upstream::{ProviderRequest, UpstreamConfig, UpstreamEvent};
 use anyhow::{anyhow, Result as AnyResult};
 use dexdo_core::note::Signature;
 use dexdo_core::params::{
-    GATEWAY_CLIENT_CHANNEL_CAPACITY, GATEWAY_REQUEST_MAX_BYTES, GATEWAY_UPSTREAM_CHANNEL_CAPACITY,
+    BUYER_API_REQUEST_BODY_MAX_BYTES, GATEWAY_CLIENT_CHANNEL_CAPACITY, GATEWAY_REQUEST_MAX_BYTES,
+    GATEWAY_UPSTREAM_CHANNEL_CAPACITY,
 };
 use dexdo_core::{DealChainState, DealSubscription};
 use dexdo_proto::{
-    BillingUsage, CanonChunk, CanonRequest, Challenge, ChallengeRequest, Gateway, GatewayServer,
-    StreamRequest,
+    BillingUsage, Challenge, ChallengeRequest, Gateway, GatewayServer, StreamFrame, StreamRequest,
 };
 use rand::RngCore;
 use std::collections::HashMap;
@@ -94,10 +93,6 @@ impl UpstreamFailure {
             "timeout"
         } else if message.starts_with("upstream connect failed") {
             "connect"
-        } else if http_status.is_some_and(is_seller_config_http_status) {
-            // the seller builds the whole upstream request, so a `4xx` request rejection is the
-            // seller's own configuration fault -- a distinct, never-retryable class, not a generic `http`.
-            "seller_config"
         } else if http_status.is_some() {
             "http"
         } else {
@@ -123,6 +118,26 @@ impl UpstreamFailure {
             retryable,
             grpc_status: format!("{:?}", status.code()),
             http_status,
+            event_sequence,
+        }
+    }
+
+    /// A provider error answer relayed to the buyer as received.
+    fn from_http_status(
+        token_contract: &str,
+        http_status: u16,
+        event_sequence: Arc<AtomicU64>,
+    ) -> Self {
+        Self {
+            token_contract: token_contract.to_string(),
+            error_class: if matches!(http_status, 401 | 403) {
+                "auth"
+            } else {
+                "http"
+            },
+            retryable: http_status == 408 || http_status == 429 || http_status >= 500,
+            grpc_status: format!("{:?}", tonic::Code::Unavailable),
+            http_status: Some(http_status),
             event_sequence,
         }
     }
@@ -439,12 +454,18 @@ impl GatewayState {
             .capacity
             .reconcile_deal(&token_contract.to_string(), state, deal)?
             .ok_or_else(|| anyhow!("TokenContract {token_contract_display} is terminal"))?;
-        let local_delivered =
-            u64::try_from(snapshot.local_delivered_after_anchor).map_err(|_| {
+        // The claim driver bills the deal's whole accepted usage, so a restarted gateway resumes
+        // counting from all of it, not from the part `tokensPending` does not cover yet.
+        let durable_delivered = snapshot
+            .tokens_pending_anchor
+            .checked_add(snapshot.local_delivered_after_anchor)
+            .and_then(|delivered| u64::try_from(delivered).ok())
+            .ok_or_else(|| {
                 anyhow!(
-                "TokenContract {token_contract_display} durable local delivery {} exceeds gateway uint64",
-                snapshot.local_delivered_after_anchor
-            )
+                    "TokenContract {token_contract_display} durable delivery {} + {} exceeds gateway uint64",
+                    snapshot.tokens_pending_anchor,
+                    snapshot.local_delivered_after_anchor
+                )
             })?;
         self.limits
             .lock()
@@ -459,7 +480,7 @@ impl GatewayState {
         self.auth.register(token_contract, buyer_pubkey);
         self.delivery(token_contract)
             .count
-            .store(local_delivered, Ordering::Release);
+            .store(durable_delivered, Ordering::Release);
         Ok(())
     }
 
@@ -556,32 +577,6 @@ impl GatewayState {
             .copied()
     }
 
-    #[cfg(test)]
-    fn stream_token_limit(
-        &self,
-        token_contract: &str,
-        req: Option<&CanonRequest>,
-        mock: bool,
-    ) -> u64 {
-        let Some(limits) = self.limits(token_contract) else {
-            return 0;
-        };
-        Self::registered_stream_token_limit(limits, req, mock)
-    }
-
-    fn registered_stream_token_limit(
-        limits: StreamLimits,
-        req: Option<&CanonRequest>,
-        mock: bool,
-    ) -> u64 {
-        if mock {
-            return requested_max_tokens(req)
-                .map(|max| limits.mock_token_count.min(max))
-                .unwrap_or(limits.mock_token_count);
-        }
-        requested_max_tokens(req).unwrap_or(u64::MAX)
-    }
-
     /// The per-deal [`DealDelivery`] tracker (created on first access, shared across the deal's streams). Each
     /// clean request terminal adds its checked billable total to cumulative `count`; `done` is not set here --
     /// it means "no more billable usage will ever arrive for this deal/session" and is owned by the buyer
@@ -606,24 +601,19 @@ impl GatewayState {
     }
 }
 
-fn requested_max_tokens(req: Option<&CanonRequest>) -> Option<u64> {
-    req.and_then(|r| r.params.as_ref())
-        .and_then(|p| (p.max_tokens != 0).then_some(p.max_tokens as u64))
-}
-
 impl Default for GatewayState {
     fn default() -> Self {
         Self::new()
     }
 }
 
-/// Relay content immediately, but hold terminal usage until a clean upstream EOF proves that no duplicate
-/// usage or post-terminal content follows it. Only then is the complete billable total committed durably and
-/// the typed usage frame released to the buyer.
+/// Relay the provider's head and bytes immediately, but hold terminal usage until a clean upstream EOF
+/// proves that no duplicate usage or post-terminal content follows it. Only then is the complete
+/// billable total committed durably and the typed usage frame released to the buyer.
 #[cfg(test)]
 pub(crate) async fn relay_counting<R>(
     up_rx: mpsc::Receiver<Result<UpstreamEvent, Status>>,
-    tx: mpsc::Sender<Result<CanonChunk, Status>>,
+    tx: mpsc::Sender<Result<StreamFrame, Status>>,
     recorder: R,
     failure_context: Option<(
         String,
@@ -633,23 +623,13 @@ pub(crate) async fn relay_counting<R>(
 ) where
     R: AuthoritativeDeliveryRecorder,
 {
-    relay_counting_with_chain_availability(
-        up_rx,
-        tx,
-        recorder,
-        failure_context,
-        None,
-        u64::MAX,
-        u64::MAX,
-        false,
-    )
-    .await;
+    relay_counting_with_chain_availability(up_rx, tx, recorder, failure_context, None, u64::MAX)
+        .await;
 }
 
-#[allow(clippy::too_many_arguments)]
 async fn relay_counting_with_chain_availability<R>(
     mut up_rx: mpsc::Receiver<Result<UpstreamEvent, Status>>,
-    tx: mpsc::Sender<Result<CanonChunk, Status>>,
+    tx: mpsc::Sender<Result<StreamFrame, Status>>,
     recorder: R,
     failure_context: Option<(
         String,
@@ -657,15 +637,12 @@ async fn relay_counting_with_chain_availability<R>(
         mpsc::UnboundedSender<UpstreamFailure>,
     )>,
     mut chain_unavailable: Option<watch::Receiver<bool>>,
-    output_limit_tokens: u64,
     billing_grant_tokens: u64,
-    exact_output_usage: bool,
 ) where
     R: AuthoritativeDeliveryRecorder,
 {
     let mut saw_output = false;
-    let mut visible_output_tokens = 0u64;
-    let mut next_seq = 0u64;
+    let mut head_status: Option<u32> = None;
     let mut terminal_usage: Option<BillingUsage> = None;
     let mut billing_exhausted = false;
     let mut terminal_error = None;
@@ -694,6 +671,17 @@ async fn relay_counting_with_chain_availability<R>(
             up_rx.recv().await
         };
         let Some(event) = event else {
+            if let Some(status) = head_status.filter(|status| !(200..300).contains(status)) {
+                // A provider error answer, relayed as received: nothing was delivered or billed.
+                if let Some((token_contract, event_sequence, failure_tx)) = &failure_context {
+                    let _ = failure_tx.send(UpstreamFailure::from_http_status(
+                        token_contract,
+                        u16::try_from(status).unwrap_or(u16::MAX),
+                        event_sequence.clone(),
+                    ));
+                }
+                break 'relay AuthoritativeDeliveryFinish::Interrupted;
+            }
             let Some(mut usage) = terminal_usage.take() else {
                 terminal_error = Some(dexdo_proto::upstream_failure_status(
                     Status::data_loss("upstream ended without terminal billing usage"),
@@ -721,68 +709,51 @@ async fn relay_counting_with_chain_availability<R>(
             if recorder.shared_budget() || charged != usage.total_tokens {
                 usage.charged_tokens = Some(charged);
             }
-            permit.send(Ok(CanonChunk {
-                seq: next_seq,
+            permit.send(Ok(StreamFrame {
                 usage: Some(usage),
-                ..CanonChunk::default()
+                ..StreamFrame::default()
             }));
             return;
         };
         match event {
-            Ok(UpstreamEvent::Chunk(chunk)) => {
+            Ok(UpstreamEvent::Head(head)) => {
+                if head_status.is_some() {
+                    terminal_error =
+                        Some(Status::data_loss("upstream stated a second response head"));
+                    break unfinished_delivery_finish(saw_output);
+                }
+                head_status = Some(head.status);
+                let permit = match tx.reserve().await {
+                    Ok(permit) => permit,
+                    Err(_) => break unfinished_delivery_finish(saw_output),
+                };
+                permit.send(Ok(StreamFrame {
+                    head: Some(head),
+                    ..StreamFrame::default()
+                }));
+            }
+            Ok(UpstreamEvent::Data { bytes, output }) => {
+                if head_status.is_none() {
+                    terminal_error = Some(Status::data_loss(
+                        "upstream content arrived before its response head",
+                    ));
+                    break unfinished_delivery_finish(saw_output);
+                }
                 if terminal_usage.is_some() {
                     terminal_error = Some(Status::data_loss(
                         "upstream content continued after terminal billing usage",
                     ));
                     break unfinished_delivery_finish(saw_output);
                 }
-                if chunk.usage.is_some() {
-                    terminal_error = Some(Status::data_loss(
-                        "upstream content event carried wire terminal usage",
-                    ));
-                    break unfinished_delivery_finish(saw_output);
-                }
-                if chunk.seq != next_seq {
-                    terminal_error = Some(Status::data_loss(format!(
-                        "upstream canonical sequence {} is not next expected {}",
-                        chunk.seq, next_seq
-                    )));
-                    break unfinished_delivery_finish(saw_output);
-                }
-                let has_output = !chunk.text.is_empty()
-                    || !chunk.reasoning.is_empty()
-                    || !chunk.token_ids.is_empty();
-                let chunk_output_tokens = if exact_output_usage || !chunk.token_ids.is_empty() {
-                    chunk.visible_output_tokens()
-                } else {
-                    0
-                };
-                visible_output_tokens = match visible_output_tokens
-                    .checked_add(chunk_output_tokens)
-                    .filter(|tokens| *tokens <= output_limit_tokens)
-                {
-                    Some(tokens) => tokens,
-                    None => {
-                        terminal_error = Some(Status::data_loss(format!(
-                            "upstream canonical output exceeds output limit {output_limit_tokens}"
-                        )));
-                        break unfinished_delivery_finish(saw_output);
-                    }
-                };
-                next_seq = match chunk.seq.checked_add(1) {
-                    Some(next) => next,
-                    None => {
-                        terminal_error =
-                            Some(Status::data_loss("canonical sequence overflows u64"));
-                        break 'relay unfinished_delivery_finish(saw_output);
-                    }
-                };
                 let permit = match tx.reserve().await {
                     Ok(permit) => permit,
                     Err(_) => break unfinished_delivery_finish(saw_output),
                 };
-                permit.send(Ok(chunk));
-                saw_output |= has_output;
+                permit.send(Ok(StreamFrame {
+                    data: bytes,
+                    ..StreamFrame::default()
+                }));
+                saw_output |= output;
             }
             Ok(UpstreamEvent::Usage(usage)) => {
                 if terminal_usage.is_some() {
@@ -795,19 +766,13 @@ async fn relay_counting_with_chain_availability<R>(
                     terminal_error = Some(Status::data_loss(error));
                     break unfinished_delivery_finish(saw_output);
                 }
-                billing_exhausted = usage.total_tokens > billing_grant_tokens;
-                let output_matches = if exact_output_usage {
-                    usage.output_tokens == visible_output_tokens
-                } else {
-                    usage.output_tokens >= visible_output_tokens
-                };
-                if !output_matches {
-                    terminal_error = Some(Status::data_loss(format!(
-                        "terminal output usage {} does not match visible output {visible_output_tokens}",
-                        usage.output_tokens
-                    )));
+                if !head_status.is_some_and(|status| (200..300).contains(&status)) {
+                    terminal_error = Some(Status::data_loss(
+                        "terminal billing usage follows no successful response",
+                    ));
                     break unfinished_delivery_finish(saw_output);
                 }
+                billing_exhausted = usage.total_tokens > billing_grant_tokens;
                 if !saw_output || usage.output_tokens == 0 {
                     terminal_error = Some(Status::data_loss(
                         "terminal billing usage has no preceding delivered output",
@@ -891,6 +856,52 @@ fn checked_authoritative_tokens(count: &AtomicU64, tokens: u64) -> Result<u64, S
         .ok_or_else(|| Status::data_loss("authoritative billable-token high-water overflow"))
 }
 
+/// The consumer request as this upstream's provider receives it. The seller changes exactly what it
+/// must: the model a request names must be the deal's and is replaced by the provider's id, a
+/// streamed Chat Completions request asks for its terminal usage, and the client's credentials and
+/// transport headers never travel. Everything else reaches the provider as the client sent it.
+#[allow(clippy::result_large_err)]
+fn provider_request(
+    upstream: &UpstreamConfig,
+    path: &str,
+    body: &[u8],
+    headers: Vec<dexdo_proto::Header>,
+) -> Result<ProviderRequest, Status> {
+    let format = ApiFormat::from_path(path)
+        .filter(|format| upstream.api_formats().contains(format))
+        .ok_or_else(|| {
+            Status::invalid_argument(format!(
+                "unsupported_api_path: this seller does not serve {path}"
+            ))
+        })?;
+    if body.len() > BUYER_API_REQUEST_BODY_MAX_BYTES {
+        return Err(Status::invalid_argument(format!(
+            "request body exceeds the maximum of {BUYER_API_REQUEST_BODY_MAX_BYTES} bytes"
+        )));
+    }
+    let mut body = RequestBody::parse(body).map_err(Status::invalid_argument)?;
+    let Some(model) = body.model() else {
+        return Err(Status::invalid_argument("request model is required"));
+    };
+    if let Some((deal_model, served_model)) = upstream.request_model() {
+        if model != deal_model {
+            return Err(Status::invalid_argument(format!(
+                "model `{model}` is not this deal's model `{deal_model}`"
+            )));
+        }
+        let served_model = served_model.to_string();
+        body.set_model(&served_model);
+    }
+    if format == ApiFormat::ChatCompletions && body.stream() {
+        body.require_stream_usage();
+    }
+    Ok(ProviderRequest {
+        format,
+        body,
+        headers: forwarded_request_headers(headers),
+    })
+}
+
 /// gRPC implementation of the gateway service.
 pub struct GatewayService {
     state: Arc<GatewayState>,
@@ -907,7 +918,7 @@ impl GatewayService {
     }
 }
 
-type ChunkStream = Pin<Box<dyn Stream<Item = Result<CanonChunk, Status>> + Send>>;
+type FrameStream = Pin<Box<dyn Stream<Item = Result<StreamFrame, Status>> + Send>>;
 
 #[tonic::async_trait]
 impl Gateway for GatewayService {
@@ -927,16 +938,21 @@ impl Gateway for GatewayService {
                 self.state.auth.discard_challenge(&tc, &nonce);
             }
         }
-        let upstream = self.state.upstream(&tc);
+        let api_paths = self
+            .state
+            .upstream(&tc)
+            .api_formats()
+            .iter()
+            .map(|format| format.path().to_string())
+            .collect();
         Ok(Response::new(Challenge {
             nonce,
-            supports_reasoning_disable: upstream.supports_reasoning_disable(),
-            supported_reasoning_efforts: upstream.supported_reasoning_efforts(),
             token_contract: tc,
+            api_paths,
         }))
     }
 
-    type OpenStreamStream = ChunkStream;
+    type OpenStreamStream = FrameStream;
 
     /// Step 2: verify the signature against the pubkey from the contract. Without a valid
     /// signature the connection closes BEFORE forwarding. Otherwise -- an incremental stream (R6).
@@ -950,6 +966,14 @@ impl Gateway for GatewayService {
         if req.billing_grant_tokens == 0 {
             return Err(Status::invalid_argument(
                 "billing_grant_tokens must be nonzero",
+            ));
+        }
+        // A buyer that predates request forwarding sends no path. `ResourceExhausted` is the one
+        // refusal such a buyer answers request-scoped on every consumer path, Messages included: its
+        // deal stays open until it updates.
+        if req.path.is_empty() {
+            return Err(Status::resource_exhausted(
+                "this seller forwards the consumer request as received; update dexdo on the buyer",
             ));
         }
         if req.signature.len() != 64 {
@@ -978,38 +1002,18 @@ impl Gateway for GatewayService {
             Status::failed_precondition("this deal is not registered on this gateway")
         })?;
 
-        let request = req.request;
         let upstream = self.state.upstream(&req.token_contract);
-        upstream.validate_reasoning(request.as_ref().and_then(|r| r.params.as_ref()))?;
-        let mock_upstream = matches!(
-            &upstream,
-            UpstreamConfig::Mock
-                | UpstreamConfig::MockWithClaimedModel(_)
-                | UpstreamConfig::MockScammer
-        );
-        let explicit_output_limit = requested_max_tokens(request.as_ref());
-        let configured_output_limit =
-            GatewayState::registered_stream_token_limit(limits, request.as_ref(), mock_upstream);
-        if configured_output_limit == 0 {
+        let request = provider_request(&upstream, &req.path, &req.body, req.headers)?;
+        if upstream.is_mock() && limits.mock_token_count == 0 {
             return Err(Status::invalid_argument(
-                "canonical request output limit must be nonzero",
+                "this mock seller delivers no output",
             ));
         }
-        if explicit_output_limit.is_some_and(|limit| limit > req.billing_grant_tokens) {
-            return Err(Status::invalid_argument(
-                "canonical request output limit exceeds billing grant",
-            ));
-        }
-        // The legacy promptless helper has no explicit CanonRequest output cap. Its declared billing
-        // grant is still a hard total bound, so it also supplies the only buyer-side output ceiling;
-        // an explicit contradictory max_tokens remains an error instead of being rewritten.
-        let requested_output_limit = configured_output_limit.min(req.billing_grant_tokens);
         // Per-deal admission is checked before the upstream task can observe the request. Shared
         // requests hold live slots; legacy exclusive requests durably reserve their token amount.
         // Both ordinary and subscription limits come only from the matched TC's strict chain snapshot.
         // Seller-local delivery since that snapshot is private, so the actual reservation may be below
-        // the buyer's declared grant; that authoritative amount becomes the stricter total-usage limit
-        // and also clamps the provider's output-only cap.
+        // the buyer's declared grant; that authoritative amount becomes the total-usage limit.
         let delivered = self.state.delivery(&req.token_contract);
         let reservation = {
             let _guard = delivered.update_lock.lock().map_err(|_| {
@@ -1039,10 +1043,6 @@ impl Gateway for GatewayService {
             .map_err(reserve_status)?
         };
         let effective_billing_grant = reservation.amount();
-        let output_limit = requested_output_limit.min(effective_billing_grant);
-        // R1: the upstream adapts the CANONICAL request that arrived in the opening
-        // call alongside authorization. The mock model builds fake output from the prompt; the real
-        // provider adapter proxies the request and normalizes the SSE (R1/R5/R6).
         // The per-deal billable tracker is shared across all of this deal's streams (the gateway map returns
         // the same `DealDelivery`), so checked input-plus-output totals accumulate over sequential requests.
         // An ordinary completion leaves the session open; an overrun closes it after accepted work drains.
@@ -1052,14 +1052,16 @@ impl Gateway for GatewayService {
             delivered.event_sequence.clone(),
             self.state.upstream_failure_tx.clone(),
         );
-        // Incremental yielding (R6): content is forwarded without buffering. Terminal provider usage is held
-        // through clean EOF, validated against both limits, then atomically commits the request total before
-        // the same typed record is released to the buyer.
+        // Incremental relay (R6): the response is forwarded without buffering. Terminal provider usage is
+        // held through clean EOF, validated against the grant, then atomically commits the request total
+        // before the same typed record is released to the buyer.
         let (up_tx, up_rx) = mpsc::channel(GATEWAY_UPSTREAM_CHANNEL_CAPACITY);
+        let mock_token_count = limits.mock_token_count;
         tokio::spawn(async move {
-            upstream.run(output_limit, request, up_tx).await;
+            upstream.run(request, mock_token_count, up_tx).await;
         });
-        let (tx, rx) = mpsc::channel::<Result<CanonChunk, Status>>(GATEWAY_CLIENT_CHANNEL_CAPACITY);
+        let (tx, rx) =
+            mpsc::channel::<Result<StreamFrame, Status>>(GATEWAY_CLIENT_CHANNEL_CAPACITY);
         tokio::spawn(relay_counting_with_chain_availability(
             up_rx,
             tx,
@@ -1069,9 +1071,7 @@ impl Gateway for GatewayService {
             },
             Some(failure_context),
             Some(chain_unavailable),
-            output_limit,
             effective_billing_grant,
-            mock_upstream,
         ));
 
         let stream = ReceiverStream::new(rx);
@@ -1079,11 +1079,12 @@ impl Gateway for GatewayService {
     }
 }
 
+#[allow(clippy::result_large_err)]
 #[cfg(test)]
 mod tests {
     use super::*;
     use dexdo_core::{order_flags, LocalNote, Note, NotePubkey, SUBSCRIPTION_WEEKS, TICK_SIZE};
-    use dexdo_proto::SamplingParams;
+    use dexdo_proto::{Header, ResponseHead};
     use tokio_stream::StreamExt;
 
     fn recorder(count: Arc<AtomicU64>) -> DealDelivery {
@@ -1093,9 +1094,56 @@ mod tests {
         }
     }
 
+    fn head(status: u32) -> Result<UpstreamEvent, Status> {
+        Ok(UpstreamEvent::Head(ResponseHead {
+            status,
+            headers: Vec::new(),
+        }))
+    }
+
+    fn output(text: &str) -> Result<UpstreamEvent, Status> {
+        Ok(UpstreamEvent::Data {
+            bytes: text.as_bytes().to_vec(),
+            output: true,
+        })
+    }
+
+    fn usage(input: u64, output: u64) -> Result<UpstreamEvent, Status> {
+        Ok(UpstreamEvent::Usage(
+            BillingUsage::new(input, output, None).unwrap(),
+        ))
+    }
+
+    async fn relay_events<R: AuthoritativeDeliveryRecorder>(
+        events: Vec<Result<UpstreamEvent, Status>>,
+        recorder: R,
+        billing_grant_tokens: u64,
+    ) -> Vec<Result<StreamFrame, Status>> {
+        let (up_tx, up_rx) = mpsc::channel(events.len().max(1));
+        for event in events {
+            up_tx.send(event).await.unwrap();
+        }
+        drop(up_tx);
+        let (tx, mut rx) = mpsc::channel(64);
+        relay_counting_with_chain_availability(
+            up_rx,
+            tx,
+            recorder,
+            None,
+            None,
+            billing_grant_tokens,
+        )
+        .await;
+        let mut buyer = Vec::new();
+        while let Some(item) = rx.recv().await {
+            buyer.push(item);
+        }
+        buyer
+    }
+
     async fn relay_with_failure_seam(
         events: Vec<Result<UpstreamEvent, Status>>,
-    ) -> (Vec<Result<CanonChunk, Status>>, Option<UpstreamFailure>) {
+    ) -> (Vec<Result<StreamFrame, Status>>, Option<UpstreamFailure>) {
         let (up_tx, up_rx) = mpsc::channel(16);
         for event in events {
             up_tx.send(event).await.unwrap();
@@ -1174,63 +1222,45 @@ mod tests {
         }
     }
 
-    #[tokio::test]
-    async fn upstream_401_is_forwarded_unchanged_and_reported_once_without_detail() {
-        let message = "upstream HTTP 401 Unauthorized: sensitive provider error detail redacted";
-        let (buyer, failure) =
-            relay_with_failure_seam(vec![Err(Status::unavailable(message))]).await;
-
-        assert_eq!(buyer.len(), 1);
-        assert!(buyer[0]
-            .as_ref()
-            .is_err_and(|status| status.message() == message));
-        let failure = failure.unwrap();
-        assert_eq!(failure.token_contract, "0:deal");
-        assert_eq!(failure.error_class, "auth");
-        assert!(!failure.retryable);
-        assert_eq!(failure.grpc_status, "Unavailable");
-        assert_eq!(failure.http_status, Some(401));
-        let safe = format!("{failure:?}");
-        assert!(!safe.contains("provider error"), "{safe}");
-        assert!(!safe.contains("Authorization"), "{safe}");
-    }
-
-    #[tokio::test]
-    async fn upstream_request_rejection_is_reported_as_a_seller_configuration_fault() {
-        // a provider `400` on a request the seller fully built is its own configuration fault -- a
-        // distinct, never-retryable class, so the operator sees the cause instead of a generic `http`.
-        let message =
-            "upstream HTTP 400 Bad Request: max_tokens must be less than or equal to 40960 \
-             [seller configuration fault: model \"qwen/qwen3-32b\" sent max_tokens=2000000 at \
-             capabilities.max_output_tokens=2000000; correct this model's max_output_tokens in the \
-             models config]";
-        let (buyer, failure) =
-            relay_with_failure_seam(vec![Err(Status::unavailable(message))]).await;
-
-        assert_eq!(buyer.len(), 1);
-        assert!(buyer[0]
-            .as_ref()
-            .is_err_and(|status| status.message() == message));
-        let failure = failure.unwrap();
-        assert_eq!(failure.error_class, "seller_config");
-        assert!(!failure.retryable);
-        assert_eq!(failure.http_status, Some(400));
-
-        // Transient provider trouble keeps its existing retryable classes.
-        let (_, throttled) = relay_with_failure_seam(vec![Err(Status::unavailable(
-            "upstream HTTP 429 Too Many Requests",
-        ))])
-        .await;
-        let throttled = throttled.unwrap();
-        assert_eq!(throttled.error_class, "http");
-        assert!(throttled.retryable);
+    /// A Chat Completions body the mock serves: `prompt` as the one user message, at most
+    /// `max_tokens` words of output.
+    fn chat(prompt: &str, max_tokens: u64) -> serde_json::Value {
+        let messages = if prompt.is_empty() {
+            serde_json::json!([])
+        } else {
+            serde_json::json!([{ "role": "user", "content": prompt }])
+        };
+        serde_json::json!({
+            "model": "mock-model",
+            "messages": messages,
+            "max_tokens": max_tokens,
+            "stream": true,
+        })
     }
 
     fn authorized_request(
         state: &GatewayState,
         buyer: &LocalNote,
         token_contract: &str,
-        max_tokens: u32,
+        max_tokens: u64,
+        billing_grant_tokens: u64,
+    ) -> Request<StreamRequest> {
+        authorized_body(
+            state,
+            buyer,
+            token_contract,
+            "/v1/chat/completions",
+            chat("", max_tokens),
+            billing_grant_tokens,
+        )
+    }
+
+    fn authorized_body(
+        state: &GatewayState,
+        buyer: &LocalNote,
+        token_contract: &str,
+        path: &str,
+        body: serde_json::Value,
         billing_grant_tokens: u64,
     ) -> Request<StreamRequest> {
         let nonce = vec![9; 32];
@@ -1241,16 +1271,29 @@ mod tests {
             token_contract: token_contract.to_string(),
             nonce,
             signature: signature.0.to_vec(),
-            request: Some(CanonRequest {
-                messages: Vec::new(),
-                params: Some(SamplingParams {
-                    max_tokens,
-                    ..SamplingParams::default()
-                }),
-                ..Default::default()
-            }),
             billing_grant_tokens,
+            path: path.to_string(),
+            body: serde_json::to_vec(&body).unwrap(),
+            headers: Vec::new(),
         })
+    }
+
+    async fn drain(
+        mut stream: <GatewayService as Gateway>::OpenStreamStream,
+    ) -> (Vec<StreamFrame>, Option<Status>) {
+        let mut frames = Vec::new();
+        let mut error = None;
+        while let Some(item) = stream.next().await {
+            match item {
+                Ok(frame) => frames.push(frame),
+                Err(status) => error = Some(status),
+            }
+        }
+        (frames, error)
+    }
+
+    fn terminal(frames: &[StreamFrame]) -> Option<BillingUsage> {
+        frames.iter().find_map(|frame| frame.usage)
     }
 
     #[derive(Clone, Default)]
@@ -1292,19 +1335,13 @@ mod tests {
         }
     }
 
-    async fn run_openai_through_relay(
+    /// A one-shot HTTP provider: answers `status` with `body` and returns the raw request it read.
+    async fn scripted_provider(
+        status: &'static str,
+        content_type: &'static str,
         body: String,
-        key_env: &str,
-    ) -> (
-        u64,
-        Vec<AuthoritativeDeliveryEvent>,
-        Vec<Result<CanonChunk, Status>>,
-        String,
-    ) {
-        use crate::seller::upstream::openai::{self, OpenAiConfig};
-        use dexdo_proto::ChatMessage;
+    ) -> (String, tokio::task::JoinHandle<String>) {
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
-
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();
         let provider = tokio::spawn(async move {
@@ -1333,37 +1370,55 @@ mod tests {
                 }
             }
             let header = format!(
-                "HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\ncontent-length: {}\r\nconnection: close\r\n\r\n",
+                "HTTP/1.1 {status}\r\ncontent-type: {content_type}\r\ncontent-length: {}\r\nconnection: close\r\nset-cookie: provider=1\r\nx-ratelimit-remaining-requests: 7\r\n\r\n",
                 body.len()
             );
             socket.write_all(header.as_bytes()).await.unwrap();
             socket.write_all(body.as_bytes()).await.unwrap();
             String::from_utf8(request).unwrap()
         });
+        (format!("http://{address}"), provider)
+    }
 
-        std::env::set_var(key_env, "fake-provider-secret");
-        let cfg = OpenAiConfig {
-            base_url: format!("http://{address}"),
-            api_key_env: key_env.to_string(),
-            ..OpenAiConfig::default()
-        };
-        let request = CanonRequest {
-            messages: vec![ChatMessage {
-                role: "user".into(),
-                content: "hello".into(),
-            }],
-            params: None,
-            ..Default::default()
-        };
+    fn openai_upstream(base_url: String) -> UpstreamConfig {
+        UpstreamConfig::OpenAi(crate::seller::OpenAiConfig {
+            base_url,
+            model: "provider/served-model".into(),
+            frame_model: "vendor--model--v1".into(),
+            api_key_env: "PATH".into(),
+            identity_aliases: Vec::new(),
+        })
+    }
+
+    async fn run_openai_through_relay(
+        body: String,
+    ) -> (
+        u64,
+        Vec<AuthoritativeDeliveryEvent>,
+        Vec<Result<StreamFrame, Status>>,
+        String,
+    ) {
+        let (base_url, provider) = scripted_provider("200 OK", "text/event-stream", body).await;
+        let request = provider_request(
+            &openai_upstream(base_url.clone()),
+            "/v1/chat/completions",
+            &serde_json::to_vec(&serde_json::json!({
+                "model": "vendor--model--v1",
+                "messages": [{ "role": "user", "content": "hello" }],
+                "stream": true,
+            }))
+            .unwrap(),
+            Vec::new(),
+        )
+        .unwrap();
         let (up_tx, up_rx) = mpsc::channel(8);
         let upstream = tokio::spawn(async move {
-            openai::run(&cfg, None, 8, Some(request), up_tx).await;
+            openai_upstream(base_url).run(request, 0, up_tx).await;
         });
         let (buyer_tx, mut buyer_rx) = mpsc::channel(8);
         let recorder = RecordingDelivery::default();
         relay_counting(up_rx, buyer_tx, recorder.clone(), None).await;
         upstream.await.unwrap();
-        std::env::remove_var(key_env);
         let provider_request = provider.await.unwrap();
         let mut buyer_events = Vec::new();
         while let Some(event) = buyer_rx.recv().await {
@@ -1377,21 +1432,140 @@ mod tests {
         )
     }
 
-    /// Drive one gRPC stream through `relay_counting`: emit `n_ok` content chunks followed by either one
+    fn data_of(frames: &[Result<StreamFrame, Status>]) -> String {
+        frames
+            .iter()
+            .filter_map(|frame| frame.as_ref().ok())
+            .map(|frame| String::from_utf8_lossy(&frame.data).into_owned())
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn upstream_401_is_forwarded_unchanged_and_reported_once_without_detail() {
+        let message = "upstream HTTP 401 Unauthorized";
+        let (buyer, failure) =
+            relay_with_failure_seam(vec![Err(Status::unavailable(message))]).await;
+
+        assert_eq!(buyer.len(), 1);
+        assert!(buyer[0]
+            .as_ref()
+            .is_err_and(|status| status.message() == message));
+        let failure = failure.unwrap();
+        assert_eq!(failure.token_contract, "0:deal");
+        assert_eq!(failure.error_class, "auth");
+        assert!(!failure.retryable);
+        assert_eq!(failure.grpc_status, "Unavailable");
+        assert_eq!(failure.http_status, Some(401));
+        let safe = format!("{failure:?}");
+        assert!(!safe.contains("provider error"), "{safe}");
+        assert!(!safe.contains("Authorization"), "{safe}");
+    }
+
+    /// A provider error answer reaches the buyer as received, bills nothing, releases the request and
+    /// is reported once to the seller operator.
+    #[tokio::test]
+    async fn a_provider_error_answer_is_relayed_unbilled_and_reported_once() {
+        for (status, retryable) in [(400, false), (429, true), (503, true)] {
+            let (buyer, failure) = relay_with_failure_seam(vec![
+                head(status),
+                Ok(UpstreamEvent::Data {
+                    bytes: b"{\"error\":{\"message\":\"provider says no\"}}".to_vec(),
+                    output: false,
+                }),
+            ])
+            .await;
+            assert_eq!(
+                buyer.len(),
+                2,
+                "{status}: head and body only, no error frame"
+            );
+            assert_eq!(
+                buyer[0].as_ref().unwrap().head.as_ref().unwrap().status,
+                status
+            );
+            assert_eq!(
+                data_of(&buyer),
+                "{\"error\":{\"message\":\"provider says no\"}}"
+            );
+            assert!(buyer
+                .iter()
+                .all(|frame| frame.as_ref().is_ok_and(|frame| frame.usage.is_none())));
+            let failure = failure.unwrap();
+            assert_eq!(failure.error_class, "http");
+            assert_eq!(failure.retryable, retryable);
+            assert_eq!(failure.http_status, Some(u16::try_from(status).unwrap()));
+        }
+
+        let events = EventRecorder::default();
+        let buyer = relay_events(
+            vec![
+                head(400),
+                Ok(UpstreamEvent::Data {
+                    bytes: b"bad".to_vec(),
+                    output: false,
+                }),
+            ],
+            events.clone(),
+            u64::MAX,
+        )
+        .await;
+        assert!(buyer.iter().all(Result::is_ok));
+        assert_eq!(
+            events.events(),
+            vec![AuthoritativeDeliveryEvent::Finished(
+                AuthoritativeDeliveryFinish::Interrupted
+            )],
+            "an error answer releases the request exactly"
+        );
+    }
+
+    #[tokio::test]
+    async fn usage_after_a_provider_error_head_is_never_billed() {
+        let events = EventRecorder::default();
+        let buyer = relay_events(
+            vec![head(500), output("partial"), usage(1, 1)],
+            events.clone(),
+            u64::MAX,
+        )
+        .await;
+        assert_eq!(
+            buyer.last().unwrap().as_ref().unwrap_err().code(),
+            tonic::Code::DataLoss
+        );
+        assert!(!events
+            .events()
+            .iter()
+            .any(|event| matches!(event, AuthoritativeDeliveryEvent::Completed(_))));
+    }
+
+    #[tokio::test]
+    async fn content_without_a_head_or_a_second_head_is_refused_unbilled() {
+        for events_in in [
+            vec![output("no head"), usage(1, 1)],
+            vec![head(200), head(200), output("x"), usage(1, 1)],
+        ] {
+            let events = EventRecorder::default();
+            let buyer = relay_events(events_in, events.clone(), u64::MAX).await;
+            assert_eq!(
+                buyer.last().unwrap().as_ref().unwrap_err().code(),
+                tonic::Code::DataLoss
+            );
+            assert!(!events
+                .events()
+                .iter()
+                .any(|event| matches!(event, AuthoritativeDeliveryEvent::Completed(_))));
+        }
+    }
+
+    /// Drive one gRPC stream through `relay_counting`: emit `n_ok` output frames followed by either one
     /// terminal usage record or an error, and return how many items reached the buyer.
     async fn run_one_stream(count: Arc<AtomicU64>, n_ok: usize, trailing_err: bool) -> usize {
         let (up_tx, up_rx) = mpsc::channel(16);
-        let (tx, mut rx) = mpsc::channel::<Result<CanonChunk, Status>>(16);
+        let (tx, mut rx) = mpsc::channel::<Result<StreamFrame, Status>>(16);
         tokio::spawn(async move {
-            for seq in 0..n_ok {
-                up_tx
-                    .send(Ok(UpstreamEvent::Chunk(CanonChunk {
-                        token_ids: vec![42],
-                        seq: seq as u64,
-                        ..CanonChunk::default()
-                    })))
-                    .await
-                    .unwrap();
+            up_tx.send(head(200)).await.unwrap();
+            for _ in 0..n_ok {
+                up_tx.send(output("word ")).await.unwrap();
             }
             if trailing_err {
                 up_tx
@@ -1399,12 +1573,7 @@ mod tests {
                     .await
                     .unwrap();
             } else if n_ok > 0 {
-                up_tx
-                    .send(Ok(UpstreamEvent::Usage(
-                        BillingUsage::new(1, n_ok as u64, None).unwrap(),
-                    )))
-                    .await
-                    .unwrap();
+                up_tx.send(usage(1, n_ok as u64)).await.unwrap();
             }
         });
         let relay = tokio::spawn(relay_counting(up_rx, tx, recorder(count), None));
@@ -1428,8 +1597,8 @@ mod tests {
             "content without a clean terminal usage record is not billable"
         );
         assert_eq!(
-            forwarded, 4,
-            "three content chunks and the terminal error reach the buyer"
+            forwarded, 5,
+            "the head, three output frames and the terminal error reach the buyer"
         );
         assert!(
             !delivery.done.load(Ordering::Acquire),
@@ -1445,7 +1614,6 @@ mod tests {
     async fn two_sequential_streams_accumulate_count_and_never_mark_deal_done() {
         let state = GatewayState::new();
         let tc = "0:deal";
-        // First request's stream.
         let d1 = state.delivery(tc);
         run_one_stream(d1.count.clone(), 3, false).await;
         assert_eq!(
@@ -1457,8 +1625,6 @@ mod tests {
             !d1.done.load(Ordering::Acquire),
             "deal not done after the first stream"
         );
-        // Second request's stream -- fetched by tc anew, as a fresh `open_stream` would: the same tracker,
-        // still usable, already carrying the first stream's count.
         let d2 = state.delivery(tc);
         assert_eq!(
             d2.count.load(Ordering::Acquire),
@@ -1483,43 +1649,6 @@ mod tests {
     }
 
     #[test]
-    fn real_upstream_limit_uses_request_and_market_not_mock_fixture() {
-        let state = GatewayState::new();
-        let tc = "0:deal";
-        state.limits.lock().unwrap().insert(
-            tc.to_string(),
-            StreamLimits {
-                mock_token_count: 8,
-                deal: ordinary_shape(300),
-            },
-        );
-        let req = CanonRequest {
-            messages: Vec::new(),
-            params: Some(SamplingParams {
-                max_tokens: 256,
-                ..SamplingParams::default()
-            }),
-            ..Default::default()
-        };
-
-        assert_eq!(
-            state.stream_token_limit(tc, Some(&req), false),
-            256,
-            "real upstream follows request max_tokens, not --mock-token-count"
-        );
-        assert_eq!(
-            state.stream_token_limit(tc, None, false),
-            u64::MAX,
-            "without request max_tokens the later authoritative reservation supplies the cap"
-        );
-        assert_eq!(
-            state.stream_token_limit(tc, Some(&req), true),
-            8,
-            "mock upstream keeps the explicit fake-token fixture"
-        );
-    }
-
-    #[test]
     fn ordinary_registration_uses_actual_funded_capacity_not_seller_configuration() {
         let state = GatewayState::new();
         let tc = "0:ordinary";
@@ -1535,7 +1664,6 @@ mod tests {
         let snapshot = state.capacity_snapshot(tc).unwrap().unwrap();
         assert_eq!(snapshot.funded_tokens, TICK_SIZE + 17);
         assert_eq!(snapshot.available().unwrap(), 17);
-        assert_eq!(state.stream_token_limit(tc, None, false), u64::MAX);
         assert_eq!(
             state
                 .capacity
@@ -1672,15 +1800,108 @@ mod tests {
             .reconcile_ordinary_capacity(tc, subscription_state(TICK_SIZE))
             .unwrap()
             .unwrap();
-        assert_eq!(accepted.local_delivered_after_anchor, 196);
-        let claim = TICK_SIZE
-            + u128::from(state.delivery(tc).count.load(Ordering::Acquire) - delivery_at_probe);
+        // both requests sit inside the paid probe tick; none of it is debt beyond the chain.
+        assert_eq!(accepted.tokens_pending_anchor, 57 + 196);
+        assert_eq!(accepted.local_delivered_after_anchor, 0);
+        deliver(TICK_SIZE as u64);
+        let usage = u128::from(state.delivery(tc).count.load(Ordering::Acquire));
+        assert_eq!(usage, TICK_SIZE + 57 + 196);
+        let unclaimed = state.capacity_snapshot(tc).unwrap().unwrap();
+        assert_eq!(
+            unclaimed.local_delivered_after_anchor, TICK_SIZE,
+            "only usage beyond the paid tick awaits a claim"
+        );
         let reconciled = state
-            .reconcile_ordinary_capacity(tc, subscription_state(claim))
+            .reconcile_ordinary_capacity(tc, subscription_state(usage))
             .unwrap()
             .unwrap();
-        assert_eq!(reconciled.tokens_pending_anchor, TICK_SIZE + 196);
+        assert_eq!(reconciled.tokens_pending_anchor, usage);
         assert_eq!(reconciled.local_delivered_after_anchor, 0);
+    }
+
+    /// a restarted gateway resumes the claim counter from the deal's whole durable usage, so the
+    /// resumed driver bills `max(one tick, usage)` exactly as the process before the restart would have.
+    #[test]
+    fn restart_restores_the_whole_usage_inside_and_beyond_the_probe_tick_2185() {
+        let directory = tempfile::tempdir().unwrap();
+        let tc = "0:restart-whole-usage-2185";
+        let deliver = |state: &GatewayState, tokens: u64| {
+            CapacityDeliveryRecorder {
+                reservation: state.capacity.reserve(&tc.to_string(), tokens).unwrap(),
+                delivery: state.delivery(tc),
+            }
+            .record_authoritative_delivery(AuthoritativeDeliveryEvent::Completed(
+                NonZeroU64::new(tokens).unwrap(),
+            ))
+            .unwrap();
+        };
+        let restart = |pending: u128| {
+            let state = GatewayState::with_upstream_and_deals_dir(
+                UpstreamConfig::Mock,
+                directory.path().to_path_buf(),
+            );
+            state
+                .register_stream(
+                    tc,
+                    buyer_pubkey(),
+                    u64::MAX,
+                    subscription_state(pending),
+                    ordinary_shape(10 * TICK_SIZE),
+                )
+                .unwrap();
+            state
+        };
+
+        let mut pre_probe = subscription_state(0);
+        pre_probe.probe_accepted = false;
+        let first = GatewayState::with_upstream_and_deals_dir(
+            UpstreamConfig::Mock,
+            directory.path().to_path_buf(),
+        );
+        first
+            .register_stream(
+                tc,
+                buyer_pubkey(),
+                u64::MAX,
+                pre_probe,
+                ordinary_shape(10 * TICK_SIZE),
+            )
+            .unwrap();
+        deliver(&first, 21_977);
+        first
+            .reconcile_ordinary_capacity(tc, subscription_state(TICK_SIZE))
+            .unwrap();
+        deliver(&first, 500_000);
+        drop(first);
+
+        let inside_tick = restart(TICK_SIZE);
+        assert_eq!(
+            inside_tick.delivery(tc).count.load(Ordering::Acquire),
+            521_977,
+            "usage inside the paid tick survives the restart"
+        );
+        deliver(&inside_tick, 1_758_240);
+        drop(inside_tick);
+
+        let beyond_tick = restart(TICK_SIZE);
+        assert_eq!(
+            beyond_tick.delivery(tc).count.load(Ordering::Acquire),
+            2_280_217,
+            "the resumed claim counter is the whole usage, not the debt beyond the probe tick"
+        );
+        let snapshot = beyond_tick.capacity_snapshot(tc).unwrap().unwrap();
+        assert_eq!(snapshot.tokens_pending_anchor, TICK_SIZE);
+        assert_eq!(snapshot.local_delivered_after_anchor, 1_280_217);
+        drop(beyond_tick);
+
+        let claimed = restart(2 * TICK_SIZE);
+        assert_eq!(
+            claimed.delivery(tc).count.load(Ordering::Acquire),
+            2_280_217
+        );
+        let snapshot = claimed.capacity_snapshot(tc).unwrap().unwrap();
+        assert_eq!(snapshot.tokens_pending_anchor, 2 * TICK_SIZE);
+        assert_eq!(snapshot.local_delivered_after_anchor, 280_217);
     }
 
     #[test]
@@ -1722,30 +1943,18 @@ mod tests {
             )
             .unwrap();
         let reservation = state.capacity.reserve(&tc.to_string(), 100).unwrap();
-        let (up_tx, up_rx) = mpsc::channel(2);
-        let (tx, mut rx) = mpsc::channel(2);
-        up_tx
-            .send(Ok(UpstreamEvent::Chunk(CanonChunk {
-                text: "forwarded before usage".into(),
-                ..CanonChunk::default()
-            })))
-            .await
-            .unwrap();
-        drop(up_tx);
-
-        relay_counting(
-            up_rx,
-            tx,
+        let buyer = relay_events(
+            vec![head(200), output("forwarded before usage")],
             CapacityDeliveryRecorder {
                 reservation,
                 delivery: state.delivery(tc),
             },
-            None,
+            100,
         )
         .await;
-        assert!(rx.recv().await.unwrap().is_ok());
+        assert_eq!(data_of(&buyer), "forwarded before usage");
         assert_eq!(
-            rx.recv().await.unwrap().unwrap_err().code(),
+            buyer.last().unwrap().as_ref().unwrap_err().code(),
             tonic::Code::DataLoss
         );
         let snapshot = state.capacity_snapshot(tc).unwrap().unwrap();
@@ -1771,36 +1980,16 @@ mod tests {
             .unwrap();
         let reservation = state.capacity.reserve(&tc.to_string(), 4).unwrap();
         assert_eq!(reservation.amount(), 4);
-        let (up_tx, up_rx) = mpsc::channel(4);
-        let (tx, mut rx) = mpsc::channel(4);
-        for event in [
-            Ok(UpstreamEvent::Chunk(CanonChunk {
-                text: "billable".into(),
-                ..CanonChunk::default()
-            })),
-            Ok(UpstreamEvent::Usage(BillingUsage::new(3, 1, None).unwrap())),
-            Ok(UpstreamEvent::Usage(BillingUsage::new(3, 1, None).unwrap())),
-        ] {
-            up_tx.send(event).await.unwrap();
-        }
-        drop(up_tx);
-
-        relay_counting(
-            up_rx,
-            tx,
+        let buyer = relay_events(
+            vec![head(200), output("billable"), usage(3, 1), usage(3, 1)],
             CapacityDeliveryRecorder {
                 reservation,
                 delivery: state.delivery(tc),
             },
-            None,
+            4,
         )
         .await;
-
-        let mut buyer = Vec::new();
-        while let Some(item) = rx.recv().await {
-            buyer.push(item);
-        }
-        assert_eq!(buyer[0].as_ref().unwrap().text, "billable");
+        assert_eq!(data_of(&buyer), "billable");
         let refusal = buyer
             .last()
             .expect("the refused request terminates the stream")
@@ -1809,7 +1998,7 @@ mod tests {
         assert_eq!(refusal.code(), tonic::Code::DataLoss);
         assert_eq!(
             state.delivery(tc).count.load(Ordering::Acquire),
-            0,
+            TICK_SIZE as u64,
             "duplicate terminal usage cannot become claimable"
         );
         let snapshot = state.capacity_snapshot(tc).unwrap().unwrap();
@@ -1831,25 +2020,17 @@ mod tests {
             )
             .unwrap();
         let reservation = state.capacity.reserve(&tc.to_string(), 100).unwrap();
-        let (up_tx, up_rx) = mpsc::channel(2);
-        let (tx, mut rx) = mpsc::channel(1);
-        up_tx
-            .send(Err(Status::unavailable("provider unavailable")))
-            .await
-            .unwrap();
-        drop(up_tx);
-        relay_counting(
-            up_rx,
-            tx,
+        let buyer = relay_events(
+            vec![Err(Status::unavailable("provider unavailable"))],
             CapacityDeliveryRecorder {
                 reservation,
                 delivery: state.delivery(tc),
             },
-            None,
+            100,
         )
         .await;
         assert_eq!(
-            rx.recv().await.unwrap().unwrap_err().code(),
+            buyer[0].as_ref().unwrap_err().code(),
             tonic::Code::Unavailable
         );
         let snapshot = state.capacity_snapshot(tc).unwrap().unwrap();
@@ -1860,7 +2041,7 @@ mod tests {
     #[tokio::test]
     async fn terminal_total_above_reservation_delivers_the_full_response_and_caps_billing() {
         let state = GatewayState::new();
-        let tc = "0:fat-structured-chunk";
+        let tc = "0:overrun";
         state
             .register_stream(
                 tc,
@@ -1872,58 +2053,35 @@ mod tests {
             .unwrap();
         let reservation = state.capacity.reserve(&tc.to_string(), u64::MAX).unwrap();
         assert_eq!(reservation.amount(), 2);
-        let (up_tx, up_rx) = mpsc::channel(2);
-        let (tx, mut rx) = mpsc::channel::<Result<CanonChunk, Status>>(2);
-        up_tx
-            .send(Ok(UpstreamEvent::Chunk(CanonChunk {
-                text: "full provider response".into(),
-                ..CanonChunk::default()
-            })))
-            .await
-            .unwrap();
-        up_tx
-            .send(Ok(UpstreamEvent::Usage(
-                BillingUsage::new(0, 3, None).unwrap(),
-            )))
-            .await
-            .unwrap();
-        drop(up_tx);
-
-        relay_counting_with_chain_availability(
-            up_rx,
-            tx,
+        let buyer = relay_events(
+            vec![head(200), output("full provider response"), usage(0, 3)],
             CapacityDeliveryRecorder {
                 reservation,
                 delivery: state.delivery(tc),
             },
-            None,
-            None,
             2,
-            2,
-            false,
         )
         .await;
-        assert_eq!(
-            rx.recv().await.unwrap().unwrap().text,
-            "full provider response"
-        );
-        let usage = rx.recv().await.unwrap().unwrap().usage.unwrap();
+        assert_eq!(data_of(&buyer), "full provider response");
+        let usage = buyer.last().unwrap().as_ref().unwrap().usage.unwrap();
         assert_eq!(usage.input_tokens, 0);
         assert_eq!(usage.output_tokens, 3);
         assert_eq!(usage.total_tokens, 3);
         assert_eq!(usage.billable_tokens(), 2);
-        assert!(rx.recv().await.is_none());
         let snapshot = state.capacity_snapshot(tc).unwrap().unwrap();
         assert_eq!(snapshot.local_delivered_after_anchor, 2);
         assert_eq!(snapshot.outstanding_reservation, 0);
         assert_eq!(snapshot.available().unwrap(), 0);
-        assert_eq!(state.delivery(tc).count.load(Ordering::Acquire), 2);
+        assert_eq!(
+            state.delivery(tc).count.load(Ordering::Acquire),
+            TICK_SIZE as u64 + 2
+        );
         assert!(state.delivery(tc).done.load(Ordering::Acquire));
         assert!(state.delivery(tc).billing_exhausted.load(Ordering::Acquire));
     }
 
     #[tokio::test]
-    async fn capacity_recorder_overflow_changes_no_state_and_exposes_no_chunk() {
+    async fn capacity_recorder_overflow_changes_no_state_and_exposes_no_usage() {
         let directory = tempfile::tempdir().unwrap();
         let state = GatewayState::with_upstream_and_deals_dir(
             UpstreamConfig::Mock,
@@ -1943,45 +2101,25 @@ mod tests {
         assert_eq!(reservation.amount(), 2);
         let delivery = state.delivery(tc);
         delivery.count.store(u64::MAX, Ordering::Relaxed);
-        let (up_tx, up_rx) = mpsc::channel(2);
-        let (tx, mut rx) = mpsc::channel::<Result<CanonChunk, Status>>(2);
-        up_tx
-            .send(Ok(UpstreamEvent::Chunk(CanonChunk {
-                token_ids: vec![1],
-                ..CanonChunk::default()
-            })))
-            .await
-            .unwrap();
-        up_tx
-            .send(Ok(UpstreamEvent::Usage(
-                BillingUsage::new(2, 1, None).unwrap(),
-            )))
-            .await
-            .unwrap();
-        drop(up_tx);
-
-        relay_counting_with_chain_availability(
-            up_rx,
-            tx,
+        let buyer = relay_events(
+            vec![head(200), output("one"), usage(2, 1)],
             CapacityDeliveryRecorder {
                 reservation,
                 delivery: delivery.clone(),
             },
-            None,
-            None,
-            1,
             2,
-            true,
         )
         .await;
-        assert_eq!(rx.recv().await.unwrap().unwrap().token_ids, vec![1]);
-        let status = rx.recv().await.unwrap().unwrap_err();
+        assert_eq!(data_of(&buyer), "one");
+        let status = buyer.last().unwrap().as_ref().unwrap_err();
         assert_eq!(status.code(), tonic::Code::DataLoss);
         assert_eq!(
             status.message(),
             "authoritative billable-token high-water overflow"
         );
-        assert!(rx.recv().await.is_none());
+        assert!(buyer
+            .iter()
+            .all(|frame| frame.as_ref().map_or(true, |frame| frame.usage.is_none())));
         let snapshot = state.capacity_snapshot(tc).unwrap().unwrap();
         assert_eq!(snapshot.local_delivered_after_anchor, 0);
         assert_eq!(snapshot.outstanding_reservation, 2);
@@ -1991,47 +2129,13 @@ mod tests {
         assert!(!delivery.billing_exhausted.load(Ordering::Acquire));
     }
 
+    /// The buyer's grant is reduced to the seller's private remainder; the provider's answer is not
+    /// cut, and the charge for its overrun is capped to that remainder.
     #[tokio::test]
-    async fn open_stream_keeps_output_cap_separate_from_total_billing_grant() {
+    async fn terminal_total_above_the_private_capacity_is_capped_and_marks_the_deal_done() {
         let state = Arc::new(GatewayState::new());
         let buyer = LocalNote::generate();
-        let tc = "0:open-stream-clamp";
-        state
-            .register_stream(
-                tc,
-                buyer.pubkey(),
-                100,
-                subscription_state(2 * TICK_SIZE - 3),
-                subscription_shape(),
-            )
-            .unwrap();
-        let service = GatewayService::new(state.clone());
-        let mut request = authorized_request(&state, &buyer, tc, 2, 3);
-        request.get_mut().request.as_mut().unwrap().messages = vec![dexdo_proto::ChatMessage {
-            role: "user".into(),
-            content: "one".into(),
-        }];
-        let response = service.open_stream(request).await.unwrap();
-        let mut stream = response.into_inner();
-        let mut chunks = 0;
-        while stream.next().await.is_some() {
-            chunks += 1;
-        }
-        assert_eq!(
-            chunks, 3,
-            "two output frames plus one terminal usage frame are returned"
-        );
-        let snapshot = state.capacity_snapshot(tc).unwrap().unwrap();
-        assert_eq!(snapshot.local_delivered_after_anchor, 3);
-        assert_eq!(snapshot.outstanding_reservation, 0);
-        assert_eq!(snapshot.available().unwrap(), 0);
-    }
-
-    #[tokio::test]
-    async fn open_stream_clamps_private_capacity_below_the_buyer_grant() {
-        let state = Arc::new(GatewayState::new());
-        let buyer = LocalNote::generate();
-        let tc = "0:open-stream-private-cap";
+        let tc = "0:open-stream-private-cap-overflow";
         state
             .register_stream(
                 tc,
@@ -2051,36 +2155,47 @@ mod tests {
             3,
             "only the seller knows its three-token authoritative remainder"
         );
-
         let service = GatewayService::new(state.clone());
-        let response = service
-            .open_stream(authorized_request(&state, &buyer, tc, 100, 100))
-            .await
-            .expect("a larger buyer grant is clamped, not rejected");
-        let mut stream = response.into_inner();
-        let mut output = 0_u64;
-        let mut terminal = None;
-        while let Some(item) = stream.next().await {
-            let chunk = item.expect("empty-input mock usage fits the private remainder");
-            if let Some(usage) = chunk.usage {
-                terminal = Some(usage);
-            } else {
-                output += chunk.visible_output_tokens();
-            }
-        }
-        assert_eq!(
-            output, 3,
-            "the provider output cap is physically reduced from the requested 100 to capacity 3"
+        let request = authorized_body(
+            &state,
+            &buyer,
+            tc,
+            "/v1/chat/completions",
+            chat("one", 100),
+            100,
         );
-        assert_eq!(terminal.unwrap().total_tokens, 3);
+        let response = service
+            .open_stream(request)
+            .await
+            .expect("a larger buyer grant is reduced to the remainder, not rejected");
+        let (frames, error) = drain(response.into_inner()).await;
+        assert!(error.is_none(), "{error:?}");
+        let usage =
+            terminal(&frames).expect("the buyer receives native usage with a capped charge");
+        usage.validate().unwrap();
+        assert_eq!(usage.input_tokens, 1);
+        assert_eq!(
+            usage.output_tokens, 100,
+            "the provider answers the whole requested length"
+        );
+        assert_eq!(usage.total_tokens, 101);
+        assert_eq!(usage.billable_tokens(), 3);
         let snapshot = state.capacity_snapshot(tc).unwrap().unwrap();
-        assert_eq!(snapshot.local_delivered_after_anchor, 3);
+        assert_eq!(
+            snapshot.local_delivered_after_anchor, 3,
+            "only the authorized reservation becomes durable billable delivery"
+        );
         assert_eq!(snapshot.outstanding_reservation, 0);
-        assert_eq!(state.delivery(tc).count.load(Ordering::Acquire), 3);
+        assert_eq!(
+            state.delivery(tc).count.load(Ordering::Acquire),
+            TICK_SIZE as u64 + 3
+        );
+        assert!(state.delivery(tc).done.load(Ordering::Acquire));
+        assert!(state.delivery(tc).billing_exhausted.load(Ordering::Acquire));
     }
 
     #[tokio::test]
-    async fn reasoning_2090_capability_queries_leave_authorization_nonces_untouched() {
+    async fn capability_queries_declare_api_paths_and_leave_authorization_nonces_untouched() {
         let state = Arc::new(GatewayState::new());
         let buyer = LocalNote::generate();
         let tc = "0:capability-query";
@@ -2095,6 +2210,11 @@ mod tests {
             .unwrap()
             .into_inner();
         assert!(!challenge.nonce.is_empty());
+        assert_eq!(
+            challenge.api_paths,
+            ["/v1/chat/completions", "/v1/responses", "/v1/messages"],
+            "the mock serves every consumer path"
+        );
         assert_eq!(state.auth.outstanding_challenge_count(tc), 1);
         for _ in 0..3 {
             let query = service
@@ -2107,10 +2227,7 @@ mod tests {
                 .into_inner();
             assert!(query.nonce.is_empty());
             assert_eq!(query.token_contract, tc);
-            assert_eq!(
-                query.supports_reasoning_disable,
-                challenge.supports_reasoning_disable
-            );
+            assert_eq!(query.api_paths, challenge.api_paths);
             assert_eq!(state.auth.outstanding_challenge_count(tc), 1);
             let signature = buyer.sign(&challenge_bytes(tc, &query.nonce));
             assert!(!state.auth.verify_response(tc, &query.nonce, &signature));
@@ -2118,304 +2235,437 @@ mod tests {
         let signature = buyer.sign(&challenge_bytes(tc, &challenge.nonce));
         assert!(state.auth.verify_response(tc, &challenge.nonce, &signature));
         assert_eq!(state.auth.outstanding_challenge_count(tc), 0);
+
+        let openai = openai_upstream("http://127.0.0.1:1".into());
+        state.route_stream(tc, openai);
+        let routed = service
+            .get_challenge(Request::new(ChallengeRequest {
+                token_contract: tc.into(),
+                capabilities_only: true,
+            }))
+            .await
+            .unwrap()
+            .into_inner();
+        assert_eq!(routed.api_paths, ["/v1/chat/completions", "/v1/responses"]);
+        state.route_stream(
+            tc,
+            UpstreamConfig::Anthropic(crate::seller::AnthropicConfig {
+                base_url: "http://127.0.0.1:1".into(),
+                model: "claude-provider-model".into(),
+                frame_model: "anthropic--claude--x".into(),
+                api_key_env: "PATH".into(),
+            }),
+        );
+        let routed = service
+            .get_challenge(Request::new(ChallengeRequest {
+                token_contract: tc.into(),
+                capabilities_only: true,
+            }))
+            .await
+            .unwrap()
+            .into_inner();
+        assert_eq!(routed.api_paths, ["/v1/messages"]);
     }
 
-    #[tokio::test]
-    async fn reasoning_2172_gateway_rechecks_effort_before_capacity_reservation() {
-        for (effort, disabled, declared) in [
-            ("high", false, false),
-            ("invalid", false, true),
-            ("low", false, true),
-            ("high", true, true),
+    /// The four seller edits, and everything else unchanged: the deal model is replaced by the
+    /// provider's id, a streamed Chat Completions request asks for usage, the client's credentials and
+    /// transport headers do not travel, and unknown fields, limits and reasoning controls arrive as sent.
+    #[test]
+    fn the_provider_request_differs_from_the_consumer_request_only_by_the_seller_edits() {
+        let upstream = openai_upstream("http://127.0.0.1:1".into());
+        let consumer = serde_json::json!({
+            "model": "vendor--model--v1",
+            "messages": [{ "role": "user", "content": "hi" }],
+            "stream": true,
+            "stream_options": { "continuous_usage_stats": true, "include_obfuscation": false },
+            "max_tokens": 9_000_000,
+            "max_completion_tokens": 7,
+            "reasoning_effort": "high",
+            "tools": [{ "type": "function", "function": { "name": "f" } }],
+            "temperature": 0.3,
+            "x_unknown": { "kept": [1, 2] },
+        });
+        let headers = [
+            ("authorization", "Bearer client-secret"),
+            ("x-api-key", "client-anthropic-secret"),
+            ("api-key", "client-azure-secret"),
+            ("openai-organization", "org-client"),
+            ("openai-project", "proj-client"),
+            ("cookie", "client=1"),
+            ("host", "127.0.0.1:8080"),
+            ("content-length", "12"),
+            ("content-type", "text/plain"),
+            ("connection", "keep-alive"),
+            ("transfer-encoding", "chunked"),
+            ("accept-encoding", "gzip"),
+            ("session_id", "agent-session"),
+            ("user-agent", "OpenAI/Python 1.40.0"),
+            ("anthropic-beta", "tools-2024"),
+        ]
+        .map(|(name, value)| Header {
+            name: name.to_string(),
+            value: value.as_bytes().to_vec(),
+        })
+        .to_vec();
+        let request = provider_request(
+            &upstream,
+            "/v1/chat/completions",
+            &serde_json::to_vec(&consumer).unwrap(),
+            headers,
+        )
+        .unwrap();
+        let mut expected = consumer.clone();
+        expected["model"] = "provider/served-model".into();
+        expected["stream_options"] =
+            serde_json::json!({ "include_obfuscation": false, "include_usage": true });
+        // The fields keep the client's order on the wire, which a `Value` comparison cannot see.
+        let sent = String::from_utf8(request.body.to_vec()).unwrap();
+        let order = [
+            "\"model\"",
+            "\"messages\"",
+            "\"stream\"",
+            "\"stream_options\"",
+            "\"max_tokens\"",
+            "\"max_completion_tokens\"",
+            "\"reasoning_effort\"",
+            "\"tools\"",
+            "\"temperature\"",
+            "\"x_unknown\"",
+        ]
+        .map(|key| sent.find(key).unwrap_or_else(|| panic!("{key} in {sent}")));
+        assert!(order.windows(2).all(|pair| pair[0] < pair[1]), "{sent}");
+        assert_eq!(serde_json::Value::Object(request.body.0), expected);
+        let forwarded: Vec<&str> = request
+            .headers
+            .iter()
+            .map(|header| header.name.as_str())
+            .collect();
+        assert_eq!(forwarded, ["session_id", "user-agent", "anthropic-beta"]);
+
+        // A non-streamed request and the other formats get no usage opt-in.
+        for (path, body) in [
+            (
+                "/v1/chat/completions",
+                serde_json::json!({"model": "vendor--model--v1", "messages": []}),
+            ),
+            (
+                "/v1/responses",
+                serde_json::json!({"model": "vendor--model--v1", "input": "hi", "stream": true}),
+            ),
         ] {
-            let mut cfg = crate::seller::OpenAiConfig {
-                base_url: "http://127.0.0.1:1".into(),
-                api_key_env: "DEXDO_2172_UNUSED_FIXTURE_KEY".into(),
-                ..Default::default()
-            };
-            cfg.capabilities.reasoning_disable =
-                dexdo_core::params::ReasoningDisableControl::ChatTemplate;
-            if declared {
-                cfg.capabilities.reasoning_effort = Some(
-                    serde_json::from_value(serde_json::json!({
-                        "control":"reasoning_effort", "supported":["high"]
-                    }))
-                    .unwrap(),
-                );
-            }
-            let state = Arc::new(GatewayState::with_upstream(UpstreamConfig::OpenAi(cfg)));
-            let buyer = LocalNote::generate();
-            let tc = "0:unsupported-effort";
-            state
-                .register_stream(
-                    tc,
-                    buyer.pubkey(),
-                    8,
-                    subscription_state(TICK_SIZE),
-                    ordinary_shape(TICK_SIZE + 8),
-                )
-                .unwrap();
-            let before = state.capacity_snapshot(tc).unwrap().unwrap();
-            let service = GatewayService::new(state.clone());
-            let query = service
-                .get_challenge(Request::new(ChallengeRequest {
-                    token_contract: tc.into(),
-                    capabilities_only: true,
-                }))
-                .await
-                .unwrap()
-                .into_inner();
-            assert!(query.nonce.is_empty());
-            assert_eq!(
-                query.supported_reasoning_efforts,
-                if declared {
-                    vec!["high".to_owned()]
-                } else {
-                    vec![]
-                }
-            );
-            assert_eq!(state.auth.outstanding_challenge_count(tc), 0);
-            let mut request = authorized_request(&state, &buyer, tc, 8, 8);
-            let params = request
-                .get_mut()
-                .request
-                .as_mut()
-                .unwrap()
-                .params
-                .as_mut()
-                .unwrap();
-            params.reasoning_effort = Some(effort.into());
-            params.disable_reasoning = disabled;
-            let Err(error) = service.open_stream(request).await else {
-                panic!("unsupported effort must be refused")
-            };
-            assert_eq!(error.code(), tonic::Code::InvalidArgument);
-            assert!(error.message().starts_with("unsupported_parameter:"));
-            let after = state.capacity_snapshot(tc).unwrap().unwrap();
-            assert_eq!(
-                after.outstanding_reservation,
-                before.outstanding_reservation
-            );
-            assert_eq!(
-                after.local_delivered_after_anchor,
-                before.local_delivered_after_anchor
-            );
-            assert_eq!(after.available().unwrap(), before.available().unwrap());
+            let request = provider_request(
+                &upstream,
+                path,
+                &serde_json::to_vec(&body).unwrap(),
+                Vec::new(),
+            )
+            .unwrap();
+            assert!(request.body.0.get("stream_options").is_none(), "{path}");
+            assert_eq!(request.body.0["model"], "provider/served-model");
         }
     }
 
-    #[tokio::test]
-    async fn unsupported_reasoning_2090_is_refused_before_capacity_reservation() {
-        let state = Arc::new(GatewayState::new());
-        let buyer = LocalNote::generate();
-        let tc = "0:unsupported-reasoning";
-        state
-            .register_stream(
-                tc,
-                buyer.pubkey(),
-                8,
-                subscription_state(TICK_SIZE),
-                ordinary_shape(TICK_SIZE + 8),
-            )
-            .unwrap();
-        let before = state.capacity_snapshot(tc).unwrap().unwrap();
-        let mut request = authorized_request(&state, &buyer, tc, 8, 8);
-        request
-            .get_mut()
-            .request
-            .as_mut()
-            .unwrap()
-            .params
-            .as_mut()
-            .unwrap()
-            .disable_reasoning = true;
-        let result = GatewayService::new(state.clone())
-            .open_stream(request)
-            .await;
-        let Err(error) = result else {
-            panic!("unsupported control must be refused");
-        };
-        assert_eq!(error.code(), tonic::Code::InvalidArgument);
-        assert!(error.message().starts_with("unsupported_parameter:"));
-        let after = state.capacity_snapshot(tc).unwrap().unwrap();
-        assert_eq!(
-            after.outstanding_reservation,
-            before.outstanding_reservation
+    #[test]
+    fn the_seller_refuses_what_it_must_not_forward() {
+        let upstream = openai_upstream("http://127.0.0.1:1".into());
+        let body = |value: serde_json::Value| serde_json::to_vec(&value).unwrap();
+        let cases = [
+            (
+                "/v1/messages",
+                body(serde_json::json!({"model": "vendor--model--v1"})),
+                "unsupported_api_path",
+            ),
+            (
+                "/v1/embeddings",
+                body(serde_json::json!({"model": "vendor--model--v1"})),
+                "unsupported_api_path",
+            ),
+            (
+                "/v1/chat/completions",
+                body(serde_json::json!({"messages": []})),
+                "request model is required",
+            ),
+            (
+                "/v1/chat/completions",
+                body(serde_json::json!({"model": "", "messages": []})),
+                "request model is required",
+            ),
+            (
+                "/v1/chat/completions",
+                body(serde_json::json!({"model": "other--model--v1"})),
+                "is not this deal's model",
+            ),
+            (
+                "/v1/chat/completions",
+                body(serde_json::json!({"model": "provider/served-model"})),
+                "is not this deal's model",
+            ),
+            ("/v1/chat/completions", b"[1,2]".to_vec(), "JSON object"),
+            ("/v1/chat/completions", b"{".to_vec(), "not valid JSON"),
+        ];
+        for (path, bytes, reason) in cases {
+            let error = provider_request(&upstream, path, &bytes, Vec::new()).unwrap_err();
+            assert_eq!(
+                error.code(),
+                tonic::Code::InvalidArgument,
+                "{path} {reason}"
+            );
+            assert!(error.message().contains(reason), "{}", error.message());
+        }
+        let limit = dexdo_core::params::BUYER_API_REQUEST_BODY_MAX_BYTES;
+        let mut at_limit = br#"{"model":"vendor--model--v1","pad":""#.to_vec();
+        at_limit.resize(limit - 2, b'x');
+        at_limit.extend_from_slice(b"\"}");
+        assert_eq!(at_limit.len(), limit);
+        assert!(provider_request(&upstream, "/v1/chat/completions", &at_limit, Vec::new()).is_ok());
+        let mut above = at_limit.clone();
+        above.insert(above.len() - 2, b'x');
+        let error =
+            provider_request(&upstream, "/v1/chat/completions", &above, Vec::new()).unwrap_err();
+        assert!(
+            error.message().contains("request body exceeds the maximum"),
+            "{}",
+            error.message()
         );
-        assert_eq!(
-            after.local_delivered_after_anchor,
-            before.local_delivered_after_anchor
-        );
-        assert_eq!(after.available().unwrap(), before.available().unwrap());
     }
 
+    /// An older buyer sends no path: its request is refused the way it keeps its deal open, before
+    /// authorization consumes a nonce or capacity is reserved.
     #[tokio::test]
-    async fn terminal_total_above_the_private_capacity_is_capped_and_marks_the_deal_done() {
+    async fn an_older_buyer_request_is_refused_without_touching_the_deal() {
         let state = Arc::new(GatewayState::new());
         let buyer = LocalNote::generate();
-        let tc = "0:open-stream-private-cap-overflow";
+        let tc = "0:older-buyer";
         state
             .register_stream(
                 tc,
                 buyer.pubkey(),
                 100,
                 subscription_state(TICK_SIZE),
-                ordinary_shape(TICK_SIZE + 3),
+                ordinary_shape(2 * TICK_SIZE),
             )
             .unwrap();
-        let service = GatewayService::new(state.clone());
-        let mut request = authorized_request(&state, &buyer, tc, 100, 100);
-        request.get_mut().request.as_mut().unwrap().messages = vec![dexdo_proto::ChatMessage {
-            role: "user".into(),
-            content: "one".into(),
-        }];
-        let response = service
-            .open_stream(request)
+        let mut request = authorized_request(&state, &buyer, tc, 1, 100).into_inner();
+        request.path.clear();
+        request.body.clear();
+        let error = GatewayService::new(state.clone())
+            .open_stream(Request::new(request))
             .await
-            .expect("the authoritative remainder can reserve before provider usage is known");
-        let mut stream = response.into_inner();
-        let mut output = 0_u64;
-        let mut terminal = None;
-        while let Some(item) = stream.next().await {
-            let chunk = item.expect("provider overrun is capped to the authorized reservation");
-            if let Some(usage) = chunk.usage {
-                terminal = Some(usage);
-            } else {
-                output += chunk.visible_output_tokens();
-            }
-        }
-        assert_eq!(
-            output, 3,
-            "the effective output cap is the private reservation"
-        );
-        let usage = terminal.expect("the buyer receives native usage with a capped charge");
-        usage.validate().unwrap();
-        assert_eq!(usage.input_tokens, 1);
-        assert_eq!(usage.output_tokens, 3);
-        assert_eq!(usage.total_tokens, 4);
-        assert_eq!(usage.billable_tokens(), 3);
+            .err()
+            .unwrap();
+        assert_eq!(error.code(), tonic::Code::ResourceExhausted);
+        assert!(error.message().contains("update dexdo on the buyer"));
+        assert_eq!(state.auth.outstanding_challenge_count(tc), 1);
         let snapshot = state.capacity_snapshot(tc).unwrap().unwrap();
-        assert_eq!(
-            snapshot.local_delivered_after_anchor, 3,
-            "only the authorized reservation becomes durable billable delivery"
-        );
-        assert_eq!(
-            snapshot.outstanding_reservation, 0,
-            "the accepted capped delivery consumes the reservation"
-        );
-        assert_eq!(state.delivery(tc).count.load(Ordering::Acquire), 3);
-        assert!(state.delivery(tc).done.load(Ordering::Acquire));
-        assert!(state.delivery(tc).billing_exhausted.load(Ordering::Acquire));
+        assert_eq!(snapshot.outstanding_reservation, 0);
+        assert_eq!(state.active_requests(tc), 0);
     }
 
-    /// E2E-ROW: E2E-USAGE-14/L0
+    /// The whole seller path against a real HTTP provider: the provider receives exactly the edited
+    /// request with the seller's own key, and the buyer receives the provider's status, headers and
+    /// bytes unchanged, then the billing record.
     #[tokio::test]
-    async fn cache_usage_2132_gateway_preserves_native_counts_and_caps_only_payment() {
-        use crate::seller::{AnthropicConfig, OpenAiConfig};
-        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    async fn the_gateway_relays_the_provider_answer_as_produced() {
+        let body = concat!(
+            "data: {\"model\":\"provider/served-model\",\"choices\":[{\"delta\":{\"content\":\"forwarded\"}}]}\n\n",
+            "data: {\"choices\":[],\"usage\":{\"prompt_tokens\":2,\"completion_tokens\":3,\"total_tokens\":5}}\n\n",
+            "data: [DONE]\n\n"
+        )
+        .to_string();
+        let (base_url, provider) =
+            scripted_provider("200 OK", "text/event-stream", body.clone()).await;
+        let state = Arc::new(GatewayState::with_upstream(openai_upstream(base_url)));
+        let buyer = LocalNote::generate();
+        let tc = "0:relayed-as-produced";
+        state
+            .register_stream(
+                tc,
+                buyer.pubkey(),
+                0,
+                subscription_state(TICK_SIZE),
+                ordinary_shape(2 * TICK_SIZE),
+            )
+            .unwrap();
+        let mut request = authorized_body(
+            &state,
+            &buyer,
+            tc,
+            "/v1/chat/completions",
+            serde_json::json!({
+                "model": "vendor--model--v1",
+                "messages": [{"role": "user", "content": "hello"}],
+                "stream": true,
+                "x_unknown": "kept",
+            }),
+            100,
+        )
+        .into_inner();
+        request.headers = vec![
+            Header {
+                name: "authorization".into(),
+                value: b"Bearer client-secret".to_vec(),
+            },
+            Header {
+                name: "session_id".into(),
+                value: b"agent-session".to_vec(),
+            },
+        ];
+        let (frames, error) = drain(
+            GatewayService::new(state.clone())
+                .open_stream(Request::new(request))
+                .await
+                .unwrap()
+                .into_inner(),
+        )
+        .await;
+        assert!(error.is_none(), "{error:?}");
+        let provider_request = provider.await.unwrap();
+        let (head_text, sent_body) = provider_request.split_once("\r\n\r\n").unwrap();
+        let sent: serde_json::Value = serde_json::from_str(sent_body).unwrap();
+        assert_eq!(
+            sent,
+            serde_json::json!({
+                "model": "provider/served-model",
+                "messages": [{"role": "user", "content": "hello"}],
+                "stream": true,
+                "x_unknown": "kept",
+                "stream_options": { "include_usage": true },
+            })
+        );
+        let head_lower = head_text.to_ascii_lowercase();
+        assert!(
+            head_lower.starts_with("post /chat/completions "),
+            "{head_text}"
+        );
+        assert!(!head_text.contains("client-secret"), "{head_text}");
+        assert!(
+            head_lower.contains("session_id: agent-session"),
+            "{head_text}"
+        );
+        assert!(
+            head_lower.contains("authorization: bearer "),
+            "the seller sends its own key: {head_text}"
+        );
 
-        for anthropic in [false, true] {
-            for shared in [false, true] {
-                for (grant, invalid) in [(5, false), (12, false), (5, true)] {
-                    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-                    let address = listener.local_addr().unwrap();
-                    let write = if invalid { -1 } else { 3 };
-                    let wire = if anthropic {
-                        format!("event: message_start\ndata: {}\n\nevent: content_block_delta\ndata: {}\n\nevent: message_delta\ndata: {}\n\nevent: message_stop\ndata: {{\"type\":\"message_stop\"}}\n\n",
-                            serde_json::json!({"type":"message_start","message":{"usage":{
-                                "input_tokens":0,"cache_read_input_tokens":4,"cache_creation_input_tokens":write}}}),
-                            serde_json::json!({"type":"content_block_delta","delta":{"type":"text_delta","text":"answer"}}),
-                            serde_json::json!({"type":"message_delta","usage":{"output_tokens":5}}))
-                    } else {
-                        format!(
-                            "data: {}\n\ndata: {}\n\ndata: [DONE]\n\n",
-                            serde_json::json!({"choices":[{"delta":{"content":"answer"}}]}),
-                            serde_json::json!({"choices":[],"usage":{"prompt_tokens":7,"completion_tokens":5,
-                                "total_tokens":12,"prompt_tokens_details":{"cached_tokens":4,"cache_write_tokens":write}}})
-                        )
-                    };
-                    let server = tokio::spawn(async move {
-                        let (mut socket, _) = listener.accept().await.unwrap();
-                        let mut request = vec![0; 8192];
-                        let read = socket.read(&mut request).await.unwrap();
-                        assert_ne!(read, 0, "scripted provider received no request bytes");
-                        let response = format!("HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{wire}", wire.len());
-                        socket.write_all(response.as_bytes()).await.unwrap();
-                    });
-                    let upstream = if anthropic {
-                        UpstreamConfig::Anthropic(AnthropicConfig {
-                            base_url: format!("http://{address}"),
-                            model: "scripted".into(),
-                            frame_model: "m".into(),
-                            api_key_env: "PATH".into(),
-                            tokenizer_family: "scripted".into(),
-                            max_output_tokens: Some(5),
-                            reasoning_disable: Default::default(),
-                        })
-                    } else {
-                        UpstreamConfig::OpenAi(OpenAiConfig {
-                            base_url: format!("http://{address}"),
-                            frame_model: "m".into(),
-                            api_key_env: "PATH".into(),
-                            ..Default::default()
-                        })
-                    };
-                    let state = Arc::new(GatewayState::with_upstream(upstream));
-                    let buyer = LocalNote::generate();
-                    let tc = "0:cache-usage-2132";
-                    state
-                        .register_stream(
-                            tc,
-                            buyer.pubkey(),
-                            5,
-                            subscription_state(TICK_SIZE),
-                            ordinary_shape(TICK_SIZE + 20),
-                        )
-                        .unwrap();
-                    let mut request = authorized_request(&state, &buyer, tc, 5, grant);
-                    request.get_mut().shared_budget = shared;
-                    let mut stream = GatewayService::new(state.clone())
-                        .open_stream(request)
-                        .await
-                        .unwrap()
-                        .into_inner();
-                    let mut terminal = None;
-                    let mut error = None;
-                    while let Some(item) = stream.next().await {
-                        match item {
-                            Ok(chunk) if chunk.usage.is_some() => terminal = chunk.usage,
-                            Ok(_) => {}
-                            Err(status) => error = Some(status),
-                        }
-                    }
-                    server.await.unwrap();
-                    let snapshot = state.capacity_snapshot(tc).unwrap().unwrap();
-                    if invalid {
-                        assert!(terminal.is_none());
-                        assert_eq!(error.unwrap().code(), tonic::Code::DataLoss);
-                        assert_eq!(snapshot.local_delivered_after_anchor, 0);
-                        assert_eq!(state.delivery(tc).count.load(Ordering::Acquire), 0);
-                    } else {
-                        assert!(error.is_none(), "{error:?}");
-                        let usage = terminal.unwrap();
-                        usage.validate().unwrap();
-                        assert_eq!(
-                            (usage.input_tokens, usage.output_tokens, usage.total_tokens),
-                            (7, 5, 12)
-                        );
-                        assert_eq!((usage.cache_read_tokens, usage.cache_write_tokens), (4, 3));
-                        assert_eq!(usage.billable_tokens(), grant);
-                        assert_eq!(snapshot.local_delivered_after_anchor, u128::from(grant));
-                        assert_eq!(snapshot.outstanding_reservation, 0);
-                        assert_eq!(state.delivery(tc).count.load(Ordering::Acquire), grant);
-                        assert_eq!(
-                            state.delivery(tc).billing_exhausted.load(Ordering::Acquire),
-                            grant < 12
-                        );
-                    }
-                }
-            }
+        let response_head = frames[0].head.as_ref().unwrap();
+        assert_eq!(response_head.status, 200);
+        let names: Vec<&str> = response_head
+            .headers
+            .iter()
+            .map(|header| header.name.as_str())
+            .collect();
+        assert!(names.contains(&"content-type"));
+        assert!(names.contains(&"x-ratelimit-remaining-requests"));
+        for transport in ["content-length", "connection", "set-cookie"] {
+            assert!(!names.contains(&transport), "{transport} must not travel");
         }
+        let relayed: Vec<u8> = frames.iter().flat_map(|frame| frame.data.clone()).collect();
+        assert_eq!(
+            relayed,
+            body.as_bytes(),
+            "the provider bytes arrive unchanged"
+        );
+        assert_eq!(terminal(&frames).unwrap().total_tokens, 5);
+        assert_eq!(
+            state.delivery(tc).count.load(Ordering::Acquire),
+            TICK_SIZE as u64 + 5
+        );
+    }
+
+    #[tokio::test]
+    async fn a_provider_error_answer_reaches_the_buyer_and_releases_the_deal() {
+        let error_body = "{\"error\":{\"message\":\"context length exceeded\",\"type\":\"invalid_request_error\"}}".to_string();
+        let (base_url, provider) =
+            scripted_provider("400 Bad Request", "application/json", error_body.clone()).await;
+        let state = Arc::new(GatewayState::with_upstream(openai_upstream(base_url)));
+        let buyer = LocalNote::generate();
+        let tc = "0:provider-error-answer";
+        state
+            .register_stream(
+                tc,
+                buyer.pubkey(),
+                0,
+                subscription_state(TICK_SIZE),
+                ordinary_shape(2 * TICK_SIZE),
+            )
+            .unwrap();
+        let request = authorized_body(
+            &state,
+            &buyer,
+            tc,
+            "/v1/chat/completions",
+            serde_json::json!({"model": "vendor--model--v1", "messages": []}),
+            100,
+        );
+        let (frames, error) = drain(
+            GatewayService::new(state.clone())
+                .open_stream(request)
+                .await
+                .unwrap()
+                .into_inner(),
+        )
+        .await;
+        provider.await.unwrap();
+        assert!(error.is_none(), "{error:?}");
+        assert_eq!(frames[0].head.as_ref().unwrap().status, 400);
+        let relayed: Vec<u8> = frames.iter().flat_map(|frame| frame.data.clone()).collect();
+        assert_eq!(relayed, error_body.as_bytes());
+        assert!(terminal(&frames).is_none());
+        let snapshot = state.capacity_snapshot(tc).unwrap().unwrap();
+        assert_eq!(snapshot.outstanding_reservation, 0);
+        assert_eq!(snapshot.local_delivered_after_anchor, 0);
+        assert_eq!(
+            state.delivery(tc).count.load(Ordering::Acquire),
+            TICK_SIZE as u64
+        );
+        let failure = state.recv_upstream_failure().await.unwrap();
+        assert_eq!(failure.http_status, Some(400));
+    }
+
+    #[tokio::test]
+    async fn a_refused_seller_credential_never_carries_the_provider_body() {
+        let (base_url, provider) = scripted_provider(
+            "401 Unauthorized",
+            "application/json",
+            "{\"error\":{\"message\":\"Incorrect API key provided: sk-abc***xyz\"}}".to_string(),
+        )
+        .await;
+        let state = Arc::new(GatewayState::with_upstream(openai_upstream(base_url)));
+        let buyer = LocalNote::generate();
+        let tc = "0:provider-401";
+        state
+            .register_stream(
+                tc,
+                buyer.pubkey(),
+                0,
+                subscription_state(TICK_SIZE),
+                ordinary_shape(2 * TICK_SIZE),
+            )
+            .unwrap();
+        let request = authorized_body(
+            &state,
+            &buyer,
+            tc,
+            "/v1/chat/completions",
+            serde_json::json!({"model": "vendor--model--v1", "messages": []}),
+            100,
+        );
+        let (frames, error) = drain(
+            GatewayService::new(state.clone())
+                .open_stream(request)
+                .await
+                .unwrap()
+                .into_inner(),
+        )
+        .await;
+        provider.await.unwrap();
+        assert!(
+            frames.is_empty(),
+            "no provider head or byte reaches the buyer"
+        );
+        let error = error.unwrap();
+        assert_eq!(error.message(), "upstream HTTP 401 Unauthorized");
+        assert!(!format!("{error:?}").contains("sk-abc"));
     }
 
     #[tokio::test]
@@ -2441,7 +2691,7 @@ mod tests {
         assert_eq!(error.code(), tonic::Code::ResourceExhausted);
         assert_eq!(
             state.delivery(tc).count.load(Ordering::Acquire),
-            0,
+            2 * TICK_SIZE as u64,
             "no upstream delivery tracker changed"
         );
     }
@@ -2470,154 +2720,72 @@ mod tests {
             .err()
             .expect("post-term request must be rejected before upstream");
         assert_eq!(error.code(), tonic::Code::ResourceExhausted);
-        assert_eq!(state.delivery(tc).count.load(Ordering::Acquire), 0);
-    }
-
-    #[tokio::test]
-    async fn relay_counts_tokens_from_structured_signals_not_chunks() {
-        let count = Arc::new(AtomicU64::new(0));
-        let (up_tx, up_rx) = mpsc::channel(16);
-        let (tx, mut rx) = mpsc::channel::<Result<CanonChunk, Status>>(16);
-        tokio::spawn(async move {
-            up_tx
-                .send(Ok(UpstreamEvent::Chunk(CanonChunk {
-                    token_ids: vec![1, 2, 3],
-                    ..CanonChunk::default()
-                })))
-                .await
-                .unwrap();
-            up_tx
-                .send(Ok(UpstreamEvent::Chunk(CanonChunk {
-                    seq: 1,
-                    ..CanonChunk::default()
-                })))
-                .await
-                .unwrap();
-            up_tx
-                .send(Ok(UpstreamEvent::Usage(
-                    BillingUsage::new(2, 3, None).unwrap(),
-                )))
-                .await
-                .unwrap();
-        });
-        relay_counting(up_rx, tx, recorder(count.clone()), None).await;
-        while rx.recv().await.is_some() {}
         assert_eq!(
-            count.load(Ordering::Acquire),
-            5,
-            "the monetary counter uses terminal input + output, not chunk count"
+            state.delivery(tc).count.load(Ordering::Acquire),
+            pending as u64
         );
     }
 
     #[tokio::test]
-    async fn relay_uses_authoritative_usage_instead_of_anthropic_delta_count() {
+    async fn relay_bills_authoritative_usage_not_frames() {
         let count = Arc::new(AtomicU64::new(0));
-        let (up_tx, up_rx) = mpsc::channel(16);
-        let (tx, mut rx) = mpsc::channel(16);
-        tokio::spawn(async move {
-            for text in ["Hello", " world"] {
-                up_tx
-                    .send(Ok(UpstreamEvent::Chunk(CanonChunk {
-                        text: text.into(),
-                        seq: if text == "Hello" { 0 } else { 1 },
-                        ..CanonChunk::default()
-                    })))
-                    .await
-                    .unwrap();
-            }
-            up_tx
-                .send(Ok(UpstreamEvent::Usage(
-                    BillingUsage::new(7, 5, None).unwrap(),
-                )))
-                .await
-                .unwrap();
-        });
-        relay_counting(up_rx, tx, recorder(count.clone()), None).await;
-        let mut delivered_chunks = 0;
-        while rx.recv().await.is_some() {
-            delivered_chunks += 1;
-        }
-        assert_eq!(delivered_chunks, 3);
+        let buyer = relay_events(
+            vec![head(200), output("Hello"), output(" world"), usage(7, 5)],
+            recorder(count.clone()),
+            u64::MAX,
+        )
+        .await;
+        assert_eq!(buyer.len(), 4, "head, two frames and the usage record");
         assert_eq!(count.load(Ordering::Acquire), 12);
     }
 
     #[tokio::test]
     async fn buyer_disconnect_before_delivery_does_not_advance_count() {
         let count = Arc::new(AtomicU64::new(0));
-        let (up_tx, up_rx) = mpsc::channel(1);
-        let (tx, rx) = mpsc::channel::<Result<CanonChunk, Status>>(1);
+        let (up_tx, up_rx) = mpsc::channel(3);
+        let (tx, rx) = mpsc::channel::<Result<StreamFrame, Status>>(1);
         drop(rx);
-        up_tx
-            .send(Ok(UpstreamEvent::Chunk(CanonChunk {
-                token_ids: vec![1, 2, 3],
-                ..CanonChunk::default()
-            })))
-            .await
-            .unwrap();
+        up_tx.send(head(200)).await.unwrap();
+        up_tx.send(output("one")).await.unwrap();
+        up_tx.send(usage(1, 1)).await.unwrap();
         drop(up_tx);
-
         relay_counting(up_rx, tx, recorder(count.clone()), None).await;
         assert_eq!(
             count.load(Ordering::Acquire),
             0,
-            "only a chunk successfully accepted by the buyer stream is billable"
+            "only output successfully accepted by the buyer stream is billable"
         );
     }
 
     #[tokio::test]
     async fn high_water_overflow_is_explicit_and_does_not_wrap() {
         let count = Arc::new(AtomicU64::new(u64::MAX));
-        let (up_tx, up_rx) = mpsc::channel(2);
-        let (tx, mut rx) = mpsc::channel::<Result<CanonChunk, Status>>(2);
-        up_tx
-            .send(Ok(UpstreamEvent::Chunk(CanonChunk {
-                token_ids: vec![1],
-                ..CanonChunk::default()
-            })))
-            .await
-            .unwrap();
-        up_tx
-            .send(Ok(UpstreamEvent::Usage(
-                BillingUsage::new(1, 1, None).unwrap(),
-            )))
-            .await
-            .unwrap();
-        drop(up_tx);
-
-        relay_counting(up_rx, tx, recorder(count.clone()), None).await;
-        assert_eq!(rx.recv().await.unwrap().unwrap().token_ids, vec![1]);
-        let status = rx.recv().await.unwrap().unwrap_err();
-        assert_eq!(status.code(), tonic::Code::DataLoss);
-        assert!(rx.recv().await.is_none());
+        let buyer = relay_events(
+            vec![head(200), output("one"), usage(1, 1)],
+            recorder(count.clone()),
+            u64::MAX,
+        )
+        .await;
+        assert_eq!(data_of(&buyer), "one");
+        assert_eq!(
+            buyer.last().unwrap().as_ref().unwrap_err().code(),
+            tonic::Code::DataLoss
+        );
         assert_eq!(count.load(Ordering::Acquire), u64::MAX);
     }
 
     #[tokio::test]
-    async fn accepted_structured_chunk_is_forwarded_once_and_recorded_once() {
+    async fn accepted_output_is_forwarded_once_and_recorded_once() {
         let events = EventRecorder::default();
-        let (up_tx, up_rx) = mpsc::channel(2);
-        let (tx, mut rx) = mpsc::channel::<Result<CanonChunk, Status>>(2);
-        up_tx
-            .send(Ok(UpstreamEvent::Chunk(CanonChunk {
-                token_ids: vec![1, 2, 3],
-                ..CanonChunk::default()
-            })))
-            .await
-            .unwrap();
-        up_tx
-            .send(Ok(UpstreamEvent::Usage(
-                BillingUsage::new(2, 3, None).unwrap(),
-            )))
-            .await
-            .unwrap();
-        drop(up_tx);
-
-        relay_counting(up_rx, tx, events.clone(), None).await;
-        let chunk = rx.recv().await.unwrap().unwrap();
-        assert_eq!(chunk.token_ids, vec![1, 2, 3]);
-        let usage = rx.recv().await.unwrap().unwrap().usage.unwrap();
-        assert_eq!(usage.total_tokens, 5);
-        assert!(rx.recv().await.is_none());
+        let buyer = relay_events(
+            vec![head(200), output("abc"), usage(2, 3)],
+            events.clone(),
+            u64::MAX,
+        )
+        .await;
+        assert_eq!(buyer.len(), 3);
+        assert_eq!(data_of(&buyer), "abc");
+        assert_eq!(buyer[2].as_ref().unwrap().usage.unwrap().total_tokens, 5);
         assert_eq!(
             events.events(),
             vec![AuthoritativeDeliveryEvent::Completed(
@@ -2631,27 +2799,21 @@ mod tests {
     #[tokio::test]
     async fn truncated_openai_eof_records_no_delivery_and_never_clean() {
         let events = EventRecorder::default();
-        let (up_tx, up_rx) = mpsc::channel(2);
-        let (tx, mut rx) = mpsc::channel::<Result<CanonChunk, Status>>(2);
-        up_tx
-            .send(Ok(UpstreamEvent::Chunk(CanonChunk {
-                text: "forwarded".into(),
-                ..CanonChunk::default()
-            })))
-            .await
-            .unwrap();
-        up_tx
-            .send(Err(Status::data_loss(
-                "OpenAI-compatible SSE ended without [DONE]",
-            )))
-            .await
-            .unwrap();
-        drop(up_tx);
-
-        relay_counting(up_rx, tx, events.clone(), None).await;
-        assert!(rx.recv().await.unwrap().is_ok());
+        let buyer = relay_events(
+            vec![
+                head(200),
+                output("forwarded"),
+                Err(Status::data_loss(
+                    "provider stream ended before its final event",
+                )),
+            ],
+            events.clone(),
+            u64::MAX,
+        )
+        .await;
+        assert_eq!(data_of(&buyer), "forwarded");
         assert_eq!(
-            rx.recv().await.unwrap().unwrap_err().code(),
+            buyer.last().unwrap().as_ref().unwrap_err().code(),
             tonic::Code::DataLoss
         );
         assert_eq!(
@@ -2666,18 +2828,12 @@ mod tests {
     #[tokio::test]
     async fn closed_receiver_before_permit_records_no_delivery() {
         let events = EventRecorder::default();
-        let (up_tx, up_rx) = mpsc::channel(1);
-        let (tx, rx) = mpsc::channel::<Result<CanonChunk, Status>>(1);
+        let (up_tx, up_rx) = mpsc::channel(2);
+        let (tx, rx) = mpsc::channel::<Result<StreamFrame, Status>>(1);
         drop(rx);
-        up_tx
-            .send(Ok(UpstreamEvent::Chunk(CanonChunk {
-                text: "not accepted".into(),
-                ..CanonChunk::default()
-            })))
-            .await
-            .unwrap();
+        up_tx.send(head(200)).await.unwrap();
+        up_tx.send(output("not accepted")).await.unwrap();
         drop(up_tx);
-
         relay_counting(up_rx, tx, events.clone(), None).await;
         assert_eq!(
             events.events(),
@@ -2691,24 +2847,13 @@ mod tests {
     #[tokio::test]
     async fn separate_usage_after_buyer_disconnect_never_records_delivery() {
         let events = EventRecorder::default();
-        let (up_tx, up_rx) = mpsc::channel(2);
-        let (tx, rx) = mpsc::channel::<Result<CanonChunk, Status>>(1);
+        let (up_tx, up_rx) = mpsc::channel(3);
+        let (tx, rx) = mpsc::channel::<Result<StreamFrame, Status>>(1);
         drop(rx);
-        up_tx
-            .send(Ok(UpstreamEvent::Chunk(CanonChunk {
-                text: "not accepted".into(),
-                ..CanonChunk::default()
-            })))
-            .await
-            .unwrap();
-        up_tx
-            .send(Ok(UpstreamEvent::Usage(
-                BillingUsage::new(1, 1, None).unwrap(),
-            )))
-            .await
-            .unwrap();
+        up_tx.send(head(200)).await.unwrap();
+        up_tx.send(output("not accepted")).await.unwrap();
+        up_tx.send(usage(1, 1)).await.unwrap();
         drop(up_tx);
-
         relay_counting(up_rx, tx, events.clone(), None).await;
         assert_eq!(
             events.events(),
@@ -2733,21 +2878,20 @@ mod tests {
         )
         .to_string();
         let (count, events, buyer_events, provider_request) =
-            run_openai_through_relay(body, "DEXDO_861_RELAY_NATIVE_USAGE_KEY").await;
-
+            run_openai_through_relay(body.clone()).await;
         assert!(provider_request.starts_with("POST "));
         assert!(
             provider_request.contains("\"include_usage\":true"),
             "the seller must ask for the record it bills by: {provider_request}"
         );
-        assert_eq!(buyer_events.len(), 2);
-        assert_eq!(buyer_events[0].as_ref().unwrap().text, "forwarded");
+        assert_eq!(data_of(&buyer_events), body);
         assert_eq!(
-            buyer_events[1]
+            buyer_events
+                .last()
+                .unwrap()
                 .as_ref()
                 .unwrap()
                 .usage
-                .as_ref()
                 .unwrap()
                 .total_tokens,
             5
@@ -2765,27 +2909,17 @@ mod tests {
     /// nothing is delivered and nothing is billable (E2E-UPS-07/18).
     #[tokio::test]
     async fn malformed_complete_openai_sse_is_data_loss_and_bills_nothing() {
-        let body = concat!(
-            "data: {\"choices\":[{\"delta\":{\"content\":\"forwarded\"},",
-            "\"logprobs\":{\"content\":[{\"token\":\"forwarded\",\"logprob\":-0.1,",
-            "\"top_logprobs\":[]}]}}]}\n\n",
-            "data: {\"choices\":[\n\n",
-            "data: {\"choices\":[],\"usage\":{\"completion_tokens\":3}}\n\n",
-            "data: [DONE]\n\n"
-        )
-        .to_string();
-        let (count, events, buyer_events, provider_request) =
-            run_openai_through_relay(body, "DEXDO_768_MALFORMED_SSE_KEY").await;
-
+        let first = "data: {\"choices\":[{\"delta\":{\"content\":\"forwarded\"}}]}\n\n";
+        let body = format!(
+            "{first}data: {{\"choices\":[\n\ndata: {{\"choices\":[],\"usage\":{{\"completion_tokens\":3}}}}\n\ndata: [DONE]\n\n"
+        );
+        let (count, events, buyer_events, provider_request) = run_openai_through_relay(body).await;
         assert!(provider_request.starts_with("POST "));
-        assert_eq!(buyer_events.len(), 2);
-        assert_eq!(buyer_events[0].as_ref().unwrap().text, "forwarded");
-        let status = buyer_events[1].as_ref().unwrap_err();
+        assert_eq!(data_of(&buyer_events), first);
+        let status = buyer_events.last().unwrap().as_ref().unwrap_err();
         assert_eq!(status.code(), tonic::Code::DataLoss);
         assert!(
-            status
-                .message()
-                .starts_with("malformed OpenAI-compatible SSE JSON:"),
+            status.message().starts_with("malformed provider SSE JSON:"),
             "{}",
             status.message()
         );
@@ -2805,21 +2939,15 @@ mod tests {
     #[tokio::test]
     async fn separate_usage_missing_after_forward_remains_ambiguous() {
         let events = EventRecorder::default();
-        let (up_tx, up_rx) = mpsc::channel(1);
-        let (tx, mut rx) = mpsc::channel::<Result<CanonChunk, Status>>(2);
-        up_tx
-            .send(Ok(UpstreamEvent::Chunk(CanonChunk {
-                text: "forwarded".into(),
-                ..CanonChunk::default()
-            })))
-            .await
-            .unwrap();
-        drop(up_tx);
-
-        relay_counting(up_rx, tx, events.clone(), None).await;
-        assert_eq!(rx.recv().await.unwrap().unwrap().text, "forwarded");
+        let buyer = relay_events(
+            vec![head(200), output("forwarded")],
+            events.clone(),
+            u64::MAX,
+        )
+        .await;
+        assert_eq!(data_of(&buyer), "forwarded");
         assert_eq!(
-            rx.recv().await.unwrap().unwrap_err().code(),
+            buyer.last().unwrap().as_ref().unwrap_err().code(),
             tonic::Code::DataLoss
         );
         assert_eq!(
@@ -2833,23 +2961,16 @@ mod tests {
     #[tokio::test]
     async fn request_recorder_marks_output_then_error_ambiguous() {
         let events = EventRecorder::default();
-        let (up_tx, up_rx) = mpsc::channel(2);
-        let (tx, mut rx) = mpsc::channel::<Result<CanonChunk, Status>>(2);
-        up_tx
-            .send(Ok(UpstreamEvent::Chunk(CanonChunk {
-                token_ids: vec![1],
-                ..CanonChunk::default()
-            })))
-            .await
-            .unwrap();
-        up_tx
-            .send(Err(Status::unavailable("provider stopped")))
-            .await
-            .unwrap();
-        drop(up_tx);
-
-        relay_counting(up_rx, tx, events.clone(), None).await;
-        while rx.recv().await.is_some() {}
+        relay_events(
+            vec![
+                head(200),
+                output("one"),
+                Err(Status::unavailable("provider stopped")),
+            ],
+            events.clone(),
+            u64::MAX,
+        )
+        .await;
         assert_eq!(
             events.events(),
             vec![AuthoritativeDeliveryEvent::Finished(
@@ -2858,40 +2979,21 @@ mod tests {
         );
     }
 
+    /// A provider total at the billing grant is charged in full; one above it is still delivered,
+    /// charged at the grant, and closes the deal's billing.
+    /// E2E-ROW: E2E-UPS-23/L0
     #[tokio::test]
     async fn relay_accepts_total_equal_to_grant_and_caps_grant_plus_one() {
         for (input_tokens, exhausted) in [(3, false), (4, true)] {
             let recorder = RecordingDelivery::default();
-            let (up_tx, up_rx) = mpsc::channel(2);
-            let (tx, mut rx) = mpsc::channel::<Result<CanonChunk, Status>>(3);
-            up_tx
-                .send(Ok(UpstreamEvent::Chunk(CanonChunk {
-                    text: "one".into(),
-                    ..CanonChunk::default()
-                })))
-                .await
-                .unwrap();
-            up_tx
-                .send(Ok(UpstreamEvent::Usage(
-                    BillingUsage::new(input_tokens, 1, None).unwrap(),
-                )))
-                .await
-                .unwrap();
-            drop(up_tx);
-
-            relay_counting_with_chain_availability(
-                up_rx,
-                tx,
+            let buyer = relay_events(
+                vec![head(200), output("one"), usage(input_tokens, 1)],
                 recorder.clone(),
-                None,
-                None,
-                1,
                 4,
-                false,
             )
             .await;
-            assert_eq!(rx.recv().await.unwrap().unwrap().text, "one");
-            let usage = rx.recv().await.unwrap().unwrap().usage.unwrap();
+            assert_eq!(data_of(&buyer), "one");
+            let usage = buyer.last().unwrap().as_ref().unwrap().usage.unwrap();
             assert_eq!(usage.input_tokens, input_tokens);
             assert_eq!(usage.output_tokens, 1);
             assert_eq!(usage.total_tokens, input_tokens + 1);
@@ -2910,78 +3012,9 @@ mod tests {
         }
     }
 
-    /// text-only SSE fragments are not token units, and provider billing output can
-    /// include hidden reasoning above the visible-output generation limit.
-    #[tokio::test]
-    async fn fragmented_real_output_accepts_billing_above_the_visible_output_limit() {
-        for output_tokens in [64, 65] {
-            let recorder = RecordingDelivery::default();
-            let (up_tx, up_rx) = mpsc::channel(66);
-            let (tx, mut rx) = mpsc::channel::<Result<CanonChunk, Status>>(67);
-            for seq in 0..65 {
-                up_tx
-                    .send(Ok(UpstreamEvent::Chunk(CanonChunk {
-                        text: "x".into(),
-                        seq,
-                        ..CanonChunk::default()
-                    })))
-                    .await
-                    .unwrap();
-            }
-            up_tx
-                .send(Ok(UpstreamEvent::Usage(
-                    BillingUsage::new(1, output_tokens, None).unwrap(),
-                )))
-                .await
-                .unwrap();
-            drop(up_tx);
-
-            relay_counting_with_chain_availability(
-                up_rx,
-                tx,
-                recorder.clone(),
-                None,
-                None,
-                64,
-                66,
-                false,
-            )
-            .await;
-
-            let mut content_chunks = 0;
-            let mut terminal = None;
-            let mut error = None;
-            while let Some(event) = rx.recv().await {
-                match event {
-                    Ok(chunk) if chunk.usage.is_some() => terminal = chunk.usage,
-                    Ok(_) => content_chunks += 1,
-                    Err(status) => error = Some(status),
-                }
-            }
-            assert_eq!(content_chunks, 65, "all transport fragments are forwarded");
-            assert_eq!(terminal.unwrap().output_tokens, output_tokens);
-            assert!(error.is_none());
-            assert_eq!(
-                recorder.events.events(),
-                vec![AuthoritativeDeliveryEvent::Completed(
-                    NonZeroU64::new(output_tokens + 1).unwrap()
-                )]
-            );
-            assert!(
-                !recorder.delivery.done.load(Ordering::Acquire),
-                "billing above the visible-output cap alone must not close the deal"
-            );
-            assert!(
-                !recorder.delivery.billing_exhausted.load(Ordering::Acquire),
-                "only billing beyond the reservation marks exhaustion"
-            );
-        }
-    }
-
     #[tokio::test]
     async fn over_grant_terminal_before_output_releases_the_capacity_reservation() {
         const GRANT: u64 = 8;
-
         let directory = tempfile::tempdir().unwrap();
         let state = GatewayState::with_upstream_and_deals_dir(
             UpstreamConfig::Mock,
@@ -3002,74 +3035,149 @@ mod tests {
             reservation: state.capacity.reserve(&tc, GRANT).unwrap(),
             delivery: delivery.clone(),
         };
-        let (up_tx, up_rx) = mpsc::channel(1);
-        let (tx, mut rx) = mpsc::channel::<Result<CanonChunk, Status>>(1);
-        up_tx
-            .send(Ok(UpstreamEvent::Usage(
-                BillingUsage::new(GRANT, 1, None).unwrap(),
-            )))
-            .await
-            .unwrap();
-        drop(up_tx);
-
-        relay_counting_with_chain_availability(
-            up_rx, tx, recorder, None, None, GRANT, GRANT, false,
-        )
-        .await;
-
+        let buyer = relay_events(vec![head(200), usage(GRANT, 1)], recorder, GRANT).await;
         assert_eq!(
-            rx.recv().await.unwrap().unwrap_err().code(),
+            buyer.last().unwrap().as_ref().unwrap_err().code(),
             tonic::Code::DataLoss
         );
-        assert!(rx.recv().await.is_none());
         let snapshot = state.capacity_snapshot(&tc).unwrap().unwrap();
         assert_eq!(snapshot.local_delivered_after_anchor, 0);
         assert_eq!(snapshot.outstanding_reservation, 0);
         assert_eq!(snapshot.available().unwrap(), u128::from(GRANT));
-        assert_eq!(delivery.count.load(Ordering::Acquire), 0);
+        assert_eq!(delivery.count.load(Ordering::Acquire), TICK_SIZE as u64);
     }
 
     #[tokio::test]
-    async fn repeated_or_skipped_content_sequence_never_commits_terminal_usage() {
-        for bad_seq in [0, 2] {
-            let events = EventRecorder::default();
-            let (up_tx, up_rx) = mpsc::channel(3);
-            let (tx, mut rx) = mpsc::channel::<Result<CanonChunk, Status>>(3);
-            up_tx
-                .send(Ok(UpstreamEvent::Chunk(CanonChunk {
-                    text: "first".into(),
-                    ..CanonChunk::default()
-                })))
-                .await
-                .unwrap();
-            up_tx
-                .send(Ok(UpstreamEvent::Chunk(CanonChunk {
-                    text: "bad".into(),
-                    seq: bad_seq,
-                    ..CanonChunk::default()
-                })))
-                .await
-                .unwrap();
-            up_tx
-                .send(Ok(UpstreamEvent::Usage(
-                    BillingUsage::new(1, 2, None).unwrap(),
-                )))
-                .await
-                .unwrap();
-            drop(up_tx);
+    async fn content_after_terminal_usage_never_commits_it() {
+        let events = EventRecorder::default();
+        let buyer = relay_events(
+            vec![head(200), output("first"), usage(1, 2), output("late")],
+            events.clone(),
+            u64::MAX,
+        )
+        .await;
+        assert_eq!(data_of(&buyer), "first");
+        assert_eq!(
+            buyer.last().unwrap().as_ref().unwrap_err().code(),
+            tonic::Code::DataLoss
+        );
+        assert!(!events
+            .events()
+            .iter()
+            .any(|event| matches!(event, AuthoritativeDeliveryEvent::Completed(_))));
+    }
 
-            relay_counting(up_rx, tx, events.clone(), None).await;
-            assert_eq!(rx.recv().await.unwrap().unwrap().text, "first");
-            assert_eq!(
-                rx.recv().await.unwrap().unwrap_err().code(),
-                tonic::Code::DataLoss
-            );
-            assert!(!events
-                .events()
-                .iter()
-                .any(|event| matches!(event, AuthoritativeDeliveryEvent::Completed(_))));
+    /// E2E-ROW: E2E-USAGE-14/L0
+    #[tokio::test]
+    async fn cache_usage_2132_gateway_preserves_native_counts_and_caps_only_payment() {
+        use crate::seller::AnthropicConfig;
+
+        for anthropic in [false, true] {
+            for shared in [false, true] {
+                for (grant, invalid) in [(5, false), (12, false), (5, true)] {
+                    let write = if invalid { -1 } else { 3 };
+                    let wire = if anthropic {
+                        format!("event: message_start\ndata: {}\n\nevent: content_block_delta\ndata: {}\n\nevent: message_delta\ndata: {}\n\nevent: message_stop\ndata: {{\"type\":\"message_stop\"}}\n\n",
+                            serde_json::json!({"type":"message_start","message":{"usage":{
+                                "input_tokens":0,"cache_read_input_tokens":4,"cache_creation_input_tokens":write}}}),
+                            serde_json::json!({"type":"content_block_delta","delta":{"type":"text_delta","text":"answer"}}),
+                            serde_json::json!({"type":"message_delta","usage":{"output_tokens":5}}))
+                    } else {
+                        format!(
+                            "data: {}\n\ndata: {}\n\ndata: [DONE]\n\n",
+                            serde_json::json!({"choices":[{"delta":{"content":"answer"}}]}),
+                            serde_json::json!({"choices":[],"usage":{"prompt_tokens":7,"completion_tokens":5,
+                                "total_tokens":12,"prompt_tokens_details":{"cached_tokens":4,"cache_write_tokens":write}}})
+                        )
+                    };
+                    let (base_url, server) =
+                        scripted_provider("200 OK", "text/event-stream", wire).await;
+                    let (upstream, path) = if anthropic {
+                        (
+                            UpstreamConfig::Anthropic(AnthropicConfig {
+                                base_url,
+                                model: "scripted".into(),
+                                frame_model: "m".into(),
+                                api_key_env: "PATH".into(),
+                            }),
+                            "/v1/messages",
+                        )
+                    } else {
+                        (
+                            UpstreamConfig::OpenAi(crate::seller::OpenAiConfig {
+                                base_url,
+                                frame_model: "m".into(),
+                                api_key_env: "PATH".into(),
+                                ..Default::default()
+                            }),
+                            "/v1/chat/completions",
+                        )
+                    };
+                    let state = Arc::new(GatewayState::with_upstream(upstream));
+                    let buyer = LocalNote::generate();
+                    let tc = "0:cache-usage-2132";
+                    state
+                        .register_stream(
+                            tc,
+                            buyer.pubkey(),
+                            5,
+                            subscription_state(TICK_SIZE),
+                            ordinary_shape(TICK_SIZE + 20),
+                        )
+                        .unwrap();
+                    let mut request = authorized_body(
+                        &state,
+                        &buyer,
+                        tc,
+                        path,
+                        serde_json::json!({"model": "m", "messages": [], "max_tokens": 5, "stream": true}),
+                        grant,
+                    );
+                    request.get_mut().shared_budget = shared;
+                    let (frames, error) = drain(
+                        GatewayService::new(state.clone())
+                            .open_stream(request)
+                            .await
+                            .unwrap()
+                            .into_inner(),
+                    )
+                    .await;
+                    server.await.unwrap();
+                    let snapshot = state.capacity_snapshot(tc).unwrap().unwrap();
+                    if invalid {
+                        assert!(terminal(&frames).is_none());
+                        assert_eq!(error.unwrap().code(), tonic::Code::DataLoss);
+                        assert_eq!(snapshot.local_delivered_after_anchor, 0);
+                        assert_eq!(
+                            state.delivery(tc).count.load(Ordering::Acquire),
+                            TICK_SIZE as u64
+                        );
+                    } else {
+                        assert!(error.is_none(), "{error:?}");
+                        let usage = terminal(&frames).unwrap();
+                        usage.validate().unwrap();
+                        assert_eq!(
+                            (usage.input_tokens, usage.output_tokens, usage.total_tokens),
+                            (7, 5, 12)
+                        );
+                        assert_eq!((usage.cache_read_tokens, usage.cache_write_tokens), (4, 3));
+                        assert_eq!(usage.billable_tokens(), grant);
+                        assert_eq!(snapshot.local_delivered_after_anchor, u128::from(grant));
+                        assert_eq!(snapshot.outstanding_reservation, 0);
+                        assert_eq!(
+                            state.delivery(tc).count.load(Ordering::Acquire),
+                            TICK_SIZE as u64 + grant
+                        );
+                        assert_eq!(
+                            state.delivery(tc).billing_exhausted.load(Ordering::Acquire),
+                            grant < 12
+                        );
+                    }
+                }
+            }
         }
     }
+
     #[tokio::test]
     async fn shared_budget_2091_preserves_full_usage_and_a_zero_charge_answer() {
         let state = GatewayState::new();
@@ -3083,63 +3191,38 @@ mod tests {
                 ordinary_shape(TICK_SIZE + 2),
             )
             .unwrap();
+        let limit = dexdo_core::params::SELLER_MAX_CONCURRENT_REQUESTS_PER_DEAL;
         let first = state
             .capacity
-            .admit_shared(
-                &tc.to_string(),
-                2,
-                dexdo_core::params::SELLER_MAX_CONCURRENT_REQUESTS_PER_DEAL,
-            )
+            .admit_shared(&tc.to_string(), 2, limit)
             .unwrap();
         let second = state
             .capacity
-            .admit_shared(
-                &tc.to_string(),
-                2,
-                dexdo_core::params::SELLER_MAX_CONCURRENT_REQUESTS_PER_DEAL,
-            )
+            .admit_shared(&tc.to_string(), 2, limit)
             .unwrap();
         for (index, reservation) in [first, second].into_iter().enumerate() {
-            let (up_tx, up_rx) = mpsc::channel(2);
-            let (tx, mut rx) = mpsc::channel(2);
-            up_tx
-                .send(Ok(UpstreamEvent::Chunk(CanonChunk {
-                    text: "full answer".into(),
-                    ..Default::default()
-                })))
-                .await
-                .unwrap();
-            up_tx
-                .send(Ok(UpstreamEvent::Usage(
-                    BillingUsage::new(2, 1, None).unwrap(),
-                )))
-                .await
-                .unwrap();
-            drop(up_tx);
-            relay_counting_with_chain_availability(
-                up_rx,
-                tx,
+            let buyer = relay_events(
+                vec![head(200), output("full answer"), usage(2, 1)],
                 CapacityDeliveryRecorder {
                     reservation,
                     delivery: state.delivery(tc),
                 },
-                None,
-                None,
                 2,
-                2,
-                false,
             )
             .await;
-            assert_eq!(rx.recv().await.unwrap().unwrap().text, "full answer");
-            let usage = rx.recv().await.unwrap().unwrap().usage.unwrap();
+            assert_eq!(data_of(&buyer), "full answer");
+            let usage = buyer.last().unwrap().as_ref().unwrap().usage.unwrap();
             assert_eq!(usage.total_tokens, 3);
             assert_eq!(usage.billable_tokens(), if index == 0 { 2 } else { 0 });
-            assert!(rx.recv().await.is_none());
             assert_eq!(state.delivery(tc).done.load(Ordering::Acquire), index == 1);
         }
-        assert_eq!(state.delivery(tc).count.load(Ordering::Acquire), 2);
+        assert_eq!(
+            state.delivery(tc).count.load(Ordering::Acquire),
+            TICK_SIZE as u64 + 2
+        );
         assert_eq!(state.active_requests(tc), 0);
     }
+
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn shared_budget_2091_overrun_closes_admission_before_draining() {
         for finish in [
@@ -3168,41 +3251,21 @@ mod tests {
             let first = state.capacity.admit_shared(&tc.into(), 1, limit).unwrap();
             let second = state.capacity.admit_shared(&tc.into(), 16, limit).unwrap();
             let delivery = state.delivery(tc);
-            let (up_tx, up_rx) = mpsc::channel(2);
-            let (tx, mut rx) = mpsc::channel(2);
-            up_tx
-                .send(Ok(UpstreamEvent::Chunk(CanonChunk {
-                    text: "full answer".into(),
-                    ..Default::default()
-                })))
-                .await
-                .unwrap();
-            up_tx
-                .send(Ok(UpstreamEvent::Usage(
-                    BillingUsage::new(1, 1, None).unwrap(),
-                )))
-                .await
-                .unwrap();
-            drop(up_tx);
-            relay_counting_with_chain_availability(
-                up_rx,
-                tx,
+            let relayed = relay_events(
+                vec![head(200), output("full answer"), usage(1, 1)],
                 CapacityDeliveryRecorder {
                     reservation: first,
                     delivery: delivery.clone(),
                 },
-                None,
-                None,
                 1,
-                1,
-                false,
             )
             .await;
-            assert_eq!(rx.recv().await.unwrap().unwrap().text, "full answer");
+            assert_eq!(data_of(&relayed), "full answer");
             assert_eq!(
-                rx.recv()
-                    .await
+                relayed
+                    .last()
                     .unwrap()
+                    .as_ref()
                     .unwrap()
                     .usage
                     .unwrap()
@@ -3221,7 +3284,6 @@ mod tests {
                     .unwrap()
                     > 0
             );
-
             let service = GatewayService::new(state.clone());
             // A slot and paid capacity remain, but neither protocol may enter a draining deal.
             for shared in [true, false] {
@@ -3261,7 +3323,10 @@ mod tests {
             task.await.unwrap();
             assert!(delivery.done.load(Ordering::Acquire));
             assert_eq!(state.active_requests(tc), 0);
-            assert_eq!(delivery.count.load(Ordering::Acquire), expected_charge);
+            assert_eq!(
+                delivery.count.load(Ordering::Acquire),
+                TICK_SIZE as u64 + expected_charge
+            );
             // A normal terminal, a cancellation and ambiguous usage must all preserve the closure.
             for shared in [true, false] {
                 let mut request = authorized_request(&state, &buyer, tc, 1, 100).into_inner();
@@ -3287,6 +3352,7 @@ mod tests {
             );
         }
     }
+
     #[tokio::test]
     async fn shared_budget_2091_gateway_enforces_configuration_and_legacy_cannot_bypass_it() {
         for count in [1_u32, 4] {
@@ -3307,7 +3373,7 @@ mod tests {
             let service = GatewayService::new(state.clone());
             // Keep each real gateway response open beyond its bounded channel capacity. The
             // terminal cannot commit until we read, so all configured slots stay occupied.
-            let output = u32::try_from(GATEWAY_CLIENT_CHANNEL_CAPACITY + 1).unwrap();
+            let output = u64::try_from(GATEWAY_CLIENT_CHANNEL_CAPACITY + 1).unwrap();
             let mut requests = Vec::new();
             for _ in 0..count {
                 let mut request = authorized_request(&state, &buyer, tc, output, 100).into_inner();
@@ -3331,12 +3397,10 @@ mod tests {
                     .expect("full deal must reject before upstream");
                 assert_eq!(error.code(), tonic::Code::ResourceExhausted);
             }
-            for mut request in requests {
-                let mut terminal = None;
-                while let Some(chunk) = request.next().await {
-                    terminal = chunk.unwrap().usage.or(terminal);
-                }
-                assert_eq!(terminal.unwrap().billable_tokens(), u64::from(output));
+            for request in requests {
+                let (frames, error) = drain(request).await;
+                assert!(error.is_none(), "{error:?}");
+                assert_eq!(terminal(&frames).unwrap().billable_tokens(), output);
             }
             assert_eq!(state.active_requests(tc), 0);
             let legacy = state
@@ -3361,6 +3425,19 @@ mod tests {
             legacy.finish_exact().unwrap();
         }
     }
+
+    fn qwen_request(state: &GatewayState, buyer: &LocalNote, tc: &str) -> StreamRequest {
+        authorized_body(
+            state,
+            buyer,
+            tc,
+            "/v1/chat/completions",
+            serde_json::json!({"model": "qwen/qwen3-32b", "messages": [], "stream": true}),
+            100,
+        )
+        .into_inner()
+    }
+
     #[tokio::test]
     async fn shared_budget_2155_gateway_reuses_the_deal_after_repeated_interruptions() {
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -3450,7 +3527,7 @@ mod tests {
             let mut charged = 0;
             for attempt in 0..6 {
                 let clean = attempt == 0 || attempt >= 4;
-                let mut request = authorized_request(&state, &buyer, tc, 3, 100).into_inner();
+                let mut request = qwen_request(&state, &buyer, tc);
                 request.shared_budget = true;
                 let mut response = service
                     .open_stream(Request::new(request))
@@ -3458,10 +3535,15 @@ mod tests {
                     .unwrap()
                     .into_inner();
                 if !clean && failure == "disconnect" {
-                    assert_eq!(response.next().await.unwrap().unwrap().text, "answer");
+                    assert!(response.next().await.unwrap().unwrap().head.is_some());
+                    assert!(
+                        String::from_utf8(response.next().await.unwrap().unwrap().data)
+                            .unwrap()
+                            .contains("answer")
+                    );
                     drop(response);
                     assert_eq!(state.active_requests(tc), 1);
-                    let mut blocked = authorized_request(&state, &buyer, tc, 3, 100).into_inner();
+                    let mut blocked = qwen_request(&state, &buyer, tc);
                     blocked.shared_budget = true;
                     assert_eq!(
                         service
@@ -3508,11 +3590,11 @@ mod tests {
                 assert_eq!(snapshot.available().unwrap(), 9 - charged);
                 assert_eq!(
                     u128::from(state.delivery(tc).count.load(Ordering::Acquire)),
-                    charged
+                    TICK_SIZE + charged
                 );
                 assert!(!state.delivery(tc).done.load(Ordering::Acquire));
             }
-            let mut exhausted = authorized_request(&state, &buyer, tc, 1, 100).into_inner();
+            let mut exhausted = qwen_request(&state, &buyer, tc);
             exhausted.shared_budget = true;
             assert_eq!(
                 service
@@ -3556,18 +3638,16 @@ mod tests {
             None,
             None,
             100,
-            100,
-            false,
         ));
-        // With a one-event channel, all three sends can finish only if the relay keeps
-        // consuming the real upstream after discovering that the client disappeared.
-        for seq in 0..3 {
+        // With a one-event channel, all sends can finish only if the relay keeps consuming the
+        // real upstream after discovering that the client disappeared.
+        up_tx
+            .send(head(200))
+            .await
+            .expect("upstream must remain observed through completion");
+        for _ in 0..3 {
             up_tx
-                .send(Ok(UpstreamEvent::Chunk(CanonChunk {
-                    text: "provider work".into(),
-                    seq,
-                    ..Default::default()
-                })))
+                .send(output("provider work"))
                 .await
                 .expect("upstream must remain observed through completion");
         }

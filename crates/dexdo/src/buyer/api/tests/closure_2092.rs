@@ -58,7 +58,7 @@ async fn closure_2092_later_refusals_keep_first_cause_on_all_endpoints() {
         deal,
     );
     let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel();
-    let (addr, task) = serve("127.0.0.1:0".parse().unwrap(), state, true, async move {
+    let (addr, task) = serve("127.0.0.1:0".parse().unwrap(), state, async move {
         let _ = shutdown_rx.await;
     })
     .await

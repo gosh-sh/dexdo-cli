@@ -1,19 +1,23 @@
 //! Test-only seller seam for buyer-side adversarial stream fixtures.
 
 //! Ordinary requests delegate to the production gateway unchanged. A request carrying an existing
-//! adversarial-output marker takes a bare gRPC branch after authorization: that branch observes the
-//! output cap on the wire but deliberately does not turn it into a seller reservation. It therefore
-//! models a third-party seller that can send a chunk crossing the remaining output allowance.
+//! adversarial-output marker takes a bare gRPC branch after authorization that deliberately skips
+//! the seller reservation: it models a third-party seller whose stream misbehaves around its terminal
+//! usage.
 
+use crate::api_format::{ApiFormat, RequestBody};
 use crate::seller::auth::AuthRegistry;
 use crate::seller::gateway::{GatewayService, GatewayState};
 use crate::seller::tls::GatewayTls;
-use crate::seller::upstream::{mock, UpstreamConfig, UpstreamEvent};
+use crate::seller::upstream::{mock, ProviderRequest, UpstreamConfig, UpstreamEvent};
 use anyhow::{anyhow, Result};
 use dexdo_core::note::{NotePubkey, Signature};
 use dexdo_core::params::{GATEWAY_CLIENT_CHANNEL_CAPACITY, GATEWAY_UPSTREAM_CHANNEL_CAPACITY};
 use dexdo_core::{DealChainState, DealSubscription};
-use dexdo_proto::{CanonChunk, Challenge, ChallengeRequest, Gateway, GatewayServer, StreamRequest};
+use dexdo_proto::{
+    Challenge, ChallengeRequest, Gateway, GatewayServer, StreamFrame, StreamRequest,
+};
+use serde_json::Value;
 use std::net::SocketAddr;
 use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
@@ -32,7 +36,7 @@ pub(super) struct RunningFixtureSeller {
     pub(super) tls_fingerprint: String,
     delayed_eof_release: Arc<Semaphore>,
     held_open: Arc<Notify>,
-    hide_reasoning_capability: Arc<AtomicBool>,
+    legacy_challenge: Arc<AtomicBool>,
     probe_output_fixture: Arc<Mutex<Option<(bool, &'static str)>>>,
     calls: Arc<AtomicUsize>,
 }
@@ -63,8 +67,9 @@ impl RunningFixtureSeller {
     pub(super) fn set_concurrency(&self, limit: std::num::NonZeroU32) {
         self.state.set_max_concurrent_requests_per_deal(limit);
     }
+    /// Answer challenges the way a seller that predates request forwarding does.
     pub(super) fn use_legacy_challenge(&self) {
-        self.hide_reasoning_capability.store(true, Ordering::SeqCst);
+        self.legacy_challenge.store(true, Ordering::SeqCst);
     }
     pub(super) fn register_stream(
         &self,
@@ -95,12 +100,16 @@ struct FixtureGateway {
     fixture_auth: Arc<AuthRegistry>,
     delayed_eof_release: Arc<Semaphore>,
     held_open: Arc<Notify>,
-    hide_reasoning_capability: Arc<AtomicBool>,
+    legacy_challenge: Arc<AtomicBool>,
     probe_output_fixture: Arc<Mutex<Option<(bool, &'static str)>>>,
     calls: Arc<AtomicUsize>,
 }
 
-type ChunkStream = Pin<Box<dyn Stream<Item = Result<CanonChunk, Status>> + Send>>;
+type FrameStream = Pin<Box<dyn Stream<Item = Result<StreamFrame, Status>> + Send>>;
+
+fn body_text(request: &StreamRequest) -> String {
+    String::from_utf8_lossy(&request.body).into_owned()
+}
 
 #[tonic::async_trait]
 impl Gateway for FixtureGateway {
@@ -108,8 +117,11 @@ impl Gateway for FixtureGateway {
         &self,
         mut request: Request<ChallengeRequest>,
     ) -> Result<Response<Challenge>, Status> {
-        self.calls.fetch_add(1, Ordering::SeqCst);
-        let legacy = self.hide_reasoning_capability.load(Ordering::SeqCst);
+        // The money-free capability query is not work the seller serves; `calls` counts the rest.
+        if !request.get_ref().capabilities_only {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+        }
+        let legacy = self.legacy_challenge.load(Ordering::SeqCst);
         if legacy {
             // An old seller ignores the additive request flag and still issues a normal nonce.
             request.get_mut().capabilities_only = false;
@@ -118,8 +130,8 @@ impl Gateway for FixtureGateway {
         let capabilities_only = request.get_ref().capabilities_only;
         let mut response = self.production.get_challenge(request).await?;
         if legacy {
-            // False is omitted by protobuf encoding, exactly the legacy two-field reply.
-            response.get_mut().supports_reasoning_disable = false;
+            // An empty list is omitted by protobuf encoding, exactly the older seller's reply.
+            response.get_mut().api_paths.clear();
         }
         if !capabilities_only {
             self.fixture_auth
@@ -128,19 +140,16 @@ impl Gateway for FixtureGateway {
         Ok(response)
     }
 
-    type OpenStreamStream = ChunkStream;
+    type OpenStreamStream = FrameStream;
 
     async fn open_stream(
         &self,
         request: Request<StreamRequest>,
     ) -> Result<Response<Self::OpenStreamStream>, Status> {
         self.calls.fetch_add(1, Ordering::SeqCst);
-        let greedy = request
-            .get_ref()
-            .request
-            .as_ref()
-            .and_then(|canon| canon.params.as_ref())
-            .is_some_and(|params| params.greedy);
+        // The B7 reference probe asks for a greedy decode; B8 and consumer requests do not.
+        let greedy = RequestBody::parse(&request.get_ref().body)
+            .is_ok_and(|body| body.0.get("temperature").and_then(Value::as_f64) == Some(0.0));
         let probe_marker = self
             .probe_output_fixture
             .lock()
@@ -164,19 +173,9 @@ impl Gateway for FixtureGateway {
             return Ok(Response::new(Box::pin(tokio_stream::once(Err(status)))));
         }
         if !adversarial_output {
-            let hold_open = request.get_ref().request.as_ref().is_some_and(|canon| {
-                canon
-                    .messages
-                    .iter()
-                    .any(|message| message.content.contains("DEXDO_FIXTURE_HOLD_STREAM_OPEN"))
-            });
-            let hold_response = request.get_ref().request.as_ref().is_some_and(|canon| {
-                canon.messages.iter().any(|message| {
-                    message
-                        .content
-                        .contains("DEXDO_FIXTURE_HOLD_SHARED_RESPONSE")
-                })
-            });
+            let hold_open = body_text(request.get_ref()).contains("DEXDO_FIXTURE_HOLD_STREAM_OPEN");
+            let hold_response =
+                body_text(request.get_ref()).contains("DEXDO_FIXTURE_HOLD_SHARED_RESPONSE");
             let response = self.production.open_stream(request).await?;
             if hold_open {
                 self.held_open.notify_one();
@@ -192,11 +191,12 @@ impl Gateway for FixtureGateway {
                 let (tx, rx) = mpsc::channel(GATEWAY_CLIENT_CHANNEL_CAPACITY);
                 tokio::spawn(async move {
                     let mut first = true;
-                    while let Some(chunk) = stream.next().await {
-                        if tx.send(chunk).await.is_err() {
+                    while let Some(frame) = stream.next().await {
+                        let output = frame.as_ref().is_ok_and(|frame| !frame.data.is_empty());
+                        if tx.send(frame).await.is_err() {
                             break;
                         }
-                        if first {
+                        if first && output {
                             first = false;
                             match release.acquire().await {
                                 Ok(permit) => permit.forget(),
@@ -210,25 +210,23 @@ impl Gateway for FixtureGateway {
             return Ok(Response::new(Box::pin(response.into_inner())));
         }
 
-        let mut request = request.into_inner();
-        let canon = request
-            .request
-            .take()
-            .ok_or_else(|| Status::invalid_argument("output fixture has no canonical request"))?;
-        let wire_max = canon
-            .params
-            .as_ref()
-            .map(|params| u64::from(params.max_tokens))
-            .filter(|max| *max > 0)
-            .ok_or_else(|| Status::invalid_argument("output fixture has no wire output cap"))?;
-        let prompt = canon
-            .messages
-            .iter()
-            .rev()
-            .find(|message| message.role == "user")
-            .map(|message| message.content.as_str())
-            .unwrap_or("");
-        let prompt = probe_marker.unwrap_or(prompt);
+        let request = request.into_inner();
+        if body_text(&request).contains("DEXDO_FIXTURE_INVALID_STATUS") {
+            // A seller that states a status no HTTP response can carry.
+            let head = StreamFrame {
+                head: Some(dexdo_proto::ResponseHead {
+                    status: 42,
+                    headers: Vec::new(),
+                }),
+                ..StreamFrame::default()
+            };
+            return Ok(Response::new(Box::pin(tokio_stream::once(Ok(head)))));
+        }
+        let format = ApiFormat::from_path(&request.path)
+            .ok_or_else(|| Status::invalid_argument("output fixture has no consumer path"))?;
+        let body = RequestBody::parse(&request.body).map_err(Status::invalid_argument)?;
+        let prompt = body_text(&request);
+        let prompt = probe_marker.unwrap_or(&prompt);
         let zero_charge = prompt.contains("DEXDO_FIXTURE_ZERO_CHARGE");
         let partial_charge = prompt.contains("DEXDO_FIXTURE_PARTIAL_CHARGE");
         let reasoning_only = prompt.contains("DEXDO_FIXTURE_REASONING_ONLY");
@@ -237,14 +235,12 @@ impl Gateway for FixtureGateway {
         let usage_then_error = prompt.contains("DEXDO_FIXTURE_USAGE_THEN_ERROR");
         let error_before_usage = prompt.contains("DEXDO_FIXTURE_ERROR_BEFORE_USAGE");
         let hold_after_content = prompt.contains("DEXDO_FIXTURE_HOLD_AFTER_CONTENT");
-        let chunks = if reasoning_only {
-            wire_max
-        } else if prompt.contains("DEXDO_FIXTURE_FATCHUNK_COMPLETE") {
-            wire_max / u64::from(mock::FAT_CHUNK_TOKENS)
-        } else if prompt.contains("DEXDO_FIXTURE_FATCHUNK") {
-            wire_max / u64::from(mock::FAT_CHUNK_TOKENS) + 1
-        } else {
-            2
+        let words = 2;
+        let stream = body.stream();
+        let provider_request = ProviderRequest {
+            format,
+            body,
+            headers: Vec::new(),
         };
 
         let (up_tx, mut up_rx) = mpsc::channel(GATEWAY_UPSTREAM_CHANNEL_CAPACITY);
@@ -252,18 +248,35 @@ impl Gateway for FixtureGateway {
         let delayed_eof_release = self.delayed_eof_release.clone();
         tokio::spawn(async move {
             let upstream = tokio::spawn(async move {
-                mock::run(chunks, Some(&canon), up_tx, false, None).await;
+                mock::run(&provider_request, words, None, up_tx).await;
             });
+            let mut first_output = true;
             while let Some(event) = up_rx.recv().await {
                 match event {
-                    Ok(UpstreamEvent::Chunk(mut chunk)) => {
-                        if reasoning_only || mixed_reasoning && chunk.seq == 0 {
-                            chunk.reasoning = std::mem::take(&mut chunk.text);
-                        }
-                        if client_tx.send(Ok(chunk)).await.is_err() {
+                    Ok(UpstreamEvent::Head(head)) => {
+                        let frame = StreamFrame {
+                            head: Some(head),
+                            ..StreamFrame::default()
+                        };
+                        if client_tx.send(Ok(frame)).await.is_err() {
                             break;
                         }
-                        if error_before_usage {
+                    }
+                    Ok(UpstreamEvent::Data { mut bytes, output }) => {
+                        if output && stream && (reasoning_only || mixed_reasoning && first_output) {
+                            bytes = reasoning_frame(format, &bytes);
+                        } else if output && !stream && (reasoning_only || mixed_reasoning) {
+                            bytes = reasoning_body(format, &bytes, mixed_reasoning);
+                        }
+                        first_output &= !output;
+                        let frame = StreamFrame {
+                            data: bytes,
+                            ..StreamFrame::default()
+                        };
+                        if client_tx.send(Ok(frame)).await.is_err() {
+                            break;
+                        }
+                        if output && error_before_usage {
                             let _ = client_tx
                                 .send(Err(dexdo_proto::upstream_failure_status(
                                     Status::unavailable(
@@ -274,7 +287,7 @@ impl Gateway for FixtureGateway {
                                 .await;
                             break;
                         }
-                        if hold_after_content {
+                        if output && hold_after_content {
                             match delayed_eof_release.acquire().await {
                                 Ok(permit) => permit.forget(),
                                 Err(_) => break,
@@ -287,10 +300,9 @@ impl Gateway for FixtureGateway {
                         } else if partial_charge {
                             usage.charged_tokens = Some(1);
                         }
-                        let terminal = dexdo_proto::CanonChunk {
-                            seq: chunks,
+                        let terminal = StreamFrame {
                             usage: Some(usage),
-                            ..Default::default()
+                            ..StreamFrame::default()
                         };
                         if client_tx.send(Ok(terminal)).await.is_err() {
                             break;
@@ -324,28 +336,113 @@ impl Gateway for FixtureGateway {
     }
 }
 
+/// One streamed output frame as the provider would send it for reasoning instead of answer text.
+fn reasoning_frame(format: ApiFormat, bytes: &[u8]) -> Vec<u8> {
+    let text = std::str::from_utf8(bytes).expect("mock frames are UTF-8");
+    let (event, data) = match text.strip_prefix("event: ") {
+        Some(rest) => {
+            let (event, data) = rest.split_once('\n').expect("an event line ends");
+            (Some(event), data)
+        }
+        None => (None, text),
+    };
+    let data = data
+        .strip_prefix("data: ")
+        .and_then(|data| data.strip_suffix("\n\n"))
+        .expect("one mock data frame");
+    let mut value: Value = serde_json::from_str(data).expect("mock frames are JSON");
+    let event = match format {
+        ApiFormat::ChatCompletions => {
+            let delta = &mut value["choices"][0]["delta"];
+            let content = delta.as_object_mut().unwrap().remove("content").unwrap();
+            delta["reasoning"] = content;
+            None
+        }
+        ApiFormat::Responses => {
+            value["type"] = "response.reasoning_text.delta".into();
+            event.map(|_| "response.reasoning_text.delta")
+        }
+        ApiFormat::Messages => {
+            let delta = &mut value["delta"];
+            let text = delta.as_object_mut().unwrap().remove("text").unwrap();
+            *delta = serde_json::json!({ "type": "thinking_delta", "thinking": text });
+            event
+        }
+    };
+    let mut frame = String::new();
+    if let Some(event) = event {
+        frame.push_str(&format!("event: {event}\n"));
+    }
+    frame.push_str(&format!("data: {value}\n\n"));
+    frame.into_bytes()
+}
+
+/// A whole answer whose text is reasoning; `keep_text` adds the reasoning beside the text instead.
+fn reasoning_body(format: ApiFormat, bytes: &[u8], keep_text: bool) -> Vec<u8> {
+    const REASONING: &str = "fixture reasoning";
+    let mut value: Value = serde_json::from_slice(bytes).expect("mock bodies are JSON");
+    match format {
+        ApiFormat::ChatCompletions => {
+            let message = &mut value["choices"][0]["message"];
+            let text = message["content"].clone();
+            if keep_text {
+                message["reasoning"] = REASONING.into();
+            } else {
+                message.as_object_mut().unwrap().remove("content");
+                message["reasoning"] = text;
+            }
+        }
+        ApiFormat::Responses => {
+            let output = value["output"].as_array_mut().unwrap();
+            let text = output[0]["content"][0]["text"].clone();
+            let reasoning = serde_json::json!({
+                "type": "reasoning",
+                "id": "rs_fixture",
+                "summary": [],
+                "content": [{
+                    "type": "reasoning_text",
+                    "text": if keep_text { Value::from(REASONING) } else { text },
+                }],
+            });
+            if keep_text {
+                output.insert(0, reasoning);
+            } else {
+                output[0] = reasoning;
+            }
+        }
+        ApiFormat::Messages => {
+            let content = value["content"].as_array_mut().unwrap();
+            let text = content[0]["text"].clone();
+            let thinking = serde_json::json!({
+                "type": "thinking",
+                "thinking": if keep_text { Value::from(REASONING) } else { text },
+                "signature": "fixture",
+            });
+            if keep_text {
+                content.insert(0, thinking);
+            } else {
+                content[0] = thinking;
+            }
+        }
+    }
+    serde_json::to_vec(&value).expect("a JSON value serializes")
+}
+
 fn is_adversarial_output_request(request: &StreamRequest) -> bool {
-    request
-        .request
-        .as_ref()
-        .and_then(|canon| {
-            canon
-                .messages
-                .iter()
-                .rev()
-                .find(|message| message.role == "user")
-        })
-        .is_some_and(|message| {
-            message.content.contains("DEXDO_FIXTURE_ZERO_CHARGE")
-                || message.content.contains("DEXDO_FIXTURE_PARTIAL_CHARGE")
-                || message.content.contains("DEXDO_FIXTURE_FATCHUNK")
-                || message.content.contains("DEXDO_FIXTURE_STRADDLE")
-                || message.content.contains("DEXDO_FIXTURE_REASONING_ONLY")
-                || message.content.contains("DEXDO_FIXTURE_MIXED_REASONING")
-                || message.content.contains("DEXDO_FIXTURE_DELAY_EOF")
-                || message.content.contains("DEXDO_FIXTURE_USAGE_THEN_ERROR")
-                || message.content.contains("DEXDO_FIXTURE_HOLD_AFTER_CONTENT")
-        })
+    let body = body_text(request);
+    [
+        "DEXDO_FIXTURE_ZERO_CHARGE",
+        "DEXDO_FIXTURE_PARTIAL_CHARGE",
+        "DEXDO_FIXTURE_REASONING_ONLY",
+        "DEXDO_FIXTURE_MIXED_REASONING",
+        "DEXDO_FIXTURE_DELAY_EOF",
+        "DEXDO_FIXTURE_USAGE_THEN_ERROR",
+        "DEXDO_FIXTURE_ERROR_BEFORE_USAGE",
+        "DEXDO_FIXTURE_HOLD_AFTER_CONTENT",
+        "DEXDO_FIXTURE_INVALID_STATUS",
+    ]
+    .iter()
+    .any(|marker| body.contains(marker))
 }
 
 fn authorize_fixture_request(
@@ -377,7 +474,7 @@ pub(super) async fn start_gateway_with(
     let fixture_auth = Arc::new(AuthRegistry::new());
     let delayed_eof_release = Arc::new(Semaphore::new(0));
     let held_open = Arc::new(Notify::new());
-    let hide_reasoning_capability = Arc::new(AtomicBool::new(false));
+    let legacy_challenge = Arc::new(AtomicBool::new(false));
     let probe_output_fixture = Arc::new(Mutex::new(None));
     let calls = Arc::new(AtomicUsize::new(0));
     let service = GatewayServer::new(FixtureGateway {
@@ -385,10 +482,11 @@ pub(super) async fn start_gateway_with(
         fixture_auth: fixture_auth.clone(),
         delayed_eof_release: delayed_eof_release.clone(),
         held_open: held_open.clone(),
-        hide_reasoning_capability: hide_reasoning_capability.clone(),
+        legacy_challenge: legacy_challenge.clone(),
         probe_output_fixture: probe_output_fixture.clone(),
         calls: calls.clone(),
-    });
+    })
+    .max_decoding_message_size(dexdo_core::params::GATEWAY_REQUEST_MAX_BYTES);
     let tls = GatewayTls::generate()?;
 
     crate::seller::tls::ensure_crypto_provider();
@@ -423,7 +521,7 @@ pub(super) async fn start_gateway_with(
         tls_fingerprint,
         delayed_eof_release,
         held_open,
-        hide_reasoning_capability,
+        legacy_challenge,
         probe_output_fixture,
         calls,
     })

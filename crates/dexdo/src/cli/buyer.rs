@@ -4083,41 +4083,27 @@ fn ensure_pending_buyer_submit_matches_invocation(
 
 /// what the probe tick costs the buyer, in tokens, BEFORE any money leaves the note.
 
-/// `TokenContract::_recordDelivered` bills the probe as a WHOLE tick no matter how little it
-/// actually delivered:
+/// `TokenContract::_recordDelivered` bills at least a WHOLE tick once the probe is accepted, no
+/// matter how little was actually delivered:
 
 /// ```solidity
 /// uint128 delivered = _tokensFinal;
 /// if (_probeAccepted && delivered < TICK_SIZE) { delivered = TICK_SIZE; }
 /// ```
 
-/// Measured live on mainnet on 2026-08-17: the probe delivered 143 465 tokens and billed
-/// 1 000 000, so every one of the twelve claims carried the same 856 535-token gap between
-/// delivered and counted. A two-tick deal paid for 2 000 000 tokens and received 1 159 177 -- the
-/// buyer got **58%** of the volume he paid for, and the deal then ended on "delivery capacity is
-/// exhausted", counting the tokens it had billed rather than the ones it had sent.
+/// That floor is all the probe costs: usage fills the paid tick, and the seller claims the deal's
+/// whole usage beyond it, so the buyer can receive every tick paid for. Until the
+/// seller claimed the probe tick ON TOP of the usage after it, which is what the 2026-08-17 mainnet
+/// deal measured: the probe delivered 143 465 tokens, every claim carried the same 856 535-token
+/// gap, and a two-tick deal delivered 1 159 177 of the 2 000 000 tokens it paid for.
 
-/// None of that was knowable from the preflight line: `probe_tick` appeared only in the accounting
-/// printed AFTER the escrow was committed. The economics themselves are the contract's and are not
-/// this function's business -- being told the number in time is.
-
-/// The share shrinks with deal size (2 ticks -> 50% of ticks, 100 ticks -> 1%), so the sentence is
-/// added only where it changes a decision: a deal small enough for the probe to take a quarter or
-/// more of it. That is exactly the size a first-time buyer picks.
+/// The floor matters only on a deal small enough for one tick to be a quarter or more of it, so the
+/// sentence is added only there. That is exactly the size a first-time buyer picks.
 fn probe_share_clause(ticks: u128) -> String {
     let tick_size = dexdo_core::params::TICK_SIZE;
-    let streaming_ticks = ticks.saturating_sub(1);
-    let clause = format!(
-        "probe_tick_charged_tokens={tick_size} billable_ticks={ticks} \
-         streaming_ticks_after_probe={streaming_ticks} \
-         streaming_tokens_after_probe={}",
-        streaming_ticks.saturating_mul(tick_size)
-    );
+    let clause = format!("probe_tick_charged_tokens={tick_size} billable_ticks={ticks}");
     if ticks > 0 && ticks <= 4 {
-        return format!(
-            "{clause} note=one of the {ticks} ticks you pay for is the probe, billed whole even if \
-             it delivers less; {streaming_ticks} tick(s) remain for streaming"
-        );
+        return format!("{clause} note=at least one tick is charged even if you use less");
     }
     clause
 }
@@ -4127,63 +4113,34 @@ fn probe_share_clause(ticks: u128) -> String {
 mod probe_share_clause_1425 {
     use super::probe_share_clause;
 
-    /// The live two-tick mainnet deal of 2026-08-17: half the ticks bought were the probe. The
-    /// buyer saw none of that before paying, so the numbers he needed are asserted by value.
+    /// A two-tick deal: the probe's whole-tick minimum is stated by value, and nothing claims the
+    /// probe takes one of the two ticks away from streaming.
     #[test]
-    fn a_two_tick_deal_states_the_probe_takes_one_of_them() {
-        let clause = probe_share_clause(2);
-        assert!(
-            clause.contains("probe_tick_charged_tokens=1000000"),
-            "the probe's whole-tick billing is not stated: {clause}"
-        );
-        assert!(
-            clause.contains("billable_ticks=2"),
-            "the paid tick count is not stated: {clause}"
-        );
-        assert!(
-            clause.contains("streaming_ticks_after_probe=1"),
-            "what is left for streaming is not stated: {clause}"
-        );
-        assert!(
-            clause.contains("streaming_tokens_after_probe=1000000"),
-            "what is left for streaming is not stated in tokens: {clause}"
-        );
-        assert!(
-            clause.contains("note=one of the 2 ticks you pay for is the probe"),
-            "a deal this small does not spell the share out: {clause}"
+    fn a_two_tick_deal_states_the_probe_minimum_charge() {
+        assert_eq!(
+            probe_share_clause(2),
+            "probe_tick_charged_tokens=1000000 billable_ticks=2 \
+             note=at least one tick is charged even if you use less"
         );
     }
 
-    /// The share is 1% here, so the sentence would be noise; the numbers still have to be there,
+    /// One tick is 1% here, so the sentence would be noise; the numbers still have to be there,
     /// because a reader who wants them must not have to know the deal size to get them.
     #[test]
     fn a_hundred_tick_deal_keeps_the_numbers_and_drops_the_sentence() {
-        let clause = probe_share_clause(100);
-        assert!(
-            clause.contains("probe_tick_charged_tokens=1000000")
-                && clause.contains("streaming_ticks_after_probe=99")
-                && clause.contains("streaming_tokens_after_probe=99000000"),
-            "the numbers vanished on a large deal: {clause}"
-        );
-        assert!(
-            !clause.contains("note="),
-            "the small-deal sentence leaked onto a deal where the probe is 1%: {clause}"
+        assert_eq!(
+            probe_share_clause(100),
+            "probe_tick_charged_tokens=1000000 billable_ticks=100"
         );
     }
 
-    /// A resting buy renders the same clause with whatever tick count was asked for, and zero must
-    /// not panic or claim a negative remainder.
+    /// A resting buy renders the same clause with whatever tick count was asked for; zero ticks
+    /// carry no probe sentence.
     #[test]
-    fn zero_ticks_neither_panics_nor_promises_streaming() {
-        let clause = probe_share_clause(0);
-        assert!(
-            clause.contains("streaming_ticks_after_probe=0")
-                && clause.contains("streaming_tokens_after_probe=0"),
-            "zero ticks did not saturate: {clause}"
-        );
-        assert!(
-            !clause.contains("note="),
-            "the sentence claimed a probe on a deal of no ticks: {clause}"
+    fn zero_ticks_carry_no_probe_sentence() {
+        assert_eq!(
+            probe_share_clause(0),
+            "probe_tick_charged_tokens=1000000 billable_ticks=0"
         );
     }
 }
@@ -10494,17 +10451,11 @@ fn request_delivery_fields(delivery: &dexdo::buyer::api::RequestDelivery) -> Val
         "streamed": delivery.streamed,
         "http_status": delivery.http_status,
         "failure_stage": delivery.failure_stage,
-        // Stable v2 output/delivery fields. Their names and meanings cannot change without v3.
-        "grant_tokens": delivery.output_limit_tokens.to_string(),
         "rendered_tokens": delivery.rendered_tokens.to_string(),
         "route_delivered_tokens": delivery
             .route_delivered_tokens
             .map(|tokens| tokens.to_string()),
-        "truncated_by_grant": delivery.truncated_by_output_limit,
-        "ended_before_grant": delivery.ended_before_output_limit,
-        // additive billing extensions.
         "billing_grant_tokens": delivery.billing_grant_tokens.to_string(),
-        "output_limit_tokens": delivery.output_limit_tokens.to_string(),
         "visible_output_tokens": delivery.visible_output_tokens.to_string(),
         "input_tokens": delivery.input_tokens.map(|tokens| tokens.to_string()),
         "output_tokens": delivery.output_tokens.map(|tokens| tokens.to_string()),
@@ -10515,9 +10466,7 @@ fn request_delivery_fields(delivery: &dexdo::buyer::api::RequestDelivery) -> Val
         "route_billable_tokens": delivery
             .route_billable_tokens
             .map(|tokens| tokens.to_string()),
-        "finish_reason": delivery.finish_reason,
-        "truncated_by_output_limit": delivery.truncated_by_output_limit,
-        "ended_before_output_limit": delivery.ended_before_output_limit
+        "finish_reason": delivery.finish_reason
     })
 }
 
@@ -10686,9 +10635,10 @@ fn publish_request_delivery(
 /// The event name the delivery record is published under.
 const REQUEST_DELIVERY_EVENT: &str = "request_delivery";
 
-/// Observe the claim high-water on the already-canonical buyer monitor cadence. This task is read-only and
-/// publishes through an unbounded channel, so neither a slow event sink nor a failed chain read can hold up a
-/// paid response or alter settlement.
+/// Observe the claim high-water on the already-canonical buyer monitor cadence. This task publishes through an
+/// unbounded channel, so a slow event sink cannot hold up a paid response. The same read is the route's view of
+/// its deal: it gives admission the trial-tick acceptance and closes local serving when the deal is not
+/// safely open, because the request path reads no chain state.
 fn spawn_buyer_claim_observer(
     chain: Arc<dyn ChainBackend>,
     deals: std::sync::Weak<dexdo::buyer::api::RouteManager>,
@@ -10706,7 +10656,9 @@ fn spawn_buyer_claim_observer(
             };
             if let Some(active) = deals.current().await {
                 let token_contract = active.route.token_contract.clone();
-                match chain.deal_state(&token_contract).await {
+                let read = chain.deal_state(&token_contract).await;
+                active.observe_deal_state(&read).await;
+                match read {
                     Ok(Some(state)) => {
                         if let Err(error) = persist_buyer_last_observed_promotion(
                             deals_dir.as_deref(),
@@ -12208,7 +12160,7 @@ async fn run_buyer_on_demand_local_api(
             args.market.clone(),
         );
     }
-    let (addr, task) = match api::serve(bind, state, args.anthropic_compat, shutdown).await {
+    let (addr, task) = match api::serve(bind, state, shutdown).await {
         Ok(ok) => ok,
         Err(err) => {
             if let Some(events) = &events {
@@ -12286,8 +12238,7 @@ async fn run_buyer_on_demand_local_api(
             "bind_addr": addr.to_string(),
             "base_url": base_url,
             "models_url": models_url,
-            "served_models": [frame_model.clone()],
-            "anthropic_compat": args.anthropic_compat
+            "served_models": [frame_model.clone()]
         }),
     )
     .await?;
@@ -12308,7 +12259,6 @@ async fn run_buyer_on_demand_local_api(
     }
     tracing::info!(
         %addr,
-        anthropic_compat = args.anthropic_compat,
         "consumer API listening; on-demand purchase will run on first chat request"
     );
     let usage_worker = spawn_buyer_usage_reconciliation(usage_store.clone(), args.as_ref().clone());
@@ -12779,7 +12729,6 @@ async fn run_buyer_inner(
                 "frame_model": frame_model.clone(),
                 "mode": if args.resume { "resume" } else { "buy" },
                 "requested_bind_addr": args.local_listen.map(|a| a.to_string()),
-                "anthropic_compat": args.anthropic_compat,
                 "continuity_mode": args.continuity_mode.as_str(),
                 "allow_unverified_model": args.allow_unverified_model
             }),
@@ -13767,7 +13716,7 @@ async fn run_buyer_inner(
         &token_contract,
     )?;
     // B19/B20: if `--local-listen` is set, bring up a local interface to
-    // the consumer (OpenAI-compatible + optional Anthropic transcoding) and serve requests.
+    // the consumer (OpenAI- and Anthropic-compatible paths, forwarded as sent) and serve requests.
     if let Some(bind) = args.local_listen {
         use dexdo::buyer::api::{self, ApiState, Route};
         let continuity_mode = args.continuity_mode.as_planner_mode();
@@ -13869,7 +13818,7 @@ async fn run_buyer_inner(
                 }),
             )?;
         }
-        let (addr, task) = api::serve(bind, state, args.anthropic_compat, shutdown).await?;
+        let (addr, task) = api::serve(bind, state, shutdown).await?;
         let base_url = format!("http://{addr}/v1");
         let models_url = format!("{base_url}/models");
         let models: serde_json::Value = reqwest::Client::builder()
@@ -13899,8 +13848,7 @@ async fn run_buyer_inner(
                     "bind_addr": addr.to_string(),
                     "base_url": base_url,
                     "models_url": models_url,
-                    "served_models": [frame_model.clone()],
-                    "anthropic_compat": args.anthropic_compat
+                    "served_models": [frame_model.clone()]
                 }),
             )?;
         } else if let Some(handoff) = render_local_openai_handoff(
@@ -13917,7 +13865,7 @@ async fn run_buyer_inner(
             crate::cli::progress::complete();
             println!("{handoff}");
         }
-        tracing::info!(%addr, anthropic_compat = args.anthropic_compat, "consumer API listening (loopback)");
+        tracing::info!(%addr, "consumer API listening (loopback)");
         let usage_worker = spawn_buyer_usage_reconciliation(usage_store.clone(), args.clone());
         let (claim_observer, mut claim_observations) = spawn_buyer_claim_observer(
             chain.clone(),
@@ -14061,10 +14009,16 @@ async fn run_buyer_inner(
     let mut stream_attempt = 1u64;
     let out = loop {
         match buyer
-            .connect_and_stream(&handover, &token_contract, stream_max_tokens)
+            .connect_and_stream(&handover, &token_contract, &frame_model, stream_max_tokens)
             .await
         {
             Ok(out) => break out,
+            Err(e)
+                if e.downcast_ref::<dexdo::buyer::SellerApiMismatch>()
+                    .is_some() =>
+            {
+                return Err(refuse_oneshot_on_seller_mismatch(&oneshot_session, e));
+            }
             Err(e) => match apply_oneshot_dead_gateway_policy(
                 &oneshot_session,
                 &token_contract,
@@ -14102,6 +14056,16 @@ async fn run_buyer_inner(
         settle_completed_oneshot(&oneshot_session).await?;
     }
     Ok(())
+}
+
+/// A seller of another version or format refused the one-shot request. The deal is left open for
+/// after the update, so dropping the session must not STOP it.
+fn refuse_oneshot_on_seller_mismatch(
+    session: &dexdo::buyer::api::SessionSettle,
+    error: anyhow::Error,
+) -> anyhow::Error {
+    session.keep_open_after_drop();
+    error
 }
 
 async fn settle_completed_oneshot(session: &dexdo::buyer::api::SessionSettle) -> Result<()> {
@@ -14199,7 +14163,6 @@ mod tests {
             http_status: 200,
             failure_stage: None,
             billing_grant_tokens: 2_500_000,
-            output_limit_tokens: 2_000_000,
             visible_output_tokens: 1_972_000,
             rendered_tokens: 1_972_000,
             route_delivered_tokens: Some(2_972_000),
@@ -14210,9 +14173,7 @@ mod tests {
             request_output_tokens: 1_972_000,
             request_billable_tokens: 2_472_011,
             route_billable_tokens: Some(3_472_000),
-            finish_reason: "stop",
-            truncated_by_output_limit: false,
-            ended_before_output_limit: true,
+            finish_reason: "stop".to_string(),
         });
         let object = fields.as_object().expect("delivery fields are an object");
         let mut keys: Vec<&str> = object.keys().map(String::as_str).collect();
@@ -14223,14 +14184,10 @@ mod tests {
                 "billable_tokens",
                 "billing_grant_tokens",
                 "deal_handle",
-                "ended_before_grant",
-                "ended_before_output_limit",
                 "failure_stage",
                 "finish_reason",
-                "grant_tokens",
                 "http_status",
                 "input_tokens",
-                "output_limit_tokens",
                 "output_tokens",
                 "protocol",
                 "rendered_tokens",
@@ -14242,8 +14199,6 @@ mod tests {
                 "route_delivered_tokens",
                 "streamed",
                 "token_contract",
-                "truncated_by_grant",
-                "truncated_by_output_limit",
                 "visible_output_tokens",
             ],
             "the documented keys, and no others"
@@ -14264,10 +14219,8 @@ mod tests {
         // Strings, not numbers: an orchestrator that reads amounts as JSON floats loses precision
         // long before it reaches a week's worth of tokens.
         assert_eq!(fields["billing_grant_tokens"], "2500000");
-        assert_eq!(fields["grant_tokens"], "2000000");
         assert_eq!(fields["rendered_tokens"], "1972000");
         assert_eq!(fields["route_delivered_tokens"], "2972000");
-        assert_eq!(fields["output_limit_tokens"], "2000000");
         assert_eq!(fields["visible_output_tokens"], "1972000");
         assert_eq!(fields["input_tokens"], "500000");
         assert_eq!(fields["output_tokens"], "1972000");
@@ -14277,13 +14230,6 @@ mod tests {
         assert_eq!(fields["request_billable_tokens"], "2472011");
         assert_eq!(fields["route_billable_tokens"], "3472000");
         assert_eq!(fields["finish_reason"], "stop");
-        assert_eq!(
-            fields["truncated_by_output_limit"],
-            serde_json::json!(false)
-        );
-        assert_eq!(fields["ended_before_output_limit"], serde_json::json!(true));
-        assert_eq!(fields["truncated_by_grant"], serde_json::json!(false));
-        assert_eq!(fields["ended_before_grant"], serde_json::json!(true));
     }
 
     /// The event travels under the name the contract lists, on the buyer event schema.
@@ -14326,7 +14272,6 @@ mod tests {
             http_status: 200,
             failure_stage: None,
             billing_grant_tokens: 1_000_000,
-            output_limit_tokens: 256,
             visible_output_tokens: 57,
             rendered_tokens: 2,
             route_delivered_tokens: Some(2),
@@ -14337,9 +14282,7 @@ mod tests {
             request_output_tokens: 57,
             request_billable_tokens: 64,
             route_billable_tokens: Some(64),
-            finish_reason: "stop",
-            truncated_by_output_limit: false,
-            ended_before_output_limit: true,
+            finish_reason: "stop".to_string(),
         };
 
         let first = super::persist_buyer_last_observed_usage(Some(dir.path()), &delivery)
@@ -14374,7 +14317,6 @@ mod tests {
             http_status: 502,
             failure_stage: Some("upstream_stream"),
             billing_grant_tokens: 1_000_000,
-            output_limit_tokens: 256,
             visible_output_tokens: 1,
             rendered_tokens: 1,
             route_delivered_tokens: Some(1),
@@ -14385,9 +14327,7 @@ mod tests {
             request_output_tokens: 0,
             request_billable_tokens: 0,
             route_billable_tokens: Some(0),
-            finish_reason: "error",
-            truncated_by_output_limit: false,
-            ended_before_output_limit: true,
+            finish_reason: "error".to_string(),
         };
 
         assert!(super::persist_buyer_last_observed_usage(None, &delivery)
@@ -14412,7 +14352,6 @@ mod tests {
             http_status: 502,
             failure_stage: Some("content_verification"),
             billing_grant_tokens: 1_000_000,
-            output_limit_tokens: 256,
             visible_output_tokens: 0,
             rendered_tokens: 0,
             route_delivered_tokens: Some(64),
@@ -14423,9 +14362,7 @@ mod tests {
             request_output_tokens: 64,
             request_billable_tokens: 66,
             route_billable_tokens: Some(66),
-            finish_reason: "error",
-            truncated_by_output_limit: false,
-            ended_before_output_limit: true,
+            finish_reason: "error".to_string(),
         };
 
         assert!(super::persist_buyer_last_observed_usage(None, &delivery)
@@ -17284,7 +17221,6 @@ mod tests {
                     local_listen: None,
                     continuity_mode: super::ContinuityModeArg::Proactive,
                     json: false,
-                    anthropic_compat: false,
                     frame_model: Some("Qwen3-32B".to_string()),
                     allow_unverified_model: true,
                     models: dir.join("models.json"),
@@ -18797,16 +18733,12 @@ mod tests {
                 std::sync::Arc::new(dexdo::buyer::api::ContentGate::skip()),
             );
             let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel::<()>();
-            let (_, task) = dexdo::buyer::api::serve(
-                "127.0.0.1:0".parse().unwrap(),
-                state,
-                false,
-                async move {
+            let (_, task) =
+                dexdo::buyer::api::serve("127.0.0.1:0".parse().unwrap(), state, async move {
                     let _ = shutdown_rx.await;
-                },
-            )
-            .await
-            .unwrap();
+                })
+                .await
+                .unwrap();
             shutdown_tx.send(()).unwrap();
             task.await.unwrap();
             (session, incident_submitted)
@@ -19213,29 +19145,23 @@ mod tests {
     async fn issue_547_http_request(
         client: reqwest::Client,
         api_addr: std::net::SocketAddr,
-        anthropic: bool,
+        path: &'static str,
         prompt: &'static str,
     ) -> reqwest::Response {
-        let (path, body) = if anthropic {
-            (
-                "/v1/messages",
-                serde_json::json!({
-                    "model": "Qwen3-32B",
-                    "messages": [{"role": "user", "content": prompt}],
-                    "max_tokens": 1,
-                    "stream": false
-                }),
-            )
-        } else {
-            (
-                "/v1/chat/completions",
-                serde_json::json!({
-                    "model": "Qwen3-32B",
-                    "messages": [{"role": "user", "content": prompt}],
-                    "max_tokens": 1,
-                    "stream": false
-                }),
-            )
+        let body = match path {
+            "/v1/responses" => serde_json::json!({
+                "model": "Qwen3-32B",
+                "input": prompt,
+                "max_output_tokens": 1,
+                "stream": false
+            }),
+            "/v1/messages" | "/v1/chat/completions" => serde_json::json!({
+                "model": "Qwen3-32B",
+                "messages": [{"role": "user", "content": prompt}],
+                "max_tokens": 1,
+                "stream": false
+            }),
+            other => panic!(" sends no request to {other}"),
         };
         client
             .post(format!("http://{api_addr}{path}"))
@@ -19619,7 +19545,7 @@ mod tests {
         );
         let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel::<()>();
         let (api_addr, api_task) =
-            dexdo::buyer::api::serve("127.0.0.1:0".parse().unwrap(), state, true, async move {
+            dexdo::buyer::api::serve("127.0.0.1:0".parse().unwrap(), state, async move {
                 let _ = shutdown_rx.await;
             })
             .await
@@ -19632,13 +19558,19 @@ mod tests {
         let openai = tokio::spawn(issue_547_http_request(
             client.clone(),
             api_addr,
-            false,
+            "/v1/chat/completions",
             "silent OpenAI request",
         ));
         wait_for_counter(&provider_calls, 1, "silent provider request").await;
-        let anthropic =
-            issue_547_http_request(client.clone(), api_addr, true, "silent Anthropic request")
-                .await;
+        // The OpenAI-compatible seller serves Responses too; Messages would be refused as a path
+        // it does not serve before its capacity is consulted.
+        let anthropic = issue_547_http_request(
+            client.clone(),
+            api_addr,
+            "/v1/responses",
+            "silent Responses request",
+        )
+        .await;
         assert_eq!(anthropic.status(), reqwest::StatusCode::TOO_MANY_REQUESTS);
         let anthropic_body: serde_json::Value = anthropic
             .json()
@@ -19778,7 +19710,7 @@ mod tests {
         );
         let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel::<()>();
         let (api_addr, api_task) =
-            dexdo::buyer::api::serve("127.0.0.1:0".parse().unwrap(), state, true, async move {
+            dexdo::buyer::api::serve("127.0.0.1:0".parse().unwrap(), state, async move {
                 let _ = shutdown_rx.await;
             })
             .await
@@ -19791,15 +19723,15 @@ mod tests {
         let openai = tokio::spawn(issue_547_http_request(
             client.clone(),
             api_addr,
-            false,
+            "/v1/chat/completions",
             "ambiguous OpenAI request",
         ));
         wait_for_counter(&provider_calls, 1, "ambiguous provider request").await;
         let anthropic = issue_547_http_request(
             client.clone(),
             api_addr,
-            true,
-            "ambiguous Anthropic request",
+            "/v1/responses",
+            "ambiguous Responses request",
         )
         .await;
         assert_eq!(anthropic.status(), reqwest::StatusCode::TOO_MANY_REQUESTS);
@@ -19868,13 +19800,18 @@ mod tests {
         let next_openai = issue_547_http_request(
             client.clone(),
             api_addr,
-            false,
+            "/v1/chat/completions",
             "replacement OpenAI request",
         )
         .await;
         assert_eq!(next_openai.status(), reqwest::StatusCode::OK);
-        let next_anthropic =
-            issue_547_http_request(client, api_addr, true, "replacement Anthropic request").await;
+        let next_anthropic = issue_547_http_request(
+            client,
+            api_addr,
+            "/v1/messages",
+            "replacement Anthropic request",
+        )
+        .await;
         assert_eq!(next_anthropic.status(), reqwest::StatusCode::OK);
         assert_eq!(init_calls.load(Ordering::SeqCst), 1);
         assert_eq!(chain.place_next_calls.load(Ordering::SeqCst), 1);
@@ -21251,6 +21188,48 @@ mod tests {
         assert_eq!(chain.reclaim_calls.load(Ordering::SeqCst), 0);
         assert_eq!(chain.stop_calls.load(Ordering::SeqCst), 0);
         assert_eq!(chain.dispute_calls.load(Ordering::SeqCst), 0);
+    }
+
+    /// A one-shot request refused for a seller of another version or format leaves the deal open:
+    /// the session the run drops submits no STOP. Without the refusal path the same drop does.
+    #[tokio::test]
+    async fn oneshot_seller_mismatch_leaves_the_deal_open() {
+        use std::sync::atomic::Ordering;
+
+        for refused in [false, true] {
+            let chain = std::sync::Arc::new(RecordingRecoveryChain::default());
+            let session = dexdo::buyer::api::SessionSettle::new_with_failure_policy_and_lifetime(
+                chain.clone(),
+                "tc-seller-mismatch".to_string(),
+                std::sync::Arc::new(dexdo_core::LocalNote::generate()),
+                dexdo::buyer::api::BuyerApiFailurePolicy::default(),
+                dexdo::buyer::api::SessionLifetimePolicy::SettleOnExit,
+            );
+            if refused {
+                let error = super::refuse_oneshot_on_seller_mismatch(
+                    &session,
+                    anyhow::anyhow!("seller_update_required"),
+                );
+                assert_eq!(error.to_string(), "seller_update_required");
+            }
+            drop(session);
+            let expected = usize::from(!refused);
+            tokio::time::timeout(std::time::Duration::from_secs(1), async {
+                while chain.stop_calls.load(Ordering::SeqCst) < expected {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .expect("the dropped session's STOP backup runs");
+            for _ in 0..100 {
+                tokio::task::yield_now().await;
+            }
+            assert_eq!(
+                chain.stop_calls.load(Ordering::SeqCst),
+                expected,
+                "refused={refused}"
+            );
+        }
     }
 
     #[tokio::test]
@@ -25610,9 +25589,7 @@ mod tests {
                  note_shell_balance={note_shell_balance} matched_ask_order_id={} \
                  matched_ask_token_contract={matched_tc} balance_sufficient=true \
                  probe_tick_charged_tokens=1000000 billable_ticks=2 \
-                 streaming_ticks_after_probe=1 streaming_tokens_after_probe=1000000 \
-                 note=one of the 2 ticks you pay for is the probe, billed whole even if it \
-                 delivers less; 1 tick(s) remain for streaming",
+                 note=at least one tick is charged even if you use less",
                 dexdo_core::params::MIN_STREAM_BUY_TICKS,
                 dexdo_core::shell_amount(order.price_per_tick),
                 dexdo_core::shell_amount(order.price_per_tick),
@@ -25732,9 +25709,7 @@ mod tests {
                  escrow=6 fee=0.15 note_shell_balance=6 \
                  matched_ask_order_id=11 matched_ask_token_contract={ask_token_contract_rendered} \
                  balance_sufficient=true probe_tick_charged_tokens=1000000 billable_ticks=2 \
-                 streaming_ticks_after_probe=1 streaming_tokens_after_probe=1000000 \
-                 note=one of the 2 ticks you pay for is the probe, billed whole even if it \
-                 delivers less; 1 tick(s) remain for streaming",
+                 note=at least one tick is charged even if you use less",
                 dexdo_core::params::MIN_STREAM_BUY_TICKS,
             )
         );
@@ -25990,7 +25965,6 @@ mod tests {
             local_listen: Some("127.0.0.1:0".parse().unwrap()),
             continuity_mode: super::ContinuityModeArg::Proactive,
             json: false,
-            anthropic_compat: false,
             frame_model: Some(frame_model.to_string()),
             allow_unverified_model: true,
             models: dir.join("models.json"),
@@ -27714,7 +27688,6 @@ mod tests {
             local_listen: None,
             continuity_mode: super::ContinuityModeArg::OnDemand,
             json: false,
-            anthropic_compat: false,
             frame_model: Some("Qwen3-32B".to_string()),
             allow_unverified_model: true,
             models: dir.join("models.json"),
@@ -27746,7 +27719,7 @@ mod tests {
         );
         let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel::<()>();
         let (addr, task) =
-            dexdo::buyer::api::serve("127.0.0.1:0".parse().unwrap(), state, false, async move {
+            dexdo::buyer::api::serve("127.0.0.1:0".parse().unwrap(), state, async move {
                 let _ = shutdown_rx.await;
             })
             .await
@@ -27846,7 +27819,7 @@ mod tests {
         );
         let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel::<()>();
         let (addr, task) =
-            dexdo::buyer::api::serve("127.0.0.1:0".parse().unwrap(), state, true, async move {
+            dexdo::buyer::api::serve("127.0.0.1:0".parse().unwrap(), state, async move {
                 let _ = shutdown_rx.await;
             })
             .await
@@ -28045,7 +28018,6 @@ mod tests {
             local_listen: Some("127.0.0.1:0".parse().unwrap()),
             continuity_mode: super::ContinuityModeArg::OnDemand,
             json: true,
-            anthropic_compat: false,
             frame_model: Some("Qwen3-32B".to_string()),
             allow_unverified_model: true,
             models: dir.join("models.json"),
@@ -28421,7 +28393,6 @@ mod tests {
             local_listen: Some("127.0.0.1:0".parse().unwrap()),
             continuity_mode: super::ContinuityModeArg::OnDemand,
             json: true,
-            anthropic_compat: false,
             frame_model: Some(journal.frame_model.clone()),
             allow_unverified_model: true,
             models: dir.join("models.json"),
@@ -28851,7 +28822,7 @@ mod tests {
             .await
             .expect("the restarted buyer decrypts this TC's handover");
         let output = buyer
-            .connect_and_stream(&handover, &token_contract, 2)
+            .connect_and_stream(&handover, &token_contract, frame_model, 2)
             .await
             .expect("the exact matched buyer reaches the same gateway capacity slot");
         assert_eq!(output.received, 2);
@@ -29343,7 +29314,6 @@ mod tests {
             local_listen: Some("127.0.0.1:0".parse().unwrap()),
             continuity_mode: super::ContinuityModeArg::OnDemand,
             json: true,
-            anthropic_compat: false,
             frame_model: Some(frame_model.to_string()),
             allow_unverified_model: true,
             models: dir.join("models.json"),
@@ -30792,7 +30762,6 @@ mod tests {
             local_listen: Some("127.0.0.1:0".parse().unwrap()),
             continuity_mode: super::ContinuityModeArg::OnDemand,
             json: true,
-            anthropic_compat: false,
             frame_model: Some("Qwen3-32B".to_string()),
             allow_unverified_model: true,
             models: dir.join("models.json"),
@@ -31338,7 +31307,6 @@ mod tests {
             local_listen: None,
             continuity_mode: super::ContinuityModeArg::OnDemand,
             json: false,
-            anthropic_compat: false,
             frame_model: Some("Qwen3-32B".to_string()),
             allow_unverified_model: true,
             models: dir.join("models.json"),

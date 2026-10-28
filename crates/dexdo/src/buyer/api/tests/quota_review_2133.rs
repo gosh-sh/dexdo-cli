@@ -13,7 +13,7 @@ struct Harness {
 impl Harness {
     async fn start(state: ApiState) -> Self {
         let (shutdown, receiver) = tokio::sync::oneshot::channel();
-        let (addr, task) = serve("127.0.0.1:0".parse().unwrap(), state.clone(), true, async {
+        let (addr, task) = serve("127.0.0.1:0".parse().unwrap(), state.clone(), async {
             let _ = receiver.await;
         })
         .await
@@ -177,8 +177,9 @@ async fn observed_external_terminal_closes_quota_before_financial_reconciliation
         } else {
             Some(never_opened_deal_state(0, unix_now_secs()))
         };
+        observe_deal(&harness.state.deals).await;
         let body = harness.serving_check().await;
-        assert_eq!(body["error"]["code"], "deal_unavailable", "{body}");
+        assert_eq!(body["error"]["code"], "deal_session_closed", "{body}");
         assert!(!session.is_settled(), "no financial reconciliation yet");
         harness.assert_quota(100, 30, 0).await;
         assert_eq!(
@@ -210,10 +211,7 @@ async fn transport_failure_keeps_active_quota_and_late_old_terminal_cannot_close
     record_work_and_accrual(&store, "A", SHELL_UNIT);
     let harness = Harness::start(state(buyer.clone(), old, store)).await;
     chain.transient_deal_state.store(true, Ordering::SeqCst);
-    assert_eq!(
-        harness.serving_check().await["error"]["code"],
-        "deal_state_unavailable"
-    );
+    observe_deal(&harness.state.deals).await;
     harness.assert_quota(100, 30, 70).await;
     assert!(!old_session.is_closed());
     chain.transient_deal_state.store(false, Ordering::SeqCst);
@@ -270,9 +268,10 @@ async fn failed_sqlite_publication_recovers_actual_terms_after_contract_disappea
     );
     harness.assert_unavailable().await;
     *chain.deal_state.lock().unwrap() = None;
+    observe_deal(&harness.state.deals).await;
     assert_eq!(
         harness.serving_check().await["error"]["code"],
-        "deal_unavailable"
+        "deal_session_closed"
     );
     harness.assert_unavailable().await;
     assert!(publication.is_err());

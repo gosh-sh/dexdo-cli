@@ -7,94 +7,24 @@
 //! an empty config, an unknown model -> an explicit error, not a silent degradation.
 
 use anyhow::{bail, Context, Result};
-pub use dexdo_core::params::{
-    ReasoningDisableControl, ReasoningEffort, ReasoningEffortControl, SampleAlgorithm,
-};
+pub use dexdo_core::params::SampleAlgorithm;
 use serde::Deserialize;
 use std::collections::BTreeMap;
 use std::path::Path;
 
 /// Model capabilities -- what the endpoint actually supports.
 
-/// Unlike the rest of the config this struct does NOT deny unknown fields: the retired `logprobs` /
-/// `top_logprobs` keys are still present in already-deployed `models.json` files, and rejecting them
-/// would take every such seller off the market on upgrade. They are ignored, not honoured.
-#[derive(Clone, Debug, Deserialize, PartialEq)]
+/// Unlike the rest of the config this struct does NOT deny unknown fields: a deployed `models.json`
+/// may carry capability keys this client does not read, and rejecting them would take such a seller
+/// off the market. They are ignored, not honoured.
+#[derive(Clone, Debug, Default, Deserialize, PartialEq)]
 pub struct Capabilities {
-    /// The model's **own** maximum output length (completion tokens) at this endpoint. The outbound
-    /// generation limit is clamped to it in addition to the deal budget: a deal budget is
-    /// `ticks * TICK_SIZE` tokens, which every real provider rejects with `400` (Groq answers
-    /// `` `max_tokens` must be less than or equal to `40960` ``), so a deal-only clamp made every
-    /// delivery fail. `None` = **unknown** -> serving that model fails closed with an explicit
-    /// error BEFORE the provider is contacted, rather than sending an unbounded value.
-    #[serde(default)]
-    pub max_output_tokens: Option<u32>,
     /// Which one provider-specific field controls B7 reproducibility. A non-`NONE` declaration
     /// asserts that the exact endpoint was found reproducible with that wire shape. `NONE` is the
     /// conservative default: send no optional field and degrade B7 rather than compare stochastic
     /// generations.
     #[serde(default)]
     pub sample_algorithm: SampleAlgorithm,
-    /// Verified disable control for this exact endpoint/model and server version.
-    /// Absent = unsupported. Native Anthropic accepts only `thinking_disabled`.
-    #[serde(default)]
-    pub reasoning_disable: ReasoningDisableControl,
-    /// Verified effort control and supported levels, independent of reasoning disable.
-    #[serde(default)]
-    pub reasoning_effort: Option<ReasoningEffortCapability>,
-}
-
-#[derive(Clone, Debug, Deserialize, PartialEq)]
-#[serde(deny_unknown_fields)]
-pub struct ReasoningEffortCapability {
-    pub control: ReasoningEffortControl,
-    pub supported: Vec<ReasoningEffort>,
-}
-
-impl Capabilities {
-    #[allow(clippy::result_large_err)]
-    pub(crate) fn validate_reasoning(
-        &self,
-        params: Option<&dexdo_proto::SamplingParams>,
-    ) -> Result<(), tonic::Status> {
-        let Some(params) = params else { return Ok(()) };
-        if params.disable_reasoning && params.reasoning_effort.is_some() {
-            return Err(tonic::Status::invalid_argument(
-                "unsupported_parameter: reasoning effort and disable cannot be combined",
-            ));
-        }
-        if params.disable_reasoning
-            && self.reasoning_disable == ReasoningDisableControl::Unsupported
-        {
-            return Err(tonic::Status::invalid_argument(
-                "unsupported_parameter: this seller/model cannot disable reasoning",
-            ));
-        }
-        if let Some(value) = &params.reasoning_effort {
-            let supported = ReasoningEffort::parse(value).is_some_and(|effort| {
-                self.reasoning_effort
-                    .as_ref()
-                    .is_some_and(|cfg| cfg.supported.contains(&effort))
-            });
-            if !supported {
-                return Err(tonic::Status::invalid_argument(format!(
-                    "unsupported_parameter: this seller/model does not support reasoning effort {value:?}",
-                )));
-            }
-        }
-        Ok(())
-    }
-}
-
-impl Default for Capabilities {
-    fn default() -> Self {
-        Self {
-            max_output_tokens: None,
-            sample_algorithm: dexdo_core::params::OPENAI_COMPATIBLE_SAMPLE_ALGORITHM_DEFAULT,
-            reasoning_disable: dexdo_core::params::REASONING_DISABLE_CONTROL_DEFAULT,
-            reasoning_effort: None,
-        }
-    }
 }
 
 /// One behavioral-probe fingerprint declared for a model in config: a deterministic
@@ -125,8 +55,8 @@ pub struct ModelConfig {
     pub served_model: String,
     /// Name of the env variable holding the key -- **per-model/provider** (not one global `GROQ_API_KEY`).
     pub api_key_env: String,
-    /// The tokenizer family for `SignalManifest.tokenizer_family` -- instead of
-    /// a substring hardcode. The buyer's profile matches by family.
+    /// The model's tokenizer family as the operator declares it. Deployed configurations carry it;
+    /// no verification reads it.
     pub tokenizer_family: String,
     /// Declared tick price in whole SHELL. No runtime path reads it: the price a seller offers
     /// comes from the deployed deal contract, so this is not a second price source.
@@ -138,8 +68,8 @@ pub struct ModelConfig {
     /// used to resolve fingerprints/vocab for the registry/provider name. Empty by default.
     #[serde(default)]
     pub identity_aliases: Vec<String>,
-    /// Tokenizer vocabulary size for the B5 tokenizer-check. `None` -> fall back to the
-    /// `tokenizer_family` mapping. qwen 152064, llama 128256, gpt 100352.
+    /// Tokenizer vocabulary size as the operator declares it (qwen 152064, llama 128256,
+    /// gpt 100352). Deployed configurations carry it; no verification reads it.
     #[serde(default)]
     pub vocab_size: Option<u32>,
     /// Behavioral fingerprints for the exact model. Empty -> no B8 (degradation R3).
@@ -201,23 +131,6 @@ impl ModelsConfig {
         let cfg: ModelsConfig = serde_json::from_str(text).context("parse JSON")?;
         if cfg.models.is_empty() {
             bail!("no models in the config");
-        }
-        for (name, model) in &cfg.models {
-            if let Some(effort) = &model.capabilities.reasoning_effort {
-                if effort.supported.is_empty() {
-                    bail!(
-                        "model {name:?}: capabilities.reasoning_effort.supported must not be empty"
-                    );
-                }
-                for (index, level) in effort.supported.iter().enumerate() {
-                    if effort.supported[..index].contains(level) {
-                        bail!(
-                            "model {name:?}: duplicate reasoning effort {:?}",
-                            level.as_str()
-                        );
-                    }
-                }
-            }
         }
         Ok(cfg)
     }
@@ -284,7 +197,7 @@ mod tests {
           "api_key_env": "GROQ_API_KEY",
           "tokenizer_family": "qwen",
           "price_per_tick": 1,
-          "capabilities": { "logprobs": true, "top_logprobs": 5, "max_output_tokens": 40960 }
+          "capabilities": { "logprobs": true, "top_logprobs": 5 }
         }
       }
     }"#;
@@ -297,42 +210,10 @@ mod tests {
         assert_eq!(by_key.frame_model, "qwen--qwen3--32b");
         assert_eq!(by_key.served_model, "qwen/qwen3-32b");
         assert_eq!(by_key.tokenizer_family, "qwen");
-        assert_eq!(by_key.capabilities.max_output_tokens, Some(40_960));
         // By the canonical frame_model.
         let by_frame = cfg.get("qwen--qwen3--32b").expect("by frame");
         assert_eq!(by_frame.frame_model, by_key.frame_model);
         assert_eq!(by_frame.served_model, "qwen/qwen3-32b");
-    }
-
-    #[test]
-    fn reasoning_2090_profiles_load_for_both_adapters() {
-        for (name, control) in [
-            ("unsupported", ReasoningDisableControl::Unsupported),
-            ("chat_template", ReasoningDisableControl::ChatTemplate),
-            (
-                "chat_template_thinking",
-                ReasoningDisableControl::ChatTemplateThinking,
-            ),
-            ("reasoning_effort", ReasoningDisableControl::ReasoningEffort),
-            ("openrouter", ReasoningDisableControl::OpenRouter),
-            (
-                "thinking_disabled",
-                ReasoningDisableControl::ThinkingDisabled,
-            ),
-        ] {
-            let mut body: serde_json::Value = serde_json::from_str(SAMPLE).unwrap();
-            body["models"]["qwen"]["capabilities"]["reasoning_disable"] = name.into();
-            let cfg = ModelsConfig::from_json(&body.to_string()).unwrap();
-            let model = cfg.get("qwen").unwrap();
-            assert_eq!(model.capabilities.reasoning_disable, control);
-            assert_eq!(
-                crate::seller::AnthropicConfig::from_model(model, None).reasoning_disable,
-                control
-            );
-        }
-        let mut body: serde_json::Value = serde_json::from_str(SAMPLE).unwrap();
-        body["models"]["qwen"]["capabilities"]["reasoning_disable"] = "guess_from_model".into();
-        assert!(ModelsConfig::from_json(&body.to_string()).is_err());
     }
 
     #[test]
@@ -356,17 +237,11 @@ mod tests {
     }
 
     #[test]
-    fn capabilities_default_leaves_the_output_cap_unknown() {
+    fn capabilities_default_to_no_sample_algorithm() {
         let json = r#"{"models":{"m":{"frame_model":"f","base_url":"http://x","served_model":"s",
           "api_key_env":"K","tokenizer_family":"fam","price_per_tick":1}}}"#;
         let cfg = ModelsConfig::from_json(json).unwrap();
         let m = cfg.get("m").unwrap();
-        // an undeclared output cap is UNKNOWN, never "unbounded" -- the seller fails closed.
-        assert_eq!(m.capabilities.max_output_tokens, None);
-        assert_eq!(
-            m.capabilities.reasoning_disable,
-            ReasoningDisableControl::Unsupported
-        );
         assert!(
             m.capabilities.sample_algorithm == SampleAlgorithm::None,
             "an omitted sample_algorithm uses the conservative NONE default"
@@ -384,7 +259,7 @@ mod tests {
             let json = format!(
                 r#"{{"models":{{"m":{{"frame_model":"f","base_url":"http://x","served_model":"s",
                   "api_key_env":"K","tokenizer_family":"fam","price_per_tick":1,
-                  "capabilities":{{"max_output_tokens":16,"sample_algorithm":"{value}"}}}}}}}}"#,
+                  "capabilities":{{"sample_algorithm":"{value}"}}}}}}}}"#,
             );
             let cfg = ModelsConfig::from_json(&json).unwrap();
             let model = cfg.get("m").unwrap();
@@ -394,7 +269,7 @@ mod tests {
 
         let invalid = r#"{"models":{"m":{"frame_model":"f","base_url":"http://x","served_model":"s",
           "api_key_env":"K","tokenizer_family":"fam","price_per_tick":1,
-          "capabilities":{"max_output_tokens":16,"sample_algorithm":"BOTH"}}}}"#;
+          "capabilities":{"sample_algorithm":"BOTH"}}}}"#;
         assert!(
             ModelsConfig::from_json(invalid).is_err(),
             "a profile must select exactly one known sampling algorithm"
@@ -402,40 +277,11 @@ mod tests {
 
         let retired_do_sample = r#"{"models":{"m":{"frame_model":"f","base_url":"http://x","served_model":"s",
           "api_key_env":"K","tokenizer_family":"fam","price_per_tick":1,
-          "capabilities":{"max_output_tokens":16,"sample_algorithm":"DO_SAMPLE"}}}}"#;
+          "capabilities":{"sample_algorithm":"DO_SAMPLE"}}}}"#;
         assert!(
             ModelsConfig::from_json(retired_do_sample).is_err(),
             "DO_SAMPLE is not a supported B7 reproducibility declaration; GLM profiles use NONE"
         );
-    }
-
-    #[test]
-    fn the_shipped_models_config_declares_an_output_cap_for_every_model() {
-        // a model whose `capabilities.max_output_tokens` is undeclared has an UNKNOWN output cap, and the
-        // seller refuses to serve it BEFORE the provider is contacted. A shipped config entry without the cap is
-        // therefore a model that cannot deliver a single token -- guard the repo's own deployment artifact so a
-        // release can never ship one, the way the live fixtures shipped one.
-
-        // re-pointed this at `models.example.json`, and the subject is unchanged: the shipped
-        // artifact. `models.json` stopped being one -- it is our own working config now, and what the
-        // user's archive carries is the example. An example teaching a config with no output cap
-        // teaches a seller a model that never serves a token, which is exactly what this guards.
-        let path = Path::new(concat!(
-            env!("CARGO_MANIFEST_DIR"),
-            "/../../models.example.json"
-        ));
-        let cfg = ModelsConfig::load(path).expect("the repo's models.example.json loads");
-        for (name, model) in &cfg.models {
-            assert!(
-                model
-                    .capabilities
-                    .max_output_tokens
-                    .is_some_and(|cap| cap > 0),
-                "shipped model \"{name}\" ({}) declares no capabilities.max_output_tokens: the seller fails \
-                 closed on an unknown output cap and never serves it",
-                model.frame_model
-            );
-        }
     }
 
     #[test]
@@ -529,75 +375,5 @@ mod tests {
         let cfg = ModelsConfig::from_json(json).unwrap();
         let m = cfg.get("m").unwrap();
         assert!(!m.fingerprints[0].accepts_reasoning_side_channel);
-    }
-}
-
-#[cfg(test)]
-mod reasoning_2172_tests {
-    use super::*;
-    use proptest::prelude::*;
-
-    #[test]
-    fn effort_capability_is_strict_and_independent_of_disable() {
-        let base = serde_json::json!({"models":{"m":{
-            "frame_model":"m", "base_url":"http://fixture", "served_model":"m",
-            "api_key_env":"unused", "tokenizer_family":"qwen", "price_per_tick":1,
-            "capabilities":{"reasoning_disable":"chat_template"}
-        }}});
-        for control in ["reasoning_effort", "reasoning_effort_nested"] {
-            let mut body = base.clone();
-            body["models"]["m"]["capabilities"]["reasoning_effort"] = serde_json::json!({
-                "control":control, "supported":["minimal", "low", "medium", "high", "xhigh", "max"]
-            });
-            let cfg = ModelsConfig::from_json(&body.to_string()).unwrap();
-            let caps = &cfg.get("m").unwrap().capabilities;
-            assert_eq!(
-                caps.reasoning_disable,
-                ReasoningDisableControl::ChatTemplate
-            );
-            assert_eq!(
-                caps.reasoning_effort
-                    .as_ref()
-                    .unwrap()
-                    .supported
-                    .iter()
-                    .map(|effort| effort.as_str())
-                    .collect::<Vec<_>>(),
-                vec!["minimal", "low", "medium", "high", "xhigh", "max"]
-            );
-            for invalid in [
-                serde_json::json!({"control":control,"supported":[]}),
-                serde_json::json!({"control":control,"supported":["low","low"]}),
-                serde_json::json!({"control":control,"supported":["none"]}),
-                serde_json::json!({"control":control,"supported":["invalid"]}),
-                serde_json::json!({"control":control,"supported":["ultra"]}),
-                serde_json::json!({"control":"invalid","supported":["high"]}),
-                serde_json::json!({"control":control,"supported":["high"],"unknown":true}),
-            ] {
-                body["models"]["m"]["capabilities"]["reasoning_effort"] = invalid;
-                assert!(ModelsConfig::from_json(&body.to_string()).is_err());
-            }
-        }
-    }
-
-    proptest! {
-        #[test]
-        fn undeclared_efforts_and_conflicting_controls_always_fail(
-            value in ".*", disabled: bool,
-        ) {
-            let caps = Capabilities {
-                reasoning_disable: ReasoningDisableControl::ChatTemplate,
-                reasoning_effort: Some(ReasoningEffortCapability {
-                    control: ReasoningEffortControl::ReasoningEffort,
-                    supported: vec![ReasoningEffort::High],
-                }),
-                ..Default::default()
-            };
-            let params = dexdo_proto::SamplingParams {
-                disable_reasoning: disabled, reasoning_effort: Some(value.clone()),
-                ..Default::default()
-            };
-            prop_assert_eq!(caps.validate_reasoning(Some(&params)).is_ok(), !disabled && value == ReasoningEffort::High.as_str());
-        }
     }
 }

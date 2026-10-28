@@ -1,3 +1,84 @@
+## v0.10.0
+
+### Breaking Changes
+
+- `/v1/messages` on the buyer is no longer translated to OpenAI. The buyer forwards
+  every request to the seller as sent -- path, body and headers, less the client's
+  credentials -- and returns the provider's answer as produced. Messages needs a seller with an Anthropic provider;
+  Chat Completions and Responses need an OpenAI-compatible seller. A request on a path
+  the seller does not serve is refused with HTTP 400 `unsupported_api_path` before any
+  money moves. A Messages client sends `anthropic-version` itself, as the Anthropic
+  API requires; the seller no longer adds one. `/v1/messages` is always available and `--anthropic-compat` is removed.
+- Every request field reaches the provider unchanged, including `reasoning_effort`,
+  `reasoning`, `tools`, tool results and fields dexdo does not know. The buyer no
+  longer checks reasoning settings before payment, and `capabilities.reasoning_disable`
+  and `capabilities.reasoning_effort` in `models.json` are ignored. `model` must name
+  the deal's model; a request without it is refused. Tools the provider runs itself,
+  such as web search, are sold by the tokens the provider reports, their results
+  included; the provider's per-call fee is not billed.
+- Provider answers, errors included, reach the client with the provider's status and
+  body. Provider response headers arrive prefixed `llm_provider-`; `retry-after`,
+  `retry-after-ms`, `x-ratelimit-*` and `anthropic-ratelimit-*` also keep their own
+  names. The buyer sets `Content-Type` itself. A provider 401 or 403 remains HTTP 502
+  without the provider's body; a provider redirect, or a provider error whose text
+  contains the seller's key, is HTTP 502 without it. Sellers no longer
+  repeat a request after a provider error; the client decides whether to retry.
+- The `session_id` and `conversation_id` headers each reach the provider as sent;
+  `conversation_id` no longer stands in for a missing `session_id`. A streamed Chat
+  Completions answer always carries the provider's usage chunk before `[DONE]`; the
+  seller removes `stream_options.continuous_usage_stats` from the request.
+- Buyer machine events move to `dexdo.buyer.event.v3`. `starting` and `endpoint_ready`
+  no longer carry `anthropic_compat`, and `request_delivery` carries the field set the
+  runtime contract lists for v3.
+- Buyer and seller must both update. A buyer refuses requests to an older seller with
+  HTTP 502 `seller_update_required` and keeps the deal open. A seller refuses an older
+  buyer's requests: an older buyer's local API keeps its deal open, while an older
+  one-shot `dexdo buyer` run settles its deal as a dead gateway.
+- The buyer checks substitution by the `model` each provider answer names, against
+  the deal model's known spellings; for a deal model named without its producer, any
+  producer prefix in the answer is ignored. An answer naming another model ends the
+  stream and closes the deal as a substitution; an answer naming no model passes.
+
+### New / Improvements
+
+- `"stream": false` requests reach the provider as non-streamed requests and return
+  its single JSON answer; the seller waits up to three minutes for it.
+
+### Fixes
+
+- Sellers let deals spend their initially funded SHELL reserve without automatically
+  refilling it from the seller note. An exhausted TokenContract reserve is reported
+  with the failed operation and available receipt evidence, including seller bond
+  funding and offer placement through the note. A failed or cancelled receipt lookup
+  preserves the known submission or rejection and leaves its cause unproven.
+  Recovery state is kept and settlement remains unconfirmed until the chain proves
+  a terminal outcome.
+- The buyer no longer slows down as its request history grows. Checking unresolved
+  usage skips completed history, and reading usage reports no longer holds up
+  request accounting.
+- Large inference purchases no longer fail with no executable liquidity because a
+  TokenContract native VMSHELL balance was compared with its SHELL ECC[2] reserve.
+  Reserve checks account for the operation and already-paid setup charges; buyer
+  stop, dispute and unopened-deal recovery do not require the original lifetime reserve.
+- Requests to the buyer's local endpoint no longer wait for a chain read of the deal
+  before they reach the seller. The read took about 1.5 s per request on shellnet, and
+  on mainnet it held a buyer to one request every two seconds across all its clients.
+  A request is no longer refused with `deal_state_unavailable` while the chain cannot
+  be read.
+- The buyer's local API checks the current deal in the background once a minute
+  instead of once a second, reducing chain reads and contention for the network
+  request limit. Probe acceptance, deal completion, and continuity decisions can
+  take up to a minute to be observed. Transient chain-read failures still retry.
+- A seller no longer bills the probe tick on top of the tokens delivered after it.
+  The probe tick is now the minimum charge: tokens delivered before and after the
+  probe count toward it, and beyond one tick the seller claims exactly the buyer's
+  total usage. Before, a buyer paid for up to almost one tick of tokens never
+  received whenever the probe was accepted before one tick was used. Sellers must
+  update; a deal whose probe was accepted before the update finishes under the old
+  rule. The buyer's pre-purchase line no longer
+  prints `streaming_ticks_after_probe` and `streaming_tokens_after_probe`, and its
+  note now reads `at least one tick is charged even if you use less`.
+
 ## v0.9.0
 
 ### Breaking Changes

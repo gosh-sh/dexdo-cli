@@ -1,20 +1,13 @@
-//! Client-side model verification. Runs **inline on the canonical
-//! stream BEFORE re-rendering** (B5-B9), on the buyer's side -- the protocol does not guarantee
-//! authenticity off-chain; the client provides it.
+//! Client-side model verification, on the buyer's side -- the protocol
+//! does not guarantee authenticity off-chain; the client provides it.
 
-//! Layers in increasing order of cost: **B5 tokenizer-check** (here), then reference
-//! spot-check (B7), behavioral probes (B8), per-seller score (B10). Currently B5 is
-//! up -- it is mandatory first and cheaply catches a crude model substitution.
+//! Layers in increasing order of cost: the **model check** of the forwarded response
+//! ([`ModelCheck`], every response), the reference spot-check (B7) and behavioral probes (B8, once
+//! per deal), per-seller score (B10).
 
-//! The verifier is **stateful per stream**: the `SignalManifest` arrives on the first chunk,
-//! the verifier captures it and runs the available layers on each chunk. No signals / not declared --
-//! we do not fabricate (R4), we degrade (R3) to the next layers.
-
-use crate::registry::model_id_alias;
+use crate::registry::{model_id_alias, registry_identity_candidates};
 use crate::seller::{ModelConfig, ModelsConfig, SampleAlgorithm};
 pub use dexdo_core::params::DEFAULT_SPOTCHECK_THRESHOLD;
-use dexdo_proto::{CanonChunk, SignalManifest};
-use std::sync::Arc;
 
 /// Stream verification verdict: continue or bail (refuse/bail to the next
 /// eligible seller B3 -- loss <= 2 ticks, without completing the deal).
@@ -26,137 +19,64 @@ pub enum Verdict {
     Bail(String),
 }
 
-/// Tokenizer profile of a family. At minimum -- the upper bound of the vocabulary: a foreign tokenizer with
-/// a different vocabulary is exposed by a token-id out of range, instantly and cheaply. `Permissive` -- the mock's fake tokens
-/// the tokenizer-check does not apply to them.
-#[derive(Debug, Clone, PartialEq, Eq)]
-enum TokenizerProfile {
-    Permissive,
-    /// Real vocabulary: all token-ids must be `< vocab_size`.
-    Vocab(u32),
+/// The model check of a forwarded response: every model the provider says produced
+/// the answer must be the deal's model in one of its spellings -- the canonical market id
+/// (`qwen--qwen3--32b`), the registry's (`Qwen/Qwen3-32B`), the provider slug (`qwen/qwen3-32b`),
+/// the producer-free name (`qwen3-32b`), or the `served_model` or an `identity_aliases` entry of the
+/// buyer's own models config for that model.
+/// A response that names no model gives no signal; inventing a verdict from silence would refuse
+/// honest sellers.
+#[derive(Debug, Clone)]
+pub struct ModelCheck {
+    expected: String,
+    accepted: Vec<String>,
+    /// The deal model names no producer (`Qwen3.8-27B`), so a provider slug that prefixes one
+    /// (`qwen/qwen3.8-27b`) is compared without it.
+    producer_free: bool,
 }
 
-/// Family profile for B5, **data-driven**: if a configured model declares this
-/// `tokenizer_family` with an explicit `vocab_size`, use it; else fall back to the built-in family
-/// mapping; else `None` (undeclared/unknown family -> nothing to check at this layer). `models = None`
-/// (no config threaded) degrades to the family mapping -- the byte-for-byte pre-config behavior.
-fn profile_for(family: &str, models: Option<&ModelsConfig>) -> Option<TokenizerProfile> {
-    if let Some(models) = models {
-        if let Some(v) = models
-            .models
-            .values()
-            .find(|m| m.tokenizer_family == family)
-            .and_then(|m| m.vocab_size)
+impl ModelCheck {
+    pub fn new(expected: &str, models: Option<&ModelsConfig>) -> Self {
+        let mut accepted: Vec<String> = registry_identity_candidates(expected)
+            .iter()
+            .map(|candidate| model_id_alias(candidate))
+            .collect();
+        if let Some(entry) = models.and_then(|models| resolve_model_cfg(expected, models)) {
+            accepted.extend(
+                [&entry.frame_model, &entry.served_model]
+                    .into_iter()
+                    .chain(&entry.identity_aliases)
+                    .map(|alias| model_id_alias(alias)),
+            );
+        }
+        accepted.sort();
+        accepted.dedup();
+        let expected = expected.trim();
+        Self {
+            expected: expected.to_string(),
+            accepted,
+            producer_free: !expected.contains('/') && !expected.contains("--"),
+        }
+    }
+
+    pub fn verify(&self, reported: &str) -> Verdict {
+        let reported_alias = model_id_alias(reported);
+        // Every path segment before the model name is dropped: `qwen/...` and a provider's
+        // `accounts/<account>/models/...` alike.
+        let without_producer = reported_alias
+            .rsplit_once('/')
+            .map(|(_, model)| model.to_string())
+            .filter(|_| self.producer_free);
+        if self.accepted.contains(&reported_alias)
+            || without_producer.is_some_and(|model| self.accepted.contains(&model))
         {
-            return Some(TokenizerProfile::Vocab(v));
+            Verdict::Pass
+        } else {
+            Verdict::Bail(format!(
+                "model-check (): the provider answered as model '{reported}', not the deal's model '{}' -- substitution",
+                self.expected
+            ))
         }
-    }
-    match family {
-        // Mock: tokens are fake by design, nothing to check.
-        "mock" => Some(TokenizerProfile::Permissive),
-        // Qwen3 (the D3 path -- Groq `qwen/qwen3-32b`): vocabulary ~152064.
-        "qwen" => Some(TokenizerProfile::Vocab(152_064)),
-        // Llama 3.x: vocabulary 128256.
-        "llama" => Some(TokenizerProfile::Vocab(128_256)),
-        // GPT-4o/cl100k family: ~100352 (round up; o200k is outside the start profile).
-        "gpt" => Some(TokenizerProfile::Vocab(100_352)),
-        _ => None,
-    }
-}
-
-/// Tokenizer-check: `token_ids` against the profile of the declared `family`. An unknown/empty
-/// family -> nothing to check (degradation R3 -- `Pass` at this layer; the next layers/spot-check catch it).
-fn tokenizer_check(family: &str, token_ids: &[u32], models: Option<&ModelsConfig>) -> Verdict {
-    match profile_for(family, models) {
-        None | Some(TokenizerProfile::Permissive) => Verdict::Pass,
-        Some(TokenizerProfile::Vocab(max)) => match token_ids.iter().find(|&&id| id >= max) {
-            Some(&bad) => Verdict::Bail(format!(
-                "tokenizer-check: token-id {bad} outside the vocabulary of family '{family}' (vocab {max}) -- foreign tokenizer"
-            )),
-            None => Verdict::Pass,
-        },
-    }
-}
-
-/// Stateful verifier of a single stream. Captures the `SignalManifest` from the first chunk and
-/// runs the available layers inline on each chunk BEFORE re-rendering. A `Bail` verdict is a signal to the buyer
-/// to bail (B10).
-#[derive(Debug, Default)]
-pub struct StreamVerifier {
-    manifest: Option<SignalManifest>,
-    /// The market frame's model (what the buyer pays for, B2) -- the model declared by the seller
-    /// is checked against it. `None` -- the check is disabled.
-    expected_model: Option<String>,
-    /// Loaded model config for the **data-driven** B5 vocabulary. `None` -- degrade to the
-    /// built-in family mapping (the pre-config behavior; unit fixtures use this path).
-    models: Option<Arc<ModelsConfig>>,
-}
-
-impl StreamVerifier {
-    pub fn new() -> Self {
-        Self::default()
-    }
-
-    /// Verifier that checks the declared model against the frame model (B7).
-    pub fn with_expected_model(model: String) -> Self {
-        Self {
-            manifest: None,
-            expected_model: Some(model),
-            models: None,
-        }
-    }
-
-    /// Like [`with_expected_model`](Self::with_expected_model) but threads the loaded model config so
-    /// B5 uses the per-model `vocab_size` (data-driven) instead of only the built-in family mapping.
-    pub fn with_expected_model_and_models(model: String, models: Arc<ModelsConfig>) -> Self {
-        Self {
-            manifest: None,
-            expected_model: Some(model),
-            models: Some(models),
-        }
-    }
-
-    /// Verify the next canonical chunk. `Pass` -- continue; `Bail(reason)` -- bail.
-    pub fn verify(&mut self, chunk: &CanonChunk) -> Verdict {
-        // R3: the manifest arrives on the first chunk (seq=0) -- capture it for the whole stream.
-        if let Some(m) = &chunk.manifest {
-            self.manifest = Some(m.clone());
-        }
-        let Some(manifest) = &self.manifest else {
-            // The gateway did not declare signals (R3/R4) -- on an empty subset there is nothing to check;
-            // we do not fabricate. We rely on the next layers (spot-check B7).
-            return Verdict::Pass;
-        };
-        // B5: tokenizer-check -- only if the gateway declared token_ids (otherwise degradation R3).
-        if manifest.has_token_ids {
-            let v = tokenizer_check(
-                &manifest.tokenizer_family,
-                &chunk.token_ids,
-                self.models.as_deref(),
-            );
-            if v != Verdict::Pass {
-                return v;
-            }
-        }
-        // B7: the declared model must match the frame model (what
-        // the buyer pays for, B2). Substitution in the declaration is a flag ("do not trust the declaration blindly").
-        // Mock is skipped (fake by design). Full comparison against reference X (running the prompt
-        // on a trusted endpoint, ~1-5% of requests) is (reference source) horizon, see the report sidecar.
-        if let Some(expected) = &self.expected_model {
-            let claimed = manifest.claimed_model.as_str();
-            let is_mock = matches!(
-                profile_for(&manifest.tokenizer_family, self.models.as_deref()),
-                Some(TokenizerProfile::Permissive)
-            );
-            if !claimed.is_empty() && !is_mock && claimed != expected {
-                return Verdict::Bail(format!(
-                    "reference-check (): declared model '{claimed}' != frame model '{expected}' -- substitution"
-                ));
-            }
-        }
-        // B8 (behavioral probes) - via a separate mechanism: the buyer sends a probe prompt and checks
-        // the response against the exact-model fingerprint ([`behavioral_check`]); this is not per-chunk.
-        Verdict::Pass
     }
 }
 
@@ -212,7 +132,7 @@ fn fingerprints_for(model_id: &str, models: &ModelsConfig) -> Vec<Fingerprint> {
 /// exact `served_model` -- NOT `identity_aliases`: a provider-neutral registry name (e.g. `Qwen/Qwen3-32B`,
 /// which may be served elsewhere) has no reference here, so we do not compare it against the configured
 /// provider's greedy output. A profile using `sample_algorithm: NONE` has no comparable reference and
-/// therefore also returns `None` -- **degradation** (R3): reliance on B5 and behavioral probes.
+/// therefore also returns `None` -- **degradation** (R3): reliance on the model check and behavioral probes.
 pub fn reference_endpoint_for(model_id: &str, models: &ModelsConfig) -> Option<ReferenceEndpoint> {
     let id = model_id.trim();
     let cfg = models
@@ -254,7 +174,7 @@ pub fn executable_reference_model_for<'a>(
 }
 
 /// Default probe-prompt of an exact/reference model (B8) -- the first configured fingerprint. `None` -- no fingerprint
-/// (degradation R3: B8 does not apply, reliance on B5/B6/B7).
+/// (degradation R3: B8 does not apply, reliance on the model check and B7).
 pub fn default_probe(model_id: &str, models: &ModelsConfig) -> Option<String> {
     fingerprints_for(model_id, models)
         .into_iter()
@@ -384,131 +304,104 @@ pub fn spotcheck_verdict(agreement: f64, threshold: f64) -> Verdict {
 mod tests {
     use super::*;
 
-    fn manifest(family: &str, has_token_ids: bool) -> SignalManifest {
-        SignalManifest {
-            tokenizer_family: family.to_string(),
-            has_token_ids,
-            claimed_model: "m".to_string(),
-        }
-    }
-
-    fn chunk(seq: u64, token_ids: Vec<u32>, manifest: Option<SignalManifest>) -> CanonChunk {
-        CanonChunk {
-            text: "x".to_string(),
-            reasoning: String::new(),
-            token_ids,
-            seq,
-            manifest,
-            usage: None,
-        }
-    }
+    // ---- B7: the model the provider says answered vs the deal's model ----
 
     #[test]
-    fn mock_family_passes_any_token_ids() {
-        // Mock tokens -- sequential numbers, Permissive profile -> Pass even on large ids.
-        let mut v = StreamVerifier::new();
-        assert_eq!(
-            v.verify(&chunk(0, vec![0], Some(manifest("mock", true)))),
-            Verdict::Pass
-        );
-        assert_eq!(v.verify(&chunk(1, vec![999_999], None)), Verdict::Pass);
-    }
-
-    #[test]
-    fn real_family_in_vocab_passes() {
-        let mut v = StreamVerifier::new();
-        assert_eq!(
-            v.verify(&chunk(
-                0,
-                vec![10, 50_000, 151_000],
-                Some(manifest("qwen", true))
-            )),
-            Verdict::Pass
-        );
-    }
-
-    #[test]
-    fn foreign_vocab_bails() {
-        // token-id outside the declared family's vocabulary -> foreign tokenizer -> Bail.
-        let mut v = StreamVerifier::new();
-        let verdict = v.verify(&chunk(0, vec![10, 500_000], Some(manifest("qwen", true))));
-        assert!(matches!(verdict, Verdict::Bail(_)), "out-of-vocab -> Bail");
-    }
-
-    #[test]
-    fn manifest_captured_on_first_chunk_applies_to_later() {
-        // The manifest is only on seq=0; subsequent chunks are checked against it.
-        let mut v = StreamVerifier::new();
-        assert_eq!(
-            v.verify(&chunk(0, vec![1], Some(manifest("qwen", true)))),
-            Verdict::Pass
-        );
-        let verdict = v.verify(&chunk(1, vec![999_999], None));
-        assert!(
-            matches!(verdict, Verdict::Bail(_)),
-            "later chunk still checked"
-        );
-    }
-
-    #[test]
-    fn degrades_when_no_token_ids_or_no_manifest() {
-        // has_token_ids=false (e.g. Groq SSE) -> the tokenizer-check does not run (R3), Pass.
-        let mut v = StreamVerifier::new();
-        assert_eq!(
-            v.verify(&chunk(0, vec![], Some(manifest("", false)))),
-            Verdict::Pass
-        );
-        // No manifest at all -> nothing to check, Pass (we do not fabricate).
-        let mut v2 = StreamVerifier::new();
-        assert_eq!(v2.verify(&chunk(0, vec![5], None)), Verdict::Pass);
-    }
-
-    // ---- B7: comparing the declared model against the frame model ----
-
-    fn manifest_full(family: &str, claimed: &str) -> SignalManifest {
-        SignalManifest {
-            tokenizer_family: family.to_string(),
-            has_token_ids: false,
-            claimed_model: claimed.to_string(),
+    fn every_spelling_of_the_deal_model_passes() {
+        for (deal, reported) in [
+            ("qwen--qwen3--32b", "qwen/qwen3-32b"),
+            ("qwen--qwen3--32b", "Qwen/Qwen3-32B"),
+            ("qwen--qwen3--32b", "qwen3-32b"),
+            ("Qwen/Qwen3-32B", "qwen/qwen3-32b"),
+            ("Qwen/Qwen3-32B", " QWEN/QWEN3-32B "),
+            ("openai--gpt-oss--120b", "openai/gpt-oss-120b"),
+            ("dexdo-mock", "dexdo-mock"),
+        ] {
+            assert_eq!(
+                ModelCheck::new(deal, None).verify(reported),
+                Verdict::Pass,
+                "{deal} answered as {reported}"
+            );
         }
     }
 
     #[test]
-    fn claimed_model_matches_frame_passes() {
-        let mut v = StreamVerifier::with_expected_model("qwen/qwen3-32b".to_string());
-        let c = chunk(0, Vec::new(), Some(manifest_full("qwen", "qwen/qwen3-32b")));
-        assert_eq!(v.verify(&c), Verdict::Pass);
+    fn another_model_bails() {
+        for (deal, reported) in [
+            ("qwen--qwen3--32b", "meta-llama/llama-3.3-70b-versatile"),
+            ("qwen--qwen3--32b", "qwen/qwen3-235b"),
+            ("Qwen/Qwen3-32B", "substituted/cheap-model"),
+            ("dexdo-mock", "mock"),
+        ] {
+            assert!(
+                matches!(
+                    ModelCheck::new(deal, None).verify(reported),
+                    Verdict::Bail(_)
+                ),
+                "{deal} answered as {reported}"
+            );
+        }
     }
 
     #[test]
-    fn claimed_model_mismatch_bails() {
-        // The seller declares a different (cheap) model than the frame paid for -> substitution -> Bail.
-        let mut v = StreamVerifier::with_expected_model("qwen/qwen3-32b".to_string());
-        let c = chunk(
-            0,
-            Vec::new(),
-            Some(manifest_full("llama", "cheap/llama-1b")),
+    fn an_identity_alias_declared_in_the_buyers_config_passes() {
+        let models = ModelsConfig::from_json(
+            r#"{"models":{"llama":{"frame_model":"meta--llama-3.3--70b","base_url":"http://x",
+              "served_model":"llama-3.3-70b-versatile","api_key_env":"K","tokenizer_family":"llama",
+              "price_per_tick":1,"identity_aliases":["llama-3.3-70b-versatile"]}}}"#,
+        )
+        .unwrap();
+        let check = ModelCheck::new("meta--llama-3.3--70b", Some(&models));
+        assert_eq!(check.verify("llama-3.3-70b-versatile"), Verdict::Pass);
+        assert!(matches!(
+            ModelCheck::new("meta--llama-3.3--70b", None).verify("llama-3.3-70b-versatile"),
+            Verdict::Bail(_)
+        ));
+    }
+
+    /// A deal model that names no producer matches the provider's slug that prefixes one, and only
+    /// that model.
+    #[test]
+    fn a_producer_free_deal_model_matches_the_providers_prefixed_slug() {
+        let check = ModelCheck::new("Qwen3.8-27B", None);
+        assert_eq!(check.verify("qwen/qwen3.8-27b"), Verdict::Pass);
+        assert_eq!(
+            check.verify("accounts/fireworks/models/qwen3.8-27b"),
+            Verdict::Pass
         );
-        assert!(
-            matches!(v.verify(&c), Verdict::Bail(_)),
-            "declared != frame -> Bail"
-        );
+        assert_eq!(check.verify("Qwen3.8-27B"), Verdict::Pass);
+        assert!(matches!(
+            check.verify("accounts/fireworks/models/qwen3-32b"),
+            Verdict::Bail(_)
+        ));
+        assert!(matches!(check.verify("qwen/qwen3-32b"), Verdict::Bail(_)));
+        let prefixed = ModelCheck::new("qwen/qwen3-32b", None);
+        assert!(matches!(
+            prefixed.verify("other/qwen3-32b"),
+            Verdict::Bail(_)
+        ));
     }
 
+    /// The provider's own id for the model, as the buyer's config records it, is a spelling of the
+    /// deal model: a dated Anthropic id must not read as a substitution.
     #[test]
-    fn mock_skips_model_check() {
-        // Mock -- the model comparison does not apply (fake by design), even on a mismatch.
-        let mut v = StreamVerifier::with_expected_model("dexdo-mock".to_string());
-        let c = chunk(0, Vec::new(), Some(manifest_full("mock", "mock")));
-        assert_eq!(v.verify(&c), Verdict::Pass);
-    }
-
-    #[test]
-    fn no_expected_model_skips_check() {
-        // Without a frame model (new()) -- B7 does not run.
-        let mut v = StreamVerifier::new();
-        let c = chunk(0, Vec::new(), Some(manifest_full("qwen", "anything")));
-        assert_eq!(v.verify(&c), Verdict::Pass);
+    fn the_served_model_in_the_buyers_config_passes() {
+        let models = ModelsConfig::from_json(
+            r#"{"models":{"claude-sonnet":{"frame_model":"claude-sonnet-4-5","base_url":"https://api.anthropic.com",
+              "served_model":"claude-sonnet-4-5-20250929","api_key_env":"K","tokenizer_family":"claude",
+              "price_per_tick":1}}}"#,
+        )
+        .unwrap();
+        let check = ModelCheck::new("claude-sonnet-4-5", Some(&models));
+        assert_eq!(check.verify("claude-sonnet-4-5-20250929"), Verdict::Pass);
+        assert!(matches!(
+            check.verify("claude-haiku-4-5-20251001"),
+            Verdict::Bail(_)
+        ));
+        assert!(matches!(
+            ModelCheck::new("claude-sonnet-4-5", None).verify("claude-sonnet-4-5-20250929"),
+            Verdict::Bail(_)
+        ));
     }
 
     // ---- B8: behavioral probes, data-driven from config ----
@@ -778,36 +671,6 @@ mod tests {
         );
     }
 
-    #[test]
-    fn config_vocab_size_drives_b5_tokenizer_check() {
-        // B5 is data-driven: a config model declaring `tokenizer_family` with `vocab_size` overrides the
-        // built-in family mapping. Here a "tiny" family with vocab 100 bails a token-id >= 100.
-        let cfg = ModelsConfig::from_json(
-            r#"{ "models": { "tiny": {
-                "frame_model": "vendor--tiny--v1", "base_url": "http://x", "served_model": "vendor/tiny-v1",
-                "api_key_env": "K", "tokenizer_family": "tinyfam", "price_per_tick": 1, "vocab_size": 100
-            } } }"#,
-        )
-        .unwrap();
-        let cfg = Arc::new(cfg);
-        // expected_model "m" matches the `manifest` helper's claimed_model so the B7 name check is a no-op and
-        // this test isolates B5 (the `manifest` claimed_model is "m").
-        let mut v = StreamVerifier::with_expected_model_and_models("m".to_string(), cfg.clone());
-        // token-id 150 >= config vocab 100 -> Bail (the built-in mapping has no "tinyfam", so without config
-        // this would degrade to Pass -- proving the config drove the check).
-        let verdict = v.verify(&chunk(0, vec![10, 150], Some(manifest("tinyfam", true))));
-        assert!(
-            matches!(verdict, Verdict::Bail(_)),
-            "config vocab bails out-of-range id"
-        );
-        // Without the config the same "tinyfam" family is unknown -> degradation (Pass).
-        let mut v2 = StreamVerifier::with_expected_model("m".to_string());
-        assert_eq!(
-            v2.verify(&chunk(0, vec![10, 150], Some(manifest("tinyfam", true)))),
-            Verdict::Pass
-        );
-    }
-
     // ---- B7 full spot-check ----
 
     #[test]
@@ -834,7 +697,7 @@ mod tests {
             r#"{"models":{"m":{"frame_model":"vendor--model--v1",
               "base_url":"https://provider.example/v1","served_model":"provider/model",
               "api_key_env":"PROVIDER_KEY","tokenizer_family":"vendor","price_per_tick":1,
-              "capabilities":{"max_output_tokens":256,"sample_algorithm":"NONE"}}}}"#,
+              "capabilities":{"sample_algorithm":"NONE"}}}}"#,
         )
         .expect("NONE profile parses");
 

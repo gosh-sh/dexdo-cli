@@ -68,9 +68,14 @@ fn assert_kept_open(
         "{case}: the failing request must report its failure: {status} {body}"
     );
     assert_ne!(status, http::StatusCode::GONE, "{case}: {body}");
+    assert_deal_kept_open(harness, deal, case);
+}
+
+/// Nothing outlived the failing request: the deal is open and unsettled, and no money moved.
+fn assert_deal_kept_open(harness: &WeeklyRouteHarness, deal: &ApiDeal, case: &str) {
     assert!(
         !deal.session.is_closed(),
-        "{case}: local API latched closed: {body}"
+        "{case}: local API latched closed"
     );
     assert_eq!(deal.session.recovery_episode(), None, "{case}");
     assert_eq!(deal.session.terminal_action(), None, "{case}");
@@ -228,7 +233,18 @@ async fn keep_open_empty_stream_keeps_serving_the_deal() {
                     .ask_full(path, 8, "DEXDO_FIXTURE_REASONING_ONLY", stream)
                     .await;
                 if kept {
-                    assert_kept_open(&harness, &deal, (status, &body), &case);
+                    if stream {
+                        // A streamed answer reaches the client with the provider's own end; the
+                        // buyer records it as `empty_output` and applies the policy.
+                        assert_eq!(status, http::StatusCode::OK, "{case}: {body}");
+                        assert!(
+                            body.contains("DEXDO_FIXTURE_REASONING_ONLY"),
+                            "{case}: {body}"
+                        );
+                        assert_deal_kept_open(&harness, &deal, &case);
+                    } else {
+                        assert_kept_open(&harness, &deal, (status, &body), &case);
+                    }
                     // Accounting is unchanged: the reasoning-only answer stays billed.
                     assert!(deal.billable_tokens() > 0, "{case}");
                     assert_next_served(&harness, &tc, path, stream, &case).await;
