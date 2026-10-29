@@ -16,7 +16,7 @@ use crate::cli::support::{
     provision_failure_clears_pending, require_model_name, require_provision_nonce,
     resolve_market_fields, validate_price_step, SHELL_UNIT,
 };
-use anyhow::{bail, Result};
+use anyhow::{bail, Context, Result};
 use dexdo::registry::{BuyerMissingBookPolicy, RegistryRole, RegistrySuggestions};
 use dexdo_core::params::{
     MARKET_DEPLOY_ACTIVATION_MAX_READS, MARKET_DEPLOY_ACTIVATION_POLL_INTERVAL,
@@ -425,8 +425,11 @@ pub(crate) async fn run_provision_with_deal_gas_overhead(
         &manifest_path,
         None,
     )
-    .await?;
-    crate::cli::commands::chain_doctor_preflight_with_endpoint(&manifest_path, None, None).await?;
+    .await
+    .context("provision step=load registry snapshot; no deployment submitted")?;
+    crate::cli::commands::chain_doctor_preflight_with_endpoint(&manifest_path, None, None)
+        .await
+        .context("provision step=chain preflight; no deployment submitted")?;
     // ASK THE BUYER'S QUESTION, HERE, BEFORE ANYTHING IS SPENT.
 
     // Everything below this line costs money -- the order book, the RootModel and the per-deal
@@ -445,7 +448,8 @@ pub(crate) async fn run_provision_with_deal_gas_overhead(
         &requested_model,
         args.allow_unverified_model,
     )
-    .await?;
+    .await
+    .context("provision step=resolve model; no deployment submitted")?;
     let target = resolve_model_registry_target_with_endpoint(
         RegistryRole::Seller,
         registry_policy.as_ref(),
@@ -459,7 +463,8 @@ pub(crate) async fn run_provision_with_deal_gas_overhead(
             note_addr: Some(note_addr.clone()),
         },
     )
-    .await?;
+    .await
+    .context("provision step=resolve registry target; no deployment submitted")?;
     let frame_model = target.frame_model;
     // The key is READ here and not where the note was settled above: a missing key file must not
     // preempt the manifest check that used to come first. Settling which note to spend from is a
@@ -511,18 +516,24 @@ pub(crate) async fn run_provision_with_deal_gas_overhead(
         || rng.next_u64(),
         |candidate| chain.token_contract_nonce_is_available(&keys, candidate),
     )
-    .await?;
+    .await
+    .context("provision step=choose deal nonce; no deployment submitted")?;
     if requested_nonce == ProvisionNonceArg::Auto {
         eprintln!("selected random deal nonce: {nonce}");
     }
     let seller_pubkey = serde_json::json!(format!("0x{}", keys.public_hex()));
-    let root_model = chain.root_model_address_for(&seller_pubkey).await?;
+    let root_model = chain
+        .root_model_address_for(&seller_pubkey)
+        .await
+        .context("provision step=derive RootModel address; no deployment submitted")?;
     let token_contract = chain
         .token_contract_deploy_address(&keys, &root_model, nonce)
-        .await?;
+        .await
+        .context("provision step=derive deal address; no deployment submitted")?;
     let expected_order_book = chain
         .inference_orderbook_address(&note, &target.model_hash, dexdo_core::TICK_SIZE)
-        .await?
+        .await
+        .context("provision step=derive order-book address; no deployment submitted")?
         .with_workchain();
     let expected_market = dexdo_core::MarketManifest {
         network: chain.network().to_string(),
@@ -539,7 +550,8 @@ pub(crate) async fn run_provision_with_deal_gas_overhead(
     let target_active = if matches!(requested_nonce, ProvisionNonceArg::Explicit(_)) {
         chain
             .exact_provision_target_is_active_and_matches(&token_contract, &expected_market)
-            .await?
+            .await
+            .context("provision step=validate existing deal; no deployment submitted")?
     } else {
         false
     };
@@ -567,176 +579,194 @@ pub(crate) async fn run_provision_with_deal_gas_overhead(
                 Ok(std::sync::Arc::new(backend) as std::sync::Arc<dyn dexdo_core::ChainBackend>)
             },
         )
-        .await?;
+        .await.context("provision step=retire replaced offers; offer retirement attempted; cost, if any, unconfirmed; new deal reserve not submitted")?;
     }
-    let capacity =
-        crate::cli::seller::seller_deal_capacity(args.deals_dir.as_deref(), &note_addr, |market| {
-            let (backend, _) =
-                dexdo_core::RealSellerBackend::from_provisioned_with_deal_gas_overhead(
-                    manifest,
-                    &note_addr,
-                    seed.trim(),
-                    &market.frame_model,
-                    market.nonce,
-                    supplied_deal_gas_overhead_raw,
-                )?;
-            Ok(std::sync::Arc::new(backend) as std::sync::Arc<dyn dexdo_core::ChainBackend>)
-        })
-        .await?;
-    ensure_provision_capacity_for_target(capacity, seller_policy.max_open_deals, target_active)?;
-    if let Some(policy) = registry_policy.as_ref() {
-        let order_book_active = order_book_active(&chain, &expected_order_book).await?;
-        enforce_model_registry_policy_with_endpoint(
-            RegistryRole::Seller,
-            policy,
-            &manifest_path,
-            None,
-            crate::cli::commands::RegistryBookExpectation {
-                frame_model: &frame_model,
-                expected_order_book: &expected_order_book,
-                order_book_active,
-                buyer_missing_book_policy: BuyerMissingBookPolicy::Reject,
-            },
-        )
-        .await?;
-    }
-    // the note deposit is a user-chosen provision parameter (default >=100 SHELL), framed by deal volume --
-    // NOT a MIN_BALANCE-anchored per-op gas knob. 1 SHELL = 1e9 raw ECC[2]. The deposit is split across the
-    // RootModel + per-deal `TokenContract` deploys, funded from the note's own ECC[2].
-    // the deposit follows THIS deal. `max_ticks` is what sets it -- the deal's `TokenContract`
-    // pays its own compute and `MAX_CLAIM_DELTA = TICK_SIZE` caps a claim at one tick, so a deal of
-    // `max_ticks` ticks takes `max_ticks` claims and its lifetime gas is linear in them.
-    let per_deploy = prepare_fresh_provision_deposit(target_active, || async {
-        let default_deposit_shells = if supplied_deal_gas_overhead_raw.is_none() {
-            default_deposit_shells(args.max_ticks)
-        } else {
-            dexdo_core::params::min_deploy_shells_with_overhead(
-                args.max_ticks,
-                deal_gas_overhead_raw,
+    // Retirement can spend before any of the remaining checks or deployments fail.
+    // Keep that attempted action on every later error, including a no-op retirement.
+    let result = async {
+        let capacity =
+            crate::cli::seller::seller_deal_capacity(args.deals_dir.as_deref(), &note_addr, |market| {
+                let (backend, _) =
+                    dexdo_core::RealSellerBackend::from_provisioned_with_deal_gas_overhead(
+                        manifest,
+                        &note_addr,
+                        seed.trim(),
+                        &market.frame_model,
+                        market.nonce,
+                        supplied_deal_gas_overhead_raw,
+                    )?;
+                Ok(std::sync::Arc::new(backend) as std::sync::Arc<dyn dexdo_core::ChainBackend>)
+            })
+            .await.context("provision step=read seller capacity; new deployment not submitted")?;
+        ensure_provision_capacity_for_target(capacity, seller_policy.max_open_deals, target_active)?;
+        if let Some(policy) = registry_policy.as_ref() {
+            let order_book_active = order_book_active(&chain, &expected_order_book)
+                .await
+                .context("provision step=read order-book state; new deployment not submitted")?;
+            enforce_model_registry_policy_with_endpoint(
+                RegistryRole::Seller,
+                policy,
+                &manifest_path,
+                None,
+                crate::cli::commands::RegistryBookExpectation {
+                    frame_model: &frame_model,
+                    expected_order_book: &expected_order_book,
+                    order_book_active,
+                    buyer_missing_book_policy: BuyerMissingBookPolicy::Reject,
+                },
             )
-        };
-        let deposit_shells = match args.deposit_shells {
-            Some(n) => n,
-            None => prompt_deposit_shells()?.unwrap_or(default_deposit_shells),
-        };
-        // Fail-closed: overflow and a below-floor deposit are explicit errors, not a
-        // silent clamp/warn.
-        let per_deploy = if supplied_deal_gas_overhead_raw.is_none() {
-            deposit_per_deploy(deposit_shells, args.max_ticks)?
-        } else {
-            deposit_per_deploy_with_overhead(
-                deposit_shells,
-                args.max_ticks,
-                Some(deal_gas_overhead_raw),
-            )?
-        };
-        eprintln!(
-            "note deposit: {deposit_shells} SHELL; ~{} SHELL for the per-deal TokenContract \
-             deploy after fundDeployShell (the RootModel is deployed by SuperRoot and needs no note funding). This \
-             {}-tick deal needs {} raw nanoSHELL ECC[2] over its whole life, so its floor is {} SHELL. Unused deploy \
-             remainder burns at destroy.",
-            per_deploy / SHELL_UNIT,
-            args.max_ticks,
-            dexdo_core::params::deal_gas_requirement_raw_with_overhead(
-                args.max_ticks,
-                deal_gas_overhead_raw,
-            ),
-            dexdo_core::params::min_deploy_shells_with_overhead(
-                args.max_ticks,
-                deal_gas_overhead_raw,
-            ),
-        );
-        // Fail-LOUD if the note's ECC[2] SHELL cannot cover the exact deploy deposit. Do not add
-        // guessed runtime headroom here: section 6 requires any threshold beyond the
-        // deploy amount to come from contract constants/receipts, not a drifting reserve.
-        {
-            // Run the stale/orphaned-note check BEFORE reading ECC balance. After a redeploy, old
-            // notes may be absent/inactive/stale-code; reporting that as "0 SHELL" would mask the
-            // actionable re-mint reason.
-            chain.assert_seller_note_current(&note).await?;
-            let note_ecc = chain
-                .get_system_account_retrying(&note)
-                .await?
-                .ok_or_else(|| {
-                    anyhow::anyhow!(
-                        "seller note {} disappeared after current-note preflight",
-                        dexdo_core::address::display(&note.with_workchain())
-                    )
-                })?
-                .ecc_balance(2);
-            let note_spendable = chain.private_note_shell_balance(&note).await?;
-            ensure_provision_deposit_covered(
-                note_ecc,
-                note_spendable,
-                deposit_shells,
-                args.price_per_tick,
-            )?;
+            .await
+            .context("provision step=validate registry policy; new deployment not submitted")?;
         }
-        Ok(per_deploy)
-    })
-    .await?;
-    // The callback below persists the already-derived identity at the last safe point before
-    // deployDeal. That pending bit remains countable if the POST response is lost or this process
-    // exits, even while the TokenContract is still activating.
-    let provision = chain
-        .provision_market_with_deal_gas_overhead_and_before_deploy(
-            &keys,
-            &note,
-            &frame_model,
-            nonce,
-            args.price_per_tick,
-            args.max_ticks,
-            per_deploy,
-            deal_gas_overhead_raw,
-            |market| {
-                if target_active {
-                    bail!(
-                        "matching active TokenContract {} became inactive during recovery; \
-                         refusing a fresh deployDeal",
-                        dexdo_core::address::display_self_dapp(&market.token_contract)
+        // the note deposit is a user-chosen provision parameter (default >=100 SHELL), framed by deal volume --
+        // NOT a MIN_BALANCE-anchored per-op gas knob. 1 SHELL = 1e9 raw ECC[2]. The deposit is split across the
+        // RootModel + per-deal `TokenContract` deploys, funded from the note's own ECC[2].
+        // the deposit follows THIS deal. `max_ticks` is what sets it -- the deal's `TokenContract`
+        // pays its own compute and `MAX_CLAIM_DELTA = TICK_SIZE` caps a claim at one tick, so a deal of
+        // `max_ticks` ticks takes `max_ticks` claims and its lifetime gas is linear in them.
+        let per_deploy = prepare_fresh_provision_deposit(target_active, || async {
+            let default_deposit_shells = if supplied_deal_gas_overhead_raw.is_none() {
+                default_deposit_shells(args.max_ticks)
+            } else {
+                dexdo_core::params::min_deploy_shells_with_overhead(
+                    args.max_ticks,
+                    deal_gas_overhead_raw,
+                )
+            };
+            let deposit_shells = match args.deposit_shells {
+                Some(n) => n,
+                None => prompt_deposit_shells()?.unwrap_or(default_deposit_shells),
+            };
+            // Fail-closed: overflow and a below-floor deposit are explicit errors, not a
+            // silent clamp/warn.
+            let per_deploy = if supplied_deal_gas_overhead_raw.is_none() {
+                deposit_per_deploy(deposit_shells, args.max_ticks)?
+            } else {
+                deposit_per_deploy_with_overhead(
+                    deposit_shells,
+                    args.max_ticks,
+                    Some(deal_gas_overhead_raw),
+                )?
+            };
+            eprintln!(
+                "note deposit: {deposit_shells} SHELL; ~{} SHELL for the per-deal TokenContract \
+                 deploy after fundDeployShell (the RootModel is deployed by SuperRoot and needs no note funding). This \
+                 {}-tick deal needs {} raw nanoSHELL ECC[2] over its whole life, so its floor is {} SHELL. Unused deploy \
+                 remainder burns at destroy.",
+                per_deploy / SHELL_UNIT,
+                args.max_ticks,
+                dexdo_core::params::deal_gas_requirement_raw_with_overhead(
+                    args.max_ticks,
+                    deal_gas_overhead_raw,
+                ),
+                dexdo_core::params::min_deploy_shells_with_overhead(
+                    args.max_ticks,
+                    deal_gas_overhead_raw,
+                ),
+            );
+            // Fail-LOUD if the note's ECC[2] SHELL cannot cover the exact deploy deposit. Do not add
+            // guessed runtime headroom here: section 6 requires any threshold beyond the
+            // deploy amount to come from contract constants/receipts, not a drifting reserve.
+            {
+                // Run the stale/orphaned-note check BEFORE reading ECC balance. After a redeploy, old
+                // notes may be absent/inactive/stale-code; reporting that as "0 SHELL" would mask the
+                // actionable re-mint reason.
+                chain.assert_seller_note_current(&note).await?;
+                let note_ecc = chain
+                    .get_system_account_retrying(&note)
+                    .await?
+                    .ok_or_else(|| {
+                        anyhow::anyhow!(
+                            "seller note {} disappeared after current-note preflight",
+                            dexdo_core::address::display(&note.with_workchain())
+                        )
+                    })?
+                    .ecc_balance(2);
+                let note_spendable = chain.private_note_shell_balance(&note).await?;
+                ensure_provision_deposit_covered(
+                    note_ecc,
+                    note_spendable,
+                    deposit_shells,
+                    args.price_per_tick,
+                )?;
+            }
+            Ok(per_deploy)
+        })
+        .await.context("provision step=check note deposit; new deployment not submitted")?;
+        // The callback below persists the already-derived identity at the last safe point before
+        // deployDeal. That pending bit remains countable if the POST response is lost or this process
+        // exits, even while the TokenContract is still activating.
+        let provision = chain
+            .provision_market_with_deal_gas_overhead_and_before_deploy(
+                &keys,
+                &note,
+                &frame_model,
+                nonce,
+                args.price_per_tick,
+                args.max_ticks,
+                per_deploy,
+                deal_gas_overhead_raw,
+                |market| {
+                    if target_active {
+                        bail!(
+                            "matching active TokenContract {} became inactive during recovery; \
+                             refusing a fresh deployDeal",
+                            dexdo_core::address::display_self_dapp(&market.token_contract)
+                        )
+                    }
+                    if market != &expected_market {
+                        bail!("provision reservation identity diverged from the derived market")
+                    }
+                    persist_provision_deal_handle(
+                        args.deals_dir.as_deref(),
+                        market,
+                        &manifest_path,
+                        true,
                     )
-                }
-                if market != &expected_market {
-                    bail!("provision reservation identity diverged from the derived market")
-                }
+                    .map(drop)
+                },
+            )
+            .await;
+        let m = match provision {
+            Ok(market) => {
                 persist_provision_deal_handle(
                     args.deals_dir.as_deref(),
-                    market,
+                    &market,
                     &manifest_path,
-                    true,
-                )
-                .map(drop)
-            },
-        )
-        .await;
-    let m = match provision {
-        Ok(market) => {
-            persist_provision_deal_handle(
-                args.deals_dir.as_deref(),
-                &market,
-                &manifest_path,
-                false,
-            )?;
-            market
-        }
-        Err(error) => {
-            let activated = matches!(
-                chain.token_contract_deal_snapshot(&token_contract).await,
-                Ok(Some(_))
-            );
-            if provision_failure_clears_pending(&error, activated) {
-                clear_provision_pending_if_present(args.deals_dir.as_deref(), &expected_market)?;
+                    false,
+                )?;
+                market
             }
-            return Err(error);
-        }
-    };
-    let json = m.to_json()?;
-    std::fs::write(&args.output, &json)
-        .map_err(|e| anyhow::anyhow!("write --output {}: {e}", args.output.display()))?;
-    drop(seller_pool_lock);
-    println!("provisioned market -> {}", args.output.display());
-    println!("{json}");
-    Ok(())
+            Err(error) => {
+                let activated = matches!(
+                    chain.token_contract_deal_snapshot(&token_contract).await,
+                    Ok(Some(_))
+                );
+                if provision_failure_clears_pending(&error, activated) {
+                    clear_provision_pending_if_present(args.deals_dir.as_deref(), &expected_market)?;
+                }
+                return Err(error);
+            }
+        };
+        let json = m.to_json()?;
+        std::fs::write(&args.output, &json)
+            .map_err(|e| anyhow::anyhow!("write --output {}: {e}", args.output.display()))?;
+        drop(seller_pool_lock);
+        println!("provisioned market -> {}", args.output.display());
+        println!("{json}");
+        Ok(())
+    }
+    .await;
+    provision_after_offer_retirement(result, previous_market.is_some())
+}
+
+fn provision_after_offer_retirement(result: Result<()>, attempted: bool) -> Result<()> {
+    if attempted {
+        result
+            .context("provision prior action=offer retirement attempted; cost, if any, unconfirmed")
+    } else {
+        result
+    }
 }
 
 fn ensure_provision_capacity(
@@ -773,6 +803,10 @@ fn ensure_provision_capacity_for_target(
 #[cfg(test)]
 #[path = "admin_1855_registry_gate_tests.rs"]
 mod admin_1855_registry_gate_tests;
+
+#[cfg(test)]
+#[path = "admin_issue_2192_tests.rs"]
+mod admin_issue_2192_tests;
 
 #[cfg(test)]
 #[path = "admin_2039_capacity_lock_tests.rs"]

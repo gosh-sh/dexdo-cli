@@ -9906,6 +9906,11 @@ impl RealBuyerBackend {
         buyer_order_flags(self.wait_for_seller)
     }
 
+    /// The flags every BUY this backend places carries: the first buy and each renewal alike.
+    pub fn buy_order_flags(&self) -> u8 {
+        self.buy_flags()
+    }
+
     /// Assemble the buyer backend + the buyer's note from an **already provisioned** actor: a minted
     /// `PrivateNote` (`note_addr` + owner key). The buyer needs no wallet (escrow is the note's balance record).
     /// `model_hash` is derived from `frame_model`. Returns the backend and a `RealNote` (handover decryption).
@@ -10640,6 +10645,14 @@ impl ChainBackend for RealBuyerBackend {
         self.chain
             .inference_buyer_order_is_active_for_owner(&order_book, order_id, buyer_note)
             .await
+            .map_err(map_err)
+    }
+
+    async fn cancel_buyer_order(&self, order_id: u128) -> Result<(), ChainError> {
+        self.chain
+            .cancel_inference_order(&self.note, &self.keys, &self.model_hash, order_id)
+            .await
+            .map(|_| ())
             .map_err(map_err)
     }
 

@@ -8930,17 +8930,25 @@ impl RealChainBackend {
         "#;
         // this reader queries the ext-out surface with its own inline GraphQL, so it never
         // reached the pager's gate. One request, one admission.
-        self.client.gate().admit().await;
-        let response = self
-            .http
-            .post(&gql)
-            .json(&json!({
-                "query": query,
-                "variables": { "accountId": account_id, "dappId": dapp_id, "last": 200 },
-            }))
-            .send()
-            .await?;
-        let response: Value = chain_response_for_status(response).await?.json().await?;
+        let response: Value = retry_transient_read(|| async {
+            self.client.gate().admit().await;
+            let response = self
+                .http
+                .post(&gql)
+                .json(&json!({
+                    "query": query,
+                    "variables": { "accountId": account_id, "dappId": dapp_id, "last": 200 },
+                }))
+                .send()
+                .await?;
+            let response: Value = chain_response_for_status(response).await?.json().await?;
+            if let Some(errors) = response.get("errors").filter(|errors| !errors.is_null()) {
+                return Err(anyhow::Error::new(GraphQlBodyError::from_errors(errors))
+                    .context("seller offer outcome GraphQL errors"));
+            }
+            Ok(response)
+        })
+        .await?;
         let edges = response["data"]["blockchain"]["account"]["messages"]["edges"]
             .as_array()
             .ok_or_else(|| anyhow!("seller offer outcome GraphQL shape changed: {response}"))?;
@@ -9840,22 +9848,30 @@ impl RealChainBackend {
         loop {
             // this reader queries the ext-out surface with its own inline GraphQL, so it never
             // reached the pager's gate. One request, one admission.
-            self.client.gate().admit().await;
-            let response = self
-                .http
-                .post(&gql)
-                .json(&json!({
-                    "query": query,
-                    "variables": {
-                        "accountId": account_id,
-                        "dappId": dapp_id,
-                        "last": crate::params::INT_IN_PAGE_SIZE,
-                        "before": before,
-                    },
-                }))
-                .send()
-                .await?;
-            let response: Value = chain_response_for_status(response).await?.json().await?;
+            let response: Value = retry_transient_read(|| async {
+                self.client.gate().admit().await;
+                let response = self
+                    .http
+                    .post(&gql)
+                    .json(&json!({
+                        "query": query,
+                        "variables": {
+                            "accountId": account_id,
+                            "dappId": dapp_id,
+                            "last": crate::params::INT_IN_PAGE_SIZE,
+                            "before": before,
+                        },
+                    }))
+                    .send()
+                    .await?;
+                let response: Value = chain_response_for_status(response).await?.json().await?;
+                if let Some(errors) = response.get("errors").filter(|errors| !errors.is_null()) {
+                    return Err(anyhow::Error::new(GraphQlBodyError::from_errors(errors))
+                        .context("note inbound-history GraphQL errors"));
+                }
+                Ok(response)
+            })
+            .await?;
             let messages = &response["data"]["blockchain"]["account"]["messages"];
             let edges = messages["edges"]
                 .as_array()
@@ -10149,27 +10165,30 @@ impl RealChainBackend {
         loop {
             // this reader queries the ext-out surface with its own inline GraphQL, so it never
             // reached the pager's gate. One request, one admission.
-            self.client.gate().admit().await;
-            let response = self
-                .http
-                .post(&gql)
-                .json(&json!({
-                    "query": query,
-                    "variables": {
-                        "accountId": account_id.as_str(),
-                        "dappId": dapp_id,
-                        "last": crate::params::EXT_OUT_PAGE_SIZE,
-                        "before": before.as_deref(),
-                    },
-                }))
-                .send()
-                .await?;
-            let response: Value = chain_response_for_status(response).await?.json().await?;
-            if let Some(errors) = response.get("errors") {
-                return Err(anyhow!(
-                    "PrivateNote {note} owner-call GraphQL errors: {errors}"
-                ));
-            }
+            let response: Value = retry_transient_read(|| async {
+                self.client.gate().admit().await;
+                let response = self
+                    .http
+                    .post(&gql)
+                    .json(&json!({
+                        "query": query,
+                        "variables": {
+                            "accountId": account_id.as_str(),
+                            "dappId": dapp_id,
+                            "last": crate::params::EXT_OUT_PAGE_SIZE,
+                            "before": before.as_deref(),
+                        },
+                    }))
+                    .send()
+                    .await?;
+                let response: Value = chain_response_for_status(response).await?.json().await?;
+                if let Some(errors) = response.get("errors").filter(|errors| !errors.is_null()) {
+                    return Err(anyhow::Error::new(GraphQlBodyError::from_errors(errors))
+                        .context(format!("PrivateNote {note} owner-call GraphQL errors")));
+                }
+                Ok(response)
+            })
+            .await?;
             let messages = response
                 .pointer("/data/blockchain/account/messages")
                 .ok_or_else(|| {
@@ -10348,28 +10367,34 @@ impl RealChainBackend {
         loop {
             // this reader queries the ext-out surface with its own inline GraphQL, so it never
             // reached the pager's gate. One request, one admission.
-            self.client.gate().admit().await;
-            let response = self
-                .http
-                .post(&gql)
-                .json(&json!({
-                    "query": query,
-                    "variables": {
-                        "accountId": bare_hex(&account_id),
-                        "dappId": bare_hex(dapp_id),
-                        // The existing account-message pager bound; not a second copy of it.
-                        "last": crate::params::EXT_OUT_PAGE_SIZE,
-                        "before": before.as_deref(),
-                    },
-                }))
-                .send()
-                .await?;
-            let response: Value = chain_response_for_status(response).await?.json().await?;
-            if let Some(errors) = response.get("errors") {
-                return Err(anyhow!(
-                    "TokenContract {token_contract} inbound-call GraphQL errors: {errors}"
-                ));
-            }
+            let response: Value = retry_transient_read(|| async {
+                self.client.gate().admit().await;
+                let response = self
+                    .http
+                    .post(&gql)
+                    .json(&json!({
+                        "query": query,
+                        "variables": {
+                            "accountId": bare_hex(&account_id),
+                            "dappId": bare_hex(dapp_id),
+                            // The existing account-message pager bound; not a second copy of it.
+                            "last": crate::params::EXT_OUT_PAGE_SIZE,
+                            "before": before.as_deref(),
+                        },
+                    }))
+                    .send()
+                    .await?;
+                let response: Value = chain_response_for_status(response).await?.json().await?;
+                if let Some(errors) = response.get("errors").filter(|errors| !errors.is_null()) {
+                    return Err(
+                        anyhow::Error::new(GraphQlBodyError::from_errors(errors)).context(format!(
+                            "TokenContract {token_contract} inbound-call GraphQL errors"
+                        )),
+                    );
+                }
+                Ok(response)
+            })
+            .await?;
             let messages = response
                 .pointer("/data/blockchain/account/messages")
                 .ok_or_else(|| {
@@ -12074,20 +12099,27 @@ impl RealChainBackend {
     {
         // fail-closed up front if the seller note is orphaned by a contract redeploy -- a clear
         // "re-mint" error instead of a downstream bare TVM_ERROR (stale note) or "note is not active".
-        self.assert_seller_note_current(note).await?;
+        self.assert_seller_note_current(note)
+            .await
+            .context("provision step=validate seller note; no deployment requested")?;
         // 1) Per-model InferenceOrderBook -- note-funded (owner-method). Deploy-if-absent.
         let model_hash = model_hash_for(frame_model);
         let ob = self
             .inference_orderbook_address(note, &model_hash, TICK_SIZE)
-            .await?;
+            .await
+            .context("provision step=derive order-book address; no deployment requested")?;
         // Derive and authenticate an already-active exact target before any idempotent surrounding
         // deployment can send money. The TokenContract address excludes constructor arguments, so
         // address equality alone never proves model, terms, or seller-note identity.
         let seller_pubkey = json!(format!("0x{}", seed_keys.public_hex()));
-        let rm = self.root_model_address_for(&seller_pubkey).await?;
+        let rm = self
+            .root_model_address_for(&seller_pubkey)
+            .await
+            .context("provision step=derive RootModel address; no deployment requested")?;
         let tc = self
             .token_contract_deploy_address(seed_keys, &rm, nonce)
-            .await?;
+            .await
+            .context("provision step=derive deal address; no deployment requested")?;
         let market = crate::MarketManifest {
             network: self.network().to_string(),
             frame_model: frame_model.to_string(),
@@ -12101,38 +12133,41 @@ impl RealChainBackend {
             max_ticks,
         };
         let target_active = self
-            .wait_active(
+            .wait_active_checked(
                 &tc,
                 crate::params::ACCOUNT_ACTIVE_SINGLE_CHECK_ATTEMPTS,
                 true,
             )
-            .await;
+            .await
+            .context("provision step=read existing deal; no deployment requested")?;
         if target_active
             && !self
                 .exact_provision_target_is_active_and_matches(&tc, &market)
-                .await?
+                .await
+                .context("provision step=validate existing deal; no deployment requested")?
         {
             return Err(anyhow!(
                 "TokenContract {} disappeared during existing-deal identity validation; refusing a fresh deployDeal",
                 display_token_contract(&tc)
             ));
         }
-        if !self
-            .wait_active(
+        let book_absent = !self
+            .wait_active_checked(
                 &ob,
                 crate::params::ACCOUNT_ACTIVE_SINGLE_CHECK_ATTEMPTS,
                 false,
             )
             .await
-        {
+            .context("provision step=read order book; no deployment requested")?;
+        if book_absent {
             self.deploy_inference_orderbook(note, seed_keys, &model_hash, frame_model, TICK_SIZE)
-                .await?;
+                .await.context("provision step=deploy order book; note-funded order-book deployment attempted, cost unconfirmed; deal reserve not submitted")?;
             if !self
-                .wait_active(&ob, crate::params::ACCOUNT_ACTIVATION_MAX_ATTEMPTS, false)
-                .await
+                .wait_active_checked(&ob, crate::params::ACCOUNT_ACTIVATION_MAX_ATTEMPTS, false)
+                .await.context("provision step=wait for order book; note-funded order-book deployment submitted, cost unconfirmed; deal reserve not submitted")?
             {
                 return Err(anyhow!(
-                    "InferenceOrderBook {} did not activate",
+                    "provision step=wait for order book; note-funded order-book deployment submitted, cost unconfirmed; deal reserve not submitted; InferenceOrderBook {} did not activate",
                     display_dexdo_address(&ob)
                 ));
             }
@@ -12157,25 +12192,27 @@ impl RealChainBackend {
         // from the RootModel `getTokenContractAddress` getter, so a not-yet-`Active` RootModel cannot
         // abort the idempotency check; that getter is used only as a post-`Active` cross-check below.
         let rm_absent = !self
-            .wait_active(
+            .wait_active_checked(
                 &rm,
                 crate::params::ACCOUNT_ACTIVE_SINGLE_CHECK_ATTEMPTS,
                 false,
             )
-            .await;
+            .await.with_context(|| format!("provision step=read RootModel; order-book deployment requested={book_absent}, cost unconfirmed; deal reserve not submitted"))?;
         if rm_absent {
-            self.deploy_root_model_note_funded(seed_keys).await?;
+            self.deploy_root_model_note_funded(seed_keys).await
+                .with_context(|| format!("provision step=deploy RootModel; order-book deployment requested={book_absent}, cost unconfirmed; RootModel funded by SuperRoot; deal reserve not submitted"))?;
         }
         // The per-deal TC address is derived from the deploy INIT-DATA (stateInit), NOT the RootModel
         // `getTokenContractAddress` network getter: on a fresh provision the RootModel deploy was just
         // sent (step above) but is not yet `Active`, so the getter would 404 and abort this idempotent check.
+        let prior_spend = format!("order-book deployment requested={book_absent}; RootModel deployment requested={rm_absent} (funded by SuperRoot); actual note cost unconfirmed");
         if target_active {
             // Idempotent skip: the TC is already `Active` => the RootModel is guaranteed `Active`, so the getter
             // is safe here -- cross-check it agrees with the INIT-DATA derivation (catch a code-hash/derivation
             // divergence between the embedded TC image and the deployed RootModel).
             let getter_tc = self
                 .resolve_token_contract(&rm, &seller_pubkey, nonce)
-                .await?;
+                .await.with_context(|| format!("provision step=validate RootModel deal address; {prior_spend}; deal reserve not submitted"))?;
             if getter_tc.with_workchain() != tc.with_workchain() {
                 return Err(anyhow!(
                     "RootModel getTokenContractAddress {} != INIT-DATA-derived {} (TC derivation diverged)",
@@ -12191,7 +12228,7 @@ impl RealChainBackend {
             // money actions. Refuse before `deployDeal` spends the note's reserve.
             let prior = self
                 .token_contract_settlement_receipts_if_present(&tc)
-                .await?;
+                .await.with_context(|| format!("provision step=read prior deal history; {prior_spend}; deal reserve not submitted"))?;
             if let Some(prior) = prior.filter(|receipts| !receipts.events.is_empty()) {
                 return Err(anyhow!(
                     "TokenContract {} is inactive but has {} immutable lifecycle events; nonce \
@@ -12225,7 +12262,7 @@ impl RealChainBackend {
                 },
             )
             .await
-            .context("note-deployed provision: PrivateNote.deployDeal failed")?;
+            .with_context(|| format!("provision step=PrivateNote.deployDeal; {prior_spend}; requested deal reserve={gas} raw nanoSHELL ECC[2]; submission outcome is reported by the cause"))?;
             self.log_deploy_prefund_snapshot("after deployDeal", note, &rm, &tc)
                 .await;
             // The deploy is an INTERNAL message the note emits, so the owner call returning is not
@@ -12233,12 +12270,13 @@ impl RealChainBackend {
             // That derived address is also the convergence guard the old external path needed a
             // separate check for -- nothing here reports an address of its own to disagree with it.
             if !self
-                .wait_active(&tc, crate::params::ACCOUNT_ACTIVATION_MAX_ATTEMPTS, true)
-                .await
+                .wait_active_checked(&tc, crate::params::ACCOUNT_ACTIVATION_MAX_ATTEMPTS, true)
+                .await.map_err(|source| anyhow::Error::new(MoneySubmitError::Ambiguous { source }))
+                .with_context(|| format!("provision step=wait for deal; {prior_spend}; deployDeal submitted with requested reserve={gas} raw nanoSHELL ECC[2]; reconcile this nonce before retrying"))?
             {
                 return Err(anyhow::Error::new(MoneySubmitError::Ambiguous {
                     source: anyhow!(
-                        "TokenContract {} did not activate after PrivateNote.deployDeal (nonce {nonce})",
+                        "provision step=wait for deal; {prior_spend}; deployDeal submitted with requested reserve={gas} raw nanoSHELL ECC[2]; TokenContract {} did not activate (nonce {nonce}); reconcile this nonce before retrying",
                         display_token_contract(&tc)
                     ),
                 }));
@@ -13487,6 +13525,30 @@ impl RealChainBackend {
             }
         }
         false
+    }
+
+    /// An exhausted read is not evidence that a contract is absent. Provision must stop rather
+    /// than submit a deployment after an inconclusive read.
+    async fn wait_active_checked(
+        &self,
+        addr: &Address,
+        tries: u32,
+        system_dapp: bool,
+    ) -> Result<bool> {
+        for i in 0..tries {
+            let account = if system_dapp {
+                self.client.get_system_account_retrying(addr).await?
+            } else {
+                self.client.get_account_retrying(addr).await?
+            };
+            if account.is_some_and(|account| account.is_active()) {
+                return Ok(true);
+            }
+            if i + 1 < tries {
+                tokio::time::sleep(crate::params::ACCOUNT_ACTIVATION_POLL_INTERVAL).await;
+            }
+        }
+        Ok(false)
     }
 }
 
@@ -20022,4 +20084,5 @@ mod tests {
     include!("client/issue_2108_tests.rs");
     include!("client/issue_2115_tests.rs");
     include!("client/issue_2199_tests.rs");
+    include!("client/issue_2192_tests.rs");
 }

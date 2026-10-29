@@ -244,15 +244,28 @@ provider's answer as produced. An OpenAI-compatible seller serves Chat Completio
 Anthropic seller serves Messages. A request on a path the seller does not serve is refused with
 `unsupported_api_path` before any money moves.
 
-Two flags worth knowing before you meet them:
+Three flags worth knowing before you meet them:
 
 - `--allow-unverified-model` exists and `--help` describes it. This document does not walk you
   through it on purpose: it waives the check that proves the model you are served is the model you
   paid for, and for a new buyer that is almost never the right answer. If the client stops and names
   it, read what it says before reaching for it.
-- `--continuity-mode` defaults to `proactive`, which keeps a warm next deal ready and **may pre-buy
-  while idle**, spending probe and idle cost with no requests running. Use `--continuity-mode
-  on-demand` to hold while idle; the first request after an idle period then waits for a fresh deal.
+- `--continuity-mode` decides what happens when your deal ends. It defaults to `off`: nothing new
+  is bought, and the buyer exits. `on-demand` buys a replacement on your next request after the
+  deal ends; that request waits for the fresh deal. `proactive` keeps a warm next deal ready and
+  **may pre-buy while idle**, spending probe and idle cost with no requests running. A replacement
+  is bought from the model book at your `--ticks` and `--max-price-per-tick`, the same whether you
+  bought by model, `--market` or `--token-contract`.
+- `--wait-for-seller` decides what happens when no seller can fill your buy, for the first buy and
+  every replacement alike. Without it the buy fills now or is refused, nothing stays in the book,
+  and the buyer exits. With it the buy waits in the model book; with `--market` or
+  `--token-contract` too, because a buy names the model book and not one deal, so the first seller
+  whose ask crosses it fills it. Stopping the buyer (Ctrl-C) takes a buy that is still waiting out
+  of the book before the client exits, so your next start begins clean.
+  If placement or cancellation cannot be confirmed, the buyer reports an error and keeps recovery
+  state. Resolve that record before starting another purchase.
+  This reconciliation happens before HTTP drain. If the buy filled at stop, `--resume`
+  adopts its saved paid deal without another purchase.
 
 ---
 

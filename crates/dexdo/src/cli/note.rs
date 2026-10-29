@@ -4,7 +4,9 @@
 //! live here.
 
 use anyhow::{anyhow, bail, Result};
-use dexdo_core::params::{NOTE_DEPLOY_PROOF_LAYER_MAX, SHELL_CURRENCY_ID};
+use dexdo_core::params::{
+    NOTE_DEPLOY_PROOF_LAYER_MAX, NOTE_DEPLOY_PROOF_LAYER_MIN, SHELL_CURRENCY_ID,
+};
 use ed25519_dalek::SigningKey;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -779,6 +781,10 @@ pub(crate) struct NoteDeployVoucherCheckpoint {
     pub proof: Option<NoteDeployVoucherProof>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_rejected_proof_layer: Option<u8>,
+    /// One-based layer selected before waiting/proving. Survives interruption
+    /// even when no proof has been generated or submitted yet.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub selected_proof_layer: Option<u8>,
 }
 
 impl std::fmt::Debug for NoteDeployVoucherCheckpoint {
@@ -862,6 +868,7 @@ impl NoteDeployVoucherCheckpoint {
             event: None,
             proof: None,
             last_rejected_proof_layer: None,
+            selected_proof_layer: None,
         };
         checkpoint.validate("voucher checkpoint")?;
         Ok(checkpoint)
@@ -916,8 +923,26 @@ impl NoteDeployVoucherCheckpoint {
                 bail!("{label}: proof voucher_token_type does not match checkpoint");
             }
         }
+        if let Some(selected) = self.selected_proof_layer {
+            if !(NOTE_DEPLOY_PROOF_LAYER_MIN..=NOTE_DEPLOY_PROOF_LAYER_MAX).contains(&selected)
+                || self.event.is_none()
+                || self
+                    .proof
+                    .as_ref()
+                    .is_some_and(|proof| proof.layer_number > selected)
+            {
+                bail!("{label}: selected proof layer is invalid or inconsistent with the paid event/proof");
+            }
+        }
         if let Some(last_rejected) = self.last_rejected_proof_layer {
-            if !(1..=NOTE_DEPLOY_PROOF_LAYER_MAX).contains(&last_rejected) {
+            if self
+                .selected_proof_layer
+                .is_some_and(|selected| selected < last_rejected)
+            {
+                bail!("{label}: selected proof layer is below an already rejected layer");
+            }
+            if !(NOTE_DEPLOY_PROOF_LAYER_MIN..=NOTE_DEPLOY_PROOF_LAYER_MAX).contains(&last_rejected)
+            {
                 bail!(
                     "{label}: rejected proof layer is outside canonical plan 1..={NOTE_DEPLOY_PROOF_LAYER_MAX}"
                 );
@@ -926,13 +951,21 @@ impl NoteDeployVoucherCheckpoint {
                 .proof
                 .as_ref()
                 .ok_or_else(|| anyhow!("{label}: rejected layer has no persisted proof"))?;
-            if !(1..=NOTE_DEPLOY_PROOF_LAYER_MAX).contains(&proof.layer_number) {
+            if proof.layer_number < last_rejected {
+                bail!("{label}: current proof layer is below an already rejected layer");
+            }
+            if !(NOTE_DEPLOY_PROOF_LAYER_MIN..=NOTE_DEPLOY_PROOF_LAYER_MAX)
+                .contains(&proof.layer_number)
+            {
                 bail!(
                     "{label}: current proof layer {} is outside canonical plan 1..={NOTE_DEPLOY_PROOF_LAYER_MAX}",
                     proof.layer_number,
                 );
             }
-            if proof.layer_number != last_rejected && proof.layer_number != last_rejected + 1 {
+            if proof.layer_number != last_rejected
+                && proof.layer_number != last_rejected + 1
+                && self.selected_proof_layer != Some(proof.layer_number)
+            {
                 bail!(
                     "{label}: current proof layer {} must be rejected layer {last_rejected} or its \
                      immediate successor {}",
@@ -957,7 +990,13 @@ impl NoteDeployVoucherCheckpoint {
             .ok_or_else(|| anyhow!("voucher checkpoint has no proof to reject"))?
             .layer_number;
         if let Some(previous) = self.last_rejected_proof_layer {
-            if layer != previous && layer != previous.saturating_add(1) {
+            if layer < previous {
+                bail!("rejected proof layer cannot move backwards");
+            }
+            if layer != previous
+                && layer != previous.saturating_add(1)
+                && self.selected_proof_layer != Some(layer)
+            {
                 bail!(
                     "rejected proof layer {layer} is not monotonic after rejected layer {previous}"
                 );
@@ -968,6 +1007,28 @@ impl NoteDeployVoucherCheckpoint {
         Ok(layer)
     }
 
+    pub(crate) fn next_anchor_layer(&self) -> Option<u8> {
+        let selected = self
+            .selected_proof_layer
+            .unwrap_or(NOTE_DEPLOY_PROOF_LAYER_MIN);
+        let next = self.last_rejected_proof_layer.map_or(selected, |rejected| {
+            selected.max(rejected.saturating_add(1))
+        });
+        (next <= NOTE_DEPLOY_PROOF_LAYER_MAX).then_some(next)
+    }
+
+    pub(crate) fn select_proof_layer(&mut self, layer: u8) -> Result<()> {
+        let expected = self
+            .next_anchor_layer()
+            .ok_or_else(|| anyhow!("paid voucher history layer plan exhausted"))?;
+        if layer != expected && layer != expected.saturating_add(1) {
+            bail!("selected proof layer {layer} is not monotonic after {expected}");
+        }
+        self.selected_proof_layer = Some(layer);
+        self.validate("voucher checkpoint before proving")
+    }
+
+    #[cfg(test)]
     pub(crate) fn next_sdk_proof_layer(&self) -> Option<u32> {
         let last_rejected = self.last_rejected_proof_layer.unwrap_or_default();
         (last_rejected < NOTE_DEPLOY_PROOF_LAYER_MAX).then(|| u32::from(last_rejected))
@@ -993,7 +1054,11 @@ impl NoteDeployVoucherCheckpoint {
         {
             bail!("replacement proof changed paid voucher identity");
         }
-        if replacement.layer_number != rejected.layer_number.saturating_add(1) {
+        if replacement.layer_number
+            != self
+                .selected_proof_layer
+                .unwrap_or_else(|| rejected.layer_number.saturating_add(1))
+        {
             bail!(
                 "replacement proof layer {} is not the next layer after rejected layer {}",
                 replacement.layer_number,
@@ -2783,6 +2848,7 @@ mod note_deploy_tests {
             event: None,
             proof: Some(proof),
             last_rejected_proof_layer: None,
+            selected_proof_layer: None,
         };
         assert_zeroize_on_drop(&checkpoint.sk_u_hex);
         let checkpoint_debug = format!("{checkpoint:?}");

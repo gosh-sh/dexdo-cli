@@ -598,15 +598,15 @@ async fn wait_claim_or_closed(
     }
 }
 
-/// Whether the deal's stream is closed (settled / self-destructed) -- an expected, non-error terminal
-/// condition for the advance loop. A **missing** snapshot is treated as *not* a clean close (`false`), so
-/// a `claim_tokens` failure with no observable close still propagates as a real error.
+/// Whether the deal's stream is closed (settled / self-destructed). A terminal settlement receipt
+/// survives account destruction, including a buyer STOP before probe acceptance (`ProbeBurned`).
+/// Disappearance or a failed receipt read alone is not terminal proof. Waiting callers retry on their
+/// existing poll cadence; this check never adds a separate receipt wait to a live deal.
 async fn deal_closed(chain: &dyn ChainBackend, token_contract: &TokenContract) -> bool {
-    chain
-        .snapshot(token_contract)
-        .await
-        .map(|s| s.closed)
-        .unwrap_or(false)
+    match chain.snapshot(token_contract).await {
+        Some(snapshot) => snapshot.closed,
+        None => matches!(chain.terminal_settlement(token_contract).await, Ok(Some(_))),
+    }
 }
 
 async fn deal_closed_observed(
@@ -896,7 +896,7 @@ mod tests {
             let backend = Self::closing_after_claim();
             backend
                 .buyer_stop_receipt_after_reads
-                .store(2, Ordering::Relaxed);
+                .store(3, Ordering::Relaxed);
             backend
         }
         fn closing_after_claim_with_transient_receipt_error() -> Self {
@@ -1027,26 +1027,35 @@ mod tests {
                 ));
             }
             Ok((self.closed.load(Ordering::Acquire)
+                && self.state.lock().unwrap().probe_accepted
                 && read >= self.buyer_stop_receipt_after_reads.load(Ordering::Acquire))
             .then_some((0, 0)))
+        }
+        async fn probe_burned_settlement(
+            &self,
+            _: &TokenContract,
+        ) -> Result<Option<(u128, u128, u128)>, ChainError> {
+            Ok((self.closed.load(Ordering::Acquire)
+                && !self.state.lock().unwrap().probe_accepted
+                && self.buyer_stop_receipt_reads.load(Ordering::Acquire)
+                    >= self.buyer_stop_receipt_after_reads.load(Ordering::Acquire))
+            .then_some((0, 0, 0)))
         }
         async fn snapshot(&self, _: &TokenContract) -> Option<StreamSnapshot> {
             if self.close_after_claim.load(Ordering::Acquire) && self.closed.load(Ordering::Acquire)
             {
                 return None;
             }
-            self.closed
-                .load(Ordering::Relaxed)
-                .then_some(StreamSnapshot {
-                    seller_locked: 0,
-                    buyer_locked: 0,
-                    buyer_lead: 0,
-                    tokens_final: self.state.lock().unwrap().tokens_final,
-                    seller_received: 0,
-                    buyer_refunded: 0,
-                    burned: 0,
-                    closed: true,
-                })
+            Some(StreamSnapshot {
+                seller_locked: 0,
+                buyer_locked: 0,
+                buyer_lead: 0,
+                tokens_final: self.state.lock().unwrap().tokens_final,
+                seller_received: 0,
+                buyer_refunded: 0,
+                burned: 0,
+                closed: self.closed.load(Ordering::Acquire),
+            })
         }
     }
 
@@ -1389,7 +1398,7 @@ mod tests {
         tokio::task::yield_now().await;
 
         assert_eq!(driver.await.unwrap().unwrap(), 2 * TICK_SIZE);
-        assert_eq!(backend.buyer_stop_receipt_reads.load(Ordering::Acquire), 2);
+        assert_eq!(backend.buyer_stop_receipt_reads.load(Ordering::Acquire), 3);
         assert_eq!(observer.terminals.load(Ordering::Relaxed), 1);
         assert_eq!(backend.finalized.load(Ordering::Relaxed), 0);
     }
@@ -1428,7 +1437,7 @@ mod tests {
         tokio::task::yield_now().await;
 
         assert_eq!(driver.await.unwrap().unwrap(), 2 * TICK_SIZE);
-        assert_eq!(backend.buyer_stop_receipt_reads.load(Ordering::Acquire), 2);
+        assert_eq!(backend.buyer_stop_receipt_reads.load(Ordering::Acquire), 3);
         assert_eq!(observer.terminals.load(Ordering::Relaxed), 1);
         assert_eq!(backend.finalized.load(Ordering::Relaxed), 0);
     }
@@ -1834,6 +1843,121 @@ mod tests {
         assert_eq!(driver.await.unwrap().unwrap(), TICK_SIZE);
         assert!(backend.claims().is_empty());
         assert_eq!(backend.finalized.load(Ordering::Relaxed), 0);
+    }
+
+    /// The real chain removes both getState and snapshot on STOP. Exercise both waits with a
+    /// surviving receipt, and prove that disappearance alone (or a failed read) never closes them.
+    async fn buyer_stop_wait_2191(first_usage: bool, receipt: bool) {
+        let backend = Arc::new(if first_usage {
+            RecordingBackend::new()
+        } else {
+            RecordingBackend::resumed(TICK_SIZE, TICK_SIZE)
+        });
+        backend.close_after_claim.store(true, Ordering::Relaxed);
+        if receipt {
+            backend
+                .buyer_stop_receipt_after_reads
+                .store(3, Ordering::Relaxed);
+        }
+        let observer = Arc::new(RecordingStateObserver::default());
+        let driver_backend = backend.clone();
+        let driver_observer = observer.clone();
+        let driver = tokio::spawn(async move {
+            drive_advance_with_observer(
+                driver_backend.as_ref(),
+                &"tc-buyer-stop-wait-2191".to_string(),
+                &LocalNote::generate(),
+                AdvanceWindows {
+                    probe: Duration::ZERO,
+                    ..AdvanceWindows::canonical()
+                },
+                4,
+                TICK_SIZE as u64,
+                true,
+                Arc::new(AtomicU64::new(if first_usage {
+                    0
+                } else {
+                    TICK_SIZE as u64
+                })),
+                Arc::new(AtomicBool::new(false)),
+                driver_observer.as_ref(),
+            )
+            .await
+        });
+
+        while observer.states.lock().unwrap().is_empty() {
+            tokio::task::yield_now().await;
+        }
+        // Let the zero probe sleep and the initial state reads reach the delivery wait.
+        tokio::time::advance(SELLER_TERMINAL_RECEIPT_POLL_INTERVAL).await;
+        tokio::task::yield_now().await;
+        assert!(!driver.is_finished());
+        assert_eq!(
+            backend.buyer_stop_receipt_reads.load(Ordering::Acquire),
+            0,
+            "a readable open snapshot must not trigger receipt polling"
+        );
+        backend.closed.store(true, Ordering::Release);
+        assert!(backend
+            .snapshot(&"tc-buyer-stop-wait-2191".to_string())
+            .await
+            .is_none());
+        if receipt {
+            // An indexing delay and a transient receipt error must also leave the wait open.
+            backend
+                .buyer_stop_receipt_errors_remaining
+                .store(1, Ordering::Release);
+            tokio::time::advance(SELLER_TERMINAL_RECEIPT_POLL_INTERVAL).await;
+            tokio::task::yield_now().await;
+            assert!(
+                !driver.is_finished(),
+                "a receipt read error is not terminal proof"
+            );
+            tokio::time::advance(SELLER_TERMINAL_RECEIPT_POLL_INTERVAL).await;
+            tokio::task::yield_now().await;
+            assert!(
+                !driver.is_finished(),
+                "an empty receipt read is not terminal proof"
+            );
+            tokio::time::advance(SELLER_TERMINAL_RECEIPT_POLL_INTERVAL).await;
+            tokio::task::yield_now().await;
+            assert!(
+                driver.is_finished(),
+                "buyer STOP must interrupt the delivery wait"
+            );
+            assert_eq!(
+                driver.await.unwrap().unwrap(),
+                if first_usage { 0 } else { TICK_SIZE }
+            );
+        } else {
+            tokio::time::advance(SELLER_TERMINAL_RECEIPT_TIMEOUT).await;
+            tokio::task::yield_now().await;
+            assert!(
+                !driver.is_finished(),
+                "a missing snapshot without a receipt must keep waiting"
+            );
+            driver.abort();
+            assert!(driver.await.unwrap_err().is_cancelled());
+        }
+        assert!(backend.claims().is_empty());
+        assert_eq!(backend.accepts.load(Ordering::Relaxed), 0);
+        assert_eq!(backend.finalized.load(Ordering::Relaxed), 0);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn buyer_stop_interrupts_delivered_tokens_wait_2191() {
+        buyer_stop_wait_2191(false, true).await;
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn buyer_stop_interrupts_first_billable_usage_wait_2191() {
+        buyer_stop_wait_2191(true, true).await;
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn missing_contract_without_stop_receipt_keeps_both_waits_open_2191() {
+        buyer_stop_wait_2191(false, false).await;
+        buyer_stop_wait_2191(true, false).await;
     }
 
     /// The live case: delivery grows while the stream is still open. Every other test here hands the

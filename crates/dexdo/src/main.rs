@@ -2309,7 +2309,7 @@ mod deal_handle_cli_tests {
         let Command::Buyer(buyer) = c.command else {
             panic!("expected Command::Buyer");
         };
-        assert_eq!(buyer.continuity_mode, ContinuityModeArg::Proactive);
+        assert_eq!(buyer.continuity_mode, ContinuityModeArg::Off);
 
         let c = Cli::try_parse_from([
             "dexdo",
@@ -4444,9 +4444,9 @@ mod tests {
     fn buyer_continuity_mode_help_documents_operator_tradeoff() {
         let help = subcommand_long_help("buyer");
         assert!(help.contains("--continuity-mode <MODE>"), "{help}");
-        assert!(help.contains("[default: proactive]"), "{help}");
+        assert!(help.contains("[default: off]"), "{help}");
         assert!(
-            help.contains("[possible values: proactive, on-demand]"),
+            help.contains("[possible values: off, on-demand, proactive]"),
             "{help}"
         );
         assert!(

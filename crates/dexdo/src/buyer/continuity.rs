@@ -146,7 +146,9 @@ impl ConsumerDemand {
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub enum ContinuityMode {
+    /// Never buys a replacement: the run ends with its deal.
     #[default]
+    Off,
     Proactive,
     OnDemand,
 }
@@ -154,6 +156,7 @@ pub enum ContinuityMode {
 impl ContinuityMode {
     pub fn planner_demand(self, observed: ConsumerDemand) -> ConsumerDemand {
         match self {
+            Self::Off => ConsumerDemand::Idle,
             Self::Proactive => ConsumerDemand::ActiveOrRecent,
             Self::OnDemand => observed,
         }

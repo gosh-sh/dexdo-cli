@@ -2038,6 +2038,19 @@ mod issue_2039_residual_recovery_tests {
 /// cover `ticks x limit x (1 + 2.5 % book fee)` (issue -- otherwise the escrow is orphaned in the book;
 /// `from_provisioned` checks the invariant ahead of time via `check_buy_deposit_headroom`).
 pub(crate) fn buyer_real_backend(args: &BuyerArgs, frame_model: &str) -> Result<ChainAndNote> {
+    let (backend, rn) = buyer_real_backend_parts(args, frame_model)?;
+    let chain: Arc<dyn ChainBackend> = Arc::new(backend);
+    let note: Arc<dyn Note> = Arc::new(rn);
+    Ok((chain, note))
+}
+
+/// The real buyer backend before it is erased behind `ChainBackend`. Every BUY it places -- the
+/// first one and each replacement -- carries its `buy_order_flags()`, and `--wait-for-seller` is
+/// the only thing that sets them, whatever the buy method.
+pub(crate) fn buyer_real_backend_parts(
+    args: &BuyerArgs,
+    frame_model: &str,
+) -> Result<(dexdo_core::RealBuyerBackend, dexdo_core::RealNote)> {
     let note_addr = require_note_addr(
         &args.identity,
         "the real chain buyer",
@@ -2084,10 +2097,7 @@ pub(crate) fn buyer_real_backend(args: &BuyerArgs, frame_model: &str) -> Result<
         )?,
         None => bail!("a fresh buyer invocation requires --max-price-per-tick"),
     };
-    let backend = backend.with_wait_for_seller(args.wait_for_seller);
-    let chain: Arc<dyn ChainBackend> = Arc::new(backend);
-    let note: Arc<dyn Note> = Arc::new(rn);
-    Ok((chain, note))
+    Ok((backend.with_wait_for_seller(args.wait_for_seller), rn))
 }
 
 /// Default endpoints file under the selected instance root, or under the legacy platform data

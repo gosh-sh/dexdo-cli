@@ -381,6 +381,9 @@ pub const HERMEZ_SRS_MAX_ATTEMPTS: usize = 5;
 /// Initial retry delay for transient Hermez SRS download failures.
 pub const HERMEZ_SRS_RETRY_INITIAL_BACKOFF: Duration = Duration::from_secs(1);
 
+/// First one-based history-proof layer used for a fresh paid voucher proof.
+pub const NOTE_DEPLOY_PROOF_LAYER_MIN: u8 = 1;
+
 /// Maximum one-based history-proof layer used by `dexdo note deploy` re-proof.
 pub const NOTE_DEPLOY_PROOF_LAYER_MAX: u8 = 3;
 
@@ -597,7 +600,10 @@ pub const BUYER_UPSTREAM_OPEN_RETRIES: usize = 1;
 pub const CONTENT_PROBE_MAX_TOKENS: u64 = 64;
 
 /// Default subscription-continuity strategy exposed by the CLI.
-pub const DEFAULT_CONTINUITY_MODE: &str = "proactive";
+
+/// `off`: the buyer never places a replacement BUY on its own; when its deal ends, it exits.
+/// A replacement is something the operator asks for with `on-demand` or `proactive`.
+pub const DEFAULT_CONTINUITY_MODE: &str = "off";
 
 /// Remaining-token threshold at which proactive renewal starts.
 pub const BUYER_RENEWAL_THRESHOLD_TOKENS: u64 = 64;
@@ -1594,26 +1600,12 @@ pub const NOTE_DEPLOY_SHELL_FUNDING_POLL_INTERVAL: Duration = Duration::from_sec
 /// Interval between PrivateNote account-activation reads.
 pub const NOTE_DEPLOY_ACTIVE_POLL_INTERVAL: Duration = Duration::from_secs(2);
 
-/// Maximum wait for ONE note-deploy halo2 voucher proof, its layer-boundary chain wait included.
-
-/// The proof is CPU-bound; the history layer it proves against is WALL-CLOCK. Layer 0 spans
-/// `W = 128` blocks, about two minutes of chain, and once the chain has moved past that boundary the
-/// layer-0 witness can no longer be exported -- the prover falls through to layer 1, whose boundary is
-/// `W^2 = 16384` blocks away. Measured on one machine minting a pool with the shipped CLI:
-
-/// | conditions | proof time | outcome |
-/// |-------------------------------------|-----------:|--------------------------------|
-/// | one deploy at a time | 104 s | lands at layer 0 |
-/// | three concurrent, separate caches | 157 s | window missed, falls to layer 1|
-
-/// The layer-1 target measured there was +10366 blocks, roughly 54 minutes of waiting for a single
-/// note against about 4 on the layer-0 path -- and the SDK waits for it without printing a verdict.
-
-/// This bound sits between the two: about four times the slowest measured honest proof, and far
-/// short of any layer-1 boundary wait. Crossing it is not a transport hiccup -- it means the layer-0
-/// window is gone and the attempt has become the expensive one, which is the moment the operator has
-/// a choice to make and must be told. Raise it with `DEXDO_NOTE_DEPLOY_PROOF_TIMEOUT_SECS`, or set
-/// that to `0` to wait however long the escalated layer takes.
+/// Base budget for one note-deploy proof attempt. Raised-layer attempts add
+/// their observed remaining chain-boundary wait to this budget. L1 uses this
+/// base budget directly; exhausting it does not prove its root has expired.
+/// Actual root eviction is determined from chain heights and the kit's anchor
+/// geometry. Override with `DEXDO_NOTE_DEPLOY_PROOF_TIMEOUT_SECS`; zero means
+/// the operator explicitly permits an unbounded wait.
 pub const NOTE_DEPLOY_PROOF_TIMEOUT: Duration = Duration::from_secs(600);
 
 /// Read-buffer size used while hashing the pinned Hermez SRS.

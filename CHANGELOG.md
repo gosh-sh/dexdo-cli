@@ -1,3 +1,57 @@
+## v0.11.0
+
+### Breaking Changes
+
+- `dexdo buyer --continuity-mode` now defaults to `off`: when its deal ends, the
+  buyer places no new BUY and exits. The previous default `proactive` bought a
+  replacement deal by itself, even with no request waiting. To keep a buyer that
+  renews, pass `--continuity-mode proactive` (buy ahead) or
+  `--continuity-mode on-demand` (buy on the next request). In `--json` mode the
+  self-ended run reports `stopping` with `reason` `policy`; `continuity_mode` in
+  `starting` can now be `off`.
+
+### New / Improvements
+
+- `dexdo buyer --wait-for-seller` now works with `--market` and `--token-contract`,
+  and applies to the first buy and to every replacement. With it the BUY carries
+  `AON` and waits in the model book; without it the BUY carries `AON|FOK`, fills
+  from one seller at once or is refused, and the buyer exits. A waiting BUY names
+  the model book, not one deal: with `--market` or `--token-contract` the first
+  seller whose ask crosses it fills it, and that deal is served. The flag is still
+  refused with `--resume` and `--mock-chain`.
+- `--continuity-mode on-demand` and `proactive` now renew the same way for a buy by
+  model, `--market` and `--token-contract`: the replacement is bought from the model
+  book at the run's `--ticks` and `--max-price-per-tick`. Without `--wait-for-seller`
+  a replacement that finds no seller ends the buyer instead of retrying. A clean
+  close that destroys the old deal also triggers proactive replacement.
+
+### Fixes
+
+- Private-note deployment and recovery rebuild expired historical proofs on the
+  next layer using the original paid voucher. Interrupted recovery keeps its
+  selected layer, keys and payment evidence, and reports unavailable historical
+  data without asking for another voucher payment.
+- Stopping `dexdo buyer` (Ctrl-C or SIGTERM) now cancels its own BUY that is still
+  waiting in the book, the first one or a replacement, before the process exits, and
+  waits for the book to confirm it; the escrow returns to the note. The next start
+  is no longer refused with "belongs to a different logical invocation". A stop
+  before the endpoint is up exits with an error that names the cancelled order; in
+  `--json` mode the cancel is reported on stderr as
+  `buyer_order_cancelled order_id=<n> reason=stop`, with no new event.
+  A delayed placement is reconciled before cancelling; an unconfirmed placement or
+  cancellation exits with an error and preserves recovery state without another BUY.
+  Pending purchases are stopped and reconciled before the API drains in-flight
+  requests. If a fill wins the stop race, its checked attribution is saved for
+  `--resume`; local expiry alone never substitutes for a confirmed escrow refund.
+- Sellers no longer hang while waiting for usage after the buyer stops a deal.
+  They recognize the settlement receipt after the deal contract is removed and
+  follow their configured `after_deal_done` policy.
+- `dexdo provision` retries temporary chain-read failures, including a gateway 502
+  while loading the model registry, and temporary GraphQL errors in HTTP 200.
+  Normal CLI errors name the failed step and any offer retirement, deployment or
+  reserve request already attempted; an unconfirmed cost remains explicitly
+  unconfirmed. Money submissions are not repeated by read retries.
+
 ## v0.10.0
 
 ### Breaking Changes

@@ -26,7 +26,7 @@ zeroize.workspace = true
 # which NTFS would not check out) is fixed upstream -- tvm-sdk, tag `v3.0.3-rc.an`. The pins point
 # at clean upstream (fork removed, `[patch]` deleted), Windows/Linux/macOS build without workarounds.
 anyhow = { workspace = true }
-gosh-ackinacki = { git = "https://github.com/gosh-dot-ai/gosh.ackinacki", tag = "gosh-ackinacki-v0.11.0", default-features = false, features = ["private-note"] }
+gosh-ackinacki = { git = "https://github.com/gosh-dot-ai/gosh.ackinacki", tag = "gosh-ackinacki-v0.12.0", default-features = false, features = ["private-note"] }
 # Extracting the code-cell from.tvc to deploy InferenceOrderBook (the same logic as the SDK's
 # `airegistry::abi::Contract::code_cell`). The workspace patch unifies this direct dependency
 # with the version gosh.ackinacki pulls into the build graph transitively.

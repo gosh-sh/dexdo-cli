@@ -434,7 +434,12 @@ async fn issue_2064_continuity_adoption(kind: super::BuyerSubmitIntentKind) {
     let chain = std::sync::Arc::new(RecordingRecoveryChain {
         next_match: Some(b.clone()),
         model_buy_terms: Some(terms),
-        no_deal_state_for: Some(a.clone()),
+        // Renewal falls back to the local remaining budget on a read outage. An absent
+        // account instead proves closure and must select the next-seller intent.
+        no_deal_state_for: (kind == super::BuyerSubmitIntentKind::ContinuityNextSeller)
+            .then(|| a.clone()),
+        deal_state_read_error_for: (kind == super::BuyerSubmitIntentKind::ContinuityRenewal)
+            .then(|| a.clone()),
         expected_journal_path: Some(lock.journal_path.clone()),
         model_buy_failure: Some(ModelBuyFailure::Ambiguous),
         ..RecordingRecoveryChain::with_deal_state(state)

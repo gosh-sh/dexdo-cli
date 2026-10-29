@@ -1243,7 +1243,7 @@ fn note_deploy_paid_escalation_window_missed_message(
 /// The verdict an operator gets instead of an hour of silence.
 
 /// It has to carry three things, because without any one of them the choice cannot be made: what
-/// happened (the layer-0 window closed mid-proof), what waiting now costs against starting over, and
+/// happened (the configured proof/wait budget ended), what waiting now costs, and
 /// what became of the paid voucher this attempt was holding.
 fn note_deploy_proof_window_missed_message(
     label: &str,
@@ -1280,11 +1280,9 @@ fn note_deploy_proof_window_missed_message(
     };
     let aftermath = match outcome {
         NoteDeployRecoveryOutcome::Discarded => format!(
-            "This attempt is abandoned and its recovery state {} has been removed: its voucher is \
-             bound to an event whose layer-0 window has closed, so resuming it would re-prove \
-             against the same stale window. Nothing is on chain from it. Start a clean \
-             `dexdo note deploy` -- on testnet the SHELL costs nothing, and a fresh voucher starts \
-             again at layer 0.",
+            "This attempt is abandoned and its recovery state {} has been removed: the journal \
+             recorded no paid voucher or deployed note. Nothing is on chain from it. Start a clean \
+             `dexdo note deploy`; its fresh voucher starts at L1.",
             recovery_path.display()
         ),
         NoteDeployRecoveryOutcome::KeptPaidFor => format!(
@@ -1311,10 +1309,9 @@ fn note_deploy_proof_window_missed_message(
     };
     format!(
         "note deploy: the {label} voucher proof did not finish within {}s (attempt layers {layers}). \
-         The halo2 proof is CPU-bound while the history layer it proves against is wall-clock, so \
-         layer 0 is gone. {wait_statement} Running deploys concurrently is what usually causes \
-         this; they are meant to run one at a time. {aftermath} To wait the escalation out instead, \
-         re-run with DEXDO_NOTE_DEPLOY_PROOF_TIMEOUT_SECS raised, or 0 for no bound.",
+         The configured proof/wait budget ended; this alone does not establish that a historical \
+         root expired. {wait_statement} {aftermath} To allow more time, re-run with \
+         DEXDO_NOTE_DEPLOY_PROOF_TIMEOUT_SECS raised, or 0 for no bound.",
         waited.as_secs()
     )
 }
@@ -2233,7 +2230,7 @@ async fn note_deploy_mint_voucher_recoverable(
     use dexdo_core::params::ROOT_PN_ADDRESS;
     use dexdo_core::private_note::{
         halo2::{
-            live::{prove_voucher_for_event, ProveVoucherForEventParams},
+            live::{prove_voucher_for_event_at_layer, ProveVoucherForEventParams},
             sk_commit::compute_sk_u_commit_hex,
         },
         proof,
@@ -2540,76 +2537,50 @@ async fn note_deploy_mint_voucher_recoverable(
             event,
             sk_u_hex: checkpoint.sk_u_hex.to_string(),
             sk_u_commit_hex: checkpoint.sk_u_commit_hex.clone(),
-            // The PROVEN figure, and it is read from the persisted checkpoint rather than from the
-            // local `voucher_value` so the nominal has one carrier: `VoucherGenerated` emits the
-            // post-deduction nominal, so proving over the attached amount is `ERR_INVALID_ZKPROOF`
-            // (137) after the wallet has already spent. The wire figure exists only in
-            // `voucher_currency_map` and the wallet preflight, and must never reach this struct.
+            // The proof carries the post-deduction nominal from the durable
+            // paid checkpoint, never the funding wallet's attached amount.
             voucher_value: checkpoint.raw_value,
             voucher_token_type: checkpoint.token_type,
             ephemeral_pubkey_hex: recipient_ephemeral_pubkey_hex.to_string(),
             history_proof_window_size: None,
             paths: halo2_paths,
         };
-        // Bounded, so a missed layer-0 window becomes a verdict the operator can act on instead of
-        // an hour of silence.
         let bound = note_deploy_proof_timeout();
         let deployed_note = recovery.pn_address.clone();
-        let proof = if checkpoint.current_proof_is_rejected() {
-            let Some(next_layer) = checkpoint.next_sdk_proof_layer() else {
-                bail!(
-                    "{} voucher history layer plan exhausted; paid voucher recovery remains at {}. \
-                     action=resume_same_paid_voucher_later; do not fund a new voucher.",
+        let proof = note_deploy_prove_paid_layers(
+            recovery_path,
+            recovery,
+            kind,
+            &mut checkpoint,
+            async |layer| {
+                // SDK and RootPN layers are one-based here. The existing wait
+                // observation takes a zero-based legacy index.
+                let legacy_layer =
+                    u32::from(layer - dexdo_core::params::NOTE_DEPLOY_PROOF_LAYER_MIN);
+                let window = if layer > dexdo_core::params::NOTE_DEPLOY_PROOF_LAYER_MIN {
+                    NoteDeployProofWindow::for_paid_escalation(
+                        bound,
+                        wait_observation.clone(),
+                        legacy_layer,
+                        recovery_path,
+                    )
+                    .await?
+                } else {
+                    NoteDeployProofWindow::observe(bound, wait_observation.clone(), legacy_layer)
+                };
+                let wait_timeout = window.bound.unwrap_or(std::time::Duration::MAX);
+                note_deploy_prove_within_history_window(
+                    prove_voucher_for_event_at_layer(params.clone(), layer, wait_timeout),
                     kind.label(),
-                    recovery_path.display()
-                );
-            };
-            // size the window against the raised layer's own boundary, and do it before the
-            // layer is raised so an unsizeable one refuses without touching HALO2_ATTEMPT_LAYERS.
-            let window = NoteDeployProofWindow::for_paid_escalation(
-                bound,
-                wait_observation.clone(),
-                next_layer,
-                recovery_path,
-            )
-            .await?;
-            let previous_layers = std::env::var_os("HALO2_ATTEMPT_LAYERS");
-            std::env::set_var("HALO2_ATTEMPT_LAYERS", next_layer.to_string());
-            let bounded = note_deploy_prove_within_history_window(
-                prove_voucher_for_event(params),
-                kind.label(),
-                &next_layer.to_string(),
-                recovery_path,
-                deployed_note.as_deref(),
-                window,
-            )
-            .await;
-            match previous_layers {
-                Some(value) => std::env::set_var("HALO2_ATTEMPT_LAYERS", value),
-                None => std::env::remove_var("HALO2_ATTEMPT_LAYERS"),
-            }
-            bounded?.map_err(|e| {
-                anyhow::anyhow!(
-                    "prove {} paid voucher on next layer {next_layer}: {e}; \
-                     action=resume_same_paid_voucher_later; recovery={}; no new wallet spend is permitted",
-                    kind.label(),
-                    recovery_path.display()
+                    &format!("L{layer}"),
+                    recovery_path,
+                    deployed_note.as_deref(),
+                    window,
                 )
-            })?
-        } else {
-            note_deploy_prove_within_history_window(
-                prove_voucher_for_event(params),
-                kind.label(),
-                "SDK default plan",
-                recovery_path,
-                deployed_note.as_deref(),
-                // The SDK default plan starts at layer 0 and falls through to layer 1. This only
-                // observes that next target for the timeout verdict; it does not select a layer.
-                NoteDeployProofWindow::observe(bound, wait_observation, 1),
-            )
-            .await?
-            .map_err(|e| anyhow::anyhow!("prove {} voucher: {e}", kind.label()))?
-        };
+                .await?
+            },
+        )
+        .await?;
         // A successful proof is the cache commit point. Later chain retries and pool finalization must
         // never depend on cache metadata or on PK/VK/BP still being present.
         promote_hermez_srs_pending_marker(
@@ -2633,6 +2604,85 @@ async fn note_deploy_mint_voucher_recoverable(
         recovery_path.display()
     );
     Ok(proof)
+}
+
+/// Selection may advance during a finalized-137 rebuild whose old proof and
+/// submit evidence are temporarily absent IN MEMORY. Change only the layer
+/// field on disk until a validated replacement commits the entire checkpoint.
+fn note_deploy_persist_proof_selection(
+    recovery_path: &std::path::Path,
+    recovery: &mut crate::cli::note::NoteDeployRecoveryState,
+    kind: crate::cli::note::NoteDeployVoucherKind,
+    checkpoint: &crate::cli::note::NoteDeployVoucherCheckpoint,
+) -> Result<()> {
+    let mut durable = crate::cli::note::load_note_deploy_recovery(recovery_path)?
+        .ok_or_else(|| anyhow::anyhow!("paid recovery file disappeared before proof selection; preserve its original keys and event"))?;
+    let mut saved = durable
+        .voucher_checkpoint(kind)
+        .cloned()
+        .ok_or_else(|| anyhow::anyhow!("paid voucher disappeared before proof selection"))?;
+    if durable.owner_public_key_hex != recovery.owner_public_key_hex
+        || saved.event != checkpoint.event
+        || saved.sk_u_hex != checkpoint.sk_u_hex
+        || saved.sk_u_commit_hex != checkpoint.sk_u_commit_hex
+        || saved.raw_value != checkpoint.raw_value
+        || saved.token_type != checkpoint.token_type
+        || saved.recipient_ephemeral_pubkey_hex != checkpoint.recipient_ephemeral_pubkey_hex
+    {
+        bail!("proof selection does not match the durable paid voucher; preserve recovery");
+    }
+    saved.selected_proof_layer = checkpoint.selected_proof_layer;
+    durable.set_voucher_checkpoint(kind, saved)?;
+    crate::cli::note::write_note_deploy_recovery(recovery_path, &durable)?;
+    recovery.set_voucher_checkpoint(kind, checkpoint.clone())
+}
+
+/// Persist layer selection before every awaited attempt. Only a typed,
+/// observed expiry can move an event without a proof to the next layer.
+async fn note_deploy_prove_paid_layers<Prove>(
+    recovery_path: &std::path::Path,
+    recovery: &mut crate::cli::note::NoteDeployRecoveryState,
+    kind: crate::cli::note::NoteDeployVoucherKind,
+    checkpoint: &mut crate::cli::note::NoteDeployVoucherCheckpoint,
+    mut prove: Prove,
+) -> Result<dexdo_core::private_note::halo2::live::Halo2Proof>
+where
+    Prove: AsyncFnMut(u8) -> Result<dexdo_core::private_note::halo2::live::Halo2Proof>,
+{
+    use dexdo_core::private_note::halo2::live::ExpiredVoucherAnchor;
+    loop {
+        let layer = checkpoint.next_anchor_layer().ok_or_else(|| anyhow::anyhow!(
+            "paid voucher history layer plan exhausted; preserve recovery {} and obtain a usable historical anchor; do not fund a new voucher",
+            recovery_path.display()
+        ))?;
+        checkpoint.select_proof_layer(layer)?;
+        note_deploy_persist_proof_selection(recovery_path, recovery, kind, checkpoint)?;
+        match prove(layer).await {
+            Ok(proof) => {
+                if proof.layer_number != layer {
+                    bail!("prover returned L{} for selected L{layer}; preserve recovery {}; no replacement or wallet spend is permitted",
+                        proof.layer_number, recovery_path.display());
+                }
+                return Ok(proof);
+            }
+            Err(error) => {
+                let expired = error.downcast_ref::<ExpiredVoucherAnchor>();
+                if expired.is_some_and(|expired| expired.layer_number == layer)
+                    && layer < dexdo_core::params::NOTE_DEPLOY_PROOF_LAYER_MAX
+                {
+                    eprintln!("note deploy: {error}; rebuilding the same paid voucher on L{}. Recovery {} is kept; no new wallet spend.", layer + 1, recovery_path.display());
+                    checkpoint.select_proof_layer(layer + 1)?;
+                    note_deploy_persist_proof_selection(recovery_path, recovery, kind, checkpoint)?;
+                    continue;
+                }
+                let cause = format!("{error:#}");
+                return Err(error.context(format!(
+                    "cannot prove the paid voucher on L{layer}: {cause}; recovery {} is KEPT. Preserve its original event and keys; retry temporary BM failures or obtain required historical data. Do not fund a new voucher",
+                    recovery_path.display()
+                )));
+            }
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -3151,6 +3201,12 @@ where
         .deposit_voucher
         .as_mut()
         .expect("paid voucher checked above");
+    voucher.selected_proof_layer = voucher.proof.as_ref().map(|proof| {
+        voucher
+            .selected_proof_layer
+            .unwrap_or(proof.layer_number)
+            .max(proof.layer_number)
+    });
     voucher.proof = None;
     voucher.last_rejected_proof_layer = None;
     if let Err(error) = reprove(recovery).await {
@@ -7182,32 +7238,14 @@ mod tests {
                 .split_once("#[cfg(test)]\nmod tests")
                 .expect("note_cmd unit-test module boundary")
                 .0;
-            let escalation = production
-                .split_once("checkpoint.next_sdk_proof_layer()")
-                .expect("the escalated branch selects the next history layer")
-                .1
-                .split_once("} else {")
-                .expect("the escalated branch ends where the initial attempt begins")
-                .0;
-
-            assert!(
-                escalation.contains("NoteDeployProofWindow::for_paid_escalation("),
-                "the raised-layer re-proof must size its window against that layer: {escalation}"
-            );
-            assert!(
-                !escalation.contains("NoteDeployProofWindow::observe("),
-                "the raised-layer re-proof must not inherit the lower layer's budget: {escalation}"
-            );
-            let sized_at = escalation
-                .find("NoteDeployProofWindow::for_paid_escalation(")
-                .expect("sized window");
-            let raised_at = escalation
-                .find("set_var(\"HALO2_ATTEMPT_LAYERS\"")
-                .expect("the layer is raised through the SDK attempt plan");
-            assert!(
-                sized_at < raised_at,
-                "an unsizeable window must refuse before HALO2_ATTEMPT_LAYERS is touched"
-            );
+            let sized_at = production
+                .find("let window = if layer >")
+                .expect("raised layers select their own wait budget");
+            let explicit_at = production
+                .find("prove_voucher_for_event_at_layer(params.clone(), layer, wait_timeout)")
+                .expect("the SDK receives the exact selected one-based layer");
+            assert!(sized_at < explicit_at);
+            assert!(!production.contains("set_var(\"HALO2_ATTEMPT_LAYERS\""));
         }
     }
 
@@ -7738,7 +7776,9 @@ mod tests {
         let mut previous = "";
         let mut proofs = 0;
         for line in production.lines() {
-            if line.contains("prove_voucher_for_event(params)") {
+            if line
+                .contains("prove_voucher_for_event_at_layer(params.clone(), layer, wait_timeout)")
+            {
                 proofs += 1;
                 assert!(
                     line.contains("note_deploy_prove_within_history_window(")
@@ -7748,7 +7788,10 @@ mod tests {
             }
             previous = line;
         }
-        assert_eq!(proofs, 2, "both note-deploy voucher proofs must be covered");
+        assert_eq!(
+            proofs, 1,
+            "the shared explicit-layer proof call must be covered for every attempt"
+        );
         assert!(
             production.contains("acquire_note_deploy_serial_lock()?"),
             "note deploy must take its turn on this machine before it spends"
@@ -13119,3 +13162,7 @@ mod note_deploy_paid_voucher_2088_tests;
 #[cfg(test)]
 #[path = "note_recover_2110_tests.rs"]
 mod note_recover_2110_tests;
+
+#[cfg(test)]
+#[path = "note_history_l2_tests.rs"]
+mod note_history_l2_tests;

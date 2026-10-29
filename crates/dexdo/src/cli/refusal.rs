@@ -272,6 +272,19 @@ pub(crate) fn for_operator(error: &anyhow::Error) -> Option<Refusal> {
     let lower = text.to_ascii_lowercase();
     let detail = text.clone();
 
+    // Provision records its own step and prior side effects. Generic network/wallet advice
+    // must not replace these facts, especially after an uncertain monetary submission.
+    if error.chain().any(|cause| {
+        let message = cause.to_string();
+        message.starts_with("provision step=") || message.starts_with("provision prior action=")
+    }) {
+        return Some(Refusal::breakage(
+            text,
+            "Keep the recovery files and the same deal nonce. Reconcile any attempted or submitted action on chain before retrying provision; unconfirmed cost is not a confirmed charge.",
+            detail,
+        ));
+    }
+
     // Preserve known TC submissions even when the diagnostic receipt read itself fails.
     if lower.contains("tokencontract")
         && (lower.contains("ecc[2]/shell reserve")
@@ -854,3 +867,7 @@ mod tests {
         assert_eq!(how_long(7200), "2 hours");
     }
 }
+
+#[cfg(test)]
+#[path = "refusal_issue_2192_tests.rs"]
+mod issue_2192_tests;

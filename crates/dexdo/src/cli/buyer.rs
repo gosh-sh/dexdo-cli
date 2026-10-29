@@ -37,7 +37,7 @@ use crate::cli::seller_policy::{
 };
 use crate::cli::support::*;
 use crate::operator_shutdown_signal;
-use anyhow::{anyhow, bail, Result};
+use anyhow::{anyhow, bail, Context, Result};
 use dexdo_core::params::BUYER_SUBMIT_RECONCILE_POLL_INTERVAL;
 #[cfg(test)]
 use dexdo_core::params::EXECUTABLE_READ_BACKOFF;
@@ -5588,14 +5588,21 @@ async fn buyer_quote_selection_once(
 ) -> Result<BuyerQuoteSelection> {
     let mut explicit_submit_safe_order = None;
     let mut model_submit_safe_order = None;
-    if explicit_tc.is_none() {
+    // a BUY allowed to rest is placed on the model book for every buy method. The chain
+    // cannot name a deal in `placeInferenceBuy`, so `--market`/`--token-contract` only say which
+    // book, and the bid rests there exactly as a buy by model does.
+    if explicit_tc.is_none() || chain.allows_resting_model_buy() {
         model_submit_safe_order = chain
             .submit_safe_model_buy_quote_order(ticks, max_price_per_tick)
             .await
             .map_err(|e| anyhow::Error::new(e).context("buyer model-only quote preflight"))?;
         if chain.allows_resting_model_buy() {
             return Ok(BuyerQuoteSelection {
-                order_book: "model_order_book",
+                order_book: if explicit_tc.is_some() {
+                    "explicit_token_contract"
+                } else {
+                    "model_order_book"
+                },
                 escrow: escrow
                     .unwrap_or_else(|| required_escrow_for_buy(ticks, max_price_per_tick)),
                 quote: ExecutableQuote {
@@ -7123,6 +7130,11 @@ fn adopt_buyer_continuity_deal(
 /// without a request to trigger it.
 
 /// So the carve-out was taken off the RUN when it belongs to the DEAL. Renewal stops here instead.
+
+/// The task ends the run itself only when a replacement found no seller and
+/// `--wait-for-seller` was not given: that BUY may not rest, so the buyer exits instead of trying
+/// again. `_market_path` describes the first deal of a `--market` run; a replacement is bought from
+/// the model book and is never that deal, so its handle records no market file.
 fn spawn_buyer_service_renewal(
     chain: Arc<dyn ChainBackend>,
     buyer: Arc<dexdo::buyer::Buyer>,
@@ -7138,15 +7150,15 @@ fn spawn_buyer_service_renewal(
     spelling_diverged: bool,
     frame_model: String,
     deals_dir: Option<std::path::PathBuf>,
-    market_path: Option<std::path::PathBuf>,
-) {
+    _market_path: Option<std::path::PathBuf>,
+) -> Option<tokio::task::JoinHandle<BuyerRunEnd>> {
     if spelling_diverged {
         tracing::warn!(
             "the ModelRegistry holds this model under a spelling other than the one this run was \
              given; the deal already open is served to its end, and no renewal is started -- a \
              renewal would place new escrow on a book `provision` refuses to create"
         );
-        return;
+        return None;
     }
     #[derive(Clone, Copy, PartialEq, Eq)]
     enum PendingCleanup {
@@ -7173,7 +7185,7 @@ fn spawn_buyer_service_renewal(
     let on_demand_recovery =
         continuity_mode == dexdo::buyer::continuity::ContinuityMode::OnDemand && deals.is_lazy();
 
-    tokio::spawn(async move {
+    Some(tokio::spawn(async move {
         use dexdo::buyer::continuity::{
             BuyerAction, BuyerContinuity, ConsumerDemand, ContinuityConfig, DealFacts,
         };
@@ -7279,6 +7291,14 @@ fn spawn_buyer_service_renewal(
                 }
             }
 
+            // A destroyed contract is closed by fact; only a failed read falls back to local facts.
+            let account_destroyed = matches!(&chain_state_read, Ok(None));
+            if account_destroyed && on_demand_recovery {
+                active
+                    .session
+                    .mark_recovered_serialized("continuity-observed-destroyed-deal")
+                    .await;
+            }
             let chain_state = match chain_state_read {
                 Ok(state) => state,
                 Err(e) => {
@@ -7291,14 +7311,18 @@ fn spawn_buyer_service_renewal(
                 }
             };
             let now_secs = unix_now_secs();
-            let current_facts = buyer_monitor_current_facts(
-                current_tc.clone(),
-                active.remaining_tokens(),
-                active.session.is_settled(),
-                chain_state,
-                now_secs,
-                active.last_accepted_output_unix_secs(),
-            );
+            let current_facts = if account_destroyed {
+                DealFacts::closed(current_tc.clone())
+            } else {
+                buyer_monitor_current_facts(
+                    current_tc.clone(),
+                    active.remaining_tokens(),
+                    active.session.is_settled(),
+                    chain_state,
+                    now_secs,
+                    active.last_accepted_output_unix_secs(),
+                )
+            };
             let consumer_demand =
                 if active.has_active_or_recent_request(now_secs, CONSUMER_DEMAND_RECENT_SECS) {
                     ConsumerDemand::ActiveOrRecent
@@ -7584,7 +7608,10 @@ fn spawn_buyer_service_renewal(
                             );
                         }
                         Err(e) if is_ambiguous_submit_error(&e) => {}
-                        Err(_e) => {
+                        Err(e) => {
+                            if let Some(end) = renewal_found_no_seller(chain.as_ref(), &e) {
+                                return end;
+                            }
                             pending = None;
                             prepare_retry = Some(PrepareRetry {
                                 current: current.clone(),
@@ -7663,7 +7690,10 @@ fn spawn_buyer_service_renewal(
                             );
                         }
                         Err(e) if is_ambiguous_submit_error(&e) => {}
-                        Err(_e) => {
+                        Err(e) => {
+                            if let Some(end) = renewal_found_no_seller(chain.as_ref(), &e) {
+                                return end;
+                            }
                             pending = None;
                             prepare_retry = Some(PrepareRetry {
                                 current: current.clone(),
@@ -7697,7 +7727,7 @@ fn spawn_buyer_service_renewal(
                             pool_note_addr.as_deref(),
                             &frame_model,
                             deals_dir.as_deref(),
-                            market_path.as_deref(),
+                            None,
                             chain.network(),
                         ) {
                             tracing::warn!(%error, "buyer continuity: durable adoption failed; journal retained");
@@ -7750,7 +7780,384 @@ fn spawn_buyer_service_renewal(
                 }
             }
         }
+    }))
+}
+
+/// The `stopping.reason` a serving run reports (`runtime-machine-contract.md` section 7.2): `policy`
+/// when its continuity mode ended it, `signal` when the operator did.
+fn buyer_stop_reason(run_end: Option<&BuyerRunEnd>) -> &'static str {
+    match run_end {
+        Some(_) => "policy",
+        None => "signal",
+    }
+}
+
+/// Why a buyer's continuity watcher ended the run on its own.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum BuyerRunEnd {
+    /// `--continuity-mode off`: the deal ended, and nothing replaces it.
+    DealEnded {
+        token_contract: dexdo_core::TokenContract,
+    },
+    /// A replacement found no seller, and without `--wait-for-seller` its BUY may not rest.
+    NoSeller { reason: String },
+}
+
+/// The rule a first buy already follows, applied to a replacement: without
+/// `--wait-for-seller`, no seller means the buyer exits and nothing is left in the book.
+
+/// "No seller" is the book's own refusal, classed by the one classifier every buy refusal goes
+/// through. A read that failed is not that answer, and keeps the existing retry.
+fn renewal_found_no_seller(chain: &dyn ChainBackend, error: &anyhow::Error) -> Option<BuyerRunEnd> {
+    if chain.allows_resting_model_buy() {
+        return None;
+    }
+    let reason = format!("{error:#}");
+    dexdo_core::params::book_refusal_class(&reason)?;
+    Some(BuyerRunEnd::NoSeller { reason })
+}
+
+/// `--continuity-mode off`: watch the deal, and end the run when it ends.
+
+/// A missing account is the contract's terminal destruction. Read errors do not prove closure;
+/// readable states use the same classifier as renewal.
+fn spawn_buyer_deal_end_watch(
+    chain: Arc<dyn ChainBackend>,
+    deals: Arc<dexdo::buyer::api::RouteManager>,
+) -> tokio::task::JoinHandle<BuyerRunEnd> {
+    tokio::spawn(async move {
+        loop {
+            tokio::time::sleep(buyer_monitor_poll_interval()).await;
+            let Some(active) = deals.current().await else {
+                continue;
+            };
+            let token_contract = active.route.token_contract.clone();
+            let chain_state = match chain.deal_state(&token_contract).await {
+                Ok(None) => return BuyerRunEnd::DealEnded { token_contract },
+                Ok(state) => state,
+                Err(error) => {
+                    tracing::warn!(
+                        token_contract = %display_token_contract(&token_contract),
+                        %error,
+                        "buyer: deal_state read failed; the deal is not taken as ended"
+                    );
+                    None
+                }
+            };
+            let facts = buyer_monitor_current_facts(
+                token_contract.clone(),
+                active.remaining_tokens(),
+                active.session.is_settled(),
+                chain_state,
+                unix_now_secs(),
+                active.last_accepted_output_unix_secs(),
+            );
+            if facts.phase == dexdo::buyer::continuity::DealPhase::Closed {
+                return BuyerRunEnd::DealEnded { token_contract };
+            }
+        }
+    })
+}
+
+/// What watches a serving buyer's deal, chosen by `--continuity-mode` alone: a buy by
+/// model, `--market` and `--token-contract` get the same watcher. `terms` are the replacement's;
+/// a run without them (a price-less resume) places no replacement in any mode.
+#[allow(clippy::too_many_arguments)]
+fn spawn_buyer_continuity(
+    mode: ContinuityModeArg,
+    terms: Option<(u128, u128, u128)>,
+    chain: Arc<dyn ChainBackend>,
+    buyer: Arc<dexdo::buyer::Buyer>,
+    deals: Arc<dexdo::buyer::api::RouteManager>,
+    pool_note_addr: Option<String>,
+    content_check: dexdo::buyer::api::ContentCheck,
+    models_cfg: Arc<dexdo::seller::ModelsConfig>,
+    api_failure_policy: dexdo::buyer::api::BuyerApiFailurePolicy,
+    spelling_diverged: bool,
+    frame_model: String,
+    deals_dir: Option<std::path::PathBuf>,
+) -> Option<tokio::task::JoinHandle<BuyerRunEnd>> {
+    if mode == ContinuityModeArg::Off {
+        return Some(spawn_buyer_deal_end_watch(chain, deals));
+    }
+    let (ticks, max_price, escrow) = terms?;
+    spawn_buyer_service_renewal(
+        chain,
+        buyer,
+        deals,
+        pool_note_addr,
+        ticks,
+        max_price,
+        escrow,
+        mode.as_planner_mode(),
+        content_check,
+        models_cfg,
+        api_failure_policy,
+        spelling_diverged,
+        frame_model,
+        deals_dir,
+        None,
+    )
+}
+
+/// The continuity watcher behind a serving buyer, and the end it called, if it called one.
+
+/// The endpoint's shutdown waits on the operator's signal OR on this watcher ending the run; once
+/// shutdown is signalled, the watcher is aborted and joined before HTTP drain and cancellation.
+/// It cannot place another BUY while the endpoint drains an in-flight response.
+#[derive(Clone)]
+struct BuyerContinuityTask {
+    task: Arc<tokio::sync::Mutex<Option<tokio::task::JoinHandle<BuyerRunEnd>>>>,
+    end: Arc<std::sync::Mutex<Option<BuyerRunEnd>>>,
+}
+
+impl BuyerContinuityTask {
+    fn new(task: Option<tokio::task::JoinHandle<BuyerRunEnd>>) -> Self {
+        Self {
+            task: Arc::new(tokio::sync::Mutex::new(task)),
+            end: Arc::new(std::sync::Mutex::new(None)),
+        }
+    }
+
+    fn shutdown_with(&self, operator: BuyerShutdownSignal) -> BuyerShutdownSignal {
+        let task = self.task.clone();
+        let abort_task = task.clone();
+        let end = self.end.clone();
+        Box::pin(async move {
+            let watcher = async move {
+                let mut slot = task.lock().await;
+                let Some(running) = slot.as_mut() else {
+                    return std::future::pending::<()>().await;
+                };
+                let ended = running.await;
+                *slot = None;
+                match ended {
+                    Ok(ended) => {
+                        *end.lock()
+                            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(ended);
+                    }
+                    Err(_) => std::future::pending::<()>().await,
+                }
+            };
+            tokio::select! {
+                () = operator => {}
+                () = watcher => {}
+            }
+            if let Some(running) = abort_task.lock().await.take() {
+                running.abort();
+                let _ = running.await;
+            }
+        })
+    }
+
+    async fn stop(&self) -> Option<BuyerRunEnd> {
+        if let Some(running) = self.task.lock().await.take() {
+            running.abort();
+            let _ = running.await;
+        }
+        self.end
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take()
+    }
+}
+
+/// Reconcile purchases at the stop boundary, before HTTP graceful drain can wait on them.
+fn buyer_api_shutdown_before_drain(
+    continuity: &BuyerContinuityTask,
+    operator: BuyerShutdownSignal,
+    deals: Arc<dexdo::buyer::api::RouteManager>,
+    chain: Arc<dyn ChainBackend>,
+    args: Arc<BuyerArgs>,
+) -> (
+    BuyerShutdownSignal,
+    tokio::sync::oneshot::Receiver<Result<()>>,
+) {
+    let stopped = continuity.shutdown_with(operator);
+    let (finished, result) = tokio::sync::oneshot::channel();
+    let shutdown = Box::pin(async move {
+        stopped.await;
+        deals.stop_purchases().await;
+        let outcome = cancel_resting_buyer_order_at_stop(chain.as_ref(), args.as_ref()).await;
+        let _ = finished.send(outcome);
     });
+    (shutdown, result)
+}
+
+/// Save the same checked match attribution used by durable recovery, without adopting or resending.
+async fn persist_buyer_fill_at_stop(
+    chain: &dyn ChainBackend,
+    journal: &BuyerSubmitJournal,
+    path: &std::path::Path,
+    note: &str,
+    cursor: &mut dexdo_core::MatchWatchCursor,
+) -> Result<bool> {
+    let fills = chain
+        .poll_matched_model_buys_for_order_book(&journal.order_book, cursor)
+        .await?;
+    if fills.is_empty() {
+        return Ok(false);
+    }
+    let matching = fills
+        .into_iter()
+        .filter(|fill| {
+            correlated_buy_token_contract(
+                fill.clone(),
+                journal.quote.fills.first(),
+                journal.ticks,
+                journal.max_price_per_tick,
+            )
+            .is_ok()
+        })
+        .collect::<Vec<_>>();
+    if matching.len() != 1 {
+        bail!(
+            "stop found {} correlated BUY fills; durable record is kept without adoption",
+            matching.len()
+        );
+    }
+    persist_resolved_buyer_submits(path, note, &[journal_match(&matching[0])])?;
+    Ok(true)
+}
+
+/// A stopping buyer takes its own resting BUY out of the book before it exits.
+
+/// The durable submit journal names this note's last BUY -- the first one or a replacement -- and
+/// the book's own facts say whether it is still resting. Only an order the book still holds for
+/// this note is cancelled, and the record is closed only by the book's cancellation fact, so the
+/// next start finds no pending money and no record from another invocation.
+
+/// Returns the cancelled order id, or `None` for a proven terminal refund/no order or a paid fill
+/// retained with durable attribution for the next recovery invocation.
+async fn cancel_resting_buyer_order(
+    chain: &dyn ChainBackend,
+    note_addr: &str,
+) -> Result<Option<u128>> {
+    let mut money_lock = BuyerMoneyLock::open(note_addr)?;
+    if !money_lock.journal_path.exists() {
+        return Ok(None);
+    }
+    money_lock.try_acquire()?;
+    let note = money_lock.note_addr.clone();
+    let Some(mut journal) = load_buyer_submit_journal(&money_lock.journal_path, &note)? else {
+        return Ok(None);
+    };
+    if !chain
+        .model_buy_order_book_identity()
+        .is_some_and(|order_book| order_book.eq_ignore_ascii_case(&journal.order_book))
+    {
+        return Ok(None);
+    }
+    let wait = std::time::Duration::from_secs(dexdo_core::params::DEFAULT_CHAIN_READ_TIMEOUT_SECS);
+    let started = tokio::time::Instant::now();
+    let mut cursor = journal.cursor.clone();
+    let order_id = loop {
+        let facts = chain
+            .buyer_order_facts_for_note(&journal.order_book, &note)
+            .await?;
+        let standing = classify_buyer_submit_standing(&journal, &facts, unix_now_secs());
+        if standing.closes_record() {
+            clear_buyer_submit_journal(&money_lock.journal_path)?;
+            return Ok(None);
+        }
+        if persist_buyer_fill_at_stop(
+            chain,
+            &journal,
+            &money_lock.journal_path,
+            &note,
+            &mut cursor,
+        )
+        .await?
+        {
+            return Ok(None);
+        }
+        match standing {
+            BuyerSubmitStanding::Resting { order_id, .. }
+            | BuyerSubmitStanding::Expired {
+                order_id,
+                cleared: false,
+                ..
+            } => break order_id,
+            _ => {}
+        }
+        // Stop can interrupt the POST before the book records Placed. Reconcile that same BUY;
+        // absence of a placement is neither proof that nothing was sent nor permission to resend.
+        if started.elapsed() >= wait {
+            bail!(
+                "BUY outcome in order book {} was not confirmed within {}s at stop; \
+                 the durable buyer record is kept; {}",
+                display_dexdo_address(&journal.order_book),
+                wait.as_secs(),
+                standing.describe(&journal)
+            );
+        }
+        tokio::time::sleep(BUYER_SUBMIT_RECONCILE_POLL_INTERVAL).await;
+    };
+    persist_buyer_submit_order_id(&money_lock.journal_path, &note, order_id)?;
+    journal.order_id = Some(order_id);
+    // A fill or expiry can win the race with cancel, including a rejected/ambiguous cancel send.
+    // Never repeat the send: wait for the same order's paid fill or proven terminal refund.
+    let cancel_error = chain.cancel_buyer_order(order_id).await.err();
+    let started = tokio::time::Instant::now();
+    loop {
+        let facts = chain
+            .buyer_order_facts_for_note(&journal.order_book, &note)
+            .await?;
+        let standing = classify_buyer_submit_standing(&journal, &facts, unix_now_secs());
+        if persist_buyer_fill_at_stop(
+            chain,
+            &journal,
+            &money_lock.journal_path,
+            &note,
+            &mut cursor,
+        )
+        .await?
+        {
+            return Ok(None);
+        }
+        if standing.closes_record() {
+            clear_buyer_submit_journal(&money_lock.journal_path)?;
+            return Ok(
+                matches!(standing, BuyerSubmitStanding::Cancelled { .. }).then_some(order_id)
+            );
+        }
+        if started.elapsed() >= wait {
+            bail!(
+                "cancel of resting buy order #{order_id} in order book {} was attempted, but the book has \
+                 not confirmed a fill or refund within {}s; the durable buyer record is kept; cancel_error={cancel_error:?}",
+                display_dexdo_address(&journal.order_book),
+                wait.as_secs()
+            );
+        }
+        tokio::time::sleep(BUYER_SUBMIT_RECONCILE_POLL_INTERVAL).await;
+    }
+}
+
+/// Cancel the resting BUY at stop, and say what happened. A stop that cannot reach the book
+/// still ends: the record stays for the next start to reconcile, and the line says so.
+async fn cancel_resting_buyer_order_at_stop(
+    chain: &dyn ChainBackend,
+    args: &BuyerArgs,
+) -> Result<()> {
+    let Some(note_addr) = args
+        .identity
+        .note_addr
+        .as_deref()
+        .filter(|_| !args.mock.mock_chain)
+    else {
+        return Ok(());
+    };
+    match cancel_resting_buyer_order(chain, note_addr).await {
+        Ok(Some(order_id)) => {
+            eprintln!("buyer_order_cancelled order_id={order_id} reason=stop");
+        }
+        Ok(None) => {}
+        Err(error) => {
+            eprintln!("buyer_order_cancel_failed reason=stop error={error:#}");
+            return Err(error);
+        }
+    }
+    Ok(())
 }
 
 #[derive(Clone, Copy)]
@@ -7780,13 +8187,106 @@ struct BuyerCommandRuntime {
 }
 
 impl BuyerCommandRuntime {
-    fn production() -> Self {
+    /// `stopped` is the operator's stop, already being listened for: the endpoint drains on it, and
+    /// a stop that comes before the endpoint is up is [`run_buyer_until_stopped`]'s.
+    fn production(stopped: tokio::sync::watch::Receiver<bool>) -> Self {
         Self {
             backend: None,
             chain_preflight: BuyerChainPreflight::Production,
-            shutdown: Box::pin(operator_shutdown_signal()),
+            shutdown: Box::pin(operator_stopped(stopped)),
         }
     }
+}
+
+async fn operator_stopped(mut stopped: tokio::sync::watch::Receiver<bool>) {
+    if stopped.wait_for(|stopped| *stopped).await.is_err() {
+        std::future::pending::<()>().await;
+    }
+}
+
+/// A production buyer's chain and note, recorded as soon as they exist, and whether its endpoint
+/// is up yet.
+#[derive(Default)]
+struct BuyerStopTarget {
+    chain: std::sync::Mutex<Option<(Arc<dyn ChainBackend>, String)>>,
+    serving: std::sync::atomic::AtomicBool,
+}
+
+tokio::task_local! {
+    static BUYER_STOP_TARGET: Arc<BuyerStopTarget>;
+}
+
+fn record_buyer_stop_target(chain: &Arc<dyn ChainBackend>, args: &BuyerArgs) {
+    if args.mock.mock_chain {
+        return;
+    }
+    let Some(note_addr) = args.identity.note_addr.clone() else {
+        return;
+    };
+    let _ = BUYER_STOP_TARGET.try_with(|target| {
+        *target
+            .chain
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some((chain.clone(), note_addr));
+    });
+}
+
+/// From here on the endpoint's own graceful shutdown answers the operator's stop.
+fn mark_buyer_serving() {
+    let _ = BUYER_STOP_TARGET.try_with(|target| {
+        target
+            .serving
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+    });
+}
+
+/// Run the buyer until it finishes, or until the operator stops it before its endpoint is up
+/// .
+
+/// Before the endpoint serves, the signal used to end the process where it stood. That is still
+/// what happens to the run -- it is dropped at its current await -- but the process now lives long
+/// enough to take this note's resting BUY out of the book, so a buyer stopped while it waits for a
+/// seller leaves no order behind and the next start finds no record of this one.
+async fn run_buyer_until_stopped(
+    run: impl std::future::Future<Output = Result<()>>,
+    mut stopped: tokio::sync::watch::Receiver<bool>,
+) -> Result<()> {
+    let target = Arc::new(BuyerStopTarget::default());
+    let before_serving = {
+        let target = target.clone();
+        async move {
+            if stopped.wait_for(|stopped| *stopped).await.is_err()
+                || target.serving.load(std::sync::atomic::Ordering::SeqCst)
+            {
+                std::future::pending::<()>().await;
+            }
+        }
+    };
+    tokio::select! {
+        result = BUYER_STOP_TARGET.scope(target.clone(), run) => result,
+        () = before_serving => Err(stopped_before_serving(&target).await),
+    }
+}
+
+async fn stopped_before_serving(target: &BuyerStopTarget) -> anyhow::Error {
+    let recorded = target
+        .chain
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .clone();
+    let resting = match recorded {
+        None => "no buy had been placed".to_string(),
+        Some((chain, note_addr)) => {
+            match cancel_resting_buyer_order(chain.as_ref(), &note_addr).await {
+                Ok(Some(order_id)) => format!(
+                    "its resting buy order #{order_id} was cancelled, and the book confirmed it"
+                ),
+                Ok(None) => "no buy of this note was resting in the book".to_string(),
+                Err(error) => format!("its resting buy could not be cancelled: {error:#}"),
+            }
+        }
+    };
+    anyhow::anyhow!("the buyer was stopped before its endpoint came up; {resting}")
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -10240,13 +10740,22 @@ pub(crate) async fn run_buyer(args: BuyerArgs) -> Result<()> {
     let json_mode = args.json;
     let mut machine_events = json_mode.then(machine::BuyerEventWriter::new);
     let mut machine_context = BuyerMachineErrorContext::default();
-    let result = run_buyer_inner(
-        args,
-        &mut machine_events,
-        &mut machine_context,
-        BuyerCommandRuntime::production(),
+    let (stop, stopped) = tokio::sync::watch::channel(false);
+    let signal = tokio::spawn(async move {
+        operator_shutdown_signal().await;
+        let _ = stop.send(true);
+    });
+    let result = run_buyer_until_stopped(
+        run_buyer_inner(
+            args,
+            &mut machine_events,
+            &mut machine_context,
+            BuyerCommandRuntime::production(stopped.clone()),
+        ),
+        stopped,
     )
     .await;
+    signal.abort();
     // An order already waiting is an answer, not a failure -- for a person. Nothing was sent and the
     // command has nothing left to do, so the block is the result and the run ends successfully.
 
@@ -10974,7 +11483,10 @@ async fn prepare_lazy_buyer_api_deal_once(
             buyer.as_ref(),
             args.identity.note_addr.as_deref(),
             &BuyerSubmitIntent::on_demand(),
-            explicit_tc.as_deref(),
+            // A resting bid's record names no deal, so a restart looks for none.
+            explicit_tc
+                .as_deref()
+                .filter(|_| !chain.allows_resting_model_buy()),
             requested_budget,
             args.resume,
         )
@@ -10985,7 +11497,7 @@ async fn prepare_lazy_buyer_api_deal_once(
     if !args.mock.mock_chain && chain_preflight.should_run() {
         chain_doctor_preflight(
             &crate::cli::commands::manifest_path()?,
-            args.market.as_deref(),
+            buyer_preflight_market(args.as_ref(), explicit_tc.as_deref()),
         )
         .await?;
         if let Some(policy) = load_enabled_model_registry_policy(
@@ -11082,7 +11594,7 @@ async fn prepare_lazy_buyer_api_deal_once(
         (kept.token_contract, kept.ticks)
     } else {
         match explicit_tc.clone() {
-            Some(tc) => {
+            Some(mut tc) => {
                 if args.resume {
                     emit_shared_buyer_event(
                         &events,
@@ -11138,7 +11650,8 @@ async fn prepare_lazy_buyer_api_deal_once(
                         args.mock.mock_chain,
                         args.identity.note_addr.as_deref(),
                         &BuyerSubmitIntent::on_demand(),
-                        Some(&tc),
+                        // a resting bid targets no deal; its record names none either.
+                        (!selection.resting_buy).then_some(tc.as_str()),
                         &selection,
                         budget.ticks,
                         budget.max_price_per_tick,
@@ -11176,7 +11689,10 @@ async fn prepare_lazy_buyer_api_deal_once(
                         }),
                     )
                     .await?;
-                    if !outcome.token_contract.eq_ignore_ascii_case(&tc) {
+                    if selection.resting_buy {
+                        // a resting bid is filled by the first seller whose ask crosses it.
+                        tc = outcome.token_contract.clone();
+                    } else if !outcome.token_contract.eq_ignore_ascii_case(&tc) {
                         bail!(
                             "explicit on-demand submit matched {}, expected {}",
                             display_token_contract(&outcome.token_contract),
@@ -11617,7 +12133,11 @@ async fn prepare_lazy_buyer_api_deal_once(
             note_addr,
             frame_model: &frame_model,
             market: None,
-            market_path: args.market.as_deref(),
+            market_path: market_path_for_deal(
+                args.market.as_deref(),
+                explicit_tc.as_deref(),
+                &token_contract,
+            ),
             contracts: &crate::cli::commands::manifest_path()?,
             endpoint,
             created_order_ids: buyer_order_id.into_iter().collect(),
@@ -11755,6 +12275,12 @@ fn build_on_demand_buyer_api_state_with(
     kept_open_wait: Arc<OnDemandKeptOpen>,
 ) -> dexdo::buyer::api::ApiState {
     let raised_money = Arc::new(std::sync::Mutex::new(raised_money));
+    // `--market`/`--token-contract` name the FIRST deal. Once a deal has been served, that
+    // one has ended and cannot be bought again, so every later purchase is a replacement on the
+    // model book -- the same purchase a run started by model makes.
+    let explicit_tc = Arc::new(std::sync::Mutex::new(
+        explicit_tc.filter(|_| pre_adopted_deal.is_none()),
+    ));
     let initializer = {
         let chain = chain.clone();
         let buyer = buyer.clone();
@@ -11771,7 +12297,11 @@ fn build_on_demand_buyer_api_state_with(
             let chain = chain.clone();
             let buyer = buyer.clone();
             let args = args.clone();
-            let explicit_tc = explicit_tc.clone();
+            let explicit_slot = explicit_tc.clone();
+            let explicit_tc = explicit_slot
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .clone();
             let frame_model = frame_model.clone();
             let content_check = content_check.clone();
             let models_cfg = models_cfg.clone();
@@ -11784,7 +12314,8 @@ fn build_on_demand_buyer_api_state_with(
                 .take();
             Box::pin(
                 ON_DEMAND_KEPT_OPEN_WAIT.scope(kept_open_wait.clone(), async move {
-                    prepare_lazy_buyer_api_deal_with_replay_backoff(
+                    let resting_allowed = chain.allows_resting_model_buy();
+                    let prepared = prepare_lazy_buyer_api_deal_with_replay_backoff(
                         chain,
                         buyer,
                         args,
@@ -11799,7 +12330,26 @@ fn build_on_demand_buyer_api_state_with(
                         raised_money,
                         chain_preflight,
                     )
-                    .await
+                    .await;
+                    match &prepared {
+                        Ok(_) => {
+                            *explicit_slot
+                                .lock()
+                                .unwrap_or_else(|poisoned| poisoned.into_inner()) = None;
+                        }
+                        // without `--wait-for-seller`, a purchase that finds no seller --
+                        // the first one or a replacement -- ends the buyer, as a first buy does.
+                        Err(error) if !resting_allowed => {
+                            let reason = error.to_string();
+                            if dexdo_core::params::book_refusal_class(&reason).is_some() {
+                                let _ = ON_DEMAND_KEPT_OPEN_WAIT.try_with(|shared| {
+                                    shared.stopped.send_replace(Some(reason));
+                                });
+                            }
+                        }
+                        Err(_) => {}
+                    }
+                    prepared
                 }),
             ) as dexdo::buyer::api::DealInitFuture
         }) as dexdo::buyer::api::DealInitializer
@@ -11840,29 +12390,6 @@ fn build_on_demand_buyer_api_state_with(
     };
     state.renewal_enabled = recover_terminal_model_deal;
     state.with_mock_model(mock_model)
-}
-
-fn model_only_on_demand_recovery_enabled(
-    _mock_chain: bool,
-    has_explicit_token_contract: bool,
-    has_market_manifest: bool,
-) -> bool {
-    !has_explicit_token_contract && !has_market_manifest
-}
-
-fn model_only_on_demand_continuation_budget(
-    mock_chain: bool,
-    has_explicit_token_contract: bool,
-    has_market_manifest: bool,
-    budget: Option<BuyerFreshBuyBudget>,
-) -> Option<BuyerFreshBuyBudget> {
-    budget.filter(|_| {
-        model_only_on_demand_recovery_enabled(
-            mock_chain,
-            has_explicit_token_contract,
-            has_market_manifest,
-        )
-    })
 }
 
 fn use_on_demand_local_api(
@@ -11932,6 +12459,9 @@ fn render_local_openai_handoff(
     // Named as spending or not spending, because that is what the choice does to an operator's
     // money -- "proactive" and "on-demand" are the flag's words, not an answer to "what will it do".
     let idle = match (fresh_continuation_enabled, continuity_mode) {
+        (_, ContinuityModeArg::Off) => {
+            "serves only the current deal and exits when it ends; no replacement BUY is made"
+        }
         (false, _) => "serves only the current deal; no replacement BUY is enabled",
         (true, ContinuityModeArg::Proactive) => {
             "may pre-buy a replacement while you are not asking; `--continuity-mode on-demand` \
@@ -12037,12 +12567,8 @@ async fn run_buyer_on_demand_local_api(
     let bind = args
         .local_listen
         .ok_or_else(|| anyhow::anyhow!("on-demand local API requires --local-listen"))?;
-    let continuation_budget = model_only_on_demand_continuation_budget(
-        args.mock.mock_chain,
-        explicit_tc.is_some(),
-        args.market.is_some(),
-        buyer_fresh_buy_budget(args.ticks, args.max_price_per_tick, args.escrow),
-    );
+    let continuation_budget =
+        buyer_fresh_buy_budget(args.ticks, args.max_price_per_tick, args.escrow);
     let recover_terminal_model_deal = continuation_budget.is_some();
     let buyer = Arc::new(buyer);
     let args = Arc::new(args);
@@ -12141,8 +12667,9 @@ async fn run_buyer_on_demand_local_api(
     state.delivery_events = Some(delivery_tx);
     state.usage = Some(usage_store.clone());
     let deals = state.deals.clone();
+    let mut renewal = None;
     if let Some(budget) = continuation_budget {
-        spawn_buyer_service_renewal(
+        renewal = spawn_buyer_service_renewal(
             chain.clone(),
             buyer,
             deals.clone(),
@@ -12157,9 +12684,18 @@ async fn run_buyer_on_demand_local_api(
             spelling_diverged,
             frame_model.clone(),
             args.deals_dir.clone(),
-            args.market.clone(),
+            None,
         );
     }
+    let continuity = BuyerContinuityTask::new(renewal);
+    let (shutdown, cancelled) = buyer_api_shutdown_before_drain(
+        &continuity,
+        shutdown,
+        deals.clone(),
+        chain.clone(),
+        args.clone(),
+    );
+    mark_buyer_serving();
     let (addr, task) = match api::serve(bind, state, shutdown).await {
         Ok(ok) => ok,
         Err(err) => {
@@ -12295,8 +12831,22 @@ async fn run_buyer_on_demand_local_api(
     usage_worker.abort();
     let _ = usage_worker.await;
     reconcile_buyer_usage(&usage_store, args.as_ref()).await;
+    // the watcher first, then this note's own resting BUY leaves the book.
+    let run_end = continuity.stop().await;
+    if task_result.is_err() {
+        deals.stop_purchases().await;
+        cancel_resting_buyer_order_at_stop(chain.as_ref(), args.as_ref()).await?;
+    } else {
+        cancelled
+            .await
+            .context("buyer shutdown did not reconcile pending purchases")??;
+    }
+    if let Some(BuyerRunEnd::NoSeller { reason }) = run_end {
+        return Err(anyhow::anyhow!(reason));
+    }
     task_result?;
-    // A kept-open wait found its deal closed on chain: the buyer stops with that one error line.
+    // A kept-open wait found its deal closed on chain, or a purchase without --wait-for-seller found
+    // no seller: the buyer stops with that one error line.
     if let Some(reason) = kept_open_stopped.borrow_and_update().clone() {
         return Err(anyhow::anyhow!(reason));
     }
@@ -12440,6 +12990,49 @@ fn render_allow_unverified_model_warning() -> String {
     )
 }
 
+/// The market file a deal handle records: only one that describes THIS deal.
+
+/// A resting buy is filled by the first seller whose ask crosses it, and a replacement is bought
+/// from the model book, so a run started with `--market` can hold a deal its file does not describe;
+/// recording the file there would be a handle that contradicts itself.
+fn market_path_for_deal<'a>(
+    market: Option<&'a std::path::Path>,
+    market_token_contract: Option<&str>,
+    token_contract: &str,
+) -> Option<&'a std::path::Path> {
+    market.filter(|_| {
+        market_token_contract
+            .is_some_and(|tc| deals::normalize_addr(tc) == deals::normalize_addr(token_contract))
+    })
+}
+
+/// `--wait-for-seller` answers "what if no seller is there", and it answers it the same way
+/// for a buy by model, `--market` and `--token-contract`: `placeInferenceBuy` names a model book,
+/// never a deal, so a resting BUY is the same order whichever of the three named the book.
+
+/// What is still refused is a run that places no buy of its own to rest: `--resume` adopts a deal
+/// without buying one, and `--mock-chain` has no book a BUY could rest in.
+fn refuse_wait_for_seller_without_a_buy(args: &BuyerArgs) -> Result<()> {
+    if args.wait_for_seller && (args.mock.mock_chain || args.resume) {
+        bail!(
+            "--wait-for-seller lets a fresh real-chain buy rest in the model book; --resume adopts \
+             an existing deal without a new buy, and --mock-chain has no book to rest in"
+        );
+    }
+    Ok(())
+}
+
+/// A model-book purchase still verifies the network and registry/book binding, but does not
+/// require the market file's original deal to remain alive. Only an immediate explicit buy does.
+fn buyer_preflight_market<'a>(
+    args: &'a BuyerArgs,
+    explicit_tc: Option<&str>,
+) -> Option<&'a std::path::Path> {
+    args.market
+        .as_deref()
+        .filter(|_| explicit_tc.is_some() && !args.wait_for_seller)
+}
+
 async fn run_buyer_inner(
     mut args: BuyerArgs,
     machine_events: &mut Option<machine::BuyerEventWriter>,
@@ -12454,17 +13047,7 @@ async fn run_buyer_inner(
         chain_preflight,
         shutdown,
     } = runtime;
-    if args.wait_for_seller
-        && (args.mock.mock_chain
-            || args.resume
-            || args.market.is_some()
-            || args.token_contract.is_some())
-    {
-        bail!(
-            "--wait-for-seller is only valid for a fresh real-chain model-only buy \
-             (--frame-model without --market/--token-contract/--resume/--mock-chain)"
-        );
-    }
+    refuse_wait_for_seller_without_a_buy(&args)?;
     // a planned restart is a `--local-listen` thing. The one-shot runtime streams once and
     // ends; there is no next process to hand the deal to, so honoring the flag there would only be a
     // way to take delivery of a stream and skip the terminal that pays for it. Refused before any
@@ -12596,7 +13179,7 @@ async fn run_buyer_inner(
     let frame_model = if let Some(policy) = registry_policy.as_ref() {
         chain_doctor_preflight(
             &crate::cli::commands::manifest_path()?,
-            args.market.as_deref(),
+            buyer_preflight_market(&args, explicit_tc.as_deref()),
         )
         .await?;
         reject_buyer_raw_token_contract_without_registry_book_proof(
@@ -12830,6 +13413,7 @@ async fn run_buyer_inner(
     } else {
         buyer_real_backend(&args, &frame_model)?
     };
+    record_buyer_stop_target(&chain, &args);
     let buyer = dexdo::buyer::Buyer::from_note(note);
     let mut subscription_resume = BuyerSubscriptionResumeCandidate::None;
     if args.resume && !args.mock.mock_chain {
@@ -12889,7 +13473,10 @@ async fn run_buyer_inner(
             &buyer,
             args.identity.note_addr.as_deref(),
             &submit_intent,
-            explicit_tc.as_deref(),
+            // A resting bid's record names no deal, so a restart looks for none.
+            explicit_tc
+                .as_deref()
+                .filter(|_| !chain.allows_resting_model_buy()),
             requested_budget,
             args.resume,
         )
@@ -12928,7 +13515,7 @@ async fn run_buyer_inner(
     if !args.mock.mock_chain && registry_policy.is_none() && chain_preflight.should_run() {
         chain_doctor_preflight(
             &crate::cli::commands::manifest_path()?,
-            args.market.as_deref(),
+            buyer_preflight_market(&args, explicit_tc.as_deref()),
         )
         .await?;
     }
@@ -12940,6 +13527,12 @@ async fn run_buyer_inner(
         .map(|reconciliation| reconciliation.submit_identity.clone());
     let resumed_from_ordinary_journal = args.resume && raised_money.is_some();
     let mut service_renewal: Option<(u128, u128, u128)> = None;
+    // the terms a replacement BUY is placed at, for every buy method. `service_renewal` stays
+    // what it was -- the model-only routing a failure policy may buy its next seller with.
+    let mut continuation_terms: Option<(u128, u128, u128)> = None;
+    // The deal `--market` describes. A resting buy may be filled by another deal of the same book,
+    // and the market file then describes a deal this run does not hold.
+    let market_token_contract = explicit_tc.clone();
     let mut buyer_order_id = None;
     let mut subscription_route_budget = None;
     let mut preserve_subscription = false;
@@ -13044,7 +13637,7 @@ async fn run_buyer_inner(
         }
     } else {
         match explicit_tc {
-            Some(tc) => {
+            Some(mut tc) => {
                 if args.resume {
                     // Connect to an ALREADY-matched deal -- escrow is already committed; a fresh place_buy would
                     // double-pay. Skip straight to reading the on-chain handover + serving.
@@ -13122,7 +13715,8 @@ async fn run_buyer_inner(
                         args.mock.mock_chain,
                         args.identity.note_addr.as_deref(),
                         &submit_intent,
-                        Some(&tc),
+                        // a resting bid targets no deal; its record names none either.
+                        (!selection.resting_buy).then_some(tc.as_str()),
                         &selection,
                         budget.ticks,
                         budget.max_price_per_tick,
@@ -13163,12 +13757,22 @@ async fn run_buyer_inner(
                             }),
                         )?;
                     }
-                    if !outcome.token_contract.eq_ignore_ascii_case(&tc) {
+                    if selection.resting_buy {
+                        // the bid rested on the model book, and the first seller whose ask
+                        // crossed it filled it. That deal is the one this escrow paid for.
+                        tc = outcome.token_contract.clone();
+                        machine_context.set_token_contract(&tc);
+                    } else if !outcome.token_contract.eq_ignore_ascii_case(&tc) {
                         bail!(
                             "explicit buyer submit matched {}, expected {}; journal retained",
                             display_token_contract(&outcome.token_contract),
                             display_token_contract(&tc)
                         );
+                    }
+                    // The practice market has no model book a replacement could be bought from.
+                    if !args.mock.mock_chain {
+                        continuation_terms =
+                            Some((budget.ticks, budget.max_price_per_tick, budget.escrow));
                     }
                 }
                 (tc, args.ticks)
@@ -13328,6 +13932,7 @@ async fn run_buyer_inner(
                     .escrow
                     .unwrap_or_else(|| dexdo_core::required_escrow_for_buy(ticks, max_price));
                 service_renewal = Some((ticks, max_price, escrow));
+                continuation_terms = service_renewal;
                 require_stream_buy_ticks(ticks)?;
                 if machine_events.is_none() {
                     crate::cli::progress::step(BUYER_STEP_PLACING.0);
@@ -13698,7 +14303,11 @@ async fn run_buyer_inner(
             note_addr,
             frame_model: &frame_model,
             market: None,
-            market_path: args.market.as_deref(),
+            market_path: market_path_for_deal(
+                args.market.as_deref(),
+                market_token_contract.as_deref(),
+                &token_contract,
+            ),
             contracts: &crate::cli::commands::manifest_path()?,
             endpoint,
             created_order_ids: buyer_order_id.into_iter().collect(),
@@ -13719,7 +14328,6 @@ async fn run_buyer_inner(
     // the consumer (OpenAI- and Anthropic-compatible paths, forwarded as sent) and serve requests.
     if let Some(bind) = args.local_listen {
         use dexdo::buyer::api::{self, ApiState, Route};
-        let continuity_mode = args.continuity_mode.as_planner_mode();
         tracing::info!(
             continuity_mode = args.continuity_mode.as_str(),
             "buyer continuity mode selected"
@@ -13779,31 +14387,36 @@ async fn run_buyer_inner(
             usage_store.expect("local-listen usage history preflighted before money preparation");
         state.usage = Some(usage_store.clone());
         let deals = state.deals.clone();
-        let fresh_continuation_enabled = service_renewal.is_some();
+        let fresh_continuation_enabled =
+            continuation_terms.is_some() && args.continuity_mode != ContinuityModeArg::Off;
         state.renewal_enabled = fresh_continuation_enabled;
-        if let Some((ticks, max_price, escrow)) = service_renewal {
-            spawn_buyer_service_renewal(
-                chain.clone(),
-                state.buyer.clone(),
-                state.deals.clone(),
-                if args.mock.mock_chain {
-                    None
-                } else {
-                    args.identity.note_addr.clone()
-                },
-                ticks,
-                max_price,
-                escrow,
-                continuity_mode,
-                renewal_content_check,
-                models_cfg.clone(),
-                api_failure_policy,
-                spelling_diverged,
-                frame_model.clone(),
-                args.deals_dir.clone(),
-                args.market.clone(),
-            );
-        }
+        // one watcher per mode, the same for every buy method. `off` ends the run when the
+        // deal ends; the other two buy a replacement at `continuation_terms`.
+        let continuity = BuyerContinuityTask::new(spawn_buyer_continuity(
+            args.continuity_mode,
+            continuation_terms,
+            chain.clone(),
+            state.buyer.clone(),
+            state.deals.clone(),
+            if args.mock.mock_chain {
+                None
+            } else {
+                args.identity.note_addr.clone()
+            },
+            renewal_content_check,
+            models_cfg.clone(),
+            api_failure_policy,
+            spelling_diverged,
+            frame_model.clone(),
+            args.deals_dir.clone(),
+        ));
+        let (shutdown, cancelled) = buyer_api_shutdown_before_drain(
+            &continuity,
+            shutdown,
+            deals.clone(),
+            chain.clone(),
+            Arc::new(args.clone()),
+        );
         // SIGINT/SIGTERM drains in-flight responses and closes the listener. Ordinary deals retain the awaited
         // STOP; a durable subscription performs no chain write and remains resumable.
         if let Some(events) = machine_events.as_mut() {
@@ -13818,6 +14431,7 @@ async fn run_buyer_inner(
                 }),
             )?;
         }
+        mark_buyer_serving();
         let (addr, task) = api::serve(bind, state, shutdown).await?;
         let base_url = format!("http://{addr}/v1");
         let models_url = format!("{base_url}/models");
@@ -13898,12 +14512,35 @@ async fn run_buyer_inner(
         usage_worker.abort();
         let _ = usage_worker.await;
         reconcile_buyer_usage(&usage_store, &args).await;
+        // the watcher goes first, so it can place nothing after the cancel below has looked;
+        // then this note's own resting BUY -- the first one or a replacement -- leaves the book.
+        let run_end = continuity.stop().await;
+        if task_result.is_err() {
+            deals.stop_purchases().await;
+            cancel_resting_buyer_order_at_stop(chain.as_ref(), &args).await?;
+        } else {
+            cancelled
+                .await
+                .context("buyer shutdown did not reconcile pending purchases")??;
+        }
         task_result?;
+        if let Some(BuyerRunEnd::NoSeller { reason }) = run_end.as_ref() {
+            return Err(anyhow::anyhow!("{reason}"));
+        }
+        let stop_reason = buyer_stop_reason(run_end.as_ref());
         while let Ok(observation) = claim_observations.try_recv() {
             emit_buyer_claim_observation(machine_events, &observation);
         }
         while let Ok(delivery) = deliveries.try_recv() {
             publish_request_delivery(machine_events, args.deals_dir.as_deref(), &delivery)?;
+        }
+        if machine_events.is_none() {
+            if let Some(BuyerRunEnd::DealEnded { token_contract }) = run_end.as_ref() {
+                println!(
+                    "deal {} ended; --continuity-mode off buys no replacement, so this buyer exits",
+                    dexdo_core::address::display_self_dapp(token_contract)
+                );
+            }
         }
         if let Some(events) = machine_events.as_mut() {
             let shutdown_report = buyer_shutdown_report(Some(session.as_ref()));
@@ -13913,7 +14550,7 @@ async fn run_buyer_inner(
                 json!({
                     "token_contract": token_contract.clone(),
                     "deal_handle": deal_handle.clone(),
-                    "reason": "signal"
+                    "reason": stop_reason
                 }),
             )?;
             match shutdown_report {
@@ -18031,20 +18668,7 @@ mod tests {
     }
 
     #[test]
-    fn issue_547_recovery_monitor_is_model_only_and_starts_before_serve() {
-        assert!(super::model_only_on_demand_recovery_enabled(
-            false, false, false
-        ));
-        assert!(super::model_only_on_demand_recovery_enabled(
-            true, false, false
-        ));
-        assert!(!super::model_only_on_demand_recovery_enabled(
-            false, true, false
-        ));
-        assert!(!super::model_only_on_demand_recovery_enabled(
-            false, false, true
-        ));
-
+    fn issue_547_recovery_monitor_starts_before_serve() {
         let source = include_str!("buyer.rs");
         let start = source
             .find("async fn run_buyer_on_demand_local_api")
@@ -18063,43 +18687,13 @@ mod tests {
     #[test]
     fn price_less_resume_disables_continuation_and_explicit_price_is_exact() {
         let chosen = 7 * dexdo_core::PRICE_STEP;
-        let missing = super::model_only_on_demand_continuation_budget(
-            false,
-            false,
-            false,
-            super::buyer_fresh_buy_budget(4, None, None),
-        );
+        let missing = super::buyer_fresh_buy_budget(4, None, None);
         assert_eq!(missing, None, "no price means no fresh continuation");
-        let explicit = super::model_only_on_demand_continuation_budget(
-            false,
-            false,
-            false,
-            super::buyer_fresh_buy_budget(4, Some(chosen), None),
-        )
-        .expect("an explicit price authorizes continuation");
+        let explicit = super::buyer_fresh_buy_budget(4, Some(chosen), None)
+            .expect("an explicit price authorizes continuation");
         assert_eq!(
             explicit.max_price_per_tick, chosen,
             "continuation must preserve the operator's exact ceiling"
-        );
-        let explicit_target = super::model_only_on_demand_continuation_budget(
-            false,
-            true,
-            false,
-            super::buyer_fresh_buy_budget(4, Some(chosen), None),
-        );
-        assert_eq!(
-            explicit_target, None,
-            "an explicit TokenContract resume never installs continuation"
-        );
-        let market_target = super::model_only_on_demand_continuation_budget(
-            false,
-            false,
-            true,
-            super::buyer_fresh_buy_budget(4, Some(chosen), None),
-        );
-        assert_eq!(
-            market_target, None,
-            "a market-target resume never installs continuation"
         );
         assert!(
             !super::use_on_demand_local_api(true, super::ContinuityModeArg::OnDemand, true),
@@ -18146,6 +18740,7 @@ mod tests {
         next_match: Option<dexdo_core::TokenContract>,
         next_match_after_cleanup: Option<dexdo_core::TokenContract>,
         no_deal_state_for: Option<dexdo_core::TokenContract>,
+        deal_state_read_error_for: Option<dexdo_core::TokenContract>,
         model_buy_terms: Option<super::BuyerOrderTerms>,
         model_buy_ambiguous_after_cleanup: bool,
         handover_token_contract: Option<dexdo_core::TokenContract>,
@@ -18581,6 +19176,11 @@ mod tests {
             &self,
             token_contract: &dexdo_core::TokenContract,
         ) -> Result<Option<dexdo_core::DealChainState>, dexdo_core::ChainError> {
+            if self.deal_state_read_error_for.as_ref() == Some(token_contract) {
+                return Err(dexdo_core::ChainError::Transport(
+                    "fixture deal-state read failed".to_string(),
+                ));
+            }
             if self.no_deal_state_for.as_ref() == Some(token_contract) {
                 return Ok(None);
             }
@@ -19647,10 +20247,6 @@ mod tests {
     async fn issue_547_handler_ambiguity_is_fact_confirmed_for_concurrent_http_requests() {
         use std::sync::atomic::Ordering;
 
-        assert!(
-            super::model_only_on_demand_recovery_enabled(true, false, false),
-            "model-only mock-chain runtime must retain recovery and lazy route replacement"
-        );
         const KEY_ENV: &str = "DEXDO_ISSUE_547_AMBIGUOUS_PROVIDER_KEY";
         let _key = EnvVarGuard::set(KEY_ENV, std::ffi::OsStr::new("test-only"));
         let (provider_addr, provider_calls, provider_release, provider_task) =
@@ -32007,4 +32603,5 @@ mod tests {
 
     include!("buyer/issue_2064_test.rs");
     include!("buyer/keep_open_2148_test.rs");
+    include!("buyer/issue_2163_test.rs");
 }

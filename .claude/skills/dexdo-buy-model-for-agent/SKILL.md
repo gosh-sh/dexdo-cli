@@ -77,7 +77,9 @@ live orders with the user's money.
 **Flags:** For an immediate attempt, use
 `buyer --frame-model A --ticks N --max-price-per-tick L` and omit `--wait-for-seller`, `--market`,
 and `--token-contract`; this is `AON|FOK`. Add `--wait-for-seller` to permit a resting `AON` order.
-`--market FILE` selects a manifest; it is not a MARKET-order flag.
+`--market FILE` selects a manifest; it is not a MARKET-order flag. `--wait-for-seller` means the
+same with `--market` or `--token-contract`, and for every replacement buy: a resting buy names the
+model book, not one deal, so the first seller whose ask crosses it fills it.
 
 **Money and time:** The client selects the lowest `(price, order_id)` at or below `L`, but that head
 ask alone must cover `N`. A fill clears at ask `A`. The immediate form fills in full now or rejects
@@ -121,8 +123,9 @@ this one order and deal, not native gas or any separately submitted order.
 deadline with lazy refund.
 
 **Flags:** Add `--wait-for-seller` if an ordinary BUY may rest; without it, `FOK` ends the attempt
-immediately. A subscription placement may rest. Before the deadline, use `orders ... cancel ID` or
-`subscription ... cancel ID`. After it, use `orders ... expire ID`.
+immediately and the buyer exits. A subscription placement may rest. Before the deadline, use
+`orders ... cancel ID` or `subscription ... cancel ID`, or stop the waiting `dexdo buyer`: it
+cancels its own resting BUY before it exits. After the deadline, use `orders ... expire ID`.
 
 **Money and time:** Every CLI BUY deadline is placement time plus 3600 seconds. At the deadline the
 order becomes non-fillable, but time alone sends no transaction. A crossing scan or a
@@ -534,10 +537,13 @@ Two flags worth knowing:
 - `--allow-unverified-model`: named here only so a refusal that mentions it is recognisable. Do not
   offer it to the user as a step. It waives the check that proves the served model is the one bought,
   so it is the user's decision to raise, not the agent's to suggest.
-- `--continuity-mode` (default `proactive`): with `--local-listen` left running, `proactive` keeps a
-  warm next deal ready and **may pre-buy while idle**, spending the probe/idle cost even with no
-  requests. Use `--continuity-mode on-demand` to hold on idle (the first request after idle then
-  waits for a fresh deal).
+- `--continuity-mode` (default `off`): what a `--local-listen` buyer does when its deal ends. `off`
+  buys no replacement, and the buyer exits when the deal ends. `on-demand` buys a replacement on the
+  next request after the deal ends (that request waits for the fresh deal). `proactive` keeps a warm
+  next deal ready and **may pre-buy while idle**, spending the probe/idle cost even with no
+  requests. Each mode works the same whether the deal was bought by model, `--market` or
+  `--token-contract`: a replacement is bought from the model book, at this run's `--ticks` and
+  `--max-price-per-tick`, and `--wait-for-seller` decides whether it may rest there.
 
 ## Phase 9. Use the model
 
@@ -620,9 +626,16 @@ and `P` of the seller bond, and returns the rest of the escrow and the whole buy
 Stop `dexdo buyer` (Ctrl-C) when the session is done. A deal that has delivered tokens closes
 cleanly and leftover escrow returns to the note; a deal that never received a request stays open, as
 described above, and needs `dexdo recover` to end it. Your on-chain exposure per open deal never
-exceeds 2 ticks. Qualifier: under the default `proactive` continuity, a `--local-listen` buyer left
+exceeds 2 ticks. Under the default `--continuity-mode off` the buyer also exits by itself when its
+deal ends. Qualifier: if the user chose `--continuity-mode proactive`, a `--local-listen` buyer left
 running idle may keep pre-buying fresh deals (extra probe/idle spend beyond that 2-tick lock), so
 stop it -- or use `--continuity-mode on-demand` -- when you are not actively sending requests.
+Stopping the buyer also takes its own buy that still rests in the book -- the first one or a
+replacement -- out of the book before the process exits, so the next start begins clean.
+If placement or cancellation cannot be confirmed, it exits with an error and retains recovery
+state; do not submit another BUY over that unresolved record.
+Pending purchases are reconciled before the API drains existing requests. If the buy filled
+at stop, use `--resume` to adopt the saved paid deal without another purchase.
 
 ---
 
@@ -648,10 +661,10 @@ stop it -- or use `--continuity-mode on-demand` -- when you are not actively sen
     --local-listen 127.0.0.1:8080
   ```
 
-  This price-less form cannot place a fresh continuation BUY after the adopted deal ends. Only a
-  model-only resume with `--continuity-mode on-demand` can opt into that later purchase by adding an
-  explicit `--max-price-per-tick`; subscription, `--market`, and `--token-contract` resumes never
-  renew through this flag.
+  This price-less form cannot place a fresh continuation BUY after the adopted deal ends. A resume
+  with `--continuity-mode on-demand` can opt into that later purchase by adding an explicit
+  `--max-price-per-tick`; it is bought from the model book whether the deal was found by model,
+  `--market` or `--token-contract`. A subscription resume never renews through this flag.
 
   (`--resume` also accepts `--market`/`--token-contract`.) If no match happened at all, check the
   seller is up on the same manifest and that your `--max-price-per-tick` was >= the ask (Phase 6).

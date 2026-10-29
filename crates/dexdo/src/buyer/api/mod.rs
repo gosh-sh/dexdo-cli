@@ -1602,6 +1602,7 @@ pub struct RouteManager {
     replace_settled: bool,
     initializer_timeout: Duration,
     initializer_lock: Mutex<()>,
+    purchase_stop: tokio::sync::watch::Sender<bool>,
     usage: StdMutex<Option<Arc<crate::buyer::usage::UsageStore>>>,
 }
 
@@ -1629,6 +1630,7 @@ impl RouteManager {
             replace_settled: false,
             initializer_timeout: MATCH_OPEN_TIMEOUT,
             initializer_lock: Mutex::new(()),
+            purchase_stop: tokio::sync::watch::channel(false).0,
             usage: StdMutex::new(None),
         }
     }
@@ -1640,6 +1642,7 @@ impl RouteManager {
             replace_settled: false,
             initializer_timeout,
             initializer_lock: Mutex::new(()),
+            purchase_stop: tokio::sync::watch::channel(false).0,
             usage: StdMutex::new(None),
         }
     }
@@ -1651,6 +1654,7 @@ impl RouteManager {
             replace_settled: true,
             initializer_timeout,
             initializer_lock: Mutex::new(()),
+            purchase_stop: tokio::sync::watch::channel(false).0,
             usage: StdMutex::new(None),
         }
     }
@@ -1666,6 +1670,7 @@ impl RouteManager {
             replace_settled: true,
             initializer_timeout,
             initializer_lock: Mutex::new(()),
+            purchase_stop: tokio::sync::watch::channel(false).0,
             usage: StdMutex::new(None),
         }
     }
@@ -1678,13 +1683,26 @@ impl RouteManager {
         self.active.read().await.clone()
     }
 
+    /// Stop only unfinished/new purchases; already serving responses retain graceful drain.
+    pub async fn stop_purchases(&self) {
+        self.purchase_stop.send_replace(true);
+        // The initializer drops its future (and money lock) before releasing this lock.
+        let _idle = self.initializer_lock.lock().await;
+    }
+
     pub async fn current_or_prepare(&self) -> Result<ApiDeal, DealInitError> {
         if let Some(active) = self.current().await {
             if !self.replace_settled || !active.session.is_settled() {
                 return Ok(active);
             }
         }
+        let mut stopping = self.purchase_stop.subscribe();
         let _guard = self.initializer_lock.lock().await;
+        if *stopping.borrow() {
+            return Err(DealInitError::new(
+                "buyer stopped before its pending purchase became ready",
+            ));
+        }
         if let Some(active) = self.current().await {
             if !self.replace_settled || !active.session.is_settled() {
                 return Ok(active);
@@ -1694,8 +1712,13 @@ impl RouteManager {
             .initializer
             .as_ref()
             .ok_or_else(|| DealInitError::new("consumer API has no active deal"))?;
-        let prepared = tokio::time::timeout(self.initializer_timeout, initializer())
-            .await
+        let prepared = tokio::select! {
+            biased;
+            _ = stopping.wait_for(|stopped| *stopped) => {
+                return Err(DealInitError::new("buyer stopped before its pending purchase became ready"));
+            }
+            prepared = tokio::time::timeout(self.initializer_timeout, initializer()) => prepared,
+        }
             .map_err(|_| {
                 DealInitError::new(format!(
                     "on-demand purchase timed out after {}s before a deal became ready",

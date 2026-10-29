@@ -394,6 +394,15 @@ pub trait ChainBackend: Send + Sync {
             "buyer order activity reconciliation is not supported by this backend".to_string(),
         ))
     }
+    /// Withdraw one BUY this note still has resting in its own model book.
+
+    /// A stopped buyer takes its resting order out of the book before it exits, so the escrow comes
+    /// back and the next start finds no pending money left behind by the previous one.
+    async fn cancel_buyer_order(&self, _order_id: u128) -> Result<(), ChainError> {
+        Err(ChainError::Chain(
+            "buyer order cancellation is not supported by this backend".to_string(),
+        ))
+    }
     /// Read-only guard for automated model-only buyer selection. The real chain backend
     /// `placeInferenceBuy(modelHash,...)` cannot name an order id or `TokenContract`, so an
     /// executable quote is submit-safe only when the raw on-chain price/time matcher reaches the

@@ -274,14 +274,30 @@ impl RealChainBackend {
         }"#;
         let mut before: Option<String> = None;
         loop {
-            self.client.gate().admit().await;
-            let response = self.http.post(&gql).json(&json!({"query":query,
-                "variables":{"accountId":token_contract.bare(),"dappId":crate::address::DEXDO_DAPP_ID,
-                    "last":crate::params::EXT_OUT_PAGE_SIZE,"before":before}})).send().await?;
-            let response: Value = chain_response_for_status(response).await?.json().await?;
-            if response.get("errors").is_some() {
-                return Err(anyhow!("funding evidence query refused"));
-            }
+            let response: Value = retry_transient_read(|| async {
+                self.client.gate().admit().await;
+                let response = self
+                    .http
+                    .post(&gql)
+                    .json(&json!({
+                        "query": query,
+                        "variables": {
+                            "accountId": token_contract.bare(),
+                            "dappId": crate::address::DEXDO_DAPP_ID,
+                            "last": crate::params::EXT_OUT_PAGE_SIZE,
+                            "before": before,
+                        },
+                    }))
+                    .send()
+                    .await?;
+                let response: Value = chain_response_for_status(response).await?.json().await?;
+                if let Some(errors) = response.get("errors").filter(|errors| !errors.is_null()) {
+                    return Err(anyhow::Error::new(GraphQlBodyError::from_errors(errors))
+                        .context("funding evidence query refused"));
+                }
+                Ok(response)
+            })
+            .await?;
             let messages = response
                 .pointer("/data/blockchain/account/messages")
                 .context("funding history shape changed")?;
@@ -374,24 +390,27 @@ impl RealChainBackend {
         let mut seen = BTreeSet::new();
         let mut before: Option<String> = None;
         loop {
-            self.client.gate().admit().await;
-            let response = self
-                .http
-                .post(&gql)
-                .json(&json!({
-                    "query": query,
-                    "variables": {"accountId": token_contract.bare(),
-                        "dappId": crate::address::DEXDO_DAPP_ID,
-                        "last": crate::params::EXT_OUT_PAGE_SIZE, "before": before}
-                }))
-                .send()
-                .await?;
-            let response: Value = chain_response_for_status(response).await?.json().await?;
-            if response.get("errors").is_some() {
-                return Err(anyhow!(
-                    "buyer operation history GraphQL refused the evidence query"
-                ));
-            }
+            let response: Value = retry_transient_read(|| async {
+                self.client.gate().admit().await;
+                let response = self
+                    .http
+                    .post(&gql)
+                    .json(&json!({
+                        "query": query,
+                        "variables": {"accountId": token_contract.bare(),
+                            "dappId": crate::address::DEXDO_DAPP_ID,
+                            "last": crate::params::EXT_OUT_PAGE_SIZE, "before": before}
+                    }))
+                    .send()
+                    .await?;
+                let response: Value = chain_response_for_status(response).await?.json().await?;
+                if let Some(errors) = response.get("errors").filter(|errors| !errors.is_null()) {
+                    return Err(anyhow::Error::new(GraphQlBodyError::from_errors(errors))
+                        .context("buyer operation history GraphQL refused the evidence query"));
+                }
+                Ok(response)
+            })
+            .await?;
             let messages = response
                 .pointer("/data/blockchain/account/messages")
                 .context("buyer operation history shape changed")?;

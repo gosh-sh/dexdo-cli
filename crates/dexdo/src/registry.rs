@@ -6,6 +6,7 @@
 
 use anyhow::{bail, Context, Result};
 use async_trait::async_trait;
+use dexdo_core::chain::RetryingReads;
 use serde::Deserialize;
 use serde_json::Value;
 use std::path::{Path, PathBuf};
@@ -888,7 +889,7 @@ impl ChainModelRegistryReader {
                     let account = self
                         .chain
                         .client()
-                        .get_account(&self.registry_address)
+                        .get_account_retrying(&self.registry_address)
                         .await?
                         .ok_or_else(|| {
                             // the refusal states the FACT it found -- no registry account at
@@ -2495,3 +2496,7 @@ mod issue_1076_tests {
         );
     }
 }
+
+#[cfg(test)]
+#[path = "registry_issue_2192_tests.rs"]
+mod issue_2192_tests;

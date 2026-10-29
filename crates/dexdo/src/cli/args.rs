@@ -411,7 +411,13 @@ pub(crate) struct BuyerArgs {
     #[arg(long)]
     pub(crate) preserve_deal_on_exit: bool,
     /// Let the whole buy wait in the model book when no seller ask is resting yet. Without this option
-    /// the whole buy either fills immediately from one seller or is rejected and refunded.
+    /// the whole buy either fills immediately from one seller or is rejected and refunded, and a buyer
+    /// that finds no seller exits.
+
+    /// The answer is the same for every buy this run places -- the first one and each replacement
+    /// --continuity-mode on-demand or proactive makes -- and for a buy by model, --market or
+    /// --token-contract alike. A resting buy names the model book, not one deal: the first seller
+    /// whose ask crosses it fills it. A stopped buyer cancels its resting buy before it exits.
     #[arg(long)]
     pub(crate) wait_for_seller: bool,
     /// Issue: load `token_contract` + `frame_model` from a `dexdo provision` market manifest
@@ -432,10 +438,14 @@ pub(crate) struct BuyerArgs {
     /// `--mock-model` seller -- and a parser default would leave nothing able to say it.
     #[arg(long)]
     pub(crate) local_listen: Option<SocketAddr>,
-    /// Continuity mode for --local-listen. proactive keeps a warm next deal ready after the current
-    /// deal closes, reaches low remaining budget, or is absent; it may pre-buy while idle and spend
-    /// the documented probe/idle cost. on-demand buys only after active/recent consumer traffic; it
-    /// avoids idle pre-buy, but the first request that needs a replacement may wait for a fresh deal.
+    /// Continuity mode for --local-listen: what the buyer does when its deal ends. off (the default)
+    /// never buys a replacement: when the deal ends, the buyer exits. proactive keeps a warm next
+    /// deal ready after the current deal closes, reaches low remaining budget, or is absent; it may
+    /// pre-buy while idle and spend the documented probe/idle cost. on-demand buys only after
+    /// active/recent consumer traffic; it avoids idle pre-buy, but the first request that needs a
+    /// replacement may wait for a fresh deal. Each mode works the same for a buy by model, --market
+    /// and --token-contract; a replacement is bought from the model book, and whether it may rest
+    /// there is --wait-for-seller's answer.
 
     /// For a few short requests per hour, use on-demand, start with --ticks 2 when one streaming tick
     /// is enough, and keep the endpoint/deal running; idle alone does not STOP it. Raise --ticks only
@@ -496,22 +506,25 @@ pub(crate) struct BuyerArgs {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
 pub(crate) enum ContinuityModeArg {
-    Proactive,
+    Off,
     OnDemand,
+    Proactive,
 }
 
 impl ContinuityModeArg {
     pub(crate) fn as_str(self) -> &'static str {
         match self {
-            Self::Proactive => "proactive",
+            Self::Off => "off",
             Self::OnDemand => "on-demand",
+            Self::Proactive => "proactive",
         }
     }
 
     pub(crate) fn as_planner_mode(self) -> dexdo::buyer::continuity::ContinuityMode {
         match self {
-            Self::Proactive => dexdo::buyer::continuity::ContinuityMode::Proactive,
+            Self::Off => dexdo::buyer::continuity::ContinuityMode::Off,
             Self::OnDemand => dexdo::buyer::continuity::ContinuityMode::OnDemand,
+            Self::Proactive => dexdo::buyer::continuity::ContinuityMode::Proactive,
         }
     }
 }

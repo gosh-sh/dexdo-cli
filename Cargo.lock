@@ -1896,8 +1896,8 @@ dependencies = [
 
 [[package]]
 name = "dark_dex_halo2_private_witness_export_lib"
-version = "0.2.0"
-source = "git+https://github.com/gosh-sh/dexdo-halo2-kit?tag=dark_dex_halo2_private_witness_export_lib-v0.2.0#965d462a6c8497f936b6d9cbee5ef0a703d48c8f"
+version = "0.3.0"
+source = "git+https://github.com/gosh-sh/dexdo-halo2-kit?tag=dark_dex_halo2_private_witness_export_lib-v0.3.0#a735fadf286e8266fa2bbd436098dd8d9b8a41ce"
 dependencies = [
  "anyhow",
  "clap",
@@ -2055,7 +2055,7 @@ dependencies = [
 [[package]]
 name = "dex-halo2-circuit"
 version = "0.1.0"
-source = "git+https://github.com/gosh-sh/dexdo-halo2-kit?tag=dark_dex_halo2_private_witness_export_lib-v0.2.0#965d462a6c8497f936b6d9cbee5ef0a703d48c8f"
+source = "git+https://github.com/gosh-sh/dexdo-halo2-kit?tag=dark_dex_halo2_private_witness_export_lib-v0.3.0#a735fadf286e8266fa2bbd436098dd8d9b8a41ce"
 dependencies = [
  "clap",
  "dense-balanced-tree",
@@ -2080,7 +2080,7 @@ dependencies = [
 
 [[package]]
 name = "dexdo"
-version = "0.10.0"
+version = "0.11.0"
 dependencies = [
  "anyhow",
  "async-stream",
@@ -2139,7 +2139,7 @@ dependencies = [
 
 [[package]]
 name = "dexdo-core"
-version = "0.10.0"
+version = "0.11.0"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -2169,7 +2169,7 @@ dependencies = [
 
 [[package]]
 name = "dexdo-e2e"
-version = "0.10.0"
+version = "0.11.0"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -2192,7 +2192,7 @@ dependencies = [
 
 [[package]]
 name = "dexdo-proto"
-version = "0.10.0"
+version = "0.11.0"
 dependencies = [
  "prost",
  "protoc-bin-vendored",
@@ -2202,7 +2202,7 @@ dependencies = [
 
 [[package]]
 name = "dexdo-wallet-onboarding"
-version = "0.10.0"
+version = "0.11.0"
 dependencies = [
  "ackinacki-kit",
  "anyhow",
@@ -3042,8 +3042,8 @@ checksum = "0cc23270f6e1808e30a928bdc84dea0b9b4136a8bc82338574f23baf47bbd280"
 
 [[package]]
 name = "gosh-ackinacki"
-version = "0.11.0"
-source = "git+https://github.com/gosh-dot-ai/gosh.ackinacki?tag=gosh-ackinacki-v0.11.0#d6f490cdda5b6fca15214d8e1fab5c2a93b82341"
+version = "0.12.0"
+source = "git+https://github.com/gosh-dot-ai/gosh.ackinacki?tag=gosh-ackinacki-v0.12.0#fc9977540af026d27e116dd5799c1071d6681581"
 dependencies = [
  "aes-gcm",
  "anyhow",
@@ -3259,7 +3259,7 @@ dependencies = [
 [[package]]
 name = "halo2-proover"
 version = "0.3.0"
-source = "git+https://github.com/gosh-sh/dexdo-halo2-kit?tag=dark_dex_halo2_private_witness_export_lib-v0.2.0#965d462a6c8497f936b6d9cbee5ef0a703d48c8f"
+source = "git+https://github.com/gosh-sh/dexdo-halo2-kit?tag=dark_dex_halo2_private_witness_export_lib-v0.3.0#a735fadf286e8266fa2bbd436098dd8d9b8a41ce"
 dependencies = [
  "clap",
  "dex-halo2-circuit",
