@@ -212,6 +212,13 @@ impl BuyerSubmitIntent {
         }
     }
 
+    fn retain_until_route_adoption(&self) -> bool {
+        matches!(
+            self.kind,
+            BuyerSubmitIntentKind::OnDemand | BuyerSubmitIntentKind::PolicyNextSeller
+        )
+    }
+
     fn after(kind: BuyerSubmitIntentKind, predecessor: &str) -> Self {
         Self {
             kind,
@@ -3164,9 +3171,12 @@ async fn complete_buyer_submit_with_journal(
                 "buyer money POST landed but its matched TokenContract state is not yet provable; journal retained and no resubmit is safe: {error}"
             )))
         })?;
-    // An uncertain POST can be followed by a crash before handover/handle persistence.
-    // Keep its proven match and identity until the caller has durably adopted the deal.
-    if !ambiguous_submit {
+    // An on-demand route is not active until handover and handle persistence finish.
+    // Retain even a confirmed POST across errors, timeouts and restarts in that gap;
+    // otherwise the next HTTP request can finance a second deal.
+    let awaiting_route = load_buyer_submit_journal(journal_path, note_addr)?
+        .is_some_and(|journal| journal.intent.retain_until_route_adoption());
+    if !ambiguous_submit && !awaiting_route {
         clear_buyer_submit_journal(journal_path)?;
     }
     Ok((token_contract, status))
@@ -4613,6 +4623,19 @@ where
                     &journal_path,
                 )
                 .await?;
+                let submit_reconciliation = if intent.retain_until_route_adoption() {
+                    let journal = load_buyer_submit_journal(&journal_path, &journal_note)?
+                        .ok_or_else(|| {
+                            anyhow!("confirmed BUY awaiting a route lost its durable journal")
+                        })?;
+                    Some(buyer_submit_reconciliation(
+                        &journal,
+                        dexdo::buyer::api::BuyerSubmitReconciliationState::FreshProven,
+                        dexdo::buyer::api::BuyerSubmitReconciliationOrigin::FreshSubmit,
+                    )?)
+                } else {
+                    submit_reconciliation
+                };
                 return Ok(BuyerQuoteSubmitOutcome {
                     token_contract,
                     status,
@@ -10966,6 +10989,17 @@ async fn prepare_lazy_buyer_api_deal_once(
     chain_preflight: BuyerChainPreflight,
 ) -> Result<dexdo::buyer::api::ApiDeal> {
     let requested_budget = buyer_fresh_buy_budget(args.ticks, args.max_price_per_tick, args.escrow);
+    // A retained journal must not hide keep_open's confirmed-closure stop signal.
+    // Check the already-held deal first; retain its journal and never submit a replacement.
+    if let Some(kept) = kept_open_handover_wait() {
+        let mut deal_check = KeptOpenDealCheck::new();
+        if let Some(reason) = deal_check
+            .closed_if_due(chain.as_ref(), &frame_model, &kept.token_contract)
+            .await
+        {
+            return Err(stop_kept_open_handover_wait(reason));
+        }
+    }
     let raised_money = if args.mock.mock_chain {
         raised_money
     } else {
@@ -11510,6 +11544,11 @@ async fn prepare_lazy_buyer_api_deal_once(
                             &last_error,
                         )
                         .await;
+                        let diagnostic = format!(
+                            "waiting-for-handover token_contract={}: existing BUY retained; \
+                             no fresh BUY before handover or confirmed recovery\n{diagnostic}",
+                            display_token_contract(&token_contract)
+                        );
                         if let Some(policy) = buyer_policy.as_ref() {
                             let policy_outcome = apply_no_handover_after_match_policy(
                                 chain.as_ref(),
@@ -11629,11 +11668,6 @@ async fn prepare_lazy_buyer_api_deal_once(
         }
     }
 
-    clear_adopted_buyer_money_journal(
-        args.identity.note_addr.as_deref(),
-        adopted_submit_identity.as_deref(),
-        &token_contract,
-    )?;
     // A durable subscription is preserved across Ctrl-C, SIGTERM and application restarts because it
     // IS one. An ordinary deal is preserved only when the operator said so (,
     // `--preserve-deal-on-exit`); without the flag it keeps its existing STOP-on-exit lifetime, so an
@@ -11673,6 +11707,12 @@ async fn prepare_lazy_buyer_api_deal_once(
             models_cfg,
         )),
     );
+    // Finish every fallible route setup step before releasing the funded BUY guard.
+    clear_adopted_buyer_money_journal(
+        args.identity.note_addr.as_deref(),
+        adopted_submit_identity.as_deref(),
+        &deal.route.token_contract,
+    )?;
     Ok(match weekly {
         Some(weekly) => deal.with_weekly_budget(weekly),
         None => deal,
@@ -14086,6 +14126,10 @@ mod journal_closure_1474_tests;
 
 #[cfg(test)]
 mod tests {
+    mod issue_185 {
+        include!("buyer/issue_185_test.rs");
+    }
+
     #[cfg(unix)]
     mod consumer_errors_1450_live;
     use crate::cli::args::{NoteDeployArgs, RecoveryIdentityArgs};
@@ -27870,6 +27914,11 @@ mod tests {
     async fn issue_547_buyer_recovered_on_demand_resume_starts_monitor_without_second_money_post() {
         let _env_lock = dexdo_pn_pool_env_lock().lock().unwrap();
         let (dir, _cleanup) = buyer_journal_test_dir("buyer-issue-61-resume");
+        // The injected backend is selected after content-identity resolution.
+        // Keep that earlier optional registry read offline in this mock test.
+        let _manifest = crate::cli::commands::manifest_for_this_thread(
+            dir.join("unavailable-registry-manifest.json"),
+        );
         let pool_path = dir.join("pool.json");
         let mut fixture = buyer_submit_test_journal();
         (fixture.max_price_per_tick, fixture.escrow) = (
