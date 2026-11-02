@@ -30,9 +30,28 @@ pub(super) struct ProviderCall<'a> {
 }
 
 /// A transport that produced no response, or whose body decoder died, did not answer. Request
-/// construction and redirect policy are local answers.
+/// construction, redirect policy and certificate verification are conclusive refusals.
 fn retryable_transport_error(error: &reqwest::Error) -> bool {
-    !error.is_builder()
+    use std::error::Error;
+    use tokio_rustls::rustls::Error as TlsError;
+
+    // reqwest reports certificate refusals as connection failures. Inspect the typed cause
+    // before converting it into Status; I/O wrappers can hide their inner error from source().
+    let certificate_refused =
+        std::iter::successors(Some(error as &(dyn Error + 'static)), |&cause| {
+            cause
+                .downcast_ref::<std::io::Error>()
+                .and_then(|io| io.get_ref().map(|inner| inner as &(dyn Error + 'static)))
+                .or_else(|| cause.source())
+        })
+        .any(|cause| {
+            matches!(
+                cause.downcast_ref::<TlsError>(),
+                Some(TlsError::InvalidCertificate(_) | TlsError::NoCertificatesPresented)
+            )
+        });
+    !certificate_refused
+        && !error.is_builder()
         && !error.is_redirect()
         && (error.is_connect()
             || error.is_timeout()

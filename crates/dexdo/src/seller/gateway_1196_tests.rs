@@ -154,6 +154,7 @@ async fn controlled_relay(
         None,
         Some(unavailable),
         u64::MAX,
+        None,
     ));
     up_tx.send(Ok(head())).await.unwrap();
     (up_tx, buyer_rx, relay)

@@ -54,13 +54,19 @@ pub(crate) async fn send_event(
         crate::telemetry::failed(status.code());
     }
     let content = matches!(&event, Ok(UpstreamEvent::Data { output: true, .. }));
-    let terminal = matches!(&event, Ok(UpstreamEvent::Usage(_)));
+    let usage = match &event {
+        Ok(UpstreamEvent::Usage(usage)) => Some((usage.input_tokens, usage.output_tokens)),
+        _ => None,
+    };
+    if let Some((input_tokens, output_tokens)) = usage {
+        crate::telemetry::usage(input_tokens, output_tokens);
+    }
     tx.send(event).await.map_err(|_| ())?;
     if content {
         crate::telemetry::chunk();
     }
-    if terminal {
-        crate::telemetry::completed();
+    if let Some((_, output_tokens)) = usage {
+        crate::telemetry::completed(output_tokens);
     }
     Ok(())
 }
@@ -384,7 +390,7 @@ impl UpstreamConfig {
     }
 
     /// `model` and `backend` labels for this upstream's request metrics.
-    fn metric_labels(&self) -> (&str, &'static str) {
+    pub(crate) fn metric_labels(&self) -> (&str, &'static str) {
         let backend = match self {
             Self::OpenAi(_) => "openai",
             Self::Anthropic(_) => "anthropic",

@@ -27,6 +27,7 @@ async fn issue_2108_check_pool_history_latency(delay: std::time::Duration) {
             price_per_tick: backend.price_per_tick,
             max_ticks: backend.offered_ticks,
             subscription: false,
+            all_or_none: false,
             gateway_advertise: gateway.clone(),
             mock_token_count: 8,
         },

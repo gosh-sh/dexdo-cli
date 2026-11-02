@@ -730,6 +730,7 @@ mod issue_2163 {
                 nonce: 7,
                 price_per_tick: PRICE,
                 max_ticks: 8,
+                all_or_none: false,
             }
             .to_json()
             .unwrap(),
@@ -2016,6 +2017,7 @@ mod issue_2163 {
                 nonce: 7,
                 price_per_tick: PRICE,
                 max_ticks: 8,
+                all_or_none: false,
             }
             .to_json()
             .unwrap(),

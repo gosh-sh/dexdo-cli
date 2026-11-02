@@ -1225,10 +1225,10 @@ impl RequestDeliveryFinalizer {
             route_delivered_tokens,
             input_tokens: answer_usage.map(|usage| usage.input_tokens),
             output_tokens: answer_usage.map(|usage| usage.output_tokens),
-            billable_tokens: answer_usage.map(|usage| usage.total_tokens),
+            billable_tokens: answer_usage.map(|usage| usage.non_cached_tokens()),
             request_input_tokens: request_usage.input_tokens,
             request_output_tokens: request_usage.output_tokens,
-            request_billable_tokens: request_usage.total_tokens,
+            request_billable_tokens: request_usage.non_cached_tokens(),
             route_billable_tokens,
             finish_reason: "cancelled".to_string(),
         };
@@ -1355,8 +1355,24 @@ impl ConsumerRequestGuard {
             .output_tokens
             .checked_add(usage.output_tokens)
             .ok_or_else(|| "consumer request output-token accounting overflow".to_string())?;
-        let observed =
+        let mut observed =
             BillingUsage::new(input_tokens, output_tokens, None).map_err(str::to_string)?;
+        observed.cache_read_tokens = self
+            .request_usage
+            .cache_read_tokens
+            .checked_add(usage.cache_read_tokens)
+            .ok_or_else(|| "consumer request cache-read accounting overflow".to_string())?;
+        observed.cache_write_tokens = self
+            .request_usage
+            .cache_write_tokens
+            .checked_add(usage.cache_write_tokens)
+            .ok_or_else(|| "consumer request cache-write accounting overflow".to_string())?;
+        observed.charged_tokens = Some(
+            self.request_usage
+                .billable_tokens()
+                .checked_add(usage.billable_tokens())
+                .ok_or_else(|| "consumer request charged-token accounting overflow".to_string())?,
+        );
         self.persist_usage("answer", usage, false);
         let finalizer = self
             .delivery_finalizer
@@ -1395,7 +1411,7 @@ impl ConsumerRequestGuard {
         finalizer.report(delivery);
     }
 
-    /// Account one validated terminal input+output total against both the route and this request's
+    /// Account one validated non-cached payment against both the route and this request's
     /// held billing reservation. Content chunks never call this money transition.
     fn record_billing(&mut self, deal: &ApiDeal, usage: BillingUsage) -> Result<(), String> {
         usage.validate().map_err(str::to_string)?;
@@ -1826,14 +1842,14 @@ pub struct RequestDelivery {
     pub input_tokens: Option<u64>,
     /// Provider-native output usage of the answer stream, present only after its clean terminal.
     pub output_tokens: Option<u64>,
-    /// Provider-native checked input+output usage of the answer stream, including seller-funded excess.
+    /// Non-cached input+output work of the answer stream, including seller-funded excess.
     pub billable_tokens: Option<u64>,
     /// Provider-native input attributed to the whole top-level request, including completed
     /// verification and seller-claimable terminal usage observed before a cancelled clean EOF.
     pub request_input_tokens: u64,
     /// Provider-native output attributed across the whole top-level request on the same basis.
     pub request_output_tokens: u64,
-    /// Checked sum of [`Self::request_input_tokens`] and [`Self::request_output_tokens`].
+    /// Non-cached input+output work across all phases, including seller-funded excess.
     pub request_billable_tokens: u64,
     /// The deal's cumulative buyer-committed billable usage after clean EOF.
     pub route_billable_tokens: Option<u64>,
@@ -2004,7 +2020,7 @@ pub(crate) fn report_pre_answer_failure(
         billable_tokens: None,
         request_input_tokens: request_usage.input_tokens,
         request_output_tokens: request_usage.output_tokens,
-        request_billable_tokens: request_usage.total_tokens,
+        request_billable_tokens: request_usage.non_cached_tokens(),
         route_billable_tokens: deal.session.route_billable_tokens(),
         finish_reason: "error".to_string(),
     });
@@ -4051,6 +4067,10 @@ pub fn router(state: ApiState) -> axum::Router {
         .layer(axum::middleware::from_fn_with_state(
             state.clone(),
             usage::track_request,
+        ))
+        // Outermost, so every answer is measured, the unknown-path 404 and the body-limit 413 too.
+        .layer(axum::middleware::from_fn(
+            crate::telemetry::buyer::http_server,
         ))
         .with_state(state)
 }
@@ -8270,6 +8290,47 @@ mod tests {
             quota - probe,
             "both admissions were made only after the accepted probe's tick was published"
         );
+        harness.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn cache_2223_guard_rejects_overcharge_and_preserves_usage_through_cancellation() {
+        let harness = weekly_route_harness_before_probe(SUB_WEEK_LEN.as_secs()).await;
+        let deal = harness.deals.current().await.unwrap();
+        let RouteBudget::Admitted(reservation) = deal.admit().await else {
+            panic!("the trial must admit a request");
+        };
+        let mut guard = deal.begin_request(1);
+        guard.hold(reservation);
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        guard
+            .arm_delivery(Some(tx), &deal, "cache-2223".into(), "openai", true)
+            .unwrap();
+        let mut usage = BillingUsage::new(1000, 100, None).unwrap();
+        usage.cache_read_tokens = 500;
+        usage.cache_write_tokens = 200;
+        usage.charged_tokens = Some(401);
+        assert!(guard.record_billing(&deal, usage).is_err());
+        assert_eq!(deal.billable_tokens(), 0);
+        assert_eq!(guard.request_usage().billable_tokens(), 0);
+        usage.charged_tokens = None;
+        guard.observe_answer_usage(usage).unwrap();
+        assert_eq!(guard.request_usage().non_cached_tokens(), 400);
+        guard.record_billing(&deal, usage).unwrap();
+        assert_eq!(deal.billable_tokens(), 400);
+        assert_eq!(guard.request_usage().billable_tokens(), 400);
+        assert_eq!(
+            guard.remaining_grant(),
+            u64::try_from(PROBE_CLAIM).unwrap() - 400
+        );
+        drop(guard);
+        let delivery = rx.recv().await.unwrap();
+        assert_eq!(delivery.input_tokens, Some(1000));
+        assert_eq!(delivery.output_tokens, Some(100));
+        assert_eq!(delivery.billable_tokens, Some(400));
+        assert_eq!(delivery.request_billable_tokens, 400);
+        assert_eq!(delivery.route_billable_tokens, Some(400));
+        assert_eq!(delivery.finish_reason, "cancelled");
         harness.shutdown().await;
     }
 

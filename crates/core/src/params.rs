@@ -1783,6 +1783,19 @@ pub const DEAL_BURN_POST_FROM_NOTE_RAW: u128 = 25_000_000;
 /// against the one it actually mirrors.
 pub const BUY_ORDER_GAS_RAW: u128 = 25_000_000;
 
+/// ECC[2] needed on the buyer note before placing an order: placement plus each
+/// automatic `fundBuyerBond` message. Each fill consumes at least
+/// `MIN_STREAM_BUY_TICKS`; AON orders can fill only once. This is not trading escrow
+/// and does not reserve funds against other concurrent users of the same note.
+pub fn buyer_order_gas_raw(ticks: u128, all_or_none: bool) -> Option<u128> {
+    let fills = if all_or_none {
+        1
+    } else {
+        ticks / MIN_STREAM_BUY_TICKS
+    };
+    BUY_ORDER_GAS_RAW.checked_add(DEAL_BURN_FUND_DEAL_RAW.checked_mul(fills)?)
+}
+
 /// `fundFromOrderBook`.
 pub const DEAL_BURN_FUND_FROM_BOOK_RAW: u128 = 20_000_000;
 /// `open`.
@@ -2281,8 +2294,9 @@ impl Default for ProtocolConsts {
     }
 }
 
-/// Maximum total attempts for one timed-out periodic upstream health probe.
-/// Two attempts absorb one isolated stall while extending only that timeout path by one health-check timeout.
+/// Maximum total attempts for initial readiness and a timed-out periodic gateway self-probe.
+/// Periodic upstream failures instead use `SellerLivenessParams::upstream_unavailable_grace`.
+/// Two attempts absorb one isolated gateway stall, extending that path by one health-check timeout.
 /// Initial SELL readiness shares this cap between timeouts and typed HTTP 429 throttling;
 /// the latter waits `SellerLivenessParams::health_interval` before its one retry.
 pub const SELLER_UPSTREAM_HEALTH_TIMEOUT_MAX_ATTEMPTS: u32 = 2;
@@ -2292,6 +2306,9 @@ pub const SELLER_UPSTREAM_HEALTH_TIMEOUT_MAX_ATTEMPTS: u32 = 2;
 pub struct SellerLivenessParams {
     /// Time between complete gateway/upstream health cycles.
     pub health_interval: Duration,
+    /// Maximum continuous detected transient upstream outage before withdrawing a resting SELL.
+    /// Successful full readiness resets it; failed probes, including throttling, never extend it.
+    pub upstream_unavailable_grace: Duration,
     /// Per-cycle budget for gateway and exact-model upstream readiness.
     pub health_check_timeout: Duration,
     /// Maximum time from the last healthy instant through the initial exact-order read and cancel
@@ -2333,6 +2350,7 @@ impl SellerLivenessParams {
     pub const fn canonical() -> Self {
         Self {
             health_interval: Duration::from_secs(20),
+            upstream_unavailable_grace: Duration::from_secs(60),
             health_check_timeout: Duration::from_secs(20),
             health_cycle_timeout: Duration::from_secs(60),
             cancel_confirmation_timeout: Duration::from_secs(60),
@@ -3451,7 +3469,10 @@ pub const BUYER_USAGE_FACTS_MAX_LIMIT: u32 = 1_000;
 pub const BUYER_USAGE_FACTS_MAX_CURSOR_BYTES: usize = 4_096;
 /// Delay between buyer usage chain-evidence reconciliation passes.
 pub const BUYER_USAGE_RECONCILE_INTERVAL: Duration = Duration::from_secs(30);
-/// Opt-in seller OTLP metrics policy. Durations are milliseconds on the environment surface.
+/// Period between independent upstream readiness probes used for seller uptime metrics.
+pub const SELLER_UPTIME_PROBE_INTERVAL: Duration = Duration::from_secs(30);
+/// Opt-in seller OTLP metrics policy, which `dexdo buyer` shares. Durations are milliseconds on the
+/// environment surface.
 /// Default time between metric exports (`OTEL_METRIC_EXPORT_INTERVAL`).
 pub const SELLER_METRICS_EXPORT_INTERVAL: Duration = Duration::from_secs(15);
 /// Default bound on one export and on shutdown flush (`OTEL_EXPORTER_OTLP_METRICS_TIMEOUT`).
@@ -3462,6 +3483,17 @@ pub const SELLER_METRICS_FRESHNESS: Duration = Duration::from_secs(120);
 pub const SELLER_METRICS_DEFAULT_ENDPOINT: &str = "http://localhost:4317";
 /// `service.name` resource attribute when `OTEL_SERVICE_NAME` is unset.
 pub const SELLER_METRICS_SERVICE_NAME: &str = "dexdo-seller";
+/// Buyer `service.name` resource attribute when `OTEL_SERVICE_NAME` is unset.
+pub const BUYER_METRICS_SERVICE_NAME: &str = "dexdo-buyer";
+/// Bucket boundaries of `dexdo.buyer.http.server.request.duration`, seconds.
+pub const BUYER_METRICS_HTTP_SERVER_DURATION_BOUNDARIES: [f64; 7] =
+    [0.0, 1.0, 5.0, 10.0, 25.0, 60.0, 300.0];
+/// Bucket boundaries of `dexdo.buyer.rpc.client.connect.duration` and
+/// `dexdo.buyer.rpc.client.call.duration`, seconds.
+pub const BUYER_METRICS_RPC_CLIENT_DURATION_BOUNDARIES: [f64; 18] = [
+    0.0, 0.005, 0.01, 0.025, 0.05, 0.075, 0.1, 0.25, 0.5, 0.75, 1.0, 2.5, 5.0, 7.5, 10.0, 25.0,
+    60.0, 300.0,
+];
 
 #[cfg(test)]
 mod buy_reserve_2196_tests {

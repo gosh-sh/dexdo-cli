@@ -13284,6 +13284,8 @@ async fn run_buyer_inner(
     };
     machine_context.network = Some(runtime_network.clone());
     machine_context.frame_model = Some(frame_model.clone());
+    // buyer metrics carry the model this run buys, fixed here before any gateway call.
+    dexdo::telemetry::buyer::set_model(&frame_model);
     if let Some(tc) = explicit_tc.as_deref() {
         machine_context.order_book = Some("explicit_token_contract".to_string());
         machine_context.set_token_contract(tc);
@@ -16473,6 +16475,7 @@ mod tests {
             // A thousand SHELL a tick: the manifest carries whole SHELL.
             price_per_tick: 1000 * dexdo_core::PRICE_STEP,
             max_ticks: 8,
+            all_or_none: false,
         };
         let market = dir.join("market.json");
         std::fs::write(&market, manifest.to_json().unwrap()).unwrap();
@@ -29272,6 +29275,7 @@ mod tests {
             price_per_tick: u64::try_from(price).unwrap(),
             max_ticks: u64::try_from(ticks).unwrap(),
             subscription: true,
+            all_or_none: false,
             gateway_advertise: seller.listen_addr.to_string(),
             mock_token_count: 2,
         };

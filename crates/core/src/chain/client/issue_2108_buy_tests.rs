@@ -114,15 +114,20 @@ async fn issue_2108_buy_first_post_has_fresh_expiry_and_primed_identity() {
 async fn issue_2108_buy_priming_failure_never_signs_journals_or_posts() {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let endpoint = format!("http://{}", listener.local_addr().unwrap());
+    let note = Address::parse(&format!("0:{}", "a".repeat(64))).unwrap();
+    let gas_reply = issue_2220_note_reply(&note, crate::params::SHELL_UNIT);
     let (requests, server) = issue_2030_producer_server(
         listener,
-        vec![(
-            200,
-            json!({"errors":[{"message":"Cannot query field messages"}]}),
-        )],
+        vec![
+            (200, gas_reply.clone()),
+            (200, gas_reply),
+            (
+                200,
+                json!({"errors":[{"message":"Cannot query field messages"}]}),
+            ),
+        ],
     );
     let backend = issue_2030_backend(&endpoint);
-    let note = Address::parse(&format!("0:{}", "a".repeat(64))).unwrap();
     let book = Address::parse(&format!("0:{}", "b".repeat(64))).unwrap();
     let keys = KeyPair::from_secret_hex(&"3a".repeat(32)).unwrap();
     let mut cursor = MatchWatchCursor::new(0);
@@ -156,8 +161,8 @@ async fn issue_2108_buy_priming_failure_never_signs_journals_or_posts() {
     assert_eq!(journal_calls, 0);
     assert_eq!(serde_json::to_value(cursor).unwrap(), original_cursor);
     let requests = requests.lock().unwrap();
-    assert_eq!(requests.len(), 1);
-    assert!(requests[0]["query"]
+    assert_eq!(requests.len(), 3);
+    assert!(requests[2]["query"]
         .as_str()
         .unwrap()
         .contains("messages(msg_type: [ExtOut]"));

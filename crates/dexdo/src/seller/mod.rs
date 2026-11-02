@@ -58,6 +58,10 @@ pub struct SellerConfig {
     pub max_ticks: u64,
     /// Whether this SELL accepts only subscription BUYs.
     pub subscription: bool,
+    /// Whether this ordinary SELL is all-or-none: one buyer takes all `max_ticks` or nobody does.
+    /// Read from the deal's market manifest (`MarketManifest::all_or_none`), never from a seller
+    /// flag. A subscription SELL is all-or-none regardless.
+    pub all_or_none: bool,
     /// Public gateway host:port that will be encrypted to the buyer (R15).
     pub gateway_advertise: String,
     /// How many fake tokens to yield (mock model). `0` = a deliberate seller no-show.
@@ -532,14 +536,22 @@ pub async fn post_offer_with_note(
         price_per_tick: cfg.price_per_tick,
         max_ticks: cfg.max_ticks,
         token_contract: cfg.token_contract.clone(),
-        flags: if cfg.subscription {
-            SUBSCRIPTION_SELL_FLAGS
-        } else {
-            0
-        },
+        flags: sell_offer_flags(cfg),
     };
     chain.post_offer(offer, note).await?;
     Ok(())
+}
+
+/// The book flags this deal's SELL carries. Posting and resuming use this one answer, so a resting
+/// order is accepted exactly when it is the order this seller would have posted.
+fn sell_offer_flags(cfg: &SellerConfig) -> u8 {
+    if cfg.subscription {
+        SUBSCRIPTION_SELL_FLAGS
+    } else if cfg.all_or_none {
+        order_flags::AON
+    } else {
+        0
+    }
 }
 
 fn validate_subscription_offer_volume(cfg: &SellerConfig) -> Result<()> {
@@ -666,11 +678,7 @@ fn validate_resting_offer(
             ),
         ));
     }
-    let expected_flags = if cfg.subscription {
-        SUBSCRIPTION_SELL_FLAGS
-    } else {
-        0
-    };
+    let expected_flags = sell_offer_flags(cfg);
     if order.flags != expected_flags {
         return Err(resting_offer_error(
             &cfg.token_contract,
@@ -1895,6 +1903,7 @@ mod tests {
             price_per_tick: 3_000_000_000,
             max_ticks: 8,
             subscription: false,
+            all_or_none: false,
             gateway_advertise: "127.0.0.1:8443".to_string(),
             mock_token_count: 8,
         }
@@ -1993,6 +2002,7 @@ mod tests {
             price_per_tick: 1_000,
             max_ticks: 8,
             subscription: false,
+            all_or_none: false,
             gateway_advertise: "127.0.0.1:1".to_string(),
             mock_token_count: 8,
         };
@@ -3460,4 +3470,6 @@ mod tests {
         assert!(!seller.server_task.is_finished());
         seller.server_task.abort();
     }
+
+    include!("all_or_none_2214_tests.rs");
 }

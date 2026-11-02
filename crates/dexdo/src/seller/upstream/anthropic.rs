@@ -407,6 +407,11 @@ mod tests {
             (10682 + 5 + 2, 510)
         );
         assert_eq!((usage.cache_read_tokens, usage.cache_write_tokens), (5, 2));
+        assert_eq!(
+            usage.billable_tokens(),
+            10682 + 510,
+            "tool input and output remain paid, cache does not"
+        );
     }
 
     /// A cumulative input or cache count that falls is a contradiction and bills nothing.

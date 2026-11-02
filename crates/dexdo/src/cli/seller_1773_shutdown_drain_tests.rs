@@ -51,6 +51,7 @@ async fn issue_1773_signalled_watcher_returns_instead_of_hanging() {
         price_per_tick: chain.price_per_tick,
         max_ticks: chain.offered_ticks,
         subscription: false,
+        all_or_none: false,
         gateway_advertise: gateway.clone(),
         mock_token_count: 8,
     };

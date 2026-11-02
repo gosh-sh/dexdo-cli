@@ -3853,51 +3853,48 @@ const EXACT_MESSAGE_RECEIPT_QUERY: &str = r#"
 /// The charge is new: a sell offer always paid `GAS_POST_FROM_NOTE` through the deal, a buy rested
 /// for free. A buyer whose note has a full balance and no physical ECC now fails at a call that used
 /// to work, with an error that points at the escrow.
-fn buy_order_shortfall(private_balance: u128, account_ecc: u128, escrow: u128) -> Option<String> {
-    let charge = crate::params::BUY_ORDER_GAS_RAW;
+fn buy_order_shortfall(
+    private_balance: u128,
+    account_ecc: u128,
+    escrow: u128,
+    ticks: u128,
+    all_or_none: bool,
+) -> Option<String> {
     if private_balance < escrow {
         return Some(format!(
             "this note holds {private_balance} raw SHELL and the order escrows {escrow}: the book \
              would refuse it with ERR_LOW_VALUE. Top the note's balance up, or place a smaller order."
         ));
     }
+    let Some(charge) = crate::params::buyer_order_gas_raw(ticks, all_or_none) else {
+        return Some("buyer-note gas requirement overflows; nothing was sent".into());
+    };
     if account_ecc < charge {
         return Some(format!(
-            "this note holds {account_ecc} raw ECC[2] and placing a buy order burns {charge} of it \
-             before the order reaches the book -- a separate pocket from the {escrow} escrow, which \
-             this note does cover. The contract refuses both shortfalls with the same ERR_LOW_VALUE, \
-             so read this as: the escrow is fine, the placement charge is not. Send SHELL to the \
-             note's ACCOUNT. A buy used to rest for free; since 4.0.36 it pays what a sell offer \
-             pays, filled or not."
+            "this note holds {account_ecc} raw ECC[2] but needs {charge} for BUY placement and \
+             automatic fundBuyerBond calls -- separate from the {escrow} trading escrow, which \
+             this note does cover. Top up the buyer note's ECC[2] gas pocket with `dexdo note topup`. \
+             The TokenContract reserve does not substitute for the buyer's payment. Nothing was sent."
         ));
     }
     None
 }
 
-/// The decision behind [`RealChainBackend::refuse_terminal_call_neither_side_can_pay`], kept pure so
-/// it can be asserted without a chain.
-
-/// `None` means go: one of the two can pay. `Some` names BOTH readings, because the operator's next
-/// move depends on which is short and the chain's own answer -- an aborted action phase -- says
-/// neither.
-fn terminal_charge_refusal(
+/// Calls supported by PrivateNote must attach the buyer's own ECC[2], even when
+/// the TC could cover the charge from its seller-funded reserve.
+fn buyer_note_charge_refusal(
     call: &str,
     note: &Address,
     note_ecc: u128,
-    deal: &Address,
-    deal_ecc: u128,
     charge: u128,
 ) -> Option<String> {
-    if note_ecc >= charge || deal_ecc >= charge {
+    if note_ecc >= charge {
         return None;
     }
     Some(format!(
-        "{call} cannot be paid for by either side, so the deal would reject it in its action phase \
-         and nothing would change. Your note {note} holds {note_ecc} raw ECC[2] and the charge is \
-         {charge}, so it cannot attach one; deal {deal} holds {deal_ecc} in its own reserve, so it \
-         cannot cover one either. Two different fixes: put SHELL on your note and retry, or ask the \
-         SELLER to top the deal up -- only the seller's note can do that, `fundDeployShell` is \
-         owner-only. Nothing was sent."
+        "{call} requires the buyer note {note} to attach {charge} raw ECC[2], but its gas pocket \
+         holds {note_ecc}. Top up this note with `dexdo note topup` and retry. Its trading balance \
+         and the TokenContract reserve do not substitute for this payment. Nothing was sent."
     ))
 }
 
@@ -9429,21 +9426,24 @@ impl RealChainBackend {
 
     /// Say WHICH pocket is short before the book answers `ERR_LOW_VALUE` for either.
 
-    /// Read-only, and it fails OPEN: a balance that will not read is not evidence of a shortfall,
-    /// and refusing a buy on a failed read would cost the buyer an order for the chain's silence.
+    /// Read both pockets before any BUY submission. A missing gas reading cannot
+    /// authorize a call whose automatic buyer bond would spend the TC reserve.
     async fn refuse_buy_order_the_note_cannot_place(
         &self,
         note: &Address,
         escrow: u128,
+        ticks: u128,
+        flags: u8,
     ) -> Result<()> {
-        let Ok(Some(account)) = self.client.get_system_account_retrying(note).await else {
-            return Ok(());
-        };
-        let Ok(private_balance) = self.private_note_shell_balance(note).await else {
-            return Ok(());
-        };
-        let account_ecc = account.ecc_balance(crate::params::SHELL_CURRENCY_ID);
-        match buy_order_shortfall(private_balance, account_ecc, escrow) {
+        let account_ecc = self.note_ecc_shell_pocket(note).await?;
+        let private_balance = self.private_note_shell_balance(note).await?;
+        match buy_order_shortfall(
+            private_balance,
+            account_ecc,
+            escrow,
+            ticks,
+            flags & crate::market::flags::AON != 0,
+        ) {
             Some(reason) => Err(anyhow!("placeInferenceBuy refused before submit: {reason}")),
             None => Ok(()),
         }
@@ -9474,7 +9474,7 @@ impl RealChainBackend {
         flags: u8,
         deadline: u64,
     ) -> Result<Value> {
-        self.refuse_buy_order_the_note_cannot_place(note, escrow)
+        self.refuse_buy_order_the_note_cannot_place(note, escrow, ticks, flags)
             .await?;
         self.submit(
             note,
@@ -9510,6 +9510,9 @@ impl RealChainBackend {
         cursor: &mut MatchWatchCursor,
         before_post: &mut (dyn FnMut(String, MatchWatchCursor, u128) -> Result<()> + Send),
     ) -> Result<Value> {
+        self.refuse_buy_order_the_note_cannot_place(note, escrow, ticks, flags)
+            .await
+            .map_err(|source| anyhow::Error::new(MoneySubmitError::Preparation { source }))?;
         let mut final_cursor = MatchWatchCursor::new(0);
         self.poll_inference_filled_tcs(note, order_book, true, &mut final_cursor)
             .await
@@ -9583,6 +9586,9 @@ impl RealChainBackend {
                 ));
             }
         }
+        self.refuse_buy_order_the_note_cannot_place(note, escrow, ticks, flags)
+            .await
+            .map_err(|source| anyhow::Error::new(MoneySubmitError::Preparation { source }))?;
         let stats = self
             .inference_orderbook_stats(order_book)
             .await
@@ -11704,42 +11710,18 @@ impl RealChainBackend {
         }
     }
 
-    /// Name WHICH side cannot pay for a buyer's terminal call, before the chain answers with a
-    /// code the operator cannot act on.
-
-    /// **The two failures look identical and require opposite actions.** Since contracts 4.0.36 the
-    /// note attaches `DEAL_GAS_TERMINAL` to `stop` / `dispute` / `cleanupUnopened` -- but attaches it
-    /// CONDITIONALLY (`PrivateNote.sol`: `if (currencies[SHELL] >= DEAL_GAS_TERMINAL)`). A note
-    /// without that ECC sends the call anyway, with an empty map, and the deal falls back to its own
-    /// reserve. So the call fails only when NEITHER can pay, and when it does the chain reports one
-    /// thing -- an aborted action phase, `RESULT_CODE_NOT_ENOUGH_EXTRA` -- for two situations that the
-    /// operator resolves differently: top up the note, or ask the seller to top up the deal (only
-    /// the seller's note can, `fundDeployShell` is `onlyOwnerPubkey`).
-
-    /// **Empty note alone is not a refusal**, and that is the point of reading both. It is the
-    /// ordinary case for a buyer who spent everything on the deal, and the deal's reserve is exactly
-    /// what it is for.
-
-    /// Read-only, and it fails OPEN on an unreadable balance: a chain that will not answer is not
-    /// evidence that money is missing, and refusing a buyer's exit on a failed read would take the
-    /// exit away for the wrong reason.
-    pub(super) async fn refuse_terminal_call_neither_side_can_pay(
+    /// Require the buyer's own physical ECC[2] for a note-forwarded TC call.
+    /// The current contract conditionally omits the attached charge on a short
+    /// note; refuse that fallback to the seller-funded TC reserve before signing.
+    /// Read errors propagate: an unknown pocket does not prove the buyer can pay.
+    pub(super) async fn require_buyer_note_charge(
         &self,
         buyer_note: &Address,
-        tc: &Address,
         call: &str,
+        charge: u128,
     ) -> Result<()> {
-        let charge = crate::params::DEAL_BURN_TERMINAL_RAW;
-        let Ok(Some(note_account)) = self.client.get_system_account_retrying(buyer_note).await
-        else {
-            return Ok(());
-        };
-        let Ok(Some(deal_account)) = self.client.get_system_account_retrying(tc).await else {
-            return Ok(());
-        };
-        let note_ecc = note_account.ecc_balance(crate::params::SHELL_CURRENCY_ID);
-        let deal_ecc = deal_account.ecc_balance(crate::params::SHELL_CURRENCY_ID);
-        match terminal_charge_refusal(call, buyer_note, note_ecc, tc, deal_ecc, charge) {
+        let note_ecc = self.note_ecc_shell_pocket(buyer_note).await?;
+        match buyer_note_charge_refusal(call, buyer_note, note_ecc, charge) {
             Some(refusal) => Err(anyhow!(refusal)),
             None => Ok(()),
         }
@@ -11754,8 +11736,12 @@ impl RealChainBackend {
         buyer_keys: &KeyPair,
         tc: &Address,
     ) -> Result<SubmittedBuyerStopReceipt> {
-        self.refuse_terminal_call_neither_side_can_pay(buyer_note, tc, "streamStop")
-            .await?;
+        self.require_buyer_note_charge(
+            buyer_note,
+            "streamStop",
+            crate::params::DEAL_BURN_TERMINAL_RAW,
+        )
+        .await?;
         self.reject_prior_settlement_action_before_prepare(
             tc,
             SettlementAction::BuyerStop,
@@ -11798,8 +11784,12 @@ impl RealChainBackend {
         buyer_keys: &KeyPair,
         tc: &Address,
     ) -> Result<SettlementActionReceipt> {
-        self.refuse_terminal_call_neither_side_can_pay(buyer_note, tc, "streamDispute")
-            .await?;
+        self.require_buyer_note_charge(
+            buyer_note,
+            "streamDispute",
+            crate::params::DEAL_BURN_TERMINAL_RAW,
+        )
+        .await?;
         self.reject_prior_settlement_action_before_prepare(
             tc,
             SettlementAction::Dispute,
@@ -11838,6 +11828,12 @@ impl RealChainBackend {
         tc: &Address,
         before_post: &mut (dyn FnMut() -> bool + Send),
     ) -> Result<Option<SubmittedBuyerStopReceipt>> {
+        self.require_buyer_note_charge(
+            buyer_note,
+            "streamStop",
+            crate::params::DEAL_BURN_TERMINAL_RAW,
+        )
+        .await?;
         self.reject_prior_settlement_action_before_prepare(
             tc,
             SettlementAction::BuyerStop,
@@ -11880,6 +11876,12 @@ impl RealChainBackend {
         buyer_keys: &KeyPair,
         tc: &Address,
     ) -> Result<Value> {
+        self.require_buyer_note_charge(
+            buyer_note,
+            "streamCleanup",
+            crate::params::DEAL_BURN_TERMINAL_RAW,
+        )
+        .await?;
         self.submit(
             buyer_note,
             PRIVATENOTE_ABI,
@@ -12131,6 +12133,7 @@ impl RealChainBackend {
             nonce,
             price_per_tick,
             max_ticks,
+            all_or_none: false,
         };
         let target_active = self
             .wait_active_checked(
@@ -16083,78 +16086,25 @@ mod tests {
     /// The charge is new: a sell offer always paid, a buy rested for free.
     #[test]
     fn a_buy_order_names_which_pocket_is_short() {
-        let charge = crate::params::BUY_ORDER_GAS_RAW;
+        let charge = crate::params::buyer_order_gas_raw(2, false).unwrap();
         let escrow = 10 * crate::params::SHELL_UNIT;
 
         // Both pockets covered: nothing to say.
-        assert!(super::buy_order_shortfall(escrow, charge, escrow).is_none());
+        assert!(super::buy_order_shortfall(escrow, charge, escrow, 2, false).is_none());
 
         // Escrow short -- the older of the two failures, and still the first one checked.
-        let low_escrow = super::buy_order_shortfall(escrow - 1, charge, escrow)
+        let low_escrow = super::buy_order_shortfall(escrow - 1, charge, escrow, 2, false)
             .expect("an escrow the note cannot cover is refused");
         assert!(low_escrow.contains("escrows"), "{low_escrow}");
 
         // The NEW failure: escrow fine, account empty. This is the one that used to work.
-        let low_charge = super::buy_order_shortfall(escrow, charge - 1, escrow)
+        let low_charge = super::buy_order_shortfall(escrow, charge - 1, escrow, 2, false)
             .expect("a placement charge the note cannot burn is refused");
         assert!(low_charge.contains("ECC[2]"), "{low_charge}");
-        assert!(low_charge.contains("separate pocket"), "{low_charge}");
-        assert!(low_charge.contains("the escrow is fine"), "{low_charge}");
-        assert!(
-            low_charge.contains("rest for free"),
-            "the refusal has to say the charge is new, or a buyer who placed orders yesterday reads \
-             it as a broken client: {low_charge}",
-        );
-
+        assert!(low_charge.contains("separate from"), "{low_charge}");
+        assert!(low_charge.contains("trading escrow"), "{low_charge}");
         // The two must not be confusable: neither text may read as the other's fix.
         assert!(!low_escrow.contains("ECC[2]"), "{low_escrow}");
-    }
-
-    /// a buyer's terminal call has TWO ways to be unpayable and the chain reports one.
-
-    /// Since 4.0.36 the note attaches `DEAL_GAS_TERMINAL` to `stop`/`dispute`/`cleanupUnopened`, but
-    /// only `if (currencies[SHELL] >= DEAL_GAS_TERMINAL)`. So an empty note is NOT a failure -- the
-    /// deal's own reserve covers it -- and a dry reserve is not one either while the note can attach.
-    /// Only both at once is, and then `gosh.burnecc` fails the action phase with
-    /// `RESULT_CODE_NOT_ENOUGH_EXTRA`: one code for two situations whose fixes are opposite, since
-    /// only the SELLER's note can refill a deal (`fundDeployShell` is owner-only).
-
-    /// Without this the buyer reads "aborted, code 38" and cannot tell whose money is missing.
-    #[test]
-    fn a_terminal_call_is_refused_only_when_neither_side_can_pay() {
-        let note = Address::parse(&format!("0:{}", "a".repeat(64))).expect("note");
-        let deal = Address::parse(&format!("0:{}", "b".repeat(64))).expect("deal");
-        let charge = crate::params::DEAL_BURN_TERMINAL_RAW;
-
-        // The ordinary case for a spent-out buyer: empty note, funded deal. Goes.
-        assert!(
-            super::terminal_charge_refusal("streamStop", &note, 0, &deal, charge, charge).is_none(),
-            "an empty note is what the deal's reserve is for; refusing here takes the buyer's exit \
-             away for no reason",
-        );
-        // The other single-sided case: funded note, dry deal. Also goes -- the note attaches.
-        assert!(
-            super::terminal_charge_refusal("streamStop", &note, charge, &deal, 0, charge).is_none(),
-        );
-        // One short of the charge on both sides is the only refusal.
-        let refusal = super::terminal_charge_refusal(
-            "streamDispute",
-            &note,
-            charge - 1,
-            &deal,
-            charge - 1,
-            charge,
-        )
-        .expect("neither side can pay, so the call would revert and change nothing");
-
-        // It has to name BOTH readings and both fixes, or it is the same unactionable answer the
-        // chain already gives.
-        assert!(refusal.contains("streamDispute"), "{refusal}");
-        assert!(refusal.contains(&note.to_string()), "{refusal}");
-        assert!(refusal.contains(&deal.to_string()), "{refusal}");
-        assert!(refusal.contains(&(charge - 1).to_string()), "{refusal}");
-        assert!(refusal.contains("SELLER"), "{refusal}");
-        assert!(refusal.contains("Nothing was sent"), "{refusal}");
     }
 
     #[test]
@@ -20084,5 +20034,6 @@ mod tests {
     include!("client/issue_2108_tests.rs");
     include!("client/issue_2115_tests.rs");
     include!("client/issue_2199_tests.rs");
+    include!("client/issue_2220_tests.rs");
     include!("client/issue_2192_tests.rs");
 }

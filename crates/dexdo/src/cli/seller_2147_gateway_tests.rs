@@ -96,6 +96,7 @@ impl Issue2147Fixture {
             price_per_tick,
             max_ticks: 4,
             subscription: false,
+            all_or_none: false,
             gateway_advertise: seller.listen_addr.to_string(),
             mock_token_count: 4,
         };
@@ -193,6 +194,7 @@ async fn issue_2147_failed_pool_candidate_preserves_active_requests_and_can_reco
         nonce: fixture.deal.nonce,
         price_per_tick: fixture.deal.cfg.price_per_tick.into(),
         max_ticks: fixture.deal.cfg.max_ticks.into(),
+        all_or_none: false,
     });
     save_pool_deal_handle(&fixture.context(), &fixture.deal).unwrap();
     let record = seller_market_handle_records(Some(fixture.root.path()), &fixture.owner)

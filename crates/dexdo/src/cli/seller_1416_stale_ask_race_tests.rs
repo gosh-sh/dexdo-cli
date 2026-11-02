@@ -327,6 +327,7 @@ fn deal_with(token_contract: &str, book: Arc<BookState>) -> SellerPoolDeal {
             price_per_tick: 1_000_000_000,
             max_ticks: 2,
             subscription: false,
+            all_or_none: false,
             gateway_advertise: "127.0.0.1:0".to_string(),
             mock_token_count: 0,
         },
@@ -883,6 +884,7 @@ async fn issue_2115_all_pool_startup_entries_keep_pending_before_getter_errors()
             nonce: deal.nonce,
             price_per_tick: dexdo_core::PRICE_STEP,
             max_ticks: 2,
+            all_or_none: false,
         });
         save_pool_deal_handle(&context, &deal).unwrap();
         backends.insert(super::deals::normalize_addr(tc), deal.chain.clone());

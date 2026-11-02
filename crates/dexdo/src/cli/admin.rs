@@ -9,9 +9,11 @@ use crate::cli::commands::{
     resolve_model_registry_target_with_endpoint, resolve_registry_content_identity, BookTarget,
 };
 use crate::cli::policy;
+#[cfg(test)]
+use crate::cli::support::ensure_provision_deposit_covered;
 use crate::cli::support::{
     clear_provision_pending_if_present, default_deposit_shells, deposit_per_deploy,
-    deposit_per_deploy_with_overhead, ensure_provision_deposit_covered,
+    deposit_per_deploy_with_overhead, ensure_provision_deposit_covered_for,
     persist_provision_deal_handle, prepare_fresh_provision_deposit, prompt_deposit_shells,
     provision_failure_clears_pending, require_model_name, require_provision_nonce,
     resolve_market_fields, validate_price_step, SHELL_UNIT,
@@ -546,6 +548,7 @@ pub(crate) async fn run_provision_with_deal_gas_overhead(
         nonce,
         price_per_tick: args.price_per_tick,
         max_ticks: args.max_ticks,
+        all_or_none: args.all_or_none,
     };
     let target_active = if matches!(requested_nonce, ProvisionNonceArg::Explicit(_)) {
         chain
@@ -683,11 +686,12 @@ pub(crate) async fn run_provision_with_deal_gas_overhead(
                     })?
                     .ecc_balance(2);
                 let note_spendable = chain.private_note_shell_balance(&note).await?;
-                ensure_provision_deposit_covered(
+                ensure_provision_deposit_covered_for(
                     note_ecc,
                     note_spendable,
                     deposit_shells,
                     args.price_per_tick,
+                    args.require_funds_for.map_or(1, std::num::NonZeroU64::get),
                 )?;
             }
             Ok(per_deploy)
@@ -714,6 +718,12 @@ pub(crate) async fn run_provision_with_deal_gas_overhead(
                             dexdo_core::address::display_self_dapp(&market.token_contract)
                         )
                     }
+                    // The chain builds the manifest from the contract, which does not hold the
+                    // offer's all-or-none choice; the deal record carries it from here on.
+                    let market = &dexdo_core::MarketManifest {
+                        all_or_none: args.all_or_none,
+                        ..market.clone()
+                    };
                     if market != &expected_market {
                         bail!("provision reservation identity diverged from the derived market")
                     }
@@ -729,6 +739,10 @@ pub(crate) async fn run_provision_with_deal_gas_overhead(
             .await;
         let m = match provision {
             Ok(market) => {
+                let market = dexdo_core::MarketManifest {
+                    all_or_none: args.all_or_none,
+                    ..market
+                };
                 persist_provision_deal_handle(
                     args.deals_dir.as_deref(),
                     &market,
@@ -1028,6 +1042,7 @@ mod tests {
             nonce: 7,
             price_per_tick: dexdo_core::PRICE_STEP,
             max_ticks: 4,
+            all_or_none: false,
         }
     }
 
@@ -1110,6 +1125,7 @@ mod tests {
             nonce: 1,
             price_per_tick: dexdo_core::PRICE_STEP,
             max_ticks: 4,
+            all_or_none: false,
         };
         persist_provision_deal_handle(
             Some(&deals_dir),
@@ -1233,7 +1249,7 @@ mod tests {
             // the money: every deploy the provision pays for, and the note reads that precede them
             "provision_market_with_deal_gas_overhead_and_before_deploy(",
             "deposit_per_deploy(",
-            "ensure_provision_deposit_covered(",
+            "ensure_provision_deposit_covered_for(",
         ] {
             let at = body
                 .find(spend)
@@ -1634,8 +1650,10 @@ mod tests {
             nonce: None,
             price_per_tick: dexdo_core::PRICE_STEP - 1,
             max_ticks: 1,
+            all_or_none: false,
             deposit_shells: None,
             output: "must-not-be-written.json".into(),
+            require_funds_for: None,
             replace_market: None,
             deals_dir: None,
             policy: None,

@@ -100,7 +100,7 @@ pub(super) struct StreamFacts {
 }
 
 pub(super) struct FrameDriver {
-    upstream: tonic::Streaming<StreamFrame>,
+    upstream: crate::buyer::GatewayStream,
     session_closed: tokio::sync::watch::Receiver<bool>,
     format: ApiFormat,
     streamed: bool,
@@ -117,7 +117,7 @@ pub(super) struct FrameDriver {
 
 impl FrameDriver {
     pub(super) fn new(
-        upstream: tonic::Streaming<StreamFrame>,
+        upstream: crate::buyer::GatewayStream,
         session_closed: tokio::sync::watch::Receiver<bool>,
         format: ApiFormat,
         streamed: bool,

@@ -58,6 +58,7 @@ tokio-rustls.workspace = true
 hyper-util.workspace = true
 tower.workspace = true
 http.workspace = true
+http-body.workspace = true
 # G, B19/B20: local OpenAI/Anthropic-compatible consumer HTTP endpoint.
 axum.workspace = true
 async-stream.workspace = true

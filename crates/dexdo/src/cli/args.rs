@@ -690,6 +690,11 @@ pub(crate) struct ProvisionArgs {
     /// Max ticks the deal `TokenContract` bounds to.
     #[arg(long, default_value_t = DEFAULT_PROVISION_MAX_TICKS)]
     pub(crate) max_ticks: u128,
+    /// Make this deal's sell offer all-or-none: one buyer takes all `--max-ticks` or the offer
+    /// keeps resting. Written into the market manifest and the deal record, so `dexdo seller`
+    /// posts this deal's offer with `AON` without a flag of its own.
+    #[arg(long)]
+    pub(crate) all_or_none: bool,
     /// Note ECC[2] allocation in whole SHELL, not raw nano/vmshell (1 SHELL = 1e9 raw).
     /// The per-deal `TokenContract`'s ECC[2] RESERVE, sent with `PrivateNote.deployDeal` (4.0.36).
     /// Every entry into the deal burns its measured charge out of it, starting with the constructor;
@@ -705,6 +710,13 @@ pub(crate) struct ProvisionArgs {
     /// seller`/`buyer` load it via `--market`.
     #[arg(long, default_value = DEFAULT_MARKET_MANIFEST_OUTPUT_PATH)]
     pub(crate) output: PathBuf,
+    /// Refuse before deploying anything unless the note covers this many deals of these terms,
+    /// this one included: the deploy deposit from the note's ECC[2] gas pocket and the `2P` seller
+    /// bond from its trading balance, each times N. A script that provisions N offers passes N to
+    /// the first call, so a note that cannot carry all of them fails before any is deployed.
+    /// Absent means this deal alone.
+    #[arg(long)]
+    pub(crate) require_funds_for: Option<std::num::NonZeroU64>,
     /// Replace saved offers for the previous market's seller note and model. Stop that seller
     /// first. Unsold offers are cancelled and durably retired; funded deals remain recoverable.
     /// A cancellation failure or concurrent match aborts replacement and keeps the old manifest.

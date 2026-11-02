@@ -623,8 +623,16 @@ pub(crate) async fn relay_counting<R>(
 ) where
     R: AuthoritativeDeliveryRecorder,
 {
-    relay_counting_with_chain_availability(up_rx, tx, recorder, failure_context, None, u64::MAX)
-        .await;
+    relay_counting_with_chain_availability(
+        up_rx,
+        tx,
+        recorder,
+        failure_context,
+        None,
+        u64::MAX,
+        None,
+    )
+    .await;
 }
 
 async fn relay_counting_with_chain_availability<R>(
@@ -638,6 +646,7 @@ async fn relay_counting_with_chain_availability<R>(
     )>,
     mut chain_unavailable: Option<watch::Receiver<bool>>,
     billing_grant_tokens: u64,
+    billing_metrics: Option<(String, &'static str)>,
 ) where
     R: AuthoritativeDeliveryRecorder,
 {
@@ -689,7 +698,8 @@ async fn relay_counting_with_chain_availability<R>(
                 ));
                 break unfinished_delivery_finish(saw_output);
             };
-            let Some(tokens) = NonZeroU64::new(usage.total_tokens.min(billing_grant_tokens)) else {
+            let Some(tokens) = NonZeroU64::new(usage.non_cached_tokens().min(billing_grant_tokens))
+            else {
                 terminal_error = Some(Status::data_loss(
                     "terminal billing usage has zero total after delivered output",
                 ));
@@ -706,7 +716,10 @@ async fn relay_counting_with_chain_availability<R>(
                     break unfinished_delivery_finish(saw_output);
                 }
             };
-            if recorder.shared_budget() || charged != usage.total_tokens {
+            if let Some((model, backend)) = &billing_metrics {
+                crate::telemetry::billed(model, backend, charged);
+            }
+            if recorder.shared_budget() || charged != usage.non_cached_tokens() {
                 usage.charged_tokens = Some(charged);
             }
             permit.send(Ok(StreamFrame {
@@ -772,7 +785,7 @@ async fn relay_counting_with_chain_availability<R>(
                     ));
                     break unfinished_delivery_finish(saw_output);
                 }
-                billing_exhausted = usage.total_tokens > billing_grant_tokens;
+                billing_exhausted = usage.non_cached_tokens() > billing_grant_tokens;
                 if !saw_output || usage.output_tokens == 0 {
                     terminal_error = Some(Status::data_loss(
                         "terminal billing usage has no preceding delivered output",
@@ -1056,6 +1069,8 @@ impl Gateway for GatewayService {
         // held through clean EOF, validated against the grant, then atomically commits the request total
         // before the same typed record is released to the buyer.
         let (up_tx, up_rx) = mpsc::channel(GATEWAY_UPSTREAM_CHANNEL_CAPACITY);
+        let (model, backend) = upstream.metric_labels();
+        let billing_metrics = Some((model.to_owned(), backend));
         let mock_token_count = limits.mock_token_count;
         tokio::spawn(async move {
             upstream.run(request, mock_token_count, up_tx).await;
@@ -1072,12 +1087,16 @@ impl Gateway for GatewayService {
             Some(failure_context),
             Some(chain_unavailable),
             effective_billing_grant,
+            billing_metrics,
         ));
 
         let stream = ReceiverStream::new(rx);
         Ok(Response::new(Box::pin(stream)))
     }
 }
+
+#[cfg(test)]
+pub(crate) use tests::exercise_billing_metrics;
 
 #[allow(clippy::result_large_err)]
 #[cfg(test)]
@@ -1132,6 +1151,7 @@ mod tests {
             None,
             None,
             billing_grant_tokens,
+            None,
         )
         .await;
         let mut buyer = Vec::new();
@@ -1139,6 +1159,105 @@ mod tests {
             buyer.push(item);
         }
         buyer
+    }
+
+    // Driven by the process-global OTLP wire test, which checks each case's exported counters.
+    pub(crate) async fn exercise_billing_metrics() {
+        async fn relay<R: AuthoritativeDeliveryRecorder>(
+            model: &str,
+            recorder: R,
+            disconnect: bool,
+        ) -> Vec<Result<StreamFrame, Status>> {
+            let (up_tx, up_rx) = mpsc::channel(3);
+            crate::telemetry::request(model, "inference", "mock", async {
+                for event in [head(200), output("full answer"), usage(2, 1)] {
+                    crate::seller::upstream::send_event(&up_tx, event)
+                        .await
+                        .unwrap();
+                }
+            })
+            .await;
+            drop(up_tx);
+            let (tx, mut rx) = mpsc::channel(1);
+            let relaying = relay_counting_with_chain_availability(
+                up_rx,
+                tx,
+                recorder,
+                None,
+                None,
+                2,
+                Some((model.into(), "mock")),
+            );
+            let receiving = async move {
+                let mut frames = Vec::new();
+                while let Some(frame) = rx.recv().await {
+                    frames.push(frame);
+                    if disconnect && frames.len() == 2 {
+                        break; // Close after the head and output, before billing can be accepted.
+                    }
+                }
+                frames
+            };
+            tokio::join!(relaying, receiving).1
+        }
+        let clamped = relay("telemetry-billing-clamp", EventRecorder::default(), false).await;
+        let usage = clamped.last().unwrap().as_ref().unwrap().usage.unwrap();
+        assert_eq!(usage.total_tokens, 3);
+        assert_eq!(usage.charged_tokens, Some(2));
+
+        let state = GatewayState::new();
+        let tc = "0:telemetry-shared-budget";
+        state
+            .register_stream(
+                tc,
+                buyer_pubkey(),
+                u64::MAX,
+                subscription_state(TICK_SIZE),
+                ordinary_shape(TICK_SIZE + 2),
+            )
+            .unwrap();
+        let limit = dexdo_core::params::SELLER_MAX_CONCURRENT_REQUESTS_PER_DEAL;
+        let first = state.capacity.admit_shared(&tc.into(), 2, limit).unwrap();
+        let second = state.capacity.admit_shared(&tc.into(), 2, limit).unwrap();
+        for (reservation, charged) in [(first, 2), (second, 0)] {
+            let frames = relay(
+                "telemetry-billing-shared",
+                CapacityDeliveryRecorder {
+                    reservation,
+                    delivery: state.delivery(tc),
+                },
+                false,
+            )
+            .await;
+            let usage = frames.last().unwrap().as_ref().unwrap().usage.unwrap();
+            assert_eq!(usage.total_tokens, 3);
+            assert_eq!(usage.charged_tokens, Some(charged));
+        }
+
+        struct RejectBilling;
+        impl AuthoritativeDeliveryRecorder for RejectBilling {
+            fn record_authoritative_delivery(
+                &self,
+                _: AuthoritativeDeliveryEvent,
+            ) -> Result<(), Status> {
+                Ok(())
+            }
+            fn complete_billing(&self, _: NonZeroU64, _: bool) -> Result<u64, Status> {
+                Err(Status::internal("billing was not accepted"))
+            }
+        }
+        let rejected = relay("telemetry-billing-rejected", RejectBilling, false).await;
+        assert_eq!(
+            rejected.last().unwrap().as_ref().unwrap_err().code(),
+            tonic::Code::Internal
+        );
+        let recorder = EventRecorder::default();
+        let disconnected = relay("telemetry-billing-disconnected", recorder.clone(), true).await;
+        assert_eq!(disconnected.len(), 2);
+        assert!(!recorder
+            .events()
+            .iter()
+            .any(|event| matches!(event, AuthoritativeDeliveryEvent::Completed(_))));
     }
 
     async fn relay_with_failure_seam(
@@ -3161,18 +3280,147 @@ mod tests {
                             (7, 5, 12)
                         );
                         assert_eq!((usage.cache_read_tokens, usage.cache_write_tokens), (4, 3));
-                        assert_eq!(usage.billable_tokens(), grant);
-                        assert_eq!(snapshot.local_delivered_after_anchor, u128::from(grant));
+                        assert_eq!(usage.billable_tokens(), 5);
+                        assert_eq!(snapshot.local_delivered_after_anchor, 5);
                         assert_eq!(snapshot.outstanding_reservation, 0);
                         assert_eq!(
                             state.delivery(tc).count.load(Ordering::Acquire),
-                            TICK_SIZE as u64 + grant
+                            TICK_SIZE as u64 + 5
                         );
-                        assert_eq!(
-                            state.delivery(tc).billing_exhausted.load(Ordering::Acquire),
-                            grant < 12
-                        );
+                        assert!(!state.delivery(tc).billing_exhausted.load(Ordering::Acquire));
                     }
+                }
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn cache_2223_review_nested_cache_never_advances_delivery_or_payment() {
+        use crate::api_format::ApiFormat;
+        for (format, mirror, details) in [
+            (ApiFormat::ChatCompletions, false, "input_tokens_details"),
+            (ApiFormat::Responses, false, "prompt_tokens_details"),
+            (ApiFormat::Messages, false, "output_tokens_details"),
+            (ApiFormat::ChatCompletions, true, "input_tokens_details"),
+        ] {
+            for streamed in [false, true] {
+                for cached in [false, true] {
+                    let mut usage = match format {
+                        ApiFormat::ChatCompletions => {
+                            serde_json::json!({"prompt_tokens":1000,"completion_tokens":100})
+                        }
+                        _ => serde_json::json!({"input_tokens":1000,"output_tokens":100}),
+                    };
+                    usage[details] = if cached {
+                        serde_json::json!({"cached_tokens":500})
+                    } else {
+                        serde_json::json!({"reasoning_tokens":70,"tool_tokens":20})
+                    };
+                    let mut payload = serde_json::json!({"usage":usage});
+                    if mirror {
+                        payload["x_groq"] = serde_json::json!({"usage":payload["usage"]});
+                        payload["usage"].as_object_mut().unwrap().remove(details);
+                    }
+                    let wire = if streamed {
+                        match format {
+                            ApiFormat::ChatCompletions => format!("data: {}\n\ndata: {payload}\n\ndata: [DONE]\n\n",
+                                serde_json::json!({"choices":[{"delta":{"content":"answer"}}]})),
+                            ApiFormat::Responses => format!("event: response.output_text.delta\ndata: {}\n\nevent: response.completed\ndata: {}\n\n",
+                                serde_json::json!({"type":"response.output_text.delta","delta":"answer"}),
+                                serde_json::json!({"type":"response.completed","response":payload})),
+                            ApiFormat::Messages => format!("event: message_start\ndata: {}\n\nevent: content_block_delta\ndata: {}\n\nevent: message_delta\ndata: {}\n\nevent: message_stop\ndata: {{\"type\":\"message_stop\"}}\n\n",
+                                serde_json::json!({"type":"message_start","message":payload}),
+                                serde_json::json!({"type":"content_block_delta","delta":{"type":"text_delta","text":"answer"}}),
+                                serde_json::json!({"type":"message_delta","usage":payload["usage"]})),
+                        }
+                    } else {
+                        match format {
+                            ApiFormat::ChatCompletions => {
+                                payload["choices"] = serde_json::json!([{"message":{"role":"assistant","content":"answer"}}])
+                            }
+                            ApiFormat::Responses => {
+                                payload["output"] = serde_json::json!([{"type":"message","content":[{"type":"output_text","text":"answer"}]}])
+                            }
+                            ApiFormat::Messages => {
+                                payload["content"] =
+                                    serde_json::json!([{"type":"text","text":"answer"}])
+                            }
+                        }
+                        payload.to_string()
+                    };
+                    let content_type = if streamed {
+                        "text/event-stream"
+                    } else {
+                        "application/json"
+                    };
+                    let (base_url, server) = scripted_provider("200 OK", content_type, wire).await;
+                    let upstream = if format == ApiFormat::Messages {
+                        UpstreamConfig::Anthropic(crate::seller::AnthropicConfig {
+                            base_url,
+                            model: "scripted".into(),
+                            frame_model: "m".into(),
+                            api_key_env: "PATH".into(),
+                        })
+                    } else {
+                        UpstreamConfig::OpenAi(crate::seller::OpenAiConfig {
+                            base_url,
+                            frame_model: "m".into(),
+                            api_key_env: "PATH".into(),
+                            ..Default::default()
+                        })
+                    };
+                    let state = Arc::new(GatewayState::with_upstream(upstream));
+                    let buyer = LocalNote::generate();
+                    let tc = "0:cache-review-2223";
+                    state
+                        .register_stream(
+                            tc,
+                            buyer.pubkey(),
+                            100,
+                            subscription_state(TICK_SIZE),
+                            ordinary_shape(TICK_SIZE + 1100),
+                        )
+                        .unwrap();
+                    let mut request = authorized_body(
+                        &state,
+                        &buyer,
+                        tc,
+                        format.path(),
+                        serde_json::json!({"model":"m","messages":[],"input":"prompt","max_tokens":100,"stream":streamed}),
+                        1100,
+                    );
+                    request.get_mut().shared_budget = true;
+                    let (frames, error) = drain(
+                        GatewayService::new(state.clone())
+                            .open_stream(request)
+                            .await
+                            .unwrap()
+                            .into_inner(),
+                    )
+                    .await;
+                    server.await.unwrap();
+                    let snapshot = state.capacity_snapshot(tc).unwrap().unwrap();
+                    let paid = if cached {
+                        assert!(
+                            terminal(&frames).is_none(),
+                            "{format:?} stream={streamed} mirror={mirror}"
+                        );
+                        assert_eq!(error.unwrap().code(), tonic::Code::DataLoss);
+                        0
+                    } else {
+                        assert!(
+                            error.is_none(),
+                            "{format:?} stream={streamed} mirror={mirror}: {error:?}"
+                        );
+                        assert_eq!(terminal(&frames).unwrap().billable_tokens(), 1100);
+                        1100
+                    };
+                    assert_eq!(snapshot.local_delivered_after_anchor, paid);
+                    assert_eq!(snapshot.outstanding_reservation, 0);
+                    assert_eq!(
+                        state.delivery(tc).count.load(Ordering::Acquire),
+                        TICK_SIZE as u64 + paid as u64
+                    );
                 }
             }
         }
@@ -3638,6 +3886,7 @@ mod tests {
             None,
             None,
             100,
+            None,
         ));
         // With a one-event channel, all sends can finish only if the relay keeps consuming the
         // real upstream after discovering that the client disappeared.

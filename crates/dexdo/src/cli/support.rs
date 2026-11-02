@@ -1775,6 +1775,7 @@ pub(crate) async fn provision_replacement_seller_with_deal_gas_overhead(
         nonce,
         price_per_tick: u128::from(price_per_tick),
         max_ticks,
+        all_or_none: false,
     };
     let target_active = chain
         .exact_provision_target_is_active_and_matches(&token_contract, &expected_market)
@@ -2498,24 +2499,65 @@ pub(crate) fn ensure_provision_deposit_covered(
     deposit_shells: u128,
     price_per_tick: u128,
 ) -> Result<()> {
-    let deploy_need = deposit_shells.checked_mul(SHELL_UNIT).ok_or_else(|| {
-        anyhow::anyhow!("--deposit-shells {deposit_shells}: overflows the u128 ECC[2] raw range")
-    })?;
-    let bond_need = seller_bond_for_price(price_per_tick)?;
+    ensure_provision_deposit_covered_for(
+        note_ecc_raw,
+        note_spendable_raw,
+        deposit_shells,
+        price_per_tick,
+        1,
+    )
+}
+
+/// The same guard for `deals` deals of these terms at once (provision's `--require-funds-for`): the
+/// deploy deposit and the `2P` bond each times `deals`, checked against the gas pocket and the
+/// trading balance separately, so a script provisioning N offers is refused before the first one.
+pub(crate) fn ensure_provision_deposit_covered_for(
+    note_ecc_raw: u128,
+    note_spendable_raw: u128,
+    deposit_shells: u128,
+    price_per_tick: u128,
+    deals: u64,
+) -> Result<()> {
+    let deals_raw = u128::from(deals);
+    let deploy_need = deposit_shells
+        .checked_mul(SHELL_UNIT)
+        .and_then(|raw| raw.checked_mul(deals_raw))
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "--deposit-shells {deposit_shells} for {deals} deal(s): overflows the u128 ECC[2] \
+                 raw range"
+            )
+        })?;
+    let bond_need = seller_bond_for_price(price_per_tick)?
+        .checked_mul(deals_raw)
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "seller bond for {deals} deal(s) at price_per_tick={price_per_tick}: overflows the \
+                 u128 ECC[2] raw range"
+            )
+        })?;
+    let scope = if deals == 1 {
+        String::new()
+    } else {
+        format!(" for {deals} deals (--require-funds-for {deals})")
+    };
     if note_ecc_raw < deploy_need {
         anyhow::bail!(
             "provision: note ECC[2] SHELL = {note_ecc_raw} raw (~{} SHELL), but --deposit-shells \
-             {deposit_shells} needs {deploy_need} raw (~{deposit_shells} SHELL) for the per-deal \
-             TokenContract deploy gas. Lower --deposit-shells (the default is this deal's own floor) \
-             or mint a note with enough physical ECC[2] gas.",
+             {deposit_shells} needs {deploy_need} raw (~{} SHELL) for the per-deal \
+             TokenContract deploy gas{scope}, short by {} raw. Lower --deposit-shells (the default \
+             is this deal's own floor) or mint a note with enough physical ECC[2] gas.",
             note_ecc_raw / SHELL_UNIT,
+            deploy_need / SHELL_UNIT,
+            deploy_need - note_ecc_raw,
         );
     }
     if note_spendable_raw < bond_need {
         anyhow::bail!(
             "provision: PrivateNote.getDetails().balance[2] = {note_spendable_raw} raw, but seller \
-             bond (2P) needs {bond_need} raw at price_per_tick={price_per_tick}. Mint a note with \
-             enough nominal SHELL; physical ECC[2] gas cannot fund the bond."
+             bond (2P) needs {bond_need} raw at price_per_tick={price_per_tick}{scope}, short by {} \
+             raw. Mint a note with enough nominal SHELL; physical ECC[2] gas cannot fund the bond.",
+            bond_need - note_spendable_raw,
         );
     }
     Ok(())

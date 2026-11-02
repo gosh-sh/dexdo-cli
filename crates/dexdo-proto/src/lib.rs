@@ -86,9 +86,6 @@ impl BillingUsage {
             self.output_tokens,
             Some(self.total_tokens),
         )?;
-        if self.billable_tokens() > self.total_tokens {
-            return Err("charged tokens exceed provider usage");
-        }
         let cached = self
             .cache_read_tokens
             .checked_add(self.cache_write_tokens)
@@ -96,12 +93,26 @@ impl BillingUsage {
         if cached > self.input_tokens {
             return Err("cache tokens exceed provider input usage");
         }
+        if self
+            .charged_tokens
+            .is_some_and(|charged| charged > self.non_cached_tokens())
+        {
+            return Err("charged tokens exceed non-cached provider usage");
+        }
         Ok(())
     }
 
-    /// Payment accepted from the deal, separately from provider-native work.
+    /// Non-cached input plus output. Validate untrusted records before monetary use.
+    pub fn non_cached_tokens(&self) -> u64 {
+        self.total_tokens
+            .saturating_sub(self.cache_read_tokens)
+            .saturating_sub(self.cache_write_tokens)
+    }
+
+    /// Payment accepted from the deal, bounded by validated non-cached provider work.
     pub fn billable_tokens(&self) -> u64 {
-        self.charged_tokens.unwrap_or(self.total_tokens)
+        self.charged_tokens
+            .unwrap_or_else(|| self.non_cached_tokens())
     }
 }
 
@@ -137,6 +148,27 @@ mod billing_usage_tests {
     }
 
     #[test]
+    fn cache_2223_billable_is_uncached_input_plus_output_and_rejects_overcharge() {
+        for (input, read, write, output, paid) in [
+            (300, 0, 0, 100, 400),
+            (800, 500, 0, 100, 400),
+            (500, 0, 200, 100, 400),
+            (1000, 500, 200, 100, 400),
+            (700, 500, 200, 100, 100),
+        ] {
+            let mut usage = BillingUsage::new(input, output, None).unwrap();
+            usage.cache_read_tokens = read;
+            usage.cache_write_tokens = write;
+            usage.validate().unwrap();
+            assert_eq!(usage.billable_tokens(), paid);
+            usage.charged_tokens = Some(paid + 1);
+            assert!(usage.validate().is_err(), "a peer cannot charge for cache");
+            usage.charged_tokens = Some(paid);
+            usage.validate().unwrap();
+        }
+    }
+
+    #[test]
     fn cache_counts_are_bounded_subsets_and_survive_the_wire() {
         use prost::Message;
         let mut usage = BillingUsage::new(12, 3, None).unwrap();
@@ -145,7 +177,7 @@ mod billing_usage_tests {
         usage.validate().unwrap();
         let decoded = BillingUsage::decode(usage.encode_to_vec().as_slice()).unwrap();
         assert_eq!(decoded, usage);
-        assert_eq!(decoded.billable_tokens(), 15);
+        assert_eq!(decoded.billable_tokens(), 6);
         usage.cache_write_tokens = 6;
         assert_eq!(
             usage.validate(),

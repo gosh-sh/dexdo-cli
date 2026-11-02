@@ -57,6 +57,7 @@ async fn issue_1056_persist_fill(
         price_per_tick: parent.price_per_tick,
         max_ticks: parent.offered_ticks,
         subscription: false,
+        all_or_none: false,
         gateway_advertise: seller.listen_addr.to_string(),
         mock_token_count: 98,
     };
@@ -105,6 +106,7 @@ fn issue_1056_save_parent_handle(
         nonce: 4,
         price_per_tick: dexdo_core::PRICE_STEP,
         max_ticks: 98,
+        all_or_none: false,
     };
     deals::save_deal_handle(
         deals_dir,

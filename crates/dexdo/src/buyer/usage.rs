@@ -2977,9 +2977,9 @@ mod tests {
             let (_dir,store)=store();
             store.start_request("r","m","openai",false).unwrap();
             let mut answer=BillingUsage::new(answer_input,answer_output,None).unwrap();
-            answer.charged_tokens=Some(answer.total_tokens/2);
             answer.cache_read_tokens=answer_input/2;
             answer.cache_write_tokens=(answer_input-answer.cache_read_tokens)/2;
+            answer.charged_tokens=Some(answer.non_cached_tokens()/2);
             let verify=BillingUsage::new(verify_input,verify_output,None).unwrap();
             for _ in 0..2 {
                 store.record_call_usage("r","answer","answer",answer,true).unwrap();

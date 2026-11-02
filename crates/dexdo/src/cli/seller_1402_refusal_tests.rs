@@ -132,6 +132,7 @@ async fn startup_above_max_serves_the_paid_candidate_before_funding_any_residual
         nonce: 20,
         price_per_tick: u128::from(dexdo_core::PRICE_STEP as u64),
         max_ticks: 4,
+        all_or_none: false,
     };
     deals::save_deal_handle(
         &deals_dir,

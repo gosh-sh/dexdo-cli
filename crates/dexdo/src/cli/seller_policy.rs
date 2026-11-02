@@ -2,6 +2,10 @@ use crate::cli::policy;
 use anyhow::{anyhow, bail, Result};
 use dexdo_core::{ChainBackend, ChainError, DealTerminalSettlement};
 
+#[cfg(test)]
+#[path = "seller_policy_metrics_tests.rs"]
+mod metrics_tests;
+
 pub(crate) async fn apply_seller_dispute_policy(
     chain: &dyn ChainBackend,
     token_contract: &dexdo_core::TokenContract,
@@ -17,6 +21,7 @@ pub(crate) async fn apply_seller_dispute_policy(
     match policy.dispute_against_me {
         policy::SellerDisputeAgainstMeAction::ReleaseIfClean => {
             let settlement = chain.release_dispute(token_contract).await?;
+            dexdo::telemetry::deal_settled(token_contract);
             let token_contract = dexdo_core::address::display_self_dapp(token_contract);
             println!(
                 "policy_action failure_class=dispute_against_me action=release_if_clean \

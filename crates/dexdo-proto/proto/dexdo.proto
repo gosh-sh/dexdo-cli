@@ -38,7 +38,7 @@ message StreamRequest {
   bytes signature = 3;
   // A field number an older peer still reads; never reuse it.
   reserved 4;
-  // Maximum provider-native input + output tokens this request may bill.
+  // Maximum non-cached input + output tokens this request may bill.
   uint64 billing_grant_tokens = 5;
   // Opt in to concurrent requests drawing from one shared deal budget.
   bool shared_budget = 6;
@@ -77,10 +77,10 @@ message BillingUsage {
   uint64 output_tokens = 2;
   uint64 total_tokens = 3;
   // Accepted payment from the deal budget, separate from provider-native counts.
-  // Absent means total_tokens.
+  // Absent means total_tokens minus cache_read_tokens and cache_write_tokens.
   // Zero is valid even when the provider delivered a nonempty answer.
   optional uint64 charged_tokens = 4;
-  // Cache counts are subsets of input_tokens, never additional billable tokens.
+  // Disjoint cache subsets of input_tokens; neither reads nor writes are billable.
   uint64 cache_read_tokens = 5;
   uint64 cache_write_tokens = 6;
 }

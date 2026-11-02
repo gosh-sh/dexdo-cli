@@ -186,8 +186,8 @@ seller_ready token_contract=<addr> gateway=<host:port> gateway_listen=<addr> ord
 ### Seller metrics (OpenTelemetry)
 
 `dexdo seller` can export metrics over OTLP/gRPC to an OpenTelemetry Collector.
-Export is off by default and independent of `RUST_LOG`; no other command starts
-it. Only metrics are exported, never logs or traces, and no labels carry
+Export is off by default and independent of `RUST_LOG`; apart from `dexdo buyer`
+(see Buyer metrics below), no other command starts it. Only metrics are exported, never logs or traces, and no labels carry
 addresses, keys, prompts or per-deal identifiers.
 
 | Variable | Default | Meaning |
@@ -231,17 +231,27 @@ table below the metrics says what each label value means.
 | `dexdo.seller.health.last_check` | observable gauge, f64, `s` | Unix time of the oldest latest check across the watched deals of a `model` and `component`. | From the latest readiness checks, on every export. |
 | `dexdo.seller.health.last_success` | observable gauge, f64, `s` | Unix time of the oldest latest success across those deals; `0` while any of them has never passed. | From the latest readiness checks, on every export. |
 | `dexdo.seller.health.status` | observable gauge, u64 | `1` on the current `state` (`pass`, `fail`, `unknown`), `0` on the other two. `unknown` when a check of a watched deal is older than 120 s; `fail` when any latest outcome is not `pass`. Once the last watched deal of a model has ended, its last result stays. | From the latest readiness checks, on every export. |
+| `dexdo.seller.uptime.status` | observable gauge, u64 | `1` on the current `state` (`pass`, `fail`, `timeout`, `throttled`, `unknown`), `0` on the others. Labels `model`, `component` (`gateway`, `upstream`); independent of whether a deal is active. The advertised gateway self-probe remains in `health.status` (`component=advertised_gateway`). | Gateway task status is sampled on gateway polling; an independent upstream readiness probe runs every 30 s. Stale observations become `unknown`. |
+| `dexdo.seller.uptime.last_check` | observable gauge, f64, `s` | Unix timestamp of the latest uptime check. Labels `model`, `component` (`gateway`, `upstream`). | On every export. |
+| `dexdo.seller.uptime.last_success` | observable gauge, f64, `s` | Unix timestamp of the latest successful uptime check; remains `0` until the component succeeds. Labels `model`, `component`. | On every export. |
 | `dexdo.seller.offer.executable` | observable gauge, f64, `1` | Seller asks seen live on the order book (deadline still ahead) within the last 120 s. `NaN` while any ask of the `model` is unknown. | From the seller's reads of its own asks on the order book, on every export. |
 | `dexdo.seller.offer.remaining_ticks` | observable gauge, f64, `1` | Ticks left in those live asks. `NaN` under the same condition. | From the seller's reads of its own asks on the order book, on every export. |
+| `dexdo.seller.offer.listed` | observable gauge, f64, `1` | `1` when an ask is authoritatively listed; `0` when its absence is authoritatively known; `NaN` while listing state is unknown. | From the seller's reads of its own asks on the order book, on every export. |
 | `dexdo.seller.offer.unknown` | observable gauge, f64, `1` | Asks with no fresh read: the last read failed or is older than 120 s. A matched ask is final and never counts here. | From the seller's reads of its own asks on the order book, on every export. |
 | `dexdo.seller.offer.recovery_age` | observable gauge, f64, `s` | Seconds since the oldest unresolved offer recovery started; `0` when none. | From the moment an offer post fails until a live ask is seen again, on every export. |
 | `dexdo.seller.offer.isolated` | observable gauge, f64, `1` | Local deal watchers isolated after an error. | When a deal watcher stops on an error or its listener is removed. |
 | `dexdo.seller.offer.events` | counter, u64 | Offer lifecycle transitions. Label `outcome`: `matched`, `expired`, `relisted`, `recovering`, `isolated`. | On each transition of a seller ask. |
 | `dexdo.seller.upstream.requests` | counter, u64 | Logical upstream requests, counted once at the end. Labels `model`, `purpose` (`inference`, `probe`), `backend` (`mock`, `openai`, `anthropic`), `outcome` (`success`, `error`, `cancelled`), `error_class` (`none`, `timeout`, `authentication`, `rate_limit`, `stream_protocol`, `unavailable`, `configuration`, `other`). | When an upstream call ends: buyer inference and readiness probes alike. |
+| `dexdo.seller.upstream.requests.active` | observable gauge, u64 | Number of active upstream requests. Labels `model`, `purpose` (`inference`, `probe`). | While a request is running, on every export. |
 | `dexdo.seller.upstream.duration` | histogram, f64, `s` | Duration of one logical request. Same labels as `upstream.requests`. | When an upstream call ends. |
 | `dexdo.seller.upstream.attempts` | counter, u64 | HTTP attempts started, retries included. Labels `model`, `purpose`, `backend`, `status_class=started`. | On every HTTP attempt to the provider; the mock backend counts one per request. |
 | `dexdo.seller.upstream.responses` | counter, u64 | HTTP responses received. Labels `model`, `purpose`, `backend`, `status_class` (`2xx`, `4xx`, `5xx`, `other`), `status_code`. | On every HTTP response from the provider; the mock backend records none. |
 | `dexdo.seller.upstream.time_to_first_token` | histogram, f64, `s` | Time from request start to the first non-empty output chunk delivered to the buyer. Labels `model`, `purpose`, `backend`. | When the first output chunk reaches the buyer. |
+| `dexdo.seller.upstream.time_per_output_token` | histogram, f64, `s` | Average time per output token after the first output token. Labels `model`, `purpose`, `backend`; emitted for successful requests with more than one output token. | When an upstream request completes. |
+| `dexdo.seller.upstream.input_tokens` | counter, u64 | Input tokens reported for completed inference usage. Labels `model`, `purpose=inference`, `backend`. | When usage is reported by the upstream adapter. |
+| `dexdo.seller.upstream.output_tokens` | counter, u64 | Output tokens reported for completed inference usage. Labels `model`, `purpose=inference`, `backend`. | When usage is reported by the upstream adapter. |
+| `dexdo.seller.billable_ticks` | counter, f64, no OTLP unit (value is ticks) | Cumulative inference usage accepted by gateway billing (`charged_tokens / TICK_SIZE`), after grant and shared-budget limits. Labels `model`, `purpose=inference`, `backend`. | Once authoritative billing succeeds. |
+| `dexdo.seller.deals.in_progress` | observable gauge, u64 | Number of matched seller deals not yet confirmed terminal. Label `model`; cleared only after an authoritative terminal settlement fact. | On every export. |
 | `dexdo.seller.telemetry.export_failures` | observable counter, u64 | Failed exports to the collector, cumulative; visible after the next successful export. | On each failed export; visible after the next successful one. |
 
 | Label | Values | Meaning |
@@ -280,6 +290,85 @@ A failed or stale chain read is reported as unknown, never as zero: while
 the last watched deal of a model is sold, its offer series show `0` and its
 health series keep their last result instead of turning `unknown`. A watcher
 that stops does not mean the offer was cancelled.
+
+### Buyer metrics (OpenTelemetry)
+
+`dexdo buyer` exports its own metrics over OTLP/gRPC with the same variables as
+`dexdo seller` (table above). Export is off unless `OTEL_METRICS_EXPORTER=otlp`;
+without it the buyer opens no connection to a collector and runs exactly as
+before. `OTEL_SERVICE_NAME` defaults to `dexdo-buyer`, and the client adds
+`role=buyer`, `network` (`mock` under `--mock-chain`) and `service.version`. An
+invalid configuration with export turned on stops `dexdo buyer` before it buys.
+A collector that is down or slow changes no answer the buyer gives: the metrics
+are lost and requests are served as usual. No label carries addresses, keys,
+prompts or deal identifiers; the seller gateway's address is never recorded, so
+`server.address` and `server.port` are not set.
+
+A service that launches buyers in batches ties them to itself through two
+resource attributes, which the buyer passes on unchanged: `service.namespace`,
+one value for every buyer that service starts, and `service.instance.id`, a
+value of its own for each buyer, for example its slot. Through a Collector's
+Prometheus exporter they usually become `job` (`<service.namespace>/<service.name>`)
+and `instance`.
+
+```sh
+export OTEL_METRICS_EXPORTER=otlp
+export OTEL_EXPORTER_OTLP_METRICS_ENDPOINT=http://127.0.0.1:4317
+export OTEL_RESOURCE_ATTRIBUTES=service.namespace=slot-orchestrator,service.instance.id=slot-7
+```
+
+Then start `dexdo buyer` in the same environment as usual.
+
+Names and labels follow the OpenTelemetry semantic conventions:
+`http.server.request.duration` and `rpc.client.call.duration` appear with the
+`dexdo.buyer.` prefix, and each error counter carries the labels of its
+histogram. Every metric also carries `model`, the model this buyer buys, as the
+seller's metrics do. Every retry is its own connection and its own calls.
+
+| Metric | Type | Value | Recorded |
+|---|---|---|---|
+| `dexdo.buyer.http.server.errors` | counter, u64 | Answers of the local API with a status of 400 or above. | On every such answer, on any path and method, including an unknown path (`404`) and a body over the limit (`413`). |
+| `dexdo.buyer.http.server.request.duration` | histogram, f64, `s` | Time from receiving a request to the last byte of its answer; a streamed answer is timed to its end or to the moment it broke off. | On every answer with any status, and on a request the client left before any answer. |
+| `dexdo.buyer.rpc.client.connect.errors` | counter, u64 | Failed connections to the seller gateway. | On every failed connection. A handover address that does not parse is no connection and is not recorded here or in `connect.duration`. |
+| `dexdo.buyer.rpc.client.connect.duration` | histogram, f64, `s` | Time from the start of the TCP connection to a ready HTTP/2 channel, or to the failure. | On every connection, failed or not. |
+| `dexdo.buyer.rpc.client.call.duration` | histogram, f64, `s` | Time of one `GetChallenge` or `OpenStream` call; `OpenStream` is timed to the end of its response stream. | When the call ends. A connection that failed makes no call. |
+| `dexdo.buyer.rpc.client.errors` | counter, u64 | Calls that ended with a gRPC status other than `OK`. | When such a call ends. |
+
+| Label | Metrics | Values |
+|---|---|---|
+| `model` | all | The model this buyer buys, as resolved at start. Never taken from a client's request. |
+| `http.request.method` | `http.server.*` | The request method; a method outside RFC 9110 other than `PATCH` is `_OTHER`. |
+| `url.scheme` | `http.server.*` | `http`. |
+| `http.response.status_code` | `http.server.*` | The status sent, as an integer. Absent when the client left before any answer. |
+| `http.route` | `http.server.*` | The matched route: `/v1/chat/completions`, `/v1/responses`, `/v1/messages`, `/v1/models`, `/v1/usage`, `/v1/usage/facts`. Absent on an unknown path; the raw path is never recorded. |
+| `network.protocol.version` | `http.server.*` | `1.1` or `2`. |
+| `error.type` | `http.server.*` | On a 5xx answer the status as a string, for example `"502"`; `client_disconnected` when the client left before any answer. Absent otherwise: a 4xx is not a server error. |
+| `error.type` | `rpc.client.connect.*` | The stage the connection failed at: `tcp_connect`, `tls_handshake`, `tls_certificate_pin` (the gateway's certificate is not the one pinned for the deal) or `http2_handshake` (TCP and TLS succeeded, HTTP/2 did not). Absent on a connection that succeeded. |
+| `tls.alert` | `rpc.client.connect.*` | The TLS alert the gateway sent, by its registry name, for example `handshake_failure`; `_OTHER` for an unassigned code. Only when an alert arrived. |
+| `rpc.system.name` | `rpc.client.call.duration`, `rpc.client.errors` | `grpc`. |
+| `rpc.method` | `rpc.client.call.duration`, `rpc.client.errors` | `dexdo.v1.Gateway/GetChallenge` or `dexdo.v1.Gateway/OpenStream`. |
+| `rpc.response.status_code` | `rpc.client.call.duration`, `rpc.client.errors` | The gRPC status name, `OK`, `CANCELLED`, `INVALID_ARGUMENT`, `RESOURCE_EXHAUSTED`, `UNAVAILABLE`, `DATA_LOSS` and so on, sent by the seller or set by the client. |
+| `error.type` | `rpc.client.call.duration`, `rpc.client.errors` | The same status name when it is not `OK`. |
+| `purpose` | `GetChallenge` calls only | `authorize`: the nonce that signs a request; `capabilities`: the once-per-deal query of the paths the seller serves. |
+
+`OpenStream` ends with `CANCELLED` when the buyer abandons the stream, usually
+because its client disconnected. A provider's HTTP error that the seller
+forwards is not a gRPC error: the client receives it unchanged and it shows in
+`http.server.*`. A stream that ends with `OK` but whose content the buyer
+rejects is still `OK` here.
+
+Histogram buckets, seconds: `http.server.request.duration` uses
+`0, 1, 5, 10, 25, 60, 300`; `rpc.client.connect.duration` and
+`rpc.client.call.duration` share
+`0, 0.005, 0.01, 0.025, 0.05, 0.075, 0.1, 0.25, 0.5, 0.75, 1, 2.5, 5, 7.5, 10, 25, 60, 300`.
+
+Through a Collector's Prometheus exporter the error counter usually appears as
+`dexdo_buyer_http_server_errors_total`; check the exposed names before writing
+alerts. An alert on server errors of the local API:
+
+```promql
+sum(rate(dexdo_buyer_http_server_errors_total{http_response_status_code=~"5.."}[5m])) > 0
+```
 
 ## Guides: 
 

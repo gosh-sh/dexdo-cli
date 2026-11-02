@@ -1139,6 +1139,7 @@ mod tests {
             // other kind.
             price_per_tick: 1000 * dexdo_core::PRICE_STEP,
             max_ticks: 1024,
+            all_or_none: false,
         }
     }
 

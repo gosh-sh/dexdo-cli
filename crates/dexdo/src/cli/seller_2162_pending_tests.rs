@@ -131,6 +131,7 @@ mod issue_2162 {
                 nonce: 1,
                 price_per_tick: dexdo_core::PRICE_STEP,
                 max_ticks: 2,
+                all_or_none: false,
             },
             &root.join("contracts.json"),
             true,

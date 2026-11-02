@@ -1,3 +1,52 @@
+## v0.12.0
+
+### New / Improvements
+
+- `dexdo seller` exports independent gateway and upstream uptime, listed offers,
+  active deals, accepted billable ticks, and upstream request, token and latency
+  metrics over OTLP. With metrics enabled, periodic readiness probes refresh
+  upstream availability even without inference traffic. Probes carry
+  `purpose=probe` so dashboards can filter inference with `purpose=inference`.
+- `dexdo provision --all-or-none` makes the deal's sell offer all-or-none: one
+  buyer takes all `--max-ticks` or the offer keeps resting, and a smaller buy
+  passes it by. The choice is written into the market manifest as
+  `"all_or_none": true` and into the deal record, and `dexdo seller` posts that
+  deal's offer with `AON` with no flag of its own. A seller holding several deals
+  posts each with the choice its own record carries. A manifest without the field
+  is an ordinary deal, and an ordinary manifest is written as before.
+- `dexdo provision --require-funds-for N` refuses before deploying anything unless
+  the note covers N deals of these terms, this one included: N deploy deposits
+  from the note's ECC[2] gas pocket and N `2P` seller bonds from its trading
+  balance, each checked on its own. Use it on the first of N provisions so a short
+  note stops before any deal is deployed. Both refusals of the deposit check now
+  also say how much is short.
+- `dexdo buyer` can export metrics over OTLP/gRPC with the same `OTEL_*`
+  variables as `dexdo seller`, off unless `OTEL_METRICS_EXPORTER=otlp`: errors
+  and duration of the requests to its local API, and errors and duration of its
+  connections and gRPC calls to the seller gateway, each labelled with the
+  model the buyer buys. The README section "Buyer metrics (OpenTelemetry)"
+  lists the metrics, their labels, an alert on server errors and how a service
+  that launches buyers sets `service.namespace` and `service.instance.id`.
+
+### Fixes
+
+- Buyer BUY orders now check the note's ECC[2] gas pocket for placement and
+  automatic buyer-bond calls separately from trading escrow. STOP, dispute and
+  unopened-deal recovery also require their charge on the buyer note; a funded
+  TokenContract no longer substitutes for it. If gas is short, top up the buyer
+  note with `dexdo note topup` and retry. Operations without a note-forwarding
+  method in the current contracts still use the TokenContract reserve.
+- `dexdo seller` keeps an existing sell offer through temporary model-provider
+  timeouts and retryable errors, retrying readiness with a pause. If full readiness
+  does not recover within 60 seconds of the first detected failure, it withdraws
+  that offer and waits for recovery before offering the same terms again. Repeated
+  rate-limit responses do not extend this grace period.
+- Model billing excludes all reported cache reads and cache writes/creation from
+  buyer charges and seller contract claims. Uncached input, including tool
+  results, and output, including reasoning and tool calls, remain billable.
+  Provider usage and cache counts remain visible for diagnostics. Update both
+  buyer and seller to apply the same billing rule.
+
 ## v0.11.0
 
 ### Breaking Changes

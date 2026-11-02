@@ -1,6 +1,6 @@
 //! Provider-native billing read from a forwarded response.
 
-//! Money is authorized only by the provider's own terminal input + output record. Each format
+//! Money is authorized only by the non-cached part of the provider's terminal input + output record. Each format
 //! states it in its own place; every format follows the same rules: one record per request (an
 //! identical restatement is the same record), no output after it, output requires a positive
 //! output count, and a response without output must not bill.
@@ -151,11 +151,101 @@ fn token(object: &serde_json::Map<String, Value>, field: &str) -> Result<u64, St
 #[allow(clippy::result_large_err)]
 fn optional_count(container: &Value, field: &str) -> Result<Option<u64>, Status> {
     match container.get(field) {
-        None | Some(Value::Null) => Ok(None),
+        None => Ok(None),
         Some(value) => value.as_u64().map(Some).ok_or_else(|| {
             Status::data_loss(format!("provider usage {field} is not a token count"))
         }),
     }
+}
+
+/// Known fields are validated separately; reject cache anywhere outside those paths.
+#[allow(clippy::result_large_err)]
+fn check_cache_fields(container: &Value, known: &[&str]) -> Result<(), Status> {
+    if let Some(object) = container.as_object() {
+        for (field, value) in object {
+            if known.contains(&field.as_str()) {
+                continue;
+            }
+            if field.contains("cache") {
+                return Err(Status::data_loss(format!(
+                    "provider cache field {field} has unsupported accounting semantics"
+                )));
+            }
+            check_cache_fields(value, &[])?;
+        }
+    } else if let Some(values) = container.as_array() {
+        for value in values {
+            check_cache_fields(value, &[])?;
+        }
+    }
+    Ok(())
+}
+
+#[allow(clippy::result_large_err)]
+fn matching_count(first: Option<u64>, second: Option<u64>) -> Result<Option<u64>, Status> {
+    if first.zip(second).is_some_and(|(a, b)| a != b) {
+        return Err(Status::data_loss("provider cache counters disagree"));
+    }
+    Ok(first.or(second))
+}
+
+/// Supported OpenAI-compatible cache counters are disjoint subsets of total input.
+/// Aliases report the same subset and must agree; they must never be added together.
+#[allow(clippy::result_large_err)]
+fn input_cache_counts(
+    container: &Value,
+    details: &str,
+) -> Result<(Option<u64>, Option<u64>), Status> {
+    check_cache_fields(
+        container,
+        &[
+            "prompt_cache_hit_tokens",
+            "prompt_cache_miss_tokens",
+            details,
+        ],
+    )?;
+    let mut read = optional_count(container, "prompt_cache_hit_tokens")?;
+    let mut write = None;
+    if let Some(details) = container.get(details).filter(|v| !v.is_null()) {
+        if !details.is_object() {
+            return Err(Status::data_loss(
+                "provider input token details is not an object",
+            ));
+        }
+        check_cache_fields(
+            details,
+            &[
+                "cached_tokens",
+                "cache_read_tokens",
+                "cache_write_tokens",
+                "cache_creation_tokens",
+            ],
+        )?;
+        read = matching_count(
+            read,
+            matching_count(
+                optional_count(details, "cached_tokens")?,
+                optional_count(details, "cache_read_tokens")?,
+            )?,
+        )?;
+        write = matching_count(
+            optional_count(details, "cache_write_tokens")?,
+            optional_count(details, "cache_creation_tokens")?,
+        )?;
+    }
+    Ok((read, write))
+}
+
+#[allow(clippy::result_large_err)]
+fn check_cache_miss(container: &Value, usage: &BillingUsage) -> Result<(), Status> {
+    if optional_count(container, "prompt_cache_miss_tokens")?
+        .is_some_and(|miss| miss != usage.input_tokens - usage.cache_read_tokens)
+    {
+        return Err(Status::data_loss(
+            "provider cache hit/miss counts disagree with input",
+        ));
+    }
+    Ok(())
 }
 
 /// One OpenAI-compatible `usage`-shaped record (E2E-UPS-18/22: untrusted counts are refused).
@@ -171,6 +261,13 @@ fn chat_usage(container: Option<&Value>) -> Result<Option<BillingUsage>, Status>
         .iter()
         .any(|field| object.contains_key(*field))
     {
+        let (read, write) = input_cache_counts(container, "prompt_tokens_details")?;
+        if read.is_some() || write.is_some() || container.get("prompt_cache_miss_tokens").is_some()
+        {
+            return Err(Status::data_loss(
+                "provider cache usage is missing input/output totals",
+            ));
+        }
         return Ok(None);
     }
     let declared_total = object
@@ -183,19 +280,11 @@ fn chat_usage(container: Option<&Value>) -> Result<Option<BillingUsage>, Status>
         declared_total,
     )
     .map_err(Status::data_loss)?;
-    if let Some(details) = object
-        .get("prompt_tokens_details")
-        .filter(|value| !value.is_null())
-    {
-        if !details.is_object() {
-            return Err(Status::data_loss(
-                "provider prompt_tokens_details is not an object",
-            ));
-        }
-        usage.cache_read_tokens = optional_count(details, "cached_tokens")?.unwrap_or(0);
-        usage.cache_write_tokens = optional_count(details, "cache_write_tokens")?.unwrap_or(0);
-    }
+    let (read, write) = input_cache_counts(container, "prompt_tokens_details")?;
+    usage.cache_read_tokens = read.unwrap_or(0);
+    usage.cache_write_tokens = write.unwrap_or(0);
     usage.validate().map_err(Status::data_loss)?;
+    check_cache_miss(container, &usage)?;
     Ok(Some(usage))
 }
 
@@ -215,34 +304,14 @@ pub(crate) fn chat_frame_usage(value: &Value) -> Result<Option<BillingUsage>, St
             {
                 return Err(Status::data_loss("provider usage totals disagree"));
             }
-            for (field, count, mirror) in [
-                (
-                    "cached_tokens",
-                    &mut standard.cache_read_tokens,
-                    groq.cache_read_tokens,
-                ),
-                (
-                    "cache_write_tokens",
-                    &mut standard.cache_write_tokens,
-                    groq.cache_write_tokens,
-                ),
-            ] {
-                let known = value["usage"]["prompt_tokens_details"][field]
-                    .as_u64()
-                    .is_some();
-                let mirror_known = value["x_groq"]["usage"]["prompt_tokens_details"][field]
-                    .as_u64()
-                    .is_some();
-                if known && mirror_known && *count != mirror {
-                    return Err(Status::data_loss(format!(
-                        "provider {field} usage totals disagree"
-                    )));
-                }
-                if !known {
-                    *count = mirror;
-                }
-            }
+            let (read, write) = input_cache_counts(&value["usage"], "prompt_tokens_details")?;
+            let (mirror_read, mirror_write) =
+                input_cache_counts(&value["x_groq"]["usage"], "prompt_tokens_details")?;
+            standard.cache_read_tokens = matching_count(read, mirror_read)?.unwrap_or(0);
+            standard.cache_write_tokens = matching_count(write, mirror_write)?.unwrap_or(0);
             standard.validate().map_err(Status::data_loss)?;
+            check_cache_miss(&value["usage"], &standard)?;
+            check_cache_miss(&value["x_groq"]["usage"], &standard)?;
             Ok(Some(standard))
         }
         (Some(usage), None) | (None, Some(usage)) => Ok(Some(usage)),
@@ -269,18 +338,11 @@ fn responses_usage(container: Option<&Value>) -> Result<Option<BillingUsage>, St
         declared_total,
     )
     .map_err(Status::data_loss)?;
-    if let Some(details) = object
-        .get("input_tokens_details")
-        .filter(|value| !value.is_null())
-    {
-        if !details.is_object() {
-            return Err(Status::data_loss(
-                "provider input_tokens_details is not an object",
-            ));
-        }
-        usage.cache_read_tokens = optional_count(details, "cached_tokens")?.unwrap_or(0);
-    }
+    let (read, write) = input_cache_counts(container, "input_tokens_details")?;
+    usage.cache_read_tokens = read.unwrap_or(0);
+    usage.cache_write_tokens = write.unwrap_or(0);
     usage.validate().map_err(Status::data_loss)?;
+    check_cache_miss(container, &usage)?;
     Ok(Some(usage))
 }
 
@@ -300,11 +362,51 @@ fn messages_counts(usage: Option<&Value>) -> Result<MessagesCounts, Status> {
     if !usage.is_object() {
         return Err(Status::data_loss("Anthropic usage is not an object"));
     }
+    check_cache_fields(
+        usage,
+        &[
+            "cache_read_input_tokens",
+            "cache_creation_input_tokens",
+            "cache_creation",
+        ],
+    )?;
+    // Anthropic optional cumulative input/cache fields use null for "not restated".
+    // Required initial input and final output are still enforced by their callers.
+    let optional = |field| {
+        if usage.get(field).is_some_and(Value::is_null) {
+            Ok(None)
+        } else {
+            optional_count(usage, field)
+        }
+    };
+    let creation = optional("cache_creation_input_tokens")?;
+    let cache_write = if let Some(details) = usage.get("cache_creation").filter(|v| !v.is_null()) {
+        let object = details
+            .as_object()
+            .ok_or_else(|| Status::data_loss("Anthropic cache_creation is not an object"))?;
+        let mut total = 0_u64;
+        for (field, value) in object {
+            if !field.starts_with("ephemeral_") || !field.ends_with("_input_tokens") {
+                return Err(Status::data_loss(
+                    "unknown Anthropic cache creation breakdown",
+                ));
+            }
+            let count = value.as_u64().ok_or_else(|| {
+                Status::data_loss("Anthropic cache creation is not a token count")
+            })?;
+            total = total
+                .checked_add(count)
+                .ok_or_else(|| Status::data_loss("Anthropic cache creation overflows u64"))?;
+        }
+        matching_count(creation, Some(total))?
+    } else {
+        creation
+    };
     Ok(MessagesCounts {
-        input: optional_count(usage, "input_tokens")?,
+        input: optional("input_tokens")?,
         output: optional_count(usage, "output_tokens")?,
-        cache_read: optional_count(usage, "cache_read_input_tokens")?,
-        cache_write: optional_count(usage, "cache_creation_input_tokens")?,
+        cache_read: optional("cache_read_input_tokens")?,
+        cache_write,
     })
 }
 
@@ -338,6 +440,7 @@ fn messages_verdict(
     let mut usage = BillingUsage::new(input, output, None).map_err(Status::data_loss)?;
     usage.cache_read_tokens = cache_read;
     usage.cache_write_tokens = cache_write;
+    usage.validate().map_err(Status::data_loss)?;
     Ok(Some(usage))
 }
 
@@ -457,6 +560,316 @@ impl MessagesMeter {
 mod tests {
     use super::*;
     use proptest::prelude::*;
+
+    fn cache_fixture(format: ApiFormat, input: u64, read: u64, write: u64, output: u64) -> Value {
+        let usage = match format {
+            ApiFormat::ChatCompletions => serde_json::json!({
+                "prompt_tokens":input+read+write,"completion_tokens":output,
+                "prompt_tokens_details":{"cached_tokens":read,"cache_write_tokens":write},
+                "completion_tokens_details":{"reasoning_tokens":output},
+            }),
+            ApiFormat::Responses => serde_json::json!({
+                "input_tokens":input+read+write,"output_tokens":output,
+                "input_tokens_details":{"cached_tokens":read,"cache_write_tokens":write},
+                "output_tokens_details":{"reasoning_tokens":output},
+            }),
+            ApiFormat::Messages => serde_json::json!({
+                "input_tokens":input,"output_tokens":output,
+                "cache_read_input_tokens":read,"cache_creation_input_tokens":write,
+                "cache_creation":{"ephemeral_5m_input_tokens":write/2,"ephemeral_1h_input_tokens":write-write/2},
+                "server_tool_use":{"web_search_requests":1},
+            }),
+        };
+        serde_json::json!({"usage":usage})
+    }
+
+    fn cached_body_and_stream(format: ApiFormat, fixture: Value) -> (BillingUsage, BillingUsage) {
+        let body = UsageMeter::body(format, &fixture, &facts(true))
+            .unwrap()
+            .unwrap();
+        let mut meter = UsageMeter::new(format);
+        match format {
+            ApiFormat::Messages => {
+                meter
+                    .observe(
+                        &serde_json::json!({"type":"message_start","message":fixture}),
+                        &facts(false),
+                    )
+                    .unwrap();
+                meter
+                    .observe(
+                        &serde_json::json!({"type":"content_block_delta"}),
+                        &facts(true),
+                    )
+                    .unwrap();
+                meter
+                    .observe(
+                        &serde_json::json!({"type":"message_delta","usage":fixture["usage"]}),
+                        &facts(false),
+                    )
+                    .unwrap();
+            }
+            ApiFormat::Responses => {
+                let terminal = ResponseFacts {
+                    done: true,
+                    ..facts(false)
+                };
+                meter
+                    .observe(&serde_json::json!({"response":fixture}), &terminal)
+                    .unwrap();
+            }
+            ApiFormat::ChatCompletions => meter.observe(&fixture, &facts(false)).unwrap(),
+        }
+        (body, meter.finish(true).unwrap().unwrap())
+    }
+
+    #[test]
+    fn cache_2223_review_nested_cache_outside_supported_paths_is_not_billable() {
+        for (format, mirror, details) in [
+            (ApiFormat::ChatCompletions, false, "input_tokens_details"),
+            (ApiFormat::Responses, false, "prompt_tokens_details"),
+            (ApiFormat::Messages, false, "output_tokens_details"),
+            (ApiFormat::ChatCompletions, true, "input_tokens_details"),
+        ] {
+            let mut fixture = cache_fixture(format, 1000, 0, 0, 100);
+            if mirror {
+                fixture["x_groq"] = serde_json::json!({"usage":fixture["usage"]});
+            }
+            let usage = if mirror {
+                &mut fixture["x_groq"]["usage"]
+            } else {
+                &mut fixture["usage"]
+            };
+            usage[details] = serde_json::json!({"reasoning_tokens":70,"tool_tokens":20});
+            let (body, stream) = cached_body_and_stream(format, fixture.clone());
+            assert_eq!(body.billable_tokens(), 1100);
+            assert_eq!(stream, body);
+            for unsupported in [
+                serde_json::json!({"cached_tokens":500}),
+                serde_json::json!({"provider":{"cached_tokens":500}}),
+                serde_json::json!([{"cached_tokens":500}]),
+            ] {
+                let mut bad = fixture.clone();
+                if mirror {
+                    bad["x_groq"]["usage"][details] = unsupported;
+                } else {
+                    bad["usage"][details] = unsupported;
+                }
+                assert!(
+                    UsageMeter::body(format, &bad, &facts(true)).is_err(),
+                    "{bad}"
+                );
+                let mut meter = UsageMeter::new(format);
+                let (event, terminal) = match format {
+                    ApiFormat::Messages => (
+                        serde_json::json!({"type":"message_start","message":bad}),
+                        facts(false),
+                    ),
+                    ApiFormat::Responses => (
+                        serde_json::json!({"response":bad}),
+                        ResponseFacts {
+                            done: true,
+                            ..facts(false)
+                        },
+                    ),
+                    ApiFormat::ChatCompletions => (bad, facts(false)),
+                };
+                assert!(meter.observe(&event, &terminal).is_err(), "{event}");
+                assert!(
+                    meter.finish(true).is_err(),
+                    "no terminal bill after rejection"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn cache_2223_review_anthropic_nullable_counters_preserve_initial_usage() {
+        let stream = |initial: Value, final_usage: Value| -> Result<_, Box<Status>> {
+            let mut meter = UsageMeter::new(ApiFormat::Messages);
+            meter.observe(
+                &serde_json::json!({"type":"message_start","message":{"usage":initial}}),
+                &facts(false),
+            )?;
+            meter.observe(
+                &serde_json::json!({"type":"content_block_delta"}),
+                &facts(true),
+            )?;
+            meter.observe(
+                &serde_json::json!({"type":"message_delta","usage":final_usage}),
+                &facts(false),
+            )?;
+            meter.finish(true).map_err(Box::new)
+        };
+        let initial = serde_json::json!({"input_tokens":300,"output_tokens":0,
+            "cache_read_input_tokens":500,"cache_creation_input_tokens":200});
+        let omitted = serde_json::json!({"output_tokens":100});
+        let nullable = serde_json::json!({"input_tokens":null,"cache_read_input_tokens":null,
+            "cache_creation_input_tokens":null,"output_tokens":100});
+        let expected = stream(initial.clone(), omitted.clone()).unwrap().unwrap();
+        assert_eq!(expected.billable_tokens(), 400);
+        assert_eq!(stream(initial.clone(), nullable).unwrap(), Some(expected));
+        let body = serde_json::json!({"usage":{"input_tokens":300,"output_tokens":100,
+            "cache_read_input_tokens":null,"cache_creation_input_tokens":null,"cache_creation":null,
+            "output_tokens_details":{"reasoning_tokens":70},"server_tool_use":{"web_search_requests":1}}});
+        assert_eq!(
+            UsageMeter::body(ApiFormat::Messages, &body, &facts(true))
+                .unwrap()
+                .unwrap()
+                .billable_tokens(),
+            400
+        );
+        let mut missing_input = initial.clone();
+        missing_input["input_tokens"] = Value::Null;
+        assert!(stream(missing_input, omitted.clone()).is_err());
+        assert!(stream(initial.clone(), serde_json::json!({"output_tokens":null})).is_err());
+        for field in [
+            "input_tokens",
+            "cache_read_input_tokens",
+            "cache_creation_input_tokens",
+        ] {
+            for bad in [
+                serde_json::json!(-1),
+                serde_json::json!(1.5),
+                serde_json::json!("5"),
+            ] {
+                let mut final_usage = omitted.clone();
+                final_usage[field] = bad.clone();
+                assert!(stream(initial.clone(), final_usage).is_err());
+                let mut malformed = body.clone();
+                malformed["usage"][field] = bad;
+                assert!(UsageMeter::body(ApiFormat::Messages, &malformed, &facts(true)).is_err());
+            }
+        }
+        for field in ["input_tokens", "output_tokens"] {
+            let mut required = body.clone();
+            required["usage"][field] = Value::Null;
+            assert!(UsageMeter::body(ApiFormat::Messages, &required, &facts(true)).is_err());
+        }
+    }
+
+    #[test]
+    fn cache_2223_all_formats_and_response_modes_exclude_read_and_creation() {
+        for format in [
+            ApiFormat::ChatCompletions,
+            ApiFormat::Responses,
+            ApiFormat::Messages,
+        ] {
+            for (input, read, write, output) in [
+                (300, 0, 0, 100),
+                (300, 500, 0, 100),
+                (300, 0, 200, 100),
+                (300, 500, 200, 100),
+                (0, 500, 200, 100),
+            ] {
+                let (body, stream) = cached_body_and_stream(
+                    format,
+                    cache_fixture(format, input, read, write, output),
+                );
+                assert_eq!(body, stream);
+                assert_eq!(body.billable_tokens(), input + output);
+                assert_eq!(body.total_tokens, input + read + write + output);
+            }
+        }
+    }
+
+    #[test]
+    fn cache_2223_aliases_and_creation_breakdowns_are_not_added_twice() {
+        let chat = serde_json::json!({"usage":{
+            "prompt_tokens":1000,"completion_tokens":100,
+            "prompt_cache_hit_tokens":500,"prompt_cache_miss_tokens":500,
+            "prompt_tokens_details":{"cached_tokens":500,"cache_read_tokens":500,
+                "cache_write_tokens":200,"cache_creation_tokens":200},
+            "completion_tokens_details":{"reasoning_tokens":70},
+        }});
+        assert_eq!(
+            UsageMeter::body(ApiFormat::ChatCompletions, &chat, &facts(true))
+                .unwrap()
+                .unwrap()
+                .billable_tokens(),
+            400
+        );
+        let mut conflicting = chat.clone();
+        conflicting["usage"]["prompt_tokens_details"]["cache_read_tokens"] = 499.into();
+        assert!(UsageMeter::body(ApiFormat::ChatCompletions, &conflicting, &facts(true)).is_err());
+        let mut mirror = chat.clone();
+        mirror["x_groq"] = serde_json::json!({"usage":chat["usage"]});
+        mirror["x_groq"]["usage"]["prompt_tokens_details"]["cache_write_tokens"] = 201.into();
+        assert!(UsageMeter::body(ApiFormat::ChatCompletions, &mirror, &facts(true)).is_err());
+        let partial = serde_json::json!({"usage":{"prompt_tokens_details":{"cached_tokens":500}},"x_groq":{"usage":{"prompt_tokens":1000,"completion_tokens":100}}});
+        assert!(UsageMeter::body(ApiFormat::ChatCompletions, &partial, &facts(true)).is_err());
+        let mut creation = cache_fixture(ApiFormat::Messages, 300, 500, 200, 100);
+        creation["usage"]["cache_creation"]["ephemeral_1h_input_tokens"] = 101.into();
+        assert!(UsageMeter::body(ApiFormat::Messages, &creation, &facts(true)).is_err());
+    }
+
+    #[test]
+    fn cache_2223_malformed_unknown_impossible_and_overflowing_counts_bill_nothing() {
+        for bad in [
+            serde_json::json!(-1),
+            serde_json::json!(1.5),
+            serde_json::json!("5"),
+            Value::Null,
+            serde_json::json!(1001),
+        ] {
+            for format in [ApiFormat::ChatCompletions, ApiFormat::Responses] {
+                let mut fixture = cache_fixture(format, 300, 500, 200, 100);
+                let details = if format == ApiFormat::Responses {
+                    "input_tokens_details"
+                } else {
+                    "prompt_tokens_details"
+                };
+                fixture["usage"][details]["cached_tokens"] = bad.clone();
+                assert!(UsageMeter::body(format, &fixture, &facts(true)).is_err());
+            }
+        }
+        for (format, usage) in [
+            (
+                ApiFormat::ChatCompletions,
+                serde_json::json!({"prompt_tokens":1000,"completion_tokens":100,"cache_other_tokens":50}),
+            ),
+            (
+                ApiFormat::Responses,
+                serde_json::json!({"input_tokens":1000,"output_tokens":100,"output_tokens_details":{"cached_tokens":50}}),
+            ),
+            (
+                ApiFormat::Messages,
+                serde_json::json!({"input_tokens":300,"output_tokens":100,"cache_other_input_tokens":50}),
+            ),
+            (
+                ApiFormat::Messages,
+                serde_json::json!({"input_tokens":u64::MAX,"output_tokens":1,"cache_read_input_tokens":1}),
+            ),
+            (
+                ApiFormat::Messages,
+                serde_json::json!({"input_tokens":1,"output_tokens":1,"cache_creation":{"ephemeral_5m_input_tokens":u64::MAX,"ephemeral_1h_input_tokens":1}}),
+            ),
+        ] {
+            assert!(
+                UsageMeter::body(format, &serde_json::json!({"usage":usage}), &facts(true))
+                    .is_err()
+            );
+        }
+    }
+
+    proptest! {
+        #[test]
+        fn cache_2223_adding_cache_preserves_input_tools_reasoning_and_billable_work(
+            input in 0_u64..1_000_000, output in 1_u64..1_000_000,
+            read in 0_u64..1_000_000, write in 0_u64..1_000_000,
+        ) {
+            for format in [ApiFormat::ChatCompletions,ApiFormat::Responses,ApiFormat::Messages] {
+                let (baseline, _) = cached_body_and_stream(format,cache_fixture(format,input,0,0,output));
+                let (body, stream) = cached_body_and_stream(format,cache_fixture(format,input,read,write,output));
+                prop_assert_eq!(body,stream);
+                prop_assert_eq!(body.billable_tokens(),baseline.billable_tokens());
+                prop_assert_eq!(body.billable_tokens(),input+output);
+                let mut forged = body;
+                forged.charged_tokens = Some(input+output+1);
+                prop_assert!(forged.validate().is_err());
+            }
+        }
+    }
 
     #[derive(Clone, Debug)]
     enum Event {

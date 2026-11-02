@@ -42,6 +42,7 @@ fn market() -> dexdo_core::MarketManifest {
         nonce: 1,
         price_per_tick: dexdo_core::PRICE_STEP,
         max_ticks: 4,
+        all_or_none: false,
     }
 }
 

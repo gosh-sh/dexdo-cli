@@ -277,6 +277,12 @@ pub struct MarketManifest {
     pub price_per_tick: u128,
     /// Max ticks the `TokenContract` bounds the deal to.
     pub max_ticks: u128,
+    /// The deal's sell offer is all-or-none: one buyer takes all `max_ticks` or the offer keeps
+    /// resting. Chosen by provision's `--all-or-none`; the seller posts this deal's offer with
+    /// `AON` when it is set. The book holds the flag, the `TokenContract` does not, so this file is
+    /// where it lives. Not written when false, so an ordinary manifest reads as it always did.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub all_or_none: bool,
 }
 
 /// A live or durable market identity was read successfully and proved not to be the requested one.
@@ -486,6 +492,7 @@ mod tests {
             // the book can hold.
             price_per_tick: 1000 * crate::params::PRICE_STEP,
             max_ticks: 1024,
+            all_or_none: false,
         }
     }
 
@@ -623,4 +630,6 @@ mod tests {
         drifted.frame_model = "llama/llama-3".to_string();
         assert!(drifted.validate().is_err());
     }
+
+    include!("manifest_all_or_none_2214_tests.rs");
 }

@@ -20,7 +20,7 @@ use anyhow::{bail, Context as _, Result};
 use dexdo::registry::{BuyerMissingBookPolicy, RegistryRole};
 use dexdo_core::params::{
     SellerLivenessParams, DEFAULT_MATCH_POLL_INTERVAL, SELLER_TERMINAL_RECEIPT_POLL_INTERVAL,
-    SELLER_TERMINAL_RECEIPT_TIMEOUT,
+    SELLER_TERMINAL_RECEIPT_TIMEOUT, SELLER_UPTIME_PROBE_INTERVAL,
 };
 use dexdo_core::{DobParams, MatchWatchCursor, SellOfferOutcome};
 use futures::{stream::FuturesUnordered, FutureExt as _, StreamExt as _};
@@ -791,6 +791,7 @@ where
             price_per_tick: u64::try_from(market.price_per_tick)?,
             max_ticks: u64::try_from(market.max_ticks)?,
             subscription: false,
+            all_or_none: market.all_or_none,
             gateway_advertise: String::new(),
             mock_token_count: 0,
         };
@@ -1309,6 +1310,7 @@ fn record_terminal_receipt_result(
 ) -> Vec<serde_json::Value> {
     match joined {
         Ok((token_contract, delivery, Some(settlement))) => {
+            dexdo::telemetry::deal_settled(&token_contract);
             emit_buyer_stop_terminal_trail(&token_contract, &delivery, settlement)
         }
         Ok((_, _, None)) => Vec::new(),
@@ -1355,6 +1357,7 @@ async fn record_advance_result(
                     seller_stop_attempted = true;
                     match chain.seller_stop(&token_contract).await {
                         Ok(settlement) => {
+                            dexdo::telemetry::deal_settled(&token_contract);
                             tracing::info!(
                                 token_contract = %display_token_contract(&token_contract),
                                 claimed_tokens,
@@ -1383,6 +1386,10 @@ async fn record_advance_result(
                     }
                 }
                 Ok(Some(state)) => {
+                    let terminal = state.is_stopped();
+                    if terminal {
+                        dexdo::telemetry::deal_settled(&token_contract);
+                    }
                     if let Err(error) = apply_seller_terminal_policy(
                         &token_contract,
                         seller_policy,
@@ -1393,6 +1400,7 @@ async fn record_advance_result(
                     }
                 }
                 Ok(None) if terminal_self_destruct_expected => {
+                    dexdo::telemetry::deal_settled(&token_contract);
                     tracing::info!(
                         token_contract = %display_token_contract(&token_contract),
                         claimed_tokens,
@@ -1435,6 +1443,7 @@ async fn record_advance_result(
                     .await
                 {
                     Ok(AdvanceFailureDisposition::BenignTerminal { reason }) => {
+                        dexdo::telemetry::deal_settled(&token_contract);
                         tracing::info!(
                             token_contract = %display_token_contract(&token_contract),
                             %reason,
@@ -1482,6 +1491,7 @@ async fn record_advance_result(
                         }
                     };
                 if let Some(reason) = terminal {
+                    dexdo::telemetry::deal_settled(&token_contract);
                     tracing::info!(
                         token_contract = %display_token_contract(&token_contract),
                         %reason,
@@ -2619,6 +2629,7 @@ where
             price_per_tick,
             max_ticks,
             subscription,
+            all_or_none: market.all_or_none,
             gateway_advertise: context.gateway_advertise.to_string(),
             mock_token_count,
         };
@@ -2830,6 +2841,41 @@ where
     }
 }
 
+/// A pool's restored-match shortcut is authoritative for the no-offer metric only when there is
+/// no unresolved SELL submission. Otherwise the listing may still appear after recovery.
+fn record_pool_offer_startup_state(
+    token_contract: &str,
+    model: &str,
+    match_was_observed: bool,
+    pending_offer: Option<bool>,
+    inspection: Option<&dexdo::seller::SellerOfferInspection>,
+) -> bool {
+    dexdo::telemetry::register(token_contract, model);
+    if match_was_observed
+        || matches!(
+            inspection,
+            Some(dexdo::seller::SellerOfferInspection::Funded)
+        )
+    {
+        dexdo::telemetry::deal_in_progress(token_contract, model);
+    }
+    let authoritatively_absent = if match_was_observed {
+        pending_offer == Some(false)
+    } else {
+        matches!(
+            inspection,
+            Some(
+                dexdo::seller::SellerOfferInspection::Funded
+                    | dexdo::seller::SellerOfferInspection::Vacant
+            )
+        )
+    };
+    if authoritatively_absent {
+        dexdo::telemetry::confirmed_offer_absent(token_contract, model);
+    }
+    authoritatively_absent
+}
+
 async fn prepare_pool_deal_reporting_identity<S>(
     seller: &dexdo::seller::RunningSeller,
     deal: &SellerPoolDeal,
@@ -2841,6 +2887,12 @@ async fn prepare_pool_deal_reporting_identity<S>(
 where
     S: futures::future::FusedFuture<Output = ()> + ?Sized,
 {
+    let metric_model = deal
+        .market
+        .as_ref()
+        .map(|market| market.frame_model.as_str())
+        .unwrap_or(context.frame_model);
+    dexdo::telemetry::register(&deal.cfg.token_contract, metric_model);
     if *shutdown_requested {
         bail!(
             "seller pool refused to start {} after the operator shutdown was observed",
@@ -2851,6 +2903,18 @@ where
         .state
         .route_stream(&deal.cfg.token_contract, deal.upstream.clone());
     if match_was_observed {
+        let pending_offer = deal
+            .chain
+            .has_pending_sell_offer(&deal.cfg.token_contract)
+            .await
+            .ok();
+        record_pool_offer_startup_state(
+            &deal.cfg.token_contract,
+            metric_model,
+            true,
+            pending_offer,
+            None,
+        );
         return Ok(PoolDealStart::Watching(None));
     }
     if deal
@@ -2889,6 +2953,13 @@ where
         Some(context.note_addr),
     )
     .await?;
+    record_pool_offer_startup_state(
+        &deal.cfg.token_contract,
+        metric_model,
+        false,
+        None,
+        Some(&inspection),
+    );
     let inspected_identity = match inspection {
         dexdo::seller::SellerOfferInspection::Resting { order_id } => {
             Some(dexdo::seller::liveness::RestingOfferIdentity {
@@ -3330,6 +3401,21 @@ where
     if max_open_deals == 0 {
         bail!("seller.max_open_deals must be at least 1");
     }
+    let mut model_upstreams = std::collections::HashMap::new();
+    for deal in &deals {
+        let model = deal
+            .market
+            .as_ref()
+            .map(|market| market.frame_model.as_str())
+            .unwrap_or(context.frame_model);
+        dexdo::telemetry::register(&deal.cfg.token_contract, model);
+        model_upstreams
+            .entry(model.to_owned())
+            .or_insert_with(|| deal.upstream.clone());
+    }
+    let uptime_models: Vec<_> = model_upstreams.keys().cloned().collect();
+    let mut uptime_probes = JoinSet::<()>::new();
+    let uptime_timeout = SellerLivenessParams::canonical().health_check_timeout;
     let (owner_fill_chain, primary_token_contract) = deals
         .first()
         .map(|deal| (deal.chain.clone(), deal.cfg.token_contract.clone()))
@@ -3356,6 +3442,12 @@ where
     let mut candidates = Vec::new();
 
     for deal in deals {
+        let metric_model = deal
+            .market
+            .as_ref()
+            .map(|market| market.frame_model.as_str())
+            .unwrap_or(context.frame_model);
+        dexdo::telemetry::register(&deal.cfg.token_contract, metric_model);
         let normalized = deals::normalize_addr(&deal.cfg.token_contract);
         if !known_tcs.insert(normalized.clone()) {
             bail!(
@@ -3430,6 +3522,8 @@ where
             }
         };
         if state.is_none() && observed {
+            dexdo::telemetry::deal_settled(&deal.cfg.token_contract);
+            dexdo::telemetry::confirmed_offer_absent(&deal.cfg.token_contract, metric_model);
             let fill = fill.expect("the terminal seller fill was just observed");
             if fill.residual_ticks == 0 {
                 println!(
@@ -3612,6 +3706,39 @@ where
             stop_rx.clone(),
         ));
         service_started_tcs.insert(service_key);
+    }
+
+    // Startup/restoration readiness already probes the exact upstream. Start the independent
+    // uptime cadence only after those checks have recorded their result, so its immediate first
+    // tick does not duplicate provider traffic. Restored deals with no recent result are probed.
+    if dexdo::telemetry::enabled() {
+        for (model, upstream) in model_upstreams {
+            uptime_probes.spawn(async move {
+                let mut cadence = tokio::time::interval(SELLER_UPTIME_PROBE_INTERVAL);
+                cadence.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+                loop {
+                    cadence.tick().await;
+                    if !dexdo::telemetry::uptime_probe_due(
+                        &model,
+                        "upstream",
+                        SELLER_UPTIME_PROBE_INTERVAL,
+                    ) {
+                        continue;
+                    }
+                    let outcome = match tokio::time::timeout(
+                        uptime_timeout,
+                        upstream.check_market_readiness(),
+                    )
+                    .await
+                    {
+                        Ok(Ok(())) => "pass",
+                        Ok(Err(error)) => dexdo::seller::liveness::upstream_uptime_outcome(&error),
+                        Err(_) => "timeout",
+                    };
+                    dexdo::telemetry::uptime(&model, "upstream", outcome);
+                }
+            });
+        }
     }
 
     let mut gateway_poll =
@@ -3927,6 +4054,7 @@ where
                     price_per_tick: authoritative_price,
                     max_ticks: authoritative_ticks,
                     subscription: current.cfg.subscription,
+                    all_or_none: market.all_or_none,
                     gateway_advertise: current.cfg.gateway_advertise.clone(),
                     mock_token_count: current.cfg.mock_token_count,
                 };
@@ -4157,6 +4285,15 @@ where
                 };
                 match outcome {
                     dexdo::seller::liveness::RestingSellerOutcome::Matched(matched) => {
+                        let metric_model = deal
+                            .market
+                            .as_ref()
+                            .map(|market| market.frame_model.as_str())
+                            .unwrap_or(context.frame_model);
+                        dexdo::telemetry::deal_in_progress(
+                            &deal.cfg.token_contract,
+                            metric_model,
+                        );
                         println!(
                             "seller_match_opened token_contract={} gateway={} gateway_listen={} cursor={}",
                             dexdo_core::address::display_self_dapp(&matched.token_contract),
@@ -4197,7 +4334,12 @@ where
                                   .await?
                                   {
                                       OpenedDealPlan::Drive(snapshot) => *snapshot,
-                                      OpenedDealPlan::RetireSettled => return Ok(false),
+                                      OpenedDealPlan::RetireSettled => {
+                                          dexdo::telemetry::deal_settled(
+                                              &deal.cfg.token_contract,
+                                          );
+                                          return Ok(false);
+                                      }
                                   };
                                   let run_subscription_keeper =
                                       snapshot.subscription.is_subscription();
@@ -4388,7 +4530,11 @@ where
                 }
             }
             _ = gateway_poll.tick() => {
-                if seller.server_task.is_finished() {
+                let outcome = if seller.server_task.is_finished() { "fail" } else { "pass" };
+                for model in &uptime_models {
+                    dexdo::telemetry::uptime(model, "gateway", outcome);
+                }
+                if outcome == "fail" {
                     stop_error = Some(anyhow::anyhow!(
                         "seller gateway stopped while pool deals were active"
                     ));
@@ -4969,11 +5115,21 @@ pub(crate) async fn run_seller_with_deal_gas_overhead(
     // The real path publishes the TC getter value, not the CLI fallback. Validate the actual
     // write-bound price as well, after read-only term discovery and before postSellOffer.
     super::support::validate_price_step(offer_price as u128)?;
+    // The all-or-none choice belongs to the deal, not to this process: it is read from the deal's
+    // manifest -- the explicit `--market` first, then the deal's own record, the same precedence the
+    // pool applies when it loads the startup deal.
+    let all_or_none = match startup_market.as_ref() {
+        Some(market) => market.all_or_none,
+        None => seller_market_handle_records(args.deals_dir.as_deref(), &seller_owner)?
+            .get(&deals::normalize_addr(&token_contract))
+            .is_some_and(|record| record.market.all_or_none),
+    };
     let mut cfg = dexdo::seller::SellerConfig {
         token_contract: token_contract.clone(),
         price_per_tick: offer_price,
         max_ticks: offer_ticks,
         subscription: args.subscription,
+        all_or_none,
         gateway_advertise: gateway_advertise.clone(),
         mock_token_count: args.mock_token_count,
     };
@@ -5463,6 +5619,7 @@ pub(crate) async fn run_seller_with_deal_gas_overhead(
                     nonce,
                     price_per_tick: u128::from(price_per_tick),
                     max_ticks: u128::from(max_ticks),
+                    all_or_none: false,
                 };
                 let chain: Arc<dyn dexdo_core::ChainBackend> =
                     Arc::new(dexdo_core::MockChainBackend::new(
@@ -5660,6 +5817,7 @@ mod tests {
             // A thousand SHELL a tick: the manifest carries whole SHELL.
             price_per_tick: 1000 * dexdo_core::PRICE_STEP,
             max_ticks: 1024,
+            all_or_none: false,
         };
         let handle = deals::DealHandle {
             version: deals::DEAL_HANDLE_VERSION,
@@ -5908,6 +6066,7 @@ mod tests {
             price_per_tick: dexdo_core::PRICE_STEP as u64,
             max_ticks: 1024,
             subscription: false,
+            all_or_none: false,
             gateway_advertise,
             mock_token_count: 8,
         };
@@ -6299,6 +6458,59 @@ mod tests {
         );
     }
 
+    #[test]
+    fn restored_pool_match_sets_offer_gauges_to_zero_only_without_pending_submit() {
+        // Exercise the same registration/recording seam called by restored startup.
+        assert!(record_pool_offer_startup_state(
+            "tc-restored-test-absent",
+            "startup-test",
+            true,
+            Some(false),
+            None
+        ));
+        assert!(!record_pool_offer_startup_state(
+            "tc-restored-test-pending",
+            "startup-test",
+            true,
+            Some(true),
+            None
+        ));
+        assert!(!record_pool_offer_startup_state(
+            "tc-restored-test-unknown",
+            "startup-test",
+            true,
+            None,
+            None
+        ));
+    }
+
+    #[test]
+    fn pool_inspection_sets_zero_for_funded_or_vacant_but_not_resting_offer() {
+        use dexdo::seller::SellerOfferInspection::{Funded, Resting, Vacant};
+
+        assert!(record_pool_offer_startup_state(
+            "tc-funded-test",
+            "startup-test",
+            false,
+            None,
+            Some(&Funded),
+        ));
+        assert!(record_pool_offer_startup_state(
+            "tc-vacant-test",
+            "startup-test",
+            false,
+            None,
+            Some(&Vacant),
+        ));
+        assert!(!record_pool_offer_startup_state(
+            "tc-resting-test",
+            "startup-test",
+            false,
+            None,
+            Some(&Resting { order_id: 4 }),
+        ));
+    }
+
     const STARTUP_CHILD_CASE: &str = "DEXDO_TEST_798_STARTUP_CASE";
     const STARTUP_CHILD_DONE: &str = "seller-offer-startup-child-done case=";
 
@@ -6346,6 +6558,7 @@ mod tests {
             price_per_tick: dexdo_core::PRICE_STEP as u64,
             max_ticks: 1024,
             subscription: false,
+            all_or_none: false,
             gateway_advertise: gateway_advertise.clone(),
             mock_token_count: 8,
         };
@@ -6650,6 +6863,7 @@ mod tests {
             price_per_tick: config.price_per_tick,
             max_ticks: config.max_ticks,
             subscription: false,
+            all_or_none: false,
             gateway_advertise: config.gateway_advertise.clone(),
             mock_token_count: config.mock_token_count,
         };
@@ -7801,6 +8015,7 @@ mod tests {
             price_per_tick: parent.price_per_tick,
             max_ticks: parent.offered_ticks,
             subscription: false,
+            all_or_none: false,
             gateway_advertise: gateway.clone(),
             mock_token_count: 8,
         };
@@ -7822,6 +8037,7 @@ mod tests {
                     nonce: 12,
                     price_per_tick: u128::from(parent_cfg.price_per_tick),
                     max_ticks: u128::from(residual_ticks),
+                    all_or_none: false,
                 },
                 std::path::Path::new("manifest/deployed.manifest.json"),
                 true,
@@ -7895,6 +8111,7 @@ mod tests {
                     nonce,
                     price_per_tick: u128::from(price),
                     max_ticks: u128::from(ticks),
+                    all_or_none: false,
                 };
                 let attempt = provision_attempts.fetch_add(1, Ordering::Relaxed);
                 if ambiguous_activation || active_before_cleanup {
@@ -8013,6 +8230,7 @@ mod tests {
                 nonce: 11,
                 price_per_tick: u128::from(parent_cfg.price_per_tick),
                 max_ticks: u128::from(successor_ticks),
+                all_or_none: false,
             };
             persist_provision_deal_handle(
                 Some(root),
@@ -8028,6 +8246,7 @@ mod tests {
                     price_per_tick: parent_cfg.price_per_tick,
                     max_ticks: successor_ticks,
                     subscription: false,
+                    all_or_none: false,
                     gateway_advertise: gateway.clone(),
                     mock_token_count: 8,
                 },
@@ -8052,6 +8271,7 @@ mod tests {
                 nonce: 20,
                 price_per_tick: u128::from(blocker.price_per_tick),
                 max_ticks: u128::from(blocker.offered_ticks),
+                all_or_none: false,
             };
             pool.push(SellerPoolDeal {
                 chain: blocker.clone(),
@@ -8060,6 +8280,7 @@ mod tests {
                     price_per_tick: blocker.price_per_tick,
                     max_ticks: blocker.offered_ticks,
                     subscription: false,
+                    all_or_none: false,
                     gateway_advertise: gateway.clone(),
                     mock_token_count: 8,
                 },
@@ -8080,6 +8301,7 @@ mod tests {
                     price_per_tick: keeper.price_per_tick,
                     max_ticks: keeper.offered_ticks,
                     subscription: false,
+                    all_or_none: false,
                     gateway_advertise: gateway.clone(),
                     mock_token_count: 8,
                 },
@@ -8100,6 +8322,7 @@ mod tests {
                     nonce: 20,
                     price_per_tick: u128::from(keeper.price_per_tick),
                     max_ticks: u128::from(keeper.offered_ticks),
+                    all_or_none: false,
                 }),
             });
         }
@@ -8578,6 +8801,7 @@ mod tests {
                 nonce,
                 price_per_tick: u128::from(price_per_tick),
                 max_ticks: u128::from(max_ticks),
+                all_or_none: false,
             };
             let chain: Arc<dyn ChainBackend> = backend;
             Ok((market, chain))
@@ -8636,6 +8860,7 @@ mod tests {
             nonce: 2039,
             price_per_tick: dexdo_core::PRICE_STEP,
             max_ticks: 8,
+            all_or_none: false,
         };
         deals::save_deal_handle(
             &deals_dir,
@@ -8735,6 +8960,7 @@ mod tests {
                 price_per_tick: live.price_per_tick,
                 max_ticks: live.offered_ticks,
                 subscription: false,
+                all_or_none: false,
                 gateway_advertise: gateway.clone(),
                 mock_token_count: 8,
             },
@@ -9458,6 +9684,7 @@ mod tests {
                 price_per_tick: backend.price_per_tick,
                 max_ticks: backend.offered_ticks,
                 subscription: false,
+                all_or_none: false,
                 gateway_advertise: gateway.clone(),
                 mock_token_count: 8,
             },
@@ -9630,6 +9857,7 @@ mod tests {
             nonce,
             price_per_tick: u128::from(backend.price_per_tick),
             max_ticks: u128::from(backend.offered_ticks),
+            all_or_none: false,
         };
         let bind_addr = "127.0.0.1:0".parse().unwrap();
         let mut seller = dexdo::seller::start_gateway_with_note(
@@ -9645,6 +9873,7 @@ mod tests {
             price_per_tick: initial.price_per_tick,
             max_ticks: initial.offered_ticks,
             subscription: false,
+            all_or_none: false,
             gateway_advertise: gateway.to_string(),
             mock_token_count: 8,
         };
@@ -9667,6 +9896,7 @@ mod tests {
                 price_per_tick: independent.price_per_tick,
                 max_ticks: independent.offered_ticks,
                 subscription: false,
+                all_or_none: false,
                 gateway_advertise: gateway.to_string(),
                 mock_token_count: 8,
             },
@@ -10052,6 +10282,7 @@ mod tests {
                 price_per_tick: backend.price_per_tick,
                 max_ticks: backend.offered_ticks,
                 subscription: false,
+                all_or_none: false,
                 gateway_advertise: unreachable.clone(),
                 mock_token_count: 8,
             },
@@ -10072,6 +10303,7 @@ mod tests {
                 nonce: 10,
                 price_per_tick: u128::from(backend.price_per_tick),
                 max_ticks: u128::from(backend.offered_ticks),
+                all_or_none: false,
             }),
         };
         // An owner fill for a TokenContract this pool has no handle for.
@@ -10336,6 +10568,7 @@ mod tests {
             nonce: 4,
             price_per_tick: dexdo_core::PRICE_STEP,
             max_ticks: 4,
+            all_or_none: false,
         };
         deals::save_deal_handle(
             &deals_dir,
@@ -10502,6 +10735,7 @@ mod tests {
                 price_per_tick: backend.price_per_tick,
                 max_ticks: backend.offered_ticks,
                 subscription: false,
+                all_or_none: false,
                 gateway_advertise: gateway_advertise.to_string(),
                 mock_token_count: 4,
             },
@@ -10801,6 +11035,7 @@ mod tests {
             price_per_tick: dexdo_core::PRICE_STEP as u64,
             max_ticks: 1024,
             subscription: false,
+            all_or_none: false,
             gateway_advertise: gateway.to_string(),
             mock_token_count: 4,
         };
@@ -10931,6 +11166,7 @@ mod tests {
             price_per_tick: dexdo_core::PRICE_STEP as u64,
             max_ticks: 2,
             subscription: false,
+            all_or_none: false,
             gateway_advertise: gateway.to_string(),
             mock_token_count: 4,
         };
@@ -10961,6 +11197,7 @@ mod tests {
                 nonce,
                 price_per_tick: u128::from(descendant_cfg.price_per_tick),
                 max_ticks: u128::from(max_ticks),
+                all_or_none: false,
             };
             deals::save_deal_handle(
                 &deals_dir,
@@ -11235,4 +11472,5 @@ mod tests {
     }
 
     include!("seller_retirement_2073_tests.rs");
+    include!("seller_all_or_none_2214_tests.rs");
 }

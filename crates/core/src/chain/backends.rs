@@ -63,7 +63,7 @@ enum TcGasOperation<'a> {
     SettleWeek,
     Stop(&'a Address),
     Dispute(&'a Address),
-    CleanupUnopened,
+    CleanupUnopened(&'a Address),
 }
 
 fn now_secs_at(now: std::time::SystemTime) -> Result<u64, ChainError> {
@@ -2794,11 +2794,11 @@ mod offer_rested_match_tests {
     }
 
     #[tokio::test]
-    async fn gas_2196_exit_checks_operation_charge_and_both_sources() {
+    async fn issue_2220_exit_checks_the_buyer_note_and_permissionless_settle_uses_tc() {
         let charge = crate::params::DEAL_BURN_TERMINAL_RAW;
         for (tc_ecc, note_ecc, expected) in [
             (0, charge, true),
-            (charge, 0, true),
+            (charge, 0, false),
             (charge - 1, charge - 1, false),
             (0, 0, false),
         ] {
@@ -2817,10 +2817,13 @@ mod offer_rested_match_tests {
                     assert!(error.to_string().contains("raw ECC[2]"), "{error}");
                 }
             }
-            buyer
-                .require_tc_gas(&tc, TcGasOperation::CleanupUnopened)
-                .await
-                .unwrap();
+            assert_eq!(
+                buyer
+                    .require_tc_gas(&tc, TcGasOperation::CleanupUnopened(&buyer.note))
+                    .await
+                    .is_ok(),
+                expected
+            );
         }
         let charge = crate::params::DEAL_BURN_SETTLE_RAW;
         for have in [charge - 1, charge, charge + 1] {
@@ -2856,7 +2859,7 @@ mod offer_rested_match_tests {
         let (chain, _inactive_server) =
             executable_fixture_backend(BTreeMap::from([(tc.bare().to_string(), fixture)])).await;
         assert!(chain
-            .require_tc_gas(&tc, TcGasOperation::CleanupUnopened)
+            .require_tc_gas(&tc, TcGasOperation::SettleWeek)
             .await
             .unwrap_err()
             .to_string()
@@ -7964,6 +7967,17 @@ impl RealChainBackend {
 
     /// Keep new-money reserve checks separate from the charge for an existing deal's exit.
     async fn require_tc_gas(&self, tc: &Address, operation: TcGasOperation<'_>) -> Result<()> {
+        let note_call = match operation {
+            TcGasOperation::Stop(note) => Some((note, "streamStop")),
+            TcGasOperation::Dispute(note) => Some((note, "streamDispute")),
+            TcGasOperation::CleanupUnopened(note) => Some((note, "streamCleanup")),
+            _ => None,
+        };
+        if let Some((note, call)) = note_call {
+            return self
+                .require_buyer_note_charge(note, call, crate::params::DEAL_BURN_TERMINAL_RAW)
+                .await;
+        }
         let have = self.active_deal_reserve_ecc(tc).await?;
         let (required, action) = match operation {
             TcGasOperation::Buy => {
@@ -7996,18 +8010,9 @@ impl RealChainBackend {
                 )
             }
             TcGasOperation::SettleWeek => (crate::params::DEAL_BURN_SETTLE_RAW, "settleWeek"),
-            TcGasOperation::Stop(note) | TcGasOperation::Dispute(note) => {
-                let call = if matches!(operation, TcGasOperation::Stop(_)) {
-                    "streamStop"
-                } else {
-                    "streamDispute"
-                };
-                return self
-                    .refuse_terminal_call_neither_side_can_pay(note, tc, call)
-                    .await;
-            }
-            // Recovery burns only attached ECC, which may be zero.
-            TcGasOperation::CleanupUnopened => return Ok(()),
+            TcGasOperation::Stop(_)
+            | TcGasOperation::Dispute(_)
+            | TcGasOperation::CleanupUnopened(_) => unreachable!(),
         };
         anyhow::ensure!(have >= required,
             "TokenContract {} ECC[2] reserve {have} raw nanoSHELL is below {required} raw nanoSHELL required for {action}; seller-side ECC[2] top-up is required",
@@ -10866,7 +10871,7 @@ impl ChainBackend for RealBuyerBackend {
     ) -> Result<Settlement, ChainError> {
         let tc = parse_tc(token_contract)?;
         let state = tc_settle_state(&self.chain, &tc).await.map_err(map_err)?;
-        self.require_tc_gas(&tc, TcGasOperation::CleanupUnopened)
+        self.require_tc_gas(&tc, TcGasOperation::CleanupUnopened(&self.note))
             .await?;
         self.chain
             .stream_cleanup(&self.note, &self.keys, &tc)

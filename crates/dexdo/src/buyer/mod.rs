@@ -26,6 +26,9 @@ use std::sync::{Arc, Mutex};
 use tokio_stream::StreamExt;
 use tonic::transport::Channel;
 
+/// The seller gateway's answer to one `OpenStream` call.
+pub type GatewayStream = crate::telemetry::buyer::CallStream<tonic::Streaming<StreamFrame>>;
+
 /// Outcome of the buyer receiving a whole response.
 #[derive(Debug)]
 pub struct StreamOutcome {
@@ -327,7 +330,7 @@ impl Buyer {
         body: Vec<u8>,
         headers: Vec<Header>,
         billing_grant_tokens: u64,
-    ) -> Result<tonic::Streaming<StreamFrame>> {
+    ) -> Result<GatewayStream> {
         let mut client = self.connect(handover).await?;
         let signed = self
             .authorize(
@@ -339,7 +342,14 @@ impl Buyer {
                 billing_grant_tokens,
             )
             .await?;
-        Ok(client.open_stream(signed).await?.into_inner())
+        let call = crate::telemetry::buyer::Call::open_stream();
+        match client.open_stream(signed).await {
+            Ok(response) => Ok(call.watch(response.into_inner())),
+            Err(status) => {
+                call.refused(&status);
+                Err(status.into())
+            }
+        }
     }
 
     /// The format a buyer-written probe uses: Chat Completions when the seller serves it, else the
@@ -511,12 +521,14 @@ impl Buyer {
 
     /// Open a gRPC channel to the gateway over TLS, pinning the fingerprint from the handover.
     async fn connect(&self, handover: &Handover) -> Result<GatewayClient<Channel>> {
+        let started = std::time::Instant::now();
+        let dialled = tls::connect_pinned(&handover.endpoint, &handover.tls_fingerprint).await;
+        crate::telemetry::buyer::connect(started, dialled.as_ref().err());
         // the address being dialled and the real cause are attached HERE, where the endpoint
         // is known. Reporting `?` straight through gave the operator `transport error` and nothing
         // else, with the address absent from the log even at `RUST_LOG=trace`.
-        let channel = tls::connect_pinned(&handover.endpoint, &handover.tls_fingerprint)
-            .await
-            .map_err(|error| tls::gateway_dial_error(&handover.endpoint, error))?;
+        let channel =
+            dialled.map_err(|error| tls::gateway_dial_error(&handover.endpoint, error))?;
         Ok(GatewayClient::new(channel)
             .max_decoding_message_size(dexdo_core::params::GATEWAY_RESPONSE_MAX_BYTES))
     }
@@ -532,13 +544,15 @@ impl Buyer {
         headers: Vec<Header>,
         billing_grant_tokens: u64,
     ) -> Result<StreamRequest> {
-        let challenge = client
+        let call = crate::telemetry::buyer::Call::get_challenge("authorize");
+        let answer = client
             .get_challenge(ChallengeRequest {
                 token_contract: token_contract.clone(),
                 capabilities_only: false,
             })
-            .await?
-            .into_inner();
+            .await;
+        call.answered(&answer);
+        let challenge = answer?.into_inner();
         check_api_path(path, &challenge.api_paths)?;
         let msg = challenge_bytes(token_contract, &challenge.nonce);
         let sig = self.note.sign(&msg);
@@ -569,16 +583,16 @@ impl Buyer {
         {
             return Ok(paths.clone());
         }
-        let paths = self
-            .connect(handover)
-            .await?
+        let mut client = self.connect(handover).await?;
+        let call = crate::telemetry::buyer::Call::get_challenge("capabilities");
+        let answer = client
             .get_challenge(ChallengeRequest {
                 token_contract: token_contract.clone(),
                 capabilities_only: true,
             })
-            .await?
-            .into_inner()
-            .api_paths;
+            .await;
+        call.answered(&answer);
+        let paths = answer?.into_inner().api_paths;
         if !paths.is_empty() {
             self.api_paths
                 .lock()

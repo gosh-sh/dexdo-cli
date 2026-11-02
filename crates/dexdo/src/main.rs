@@ -685,18 +685,24 @@ async fn main() -> Result<()> {
         })
     });
 
-    // Validate enabled seller telemetry before any financial command dispatch.
-    let telemetry = if let Command::Seller(args) = &cli.command {
-        let config = dexdo::telemetry::Config::from_env()?.map(|config| {
-            if args.mock.mock_chain {
-                config.with_mock_network()
-            } else {
-                config
-            }
-        });
-        dexdo::telemetry::Session::start(config)?
-    } else {
-        None
+    // Validate enabled seller or buyer telemetry before any financial command dispatch.
+    let metered = match &cli.command {
+        Command::Seller(args) => Some((dexdo::telemetry::Role::Seller, args.mock.mock_chain)),
+        Command::Buyer(args) => Some((dexdo::telemetry::Role::Buyer, args.mock.mock_chain)),
+        _ => None,
+    };
+    let telemetry = match metered {
+        Some((role, mock_chain)) => {
+            let config = dexdo::telemetry::Config::from_env_as(role)?.map(|config| {
+                if mock_chain {
+                    config.with_mock_network()
+                } else {
+                    config
+                }
+            });
+            dexdo::telemetry::Session::start(config)?
+        }
+        None => None,
     };
 
     let result = match instance_lock {
@@ -2881,6 +2887,82 @@ mod deposit_tests {
     }
 }
 
+/// the deposit guard for N deals at once (provision's `--require-funds-for`).
+#[cfg(test)]
+mod deposit_for_n_deals_2214_tests {
+    use crate::cli::support::{
+        default_deposit_shells, ensure_provision_deposit_covered,
+        ensure_provision_deposit_covered_for, SHELL_UNIT,
+    };
+    use proptest::prelude::*;
+
+    /// the owner's first run, 50 offers of 50 ticks at 1 SHELL. `--require-funds-for 50`
+    /// multiplies both halves and keeps them apart -- 50 deploy deposits out of the gas pocket, 50
+    /// `2P` bonds out of the trading balance -- and the refusal says how much is short.
+    #[test]
+    fn provision_deposit_guard_covers_every_offer_still_to_come() {
+        let shells = default_deposit_shells(50);
+        let price = dexdo_core::PRICE_STEP;
+        let deals = 50_u64;
+        let gas_need = shells * SHELL_UNIT * u128::from(deals);
+        let bond_need = 2 * price * u128::from(deals);
+        assert!(
+            ensure_provision_deposit_covered_for(gas_need, bond_need, shells, price, deals).is_ok()
+        );
+
+        let gas =
+            ensure_provision_deposit_covered_for(gas_need - 1, u128::MAX, shells, price, deals)
+                .expect_err("49 and a bit deploys' worth of gas is not 50");
+        let gas = gas.to_string();
+        assert!(
+            gas.contains("for 50 deals (--require-funds-for 50)"),
+            "{gas}"
+        );
+        assert!(gas.contains("short by 1 raw"), "{gas}");
+
+        let bond =
+            ensure_provision_deposit_covered_for(u128::MAX, bond_need - 1, shells, price, deals)
+                .expect_err("gas in the pocket cannot fund 50 bonds");
+        let bond = bond.to_string();
+        assert!(bond.contains("seller bond"), "{bond}");
+        assert!(
+            bond.contains("for 50 deals (--require-funds-for 50)"),
+            "{bond}"
+        );
+        assert!(bond.contains("short by 1 raw"), "{bond}");
+
+        // One deal is the single-deal guard: what passes or fails it is unchanged.
+        let one = shells * SHELL_UNIT;
+        assert!(ensure_provision_deposit_covered_for(one, 2 * price, shells, price, 1).is_ok());
+        assert!(ensure_provision_deposit_covered(one, 2 * price, shells, price).is_ok());
+        assert!(ensure_provision_deposit_covered_for(one, 2 * price, shells, price, 2).is_err());
+        let single = ensure_provision_deposit_covered_for(one - 1, 0, shells, price, 1)
+            .expect_err("one raw short of one deploy")
+            .to_string();
+        assert!(!single.contains("--require-funds-for"), "{single}");
+    }
+
+    proptest! {
+        /// the N-deal guard refuses exactly when either pocket is short of N deals' worth,
+        /// and gas never stands in for bond nor bond for gas.
+        #[test]
+        fn provision_deposit_guard_for_n_deals_is_exact(
+            deals in 1_u64..=1_000,
+            shells in 1_u128..=100,
+            price_shells in 0_u128..=100,
+            gas_have in 0_u128..=200_000 * SHELL_UNIT,
+            bond_have in 0_u128..=400_000 * SHELL_UNIT,
+        ) {
+            let price = price_shells * dexdo_core::PRICE_STEP;
+            let gas_need = shells * SHELL_UNIT * u128::from(deals);
+            let bond_need = 2 * price * u128::from(deals);
+            let result =
+                ensure_provision_deposit_covered_for(gas_have, bond_have, shells, price, deals);
+            prop_assert_eq!(result.is_ok(), gas_have >= gas_need && bond_have >= bond_need);
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -4531,6 +4613,7 @@ mod tests {
             // price the book can hold.
             price_per_tick: 1000 * dexdo_core::PRICE_STEP,
             max_ticks: 8,
+            all_or_none: false,
         };
         let dir = tempfile::tempdir().expect("market manifest test dir");
         let dir = dir.path();

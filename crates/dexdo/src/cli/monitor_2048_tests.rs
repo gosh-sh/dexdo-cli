@@ -21,6 +21,7 @@ fn market_file(dir: &Path, name: &str, book: char) -> PathBuf {
         nonce: 0,
         price_per_tick: 40 * dexdo_core::params::SHELL_UNIT,
         max_ticks: 446,
+        all_or_none: false,
     };
     let path = dir.join(name);
     std::fs::write(&path, manifest.to_json().unwrap()).unwrap();

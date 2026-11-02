@@ -32,6 +32,18 @@ pub enum HealthComponent {
     UpstreamModel,
 }
 
+/// Classify an upstream readiness error for uptime metrics. A provider HTTP 429 proves
+/// connectivity and is reported as throttled rather than unavailable.
+pub fn upstream_uptime_outcome(error: &anyhow::Error) -> &'static str {
+    error
+        .downcast_ref::<tonic::Status>()
+        .filter(|status| {
+            dexdo_proto::is_retryable_upstream(status)
+                && status.message().starts_with("upstream HTTP 429 ")
+        })
+        .map_or("fail", |_| "throttled")
+}
+
 impl HealthComponent {
     pub fn as_str(self) -> &'static str {
         match self {
@@ -78,6 +90,16 @@ impl HealthFailure {
                     dexdo_proto::is_retryable_upstream(status)
                         && status.message().starts_with("upstream HTTP 429 ")
                 })
+    }
+
+    fn is_transient_upstream(&self) -> bool {
+        self.component == HealthComponent::UpstreamModel
+            && (self.timed_out
+                || self
+                    .source
+                    .as_deref()
+                    .and_then(|source| source.downcast_ref::<tonic::Status>())
+                    .is_some_and(dexdo_proto::is_retryable_upstream))
     }
 
     fn into_startup_error(self, advertised: &str) -> anyhow::Error {
@@ -761,6 +783,12 @@ async fn check_readiness_with_probes(
             (result, started.elapsed())
         }),
     );
+    let upstream_uptime = match &upstream_result {
+        Ok(Ok(())) => "pass",
+        Ok(Err(error)) => upstream_uptime_outcome(error),
+        Err(_) => "timeout",
+    };
+    crate::telemetry::uptime(metrics_model, "upstream", upstream_uptime);
     crate::telemetry::health(
         token_contract,
         metrics_model,
@@ -924,6 +952,7 @@ async fn target_state(
             order.deadline,
             order.ticks,
             dexdo_core::order_deadline_is_live(order.is_buy, order.deadline, observed_at),
+            true,
         );
         // present in the book is not the same as usable. A row past its own deadline is skipped
         // by the matcher (`_isExpired`, `contracts/airegistry/InferenceOrderBook.sol:1115-1117`), so
@@ -941,12 +970,12 @@ async fn target_state(
         .read_openable_match_now(&identity.token_contract)
         .await?
     {
-        crate::telemetry::observe_offer(&identity.token_contract, 0, 0, false);
+        crate::telemetry::observe_offer(&identity.token_contract, 0, 0, false, false);
         crate::telemetry::offer_event(&identity.token_contract, "matched");
         crate::telemetry::terminal(&identity.token_contract);
         return Ok(TargetState::Matched(matched));
     }
-    crate::telemetry::observe_offer(&identity.token_contract, 0, 0, false);
+    crate::telemetry::observe_offer(&identity.token_contract, 0, 0, false, false);
     Ok(TargetState::Absent)
 }
 
@@ -1002,12 +1031,12 @@ async fn resting_offer_expiry(
             .read_openable_match_now(&identity.token_contract)
             .await?
         {
-            crate::telemetry::observe_offer(&identity.token_contract, 0, 0, false);
+            crate::telemetry::observe_offer(&identity.token_contract, 0, 0, false, false);
             crate::telemetry::offer_event(&identity.token_contract, "matched");
             crate::telemetry::terminal(&identity.token_contract);
             return Ok(SupervisedOfferPoll::Matched(matched));
         }
-        crate::telemetry::observe_offer(&identity.token_contract, 0, 0, false);
+        crate::telemetry::observe_offer(&identity.token_contract, 0, 0, false, false);
         return Ok(SupervisedOfferPoll::Expired(RestingOfferExpiry {
             // The book's own figure, from while it still held the row. A zero says the row was gone
             // before this supervision read it even once: the removal of an unfunded deal's ask is the
@@ -1022,6 +1051,7 @@ async fn resting_offer_expiry(
         order.deadline,
         order.ticks,
         dexdo_core::order_deadline_is_live(order.is_buy, order.deadline, observed_at),
+        true,
     );
     if dexdo_core::order_deadline_is_live(order.is_buy, order.deadline, observed_at) {
         return Ok(SupervisedOfferPoll::Live {
@@ -1032,7 +1062,7 @@ async fn resting_offer_expiry(
         .read_openable_match_now(&identity.token_contract)
         .await?
     {
-        crate::telemetry::observe_offer(&identity.token_contract, 0, 0, false);
+        crate::telemetry::observe_offer(&identity.token_contract, 0, 0, false, false);
         crate::telemetry::offer_event(&identity.token_contract, "matched");
         crate::telemetry::terminal(&identity.token_contract);
         return Ok(SupervisedOfferPoll::Matched(matched));
@@ -1650,6 +1680,7 @@ async fn watch_accepted_cancel(
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum CycleDeadlineSite {
     HealthCheck,
+    UpstreamGrace,
     Cancel,
 }
 
@@ -2581,6 +2612,7 @@ where
 struct SupervisionTiming {
     health_interval: Duration,
     health_timeout: Duration,
+    upstream_grace: Duration,
     cycle_timeout: Duration,
     cancel_poll: Duration,
     /// how often the supervised order's own deadline is re-read from the book.
@@ -2639,7 +2671,18 @@ where
         let mut consecutive_expiry_read_failures = 0_u64;
         let mut last_successful_expiry_read = tokio::time::Instant::now();
 
-        'supervision: loop {
+        let mut upstream_failure: Option<(tokio::time::Instant, HealthFailure)> = None;
+        let mut health_check: Option<
+            futures::future::BoxFuture<
+                '_,
+                std::result::Result<(), (HealthFailure, tokio::time::Instant)>,
+            >,
+        > = None;
+        let mut expiry_read: Option<
+            futures::future::BoxFuture<'_, Option<Result<SupervisedOfferPoll>>>,
+        > = None;
+        loop {
+            let grace_deadline = upstream_failure.as_ref().map(|(deadline, _)| *deadline);
             tokio::select! {
                 match_result = &mut matched => {
                     break match match_result {
@@ -2654,157 +2697,135 @@ where
                     Trigger::Shutdown,
                     tokio::time::Instant::now() + timing.cycle_timeout,
                 )),
-                _ = health.tick() => {
-                    // The cycle budget can be spent before this arm is ever entered. The expiry
-                    // read in the same `select!` holds the loop for up to
-                    // `TRANSIENT_READ_TOTAL_BUDGET` (45s) while the health cadence is
-                    // `health_interval` (20s), so ONE slow book read is enough for the health tick
-                    // to arrive later than `last_healthy + cycle_timeout`. Sizing the check from
-                    // what is left of that window then hands it ZERO: the `timeout_at` in
-                    // `check_readiness_with_probe` fires before a socket is opened, the seller
-                    // reports `handshake_timeout` against a gateway nobody contacted, cancels a
-                    // healthy resting SELL, and tells the operator to clean up an order that was
-                    // never sick. Observed on a long-lived seller: last healthy 12:37:01, next
-                    // cycle 12:38:41, deal retired on a probe that never ran.
-
-                    // A starved cycle is evidence about this loop, not about the gateway. Give the
-                    // check its own budget and measure the cancellation headroom from the instant
-                    // it actually starts.
-                    let cycle_start = tokio::time::Instant::now();
-                    let starved = last_healthy + timing.cycle_timeout <= cycle_start;
-                    if starved {
-                        tracing::warn!(
-                            event = "seller_health_cycle_starved",
-                            timestamp = unix_timestamp(),
-                            owner_note = %identity.owner_note,
-                            token_contract = %identity.token_contract,
-                            order_id = identity.order_id,
-                            since_last_healthy_ms = last_healthy.elapsed().as_millis() as u64,
-                            cycle_timeout_ms = timing.cycle_timeout.as_millis() as u64,
-                            "supervision reached the readiness check after its own cycle budget had \
-                             expired; rebasing the cycle rather than failing a check that never ran"
-                        );
+                _ = tokio::time::sleep_until(
+                    grace_deadline.unwrap_or_else(tokio::time::Instant::now)
+                ), if grace_deadline.is_some() => {
+                    let (_, failure) = upstream_failure.take().expect("active upstream grace");
+                    break Err((Trigger::Health(failure),
+                        tokio::time::Instant::now() + timing.cycle_timeout));
+                }
+                result = async {
+                    health_check.as_mut().expect("active readiness check").await
+                }, if health_check.is_some() => {
+                    health_check = None;
+                    if grace_deadline.is_some_and(|deadline| tokio::time::Instant::now() >= deadline) {
+                        let (_, failure) = upstream_failure.take().expect("active upstream grace");
+                        break Err((Trigger::Health(failure),
+                            tokio::time::Instant::now() + timing.cycle_timeout));
                     }
-                    let cycle_base = if starved { cycle_start } else { last_healthy };
-                    let deadline = cycle_base + timing.cycle_timeout;
-                    #[cfg(test)]
-                    observe_cycle_deadline(CycleDeadlineSite::HealthCheck, deadline);
-                    let retry_allowance = timing.health_timeout.saturating_mul(
-                        SELLER_UPSTREAM_HEALTH_TIMEOUT_MAX_ATTEMPTS.saturating_sub(1),
-                    );
-                    let timeout_deadline = deadline + retry_allowance;
-                    let mut attempt = 1;
-                    let mut check_deadline = deadline;
-                    loop {
-                        let remaining = check_deadline
-                            .saturating_duration_since(tokio::time::Instant::now());
-                        let check_timeout = std::cmp::min(timing.health_timeout, remaining);
-                        match check_readiness(
-                            seller,
-                            &cfg.gateway_advertise,
-                            check_timeout,
-                            Some(identity),
-                            &identity.token_contract,
-                            timing.advertise_probe,
-                        ).await {
-                            Ok(()) => {
-                                last_healthy = tokio::time::Instant::now();
-                                break;
-                            }
-                            Err(failure) if failure.is_upstream_throttled() => {
-                                tracing::warn!(
-                                    event = "seller_upstream_throttled",
+                    // A bounded pause after the completed probe, including timeouts and throttling.
+                    health.reset();
+                    match result {
+                        Ok(()) => {
+                            last_healthy = tokio::time::Instant::now();
+                            if upstream_failure.take().is_some() {
+                                tracing::info!(
+                                    event = "seller_upstream_grace_recovered",
                                     token_contract = %display_token_contract(&identity.token_contract),
                                     order_id = identity.order_id,
-                                    reason = %failure,
-                                    "provider throttled; preserving the resting SELL until the next health check"
+                                    "full readiness recovered; retaining exact SELL"
                                 );
-                                last_healthy = tokio::time::Instant::now();
-                                break;
-                            }
-                            // Both readiness components are bounded network probes sharing one
-                            // deadline, so both can lose it to an isolated stall -- which is what
-                            // `SELLER_UPSTREAM_HEALTH_TIMEOUT_MAX_ATTEMPTS` exists to absorb. The
-                            // self-probe was excluded, and since it is matched first, a stalled
-                            // gateway probe retired the deal even when the retry would have found
-                            // both components healthy. A timeout is not a failed probe: makes
-                            // a self-probe FAILURE fatal, and that stays.
-                            Err(failure)
-                                if failure.timed_out
-                                    && matches!(
-                                        failure.component,
-                                        HealthComponent::UpstreamModel
-                                            | HealthComponent::AdvertisedGateway
-                                    )
-                                    && attempt
-                                        < SELLER_UPSTREAM_HEALTH_TIMEOUT_MAX_ATTEMPTS =>
-                            {
-                                tracing::warn!(
-                                    event = "seller_health_timeout_retry",
-                                    component = failure.component.as_str(),
-                                    timestamp = unix_timestamp(),
-                                    owner_note = %display_dexdo_address(&identity.owner_note),
-                                    token_contract = %display_token_contract(&identity.token_contract),
-                                    order_id = identity.order_id,
-                                    failed_attempt = attempt,
-                                    next_attempt = attempt + 1,
-                                    max_attempts = SELLER_UPSTREAM_HEALTH_TIMEOUT_MAX_ATTEMPTS,
-                                    reason = %failure,
-                                    "timed-out readiness probe; retrying before retiring exact SELL"
-                                );
-                                attempt += 1;
-                                check_deadline = timeout_deadline;
-                            }
-                            Err(failure) => {
-                                // A timeout-authorized retry may consume the original cycle even if
-                                // it returns a different terminal class; keep cancellation headroom.
-                                let cancellation_deadline = if attempt > 1 {
-                                    timeout_deadline
-                                } else {
-                                    deadline
-                                };
-                                break 'supervision Err((
-                                    Trigger::Health(failure),
-                                    cancellation_deadline,
-                                ));
                             }
                         }
+                        Err((failure, _)) if failure.is_transient_upstream() => {
+                            let deadline = grace_deadline.unwrap_or_else(||
+                                tokio::time::Instant::now() + timing.upstream_grace);
+                            #[cfg(test)]
+                            observe_cycle_deadline(CycleDeadlineSite::UpstreamGrace, deadline);
+                            tracing::warn!(
+                                event = "seller_upstream_grace_wait",
+                                token_contract = %display_token_contract(&identity.token_contract),
+                                order_id = identity.order_id,
+                                remaining_ms = deadline.saturating_duration_since(
+                                    tokio::time::Instant::now()).as_millis() as u64,
+                                retry_interval_ms = timing.health_interval.as_millis() as u64,
+                                reason = %failure,
+                                "transient upstream failure; retaining exact SELL during bounded grace"
+                            );
+                            // Further failures update the reason, never the original deadline.
+                            upstream_failure = Some((deadline, failure));
+                        }
+                        Err((failure, deadline)) => break Err((Trigger::Health(failure), deadline)),
                     }
                 }
-                _ = expiry.tick() => {
-                    // The read gets the total budget of the retry it wraps, not the shorter cadence
-                    // that decides when the next read starts. A book that never answers still cannot
-                    // wedge supervision: the nested select keeps shutdown and the match watcher live
-                    // while this arm waits for the bounded read.
-
-                    // A transport blip is not proof of expiry either, so an unreadable book leaves the
-                    // seller owning an offer whose current expiry is unverified, and the next tick asks
-                    // again. Only an authoritative row that is present AND past its deadline ends
-                    // supervision here.
-                    expiry_read_attempt_total = expiry_read_attempt_total.saturating_add(1);
-                    let read = tokio::time::timeout(
-                        TRANSIENT_READ_TOTAL_BUDGET,
-                        resting_offer_expiry(chain, identity, last_deadline),
-                    );
-                    tokio::pin!(read);
-                    let read_result = tokio::select! {
-                        match_result = &mut matched => {
-                            break match match_result {
-                                Ok(matched) => Ok(matched),
-                                Err(error) => Err((
-                                    Trigger::Watcher(error.to_string()),
-                                    tokio::time::Instant::now() + timing.cycle_timeout,
-                                )),
-                            };
+                _ = health.tick(), if health_check.is_none() => {
+                    health_check = Some(Box::pin(async move {
+                        // Measure the cycle from when its future is actually polled: an unrelated
+                        // slow book read is not evidence that a probe which never ran failed.
+                        let cycle_start = tokio::time::Instant::now();
+                        let starved = last_healthy + timing.cycle_timeout <= cycle_start;
+                        if starved {
+                            tracing::warn!(
+                                event = "seller_health_cycle_starved",
+                                timestamp = unix_timestamp(),
+                                owner_note = %identity.owner_note,
+                                token_contract = %identity.token_contract,
+                                order_id = identity.order_id,
+                                since_last_healthy_ms = last_healthy.elapsed().as_millis() as u64,
+                                cycle_timeout_ms = timing.cycle_timeout.as_millis() as u64,
+                                "supervision reached readiness after its cycle budget expired; rebasing the cycle"
+                            );
                         }
-                        _ = &mut shutdown => break Err((
-                            Trigger::Shutdown,
-                            tokio::time::Instant::now() + timing.cycle_timeout,
-                        )),
-                        read_result = &mut read => read_result,
-                    };
+                        let cycle_base = if starved { cycle_start } else { last_healthy };
+                        let deadline = cycle_base + timing.cycle_timeout;
+                        #[cfg(test)]
+                        observe_cycle_deadline(CycleDeadlineSite::HealthCheck, deadline);
+                        let timeout_deadline = deadline + timing.health_timeout.saturating_mul(
+                            SELLER_UPSTREAM_HEALTH_TIMEOUT_MAX_ATTEMPTS.saturating_sub(1));
+                        let mut attempt = 1;
+                        let mut check_deadline = deadline;
+                        loop {
+                            let remaining = check_deadline.saturating_duration_since(
+                                tokio::time::Instant::now());
+                            let check_timeout = std::cmp::min(timing.health_timeout, remaining);
+                            match check_readiness(
+                                seller, &cfg.gateway_advertise, check_timeout, Some(identity),
+                                &identity.token_contract, timing.advertise_probe,
+                            ).await {
+                                // Preserve the existing bounded tolerance for a gateway self-probe
+                                // timeout. Upstream faults instead retry at the health cadence above.
+                                Err(failure) if failure.timed_out
+                                    && failure.component == HealthComponent::AdvertisedGateway
+                                    && attempt < SELLER_UPSTREAM_HEALTH_TIMEOUT_MAX_ATTEMPTS => {
+                                    tracing::warn!(
+                                        event = "seller_health_timeout_retry",
+                                        component = failure.component.as_str(),
+                                        timestamp = unix_timestamp(),
+                                        owner_note = %display_dexdo_address(&identity.owner_note),
+                                        token_contract = %display_token_contract(&identity.token_contract),
+                                        order_id = identity.order_id,
+                                        failed_attempt = attempt,
+                                        next_attempt = attempt + 1,
+                                        max_attempts = SELLER_UPSTREAM_HEALTH_TIMEOUT_MAX_ATTEMPTS,
+                                        reason = %failure,
+                                        "timed-out gateway readiness probe; retrying before retiring exact SELL"
+                                    );
+                                    attempt += 1;
+                                    check_deadline = timeout_deadline;
+                                }
+                                outcome => return outcome.map_err(|failure| (failure,
+                                    if attempt > 1 { timeout_deadline } else { deadline })),
+                            }
+                        }
+                    }));
+                }
+                _ = expiry.tick(), if expiry_read.is_none() => {
+                    expiry_read_attempt_total = expiry_read_attempt_total.saturating_add(1);
+                    // Keep the bounded book read in the same select as readiness. Waiting inside
+                    // this arm would stop polling an in-flight probe and manufacture timeouts.
+                    expiry_read = Some(Box::pin(async move {
+                        tokio::time::timeout(
+                            TRANSIENT_READ_TOTAL_BUDGET,
+                            resting_offer_expiry(chain, identity, last_deadline),
+                        ).await.ok()
+                    }));
+                }
+                read_result = async {
+                    expiry_read.as_mut().expect("active expiry read").await
+                }, if expiry_read.is_some() => {
+                    expiry_read = None;
                     match read_result {
-                        Ok(Ok(poll)) => {
+                        Some(Ok(poll)) => {
                             consecutive_expiry_read_failures = 0;
                             last_successful_expiry_read = tokio::time::Instant::now();
                             match poll {
@@ -2818,7 +2839,7 @@ where
                                 SupervisedOfferPoll::Matched(matched) => break Ok(matched),
                             }
                         }
-                        Ok(Err(error)) => {
+                        Some(Err(error)) => {
                             if error.downcast_ref::<dexdo_core::ChainError>().is_some_and(|error|
                                 !matches!(error, dexdo_core::ChainError::Transport(_))) {
                                 return Err(error);
@@ -2833,7 +2854,7 @@ where
                                 expiry_read_attempt_total,
                             );
                         }
-                        Err(_) => {
+                        None => {
                             crate::telemetry::unknown(&identity.token_contract);
                             consecutive_expiry_read_failures =
                                 consecutive_expiry_read_failures.saturating_add(1);
@@ -2858,6 +2879,19 @@ where
         }
         Err(trigger) => trigger,
     };
+
+    if let Trigger::Health(failure) = &trigger {
+        if failure.is_transient_upstream() {
+            tracing::warn!(
+                event = "seller_upstream_grace_expired",
+                token_contract = %display_token_contract(&identity.token_contract),
+                order_id = identity.order_id,
+                grace_ms = timing.upstream_grace.as_millis() as u64,
+                reason = %failure,
+                "upstream did not recover within grace; withdrawing exact SELL"
+            );
+        }
+    }
 
     // expiry is terminal on its own and needs no write. The order is already unmatchable on
     // chain, so cancelling it would spend gas to remove something the matcher already skips, and the
@@ -3444,6 +3478,7 @@ fn canonical_timing(
     SupervisionTiming {
         health_interval: params.health_interval,
         health_timeout: params.health_check_timeout,
+        upstream_grace: params.upstream_unavailable_grace,
         cycle_timeout: params.health_cycle_timeout,
         cancel_poll: params.cancel_confirmation_poll,
         expiry_poll: params.offer_expiry_poll,
@@ -3459,6 +3494,7 @@ fn canonical_timing(
 mod tests {
     include!("expiry_confirmation_2050_tests.rs");
     include!("upstream_recovery_2077_tests.rs");
+    include!("upstream_grace_2222_tests.rs");
     include!("offer_recovery_2096_tests.rs");
     include!("watch_read_recovery_2122_tests.rs");
 
@@ -3502,6 +3538,31 @@ mod tests {
     use std::sync::atomic::{AtomicU64, Ordering};
     use std::sync::{Arc, Mutex};
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    #[test]
+    fn uptime_probe_classifies_retryable_429_as_throttled_only() {
+        let rate_limited = dexdo_proto::retryable_upstream_status(tonic::Status::unavailable(
+            "upstream HTTP 429 Too Many Requests",
+        ));
+        assert_eq!(
+            super::upstream_uptime_outcome(&anyhow::Error::new(rate_limited)),
+            "throttled"
+        );
+
+        let other_retryable = dexdo_proto::retryable_upstream_status(tonic::Status::unavailable(
+            "upstream HTTP 503 Service Unavailable",
+        ));
+        assert_eq!(
+            super::upstream_uptime_outcome(&anyhow::Error::new(other_retryable)),
+            "fail"
+        );
+
+        let unclassified_429 = tonic::Status::unavailable("upstream HTTP 429 Too Many Requests");
+        assert_eq!(
+            super::upstream_uptime_outcome(&anyhow::Error::new(unclassified_429)),
+            "fail"
+        );
+    }
 
     #[derive(Clone, Copy)]
     enum CancelBehavior {
@@ -3977,6 +4038,7 @@ mod tests {
             price_per_tick: 1000,
             max_ticks: 8,
             subscription: false,
+            all_or_none: false,
             gateway_advertise: "127.0.0.1:0".to_string(),
             mock_token_count: 8,
         }
@@ -4675,6 +4737,7 @@ mod tests {
         SupervisionTiming {
             health_interval: Duration::from_millis(5),
             health_timeout: Duration::from_millis(500),
+            upstream_grace: Duration::from_secs(1),
             cycle_timeout: Duration::from_millis(600),
             cancel_poll: Duration::from_millis(1),
             expiry_poll: Duration::from_secs(3_600),
@@ -4932,6 +4995,7 @@ mod tests {
         SupervisionTiming {
             health_interval: Duration::from_millis(5),
             health_timeout: Duration::from_millis(300),
+            upstream_grace: fast_timing().upstream_grace,
             cycle_timeout: Duration::from_secs(3),
             cancel_poll: Duration::from_millis(1),
             expiry_poll: Duration::from_secs(3_600),
@@ -6902,6 +6966,9 @@ mod tests {
                 unix_timestamp() + dexdo_core::params::MAX_SELL_TTL.as_secs(),
                 offer.max_ticks,
             );
+            for rows in [&self.rows, &self.postings] {
+                rows.lock().unwrap().last_mut().unwrap().flags = offer.flags;
+            }
             if failed {
                 self.pending_submission.store(true, Ordering::SeqCst);
                 return Err(ChainError::AmbiguousSubmit(
@@ -7214,6 +7281,7 @@ mod tests {
         SupervisionTiming {
             health_interval: Duration::from_secs(3_600),
             health_timeout: Duration::from_secs(2),
+            upstream_grace: fast_timing().upstream_grace,
             cycle_timeout: Duration::from_secs(2),
             cancel_poll: Duration::from_millis(1),
             expiry_poll: Duration::from_millis(1),
@@ -7989,6 +8057,7 @@ mod tests {
                 price_per_tick: price,
                 max_ticks: ticks,
                 subscription: false,
+                all_or_none: false,
                 gateway_advertise: "127.0.0.1:1".into(),
                 mock_token_count: 0,
             };
@@ -9649,6 +9718,7 @@ mod tests {
             SupervisionTiming {
                 health_interval: Duration::from_secs(3_600),
                 health_timeout: Duration::from_secs(1),
+                upstream_grace: fast_timing().upstream_grace,
                 cycle_timeout: Duration::from_secs(2),
                 cancel_poll: Duration::from_millis(1),
                 expiry_poll: SellerLivenessParams::canonical().offer_expiry_poll,

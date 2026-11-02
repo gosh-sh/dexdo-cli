@@ -1,23 +1,13 @@
-/// A provider answer is enough to withdraw the exact offer, but must not permanently
+/// A non-transient provider failure withdraws the exact offer, but must not permanently
 /// remove healthy capacity from the market. Recovery uses the real HTTP/SSE adapter.
 #[tokio::test]
-async fn issue_2077_any_upstream_error_recovers_the_cancelled_offer() {
+async fn issue_2077_non_transient_upstream_error_recovers_the_cancelled_offer() {
     for (status, body) in [
         ("200 OK", "data: {\"error\":{\"message\":\"Our servers are currently overloaded. Please try again later.\"}}\n\n"),
-        ("503 Service Unavailable\r\nRetry-After: 1", "{\"error\":{\"message\":\"maintenance\"}}"),
         ("401 Unauthorized", "{\"error\":{\"message\":\"credential rejected\"}}"),
         ("200 OK", "data: {\"error\":{\"message\":\"an entirely different provider failure\"}}\n\n"),
     ] {
-        // Retryable HTTP statuses first exhaust the existing timeout tolerance.
-        // The provider's explicit delay exceeds fast_timing().health_timeout, so each
-        // scripted 503 occupies a separate probe. Full jitter may otherwise consume
-        // both failures in one probe and recover without withdrawing the offer.
-        let attempts = if status.starts_with("429") || status.starts_with("503") {
-            SELLER_UPSTREAM_HEALTH_TIMEOUT_MAX_ATTEMPTS as usize
-        } else {
-            1
-        };
-        let mut script = vec![(status, body.to_string(), Duration::ZERO); attempts];
+        let mut script = vec![(status, body.to_string(), Duration::ZERO)];
         script.push(("200 OK", healthy_sse(), Duration::ZERO));
         let (base_url, probes, upstream) = scripted_http_server(script);
         let tc = address('7');

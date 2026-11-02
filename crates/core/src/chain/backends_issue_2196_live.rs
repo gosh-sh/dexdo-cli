@@ -1,6 +1,7 @@
 //! Opt-in shellnet evidence for the currency gate. Keys and recovery stay in a caller-owned directory.
 // Reuse this module's two-note setup and receipt helpers for the focused seller regression.
 include!("backends_issue_2199_live.rs");
+include!("backends_issue_2220_live.rs");
 use super::*;
 use std::{fs, os::unix::fs::OpenOptionsExt, path::Path, process::Command};
 
@@ -540,10 +541,10 @@ async fn live_2196_low_ecc_exit_gates_and_cleanup() {
             .require_tc_gas(&tc, TcGasOperation::Stop(&buyer))
             .await
             .is_err());
-        chain
-            .require_tc_gas(&tc, TcGasOperation::CleanupUnopened)
+        assert!(chain
+            .require_tc_gas(&tc, TcGasOperation::CleanupUnopened(&buyer))
             .await
-            .unwrap();
+            .is_err());
 
         if dispute {
             chain
@@ -605,14 +606,14 @@ async fn live_2196_low_ecc_exit_gates_and_cleanup() {
                 .await
                 .unwrap();
             wait_ecc(&chain, &tc, DEAL_BURN_TERMINAL_RAW, true).await;
-            chain
+            assert!(chain
                 .require_tc_gas(&tc, TcGasOperation::Stop(&buyer))
                 .await
-                .unwrap();
-            chain
+                .is_err());
+            assert!(chain
                 .require_tc_gas(&tc, TcGasOperation::Dispute(&buyer))
                 .await
-                .unwrap();
+                .is_err());
         }
 
         // Establish an exhausted-reserve deal on chain to exercise recovery itself.
@@ -708,6 +709,11 @@ async fn live_2196_low_ecc_exit_gates_and_cleanup() {
             }
         } else {
             assert_eq!(account_ecc(&chain, &tc, true).await, 0);
+            chain
+                .giver_send_shell(&buyer.with_workchain(), DEAL_BURN_TERMINAL_RAW)
+                .await
+                .unwrap();
+            wait_ecc(&chain, &buyer, DEAL_BURN_TERMINAL_RAW, true).await;
             backend
                 .cleanup_unopened(&tc.with_workchain())
                 .await

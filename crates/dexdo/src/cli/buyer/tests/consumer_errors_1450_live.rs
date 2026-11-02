@@ -472,6 +472,7 @@ async fn live_consumer_errors_1450() {
             price_per_tick: price as u64,
             max_ticks: ticks as u64,
             subscription: false,
+            all_or_none: false,
             gateway_advertise: gateway.listen_addr.to_string(),
             mock_token_count: long_tokens,
         },

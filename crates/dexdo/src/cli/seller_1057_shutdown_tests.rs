@@ -58,6 +58,7 @@ async fn issue_1057_pool(matched_ticks: u64) -> Issue1057Pool {
         price_per_tick: parent.price_per_tick,
         max_ticks: parent.offered_ticks,
         subscription: false,
+        all_or_none: false,
         gateway_advertise: gateway.clone(),
         mock_token_count: 8,
     };
@@ -114,6 +115,7 @@ fn issue_1057_market(
         nonce,
         price_per_tick: u128::from(price),
         max_ticks: u128::from(ticks),
+        all_or_none: false,
     };
     let chain: Arc<dyn ChainBackend> = successor;
     (market, chain)
@@ -644,6 +646,7 @@ async fn issue_1057_consumed_shutdown_between_two_residuals_provisions_once() {
         price_per_tick: second_parent.price_per_tick,
         max_ticks: second_parent.offered_ticks,
         subscription: false,
+        all_or_none: false,
         gateway_advertise: pool.gateway.clone(),
         mock_token_count: 8,
     };

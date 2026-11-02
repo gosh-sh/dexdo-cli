@@ -678,6 +678,7 @@ mod tests {
                 nonce: 42,
                 price_per_tick: 1000,
                 max_ticks: 8,
+                all_or_none: false,
             }),
             contracts: "manifest/deployed.manifest.json".into(),
             endpoint: (role == DealHandleRole::Seller).then(|| deals::DealEndpointInfo {

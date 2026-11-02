@@ -516,10 +516,10 @@ impl AnswerContext {
             route_delivered_tokens: Some(self.deal.route_visible_output_tokens()),
             input_tokens: accepted_usage.map(|usage| usage.input_tokens),
             output_tokens: accepted_usage.map(|usage| usage.output_tokens),
-            billable_tokens: accepted_usage.map(|usage| usage.total_tokens),
+            billable_tokens: accepted_usage.map(|usage| usage.non_cached_tokens()),
             request_input_tokens: request_usage.input_tokens,
             request_output_tokens: request_usage.output_tokens,
-            request_billable_tokens: request_usage.total_tokens,
+            request_billable_tokens: request_usage.non_cached_tokens(),
             route_billable_tokens: self.deal.session.route_billable_tokens(),
             finish_reason,
         }

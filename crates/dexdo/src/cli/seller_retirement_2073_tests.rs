@@ -45,6 +45,7 @@ mod retirement_2073 {
                     nonce: digit.to_digit(10).unwrap() as u64,
                     price_per_tick: u128::from(chain.price_per_tick),
                     max_ticks: u128::from(ticks),
+                    all_or_none: false,
                 };
                 let deal = SellerPoolDeal {
                     chain: chain.clone(),
@@ -53,6 +54,7 @@ mod retirement_2073 {
                         price_per_tick: chain.price_per_tick,
                         max_ticks: ticks,
                         subscription: false,
+                        all_or_none: false,
                         gateway_advertise: "127.0.0.1:9000".into(),
                         mock_token_count: 2,
                     },
