@@ -656,7 +656,7 @@ mod tests {
         let s = store(&dir, "network-a");
         s.apply_operational_expense(operation(None)).unwrap();
         let before = serde_json::to_value(s.facts(&Default::default()).unwrap()).unwrap();
-        s.lock().unwrap().execute_batch("ALTER TABLE money_facts DROP COLUMN probe_consumption_tokens; ALTER TABLE request_usage DROP COLUMN accepted_at; DROP INDEX request_usage_pending; ALTER TABLE request_usage DROP COLUMN deal_id; DROP TABLE deal_prices; PRAGMA user_version=3;").unwrap();
+        s.lock().unwrap().execute_batch("ALTER TABLE money_facts DROP COLUMN probe_consumption_tokens; ALTER TABLE request_usage DROP COLUMN accepted_at; DROP INDEX request_usage_pending; ALTER TABLE request_usage DROP COLUMN deal_id; DROP TABLE deal_prices; DROP TABLE admission_models; DROP TABLE admission_deals; PRAGMA user_version=3;").unwrap();
         drop(s);
         for _ in 0..2 {
             let upgraded = store(&dir, "network-a");

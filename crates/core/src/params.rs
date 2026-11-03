@@ -254,6 +254,10 @@ pub const TICK_SIZE: u128 = 1_000_000;
 /// the gate only bounds risk for the next admission.
 pub const SELLER_UNCLAIMED_BILLABLE_RISK_LIMIT: u128 = TICK_SIZE;
 
+/// Minimum retry hint for a busy seller or a temporary provider 429 without its own delay.
+/// This is a pacing recommendation, not a reservation or a promise of admission.
+pub const CAPACITY_RETRY_DEFAULT: Duration = Duration::from_secs(1);
+
 /// Default simultaneous provider requests per deal. A positive count limits parallel work,
 /// not the token cost of a request whose provider-native usage is known only at completion.
 pub const SELLER_MAX_CONCURRENT_REQUESTS_PER_DEAL: std::num::NonZeroU32 =
@@ -3458,7 +3462,7 @@ pub const BUYER_USAGE_SQLITE_BUSY_TIMEOUT: Duration = Duration::from_secs(5);
 /// Delay between transient WAL-initialization retries, within the SQLite busy wait budget.
 pub const BUYER_USAGE_SQLITE_INIT_RETRY_INTERVAL: Duration = Duration::from_millis(10);
 /// SQLite format version of the persistent buyer usage history.
-pub const BUYER_USAGE_SCHEMA_VERSION: u32 = 6;
+pub const BUYER_USAGE_SCHEMA_VERSION: u32 = 7;
 /// Default number of financial facts per HTTP page (rows).
 pub const BUYER_USAGE_FACTS_DEFAULT_LIMIT: u32 = 100;
 /// Minimum financial-facts page size (rows).
@@ -3486,13 +3490,15 @@ pub const SELLER_METRICS_SERVICE_NAME: &str = "dexdo-seller";
 /// Buyer `service.name` resource attribute when `OTEL_SERVICE_NAME` is unset.
 pub const BUYER_METRICS_SERVICE_NAME: &str = "dexdo-buyer";
 /// Bucket boundaries of `dexdo.buyer.http.server.request.duration`, seconds.
-pub const BUYER_METRICS_HTTP_SERVER_DURATION_BOUNDARIES: [f64; 7] =
-    [0.0, 1.0, 5.0, 10.0, 25.0, 60.0, 300.0];
+pub const BUYER_METRICS_HTTP_SERVER_DURATION_BOUNDARIES: [f64; 18] = [
+    0.0, 0.5, 1.0, 2.0, 5.0, 10.0, 15.0, 20.0, 30.0, 45.0, 60.0, 75.0, 90.0, 120.0, 150.0, 180.0,
+    240.0, 300.0,
+];
 /// Bucket boundaries of `dexdo.buyer.rpc.client.connect.duration` and
 /// `dexdo.buyer.rpc.client.call.duration`, seconds.
-pub const BUYER_METRICS_RPC_CLIENT_DURATION_BOUNDARIES: [f64; 18] = [
-    0.0, 0.005, 0.01, 0.025, 0.05, 0.075, 0.1, 0.25, 0.5, 0.75, 1.0, 2.5, 5.0, 7.5, 10.0, 25.0,
-    60.0, 300.0,
+pub const BUYER_METRICS_RPC_CLIENT_DURATION_BOUNDARIES: [f64; 27] = [
+    0.0, 0.005, 0.01, 0.025, 0.05, 0.075, 0.1, 0.25, 0.5, 0.75, 1.0, 2.5, 5.0, 7.5, 10.0, 15.0,
+    20.0, 30.0, 45.0, 60.0, 75.0, 90.0, 120.0, 150.0, 180.0, 240.0, 300.0,
 ];
 
 #[cfg(test)]

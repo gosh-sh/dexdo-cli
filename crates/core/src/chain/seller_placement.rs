@@ -98,9 +98,9 @@ impl SellerPlacement {
 impl RealChainBackend {
     async fn seller_placement_message(&self, id: &str) -> Result<Value> {
         let query = r#"query($hash: String!) { blockchain { message(hash: $hash) {
-                id src dst body
+                id src dst body boc
                 dst_transaction { id status aborted out_msgs
-                    compute { success exit_code } action { success result_code } }
+                    compute { success exit_code } action { success result_code no_funds } }
             } } }"#;
         let response: Value = retry_transient_read(|| async {
             self.client.gate().admit().await;
@@ -130,6 +130,88 @@ impl RealChainBackend {
             ));
         }
         Ok(node.clone())
+    }
+
+    /// Re-read the exact old execution before allowing reserve recovery. An empty book or a
+    /// diagnostic string alone cannot prove that an earlier SELL will never reach the book.
+    pub(in crate::chain) async fn verified_seller_reserve_rejection(
+        &self,
+        post: &SellerPlacement,
+        flags: u8,
+        nonce: u64,
+    ) -> Result<SellerPlacement> {
+        let root = self.seller_placement_message(&post.message_id).await?;
+        let transaction = &root["dst_transaction"];
+        let finalized = |transaction: &Value| {
+            transaction["id"].as_str().is_some_and(|id| !id.is_empty())
+                && (transaction["status"].as_i64() == Some(3)
+                    || transaction["status"].as_str() == Some("Finalized"))
+        };
+        let call = root["body"]
+            .as_str()
+            .and_then(|body| decode_external_abi_message(body, PRIVATENOTE_ABI, true))
+            .or_else(|| {
+                root["boc"]
+                    .as_str()
+                    .filter(|boc| {
+                        external_message_hash(boc).ok().as_deref() == Some(post.message_id.as_str())
+                    })
+                    .and_then(|boc| decode_external_abi_message_boc(boc, PRIVATENOTE_ABI, true))
+            });
+        if root["dst"].as_str() != Some(post.note.as_str())
+            || !finalized(transaction)
+            || !successful_inbound_call(&root)
+            || !call.is_some_and(|call| {
+                call.function_name == "postSellOffer"
+                    && decoded_u128(&call.tokens, "flags") == Some(u128::from(flags))
+                    && decoded_u128(&call.tokens, "nonce") == Some(u128::from(nonce))
+            })
+        {
+            return Err(anyhow!(
+                "original finalized postSellOffer and unchanged flags/nonce are unproven"
+            ));
+        }
+        // This entry emits one note -> TC call. More outputs could hide another publication.
+        let outputs = transaction["out_msgs"]
+            .as_array()
+            .filter(|outputs| outputs.len() == 1)
+            .ok_or_else(|| anyhow!("original SELL does not have exactly one TC dispatch"))?;
+        let id = outputs[0]
+            .as_str()
+            .filter(|id| !id.is_empty())
+            .ok_or_else(|| anyhow!("original SELL TC dispatch identity is missing"))?;
+        let child = self.seller_placement_message(id).await?;
+        let transaction = &child["dst_transaction"];
+        if child["src"].as_str() != Some(post.note.as_str())
+            || child["dst"].as_str() != Some(post.token_contract.as_str())
+            || !child["body"]
+                .as_str()
+                .and_then(|body| decode_internal_abi_call(body, TOKENCONTRACT_ABI))
+                .is_some_and(|call| {
+                    call.function_name == "postFromNote"
+                        && decoded_u128(&call.tokens, "flags") == Some(u128::from(flags))
+                })
+            || !finalized(transaction)
+            || transaction["aborted"].as_bool() != Some(true)
+            || transaction["compute"]["exit_code"].as_i64() != Some(0)
+            || transaction["action"]["success"].as_bool() != Some(false)
+            || transaction["action"]["result_code"].as_i64() != Some(38)
+            || transaction["action"]["no_funds"].as_bool() != Some(true)
+            || !transaction["out_msgs"]
+                .as_array()
+                .is_some_and(Vec::is_empty)
+        {
+            return Err(anyhow!(
+                "original postFromNote reserve rejection without outgoing messages is unproven"
+            ));
+        }
+        let mut verified = post.clone();
+        verified.rejection = Some(format!(
+            "{}; recovery verified finalized reserve rejection message_hash={id} transaction_hash={} \
+             aborted=true compute_exit=0 action_success=false action_result_code=38 no_funds=true out_msgs=[]",
+            post.rejection.as_deref().unwrap_or_default(), transaction["id"],
+        ));
+        Ok(verified)
     }
 
     /// Read-only diagnosis after a note call failed to produce the expected TC state.

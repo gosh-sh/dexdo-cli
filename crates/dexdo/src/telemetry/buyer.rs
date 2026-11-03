@@ -102,11 +102,17 @@ pub async fn http_server(request: Request, next: Next) -> Response {
         started: Instant::now(),
         attributes,
         status: None,
+        onchain_limit: false,
         recorded: false,
     };
     // Dropped here, before an answer exists, the request ends as `client_disconnected`.
     let response = next.run(request).await;
     exchange.status = Some(response.status());
+    exchange.onchain_limit = response.status() == http::StatusCode::TOO_MANY_REQUESTS
+        && response
+            .headers()
+            .get("dexdo-limit")
+            .is_some_and(|value| value == "onchain_deal_limit");
     response.map(|body| Body::new(TimedBody { body, exchange }))
 }
 
@@ -115,6 +121,7 @@ struct HttpExchange {
     started: Instant,
     attributes: Vec<KeyValue>,
     status: Option<http::StatusCode>,
+    onchain_limit: bool,
     recorded: bool,
 }
 impl HttpExchange {
@@ -134,7 +141,13 @@ impl HttpExchange {
                     attributes.push(KeyValue::new("error.type", status.as_str().to_owned()));
                 }
                 if status.as_u16() >= 400 {
+                    if self.onchain_limit {
+                        attributes.push(KeyValue::new("dexdo.limit", "onchain_deal_limit"));
+                    }
                     self.metrics.http_errors.add(1, &attributes);
+                    if self.onchain_limit {
+                        attributes.pop();
+                    }
                 }
             }
             None => attributes.push(KeyValue::new("error.type", "client_disconnected")),

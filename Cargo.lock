@@ -2080,7 +2080,7 @@ dependencies = [
 
 [[package]]
 name = "dexdo"
-version = "0.12.0"
+version = "0.13.0"
 dependencies = [
  "anyhow",
  "async-stream",
@@ -2140,7 +2140,7 @@ dependencies = [
 
 [[package]]
 name = "dexdo-core"
-version = "0.12.0"
+version = "0.13.0"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -2170,7 +2170,7 @@ dependencies = [
 
 [[package]]
 name = "dexdo-e2e"
-version = "0.12.0"
+version = "0.13.0"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -2193,7 +2193,7 @@ dependencies = [
 
 [[package]]
 name = "dexdo-proto"
-version = "0.12.0"
+version = "0.13.0"
 dependencies = [
  "prost",
  "protoc-bin-vendored",
@@ -2203,7 +2203,7 @@ dependencies = [
 
 [[package]]
 name = "dexdo-wallet-onboarding"
-version = "0.12.0"
+version = "0.13.0"
 dependencies = [
  "ackinacki-kit",
  "anyhow",

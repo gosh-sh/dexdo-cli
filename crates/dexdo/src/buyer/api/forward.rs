@@ -8,7 +8,7 @@
 
 use super::stream::{FrameDriver, FrameNext, StreamError, StreamFacts};
 use super::{
-    aggregate_body_response, attach_request_id, capacity_rejection, consumer_request_id,
+    aggregate_body_response, attach_request_id, capacity_response, consumer_request_id,
     handle_stream_error_policy, is_capacity_backpressure, report_pre_answer_failure, ApiDeal,
     ApiState, ClosureCategory, ConsumerError, ConsumerErrorCode, ConsumerRequestGuard,
     DeadGatewayAction, DealInitError, RequestDelivery, RouteBudget, StreamErrorPolicyAction,
@@ -387,7 +387,7 @@ async fn handle_with_id(
                 request_guard.complete();
                 (
                     StatusCode::TOO_MANY_REQUESTS,
-                    capacity_rejection(&error).response(StatusCode::TOO_MANY_REQUESTS, anthropic),
+                    capacity_response(&error, anthropic),
                 )
             } else {
                 request_guard.observe_policy_failure(ClosureCategory::DeadGateway);
@@ -558,11 +558,9 @@ async fn pre_head_failure(
             StatusCode::TOO_MANY_REQUESTS.as_u16(),
             "upstream_capacity",
         );
-        return ConsumerError::new(
-            ConsumerErrorCode::DealCapacityUnavailable,
-            format!("the deal has no delivery capacity for this request yet; retry after seller capacity reconciliation: {error}"),
-        )
-        .response(StatusCode::TOO_MANY_REQUESTS, anthropic);
+        if let StreamError::Upstream(status) = &error {
+            return capacity_response(&anyhow::Error::new(status.clone()), anthropic);
+        }
     }
     if handle_stream_error_policy(deal, 0, &error, &mut request_guard).await
         == StreamErrorPolicyAction::RequestScoped

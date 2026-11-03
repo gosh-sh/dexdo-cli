@@ -31,6 +31,9 @@ mod quota_journal;
 #[path = "usage_consumption.rs"]
 mod consumption;
 
+#[path = "usage_snapshot.rs"]
+mod snapshot;
+
 #[cfg(test)]
 #[path = "usage_quota_tests.rs"]
 mod quota_tests;
@@ -344,7 +347,7 @@ impl UsageStore {
         let version: u32 =
             transaction.pragma_query_value(None, "user_version", |row| row.get(0))?;
         ensure!(
-            matches!(version, 0 | 3..=5) || version == BUYER_USAGE_SCHEMA_VERSION,
+            matches!(version, 0 | 3..=6) || version == BUYER_USAGE_SCHEMA_VERSION,
             "unsupported buyer usage schema version {version}"
         );
         transaction.execute_batch(
@@ -480,6 +483,9 @@ impl UsageStore {
             "INSERT OR IGNORE INTO facts_revision(network,store_id,revision) VALUES(?1,lower(hex(randomblob(16))),0)",
             [&network],
         )?;
+        if version < BUYER_USAGE_SCHEMA_VERSION {
+            Self::migrate_admission(&transaction)?;
+        }
         transaction.pragma_update(None, "user_version", BUYER_USAGE_SCHEMA_VERSION)?;
         transaction.commit()?;
         let quota_journal = path.with_extension(format!(
@@ -550,7 +556,8 @@ impl UsageStore {
     ) -> Result<()> {
         ensure!(!request_id.is_empty(), "usage request ID is empty");
         timestamp(at_ms)?;
-        let connection = self.lock()?;
+        let mut writer = self.lock()?;
+        let connection = writer.transaction_with_behavior(TransactionBehavior::Immediate)?;
         let old = connection
             .query_row(
                 "SELECT model,protocol,streamed FROM requests WHERE network=?1 AND request_id=?2",
@@ -576,12 +583,15 @@ impl UsageStore {
              VALUES(?1,?2,?3,?4,?5,?6,?7)",
             params![self.network(), request_id, &*self.runtime_id, model, protocol, streamed, at_ms],
         ).context("record buyer usage request start")?;
+        Self::update_totals_in(&connection, self.network(), request_id, None)?;
+        connection.commit()?;
         Ok(())
     }
 
     pub fn link_deal(&self, request_id: &str, deal_id: &str) -> Result<()> {
         let mut connection = self.lock()?;
         let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let before = Self::request_totals_in(&transaction, self.network(), request_id)?;
         let previous: Option<Option<String>> = transaction
             .query_row(
                 "SELECT deal_id FROM requests WHERE network=?1 AND request_id=?2",
@@ -602,6 +612,7 @@ impl UsageStore {
             "UPDATE request_usage SET deal_id=?3 WHERE network=?1 AND request_id=?2",
             params![self.network(), request_id, deal_id],
         )?;
+        Self::update_totals_in(&transaction, self.network(), request_id, Some(before))?;
         transaction.commit()?;
         Ok(())
     }
@@ -629,7 +640,10 @@ impl UsageStore {
         );
         ensure!(!call_id.is_empty(), "usage call ID is empty");
         usage.validate().map_err(|error| anyhow!(error))?;
-        let connection = self.lock()?;
+        let writing = std::time::Instant::now();
+        let mut writer = self.lock()?;
+        let connection = writer.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let before = Self::request_totals_in(&connection, self.network(), request_id)?;
         let old = connection.query_row(
             "SELECT input_tokens,output_tokens,total_tokens,charged_tokens,accepted,cache_read_tokens,cache_write_tokens FROM request_usage
              WHERE network=?1 AND request_id=?2 AND phase=?3 AND call_id=?4",
@@ -674,6 +688,12 @@ impl UsageStore {
                 params![self.network(), request_id, phase],
             )?;
         }
+        Self::update_totals_in(&connection, self.network(), request_id, Some(before))?;
+        connection.commit()?;
+        tracing::debug!(
+            write_us = writing.elapsed().as_secs_f64() * 1_000_000.0,
+            "usage write timing"
+        );
         Ok(())
     }
 
@@ -693,11 +713,16 @@ impl UsageStore {
     /// Persist a write failure before the request is completed, so a missing paid phase cannot
     /// later appear as a confirmed zero. A failed marker leaves the request unfinished instead.
     pub fn mark_request_history_incomplete(&self, request_id: &str) -> Result<()> {
-        let changed = self.lock()?.execute(
+        let mut connection = self.lock()?;
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let before = Self::request_totals_in(&transaction, self.network(), request_id)?;
+        let changed = transaction.execute(
             "UPDATE requests SET history_complete=0 WHERE network=?1 AND request_id=?2",
             params![self.network(), request_id],
         )?;
         ensure!(changed == 1, "usage request not found");
+        Self::update_totals_in(&transaction, self.network(), request_id, Some(before))?;
+        transaction.commit()?;
         Ok(())
     }
 
@@ -738,7 +763,9 @@ impl UsageStore {
         } else {
             "succeeded"
         };
-        let connection = self.lock()?;
+        let mut writer = self.lock()?;
+        let connection = writer.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let before = Self::request_totals_in(&connection, self.network(), request_id)?;
         let existing = connection.query_row(
             "SELECT started_at,finished_at,http_status,finish_reason,failure_stage FROM requests WHERE network=?1 AND request_id=?2",
             params![self.network(), request_id],
@@ -762,6 +789,8 @@ impl UsageStore {
              WHERE network=?1 AND request_id=?2",
             params![self.network(), request_id,at_ms,outcome,http_status,finish_reason,failure_stage],
         )?;
+        Self::update_totals_in(&connection, self.network(), request_id, Some(before))?;
+        connection.commit()?;
         Ok(())
     }
 
@@ -889,6 +918,16 @@ impl UsageStore {
     }
 
     fn quota_in(&self, transaction: &rusqlite::Transaction<'_>) -> Result<Value> {
+        self.quota_with_cost_in(transaction, |id, price| {
+            self.consumed_cost_in(transaction, id, price)
+        })
+    }
+
+    fn quota_with_cost_in(
+        &self,
+        transaction: &rusqlite::Transaction<'_>,
+        consumed: impl FnOnce(&str, u128) -> Result<u128>,
+    ) -> Result<Value> {
         let quota: Option<(String, String, String, bool)> = transaction
             .query_row(
                 "SELECT deal_id,filled_ticks,price_raw,closed FROM deal_quota WHERE network=?1",
@@ -905,7 +944,7 @@ impl UsageStore {
                 .checked_mul(price)
                 .context("purchased quota overflow")?;
             closed = is_closed;
-            used = self.consumed_cost_in(transaction, &id, price)?;
+            used = consumed(&id, price)?;
         }
         let remaining = if closed {
             0
@@ -1291,11 +1330,17 @@ impl UsageStore {
         let mut last_recorded = None::<i64>;
         let mut unfinished = 0_u64;
         let mut interrupted = 0_u64;
+        let waiting = std::time::Instant::now();
+        let mut db_wait = std::time::Duration::ZERO;
         {
             let mut connection = self.lock()?;
+            db_wait += waiting.elapsed();
             self.restore_quota(&mut connection, true)?;
         }
+        let waiting = std::time::Instant::now();
         let mut connection = self.lock_history()?;
+        db_wait += waiting.elapsed();
+        let reading = std::time::Instant::now();
         let transaction = connection.transaction()?;
         let mut requests = transaction.prepare(
             "SELECT request_id,model,started_at,finished_at,outcome,deal_id,history_complete FROM requests WHERE network=?1",
@@ -1534,6 +1579,11 @@ impl UsageStore {
         drop(notes);
         let quota = self.quota_in(&transaction)?;
         transaction.commit()?;
+        tracing::debug!(
+            db_wait_us = db_wait.as_secs_f64() * 1_000_000.0,
+            read_us = reading.elapsed().as_secs_f64() * 1_000_000.0,
+            "usage report timing"
+        );
         let daily = days
             .into_iter()
             .map(|(date, summary)| with_field(summary.json(), "date", json!(date.to_string())))

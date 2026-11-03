@@ -1998,7 +1998,7 @@ async fn note_deploy_submit_voucher_boc(
 ) -> Result<Option<NoteDeployWalletActionReceipt>> {
     use dexdo_core::ackinacki_wallet::query::send_message_routed;
     dexdo_core::chain_clock_skew_preflight(endpoint).await?;
-    send_message_routed(
+    let submit_result = send_message_routed(
         http,
         endpoint,
         boc,
@@ -2011,26 +2011,32 @@ async fn note_deploy_submit_voucher_boc(
         anyhow::anyhow!(
             "submit UpdateCustodianMultisigWallet_v2.submitTransaction -> RootPN.generateVoucher: {e}"
         )
-    })?;
-    dexdo_core::chain::observe_note_deploy_wallet_action(
+    });
+    // The SDK also returns Err for a finalized action-phase abort. Reconcile the
+    // exact submitted message before classifying it as an uncertain wallet spend.
+    let receipt = dexdo_core::chain::observe_note_deploy_wallet_action(
         http,
         endpoint,
         boc,
         multisig_address.bare(),
         multisig_address.bare(),
     )
-    .await
-    .map(|receipt| {
-        receipt.map(|receipt| NoteDeployWalletActionReceipt {
-            transaction_hash: receipt.transaction_hash,
-            compute_exit_code: None,
-            aborted: receipt.aborted,
-            action_result_code: receipt.action_result_code,
-            outmsg_count: receipt.outmsg_count,
-            wallet_ecc_balances: receipt.wallet_ecc_balances,
+    .await;
+    if !matches!(&receipt, Ok(Some(_))) {
+        submit_result?;
+    }
+    receipt
+        .map(|receipt| {
+            receipt.map(|receipt| NoteDeployWalletActionReceipt {
+                transaction_hash: receipt.transaction_hash,
+                compute_exit_code: None,
+                aborted: receipt.aborted,
+                action_result_code: receipt.action_result_code,
+                outmsg_count: receipt.outmsg_count,
+                wallet_ecc_balances: receipt.wallet_ecc_balances,
+            })
         })
-    })
-    .map_err(|e| anyhow::anyhow!("observe finalized note-deploy wallet action: {e}"))
+        .map_err(|e| anyhow::anyhow!("observe finalized note-deploy wallet action: {e}"))
 }
 
 #[async_trait::async_trait(?Send)]
@@ -2110,7 +2116,14 @@ fn note_deploy_verify_failed_action_had_no_effect(
     for currency_id in currency_ids {
         let before = balance(before_ecc, currency_id);
         let after = balance(wallet_ecc_balances, currency_id);
-        if before != after {
+        // ensureBalance() can consume SHELL for the wallet's own gas before an
+        // action-38 abort. Zero outbound messages still proves it paid no voucher.
+        if before != after
+            && !(receipt.aborted
+                && receipt.action_result_code == 38
+                && currency_id == SHELL_CURRENCY_ID
+                && after < before)
+        {
             bail!(
                 "wallet ECC[{currency_id}] changed from {before} to {after}, so absence of the \
                  corresponding voucher effect is not proven"
@@ -2413,10 +2426,15 @@ async fn note_deploy_mint_voucher_recoverable(
                 );
                 let currency =
                     note_deploy_ecc_name(kind, recovery.token_type, checkpoint.token_type);
+                let cause = if receipt.action_result_code == 38 {
+                    "insufficient wallet funds; "
+                } else {
+                    ""
+                };
                 bail!(
                     "funding wallet {} {} voucher transaction {} failed definitively: \
-                     compute_exit_code={compute_exit}, aborted={}, action_result_code={}{}; the exact \
-                     wallet action produced zero outbound messages and left the required ECC unchanged, \
+                     {cause}compute_exit_code={compute_exit}, aborted={}, action_result_code={}{}; the exact \
+                     wallet action produced zero outbound messages, \
                      so no corresponding RootPN voucher effect occurred. Fund {currency} and retry the \
                      same `dexdo note deploy` command unchanged; it resumes from the state at {}.",
                     dexdo_core::address::display_self_dapp(&multisig_address.with_workchain()),
@@ -8377,6 +8395,7 @@ mod tests {
         calls: std::cell::Cell<usize>,
         saw_nonempty_boc: std::cell::Cell<bool>,
         outcome: Result<Option<super::NoteDeployWalletActionReceipt>, &'static str>,
+        endpoint: Option<String>,
     }
 
     impl Default for CountingVoucherSubmitter {
@@ -8391,6 +8410,7 @@ mod tests {
                 calls: std::cell::Cell::new(0),
                 saw_nonempty_boc: std::cell::Cell::new(false),
                 outcome: Ok(receipt),
+                endpoint: None,
             }
         }
 
@@ -8407,12 +8427,21 @@ mod tests {
         async fn submit_voucher_boc(
             &self,
             _endpoint: &str,
-            _multisig_address: &dexdo_core::Address,
+            multisig_address: &dexdo_core::Address,
             boc: &str,
-            _http: &reqwest::Client,
+            http: &reqwest::Client,
         ) -> anyhow::Result<Option<super::NoteDeployWalletActionReceipt>> {
             self.calls.set(self.calls.get() + 1);
             self.saw_nonempty_boc.set(!boc.is_empty());
+            if let Some(endpoint) = &self.endpoint {
+                return super::note_deploy_submit_voucher_boc(
+                    endpoint,
+                    multisig_address,
+                    boc,
+                    http,
+                )
+                .await;
+            }
             self.outcome.clone().map_err(anyhow::Error::msg)
         }
     }
@@ -9534,6 +9563,177 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn note_deploy_issue_2195_aborted_post_reconciles_before_funded_retry() {
+        use crate::cli::note::NoteDeployVoucherKind;
+        use std::sync::{
+            atomic::{AtomicUsize, Ordering},
+            Arc,
+        };
+
+        for case in [
+            "no-funds",
+            "outbound",
+            "wrong-message",
+            "stale",
+            "missing-action",
+        ] {
+            let posts = Arc::new(AtomicUsize::new(0));
+            let server_posts = Arc::clone(&posts);
+            let router = axum::Router::new()
+                .route(
+                    "/v2/messages",
+                    axum::routing::post(move || async move {
+                        server_posts.fetch_add(1, Ordering::SeqCst);
+                        axum::Json(serde_json::json!({
+                            "result": {"exit_code": 0, "aborted": true}
+                        }))
+                    }),
+                )
+                .route(
+                    "/graphql",
+                    axum::routing::post(move |axum::Json(request): axum::Json<serde_json::Value>| async move {
+                        if request["query"].as_str().unwrap().contains("gen_utime") {
+                            let now = std::time::SystemTime::now()
+                                .duration_since(std::time::UNIX_EPOCH).unwrap().as_secs();
+                            return axum::Json(serde_json::json!({"data":{"blockchain":{
+                                "blocks":{"edges":[{"node":{"gen_utime":now}}]}
+                            }}}));
+                        }
+                        let vars = &request["variables"];
+                        axum::Json(serde_json::json!({"data":{"blockchain":{
+                            "message": {
+                                "id": if case == "wrong-message" { serde_json::json!("other") } else { vars["hash"].clone() },
+                                "dst": vars["accountId"],
+                                "dst_transaction": {
+                                    "id": "wallet-tx-38", "status": 3, "aborted": true,
+                                    "account_addr": vars["accountId"],
+                                    "outmsg_cnt": if case == "outbound" { 1 } else { 0 },
+                                    "compute": {"exit_code": 0, "success": true},
+                                    "action": if case == "missing-action" { serde_json::Value::Null } else {
+                                        serde_json::json!({"result_code":38, "success":false, "no_funds":true})
+                                    }
+                                }
+                            },
+                            "account": {
+                                "info": {"id": vars["accountId"], "dapp_id": vars["dappId"],
+                                    // The wallet converts SHELL to gas before its action fails.
+                                    "balance_other": [{"currency":2, "value":"348770000000"}]},
+                                "transactions": {"edges":[{"node":{"id":if case == "stale" {"later-tx"} else {"wallet-tx-38"}}}]}
+                            }
+                        }}}))
+                    }),
+                );
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let submitter = CountingVoucherSubmitter {
+                endpoint: Some(format!("http://{}", listener.local_addr().unwrap())),
+                ..Default::default()
+            };
+            let server = tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
+            let temp = tempfile::tempdir().unwrap();
+            let recovery_path = temp.path().join("recovery.json");
+            let reader = issue_678_wallet_reader(vec![(
+                SHELL_CURRENCY_ID,
+                issue_678_required_deposit_ecc(),
+            )]);
+            let mut recovery = test_recovery_state();
+            let error = run_issue_678_deposit(
+                &recovery_path,
+                &mut recovery,
+                &reader,
+                &submitter,
+                Default::default(),
+            )
+            .await
+            .expect_err("aborted wallet POST must fail")
+            .to_string();
+            assert_eq!(posts.load(Ordering::SeqCst), 1, "{case}");
+            server.abort();
+
+            if case != "no-funds" {
+                assert!(!error.contains("retry the same"), "{case}: {error}");
+                assert_issue_678_restart_never_posts(&recovery_path).await;
+                continue;
+            }
+            assert!(error.contains("insufficient"), "{error}");
+            assert!(error.contains("SHELL ECC[2]"), "{error}");
+            assert!(
+                error.contains("action_result_code=38 (NOT_ENOUGH_EXTRA)"),
+                "{error}"
+            );
+            assert!(
+                error.contains("retry the same `dexdo note deploy` command unchanged"),
+                "{error}"
+            );
+            assert!(!error.contains("outcome is ambiguous"), "{error}");
+            assert!(!error.contains("ECC unchanged"), "{error}");
+            let checkpoint = recovery
+                .voucher_checkpoint(NoteDeployVoucherKind::Deposit)
+                .unwrap();
+            assert!(!checkpoint.submit_maybe_sent);
+            let identity = checkpoint.sk_u_commit_hex.clone();
+            let mut recovery = crate::cli::note::load_note_deploy_recovery(&recovery_path)
+                .unwrap()
+                .unwrap();
+            assert!(
+                !recovery
+                    .voucher_checkpoint(NoteDeployVoucherKind::Deposit)
+                    .unwrap()
+                    .submit_maybe_sent
+            );
+            let funded_reader = issue_678_wallet_reader(vec![(SHELL_CURRENCY_ID, u128::MAX)]);
+            let retry_submitter = CountingVoucherSubmitter::default();
+            let error = run_issue_678_deposit(
+                &recovery_path,
+                &mut recovery,
+                &funded_reader,
+                &retry_submitter,
+                super::NoteDeployVoucherFailpoints {
+                    before_voucher_event_wait: true,
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect_err("stop before voucher proving")
+            .to_string();
+            assert!(
+                error.contains("simulated interruption before voucher event wait"),
+                "{error}"
+            );
+            assert_eq!(retry_submitter.calls.get(), 1);
+            assert_eq!(
+                recovery
+                    .voucher_checkpoint(NoteDeployVoucherKind::Deposit)
+                    .unwrap()
+                    .sk_u_commit_hex,
+                identity
+            );
+            assert_issue_678_restart_never_posts(&recovery_path).await;
+        }
+    }
+
+    proptest::proptest! {
+        #[test]
+        fn note_deploy_issue_2195_gas_conversion_requires_aborted_38_without_outbound_messages(
+            after in 0..issue_678_required_deposit_ecc(),
+            aborted in proptest::bool::ANY,
+            code in proptest::sample::select(vec![0_i64, 37, 38, 380]),
+            outmsg_count in 0..3_u64,
+            currency_id in proptest::sample::select(vec![SHELL_CURRENCY_ID, 1_u32]),
+        ) {
+            let mut receipt = issue_678_receipt(aborted, code);
+            receipt.outmsg_count = outmsg_count;
+            receipt.wallet_ecc_balances = Some(vec![(currency_id, after)]);
+            let result = super::note_deploy_verify_failed_action_had_no_effect(
+                &receipt,
+                &[(currency_id, issue_678_required_deposit_ecc())],
+                crate::cli::note::NoteDeployVoucherKind::Deposit,
+                currency_id,
+            );
+            proptest::prop_assert_eq!(result.is_ok(), aborted && code == 38 && outmsg_count == 0 && currency_id == SHELL_CURRENCY_ID);
+        }
+    }
+
+    #[tokio::test]
     async fn note_deploy_issue_678_action_38_persists_no_effect_and_funded_recovery_posts_once() {
         use crate::cli::note::NoteDeployVoucherKind;
 
@@ -9570,7 +9770,7 @@ mod tests {
             "aborted=true",
             "action_result_code=38 (NOT_ENOUGH_EXTRA)",
             "exact wallet action produced zero outbound messages",
-            "required ECC unchanged",
+            "insufficient wallet funds",
             "Fund requested token and SHELL ECC[2]",
         ] {
             assert!(error.contains(fact), "missing {fact}: {error}");
@@ -9985,7 +10185,7 @@ mod tests {
 
         let mut outbound_effect = issue_678_receipt(true, 38);
         outbound_effect.outmsg_count = 1;
-        let mut matching_ecc_effect = issue_678_receipt(true, 38);
+        let mut matching_ecc_effect = issue_678_receipt(true, 37);
         matching_ecc_effect.wallet_ecc_balances = Some(vec![(
             SHELL_CURRENCY_ID,
             issue_678_required_deposit_ecc() - 1,

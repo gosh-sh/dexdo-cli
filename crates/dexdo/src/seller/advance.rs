@@ -112,6 +112,9 @@ impl ClaimDeliveryMeasurement {
 }
 
 pub trait ClaimStateObserver: Send + Sync {
+    /// Publish a retry hint from this driver's actual schedule, without changing admission or writes.
+    fn observe_retry_after(&self, _token_contract: &TokenContract, _delay: Duration) {}
+
     fn observe(
         &self,
         token_contract: &TokenContract,
@@ -332,6 +335,7 @@ pub async fn drive_advance_with_observer(
 
         // The probe gates everything: wait out the buyer's silence, then take the trial tick. A submit
         // response can race a state update, so the state below -- not the response alone -- decides.
+        observer.observe_retry_after(token_contract, windows.probe);
         tokio::time::sleep(windows.probe).await;
         if deal_closed_observed(chain, token_contract, observer).await? {
             return Ok(0);
@@ -368,6 +372,7 @@ pub async fn drive_advance_with_observer(
                 first_tick_wait_emitted = true;
             }
             // Poll for the first accepted billable token, but stay responsive to an external close.
+            observer.observe_retry_after(token_contract, windows.claim_interval);
             if wait_claim_or_closed(chain, token_contract, windows.claim_interval).await {
                 return Ok(0);
             }
@@ -453,6 +458,9 @@ pub async fn drive_advance_with_observer(
                     );
                     waiting_event_emitted = true;
                 }
+                // Newly delivered backlog waits for this idle poll and then the ordinary claim sleep.
+                observer
+                    .observe_retry_after(token_contract, windows.claim_interval.saturating_mul(2));
                 if wait_claim_or_closed(chain, token_contract, windows.claim_interval).await {
                     break;
                 }
@@ -461,6 +469,7 @@ pub async fn drive_advance_with_observer(
         }
 
         // Wait out the minimum interval, which is also what accrues the rate allowance.
+        observer.observe_retry_after(token_contract, windows.claim_interval);
         tokio::time::sleep(windows.claim_interval).await;
         let deal_delivery_count = delivered.load(Ordering::Acquire);
         let target = claim_target(deal_delivery_count, token_budget);
@@ -1244,11 +1253,16 @@ mod tests {
 
     #[derive(Default)]
     struct RecordingStateObserver {
+        retry_delays: std::sync::Mutex<Vec<Duration>>,
         states: std::sync::Mutex<Vec<DealChainState>>,
         terminals: AtomicU64,
     }
 
     impl ClaimStateObserver for RecordingStateObserver {
+        fn observe_retry_after(&self, _: &TokenContract, delay: Duration) {
+            self.retry_delays.lock().unwrap().push(delay);
+        }
+
         fn observe(&self, _: &TokenContract, state: DealChainState) -> Result<(), ChainError> {
             self.states.lock().unwrap().push(state);
             Ok(())
@@ -1258,6 +1272,46 @@ mod tests {
             self.terminals.fetch_add(1, Ordering::Relaxed);
             Ok(())
         }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn retry_after_2231_follows_the_probe_idle_poll_and_claim_sleeps() {
+        let backend = RecordingBackend::new();
+        let observer = RecordingStateObserver::default();
+        let windows = AdvanceWindows::canonical();
+        let delivered = Arc::new(AtomicU64::new(TICK_SIZE as u64));
+        let done = Arc::new(AtomicBool::new(false));
+        let later = delivered.clone();
+        let finished = done.clone();
+        let producer = tokio::spawn(async move {
+            tokio::time::sleep(windows.probe + windows.claim_interval / 2).await;
+            later.store((2 * TICK_SIZE) as u64, Ordering::Release);
+            finished.store(true, Ordering::Release);
+        });
+        let claimed = drive_advance_with_observer(
+            &backend,
+            &"tc-retry-schedule".to_owned(),
+            &LocalNote::generate(),
+            windows,
+            2,
+            TICK_SIZE as u64,
+            true,
+            delivered,
+            done,
+            &observer,
+        )
+        .await
+        .unwrap();
+        producer.await.unwrap();
+        assert_eq!(claimed, 2 * TICK_SIZE);
+        assert_eq!(
+            *observer.retry_delays.lock().unwrap(),
+            vec![
+                windows.probe,
+                windows.claim_interval * 2,
+                windows.claim_interval,
+            ]
+        );
     }
 
     #[tokio::test]

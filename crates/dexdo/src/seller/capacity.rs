@@ -118,6 +118,7 @@ const CAPACITY_PERSIST_TOKEN_INTERVAL: u128 = 1_000;
 struct CapacityEntryState {
     record: DurableCapacityRecord,
     terminal: bool,
+    probe_accepted: bool,
     /// Delivered tokens applied to `record` in memory but not yet written to disk by the compatibility
     /// incremental-accounting path.
     unpersisted_delivered: u128,
@@ -238,6 +239,7 @@ impl CapacityManager {
                     state: Mutex::new(CapacityEntryState {
                         record,
                         terminal: false,
+                        probe_accepted: state.probe_accepted,
                         unpersisted_delivered: 0,
                         active_shared_requests: 0,
                     }),
@@ -325,6 +327,7 @@ impl CapacityManager {
             persist_candidate(entry.path.as_deref(), &candidate)?;
             locked.record = candidate;
         }
+        locked.probe_accepted = state.probe_accepted;
         Ok(Some(CapacitySnapshot::from(&locked.record)))
     }
 
@@ -390,9 +393,14 @@ impl CapacityManager {
             return Err(ReserveError::Terminal);
         }
         validate_record(&locked.record).map_err(ReserveError::InvalidState)?;
-        if locked.record.outstanding_reservation != 0
-            || locked.record.local_delivered_after_anchor >= SELLER_UNCLAIMED_BILLABLE_RISK_LIMIT
-        {
+        if locked.record.local_delivered_after_anchor >= SELLER_UNCLAIMED_BILLABLE_RISK_LIMIT {
+            return Err(if locked.probe_accepted {
+                ReserveError::OnchainLimit
+            } else {
+                ReserveError::Exhausted
+            });
+        }
+        if locked.record.outstanding_reservation != 0 {
             return Err(ReserveError::Exhausted);
         }
         if locked.active_shared_requests >= limit.get() {
@@ -477,7 +485,11 @@ impl CapacityManager {
         }
         validate_record(&locked.record).map_err(ReserveError::InvalidState)?;
         if locked.record.local_delivered_after_anchor >= SELLER_UNCLAIMED_BILLABLE_RISK_LIMIT {
-            return Err(ReserveError::Exhausted);
+            return Err(if locked.probe_accepted {
+                ReserveError::OnchainLimit
+            } else {
+                ReserveError::Exhausted
+            });
         }
         let available = CapacitySnapshot::from(&locked.record)
             .available()
@@ -564,6 +576,7 @@ pub enum ReserveError {
     UnknownDeal,
     Terminal,
     Exhausted,
+    OnchainLimit,
     Concurrency,
     InvalidState(anyhow::Error),
 }
@@ -574,6 +587,10 @@ impl fmt::Display for ReserveError {
             Self::UnknownDeal => write!(formatter, "deal capacity is not registered"),
             Self::Terminal => write!(formatter, "deal capacity is terminal"),
             Self::Exhausted => write!(formatter, "deal capacity is exhausted"),
+            Self::OnchainLimit => write!(
+                formatter,
+                "deal unclaimed billable backlog reached the on-chain limit"
+            ),
             Self::Concurrency => write!(formatter, "deal request concurrency limit reached"),
             Self::InvalidState(error) => write!(formatter, "invalid deal capacity: {error}"),
         }
@@ -1389,7 +1406,7 @@ mod tests {
         second.finish_exact().unwrap();
         assert!(matches!(
             manager.reserve(&tc, 1),
-            Err(ReserveError::Exhausted)
+            Err(ReserveError::OnchainLimit)
         ));
     }
 
@@ -1420,7 +1437,7 @@ mod tests {
 
         assert!(matches!(
             manager.reserve(&tc, 1),
-            Err(ReserveError::Exhausted)
+            Err(ReserveError::OnchainLimit)
         ));
 
         let reconciled = manager
@@ -1509,7 +1526,7 @@ mod tests {
             } else {
                 prop_assert!(matches!(
                     admission,
-                    Err(ReserveError::Exhausted)
+                    Err(ReserveError::OnchainLimit)
                 ));
             }
         }
@@ -1908,7 +1925,7 @@ mod tests {
         first.finish_exact().unwrap();
         assert!(matches!(
             manager.reserve(&tc, 1),
-            Err(ReserveError::Exhausted)
+            Err(ReserveError::OnchainLimit)
         ));
 
         // Wall clock is intentionally absent from this API: the same strict state cannot reopen capacity.
@@ -1917,7 +1934,7 @@ mod tests {
             .unwrap();
         assert!(matches!(
             manager.reserve(&tc, 1),
-            Err(ReserveError::Exhausted)
+            Err(ReserveError::OnchainLimit)
         ));
 
         let next = manager
@@ -2784,7 +2801,7 @@ mod tests {
         );
         assert!(matches!(
             manager.admit_shared(&tc, 1, limit),
-            Err(ReserveError::Exhausted)
+            Err(ReserveError::OnchainLimit)
         ));
         assert_invariant(manager.snapshot(&tc).unwrap().unwrap());
     }
@@ -2968,6 +2985,38 @@ mod tests {
                 assert_invariant(manager.snapshot(&tc).unwrap().unwrap());
             }
             prop_assert_eq!(charged, amounts.iter().sum::<u64>().min(TICK_SIZE as u64));
+        }
+    }
+    #[test]
+    fn retry_after_2231_only_accepted_probe_backlog_gets_the_onchain_cause() {
+        for accepted in [false, true] {
+            for shared in [false, true] {
+                let manager = CapacityManager::in_memory();
+                let tc = "0:retry-cause".to_owned();
+                let pending = if accepted { TICK_SIZE } else { 0 };
+                manager
+                    .reconcile_deal(&tc, state(accepted, pending), ordinary(ORDINARY_FUNDED))
+                    .unwrap();
+                let request = manager.reserve(&tc, TICK_SIZE as u64).unwrap();
+                request.finish_with_delivery(TICK_SIZE as u64).unwrap();
+                let refusal = if shared {
+                    manager.admit_shared(&tc, 1, std::num::NonZeroU32::MIN)
+                } else {
+                    manager.reserve(&tc, 1)
+                };
+                assert!(if accepted {
+                    matches!(refusal, Err(ReserveError::OnchainLimit))
+                } else {
+                    matches!(refusal, Err(ReserveError::Exhausted))
+                });
+                if accepted {
+                    // A reconciled claim releases the backlog gate.
+                    manager
+                        .reconcile_deal(&tc, state(true, 2 * TICK_SIZE), ordinary(ORDINARY_FUNDED))
+                        .unwrap();
+                    assert!(manager.reserve(&tc, 1).is_ok());
+                }
+            }
         }
     }
 }

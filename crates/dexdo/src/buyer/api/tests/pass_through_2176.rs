@@ -141,6 +141,11 @@ async fn provider(native: bool) -> (UpstreamConfig, Captures, tokio::task::JoinH
             let answer_model = body["x_fixture_model"].as_str().map(str::to_string);
             let truncate = body["x_fixture_truncate"] == true;
             let echo_key = body["x_fixture_echo_key"] == true;
+            let retry_mode = body["x_fixture_retry"]
+                .as_str()
+                .unwrap_or("seconds")
+                .to_owned();
+            let error_code = body["x_fixture_error_code"].as_str().map(str::to_owned);
             captured.lock().unwrap().push(Captured {
                 path: path.clone(),
                 headers,
@@ -166,6 +171,9 @@ async fn provider(native: bool) -> (UpstreamConfig, Captures, tokio::task::JoinH
                 }
                 Some(status) => {
                     let mut error = json!({"error":{"message":PROVIDER_ERROR}});
+                    if let Some(code) = error_code {
+                        error["error"]["code"] = json!(code);
+                    }
                     if echo_key {
                         // A provider that names the key it was called with.
                         error["error"]["key"] = json!("seller-fixture-key");
@@ -201,6 +209,12 @@ async fn provider(native: bool) -> (UpstreamConfig, Captures, tokio::task::JoinH
                 ("set-cookie", "provider-session=secret"),
             ] {
                 headers.insert(name, http::HeaderValue::from_static(value));
+            }
+            if retry_mode != "seconds" && retry_mode != "both" {
+                headers.remove("retry-after");
+            }
+            if retry_mode == "milliseconds" || retry_mode == "both" {
+                headers.insert("retry-after-ms", http::HeaderValue::from_static("2501"));
             }
             response
         }
@@ -287,6 +301,86 @@ const ROUTES: [(&str, bool); 3] = [
     ("/v1/responses", false),
     ("/v1/messages", true),
 ];
+
+#[tokio::test]
+async fn provider_retry_hints_2231_reach_every_endpoint_without_changing_the_answer() {
+    let default_seconds = dexdo_core::params::CAPACITY_RETRY_DEFAULT
+        .as_secs()
+        .to_string();
+    let default_ms = dexdo_core::params::CAPACITY_RETRY_DEFAULT
+        .as_millis()
+        .to_string();
+    for ((path, native), stream) in ROUTES
+        .into_iter()
+        .flat_map(|route| [(route, false), (route, true)])
+    {
+        let (upstream, captures, task) = provider(native).await;
+        let harness = harness(upstream).await;
+        for (status, mode, code, seconds, milliseconds) in [
+            (
+                429,
+                "none",
+                None,
+                Some(default_seconds.as_str()),
+                Some(default_ms.as_str()),
+            ),
+            (429, "milliseconds", None, Some("3"), Some("2501")),
+            (429, "both", None, Some("3"), Some("2501")),
+            (429, "seconds", None, Some("3"), None),
+            (429, "none", Some("insufficient_quota"), None, None),
+            (503, "none", None, None, None),
+        ] {
+            let mut sent = client_request(path, stream);
+            sent["x_fixture_status"] = json!(status);
+            sent["x_fixture_retry"] = json!(mode);
+            if let Some(code) = code {
+                sent["x_fixture_error_code"] = json!(code);
+            }
+            let response = send(&harness, path, &[], &sent).await;
+            assert_eq!(response.status().as_u16(), status);
+            let headers = response.headers().clone();
+            assert_eq!(
+                headers
+                    .get("retry-after")
+                    .map(|value| value.to_str().unwrap()),
+                seconds,
+                "{path} {stream} {mode} {code:?}"
+            );
+            assert_eq!(
+                headers
+                    .get("retry-after-ms")
+                    .map(|value| value.to_str().unwrap()),
+                milliseconds
+            );
+            assert!(!headers.contains_key("dexdo-limit"));
+            if mode == "milliseconds" || mode == "both" {
+                assert_eq!(headers["llm_provider-retry-after-ms"], "2501");
+            }
+            let body = response.text().await.unwrap();
+            assert_eq!(
+                headers["content-length"]
+                    .to_str()
+                    .unwrap()
+                    .parse::<usize>()
+                    .unwrap(),
+                body.len()
+            );
+            let actual: Value = serde_json::from_str(&body).unwrap();
+            assert_eq!(actual["error"]["message"], PROVIDER_ERROR);
+            assert_eq!(actual["error"]["code"].as_str(), code);
+            assert_eq!(harness.delivered().await, 0);
+            assert_eq!(harness.chain.foreign_money_calls(), 0);
+            assert!(!harness.deals.current().await.unwrap().session.is_closed());
+        }
+        assert_eq!(
+            captures.lock().unwrap().len(),
+            6,
+            "the seller must not retry requests"
+        );
+        harness.shutdown().await;
+        task.abort();
+    }
+}
 
 /// Every field the client sent reaches the provider unchanged, unknown ones included. The only
 /// difference is the seller's own: a streamed Chat Completions request asks for its usage record.

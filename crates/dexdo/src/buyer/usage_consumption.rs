@@ -2,7 +2,7 @@
 use super::*;
 
 /// Exact cumulative price without overflowing the intermediate tokens * price product.
-fn cost(price: u128, tokens: u128) -> Result<u128> {
+pub(super) fn cost(price: u128, tokens: u128) -> Result<u128> {
     let tick = dexdo_core::params::TICK_SIZE;
     (tokens / tick)
         .checked_mul(price)

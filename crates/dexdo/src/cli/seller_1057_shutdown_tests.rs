@@ -302,6 +302,9 @@ impl ChainBackend for Issue1057ActiveBackend {
     }
 
     async fn snapshot(&self, token_contract: &TokenContract) -> Option<StreamSnapshot> {
+        // The active settlement driver starts with this terminal-state check. Config reads also
+        // happen while registering gateway capacity, before the driver has started.
+        self.started.fetch_add(1, Ordering::Relaxed);
         self.inner.snapshot(token_contract).await
     }
 
@@ -316,7 +319,6 @@ impl ChainBackend for Issue1057ActiveBackend {
         &self,
         token_contract: &TokenContract,
     ) -> Result<dexdo_core::ClaimBounds, ChainError> {
-        self.started.fetch_add(1, Ordering::Relaxed);
         self.inner.deal_claim_bounds(token_contract).await
     }
 }
@@ -457,6 +459,14 @@ async fn issue_1057_shutdown_after_active_start_keeps_existing_active_path() {
         }
     };
     let shutdown = Issue1057Shutdown::after_active_started(active.clone());
+    active
+        .deal_claim_bounds(&pool.deal.cfg.token_contract)
+        .await
+        .unwrap();
+    assert!(
+        !shutdown.triggered(),
+        "gateway capacity config reads must not trigger shutdown before the active driver starts"
+    );
     tokio::pin!(shutdown);
     let mut shutdown_requested = false;
 

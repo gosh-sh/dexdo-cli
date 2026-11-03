@@ -338,6 +338,45 @@ impl AuthoritativeDeliveryRecorder for CapacityDeliveryRecorder {
 struct StreamLimits {
     mock_token_count: u64,
     deal: DealSubscription,
+    retry: CapacityRetry,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct CapacityRetry {
+    bounds: dexdo_core::ClaimBounds,
+    state: DealChainState,
+    next_attempt: tokio::time::Instant,
+}
+
+impl CapacityRetry {
+    fn delay(
+        self,
+        unix_now: std::time::Duration,
+        now: tokio::time::Instant,
+    ) -> std::time::Duration {
+        use std::time::Duration;
+        let allowed = if self.state.probe_accepted {
+            Duration::from_secs(self.state.last_claim_time).saturating_add(
+                self.bounds
+                    .min_claim_interval
+                    .max(self.bounds.min_seconds_per_tick),
+            )
+        } else {
+            // Registration precedes open(): until its first readback, allow a full probe window.
+            let anchor = if self.state.probe_time == 0 {
+                unix_now
+            } else {
+                Duration::from_secs(self.state.probe_time)
+            };
+            anchor.saturating_add(self.bounds.probe_window)
+        };
+        allowed
+            .saturating_sub(unix_now)
+            .max(self.next_attempt.saturating_duration_since(now))
+            // One existing confirmation/readback poll, not a guarantee of transaction inclusion.
+            .saturating_add(dexdo_core::params::ClaimConfirmationParams::canonical().poll_interval)
+            .max(dexdo_core::params::CAPACITY_RETRY_DEFAULT)
+    }
 }
 
 /// Gateway state, shared across gRPC calls.
@@ -440,7 +479,7 @@ impl GatewayState {
             .insert(token_contract.to_string(), upstream);
     }
 
-    /// Register a deal from one coherent strict chain snapshot before exposing it to the buyer.
+    /// Register mock/offline capacity with canonical bounds. Production supplies contract bounds below.
     pub fn register_stream(
         &self,
         token_contract: &str,
@@ -448,6 +487,26 @@ impl GatewayState {
         mock_token_count: u64,
         state: DealChainState,
         deal: DealSubscription,
+    ) -> AnyResult<()> {
+        self.register_stream_with_claim_bounds(
+            token_contract,
+            buyer_pubkey,
+            mock_token_count,
+            state,
+            deal,
+            dexdo_core::ClaimBounds::canonical(),
+        )
+    }
+
+    /// Register production capacity with the per-deal bounds read from the contract.
+    pub fn register_stream_with_claim_bounds(
+        &self,
+        token_contract: &str,
+        buyer_pubkey: dexdo_core::note::NotePubkey,
+        mock_token_count: u64,
+        state: DealChainState,
+        deal: DealSubscription,
+        bounds: dexdo_core::ClaimBounds,
     ) -> AnyResult<()> {
         let token_contract_display = dexdo_core::address::display_self_dapp(token_contract);
         let snapshot = self
@@ -475,6 +534,16 @@ impl GatewayState {
                 StreamLimits {
                     mock_token_count,
                     deal,
+                    retry: CapacityRetry {
+                        bounds,
+                        state,
+                        next_attempt: tokio::time::Instant::now()
+                            + if state.probe_accepted {
+                                bounds.min_claim_interval
+                            } else {
+                                bounds.probe_window
+                            },
+                    },
                 },
             );
         self.auth.register(token_contract, buyer_pubkey);
@@ -507,8 +576,7 @@ impl GatewayState {
                 "TokenContract {token_contract}: subscription keeper observed an ordinary deal shape"
             ));
         }
-        self.capacity
-            .reconcile_deal(&token_contract.to_string(), state, subscription)
+        self.reconcile_deal_capacity(token_contract, state, subscription)
     }
 
     pub fn reconcile_deal_capacity(
@@ -517,8 +585,45 @@ impl GatewayState {
         state: DealChainState,
         deal: DealSubscription,
     ) -> AnyResult<Option<CapacitySnapshot>> {
-        self.capacity
-            .reconcile_deal(&token_contract.to_string(), state, deal)
+        let snapshot = self
+            .capacity
+            .reconcile_deal(&token_contract.to_string(), state, deal)?;
+        if let Some(retry) = lock_or_recover(&self.limits, GATEWAY_LIMITS_LOCK)
+            .get_mut(token_contract)
+            .map(|limits| &mut limits.retry)
+        {
+            retry.state = state;
+        }
+        Ok(snapshot)
+    }
+
+    /// Read-only hint from the existing driver's actual sleep; does not change its cadence.
+    pub fn schedule_capacity_retry(&self, token_contract: &str, delay: std::time::Duration) {
+        if let Some(retry) = lock_or_recover(&self.limits, GATEWAY_LIMITS_LOCK)
+            .get_mut(token_contract)
+            .map(|limits| &mut limits.retry)
+        {
+            retry.next_attempt = tokio::time::Instant::now() + delay;
+        }
+    }
+
+    fn reserve_status(&self, token_contract: &str, error: ReserveError) -> Status {
+        let default = dexdo_core::params::CAPACITY_RETRY_DEFAULT;
+        let delay = if matches!(error, ReserveError::Exhausted | ReserveError::OnchainLimit) {
+            self.limits(token_contract)
+                .map(|limits| limits.retry)
+                .map_or(default, |retry| {
+                    retry.delay(
+                        std::time::SystemTime::now()
+                            .duration_since(std::time::UNIX_EPOCH)
+                            .unwrap_or_default(),
+                        tokio::time::Instant::now(),
+                    )
+                })
+        } else {
+            default
+        };
+        reserve_status(error, delay)
     }
 
     pub fn prepare_probe_capacity(&self, token_contract: &str, delivered: u64) -> AnyResult<u64> {
@@ -841,10 +946,18 @@ fn capacity_status(error: impl std::fmt::Display) -> Status {
     Status::data_loss(format!("seller deal capacity persistence failed: {error}"))
 }
 
-fn reserve_status(error: ReserveError) -> Status {
-    match error {
-        ReserveError::Exhausted => {
-            Status::resource_exhausted("deal delivery capacity is exhausted")
+fn reserve_status(error: ReserveError, delay: std::time::Duration) -> Status {
+    let mut status = match error {
+        ReserveError::Exhausted | ReserveError::OnchainLimit => {
+            if matches!(error, ReserveError::OnchainLimit) {
+                let mut status = Status::resource_exhausted(error.to_string());
+                status
+                    .metadata_mut()
+                    .insert("dexdo-limit", "onchain_deal_limit".parse().unwrap());
+                status
+            } else {
+                Status::resource_exhausted("deal delivery capacity is exhausted")
+            }
         }
         ReserveError::Concurrency => {
             let mut status = Status::resource_exhausted(error.to_string());
@@ -857,7 +970,17 @@ fn reserve_status(error: ReserveError) -> Status {
             Status::failed_precondition(error.to_string())
         }
         ReserveError::InvalidState(_) => capacity_status(error),
+    };
+    if status.code() == tonic::Code::ResourceExhausted {
+        let milliseconds = u64::try_from(delay.as_nanos().div_ceil(1_000_000))
+            .unwrap_or(u64::MAX)
+            .max(1);
+        status.metadata_mut().insert(
+            "dexdo-retry-after-ms",
+            milliseconds.to_string().parse().unwrap(),
+        );
     }
+    status
 }
 
 #[allow(clippy::result_large_err)]
@@ -1035,7 +1158,9 @@ impl Gateway for GatewayService {
             // An overrun closes admission while accepted work drains, even with paid capacity left.
             // The same lock covers completion and its last-active-request check.
             if delivered.billing_exhausted.load(Ordering::Acquire) {
-                return Err(reserve_status(ReserveError::Exhausted));
+                return Err(self
+                    .state
+                    .reserve_status(&req.token_contract, ReserveError::Exhausted));
             }
             if req.shared_budget {
                 self.state.capacity.admit_shared(
@@ -1053,7 +1178,7 @@ impl Gateway for GatewayService {
                     .capacity
                     .reserve_exclusive(&req.token_contract, req.billing_grant_tokens)
             }
-            .map_err(reserve_status)?
+            .map_err(|error| self.state.reserve_status(&req.token_contract, error))?
         };
         let effective_billing_grant = reservation.amount();
         // The per-deal billable tracker is shared across all of this deal's streams (the gateway map returns
@@ -3295,7 +3420,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn cache_2223_review_nested_cache_never_advances_delivery_or_payment() {
+    async fn cache_2234_unknown_nested_cache_does_not_change_delivery_or_payment() {
         use crate::api_format::ApiFormat;
         for (format, mirror, details) in [
             (ApiFormat::ChatCompletions, false, "input_tokens_details"),
@@ -3400,21 +3525,19 @@ mod tests {
                     .await;
                     server.await.unwrap();
                     let snapshot = state.capacity_snapshot(tc).unwrap().unwrap();
-                    let paid = if cached {
-                        assert!(
-                            terminal(&frames).is_none(),
-                            "{format:?} stream={streamed} mirror={mirror}"
-                        );
-                        assert_eq!(error.unwrap().code(), tonic::Code::DataLoss);
-                        0
-                    } else {
-                        assert!(
-                            error.is_none(),
-                            "{format:?} stream={streamed} mirror={mirror}: {error:?}"
-                        );
-                        assert_eq!(terminal(&frames).unwrap().billable_tokens(), 1100);
-                        1100
-                    };
+                    assert!(
+                        error.is_none(),
+                        "{format:?} stream={streamed} mirror={mirror} cached={cached}: {error:?}"
+                    );
+                    let usage = terminal(&frames).unwrap();
+                    usage.validate().unwrap();
+                    assert_eq!(
+                        (usage.input_tokens, usage.output_tokens, usage.total_tokens),
+                        (1000, 100, 1100)
+                    );
+                    assert_eq!((usage.cache_read_tokens, usage.cache_write_tokens), (0, 0));
+                    assert_eq!(usage.billable_tokens(), 1100);
+                    let paid = 1100;
                     assert_eq!(snapshot.local_delivered_after_anchor, paid);
                     assert_eq!(snapshot.outstanding_reservation, 0);
                     assert_eq!(
@@ -3914,6 +4037,88 @@ mod tests {
             .unwrap()
             .finish_exact()
             .unwrap();
+    }
+    #[test]
+    fn retry_after_2231_labels_only_the_onchain_backlog() {
+        for (error, label) in [
+            (ReserveError::Concurrency, false),
+            (ReserveError::Exhausted, false),
+            (ReserveError::OnchainLimit, true),
+        ] {
+            let status = reserve_status(error, dexdo_core::params::CAPACITY_RETRY_DEFAULT);
+            assert_eq!(status.code(), tonic::Code::ResourceExhausted);
+            assert_eq!(
+                status
+                    .metadata()
+                    .get("dexdo-retry-after-ms")
+                    .unwrap()
+                    .to_str()
+                    .unwrap()
+                    .parse::<u128>()
+                    .unwrap(),
+                dexdo_core::params::CAPACITY_RETRY_DEFAULT.as_millis()
+            );
+            assert_eq!(status.metadata().contains_key("dexdo-limit"), label);
+        }
+        for error in [
+            ReserveError::UnknownDeal,
+            ReserveError::Terminal,
+            ReserveError::InvalidState(anyhow!("bad state")),
+        ] {
+            let status = reserve_status(error, dexdo_core::params::CAPACITY_RETRY_DEFAULT);
+            assert!(!status.metadata().contains_key("dexdo-retry-after-ms"));
+            assert!(!status.metadata().contains_key("dexdo-limit"));
+        }
+    }
+
+    #[test]
+    fn retry_after_2231_before_open_readback_uses_a_full_probe_window() {
+        let bounds = dexdo_core::ClaimBounds::canonical();
+        let now = tokio::time::Instant::now();
+        let mut state = subscription_state(0);
+        state.probe_accepted = false;
+        state.probe_time = 0;
+        let hint = CapacityRetry {
+            bounds,
+            state,
+            next_attempt: now,
+        }
+        .delay(std::time::Duration::from_secs(1000), now);
+        assert!(
+            hint >= bounds.probe_window
+                + dexdo_core::params::ClaimConfirmationParams::canonical().poll_interval
+        );
+    }
+
+    proptest::proptest! {
+        #[test]
+        fn retry_after_2231_respects_contract_schedule_and_readback_margin(
+            elapsed in 0u64..=500,
+            scheduled in 0u64..=300,
+            probe in proptest::bool::ANY,
+            interval in 1u64..=180,
+            rate_floor in 1u64..=180,
+            probe_window in 1u64..=500,
+        ) {
+            use std::time::Duration;
+            let bounds = dexdo_core::ClaimBounds {
+                min_claim_interval: Duration::from_secs(interval),
+                min_seconds_per_tick: Duration::from_secs(rate_floor),
+                probe_window: Duration::from_secs(probe_window),
+                ..dexdo_core::ClaimBounds::canonical()
+            };
+            let now = tokio::time::Instant::now();
+            let mut state = subscription_state(TICK_SIZE);
+            state.probe_accepted = !probe;
+            state.probe_time = 1000;
+            state.last_claim_time = 1000;
+            let hint = CapacityRetry { bounds, state, next_attempt: now + Duration::from_secs(scheduled) }
+                .delay(Duration::from_secs(1000 + elapsed), now);
+            let floor = if probe { bounds.probe_window } else { bounds.min_claim_interval.max(bounds.min_seconds_per_tick) };
+            let margin = dexdo_core::params::ClaimConfirmationParams::canonical().poll_interval;
+            proptest::prop_assert!(hint >= floor.saturating_sub(Duration::from_secs(elapsed)).saturating_add(margin));
+            proptest::prop_assert!(hint >= Duration::from_secs(scheduled).saturating_add(margin));
+        }
     }
 }
 

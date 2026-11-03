@@ -233,7 +233,7 @@ fn issue_2193_existing_database_reopens_with_indexes_and_pending_output() {
         .execute_batch(
             "DROP INDEX requests_incomplete_usage; DROP INDEX requests_unfinished_usage;
          DROP INDEX request_usage_pending; ALTER TABLE request_usage DROP COLUMN deal_id;
-             PRAGMA user_version=5;",
+             DROP TABLE admission_models; DROP TABLE admission_deals; PRAGMA user_version=5;",
         )
         .unwrap();
     drop(store);

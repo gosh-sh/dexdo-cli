@@ -1,3 +1,36 @@
+## v0.13.0
+
+### New / Improvements
+
+- Buyer integrations can read `GET /v1/usage/admission` for cumulative accepted token
+  counters and the current SHELL quota without rebuilding historical reports. Exact
+  decimal strings preserve large totals; `complete` distinguishes confirmed totals
+  from incomplete history. The snapshot does not reserve capacity or authorize a request.
+
+### Fixes
+
+- `dexdo seller` retries a SELL rejected for insufficient contract SHELL reserve
+  after that contract is topped up. It verifies the original rejection and the
+  current contract and order state before retrying, preserves the rejected
+  attempt, and keeps waiting when the previous submission outcome is unknown.
+- Inference accepts additional provider cache metadata instead of failing with
+  HTTP 502. Supported cache read and write counts are still excluded from billing
+  exactly once; unrecognized fields stay in the response and do not change billing.
+  Cache reported only in an unsupported form can remain in the billable total.
+- `dexdo note deploy` reports confirmed insufficient wallet funds instead of an
+  unknown outcome, including when the wallet converted SHELL to its own gas before
+  the voucher send failed. If the receipt proves no voucher was sent, fund the
+  wallet and repeat the same command with the same pool path.
+- Temporary capacity refusals now include retry timing: busy deals suggest one second, while
+  blockchain-limited deals report the expected wait for the next claim and confirmation.
+  The `onchain_deal_limit` error code and `dexdo-limit` header identify that limit, with a
+  matching buyer Grafana panel. Retry hints are minimum waits, not admission guarantees.
+- Provider retry headers remain unchanged. A temporary provider HTTP 429 without a retry hint
+  now suggests one second; a milliseconds-only hint also supplies rounded-up seconds.
+  Explicit billing and quota refusals do not receive an invented delay.
+- Buyer HTTP and seller RPC duration histograms use finer buckets for long requests,
+  improving percentile estimates in Grafana. Historical samples retain their original buckets.
+
 ## v0.12.0
 
 ### New / Improvements

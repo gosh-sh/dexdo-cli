@@ -2,6 +2,7 @@
 // Reuse this module's two-note setup and receipt helpers for the focused seller regression.
 include!("backends_issue_2199_live.rs");
 include!("backends_issue_2220_live.rs");
+include!("backends_issue_2230_live.rs");
 use super::*;
 use std::{fs, os::unix::fs::OpenOptionsExt, path::Path, process::Command};
 

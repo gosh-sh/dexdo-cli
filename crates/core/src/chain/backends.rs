@@ -8650,6 +8650,64 @@ impl RealSellerBackend {
         Ok(())
     }
 
+    async fn recover_reserve_rejected_offer(
+        &self,
+        tc: &Address,
+        book: &Address,
+        flags: u8,
+    ) -> Result<Option<String>, ChainError> {
+        self.load_pending_offer(tc, book).await?;
+        let pending = self.pending_offer.lock().await;
+        let Some(post) = pending
+            .as_ref()
+            .filter(|post| post.tc_rejection().is_some())
+        else {
+            return Ok(None);
+        };
+        let recovery = async {
+            let verified = self.chain.verified_seller_reserve_rejection(post, flags, self.nonce).await?;
+            let state = self.chain.token_contract_deal_state(tc).await?
+                .ok_or_else(|| anyhow::anyhow!("TokenContract state is missing"))?;
+            if let Some(reason) = state.used_reason() {
+                return Err(anyhow::anyhow!("TokenContract is already used: {reason}"));
+            }
+            if !self.chain.raw_resting_sell_orders_for_tc(book, tc).await?.is_empty() {
+                return Err(anyhow::anyhow!("a resting SELL already exists"));
+            }
+            if self.chain.token_contract_offer(tc).await?.is_none_or(|latch| latch.offer_posted) {
+                return Err(anyhow::anyhow!("TokenContract offer latch is not proven released"));
+            }
+            let reserve = self.chain.active_deal_reserve_ecc(tc).await?;
+            let required = crate::params::DEAL_BURN_POST_FROM_NOTE_RAW;
+            if reserve < required {
+                return Err(anyhow::anyhow!(
+                    "current_reserve_raw={reserve} required_operation_charge_raw={required}; \
+                     replenish this TokenContract; the running seller will check again"
+                ));
+            }
+            let path = self.offer_journal_path(tc)
+                .ok_or_else(|| anyhow::anyhow!("reserve recovery requires a durable seller offer journal"))?;
+            // Keep the old active journal until before_post atomically replaces it with the
+            // successor. Cancellation before then just repeats these read-only checks.
+            let archive = path.with_extension(format!("{}.rejected.json", post.message_id));
+            verified.save(Some(&archive))?;
+            eprintln!(
+                "seller_offer_reserve_recovery token_contract={} historical_message_hash={} \
+                 current_reserve_raw={reserve} required_operation_charge_raw={required} action=retry_original_sell",
+                display_token_contract(tc), post.message_id,
+            );
+            Ok(Some(post.message_id.clone()))
+        }.await;
+        recovery.map_err(|error| {
+            ChainError::AmbiguousSubmit(format!(
+                "SELL reserve recovery refused for {}: {error:#}; historical_rejection={}; \
+             original submission retained; no new SELL submitted",
+                display_token_contract(tc),
+                post.tc_rejection().unwrap_or_default(),
+            ))
+        })
+    }
+
     pub(super) async fn reconcile_pending_offer(
         &self,
         tc: &Address,
@@ -9039,7 +9097,14 @@ impl ChainBackend for RealSellerBackend {
                 .map_err(map_err)
         })
         .await?;
-        if self.reconcile_pending_offer(&tc, &ob).await? {
+        let recovered = tokio::time::timeout(
+            OFFER_ACCEPTANCE_TIMEOUT,
+            self.recover_reserve_rejected_offer(&tc, &ob, offer.flags),
+        ).await.map_err(|_| ChainError::AmbiguousSubmit(format!(
+            "SELL reserve recovery checks timed out for {}; original submission retained; no new SELL submitted",
+            display_token_contract(&tc),
+        )))??;
+        if recovered.is_none() && self.reconcile_pending_offer(&tc, &ob).await? {
             return Ok(());
         }
         if retry_seller_read("seller order-book state", || async {
@@ -9090,8 +9155,17 @@ impl ChainBackend for RealSellerBackend {
         let path = self.offer_journal_path(&tc);
         let mut pending = self.pending_offer.lock().await;
         let since = now_secs()?.saturating_sub(crate::params::SELLER_OFFER_EVENT_LOOKBACK_SECS);
+        let mut checkpointed = false;
         let submitted = {
             let mut before_post = |message_id| {
+                if let Some(previous) = recovered.as_deref() {
+                    if pending
+                        .as_ref()
+                        .is_none_or(|post| post.message_id != previous)
+                    {
+                        return Err(anyhow::anyhow!("SELL submission changed during reserve recovery; reconcile it before retrying"));
+                    }
+                }
                 let post = super::client::SellerPlacement::new(
                     self.chain.network(),
                     &self.note,
@@ -9102,6 +9176,7 @@ impl ChainBackend for RealSellerBackend {
                 );
                 post.save(path.as_deref())?;
                 *pending = Some(post);
+                checkpointed = true;
                 Ok(())
             };
             tokio::time::timeout(
@@ -9122,9 +9197,11 @@ impl ChainBackend for RealSellerBackend {
             .await
         };
         if let Ok(Err(error)) = &submitted {
-            if error
-                .downcast_ref::<super::client::MoneySubmitError>()
-                .is_some_and(|error| error.clears_journal())
+            // Before checkpointing, pending can still be the original rejected SELL.
+            if checkpointed
+                && error
+                    .downcast_ref::<super::client::MoneySubmitError>()
+                    .is_some_and(|error| error.clears_journal())
                 && pending.is_some()
             {
                 if let Some(path) = path.as_ref() {

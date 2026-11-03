@@ -16,7 +16,7 @@ pub mod forward;
 mod stream;
 mod usage;
 
-use error::capacity_rejection;
+use error::capacity_response;
 pub use error::{ConsumerError, ConsumerErrorCode};
 
 use crate::buyer::verify::Verdict;
@@ -1556,6 +1556,10 @@ pub(crate) fn aggregate_body_response(
 ) -> Response {
     let status = http::StatusCode::from_u16(delivery.http_status)
         .expect("request delivery carries a valid HTTP status");
+    let mut headers = forward::response_headers(&headers, "application/json");
+    if status == http::StatusCode::TOO_MANY_REQUESTS {
+        error::provider_retry_headers(&mut headers, &body);
+    }
     request_guard.mark_response_started();
     request_guard.prepare_delivery(delivery);
     let finalizer = request_guard.delivery_finalizer();
@@ -1573,7 +1577,7 @@ pub(crate) fn aggregate_body_response(
         .status(status)
         .body(Body::from_stream(body))
         .expect("aggregated response is valid");
-    *response.headers_mut() = forward::response_headers(&headers, "application/json");
+    *response.headers_mut() = headers;
     response
         .headers_mut()
         .insert(http::header::CONTENT_LENGTH, content_length.into());
@@ -4062,6 +4066,7 @@ pub fn router(state: ApiState) -> axum::Router {
         .route("/v1/messages", post(forward::messages))
         .route("/v1/models", get(forward::models))
         .route("/v1/usage", get(usage::get_usage))
+        .route("/v1/usage/admission", get(usage::get_admission))
         .route("/v1/usage/facts", get(usage::get_facts))
         .layer(DefaultBodyLimit::max(BUYER_API_REQUEST_BODY_MAX_BYTES))
         .layer(axum::middleware::from_fn_with_state(
@@ -4118,6 +4123,7 @@ mod tests {
     mod consumer_errors_1450;
     mod quota_review_2133;
     mod usage_history;
+    mod usage_snapshot_2237;
     use super::*;
     use dexdo_core::SUB_WEEK_LEN;
 
@@ -4129,6 +4135,7 @@ mod tests {
     mod read_recovery_2129;
     mod request_body_2173;
     mod request_path_2187;
+    mod retry_after_2231;
     mod route_swap_1025;
     mod upstream_retry_2135;
 

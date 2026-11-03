@@ -51,6 +51,14 @@ struct OrdinaryCapacityObserver {
 }
 
 impl dexdo::seller::ClaimStateObserver for OrdinaryCapacityObserver {
+    fn observe_retry_after(
+        &self,
+        token_contract: &dexdo_core::TokenContract,
+        delay: std::time::Duration,
+    ) {
+        self.gateway.schedule_capacity_retry(token_contract, delay);
+    }
+
     fn active_requests(&self, token_contract: &dexdo_core::TokenContract) -> u32 {
         self.gateway.active_requests(token_contract)
     }
@@ -144,6 +152,14 @@ struct ClaimMeasurementObserver {
 }
 
 impl dexdo::seller::ClaimStateObserver for ClaimMeasurementObserver {
+    fn observe_retry_after(
+        &self,
+        token_contract: &dexdo_core::TokenContract,
+        delay: std::time::Duration,
+    ) {
+        self.gateway.schedule_capacity_retry(token_contract, delay);
+    }
+
     fn active_requests(&self, token_contract: &dexdo_core::TokenContract) -> u32 {
         self.gateway.active_requests(token_contract)
     }

@@ -20035,5 +20035,6 @@ mod tests {
     include!("client/issue_2115_tests.rs");
     include!("client/issue_2199_tests.rs");
     include!("client/issue_2220_tests.rs");
+    include!("client/issue_2230_tests.rs");
     include!("client/issue_2192_tests.rs");
 }

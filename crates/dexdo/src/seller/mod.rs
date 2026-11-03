@@ -869,12 +869,14 @@ pub async fn provision_match(
             display_token_contract(&cfg.token_contract)
         );
     }
-    seller.state.register_stream(
+    let bounds = chain.deal_claim_bounds(&cfg.token_contract).await?;
+    seller.state.register_stream_with_claim_bounds(
         &cfg.token_contract,
         m.buyer_pubkey,
         cfg.mock_token_count,
         state,
         deal,
+        bounds,
     )?;
     if !read_opened_with_retry(chain, &cfg.token_contract).await? {
         loop {

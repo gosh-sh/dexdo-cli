@@ -1,3 +1,4 @@
+use super::super::error::capacity_rejection;
 use super::*;
 
 fn assert_refusal(body: &str, code: &str, action: &str, path: &str) {
@@ -269,7 +270,22 @@ async fn busy_request_does_not_spend_or_close_the_shared_deal() {
         assert_eq!(first.status(), reqwest::StatusCode::OK);
         assert!(first.chunk().await.unwrap().is_some());
         let before = harness.remaining().await;
-        let (status, body) = harness.ask_full(path, 1, "", false).await;
+        let response = harness.send_full(path, 1, "", false).await;
+        assert_eq!(
+            response.headers()["retry-after"],
+            dexdo_core::params::CAPACITY_RETRY_DEFAULT
+                .as_secs()
+                .to_string()
+        );
+        assert_eq!(
+            response.headers()["retry-after-ms"],
+            dexdo_core::params::CAPACITY_RETRY_DEFAULT
+                .as_millis()
+                .to_string()
+        );
+        assert!(!response.headers().contains_key("dexdo-limit"));
+        let status = response.status();
+        let body = response.text().await.unwrap();
         assert_eq!(status, reqwest::StatusCode::TOO_MANY_REQUESTS, "{body}");
         assert_refusal(&body, "deal_busy", "retry_with_backoff", path);
         assert_eq!(harness.remaining().await, before);

@@ -22,6 +22,10 @@ use std::sync::{
 #[path = "usage_live_cost_tests.rs"]
 mod live_cost_tests;
 
+#[cfg(test)]
+#[path = "usage_snapshot_http_tests.rs"]
+mod snapshot_http_tests;
+
 #[derive(Clone)]
 struct RequestContext {
     id: String,
@@ -432,6 +436,7 @@ pub(super) async fn get_usage(
     if let Err(error) = query.validate(now) {
         return invalid_query(error.to_string());
     }
+    let syncing = std::time::Instant::now();
     if let Err(error) = sync_deal_quota(&state).await {
         // An authoritatively unopened candidate leaves the last confirmed quota readable.
         // Serving still rejects this error; unresolved purchases and storage errors stay fatal.
@@ -440,11 +445,39 @@ pub(super) async fn get_usage(
             return unavailable("current deal quota could not be read");
         }
     }
+    tracing::debug!(
+        sync_us = syncing.elapsed().as_secs_f64() * 1_000_000.0,
+        "usage report quota sync timing"
+    );
     match tokio::task::spawn_blocking(move || gateway_response(store.query(&query, now)?)).await {
         Ok(Ok(value)) => Json(value).into_response(),
         error => {
             tracing::error!(?error, "buyer usage: history query failed");
             unavailable("usage history could not be read")
+        }
+    }
+}
+
+pub(super) async fn get_admission(State(state): State<ApiState>) -> Response {
+    let Some(store) = state.usage.clone() else {
+        return unavailable("usage history is not configured");
+    };
+    let syncing = std::time::Instant::now();
+    if let Err(error) = sync_deal_quota(&state).await {
+        if !error.is::<QuotaNotOpened>() {
+            tracing::error!(%error, "buyer admission: current quota could not be persisted");
+            return unavailable("current deal quota could not be read");
+        }
+    }
+    tracing::debug!(
+        sync_us = syncing.elapsed().as_secs_f64() * 1_000_000.0,
+        "admission quota sync timing"
+    );
+    match tokio::task::spawn_blocking(move || store.admission_snapshot(&state.frame_model)).await {
+        Ok(Ok(value)) => Json(value).into_response(),
+        error => {
+            tracing::error!(?error, "buyer admission: snapshot query failed");
+            unavailable("usage snapshot could not be read")
         }
     }
 }

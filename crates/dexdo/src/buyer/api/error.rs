@@ -38,6 +38,7 @@ pub enum ConsumerErrorCode {
     VerificationGrantConsumed,
     DealBusy,
     DealCapacityUnavailable,
+    OnchainDealLimit,
     UpstreamRetryable,
     UpstreamUsageUnresolved,
     UnsupportedApiPath,
@@ -57,7 +58,7 @@ impl ConsumerErrorCode {
             Self::DealNotOpened
             | Self::PurchaseReconciliationRequired
             | Self::SubscriptionStateUnavailable => "read_only_reconciliation",
-            Self::DealCapacityUnavailable => "retry_after_reconciliation",
+            Self::DealCapacityUnavailable | Self::OnchainDealLimit => "retry_after_reconciliation",
             Self::UpstreamUsageUnresolved => "read_only_reconciliation",
             Self::InvalidBuyTicks | Self::UnsupportedApiPath => "change_request",
             Self::SellerUpdateRequired => "wait_for_seller_update",
@@ -160,17 +161,101 @@ impl ApiState {
 
 /// Older sellers have no typed metadata: preserve their generic reconciliation guidance.
 pub(super) fn capacity_rejection(error: &anyhow::Error) -> ConsumerError {
-    let busy = error.downcast_ref::<tonic::Status>().is_some_and(|status| {
+    let status = error.downcast_ref::<tonic::Status>();
+    let busy = status.is_some_and(|status| {
         status
             .metadata()
             .get("dexdo-error-code")
             .is_some_and(|code| code == "deal_busy")
     });
-    if busy {
+    let onchain = status.is_some_and(|status| {
+        status
+            .metadata()
+            .get("dexdo-limit")
+            .is_some_and(|value| value == "onchain_deal_limit")
+    });
+    if onchain {
+        ConsumerError::new(ConsumerErrorCode::OnchainDealLimit,
+            "the deal's unclaimed billable backlog reached its on-chain throughput limit; retry after the next claim is reconciled")
+    } else if busy {
         ConsumerError::new(ConsumerErrorCode::DealBusy,
             "the deal's concurrent request limit is reached; retry with backoff after an active request finishes")
     } else {
         ConsumerError::new(ConsumerErrorCode::DealCapacityUnavailable,
             format!("the deal has no delivery capacity for this request yet; retry after seller capacity reconciliation: {error}"))
     }
+}
+
+pub(super) fn capacity_response(error: &anyhow::Error, anthropic: bool) -> Response {
+    let refusal = capacity_rejection(error);
+    let mut response = refusal.response(http::StatusCode::TOO_MANY_REQUESTS, anthropic);
+    if refusal.code == ConsumerErrorCode::OnchainDealLimit {
+        response
+            .headers_mut()
+            .insert("dexdo-limit", "onchain_deal_limit".parse().unwrap());
+    }
+    if let Some(delay) = error
+        .downcast_ref::<tonic::Status>()
+        .and_then(|status| status.metadata().get("dexdo-retry-after-ms"))
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.parse::<u64>().ok())
+        .filter(|delay| *delay > 0)
+    {
+        retry_headers(response.headers_mut(), delay);
+    }
+    response
+}
+
+pub(super) fn retry_headers(headers: &mut http::HeaderMap, milliseconds: u64) {
+    headers.insert(
+        http::header::RETRY_AFTER,
+        milliseconds.div_ceil(1000).max(1).into(),
+    );
+    headers.insert("retry-after-ms", milliseconds.into());
+}
+
+/// Preserve provider hints, filling only a missing seconds header or a wholly missing hint.
+pub(super) fn provider_retry_headers(headers: &mut http::HeaderMap, body: &[u8]) {
+    if headers.contains_key(http::header::RETRY_AFTER) {
+        return;
+    }
+    if let Some(milliseconds) = headers.get("retry-after-ms") {
+        if let Some(milliseconds) = milliseconds
+            .to_str()
+            .ok()
+            .and_then(|value| value.parse::<u64>().ok())
+        {
+            headers.insert(
+                http::header::RETRY_AFTER,
+                milliseconds.div_ceil(1000).max(1).into(),
+            );
+        }
+        return;
+    }
+    if let Ok(body) = serde_json::from_slice::<serde_json::Value>(body) {
+        let error = &body["error"];
+        if ["code", "type"].into_iter().any(|field| {
+            matches!(
+                error[field].as_str(),
+                Some(
+                    "insufficient_quota"
+                        | "credit_balance_exhausted"
+                        | "billing_error"
+                        | "organization_spend_limit_exceeded"
+                        | "project_spend_limit_exceeded"
+                        | "organization_usage_limit_exceeded"
+                        | "usage_limit_exceeded"
+                )
+            )
+        }) || error["message"]
+            .as_str()
+            .is_some_and(|message| message.starts_with("You have reached your API usage limits:"))
+        {
+            return;
+        }
+    }
+    retry_headers(
+        headers,
+        dexdo_core::params::CAPACITY_RETRY_DEFAULT.as_millis() as u64,
+    );
 }

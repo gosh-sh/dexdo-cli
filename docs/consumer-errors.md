@@ -20,13 +20,14 @@ request refused before its answer starts receives the same JSON error body.
 | `verification_grant_consumed` | Completed identity verification used the request's whole grant. No answer request was sent. | `retry`: the deal is now verified; a later request can still be refused if the shared budget is spent. |
 | `deal_busy` | The seller's per-deal concurrent request limit is occupied. | `retry_with_backoff`: retry after an active request finishes. |
 | `deal_capacity_unavailable` | Paid remainder is temporarily behind the pre-acceptance trial ceiling, or the seller refused capacity without a specific busy indication. | `retry_after_reconciliation`: wait for authoritative probe acceptance or seller capacity reconciliation on this deal. |
+| `onchain_deal_limit` | The accepted probe's unclaimed billable backlog reached one tick and admission waits for the next claim. | `retry_after_reconciliation`: wait for the seller's next claim and authoritative readback; sustained refusals indicate that another buyer/deal is needed for more throughput. |
 | `upstream_retryable` | The provider failed temporarily before any output: its stream or body ended before the answer, or the connection dropped. The deal remains open. | `retry_with_backoff`: retry this request on the same deal. |
 | `unsupported_api_path` | The seller's provider does not serve this path: an OpenAI-compatible seller serves Chat Completions and Responses, an Anthropic seller serves Messages. No money moved and the deal remains open. | `change_request`: send the request on a path the seller serves. |
 | `seller_update_required` | The seller runs a version that does not forward requests as sent. No money moved and the deal remains open. | `wait_for_seller_update`: retry after the seller updates. |
 | `invalid_buy_ticks` | The requested purchase is below the stream minimum. | `change_request`: correct the purchase parameters. |
 | `deal_unavailable` | Deal initialization or serving failed without one of the specific causes above. | `operator_action`: inspect the diagnostic before deciding whether to retry. |
 
-Busy and seller capacity refusals use HTTP 429. `unsupported_api_path` uses HTTP 400 and
+Busy and seller capacity refusals, including `onchain_deal_limit`, use HTTP 429. `unsupported_api_path` uses HTTP 400 and
 `seller_update_required` HTTP 502. Buyer admission refusals, including
 the temporary trial ceiling, and initialization refusals use HTTP 503.
 Invalid purchase ticks retain HTTP 400 on the OpenAI
@@ -49,7 +50,8 @@ or route-replacement support alone.
 
 Retries must be bounded and respect caller cancellation/deadlines. For
 `retry_with_backoff`, use the integration's backoff policy and avoid immediate
-retry loops; no requests-per-minute limit or fixed wait duration is implied.
+retry loops. A retry hint is a minimum wait recommendation, not a reservation or a guarantee
+that the next request will be admitted; a repeated refusal carries the current hint.
 Neither refusal rendering nor its recovery guidance submits a BUY. The existing
 configured lifecycle/recovery policy continues to govern monetary operations.
 
@@ -57,12 +59,35 @@ The seller carries the typed busy cause as additive `dexdo-error-code: deal_busy
 gRPC metadata. Both peers must update for that distinction. A seller without this
 metadata yields `deal_capacity_unavailable`; buyers never infer busy from prose.
 
+Updated sellers add `dexdo-retry-after-ms` gRPC metadata to capacity refusals. Buyers expose it
+as `retry-after-ms` in milliseconds and `Retry-After` in whole seconds, rounded up with a
+minimum of one second. Older sellers without a valid positive delay retain their no-header
+capacity response. `deal_busy` uses a fixed one-second delay. Capacity delays reflect the
+seller's actual claim schedule, never earlier than `lastClaimTime + max(minClaimInterval,
+minSecondsPerTick)` after acceptance, or `probeTime + PROBE_WINDOW` before acceptance,
+plus one confirmation/readback poll (currently three seconds). Until the first post-open
+readback supplies `probeTime`, the seller conservatively allows a full probe window. Values above 60 seconds
+are preserved. An idle claim driver can schedule its next attempt later than the contract minimum.
+
+Only a refusal caused by the accepted probe's unclaimed backlog reaching one tick carries
+`dexdo-limit: onchain_deal_limit` in gRPC metadata and the HTTP response, with the same value
+in JSON `error.code`. Probe, concurrency and provider refusals never receive this label.
+Those HTTP 429s alone add `dexdo.limit="onchain_deal_limit"` to
+`dexdo.buyer.http.server.errors` (Prometheus label `dexdo_limit`); the buyer Grafana dashboard
+shows their rate per model and instance in `onchain_deal_limit 429 per second`.
+
 A provider's own error answer -- for example HTTP 429 with `retry-after`, or a 5xx -- reaches the
 caller with the provider's status and body. Every provider header arrives prefixed
 `llm_provider-`; `retry-after`, `retry-after-ms`, `x-ratelimit-*` and `anthropic-ratelimit-*` also
-arrive under their own names, so a client retries by them as it would against the provider. The
-answer carries no dexdo code, moves no money and leaves the deal open; the seller does not repeat
-the request. The exception is HTTP 401 and 403, a refused seller key: the caller receives HTTP 502
+arrive under their own names, so a client retries by them as it would against the provider.
+The provider's retry values are preserved verbatim. For HTTP 429, if only a valid integer `retry-after-ms` is
+present, the buyer derives the missing seconds header by rounding up, minimum one second.
+A temporary provider HTTP 429 without either header receives `Retry-After: 1` and
+`retry-after-ms: 1000`. Explicit provider billing/spend/quota codes (including
+`insufficient_quota`, `credit_balance_exhausted` and `*_spend_limit_exceeded`), or the
+Claude monthly API-usage-cap diagnostic, do not receive an invented delay. Status and body
+are preserved. The answer carries no dexdo code, moves no money and leaves the deal open;
+the seller does not repeat the request. The exception is HTTP 401 and 403, a refused seller key: the caller receives HTTP 502
 without the provider's body. A provider redirect (3xx) is likewise HTTP 502, without `Location`, and
 so is any provider error whose text contains the seller's key: such an answer never leaves the seller.
 
