@@ -2,8 +2,9 @@
 //! path.
 use anyhow::{bail, Context, Result};
 use dexdo_core::params::{
-    BUYER_METRICS_SERVICE_NAME, SELLER_METRICS_DEFAULT_ENDPOINT, SELLER_METRICS_EXPORT_INTERVAL,
-    SELLER_METRICS_EXPORT_TIMEOUT, SELLER_METRICS_FRESHNESS, SELLER_METRICS_SERVICE_NAME,
+    SellerLivenessParams, BUYER_METRICS_SERVICE_NAME, SELLER_METRICS_DEFAULT_ENDPOINT,
+    SELLER_METRICS_EXPORT_INTERVAL, SELLER_METRICS_EXPORT_TIMEOUT, SELLER_METRICS_FRESHNESS,
+    SELLER_METRICS_SERVICE_NAME, SELLER_UPTIME_PROBE_INTERVAL,
 };
 use opentelemetry::{
     metrics::{Counter, Histogram, MeterProvider},
@@ -23,6 +24,113 @@ use std::{
 pub mod buyer;
 
 static METRICS: OnceLock<Arc<Metrics>> = OnceLock::new();
+/// `dexdo.<role>.contract.call.errors`: the session's role and its counter.
+static CONTRACT_CALL_ERRORS: OnceLock<(Role, Counter<u64>)> = OnceLock::new();
+/// The model this seller process was started for: the `model` of a failed contract call that is
+/// not a call to one of its deals' TokenContracts.
+static SELLER_MODEL: OnceLock<String> = OnceLock::new();
+
+/// Name the model this seller process sells, once it is fixed.
+pub fn set_model(model: &str) {
+    let _ = SELLER_MODEL.set(model.to_owned());
+}
+
+/// The account part of an address, lowercase: the same key whichever form the address came in.
+fn account_key(address: &str) -> String {
+    address
+        .rsplit(':')
+        .next()
+        .unwrap_or_default()
+        .to_ascii_lowercase()
+}
+
+/// Count one failed contract call. A call to a seller deal's TokenContract carries that deal's
+/// model; any other call carries the model the process was started for.
+fn contract_call_failed(call: &dexdo_core::chain::call_errors::FailedCall<'_>) {
+    let Some((role, counter)) = CONTRACT_CALL_ERRORS.get() else {
+        return;
+    };
+    let model = match role {
+        Role::Buyer => buyer::model(),
+        Role::Seller => METRICS
+            .get()
+            .and_then(|metrics| {
+                lock(&metrics.observations)
+                    .deal_models
+                    .get(&account_key(call.account))
+                    .cloned()
+            })
+            .or_else(|| SELLER_MODEL.get().cloned()),
+    };
+    let mut attributes: Vec<KeyValue> = model
+        .map(|model| KeyValue::new("model", model))
+        .into_iter()
+        .collect();
+    attributes.extend([
+        KeyValue::new("error.type", call.error_type.as_str()),
+        KeyValue::new("contract", call.contract),
+        KeyValue::new("method", call.method.to_owned()),
+    ]);
+    counter.add(1, &attributes);
+}
+pub(crate) fn seller_claim_failed(
+    token_contract: &str,
+    attempted_tokens: u128,
+    error: &dexdo_core::ChainError,
+) {
+    use dexdo_core::ChainError;
+    let error_type = match error {
+        ChainError::AmbiguousSubmit(_) | ChainError::ClaimReplayRecovery { .. } => "unconfirmed",
+        ChainError::Transport(_) => "transport",
+        ChainError::Contract(_) | ChainError::ClaimWindowRefused(_) | ChainError::Limit(_) => {
+            "contract_refused"
+        }
+        ChainError::UnsafeClaimState(_) => "invalid_claim_state",
+        _ => "claim_failed",
+    };
+    tracing::event!(
+        name: "dexdo.seller.claim.failed", target: module_path!(), tracing::Level::WARN, {
+        "error.type" = error_type,
+        "dexdo.contract.method" = "claimTokens",
+        token_contract = %dexdo_core::address::display_self_dapp(token_contract),
+        attempted_tokens,
+        %error,
+        }, "claim failed; waiting for authoritative claim state"
+    );
+    if let Some(metrics) = METRICS.get() {
+        let model = lock(&metrics.observations)
+            .deal_models
+            .get(&account_key(token_contract))
+            .cloned()
+            .or_else(|| SELLER_MODEL.get().cloned());
+        let mut attributes = model.as_deref().map(attrs).unwrap_or_default();
+        attributes.push(KeyValue::new("error.type", error_type));
+        metrics.claim_errors.add(1, &attributes);
+    }
+}
+
+pub(crate) fn grpc_status_name(code: tonic::Code) -> &'static str {
+    match code {
+        tonic::Code::Ok => "OK",
+        tonic::Code::Cancelled => "CANCELLED",
+        tonic::Code::Unknown => "UNKNOWN",
+        tonic::Code::InvalidArgument => "INVALID_ARGUMENT",
+        tonic::Code::DeadlineExceeded => "DEADLINE_EXCEEDED",
+        tonic::Code::NotFound => "NOT_FOUND",
+        tonic::Code::AlreadyExists => "ALREADY_EXISTS",
+        tonic::Code::PermissionDenied => "PERMISSION_DENIED",
+        tonic::Code::ResourceExhausted => "RESOURCE_EXHAUSTED",
+        tonic::Code::FailedPrecondition => "FAILED_PRECONDITION",
+        tonic::Code::Aborted => "ABORTED",
+        tonic::Code::OutOfRange => "OUT_OF_RANGE",
+        tonic::Code::Unimplemented => "UNIMPLEMENTED",
+        tonic::Code::Internal => "INTERNAL",
+        tonic::Code::Unavailable => "UNAVAILABLE",
+        tonic::Code::DataLoss => "DATA_LOSS",
+        tonic::Code::Unauthenticated => "UNAUTHENTICATED",
+    }
+}
+
 pub fn enabled() -> bool {
     METRICS.get().is_some()
 }
@@ -358,6 +466,13 @@ impl Session {
             }
             Role::Buyer => buyer::install(&provider.meter(role.meter())),
         }
+        let counter = provider
+            .meter(role.meter())
+            .u64_counter(format!("{}.contract.call.errors", role.meter()))
+            .build();
+        if CONTRACT_CALL_ERRORS.set((role, counter)).is_ok() {
+            dexdo_core::chain::call_errors::observe(contract_call_failed);
+        }
         Ok(Self {
             provider,
             timeout: config.timeout,
@@ -428,6 +543,11 @@ struct Observations {
     // retaining every historical TokenContract or poisoning active successor observations.
     summaries: HashMap<String, Offer>,
     health_summaries: HashMap<(String, &'static str), Health>,
+    /// The model of every deal this process registered, by its TokenContract's account key.
+    deal_models: HashMap<String, String>,
+    /// SHELL on each note with an active deal, by (`note`, `pocket`). NaN is a failed read, or a
+    /// note whose last active deal ended: an exported series cannot be withdrawn.
+    note_balances: HashMap<(String, &'static str), f64>,
 }
 impl Observations {
     fn health_values(&self) -> Vec<&Health> {
@@ -473,6 +593,7 @@ impl Observations {
     }
 }
 struct Metrics {
+    claim_errors: Counter<u64>,
     checks: Counter<u64>,
     check_duration: Histogram<f64>,
     events: Counter<u64>,
@@ -572,7 +693,8 @@ impl Metrics {
             .with_callback(move |o| {
                 let state = lock(&state_uptime);
                 for uptime in state.uptime.values() {
-                    let current = uptime_status(uptime.outcome, uptime.checked, now());
+                    let current =
+                        uptime_status(uptime.component, uptime.outcome, uptime.checked, now());
                     let mut a = attrs(&uptime.model);
                     a.push(KeyValue::new("component", uptime.component.to_owned()));
                     for status in ["unknown", "pass", "fail", "timeout", "throttled"] {
@@ -705,7 +827,24 @@ impl Metrics {
                 }
             })
             .build();
+        let state_notes = state.clone();
+        meter
+            .f64_observable_gauge("dexdo.seller.note.balance")
+            .with_unit("{SHELL}")
+            .with_callback(move |o| {
+                for ((note, pocket), shell) in &lock(&state_notes).note_balances {
+                    o.observe(
+                        *shell,
+                        &[
+                            KeyValue::new("note", note.clone()),
+                            KeyValue::new("pocket", *pocket),
+                        ],
+                    );
+                }
+            })
+            .build();
         Self {
+            claim_errors: meter.u64_counter("dexdo.seller.claim.errors").build(),
             checks: meter.u64_counter("dexdo.seller.health.checks").build(),
             check_duration: meter
                 .f64_histogram("dexdo.seller.health.duration")
@@ -743,6 +882,9 @@ pub fn register(tc: &str, model: &str) {
     if let Some(m) = METRICS.get() {
         let mut observations = lock(&m.observations);
         observations
+            .deal_models
+            .insert(account_key(tc), model.into());
+        observations
             .offers
             .entry(tc.into())
             .or_insert_with(|| Offer {
@@ -760,11 +902,7 @@ pub fn register(tc: &str, model: &str) {
         // A restored, already-running deal may not execute readiness before it starts serving.
         // Keep readiness series present and explicitly unknown until a real check records a
         // result; registering a deal is not itself a health check and must not increment checks.
-        for component in [
-            "gateway_task",
-            "advertised_gateway",
-            "upstream_authentication_and_model",
-        ] {
+        for component in ["gateway_task", "advertised_gateway"] {
             observations
                 .health
                 .entry((tc.into(), component))
@@ -811,15 +949,62 @@ fn active_request(model: &str, purpose: &'static str, started: bool) {
         }
     }
 }
-fn uptime_status(outcome: &'static str, checked: f64, time: f64) -> &'static str {
-    if checked == 0. || time - checked > SELLER_METRICS_FRESHNESS.as_secs_f64() {
+/// Run the inference probe used by the seller's per-model uptime task.
+pub async fn probe_upstream(
+    upstream: &crate::seller::UpstreamConfig,
+    timeout: Duration,
+) -> &'static str {
+    match tokio::time::timeout(timeout, upstream.check_market_readiness()).await {
+        Ok(Ok(())) => "pass",
+        Ok(Err(error)) => upstream_uptime_outcome(&error),
+        Err(_) => "timeout",
+    }
+}
+
+pub(crate) async fn run_upstream_uptime(model: String, upstream: crate::seller::UpstreamConfig) {
+    let timeout = SellerLivenessParams::canonical().health_check_timeout;
+    let interval = SELLER_UPTIME_PROBE_INTERVAL;
+    let delay = upstream_probe_delay(&model);
+    if !delay.is_zero() {
+        tokio::time::sleep(delay).await;
+    }
+    loop {
+        let outcome = probe_upstream(&upstream, timeout).await;
+        uptime(&model, "upstream", outcome);
+        tokio::time::sleep(interval).await;
+    }
+}
+
+/// Classify an upstream readiness error for uptime metrics. A provider HTTP 429 proves
+/// connectivity and is reported as throttled rather than unavailable.
+fn upstream_uptime_outcome(error: &anyhow::Error) -> &'static str {
+    error
+        .downcast_ref::<tonic::Status>()
+        .filter(|status| {
+            dexdo_proto::is_retryable_upstream(status)
+                && status.message().starts_with("upstream HTTP 429 ")
+        })
+        .map_or("fail", |_| "throttled")
+}
+
+fn uptime_status(component: &str, outcome: &'static str, checked: f64, time: f64) -> &'static str {
+    let freshness = if component == "upstream" {
+        SELLER_UPTIME_PROBE_INTERVAL + SellerLivenessParams::canonical().health_check_timeout
+    } else {
+        SELLER_METRICS_FRESHNESS
+    };
+    if checked == 0. || time - checked > freshness.as_secs_f64() {
         "unknown"
     } else {
         outcome
     }
 }
-fn uptime_probe_due_at(checked: Option<f64>, time: f64, interval: Duration) -> bool {
-    checked.is_none_or(|checked| time - checked >= interval.as_secs_f64())
+fn upstream_probe_delay_at(checked: Option<f64>, time: f64) -> Duration {
+    let interval = SELLER_UPTIME_PROBE_INTERVAL.as_secs_f64();
+    let remaining = checked.map_or(0., |checked| {
+        (interval - (time - checked)).clamp(0., interval)
+    });
+    Duration::from_secs_f64(remaining)
 }
 /// Record an independent process/provider uptime probe, separate from offer readiness decisions.
 pub fn uptime(model: &str, component: &'static str, outcome: &'static str) {
@@ -848,18 +1033,14 @@ pub fn uptime(model: &str, component: &'static str, outcome: &'static str) {
         );
     }
 }
-/// Avoid an independent upstream request while a recent seller readiness probe already
-/// provides the same model-uptime observation.
-pub fn uptime_probe_due(model: &str, component: &'static str, interval: Duration) -> bool {
-    let Some(metrics) = METRICS.get() else {
-        return false;
-    };
-    let state = lock(&metrics.observations);
-    let checked = state
-        .uptime
-        .get(&(model.to_owned(), component))
-        .map(|uptime| uptime.checked);
-    uptime_probe_due_at(checked, now(), interval)
+fn upstream_probe_delay(model: &str) -> Duration {
+    let checked = METRICS.get().and_then(|metrics| {
+        lock(&metrics.observations)
+            .uptime
+            .get(&(model.to_owned(), "upstream"))
+            .map(|uptime| uptime.checked)
+    });
+    upstream_probe_delay_at(checked, now())
 }
 /// Record a chain-confirmed matched deal as currently being served.
 pub fn deal_in_progress(tc: &str, model: &str) {
@@ -873,6 +1054,53 @@ pub fn deal_in_progress(tc: &str, model: &str) {
 pub fn deal_settled(tc: &str) {
     if let Some(m) = METRICS.get() {
         lock(&m.observations).in_progress_deals.remove(tc);
+    }
+}
+/// The TokenContracts of the deals this seller is working now: an offer it watches, or a matched
+/// deal it serves until its terminal settlement.
+pub fn active_deals() -> Vec<String> {
+    let Some(m) = METRICS.get() else {
+        return Vec::new();
+    };
+    let state = lock(&m.observations);
+    let mut deals: Vec<String> = state
+        .offers
+        .keys()
+        .chain(state.in_progress_deals.keys())
+        .cloned()
+        .collect();
+    deals.sort();
+    deals.dedup();
+    deals
+}
+/// The balances of one note, by its number in the note pool. `None` is a pocket whose read failed.
+pub struct NoteBalance {
+    pub note: usize,
+    pub trading_raw: Option<u128>,
+    pub gas_raw: Option<u128>,
+}
+/// Replace the balances of the notes with active deals. A note missing from `balances` that was
+/// written before reads NaN from now on.
+pub fn note_balances(balances: &[NoteBalance]) {
+    if let Some(m) = METRICS.get() {
+        let mut state = lock(&m.observations);
+        for shell in state.note_balances.values_mut() {
+            *shell = f64::NAN;
+        }
+        let shell = |raw: Option<u128>| {
+            raw.map_or(f64::NAN, |raw| {
+                raw as f64 / dexdo_core::params::SHELL_UNIT as f64
+            })
+        };
+        for balance in balances {
+            let note = balance.note.to_string();
+            state
+                .note_balances
+                .insert((note.clone(), "trading"), shell(balance.trading_raw));
+            state
+                .note_balances
+                .insert((note, "gas"), shell(balance.gas_raw));
+        }
     }
 }
 pub fn observe_offer(tc: &str, deadline: u64, ticks: u128, live: bool, listed: bool) {
@@ -1235,7 +1463,6 @@ pub fn failed(code: tonic::Code) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use dexdo_core::params::SELLER_UPTIME_PROBE_INTERVAL;
     use opentelemetry_proto::tonic::{
         collector::metrics::v1::{
             metrics_service_server::{MetricsService, MetricsServiceServer},
@@ -1253,37 +1480,49 @@ mod tests {
         })
     }
     #[test]
-    fn uptime_probe_due_uses_the_canonical_30_second_interval() {
-        assert_eq!(SELLER_UPTIME_PROBE_INTERVAL, Duration::from_secs(30));
-        assert!(uptime_probe_due_at(
-            None,
-            100.0,
-            SELLER_UPTIME_PROBE_INTERVAL
+    fn uptime_probe_classifies_retryable_429_as_throttled_only() {
+        let rate_limited = dexdo_proto::retryable_upstream_status(tonic::Status::unavailable(
+            "upstream HTTP 429 Too Many Requests",
         ));
-        assert!(!uptime_probe_due_at(
-            Some(99.0),
-            100.0,
-            SELLER_UPTIME_PROBE_INTERVAL
+        assert_eq!(
+            super::upstream_uptime_outcome(&anyhow::Error::new(rate_limited)),
+            "throttled"
+        );
+
+        let other_retryable = dexdo_proto::retryable_upstream_status(tonic::Status::unavailable(
+            "upstream HTTP 503 Service Unavailable",
         ));
-        assert!(!uptime_probe_due_at(
-            Some(70.001),
-            100.0,
-            SELLER_UPTIME_PROBE_INTERVAL
-        ));
-        assert!(uptime_probe_due_at(
-            Some(70.0),
-            100.0,
-            SELLER_UPTIME_PROBE_INTERVAL
-        ));
+        assert_eq!(
+            super::upstream_uptime_outcome(&anyhow::Error::new(other_retryable)),
+            "fail"
+        );
+
+        let unclassified_429 = tonic::Status::unavailable("upstream HTTP 429 Too Many Requests");
+        assert_eq!(
+            super::upstream_uptime_outcome(&anyhow::Error::new(unclassified_429)),
+            "fail"
+        );
+    }
+
+    #[test]
+    fn upstream_probe_delay_uses_the_canonical_five_minute_interval() {
+        assert_eq!(SELLER_UPTIME_PROBE_INTERVAL, Duration::from_secs(300));
+        assert!(upstream_probe_delay_at(None, 100.).is_zero());
+        assert_eq!(
+            upstream_probe_delay_at(Some(100.), 399.),
+            Duration::from_secs(1)
+        );
+        assert!(upstream_probe_delay_at(Some(100.), 400.).is_zero());
     }
     #[test]
     fn uptime_status_preserves_throttling_and_expires_stale_observations() {
         for outcome in ["pass", "fail", "timeout", "throttled", "unknown"] {
-            assert_eq!(uptime_status(outcome, 100.0, 101.0), outcome);
+            assert_eq!(uptime_status("upstream", outcome, 100.0, 399.0), outcome);
         }
-        assert_eq!(uptime_status("pass", 0.0, 101.0), "unknown");
+        assert_eq!(uptime_status("upstream", "pass", 0.0, 101.0), "unknown");
         assert_eq!(
             uptime_status(
+                "gateway",
                 "pass",
                 100.0,
                 100.0 + SELLER_METRICS_FRESHNESS.as_secs_f64() + 0.001
@@ -1583,6 +1822,227 @@ mod tests {
         let _ = server.await;
         std::env::remove_var("DEXDO_METRICS_TEST_ONLY_KEY");
     }
+    async fn exercise_shared_uptime_cycle(
+        provider: &SdkMeterProvider,
+        received: &mut tokio::sync::mpsc::Receiver<ExportMetricsServiceRequest>,
+    ) {
+        use crate::seller::{self, liveness, OpenAiConfig, SellerConfig, UpstreamConfig};
+        use dexdo_core::{ChainBackend, DobParams, MockChainBackend, ProtocolConsts};
+
+        const MODEL: &str = "telemetry-wire-shared-upstream";
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let release = Arc::new(tokio::sync::Notify::new());
+        let (requests, mut observed) = tokio::sync::mpsc::unbounded_channel();
+        let index = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let app = axum::Router::new().route(
+            "/chat/completions",
+            axum::routing::post({
+                let release = release.clone();
+                let index = index.clone();
+                move || {
+                    let release = release.clone();
+                    let requests = requests.clone();
+                    let index = index.clone();
+                    async move {
+                        use axum::{http::StatusCode, response::IntoResponse};
+                        let call = index.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                        requests.send(call).unwrap();
+                        match call {
+                            0 => {
+                                release.notified().await;
+                                StatusCode::TOO_MANY_REQUESTS.into_response()
+                            }
+                            1 => ([("content-type", "text/event-stream")], "data: {}\n\n").into_response(),
+                            2 => std::future::pending().await,
+                            _ => ([
+                                ("content-type", "text/event-stream"),
+                            ], concat!(
+                                "data: {\"model\":\"telemetry-wire-shared-upstream\",\"choices\":[{\"delta\":{\"content\":\"OK\"}}]}\n\n",
+                                "data: {\"choices\":[],\"usage\":{\"prompt_tokens\":1,\"completion_tokens\":1,\"total_tokens\":2}}\n\n",
+                                "data: [DONE]\n\n",
+                            )).into_response(),
+                        }
+                    }
+                }
+            }),
+        );
+        let http = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let upstream = UpstreamConfig::OpenAi(OpenAiConfig {
+            base_url: format!("http://{address}"),
+            model: MODEL.into(),
+            frame_model: MODEL.into(),
+            api_key_env: "PATH".into(),
+            ..Default::default()
+        });
+        let seller = Arc::new(
+            seller::start_gateway_with("127.0.0.1:0".parse().unwrap(), upstream.clone())
+                .await
+                .unwrap(),
+        );
+        let dir = tempfile::tempdir().unwrap();
+        let chain = Arc::new(MockChainBackend::new(
+            dir.path().join("book.json"),
+            ProtocolConsts::canonical(),
+            DobParams::canonical(),
+        ));
+        let cfg = SellerConfig {
+            token_contract: format!("0:{}", "6".repeat(64)),
+            price_per_tick: dexdo_core::PRICE_STEP.try_into().unwrap(),
+            max_ticks: 4,
+            subscription: false,
+            all_or_none: false,
+            gateway_advertise: seller.listen_addr.to_string(),
+            mock_token_count: 4,
+        };
+        seller::post_offer(&seller, chain.as_ref(), &cfg)
+            .await
+            .unwrap();
+        let row = chain
+            .raw_resting_sell_orders_for_tc(&cfg.token_contract)
+            .await
+            .unwrap()
+            .remove(0);
+        let order_id = row.order_id;
+        let tc = cfg.token_contract.clone();
+        let watch = seller::SellerMatchWatchConfig {
+            cursor_path: dir.path().join("watch.json"),
+            poll_interval: dexdo_core::params::DEFAULT_MATCH_POLL_INTERVAL,
+        };
+        let mut supervision = tokio::spawn({
+            let seller = seller.clone();
+            let chain = chain.clone();
+            async move {
+                let identity = liveness::RestingOfferIdentity {
+                    owner_note: row.owner_note,
+                    token_contract: cfg.token_contract.clone(),
+                    order_id,
+                };
+                liveness::supervise_resting_offer(
+                    &seller,
+                    chain.as_ref(),
+                    &cfg,
+                    &watch,
+                    &identity,
+                    std::future::pending(),
+                    false,
+                    liveness::AdvertiseProbePolicy::Required,
+                )
+                .await
+            }
+        });
+
+        // Only the uptime task runs on the clock we advance. The gateway, supervisor
+        // and OTLP collector keep their real deadlines while this task sleeps.
+        let probe_runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let probe_handle = probe_runtime.handle().clone();
+        let (clock, mut ticks) =
+            tokio::sync::mpsc::channel::<(Duration, tokio::sync::oneshot::Sender<()>)>(1);
+        let probe_driver = tokio::task::spawn_blocking(move || {
+            probe_runtime.block_on(async {
+                while let Some((elapsed, done)) = ticks.recv().await {
+                    tokio::time::pause();
+                    tokio::time::advance(elapsed).await;
+                    tokio::time::resume();
+                    let _ = done.send(());
+                }
+            });
+        });
+        let advance_probe_clock = async |elapsed| {
+            let (done, advanced) = tokio::sync::oneshot::channel();
+            clock.send((elapsed, done)).await.unwrap();
+            advanced.await.unwrap();
+        };
+        let watch_uptime = || {
+            let _probe_runtime = probe_handle.enter();
+            seller.state.watch_model_uptime(MODEL, &upstream);
+        };
+
+        register(&tc, MODEL);
+        watch_uptime();
+        assert_eq!(
+            tokio::time::timeout(SELLER_METRICS_EXPORT_TIMEOUT, observed.recv())
+                .await
+                .unwrap(),
+            Some(0)
+        );
+
+        // The second pool group registers the same model while the first request is in flight.
+        register("second-pool-group", MODEL);
+        watch_uptime();
+        assert!(
+            tokio::time::timeout(Duration::from_millis(25), observed.recv())
+                .await
+                .is_err()
+        );
+        release.notify_one();
+
+        for (call, expected) in ["throttled", "fail", "timeout", "pass"]
+            .into_iter()
+            .enumerate()
+        {
+            if call > 0 {
+                advance_probe_clock(SELLER_UPTIME_PROBE_INTERVAL).await;
+                assert_eq!(
+                    tokio::time::timeout(SELLER_METRICS_EXPORT_TIMEOUT, observed.recv())
+                        .await
+                        .unwrap(),
+                    Some(call),
+                );
+            }
+            if expected == "timeout" {
+                advance_probe_clock(SellerLivenessParams::canonical().health_check_timeout).await;
+            }
+            tokio::time::timeout(SELLER_METRICS_EXPORT_TIMEOUT, async {
+                loop {
+                    let current = lock(&METRICS.get().unwrap().observations)
+                        .uptime
+                        .get(&(MODEL.into(), "upstream"))
+                        .map(|value| value.outcome);
+                    if current == Some(expected) {
+                        break;
+                    }
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .unwrap_or_else(|_| panic!("upstream probe {call} did not record {expected}"));
+            let export = collect(provider, received).await;
+            assert_eq!(
+                gauge_sum_for(
+                    &export,
+                    "dexdo.seller.uptime.status",
+                    MODEL,
+                    "state",
+                    expected
+                ),
+                1.,
+                "exported probe outcome {expected}",
+            );
+            let orders: Vec<_> = chain
+                .raw_resting_sell_orders_for_tc(&tc)
+                .await
+                .unwrap()
+                .iter()
+                .map(|order| order.order_id)
+                .collect();
+            if orders != [order_id] || supervision.is_finished() {
+                let outcome =
+                    tokio::time::timeout(SELLER_METRICS_EXPORT_TIMEOUT, &mut supervision).await;
+                panic!("probe {expected}: expected resting SELL {order_id}, got {orders:?}, supervisor outcome {outcome:?}");
+            }
+        }
+        assert!(observed.try_recv().is_err());
+        supervision.abort();
+        seller.server_task.abort();
+        http.abort();
+        drop(clock);
+        probe_driver.await.unwrap();
+    }
+
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn real_otlp_wire_recovers_from_errors_without_sensitive_or_unbounded_labels() {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -1609,8 +2069,24 @@ mod tests {
         .unwrap()
         .unwrap();
         let session = Session::start(Some(cfg)).unwrap().unwrap();
+        let claim_tc = "test-2266";
+        let claim_model = "telemetry-claim-retry";
+        register(claim_tc, claim_model);
+        crate::seller::advance::exercise_claim_retry_metrics(claim_tc).await;
         crate::seller::gateway::exercise_billing_metrics().await;
         let billing = collect(&session.provider, &mut received).await;
+        for error_type in ["transport", "unconfirmed"] {
+            assert_eq!(
+                sum_f64_for(
+                    &billing,
+                    "dexdo.seller.claim.errors",
+                    claim_model,
+                    "error.type",
+                    error_type
+                ),
+                1.0,
+            );
+        }
         for (model, charged, input, output) in [
             ("telemetry-billing-clamp", 2, 2, 1),
             ("telemetry-billing-shared", 2, 4, 2),
@@ -1656,7 +2132,7 @@ mod tests {
         health(
             "tc-SECRET",
             WIRE_MODEL,
-            "upstream_authentication_and_model",
+            "advertised_gateway",
             "pass",
             Some(Duration::ZERO),
         );
@@ -1770,7 +2246,7 @@ mod tests {
         health(
             "tc-SECRET",
             WIRE_MODEL,
-            "upstream_authentication_and_model",
+            "advertised_gateway",
             "timeout",
             Some(Duration::ZERO),
         );
@@ -1780,12 +2256,8 @@ mod tests {
             .is_nan());
         assert_eq!(points(&request, "dexdo.seller.offer.unknown")[0].1, 1.);
         let status = points(&request, "dexdo.seller.health.status");
-        assert_eq!(status.len(), 9);
-        for component in [
-            "gateway_task",
-            "advertised_gateway",
-            "upstream_authentication_and_model",
-        ] {
+        assert_eq!(status.len(), 6);
+        for component in ["gateway_task", "advertised_gateway"] {
             let component_status: Vec<_> = status
                 .iter()
                 .filter(|(attributes, _)| {
@@ -1810,7 +2282,7 @@ mod tests {
         health(
             "tc-SECRET",
             WIRE_MODEL,
-            "upstream_authentication_and_model",
+            "advertised_gateway",
             "pass",
             Some(Duration::ZERO),
         );
@@ -2078,6 +2550,7 @@ mod tests {
             && matches!(&m.data, Some(metric::Data::Sum(sum)) if sum.data_points.iter().any(|p| sold_gateway(&p.attributes)))));
         assert!(!metrics.iter().any(|m| m.name == "dexdo.seller.health.duration"
             && matches!(&m.data, Some(metric::Data::Histogram(h)) if h.data_points.iter().any(|p| sold_gateway(&p.attributes)))));
+        exercise_shared_uptime_cycle(&session.provider, &mut received).await;
         session.shutdown().await;
         let _ = stop.send(());
         server.await.unwrap().unwrap();

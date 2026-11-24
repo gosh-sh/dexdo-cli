@@ -750,7 +750,7 @@ mod keep_open_2148 {
             .unwrap();
         let body = &source[start..start + source[start..].find("\n}\n").unwrap()];
         let watch = body
-            .find("_ = stopped.wait_for(Option::is_some) => {}")
+            .find("Ok(_) = stopped.wait_for(Option::is_some) => {}")
             .unwrap();
         let serve = body
             .find("api::serve(bind, state, shutdown)")

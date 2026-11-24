@@ -7,5 +7,15 @@ fn main() {
             std::env::set_var("PROTOC", protoc);
         }
     }
-    tonic_build::compile_protos("proto/dexdo.proto").expect("compile dexdo.proto");
+    tonic_build::configure()
+        .type_attribute(
+            ".dexdo.v1.BillingUsage",
+            "#[derive(serde::Serialize, serde::Deserialize)]",
+        )
+        .field_attribute(
+            ".dexdo.v1.BillingUsage.cumulative_billable_tokens",
+            "#[serde(default, skip_serializing_if = \"Option::is_none\")]",
+        )
+        .compile_protos(&["proto/dexdo.proto"], &["proto"])
+        .expect("compile dexdo.proto");
 }

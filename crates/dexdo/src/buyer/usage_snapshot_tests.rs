@@ -1,5 +1,7 @@
 use super::*;
 
+const DROP_CHANGE_JOURNAL: &str = include_str!("drop_usage_change_journal.sql");
+
 fn fixture() -> (tempfile::TempDir, UsageStore) {
     let dir = tempfile::tempdir().unwrap();
     let store = UsageStore::open(dir.path().join("usage.sqlite3"), "shellnet").unwrap();
@@ -149,6 +151,71 @@ fn snapshot_2237_uncertainty_and_write_failure_are_not_confirmed_zero() {
 }
 
 #[test]
+fn issue_2258_schema_7_upgrade_preserves_history_admission_and_quota() {
+    let (dir, store) = fixture();
+    store.register_deal("deal", "m").unwrap();
+    store.open_deal_quota("deal", 3, SHELL_UNIT).unwrap();
+    store.start_request("r", "m", "openai", false).unwrap();
+    store.link_deal("r", "deal").unwrap();
+    store
+        .record_call_usage(
+            "r",
+            "answer",
+            "answer",
+            BillingUsage::new(3, 4, None).unwrap(),
+            true,
+        )
+        .unwrap();
+    store.finish_request("r", 200, Some("stop"), None).unwrap();
+    let now = Utc::now();
+    let history = store.query(&UsageQuery::default(), now).unwrap()["usage"].clone();
+    let admission = store.admission_snapshot("m").unwrap();
+    assert_eq!(history["total"]["requests"]["succeeded"], 1);
+    assert_eq!(admission["accepted"]["output_tokens"], "4");
+    assert_eq!(
+        admission["quota"]["used"],
+        shell(7 * SHELL_UNIT / dexdo_core::params::TICK_SIZE)
+    );
+
+    // Reconstruct the v0.13.0 layout, including both populated admission tables.
+    store
+        .lock()
+        .unwrap()
+        .execute_batch(DROP_CHANGE_JOURNAL)
+        .unwrap();
+    store
+        .lock()
+        .unwrap()
+        .execute_batch(
+            "DROP INDEX request_usage_cumulative;
+             ALTER TABLE request_usage DROP COLUMN cumulative_billable_tokens;
+             PRAGMA user_version=7;",
+        )
+        .unwrap();
+    // Verify the SQLite quota survives without recovery from the journal.
+    std::fs::remove_file(store.quota_journal.as_ref()).unwrap();
+    drop(store);
+
+    let path = dir.path().join("usage.sqlite3");
+    for _ in 0..2 {
+        let store = UsageStore::open(&path, "shellnet").unwrap();
+        assert_eq!(
+            store
+                .lock()
+                .unwrap()
+                .pragma_query_value(None, "user_version", |row| row.get::<_, u32>(0))
+                .unwrap(),
+            BUYER_USAGE_SCHEMA_VERSION
+        );
+        assert_eq!(
+            store.query(&UsageQuery::default(), now).unwrap()["usage"],
+            history
+        );
+        assert_eq!(store.admission_snapshot("m").unwrap(), admission);
+    }
+}
+
+#[test]
 fn snapshot_2237_migration_is_atomic_and_backfills_every_network_once() {
     let (dir, store) = fixture();
     {
@@ -180,6 +247,11 @@ fn snapshot_2237_migration_is_atomic_and_backfills_every_network_once() {
     store
         .lock()
         .unwrap()
+        .execute_batch(DROP_CHANGE_JOURNAL)
+        .unwrap();
+    store
+        .lock()
+        .unwrap()
         .execute_batch(
             "DROP TABLE admission_models; DROP TABLE admission_deals; PRAGMA user_version=6;",
         )
@@ -195,6 +267,7 @@ fn snapshot_2237_migration_is_atomic_and_backfills_every_network_once() {
         );
     }
     let connection = Connection::open(dir.path().join("usage.sqlite3")).unwrap();
+    connection.execute_batch(DROP_CHANGE_JOURNAL).unwrap();
     connection.execute_batch("DROP TABLE admission_models; DROP TABLE admission_deals; PRAGMA user_version=6; UPDATE request_usage SET input_tokens='broken';").unwrap();
     assert!(UsageStore::open(dir.path().join("usage.sqlite3"), "shellnet").is_err());
     assert_eq!(

@@ -122,7 +122,8 @@ async fn the_submit_predicate_is_not_widened() {
 
 /// Where the buy path reads the fill, and where the settlement confirmation reads its events: both
 /// are polled after money has moved, and both used to go out unwrapped. Frozen here so a later
-/// edit cannot quietly take either back out of the policy.
+/// edit cannot quietly take either back out of the policy. Since the admitted page read
+/// owns the retry boundary, so check every link from the reader down to that page.
 #[test]
 fn both_post_money_readers_go_through_the_read_policy() {
     let source = include_str!("client.rs");
@@ -135,12 +136,17 @@ fn both_post_money_readers_go_through_the_read_policy() {
         (
             "pub async fn token_contract_settlement_receipts(",
             "/// Read current getters when active and immutable ext-out history for one TokenContract.",
-            "retry_transient_read",
+            "fetch_all_ext_out_messages_routed",
         ),
         (
             "async fn fetch_all_ext_out_messages_routed<",
             "fn filter_map_ext_out_messages_in_order<",
-            "retry_transient_read",
+            "fetch_ext_out_page(",
+        ),
+        (
+            "pub(super) async fn fetch_ext_out_page(",
+            "pub(super) async fn fetch_all_ext_out_messages<",
+            "retry_chain_read(Some(gate),",
         ),
     ] {
         let start = source.find(reader).expect("reader present");

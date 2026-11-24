@@ -139,6 +139,65 @@ mod issue_2162 {
         .unwrap()
     }
 
+    async fn reconcile_for_note(
+        root: &std::path::Path,
+        manifest: &std::path::Path,
+    ) -> Result<()> {
+        let chain = dexdo_core::RealChainBackend::connect(manifest)?;
+        let owner = owner();
+        reconcile_seller_pending_provisions(Some(root), &chain, |note| note == owner).await
+    }
+
+    #[tokio::test]
+    async fn issue_2246_new_note_reservation_stays_with_provision_until_next_startup() {
+        let server = account_server(vec![found('1'), found('2')]).await;
+        let root = tempfile::tempdir().unwrap();
+        let manifest = contracts(root.path(), &server.endpoint);
+        let first = pending(root.path(), '1');
+        let chain = dexdo_core::RealChainBackend::connect(&manifest).unwrap();
+        let snapshot = seller_market_handle_records_matching(
+            Some(root.path()), Some(chain.network()), |_| true,
+        ).unwrap();
+        let locked_note = deals::normalize_addr(&snapshot[&tc('1')].handle.note_addr);
+        let seller_lock = acquire_seller_pool_lock(
+            &seller_pool_dir(Some(root.path()), &locked_note).unwrap(),
+        ).unwrap();
+
+        let mut market = snapshot[&tc('1')].market.clone();
+        market.token_contract = tc('2');
+        market.seller_note = tc('b');
+        let provision_dir = seller_pool_dir(Some(root.path()), &market.seller_note).unwrap();
+        let provision_lock = acquire_seller_pool_lock(&provision_dir).unwrap();
+        let second = persist_provision_deal_handle(Some(root.path()), &market, &manifest, true)
+            .unwrap();
+        let before = std::fs::read(&second).unwrap();
+        let includes_note = |note: &str| note == locked_note;
+        reconcile_seller_pending_provisions(Some(root.path()), &chain, includes_note)
+            .await.unwrap();
+        let adopted = seller_market_handle_records_matching(
+            Some(root.path()), Some(chain.network()), includes_note,
+        ).unwrap();
+        assert_eq!(adopted.len(), 1);
+        assert!(!adopted[&tc('1')].provision_pending);
+        assert!(!deals::load_deal_record(&first).unwrap().provision_pending);
+        assert_eq!(std::fs::read(&second).unwrap(), before);
+        assert_eq!(server.requests.lock().unwrap().len(), 1);
+
+        drop(provision_lock);
+        let _next_start_lock = acquire_seller_pool_lock(&provision_dir).unwrap();
+        let new_owner = deals::normalize_addr(&market.seller_note);
+        reconcile_seller_pending_provisions(Some(root.path()), &chain, |note| {
+            note == locked_note || note == new_owner
+        }).await.unwrap();
+        let adopted = seller_market_handle_records_matching(
+            Some(root.path()), Some(chain.network()), |note| note == locked_note || note == new_owner,
+        ).unwrap();
+        assert_eq!(adopted[&tc('2')].handle.note_addr, market.seller_note);
+        assert!(!adopted[&tc('2')].provision_pending);
+        assert_eq!(server.requests.lock().unwrap().len(), 2);
+        drop(seller_lock);
+    }
+
     #[tokio::test]
     async fn found_and_exact_missing_accounts_clear_every_pending_file() {
         for missing in [
@@ -154,7 +213,7 @@ mod issue_2162 {
             let mut handle = deals::load_deal_handle(&second).unwrap();
             handle.created_at_unix += 1;
             deals::save_deal_handle(root.path(), &handle).unwrap();
-            reconcile_seller_pending_provisions(Some(root.path()), &owner(), &manifest)
+            reconcile_for_note(root.path(), &manifest)
                 .await
                 .unwrap();
             for path in [first, second] {
@@ -189,7 +248,7 @@ mod issue_2162 {
             std::fs::read(&first).unwrap(),
             std::fs::read(&second).unwrap(),
         ];
-        let error = reconcile_seller_pending_provisions(Some(root.path()), &owner(), &manifest)
+        let error = reconcile_for_note(root.path(), &manifest)
             .await
             .unwrap_err();
         let rendered = format!("{error:#}");
@@ -216,7 +275,7 @@ mod issue_2162 {
         let manifest = contracts(root.path(), &server.endpoint);
         let path = pending(root.path(), '1');
         let before = std::fs::read(&path).unwrap();
-        let error = reconcile_seller_pending_provisions(Some(root.path()), &owner(), &manifest)
+        let error = reconcile_for_note(root.path(), &manifest)
             .await
             .unwrap_err();
         let rendered = format!("{error:#}");
@@ -251,7 +310,7 @@ mod issue_2162 {
             let root = tempfile::tempdir().unwrap();
             let manifest = contracts(root.path(), &server.endpoint);
             let path = pending(root.path(), '1');
-            reconcile_seller_pending_provisions(Some(root.path()), &owner(), &manifest)
+            reconcile_for_note(root.path(), &manifest)
                 .await
                 .unwrap();
             assert_eq!(server.requests.lock().unwrap().len(), 2);
@@ -283,7 +342,7 @@ mod issue_2162 {
         let before = untouched
             .each_ref()
             .map(|path| std::fs::read(path).unwrap());
-        reconcile_seller_pending_provisions(Some(root.path()), &owner(), &manifest)
+        reconcile_for_note(root.path(), &manifest)
             .await
             .unwrap();
         assert!(
@@ -308,7 +367,7 @@ mod issue_2162 {
         let canonical = pending(root.path(), '1');
         let legacy = root.path().join("deal-legacy-seller.json");
         std::fs::copy(&canonical, &legacy).unwrap();
-        reconcile_seller_pending_provisions(Some(root.path()), &owner(), &manifest)
+        reconcile_for_note(root.path(), &manifest)
             .await
             .unwrap();
         assert!(
@@ -320,6 +379,14 @@ mod issue_2162 {
         assert_eq!(server.requests.lock().unwrap().len(), 2);
     }
 
+    fn startup_pool(root: &std::path::Path) -> std::path::PathBuf {
+        let pool = root.join("pn_pool.json");
+        write_owner_only_key_fixture(&pool, &json!({"notes": [{
+            "address": owner(), "owner_secret_key_hex": "11".repeat(32),
+        }]}).to_string());
+        pool
+    }
+
     fn startup_args(root: &std::path::Path) -> SellerArgs {
         std::fs::write(root.join("policy.json"), json!({
             "version": 1, "seller": {
@@ -328,7 +395,6 @@ mod issue_2162 {
             }
         }).to_string()).unwrap();
         let mut args = parsed_seller_args(&["--allow-private-advertise"]);
-        args.identity.note_addr = Some(owner());
         args.token_contract = Some(tc('1'));
         args.deals_dir = Some(root.to_path_buf());
         args.models = root.join("missing-models.json");
@@ -358,7 +424,8 @@ mod issue_2162 {
                 std::fs::read(&second).unwrap(),
             ];
             let args = startup_args(root.path());
-            let error = run_seller(args).await.unwrap_err();
+            let pool = startup_pool(root.path());
+            let error = run_seller_from_pool(args, None, Some(&pool)).await.unwrap_err();
             let rendered = format!("{error:#}");
             if success {
                 assert!(rendered.contains("missing-models.json"), "{rendered}");
@@ -402,7 +469,7 @@ mod issue_2162 {
             let manifest = contracts(root.path(), &server.endpoint);
             let path = pending(root.path(), '1');
             let started = tokio::time::Instant::now();
-            reconcile_seller_pending_provisions(Some(root.path()), &owner(), &manifest)
+            reconcile_for_note(root.path(), &manifest)
                 .await
                 .unwrap();
             assert!(
@@ -430,7 +497,7 @@ mod issue_2162 {
             let path = pending(root.path(), '1');
             tokio::time::timeout(
                 dexdo_core::params::TRANSIENT_READ_ATTEMPT_TIMEOUT,
-                reconcile_seller_pending_provisions(Some(root.path()), &owner(), &manifest),
+                reconcile_for_note(root.path(), &manifest),
             )
             .await
             .expect("invalid or excessive delay uses the existing fallback")
@@ -447,7 +514,8 @@ mod issue_2162 {
         let root =
             std::path::PathBuf::from(std::env::var_os("DEXDO_TEST_2162_SHUTDOWN_ROOT").unwrap());
         let _manifest = crate::cli::commands::manifest_for_this_thread(root.join("contracts.json"));
-        let error = run_seller(startup_args(&root)).await.unwrap_err();
+        let pool = startup_pool(&root);
+        let error = run_seller_from_pool(startup_args(&root), None, Some(&pool)).await.unwrap_err();
         assert!(
             format!("{error:#}").contains("missing-models.json"),
             "{error:#}"
@@ -576,7 +644,8 @@ mod issue_2162 {
         }
         let mut args = startup_args(root.path());
         args.token_contract = Some(missing.to_string());
-        let error = run_seller(args).await.unwrap_err();
+        let pool = startup_pool(root.path());
+        let error = run_seller_from_pool(args, None, Some(&pool)).await.unwrap_err();
         let rendered = format!("{error:#}");
         assert!(rendered.contains("missing-models.json"), "{rendered}");
         for path in &files {

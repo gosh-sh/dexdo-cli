@@ -18,7 +18,7 @@ async fn issue_2047_relist(retired: &[u64], saved: Option<u64>) {
         let note_addr = pool.note_addr.clone();
         let cursor = pool.deal.watch.cursor_path.clone();
         let parent_tc = pool.parent.token_contract.clone();
-        move |model: String, nonce: u64, price: u64, ticks: u64| {
+        move |_: String, model: String, nonce: u64, price: u64, ticks: u64| {
             // The chosen, usable identity must survive a crash before this money call.
             let fill = dexdo::seller::read_seller_fill_lineage(&cursor, &parent_tc)
                 .unwrap()
@@ -114,7 +114,7 @@ async fn issue_2047_nonce_read_failure_preserves_cursor_and_spends_nothing() {
         let calls = Arc::new(AtomicU64::new(0));
         let mut provision = {
             let calls = calls.clone();
-            move |_: String, _: u64, _: u64, _: u64| {
+            move |_: String, _: String, _: u64, _: u64, _: u64| {
                 calls.fetch_add(1, Ordering::Relaxed);
                 futures::future::ready(Err(anyhow::anyhow!("must not reach money provisioner")))
             }
@@ -165,7 +165,7 @@ async fn issue_2047_shutdown_after_history_read_spends_nothing_and_does_not_rese
     let calls = Arc::new(AtomicU64::new(0));
     let mut provision = {
         let calls = calls.clone();
-        move |_: String, _: u64, _: u64, _: u64| {
+        move |_: String, _: String, _: u64, _: u64, _: u64| {
             calls.fetch_add(1, Ordering::Relaxed);
             futures::future::ready(Err(anyhow::anyhow!("must not provision after shutdown")))
         }

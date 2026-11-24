@@ -17,10 +17,7 @@ use crate::cli::machine;
 use anyhow::{bail, Result};
 use dexdo::registry::{BuyerMissingBookPolicy, RegistryRole};
 use dexdo_core::address as addr;
-use dexdo_core::{
-    chain::BookEventFold, submit_safe_single_ask_quote, ExecutableQuote, OrderBookOrder,
-    OrderBookSnapshot,
-};
+use dexdo_core::{chain::BookEventFold, ExecutableQuote, OrderBookOrder, OrderBookSnapshot};
 use dexdo_core::{executable_quote, model_hash_for, ChainBackend};
 use serde_json::json;
 use std::future::Future;
@@ -701,7 +698,7 @@ pub(crate) async fn run_quote(args: QuoteArgs) -> Result<()> {
         let target = book_target_for(requested_model.clone(), args.note_addr.clone());
         (requested_model, target)
     };
-    let (view, q) = budget
+    let (snapshot, active, q) = budget
         .read(async {
             preload_model_registry_policy(
                 RegistryRole::Buyer,
@@ -717,27 +714,47 @@ pub(crate) async fn run_quote(args: QuoteArgs) -> Result<()> {
                 target,
             )
             .await?;
-            let order_book = resolve_order_book_target(&chain, &target).await?;
-            let view = read_executable_market_view(&chain, &target, &order_book).await?;
+            // Like BUY and executable-book, quote must see the raw storage order, including
+            // any earlier maker that a filtered or incomplete event view could omit.
+            let snapshot = read_book_target(&chain, &target).await?;
+            let active = snapshot.active();
             if let Some(policy) = registry_policy.as_ref() {
                 enforce_model_registry_policy(
                     RegistryRole::Buyer,
                     policy,
                     &manifest_path,
                     &target.frame_model,
-                    &view.snapshot.order_book,
-                    view.active,
+                    &snapshot.order_book,
+                    active,
                     BuyerMissingBookPolicy::Reject,
                 )
                 .await?;
             }
-            let q = submit_safe_single_ask_quote(&view.snapshot.orders, args.ticks, args.budget)
-                .map_err(|e| anyhow::anyhow!("quote: {e}"))?;
-            Ok((view, q))
+            let q = match chain
+                .quote_matched_buy(&snapshot, args.ticks, args.budget)
+                .await
+            {
+                Ok(quote) => quote,
+                Err(error)
+                    if matches!(
+                        error.downcast_ref::<dexdo_core::ChainError>(),
+                        Some(dexdo_core::ChainError::OrderUnavailable(_))
+                    ) =>
+                {
+                    eprintln!("{error:#}");
+                    ExecutableQuote {
+                        filled_ticks: 0,
+                        total_with_fee: 0,
+                        complete: false,
+                        fills: Vec::new(),
+                    }
+                }
+                Err(error) => return Err(error),
+            };
+            Ok((snapshot, active, q))
         })
         .await?;
-    let snapshot = &view.snapshot;
-    if !view.active {
+    if !active {
         eprint_book_not_deployed(&snapshot.frame_model, &snapshot.order_book);
     }
     if args.json {
@@ -753,22 +770,12 @@ pub(crate) async fn run_quote(args: QuoteArgs) -> Result<()> {
         let object = response
             .as_object_mut()
             .ok_or_else(|| anyhow::anyhow!("quote response is not an object"))?;
-        object.insert("source".to_string(), json!(view.source));
-        object.insert("lastUpdateId".to_string(), json!(view.last_update_id));
+        object.insert("source".to_string(), json!("chain"));
+        object.insert("lastUpdateId".to_string(), json!("-"));
         println!("{}", serde_json::to_string_pretty(&response)?);
         return Ok(());
     }
-    if q.filled_ticks == 0 {
-        println!(
-            "{}",
-            render_quote_summary(snapshot, &q, view.source, &view.last_update_id)
-        );
-        return Ok(());
-    }
-    println!(
-        "{}",
-        render_quote_summary(snapshot, &q, view.source, &view.last_update_id)
-    );
+    println!("{}", render_quote_summary(&snapshot, &q, "chain", "-"));
     for fill in q.fills {
         println!("{}", quote_fill_line(&fill));
     }

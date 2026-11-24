@@ -14,6 +14,36 @@ impl OnchainSubmitError {
     pub fn sanitized_payload(&self) -> &Value {
         &self.sanitized_payload
     }
+
+    /// Where the submit was refused, read with the same tests [`validate_onchain_submit_response`]
+    /// refused it by: a non-zero compute exit code or an abort is the compute phase, a non-zero
+    /// action result code is the action phase, and a node error carrying neither is the node.
+    pub fn refusal(&self) -> SubmitRefusal {
+        let payload = &self.sanitized_payload;
+        let node_error = payload.get("error").filter(|error| !error.is_null());
+        let scope = node_error.unwrap_or(payload);
+        if first_nonzero_exit_code(scope).is_some() {
+            SubmitRefusal::Compute
+        } else if first_nonzero_action_result_code(scope).is_some() {
+            SubmitRefusal::Action
+        } else if node_error.is_some() {
+            SubmitRefusal::Node
+        } else {
+            // The only remaining refusal is `result.aborted`, which is the compute phase's.
+            SubmitRefusal::Compute
+        }
+    }
+}
+
+/// The part of the chain that refused a submitted message.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SubmitRefusal {
+    /// The node refused the message before executing it.
+    Node,
+    /// The transaction aborted, or its compute phase exited non-zero.
+    Compute,
+    /// The action phase returned a non-zero result code.
+    Action,
 }
 
 impl fmt::Display for OnchainSubmitError {

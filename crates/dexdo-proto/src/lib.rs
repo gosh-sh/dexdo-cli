@@ -74,6 +74,7 @@ impl BillingUsage {
             output_tokens,
             total_tokens,
             charged_tokens: None,
+            cumulative_billable_tokens: None,
             cache_read_tokens: 0,
             cache_write_tokens: 0,
         })
@@ -98,6 +99,12 @@ impl BillingUsage {
             .is_some_and(|charged| charged > self.non_cached_tokens())
         {
             return Err("charged tokens exceed non-cached provider usage");
+        }
+        if self
+            .cumulative_billable_tokens
+            .is_some_and(|total| self.charged_tokens.is_none_or(|charged| charged > total))
+        {
+            return Err("invalid cumulative seller billing");
         }
         Ok(())
     }
@@ -240,6 +247,37 @@ mod version_mismatch_wire_tests {
         assert!(decoded.path.is_empty());
         assert!(decoded.body.is_empty());
         assert!(decoded.headers.is_empty());
+    }
+
+    #[derive(Clone, PartialEq, Message)]
+    struct LegacyRecoveryChallenge {
+        #[prost(bytes = "vec", tag = "1")]
+        nonce: Vec<u8>,
+        #[prost(string, tag = "2")]
+        token_contract: String,
+        #[prost(string, repeated, tag = "5")]
+        api_paths: Vec<String>,
+        #[prost(string, tag = "6")]
+        usage_recovery_network: String,
+    }
+
+    #[test]
+    fn rolling_upgrade_preserves_paths_and_authorization_without_negotiating_recovery() {
+        let old_seller = LegacyRecoveryChallenge {
+            nonce: vec![1, 2, 3],
+            token_contract: "deal".into(),
+            api_paths: vec!["/v1/chat/completions".into()],
+            usage_recovery_network: "legacy-network".into(),
+        };
+        let upgraded = Challenge::decode(old_seller.encode_to_vec().as_slice()).unwrap();
+        assert_eq!(upgraded.nonce, old_seller.nonce);
+        assert_eq!(upgraded.token_contract, old_seller.token_contract);
+        assert_eq!(upgraded.api_paths, old_seller.api_paths);
+
+        let old_buyer =
+            LegacyRecoveryChallenge::decode(upgraded.encode_to_vec().as_slice()).unwrap();
+        assert_eq!(old_buyer.api_paths, old_seller.api_paths);
+        assert!(old_buyer.usage_recovery_network.is_empty());
     }
 
     /// The challenge an older buyer reads: only the nonce and the deal.

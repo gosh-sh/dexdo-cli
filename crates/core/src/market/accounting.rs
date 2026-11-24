@@ -15,7 +15,10 @@ use std::collections::BTreeMap;
 /// which can overflow and then be divided (`/ 10000`) back below `u128::MAX`, yielding a truncated value a
 /// final `== u128::MAX` check would miss. This is the single source of truth for the escrow amount; the guard
 /// rejects on `None` (fail-closed), not merely on a saturated final result.
-fn checked_required_escrow_for_buy(ticks: u128, max_price_per_tick: u128) -> Option<u128> {
+pub(crate) fn checked_required_escrow_for_buy(
+    ticks: u128,
+    max_price_per_tick: u128,
+) -> Option<u128> {
     let fee = max_price_per_tick.checked_mul(u128::from(PLATFORM_FEE_BPS))? / 10_000;
     let unit = max_price_per_tick.checked_add(fee)?;
     ticks.checked_mul(unit)

@@ -25,6 +25,9 @@ use std::{
 mod facts;
 pub use facts::{UsageFact, UsageFacts, UsageFactsCursorExpired, UsageFactsQuery};
 
+#[path = "usage_change_journal.rs"]
+mod change_journal;
+
 #[path = "usage_quota_journal.rs"]
 mod quota_journal;
 
@@ -37,19 +40,6 @@ mod snapshot;
 #[cfg(test)]
 #[path = "usage_quota_tests.rs"]
 mod quota_tests;
-
-// Start from exceptional states, never from the completed request history. The pending
-// usage lookup visits only unresolved markers, then seeks their exact request by primary key.
-const UNRESOLVED_OUTPUT_USAGE_SQL: &str =
-    "SELECT EXISTS(SELECT 1 FROM requests r WHERE r.network=?1 AND r.deal_id=?2
-        AND r.history_complete=0)
-     OR EXISTS(SELECT 1 FROM requests r WHERE r.network=?1 AND r.deal_id=?2
-        AND r.finished_at IS NULL AND r.runtime_id<>?3)
-     OR EXISTS(SELECT 1 FROM request_usage u WHERE u.network=?1 AND u.deal_id=?2
-        AND u.call_id='in_progress' AND u.accepted=0
-        AND EXISTS(SELECT 1 FROM requests r WHERE r.network=u.network
-            AND r.request_id=u.request_id AND r.deal_id=?2
-            AND (u.phase='answer' OR r.finished_at IS NOT NULL OR r.runtime_id<>?3)))";
 
 #[cfg(test)]
 #[path = "usage_admission_tests.rs"]
@@ -263,6 +253,15 @@ impl ExpenseBreakdown {
     }
 }
 
+#[derive(PartialEq, serde::Serialize, Deserialize)]
+struct ConfirmedBill {
+    request_id: String,
+    phase: String,
+    usage: BillingUsage,
+    buyer_billable_floor: Option<u64>,
+    accepted_at: i64,
+}
+
 #[derive(Clone)]
 pub struct UsageStore {
     connection: Arc<Mutex<Connection>>,
@@ -270,6 +269,7 @@ pub struct UsageStore {
     network: Arc<str>,
     runtime_id: Arc<str>,
     quota_journal: Arc<PathBuf>,
+    billing_journal: Arc<Mutex<PathBuf>>,
 }
 
 impl std::fmt::Debug for UsageStore {
@@ -347,7 +347,7 @@ impl UsageStore {
         let version: u32 =
             transaction.pragma_query_value(None, "user_version", |row| row.get(0))?;
         ensure!(
-            matches!(version, 0 | 3..=6) || version == BUYER_USAGE_SCHEMA_VERSION,
+            matches!(version, 0 | 3..=BUYER_USAGE_SCHEMA_VERSION),
             "unsupported buyer usage schema version {version}"
         );
         transaction.execute_batch(
@@ -364,7 +364,8 @@ impl UsageStore {
                 call_id TEXT NOT NULL, input_tokens TEXT NOT NULL, output_tokens TEXT NOT NULL,
                 total_tokens TEXT NOT NULL, charged_tokens TEXT NOT NULL, accepted INTEGER NOT NULL,
                 cache_read_tokens TEXT NOT NULL, cache_write_tokens TEXT NOT NULL,
-                accepted_at INTEGER, deal_id TEXT,
+                accepted_at INTEGER, deal_id TEXT, cumulative_billable_tokens TEXT,
+                buyer_billable_floor TEXT,
                 PRIMARY KEY(network, request_id, phase, call_id),
                 FOREIGN KEY(network, request_id) REFERENCES requests(network, request_id)
             );
@@ -402,10 +403,6 @@ impl UsageStore {
                 ON money_facts(network, deal_id) WHERE kind = 'settlement';
             CREATE INDEX IF NOT EXISTS requests_finished
                 ON requests(network, finished_at);
-            CREATE INDEX IF NOT EXISTS requests_incomplete_usage
-                ON requests(network, deal_id) WHERE history_complete=0;
-            CREATE INDEX IF NOT EXISTS requests_unfinished_usage
-                ON requests(network, deal_id, runtime_id) WHERE finished_at IS NULL;
             CREATE INDEX IF NOT EXISTS facts_occurred
                 ON money_facts(network, occurred_at);
             CREATE INDEX IF NOT EXISTS facts_page_order
@@ -450,12 +447,35 @@ impl UsageStore {
                     WHERE r.network=request_usage.network AND r.request_id=request_usage.request_id);",
             )?;
         }
-        // Keep the request's immutable deal binding on its usage rows so the pending index
-        // can seek one deal without walking unresolved history from the rest of the network.
+        if (3..=8).contains(&version) {
+            let has_cumulative: bool = transaction.query_row(
+                "SELECT EXISTS(SELECT 1 FROM pragma_table_info('request_usage')
+                 WHERE name='cumulative_billable_tokens')",
+                [],
+                |row| row.get(0),
+            )?;
+            if !has_cumulative {
+                transaction.execute_batch(
+                    "ALTER TABLE request_usage ADD COLUMN cumulative_billable_tokens TEXT",
+                )?;
+            }
+        }
+        if matches!(version, 3..=10) {
+            let has_floor: bool = transaction.query_row(
+                "SELECT EXISTS(SELECT 1 FROM pragma_table_info('request_usage')
+                 WHERE name='buyer_billable_floor')",
+                [],
+                |row| row.get(0),
+            )?;
+            if !has_floor {
+                transaction.execute_batch(
+                    "ALTER TABLE request_usage ADD COLUMN buyer_billable_floor TEXT",
+                )?;
+            }
+        }
         transaction.execute_batch(
-            "CREATE INDEX IF NOT EXISTS request_usage_pending
-                ON request_usage(network, deal_id, request_id, phase)
-                WHERE call_id='in_progress' AND accepted=0;",
+            "CREATE INDEX IF NOT EXISTS request_usage_cumulative
+                ON request_usage(network, deal_id) WHERE accepted=1 AND cumulative_billable_tokens IS NOT NULL;",
         )?;
         // Quota terms and a verified one-tick probe payment both prove the execution price.
         // Keep every recovered price after the current purchase is replaced or destroyed.
@@ -483,8 +503,28 @@ impl UsageStore {
             "INSERT OR IGNORE INTO facts_revision(network,store_id,revision) VALUES(?1,lower(hex(randomblob(16))),0)",
             [&network],
         )?;
-        if version < BUYER_USAGE_SCHEMA_VERSION {
-            Self::migrate_admission(&transaction)?;
+        if version < 10 {
+            transaction.execute_batch(
+                "DROP TABLE IF EXISTS request_usage_recovery;
+                 DROP TABLE IF EXISTS request_usage_sequence;
+                 DROP INDEX IF EXISTS request_usage_pending;
+                 DROP INDEX IF EXISTS requests_incomplete_usage;
+                 DROP INDEX IF EXISTS requests_unfinished_usage;",
+            )?;
+            if version < 7 {
+                transaction.execute(
+                    "UPDATE request_usage SET accepted=1 WHERE call_id='in_progress' AND accepted=0",
+                    [],
+                )?;
+                Self::migrate_admission(&transaction)?;
+            } else {
+                Self::close_legacy_usage(&transaction)?;
+            }
+        }
+        if version <= 11 {
+            change_journal::create(&transaction)?;
+        } else {
+            change_journal::configure_retention(&transaction)?;
         }
         transaction.pragma_update(None, "user_version", BUYER_USAGE_SCHEMA_VERSION)?;
         transaction.commit()?;
@@ -498,11 +538,14 @@ impl UsageStore {
             Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_ONLY)
                 .context("open buyer usage history reader")?;
         history_connection.busy_timeout(BUYER_USAGE_SQLITE_BUSY_TIMEOUT)?;
+        let billing_journal =
+            path.with_extension(format!("{}.billing", hex::encode(network.as_bytes())));
         let store = Self {
             connection: Arc::new(Mutex::new(connection)),
             history_connection: Arc::new(Mutex::new(history_connection)),
             network: network.into(),
             runtime_id: format!("{:032x}", rand::random::<u128>()).into(),
+            billing_journal: Arc::new(Mutex::new(billing_journal)),
             quota_journal: Arc::new(quota_journal),
         };
         // A failed SQLite write must not lose the last opened purchase after TC destruction.
@@ -511,6 +554,7 @@ impl UsageStore {
             let mut connection = store.lock()?;
             store.restore_quota(&mut connection, false)?;
         }
+        store.flush_confirmed_usage()?;
         Ok(store)
     }
 
@@ -634,21 +678,47 @@ impl UsageStore {
         usage: BillingUsage,
         accepted: bool,
     ) -> Result<()> {
+        let writing = std::time::Instant::now();
+        let mut writer = self.lock()?;
+        let connection = writer.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        self.record_call_usage_in(
+            &connection,
+            request_id,
+            phase,
+            call_id,
+            usage,
+            accepted.then(|| Utc::now().timestamp_millis()),
+        )?;
+        connection.commit()?;
+        tracing::debug!(
+            write_us = writing.elapsed().as_secs_f64() * 1_000_000.0,
+            "usage write timing"
+        );
+        Ok(())
+    }
+
+    fn record_call_usage_in(
+        &self,
+        connection: &Connection,
+        request_id: &str,
+        phase: &str,
+        call_id: &str,
+        usage: BillingUsage,
+        accepted_at: Option<i64>,
+    ) -> Result<()> {
         ensure!(
             matches!(phase, "answer" | "verification_b8" | "verification_b7"),
             "unknown usage phase"
         );
         ensure!(!call_id.is_empty(), "usage call ID is empty");
         usage.validate().map_err(|error| anyhow!(error))?;
-        let writing = std::time::Instant::now();
-        let mut writer = self.lock()?;
-        let connection = writer.transaction_with_behavior(TransactionBehavior::Immediate)?;
-        let before = Self::request_totals_in(&connection, self.network(), request_id)?;
+        let accepted = accepted_at.is_some();
+        let before = Self::request_totals_in(connection, self.network(), request_id)?;
         let old = connection.query_row(
-            "SELECT input_tokens,output_tokens,total_tokens,charged_tokens,accepted,cache_read_tokens,cache_write_tokens FROM request_usage
+            "SELECT input_tokens,output_tokens,total_tokens,charged_tokens,accepted,cache_read_tokens,cache_write_tokens,cumulative_billable_tokens FROM request_usage
              WHERE network=?1 AND request_id=?2 AND phase=?3 AND call_id=?4",
             params![self.network(), request_id, phase, call_id],
-            |row| Ok((row.get::<_, String>(0)?,row.get::<_, String>(1)?,row.get::<_, String>(2)?,row.get::<_, String>(3)?,row.get::<_, bool>(4)?,row.get::<_,String>(5)?,row.get::<_,String>(6)?)),
+            |row| Ok((row.get::<_, String>(0)?,row.get::<_, String>(1)?,row.get::<_, String>(2)?,row.get::<_, String>(3)?,row.get::<_, bool>(4)?,row.get::<_,String>(5)?,row.get::<_,String>(6)?,row.get::<_,Option<String>>(7)?)),
         ).optional()?;
         let input = usage.input_tokens.to_string();
         let output = usage.output_tokens.to_string();
@@ -656,6 +726,9 @@ impl UsageStore {
         let charged = usage.billable_tokens().to_string();
         let cache_read = usage.cache_read_tokens.to_string();
         let cache_write = usage.cache_write_tokens.to_string();
+        let cumulative = usage
+            .cumulative_billable_tokens
+            .map(|tokens| tokens.to_string());
         if let Some(old) = old {
             ensure!(
                 old.0 == input
@@ -663,22 +736,23 @@ impl UsageStore {
                     && old.2 == total
                     && old.3 == charged
                     && old.5 == cache_read
-                    && old.6 == cache_write,
+                    && old.6 == cache_write
+                    && (old.7.is_none() || old.7 == cumulative),
                 "conflicting replay of buyer usage call"
             );
             if accepted && !old.4 {
                 connection.execute(
-                    "UPDATE request_usage SET accepted=1,accepted_at=?5 WHERE network=?1 AND request_id=?2 AND phase=?3 AND call_id=?4",
-                    params![self.network(), request_id, phase, call_id, Utc::now().timestamp_millis()],
+                    "UPDATE request_usage SET accepted=1,accepted_at=?5,cumulative_billable_tokens=?6 WHERE network=?1 AND request_id=?2 AND phase=?3 AND call_id=?4",
+                    params![self.network(), request_id, phase, call_id, accepted_at, cumulative],
                 )?;
             }
         } else {
             connection.execute(
-                "INSERT INTO request_usage(network,request_id,phase,call_id,input_tokens,output_tokens,total_tokens,charged_tokens,accepted,cache_read_tokens,cache_write_tokens,accepted_at,deal_id)
+                "INSERT INTO request_usage(network,request_id,phase,call_id,input_tokens,output_tokens,total_tokens,charged_tokens,accepted,cache_read_tokens,cache_write_tokens,accepted_at,deal_id,cumulative_billable_tokens)
                  VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,
-                    (SELECT deal_id FROM requests WHERE network=?1 AND request_id=?2))",
+                    (SELECT deal_id FROM requests WHERE network=?1 AND request_id=?2),?13)",
                 params![self.network(), request_id, phase, call_id, input, output, total, charged, accepted,cache_read,cache_write,
-                    accepted.then(|| Utc::now().timestamp_millis())],
+                    accepted_at, cumulative],
             )?;
         }
         if accepted && phase == call_id {
@@ -688,26 +762,169 @@ impl UsageStore {
                 params![self.network(), request_id, phase],
             )?;
         }
-        Self::update_totals_in(&connection, self.network(), request_id, Some(before))?;
-        connection.commit()?;
-        tracing::debug!(
-            write_us = writing.elapsed().as_secs_f64() * 1_000_000.0,
-            "usage write timing"
-        );
+        Self::update_totals_in(connection, self.network(), request_id, Some(before))?;
         Ok(())
     }
 
-    /// Unresolved output survives request completion and process restart. Only validated usage
-    /// for that exact request and phase can finish its state row; an open chain read cannot.
-    /// Missing state writes fall back to incomplete history or an older runtime's unfinished request.
-    /// A live verification call's initial state row alone does not pause concurrent waiters.
-    pub(crate) fn has_unresolved_output_usage(&self, deal_id: &str) -> Result<bool> {
-        Ok(self
-            .lock()?
-            .prepare_cached(UNRESOLVED_OUTPUT_USAGE_SQL)?
-            .query_row(params![self.network(), deal_id, &*self.runtime_id], |row| {
-                row.get(0)
-            })?)
+    /// A successful response can follow a failed SQLite write only after the exact bill is durable.
+    pub(crate) fn record_confirmed_usage(
+        &self,
+        request_id: &str,
+        phase: &str,
+        usage: BillingUsage,
+        buyer_billable_floor: Option<u64>,
+    ) -> Result<()> {
+        self.record_confirmed_bill(ConfirmedBill {
+            request_id: request_id.to_owned(),
+            phase: phase.to_owned(),
+            usage,
+            buyer_billable_floor,
+            accepted_at: Utc::now().timestamp_millis(),
+        })
+    }
+
+    fn record_confirmed_bill(&self, mut bill: ConfirmedBill) -> Result<()> {
+        let journal = self.billing_journal.lock().unwrap();
+        if let Err(error) = self.write_confirmed_bill(&bill) {
+            std::fs::create_dir_all(&*journal)?;
+            #[cfg(unix)]
+            std::fs::File::open(
+                journal
+                    .parent()
+                    .filter(|path| !path.as_os_str().is_empty())
+                    .unwrap_or_else(|| Path::new(".")),
+            )?
+            .sync_all()?;
+            use sha2::{Digest, Sha256};
+            let key = Sha256::digest(serde_json::to_vec(&(&bill.request_id, &bill.phase))?);
+            let file = journal.join(format!("{key:x}.json"));
+            match std::fs::read(&file) {
+                Ok(existing) => {
+                    let existing: ConfirmedBill = serde_json::from_slice(&existing)?;
+                    // A second write attempt must keep the original acceptance time.
+                    bill.accepted_at = existing.accepted_at;
+                    ensure!(
+                        existing == bill,
+                        "conflicting replay of journaled buyer bill"
+                    );
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => return Err(error).context("read journaled buyer bill"),
+            }
+            quota_journal::write_usage_journal(&file, &bill).with_context(|| {
+                format!("could not preserve confirmed bill after SQLite failure: {error}")
+            })?;
+            tracing::error!(%error, request_id = bill.request_id, phase = bill.phase, "buyer usage: journaled confirmed billing for SQLite retry");
+        }
+        Ok(())
+    }
+
+    pub(crate) fn flush_confirmed_usage(&self) -> Result<()> {
+        let journal = self.billing_journal.lock().unwrap();
+        let entries = match std::fs::read_dir(&*journal) {
+            Ok(entries) => entries,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+            Err(error) => return Err(error).context("open confirmed billing journal"),
+        };
+        for entry in entries {
+            let path = entry?.path();
+            if path.extension().and_then(|extension| extension.to_str()) != Some("json") {
+                continue;
+            }
+            let result = (|| -> Result<()> {
+                let bill: ConfirmedBill = serde_json::from_slice(&std::fs::read(&path)?)?;
+                self.write_confirmed_bill(&bill)?;
+                std::fs::remove_file(&path)?;
+                Ok(())
+            })();
+            result.with_context(|| format!("replay confirmed buyer bill {}", path.display()))?;
+        }
+        Ok(())
+    }
+
+    fn write_confirmed_bill(&self, bill: &ConfirmedBill) -> Result<()> {
+        let mut writer = self.lock()?;
+        let tx = writer.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        self.record_call_usage_in(
+            &tx,
+            &bill.request_id,
+            &bill.phase,
+            &bill.phase,
+            bill.usage,
+            Some(bill.accepted_at),
+        )?;
+        if let Some(floor) = bill.buyer_billable_floor {
+            let saved: Option<String> = tx.query_row(
+                "SELECT buyer_billable_floor FROM request_usage
+                 WHERE network=?1 AND request_id=?2 AND phase=?3 AND call_id=?3",
+                params![self.network(), bill.request_id, bill.phase],
+                |row| row.get(0),
+            )?;
+            let floor = floor.to_string();
+            ensure!(
+                saved.as_ref().is_none_or(|saved| *saved == floor),
+                "conflicting replay of buyer bill position"
+            );
+            if saved.is_none() {
+                tx.execute(
+                    "UPDATE request_usage SET buyer_billable_floor=?4
+                     WHERE network=?1 AND request_id=?2 AND phase=?3 AND call_id=?3",
+                    params![self.network(), bill.request_id, bill.phase, floor],
+                )?;
+            }
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
+    fn close_legacy_usage(connection: &Connection) -> Result<()> {
+        let pending = {
+            let mut statement = connection.prepare(
+                "SELECT DISTINCT network,request_id FROM request_usage
+                 WHERE call_id='in_progress' AND accepted=0",
+            )?;
+            let rows = statement.query_map([], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+            })?;
+            rows.collect::<rusqlite::Result<Vec<_>>>()?
+        };
+        for (network, request) in pending {
+            let before = Self::request_totals_in(connection, &network, &request)?;
+            connection.execute(
+                "UPDATE request_usage SET accepted=1 WHERE network=?1 AND request_id=?2
+                 AND call_id='in_progress' AND accepted=0",
+                params![network, request],
+            )?;
+            Self::update_totals_in(connection, &network, &request, Some(before))?;
+        }
+        Ok(())
+    }
+
+    pub(crate) fn confirmed_usage_above(&self, deal: &str, claim_anchor: u128) -> Result<u64> {
+        let writer = self.lock()?;
+        if claim_anchor == 0 {
+            return u64::try_from(snapshot::read_deal(&writer, self.network(), deal)?)
+                .context("restored usage exceeds the route counter");
+        }
+        // Legacy sellers did not send a position on unnegotiated streams. For bills accepted
+        // since the upgrade the buyer records a lower bound based on its route anchor and accepted
+        // work. Older unpositioned bills remain in history; no chain overlap can be inferred.
+        let mut statement = writer.prepare_cached(
+            "SELECT charged_tokens,COALESCE(cumulative_billable_tokens,buyer_billable_floor) FROM request_usage
+             WHERE network=?1 AND deal_id=?2 AND accepted=1
+               AND (cumulative_billable_tokens IS NOT NULL OR buyer_billable_floor IS NOT NULL)",
+        )?;
+        let mut rows = statement.query(params![self.network(), deal])?;
+        let mut total = 0u64;
+        let anchor = u64::try_from(claim_anchor).unwrap_or(u64::MAX);
+        while let Some(row) = rows.next()? {
+            let charged = row.get::<_, String>(0)?.parse::<u64>()?;
+            let cumulative = row.get::<_, String>(1)?.parse::<u64>()?;
+            total = total
+                .checked_add(charged.min(cumulative.saturating_sub(anchor)))
+                .context("restored usage exceeds the route counter")?;
+        }
+        Ok(total)
     }
 
     /// Persist a write failure before the request is completed, so a missing paid phase cannot
@@ -789,6 +1006,11 @@ impl UsageStore {
              WHERE network=?1 AND request_id=?2",
             params![self.network(), request_id,at_ms,outcome,http_status,finish_reason,failure_stage],
         )?;
+        connection.execute(
+            "UPDATE request_usage SET accepted=1 WHERE network=?1 AND request_id=?2
+             AND call_id='in_progress' AND accepted=0",
+            params![self.network(), request_id],
+        )?;
         Self::update_totals_in(&connection, self.network(), request_id, Some(before))?;
         connection.commit()?;
         Ok(())
@@ -797,11 +1019,22 @@ impl UsageStore {
     /// Call only after obtaining the buyer's exclusive instance lock. An unfinished request has
     /// no known completion time, so recovery preserves NULL rather than moving it into today.
     pub fn recover_interrupted_requests(&self) -> Result<usize> {
-        Ok(self.lock()?.execute(
-            "UPDATE requests SET outcome='interrupted',failure_stage='process_interrupted'
+        let mut writer = self.lock()?;
+        let tx = writer.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let interrupted = tx.execute(
+            "UPDATE requests SET outcome='interrupted',failure_stage=COALESCE(failure_stage,'process_interrupted')
              WHERE network=?1 AND outcome='in_progress' AND runtime_id<>?2",
             params![self.network(), &*self.runtime_id],
-        )?)
+        )?;
+        tx.execute(
+            "UPDATE request_usage AS u SET accepted=1 WHERE u.network=?1
+             AND u.call_id='in_progress' AND u.accepted=0
+             AND EXISTS(SELECT 1 FROM requests r WHERE r.network=u.network
+                 AND r.request_id=u.request_id AND r.runtime_id<>?2 AND r.finished_at IS NULL)",
+            params![self.network(), &*self.runtime_id],
+        )?;
+        tx.commit()?;
+        Ok(interrupted)
     }
 
     pub fn register_deal(&self, deal_id: &str, model: &str) -> Result<()> {

@@ -328,7 +328,7 @@ fn well_formed_flags_pass_the_flag_gate_and_the_registry_is_what_refuses_them() 
 fn the_seller_asks_the_registry_before_it_lists_and_not_only_behind_a_config_file() {
     let body = crate::cli::source_probe::code_of(
         include_str!("seller.rs"),
-        "pub(crate) async fn run_seller_with_deal_gas_overhead",
+        "async fn run_seller_from_pool",
     );
     let gate = body
         .find("ensure_model_resolves(")

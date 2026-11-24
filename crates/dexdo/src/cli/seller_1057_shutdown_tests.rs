@@ -190,9 +190,32 @@ impl futures::future::FusedFuture for Issue1057Shutdown {
     }
 }
 
+#[derive(Clone, Copy)]
+enum OpenedPreparationFailure {
+    StopBeforeState,
+    StopDuringBoundsRetry,
+    InvalidBounds,
+}
+
 struct Issue1057ActiveBackend {
     inner: Arc<PoolTestBackend>,
     started: AtomicU64,
+    post_open_faults: AtomicU64,
+    preparation_failure: Option<OpenedPreparationFailure>,
+    post_open_bounds_reads: AtomicU64,
+}
+
+impl Issue1057ActiveBackend {
+    fn check_post_open_read(&self, read: u64) -> Result<(), ChainError> {
+        if self.inner.opened.load(Ordering::Relaxed)
+            && self.post_open_faults.fetch_and(!read, Ordering::Relaxed) & read != 0
+        {
+            return Err(ChainError::Transport(
+                "BK read budget exhausted after open".into(),
+            ));
+        }
+        Ok(())
+    }
 }
 
 #[async_trait::async_trait]
@@ -254,7 +277,14 @@ impl ChainBackend for Issue1057ActiveBackend {
     ) -> Result<(), ChainError> {
         self.inner
             .open_stream(token_contract, enc_endpoint, note)
-            .await
+            .await?;
+        if matches!(
+            self.preparation_failure,
+            Some(OpenedPreparationFailure::StopBeforeState)
+        ) {
+            self.inner.exists.store(false, Ordering::Relaxed);
+        }
+        Ok(())
     }
 
     async fn read_handover(
@@ -291,6 +321,7 @@ impl ChainBackend for Issue1057ActiveBackend {
         &self,
         token_contract: &TokenContract,
     ) -> Result<Option<DealChainState>, ChainError> {
+        self.check_post_open_read(1)?;
         self.inner.deal_state(token_contract).await
     }
 
@@ -298,6 +329,7 @@ impl ChainBackend for Issue1057ActiveBackend {
         &self,
         token_contract: &TokenContract,
     ) -> Result<Option<DealChainSnapshot>, ChainError> {
+        self.check_post_open_read(2)?;
         self.inner.deal_snapshot(token_contract).await
     }
 
@@ -319,6 +351,33 @@ impl ChainBackend for Issue1057ActiveBackend {
         &self,
         token_contract: &TokenContract,
     ) -> Result<dexdo_core::ClaimBounds, ChainError> {
+        if self.inner.opened.load(Ordering::Relaxed) {
+            let reads = self.post_open_bounds_reads.fetch_add(1, Ordering::Relaxed);
+            if matches!(
+                self.preparation_failure,
+                Some(OpenedPreparationFailure::StopDuringBoundsRetry)
+            ) && reads == 0
+            {
+                self.inner.exists.store(false, Ordering::Relaxed);
+                return Err(ChainError::Transport(
+                    "BK getConfig budget exhausted".into(),
+                ));
+            }
+            if !self.inner.exists.load(Ordering::Relaxed) {
+                return Err(ChainError::Chain(
+                    "getConfig() returned no data for claim bounds".into(),
+                ));
+            }
+            if matches!(
+                self.preparation_failure,
+                Some(OpenedPreparationFailure::InvalidBounds)
+            ) {
+                return Err(ChainError::Chain(
+                    "getConfig() claim bounds are malformed".into(),
+                ));
+            }
+        }
+        self.check_post_open_read(4)?;
         self.inner.deal_claim_bounds(token_contract).await
     }
 }
@@ -335,7 +394,7 @@ async fn issue_1057_shutdown_with_pending_residual_spends_zero_provision_calls()
         let calls = calls.clone();
         let successor = pool.successor.clone();
         let note_addr = pool.note_addr.clone();
-        move |model: String, nonce: u64, price: u64, ticks: u64| {
+        move |_: String, model: String, nonce: u64, price: u64, ticks: u64| {
             calls.lock().unwrap().push((nonce, price, ticks));
             futures::future::ready(Ok(issue_1057_market(
                 model,
@@ -383,7 +442,7 @@ async fn issue_1057_no_shutdown_before_residual_preserves_one_provision() {
         let calls = calls.clone();
         let successor = pool.successor.clone();
         let note_addr = pool.note_addr.clone();
-        move |model: String, nonce: u64, price: u64, ticks: u64| {
+        move |_: String, model: String, nonce: u64, price: u64, ticks: u64| {
             calls.lock().unwrap().push((nonce, price, ticks));
             futures::future::ready(Ok(issue_1057_market(
                 model,
@@ -435,10 +494,81 @@ async fn issue_1057_no_shutdown_before_residual_preserves_one_provision() {
 
 #[tokio::test]
 async fn issue_1057_shutdown_after_active_start_keeps_existing_active_path() {
+    assert_active_driver_starts_after_open(0).await;
+}
+
+#[tokio::test]
+async fn issue_2206_pool_keeps_opened_deal_until_one_driver_starts() {
+    assert_active_driver_starts_after_open(0b111).await;
+}
+
+#[tokio::test]
+async fn issue_2206_pool_retires_destroyed_deals_before_starting_driver() {
+    for (failure, expected_reads) in [
+        (OpenedPreparationFailure::StopBeforeState, 0),
+        (OpenedPreparationFailure::StopDuringBoundsRetry, 2),
+        (OpenedPreparationFailure::InvalidBounds, 1),
+    ] {
+        let mut pool = issue_1057_pool(8).await;
+        let active = Arc::new(Issue1057ActiveBackend {
+            inner: pool.parent.clone(),
+            started: AtomicU64::new(0),
+            post_open_faults: AtomicU64::new(0),
+            preparation_failure: Some(failure),
+            post_open_bounds_reads: AtomicU64::new(0),
+        });
+        pool.deal.chain = active.clone();
+        let mut provision = |_: String,
+                             _: String,
+                             _: u64,
+                             _: u64,
+                             _: u64|
+         -> std::future::Ready<
+            Result<(dexdo_core::MarketManifest, Arc<dyn ChainBackend>)>,
+        > {
+            panic!("a fully matched deal must not provision a successor")
+        };
+        let shutdown = std::future::pending::<()>().fuse();
+        tokio::pin!(shutdown);
+        let outcome = tokio::time::timeout(
+            2 * DEFAULT_MATCH_POLL_INTERVAL,
+            run_seller_pool(
+                &pool.seller,
+                vec![pool.deal.clone()],
+                pool.context(),
+                &pool_test_policy(1),
+                &mut provision,
+                shutdown.as_mut(),
+                &mut false,
+            ),
+        )
+        .await
+        .expect("the watcher must retire or refuse without starting a driver");
+        if matches!(failure, OpenedPreparationFailure::InvalidBounds) {
+            let error = outcome.expect_err("an active deal with invalid config must fail closed");
+            assert!(format!("{error:#}").contains("claim bounds are malformed"));
+        } else {
+            outcome.expect("STOP must retire the deal without a pool error");
+        }
+        assert_eq!(
+            active.post_open_bounds_reads.load(Ordering::Relaxed),
+            expected_reads
+        );
+        assert_eq!(active.started.load(Ordering::Relaxed), 0);
+        assert_eq!(pool.parent.open_calls.load(Ordering::Relaxed), 1);
+        assert_eq!(pool.parent.post_calls.load(Ordering::Relaxed), 0);
+        assert_eq!(pool.parent.seller_stop_calls.load(Ordering::Relaxed), 0);
+    }
+}
+
+async fn assert_active_driver_starts_after_open(post_open_faults: u64) {
     let mut pool = issue_1057_pool(8).await;
     let active = Arc::new(Issue1057ActiveBackend {
         inner: pool.parent.clone(),
         started: AtomicU64::new(0),
+        post_open_faults: AtomicU64::new(post_open_faults),
+        preparation_failure: None,
+        post_open_bounds_reads: AtomicU64::new(0),
     });
     pool.deal.chain = active.clone();
     let calls = Arc::new(AtomicU64::new(0));
@@ -446,7 +576,7 @@ async fn issue_1057_shutdown_after_active_start_keeps_existing_active_path() {
         let calls = calls.clone();
         let successor = pool.successor.clone();
         let note_addr = pool.note_addr.clone();
-        move |model: String, nonce: u64, price: u64, ticks: u64| {
+        move |_: String, model: String, nonce: u64, price: u64, ticks: u64| {
             calls.fetch_add(1, Ordering::Relaxed);
             futures::future::ready(Ok(issue_1057_market(
                 model,
@@ -471,7 +601,8 @@ async fn issue_1057_shutdown_after_active_start_keeps_existing_active_path() {
     let mut shutdown_requested = false;
 
     let outcome = tokio::time::timeout(
-        std::time::Duration::from_secs(30),
+        std::time::Duration::from_secs(30)
+            + DEFAULT_MATCH_POLL_INTERVAL * post_open_faults.count_ones(),
         run_seller_pool(
             &pool.seller,
             vec![pool.deal.clone()],
@@ -491,6 +622,8 @@ async fn issue_1057_shutdown_after_active_start_keeps_existing_active_path() {
         1,
         "the matched deal must reach the existing active settlement-driver path before shutdown"
     );
+    assert_eq!(active.post_open_faults.load(Ordering::Relaxed), 0);
+    assert_eq!(pool.parent.open_calls.load(Ordering::Relaxed), 1);
     assert_eq!(
         pool.parent.open_calls.load(Ordering::Relaxed),
         1,
@@ -697,7 +830,7 @@ async fn issue_1057_consumed_shutdown_between_two_residuals_provisions_once() {
         let provision_calls = provision_calls.clone();
         let owner_fills = pool.parent.owner_fills.clone();
         let note_addr = pool.note_addr.clone();
-        move |model: String, nonce: u64, price: u64, ticks: u64| {
+        move |_: String, model: String, nonce: u64, price: u64, ticks: u64| {
             provision_calls.fetch_add(1, Ordering::Relaxed);
             let successor = Arc::new(PoolTestBackend::new(
                 owner_fills.clone(),

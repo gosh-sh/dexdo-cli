@@ -71,16 +71,22 @@ fn the_ceiling_is_what_the_manifest_declares_and_nothing_otherwise() {
 /// moving it into data moved that job here, and a check that does not do it is worse than the
 /// const it replaced.
 
-/// What is asserted: at least one committed manifest declares a ceiling, and every ceiling declared
-/// anywhere is exactly the owner's figure. No manifest is named -- a second chain earning a ceiling
-/// of its own is an owner decision, and this going red is how that decision gets made deliberately
-/// rather than by someone editing a file.
+/// What is asserted: the named carrier manifests that are present declare a ceiling, no other
+/// manifest does, and every ceiling declared anywhere is exactly the owner's figure. A chain
+/// earning or losing a ceiling is an owner decision, and this going red is how that decision gets
+/// made deliberately rather than by someone editing a file.
 #[test]
 fn the_owners_ceiling_is_the_figure_the_committed_manifests_carry() {
     /// The owner's figure: a burst is answered with `pool timed out while waiting for an
     /// open connection` at HTTP 200, and a retry on top of a self-inflicted overload makes the
     /// overload worse.
-    const OWNERS_CEILING: u32 = 3;
+
+    /// Raised from 3 to 10 by the owner's decision on 2026-11-20: on mainnet a seller whose
+    /// opened deal waited for its first buyer token re-read the TokenContract snapshot every 3 s,
+    /// which alone took two of three admissions per second; its fill discovery and match setup
+    /// reads then waited past the 20 s read timeout and the seller exited. With 10 the same seller
+    /// finished the deal setup at once. The endpoint itself answered those reads in 0.2 s.
+    const OWNERS_CEILING: u32 = 10;
 
     let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../manifest");
     let mut declared = Vec::new();
@@ -105,15 +111,38 @@ fn the_owners_ceiling_is_the_figure_the_committed_manifests_carry() {
     /// exactly why the weaker form is a trap: give a second manifest a ceiling and deleting the
     /// first one's would leave this green while that chain silently drops to unlimited. Counting
     /// makes both directions loud -- a ceiling lost, and a ceiling gained without anyone deciding.
-    const CARRIERS: usize = 1;
+
+    /// Mainnet and shellnet since 2026-11-20: the owner gave shellnet the same ceiling as
+    /// mainnet. The public tree ships only mainnet's manifest, so the carriers expected are the
+    /// named ones present in the directory; a named carrier that is present and declares no
+    /// ceiling is still red.
+    const CARRIERS: [&str; 2] = ["mainnet.manifest.json", "shellnet.manifest.json"];
+    let mut expected: Vec<&str> = CARRIERS
+        .iter()
+        .copied()
+        .filter(|name| dir.join(name).is_file())
+        .collect();
+    expected.sort_unstable();
+    assert!(
+        !expected.is_empty(),
+        "no carrier manifest {CARRIERS:?} is present in {}",
+        dir.display()
+    );
+    let mut declared_names: Vec<&str> = declared.iter().map(|(name, _)| name.as_str()).collect();
+    declared_names.sort_unstable();
 
     assert_eq!(
         declared.len(),
-        CARRIERS,
-        "{} committed manifest(s) declare `requests_per_second`, expected {CARRIERS}: {declared:?}. \
+        expected.len(),
+        "{} committed manifest(s) declare `requests_per_second`, expected {}: {declared:?}. \
          A ceiling lost means a chain now runs unmetered; a ceiling gained is an owner's decision \
          about a chain's tolerance, not an edit. Either way, say so here.",
-        declared.len()
+        declared.len(),
+        expected.len()
+    );
+    assert_eq!(
+        declared_names, expected,
+        "the manifests declaring `requests_per_second` are {declared_names:?}, expected {expected:?}"
     );
     for (name, per_second) in &declared {
         assert_eq!(

@@ -224,6 +224,7 @@ pub(super) async fn persist_deal_quota(
                 .await?;
         store.open_deal_quota(id, *ticks, *price)?;
     }
+    restore_confirmed_usage(deal, store)?;
     let _ = deal.session.usage_quota.set(store.clone());
     let terminal = deal
         .session
@@ -234,6 +235,37 @@ pub(super) async fn persist_deal_quota(
         .is_some();
     if deal.session.is_settled() || terminal {
         store.close_deal_quota(id)?;
+    }
+    Ok(())
+}
+
+fn restore_confirmed_usage(deal: &super::ApiDeal, store: &UsageStore) -> Result<()> {
+    if deal.confirmed_usage_loaded.get().is_some() {
+        return Ok(());
+    }
+    let _accounting = deal
+        .session
+        .billing_lock
+        .lock()
+        .expect("billing lock poisoned");
+    if deal.confirmed_usage_loaded.get().is_none() {
+        let anchor = deal.weekly.as_ref().map(|weekly| {
+            weekly
+                .claim_anchor
+                .lock()
+                .expect("subscription claim anchor poisoned")
+        });
+        let restored = store.confirmed_usage_above(
+            &deal.route.token_contract,
+            anchor.as_deref().copied().unwrap_or_default(),
+        )?;
+        deal.billable_tokens
+            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |used| {
+                used.checked_add(restored)
+            })
+            .ok()
+            .context("restored usage exceeds the route counter")?;
+        let _ = deal.confirmed_usage_loaded.set(());
     }
     Ok(())
 }

@@ -6,8 +6,9 @@ use super::client::{
     TokenContractSettlementReceipt,
 };
 use super::client::{
-    MessagePostResponseDecodeError, RealChainBackend, RetryingReads, SellerOfferEvents,
-    SubmittedBuyerStopReceipt, TokenContractSettlementEvent, TokenContractSettlementReceipts,
+    MessagePostRequestError, MessagePostResponseDecodeError, RealChainBackend, RetryingReads,
+    SellerOfferEvents, SubmittedBuyerStopReceipt, TokenContractSettlementEvent,
+    TokenContractSettlementReceipts,
 };
 use super::contracts_provision::*;
 use crate::machine::Settlement;
@@ -31,7 +32,7 @@ use crate::params::{
     Shell, EMPTY_MODEL_BOOK_REASON, MATCH_OPEN_TIMEOUT_SECS, OFFER_ACCEPTANCE_TIMEOUT,
     POST_SELL_OFFER_SUBMIT_TIMEOUT, RAW_MATCHER_NO_SUBMIT_SAFE_ASK, SELLER_READ_BACKOFF, TICK_SIZE,
 };
-use anyhow::{anyhow, Result};
+use anyhow::{anyhow, Context, Result};
 use async_trait::async_trait;
 use gosh_ackinacki::sdk::{Address, KeyPair};
 use serde_json::{json, Value};
@@ -43,6 +44,10 @@ mod backends_issue_2108_tests;
 #[cfg(test)]
 #[path = "backends_issue_2122_tests.rs"]
 mod backends_issue_2122_tests;
+
+#[cfg(test)]
+#[path = "backends_issue_2207_tests.rs"]
+mod backends_issue_2207_tests;
 
 #[cfg(all(test, unix))]
 #[path = "backends_issue_2196_live.rs"]
@@ -59,7 +64,6 @@ fn display_token_contract(address: impl ToString) -> String {
 /// The charge source depends on the operation, not on the native balance.
 #[derive(Clone, Copy)]
 enum TcGasOperation<'a> {
-    Buy,
     SettleWeek,
     Stop(&'a Address),
     Dispute(&'a Address),
@@ -772,7 +776,23 @@ fn map_read_err(error: anyhow::Error) -> ChainError {
     }
 }
 
+fn map_seller_deal_read_err(error: anyhow::Error) -> ChainError {
+    if super::client::is_non_monotonic_deal_state(&error) {
+        return ChainError::UnsafeClaimState(format!("{error:#}"));
+    }
+    map_read_err(error)
+}
+
 fn map_claim_submit_err(error: anyhow::Error) -> ChainError {
+    if error
+        .chain()
+        .any(|cause| cause.is::<MessagePostRequestError>())
+    {
+        return ChainError::AmbiguousSubmit(format!(
+            "{error:#}; claim message POST may have applied; \
+             reconcile tokensPending before any resubmit"
+        ));
+    }
     if error.chain().any(|cause| {
         cause
             .downcast_ref::<MessagePostResponseDecodeError>()
@@ -782,6 +802,28 @@ fn map_claim_submit_err(error: anyhow::Error) -> ChainError {
             "{error:#}; claim message POST received HTTP success, but its response was unusable; \
              reconcile tokensPending before any resubmit"
         ));
+    }
+    if super::client::is_duplicate_message_submit(&error) {
+        return ChainError::AmbiguousSubmit(format!(
+            "{error:#}; reconcile tokensPending before accepting a duplicate claim"
+        ));
+    }
+    if super::client::is_block_producer_forwarding_timeout(&error)
+        || super::client::is_producer_rate_limit_submit(&error)
+    {
+        return ChainError::AmbiguousSubmit(format!(
+            "{error:#}; reconcile tokensPending after an inconclusive producer response"
+        ));
+    }
+    if super::client::is_claim_replay_refusal(&error) {
+        return ChainError::ClaimReplayRecovery {
+            message: format!("{error:#}; external message failed replay protection"),
+            observed: None,
+            read_failure: None,
+        };
+    }
+    if super::client::is_claim_window_refusal(&error) {
+        return ChainError::ClaimWindowRefused(format!("{error:#}"));
     }
     map_err(error)
 }
@@ -1118,7 +1160,7 @@ async fn seller_note_spendable_shell(
     chain
         .private_note_shell_balance(seller_note)
         .await
-        .map_err(map_err)
+        .map_err(map_read_err)
 }
 
 /// The single seller-bond record predicate, shared by every point that must hold an action back for a
@@ -1161,7 +1203,7 @@ async fn assert_note_record_covers_seller_bond(
     let bond = chain
         .token_contract_seller_bond(tc)
         .await
-        .map_err(map_err)?
+        .map_err(map_read_err)?
         .ok_or_else(|| {
             ChainError::Chain(format!(
                 "TokenContract {display_tc}: getSellerBond() returned no data; refusing \
@@ -1171,7 +1213,7 @@ async fn assert_note_record_covers_seller_bond(
     let price_per_tick = chain
         .token_contract_price_per_tick(tc)
         .await
-        .map_err(map_err)?
+        .map_err(map_read_err)?
         .ok_or_else(|| {
             ChainError::Chain(format!(
                 "TokenContract {display_tc}: getDeal().pricePerTick returned no data; refusing \
@@ -1202,10 +1244,12 @@ pub(super) async fn post_seller_bond_and_wait(
     tc: &Address,
 ) -> Result<(), ChainError> {
     let display_tc = display_token_contract(token_contract);
+    tracing::event!(name: "seller_bond_preflight", tracing::Level::DEBUG,
+        token_contract = %display_tc, "checking seller bond before open");
     let bond_before = chain
         .token_contract_seller_bond(tc)
         .await
-        .map_err(map_err)?
+        .map_err(map_read_err)?
         .ok_or_else(|| {
             ChainError::Chain(format!(
                 "TokenContract {display_tc}: getSellerBond() returned no data before the seller-bond fundDeal"
@@ -1214,7 +1258,7 @@ pub(super) async fn post_seller_bond_and_wait(
     let price_per_tick = chain
         .token_contract_price_per_tick(tc)
         .await
-        .map_err(map_err)?
+        .map_err(map_read_err)?
         .ok_or_else(|| {
             ChainError::Chain(format!(
                 "TokenContract {display_tc}: getDeal().pricePerTick returned no data; refusing \
@@ -1239,16 +1283,28 @@ pub(super) async fn post_seller_bond_and_wait(
     let (_, message_hash) = chain
         .note_fund_deal_with_identity(seller_note, seller_keys, nonce, 0, post_amount)
         .await
-        .map_err(map_err)?;
+        .map_err(
+            |error| match error.downcast_ref::<crate::MoneySubmitError>() {
+                Some(crate::MoneySubmitError::Preparation { .. }) => map_read_err(error),
+                _ => map_err(error),
+            },
+        )?;
     let confirmation = async {
-        for _ in 0..crate::params::SELLER_BOND_CONFIRM_MAX_READS {
-            if chain
+        let mut reads = 0;
+        while reads < crate::params::SELLER_BOND_CONFIRM_MAX_READS {
+            match chain
                 .token_contract_deal_seller_bond(tc)
                 .await
-                .map_err(map_err)?
-                .is_some_and(|bond| bond.bond_funded)
+                .map_err(map_read_err)
             {
-                return Ok(());
+                Ok(Some(bond)) if bond.bond_funded => return Ok(()),
+                Ok(_) => reads += 1,
+                Err(ChainError::Transport(error)) => tracing::warn!(
+                    token_contract = %display_tc,
+                    %error,
+                    "seller fundDeal readback failed; retaining submitted funding"
+                ),
+                Err(error) => return Err(error),
             }
             tokio::time::sleep(crate::params::SELLER_BOND_CONFIRM_POLL_INTERVAL).await;
         }
@@ -1271,8 +1327,8 @@ pub(super) async fn post_seller_bond_and_wait(
     .await;
     match confirmation {
         Ok(()) => Ok(()),
-        Err(error) => Err(map_err(
-            chain
+        Err(error) => {
+            let error = chain
                 .diagnose_note_tc_failure(
                     seller_note,
                     tc,
@@ -1280,8 +1336,12 @@ pub(super) async fn post_seller_bond_and_wait(
                     &message_hash,
                     anyhow::Error::new(error),
                 )
-                .await,
-        )),
+                .await;
+            Err(match map_err(error) {
+                ChainError::Transport(message) => ChainError::AmbiguousSubmit(message),
+                error => error,
+            })
+        }
     }
 }
 
@@ -1960,8 +2020,16 @@ fn next_matching_ask(
     ticks: u128,
 ) -> Option<&OrderBookOrder> {
     asks.iter()
-        .filter(|ask| ask.price_per_tick <= max_price_per_tick && ask.ticks >= ticks)
+        .filter(|ask| ask.price_per_tick <= max_price_per_tick && ask_matches_buy_size(ask, ticks))
         .min_by_key(|ask| (ask.price_per_tick, ask.order_id))
+}
+
+fn ask_matches_buy_size(ask: &OrderBookOrder, ticks: u128) -> bool {
+    ask.ticks >= ticks && (ask.flags & crate::market::flags::AON == 0 || ask.ticks == ticks)
+}
+
+fn is_subscription_ask(ask: &OrderBookOrder) -> bool {
+    ask.flags & crate::market::flags::SUBSCRIPTION != 0
 }
 
 fn no_matching_ask_reason(
@@ -1998,8 +2066,16 @@ fn no_matching_ask_reason(
 /// happens to be cheapest is short. A buy carries `FLAG_AON`, so the volume has to come from a single
 /// seller; asks too small for it are skipped by the book itself and cannot be added together.
 fn check_single_head_capacity(ask: &OrderBookOrder, ticks: u128) -> Result<(), String> {
-    if ask.ticks >= ticks {
+    if ask_matches_buy_size(ask, ticks) {
         return Ok(());
+    }
+    if ask.ticks > ticks {
+        return Err(format!(
+            "{} {} is all-or-none and requires {} ticks, buyer requested {ticks}",
+            crate::params::INSUFFICIENT_HEAD_ASK_REASON,
+            describe_buy_ask(ask),
+            ask.ticks
+        ));
     }
     Err(format!(
         "{} order #{} tokenContract {} has only {} ticks, buyer requested {ticks}, and no other \
@@ -2031,7 +2107,8 @@ fn selected_model_buy_ask(
     ticks: u128,
     now: u64,
 ) -> Result<OrderBookOrder, String> {
-    let (live, lapsed) = coalesced_live_candidates(asks, now)?;
+    let (mut live, lapsed) = coalesced_live_candidates(asks, now)?;
+    live.retain(|ask| !is_subscription_ask(ask));
     let Some(best) = next_matching_ask(&live, max_price_per_tick, ticks) else {
         // Crossing asks exist but none is big enough: that is a different state from "nothing
         // crosses this ceiling", and it keeps its own class so the operator is told the size is
@@ -2146,8 +2223,13 @@ fn submit_safe_executable_book_asks(
 
     for raw in raw_asks
         .iter()
-        .filter(|ask| ask.price_per_tick <= max_price_per_tick)
+        .filter(|ask| ask.price_per_tick <= max_price_per_tick && !is_subscription_ask(ask))
     {
+        // The AON matcher skips size-incompatible rows, even if their TC is unusable.
+        if !ask_matches_buy_size(raw, ticks) {
+            blocker.get_or_insert(ListingBlocker::InsufficientHead(raw.clone()));
+            continue;
+        }
         let Some(executable) = executable_asks
             .iter()
             .find(|executable| same_token_contract(raw, executable))
@@ -2155,17 +2237,7 @@ fn submit_safe_executable_book_asks(
             blocker = Some(ListingBlocker::NonExecutable(raw.clone()));
             break;
         };
-        if executable.ticks >= ticks {
-            rows.push(executable.clone());
-        } else {
-            // An ask too small for this request is not a wall: `_match` skips an AON-size-incompatible
-            // maker and keeps walking (`contracts/airegistry/InferenceOrderBook.sol:1056`), so the asks
-            // queued behind it ARE reachable and belong in the listing. Breaking here hid them --
-            // one cheap two-tick ask made a book full of larger asks read as "nothing to match with",
-            // and no ceiling brought them back. It stays remembered as the blocker only for the case
-            // where the walk ends with nothing listed at all.
-            blocker.get_or_insert(ListingBlocker::InsufficientHead(executable.clone()));
-        }
+        rows.push(executable.clone());
     }
 
     if !rows.is_empty() {
@@ -2241,7 +2313,7 @@ fn check_expected_buy_target(
     max_price_per_tick: u128,
     ticks: u128,
     now: u64,
-) -> Result<(), String> {
+) -> Result<OrderBookOrder, String> {
     let expected_tc_display = display_token_contract(expected_tc_lower);
     let display_ask_tc = |ask: &OrderBookOrder| {
         ask.token_contract
@@ -2254,7 +2326,8 @@ fn check_expected_buy_target(
             .as_deref()
             .is_some_and(|tc| tc.eq_ignore_ascii_case(expected_tc_lower))
     };
-    let (live, _lapsed) = coalesced_live_candidates(asks, now)?;
+    let (mut live, _lapsed) = coalesced_live_candidates(asks, now)?;
+    live.retain(|ask| !is_subscription_ask(ask));
     let expected = live.iter().find(|ask| is_expected(ask));
     let Some(best) = next_matching_ask(&live, max_price_per_tick, ticks) else {
         return Err(match expected {
@@ -2282,7 +2355,7 @@ fn check_expected_buy_target(
         .is_some_and(|tc| tc.eq_ignore_ascii_case(expected_tc_lower))
     {
         check_single_head_capacity(best, ticks)?;
-        return Ok(());
+        return Ok(best.clone());
     }
     Err(match expected {
         Some(ask) => format!(
@@ -2615,7 +2688,7 @@ mod offer_rested_match_tests {
                     state,
                     crate::params::ACTIVE_CONTRACT_GAS_HEALTH_MIN_NANOVMSHELL + 1,
                     ecc,
-                    2,
+                    57_500,
                     false,
                 );
                 (address.trim_start_matches("0:").to_string(), fixture)
@@ -2672,6 +2745,152 @@ mod offer_rested_match_tests {
         (backend, ExecutableFilterServer(task))
     }
 
+    #[tokio::test]
+    async fn claim_duplicate_with_queue_overflow_text_reads_same_contract_without_repost() {
+        assert_claim_refusal_reads_back_without_repost("DUPLICATE_MESSAGE", 0, |_| {
+            "queue overflow".to_string()
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    async fn claim_duplicate_with_embedded_wrong_producer_reads_same_contract_without_repost() {
+        assert_claim_refusal_reads_back_without_repost("DUPLICATE_MESSAGE", 0, wrong_producer_text)
+            .await;
+    }
+
+    #[tokio::test]
+    async fn claim_replay_refusal_reads_same_contract_without_retry_or_redirect() {
+        assert_claim_refusal_reads_back_without_repost("TVM_ERROR", 52, |_| {
+            "queue overflow".to_string()
+        })
+        .await;
+        assert_claim_refusal_reads_back_without_repost("TVM_ERROR", 52, wrong_producer_text).await;
+    }
+
+    fn wrong_producer_text(producer: &str) -> String {
+        let refusal = json!({"error": {"code": "WRONG_PRODUCER", "data": {
+            "producers": [producer]
+        }}});
+        format!("Block Producer returned non-success HTTP status 400 Bad Request: {refusal}")
+    }
+
+    async fn assert_claim_refusal_reads_back_without_repost(
+        code: &'static str,
+        exit_code: u64,
+        message: impl FnOnce(&str) -> String,
+    ) {
+        let tc = Address::parse(&format!("0:{}", "1".repeat(64))).unwrap();
+        let account = tc.bare().to_string();
+        let account_response = |pending: u128| {
+            let mut state = super::test_get_state(true, true, true, false, 10, 1, 0);
+            state["tokensPending"] = json!(pending.to_string());
+            let reserve = crate::params::ACTIVE_CONTRACT_GAS_HEALTH_MIN_NANOVMSHELL + 1;
+            let fixture = token_contract_account_fixture(
+                &tc.with_workchain(),
+                &state,
+                reserve,
+                reserve,
+                4,
+                true,
+            );
+            json!({"data": {"blockchain": {"account": {"info": {
+                "address": account, "acc_type_name": "Active", "boc": fixture.boc,
+                "code_hash": fixture.code_hash,
+                "balance": format!("0x{:x}", fixture.native_balance),
+                "balance_other": [{"currency": crate::params::SHELL_CURRENCY_ID,
+                    "value": format!("0x{:x}", fixture.ecc_balance)}],
+            }}}}})
+        };
+        let before = account_response(TICK_SIZE);
+        let after = account_response(2 * TICK_SIZE);
+        let requests = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let seen = requests.clone();
+        let producer = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let producer_endpoint = format!("http://{}", producer.local_addr().unwrap());
+        let message = message(&producer_endpoint);
+        let producer_requests = requests.clone();
+        let producer_account = account.clone();
+        let _producer = ExecutableFilterServer(tokio::spawn(async move {
+            while let Ok((mut socket, _)) = producer.accept().await {
+                let post: Value =
+                    serde_json::from_str(&read_request_body(&mut socket).await.unwrap()).unwrap();
+                assert_eq!(post[0]["account_id"], producer_account);
+                producer_requests.lock().unwrap().push("producer claim");
+                socket
+                    .write_all(b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 2\r\nConnection: close\r\n\r\n{}")
+                    .await
+                    .unwrap();
+            }
+        }));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let endpoint = format!("http://{}", listener.local_addr().unwrap());
+        let _server = ExecutableFilterServer(tokio::spawn(async move {
+            while let Ok((mut socket, _)) = listener.accept().await {
+                let request: Value =
+                    serde_json::from_str(&read_request_body(&mut socket).await.unwrap()).unwrap();
+                let (status, response) = if let Some(post) = request.get(0) {
+                    assert_eq!(post["account_id"], account);
+                    let mut seen = seen.lock().unwrap();
+                    let repeated = seen.contains(&"claim");
+                    seen.push("claim");
+                    if repeated {
+                        ("200 OK", json!({"result": {"exit_code": 0}}))
+                    } else {
+                        (
+                            "400 Bad Request",
+                            json!({"error": {
+                                "code": code, "message": message,
+                                "data": {"exit_code": exit_code, "message_hash": "example-message-hash"}
+                            }}),
+                        )
+                    }
+                } else if request["query"].as_str().unwrap().contains("gen_utime") {
+                    let now = super::now_secs_at(std::time::SystemTime::now()).unwrap();
+                    (
+                        "200 OK",
+                        json!({"data": {"blockchain": {"blocks": {
+                            "edges": [{"node": {"gen_utime": now}}]
+                        }}}}),
+                    )
+                } else {
+                    assert!(request.to_string().contains(&account));
+                    let mut seen = seen.lock().unwrap();
+                    let state = if seen.contains(&"claim") {
+                        &after
+                    } else {
+                        &before
+                    };
+                    seen.push("getState");
+                    ("200 OK", state.clone())
+                };
+                let body = response.to_string();
+                let response = format!(
+                    "HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                socket.write_all(response.as_bytes()).await.unwrap();
+            }
+        }));
+        let backend = RealChainBackend::connect_with_endpoint(manifest(), Some(&endpoint)).unwrap();
+        let result =
+            super::submit_claim_confirmed(&backend, &tc, &KeyPair::generate(), 2 * TICK_SIZE).await;
+        assert_eq!(
+            *requests.lock().unwrap(),
+            ["getState", "claim", "getState"],
+            "{result:?}"
+        );
+        if code == "TVM_ERROR" {
+            assert!(matches!(
+                result,
+                Err(crate::ChainError::ClaimReplayRecovery { observed: Some(observed), read_failure: None, .. })
+                    if observed == 2 * TICK_SIZE
+            ));
+        } else {
+            result.expect("readback on the same contract confirms the submitted cumulative claim");
+        }
+    }
+
     async fn gas_2196_backend(
         max_ticks: u128,
         ecc: u128,
@@ -2714,7 +2933,7 @@ mod offer_rested_match_tests {
     async fn gas_2196_large_buy_uses_ecc_not_native_on_all_production_seams() {
         let (buyer, tc, _server) = gas_2196_backend(57_500, 862_850_000_000, 0, false).await;
         let ask = parsed_ask(15, &tc.with_workchain(), crate::params::SHELL_UNIT, 57_500);
-        let book = executable_filter_snapshot(&[ask]);
+        let book = executable_filter_snapshot(std::slice::from_ref(&ask));
         assert_eq!(
             buyer
                 .chain
@@ -2743,53 +2962,222 @@ mod offer_rested_match_tests {
             assert_eq!(listed.len(), 1);
         }
         buyer
-            .require_tc_gas(&tc, TcGasOperation::Buy)
+            .chain
+            .require_matched_buy_reserve(&ask, 57_500)
             .await
             .unwrap();
     }
 
     #[tokio::test]
-    async fn gas_2196_buy_boundaries_and_setup_burns_use_constructor_terms() {
-        for max_ticks in [2, 875, 57_500] {
-            for bond in [false, true] {
-                let required = crate::params::deal_buy_reserve_raw(max_ticks, bond);
-                for have in [required - 1, required, required + 1] {
-                    let (buyer, tc, _server) = gas_2196_backend(max_ticks, have, 0, bond).await;
-                    let book = executable_filter_snapshot(&[parsed_ask(
-                        15,
-                        &tc.with_workchain(),
-                        crate::params::SHELL_UNIT,
-                        max_ticks,
-                    )]);
-                    let expected = have >= required;
-                    assert_eq!(
-                        buyer.require_tc_gas(&tc, TcGasOperation::Buy).await.is_ok(),
-                        expected
+    async fn issue_2242_checks_the_matched_fill_on_every_buy_surface() {
+        let ticks = 10;
+        let price = 3 * crate::params::SHELL_UNIT;
+        let required = crate::params::matched_buy_reserve_raw(ticks, false, false);
+        for have in [0, required - 1, required, 350_000_000] {
+            let (buyer, tc, _server) = gas_2196_backend(100, have, 0, false).await;
+            let ask = parsed_ask(3235, &tc.with_workchain(), price, 100);
+            let book = executable_filter_snapshot(std::slice::from_ref(&ask));
+            let expected = have >= required;
+            let selected = buyer
+                .chain
+                .submit_safe_model_buy_ask(&book, ticks, price)
+                .await;
+            let (listed, reason) = buyer
+                .chain
+                .submit_safe_executable_book_asks(&book, ticks, price)
+                .await
+                .unwrap();
+            let quote = buyer
+                .chain
+                .quote_matched_buy(&book, Some(ticks), None)
+                .await;
+            let explicit = buyer.chain.require_matched_buy_reserve(&ask, ticks).await;
+            if expected {
+                assert_eq!(selected.unwrap().order_id, ask.order_id);
+                assert_eq!(listed, vec![ask.clone()]);
+                assert!(reason.is_none());
+                let quote = quote.unwrap();
+                assert_eq!(quote.filled_ticks, ticks);
+                assert_eq!(quote.fills[0].order_id, ask.order_id);
+                explicit.unwrap();
+                assert_eq!(
+                    buyer.chain.executable_resting_asks(&book).await.unwrap(),
+                    vec![ask]
+                );
+            } else {
+                assert!(listed.is_empty());
+                for message in [
+                    selected.unwrap_err().to_string(),
+                    reason.unwrap(),
+                    quote.unwrap_err().to_string(),
+                    explicit.unwrap_err().to_string(),
+                ] {
+                    assert!(
+                        message.contains("order ") && message.contains("10-tick fill"),
+                        "{message}"
                     );
-                    assert_eq!(
-                        buyer
-                            .chain
-                            .executable_resting_asks(&book)
-                            .await
-                            .unwrap()
-                            .len(),
-                        usize::from(expected)
+                    assert!(
+                        message.contains(&format!("{required} raw ECC[2]")),
+                        "{message}"
                     );
-                    // A small requested fill must not lower a large constructor's requirement.
-                    let result = buyer
-                        .chain
-                        .submit_safe_model_buy_ask(&book, 2, crate::params::SHELL_UNIT)
-                        .await;
-                    assert_eq!(result.is_ok(), expected);
-                    if let Err(error) = result {
-                        assert!(error.to_string().contains("ECC[2] reserve"), "{error}");
-                        assert_eq!(
-                            buy_refusal_class(&error.to_string()),
-                            crate::params::NO_EXECUTABLE_ASK_CLASS
-                        );
-                    }
+                    assert!(message.contains(&format!("{have} raw ECC[2]")), "{message}");
                 }
             }
+        }
+    }
+
+    #[tokio::test]
+    async fn issue_2242_does_not_quote_around_a_blocked_raw_match() {
+        let first = format!("0:{}", "6".repeat(64));
+        let later = format!("0:{}", "7".repeat(64));
+        let price = 3 * crate::params::SHELL_UNIT;
+        let mut first_ask = parsed_ask(3235, &first, price, 100);
+        let later_ask = parsed_ask(3236, &later, price, 100);
+        let fixtures = [(&first, 0), (&later, 350_000_000)]
+            .into_iter()
+            .map(|(address, ecc)| {
+                (
+                    address.trim_start_matches("0:").to_string(),
+                    token_contract_account_fixture(address, &fresh_tc_state(), 0, ecc, 100, false),
+                )
+            })
+            .collect();
+        let (chain, _server) = executable_fixture_backend(fixtures).await;
+        let book = executable_filter_snapshot(&[first_ask.clone(), later_ask.clone()]);
+        assert!(chain
+            .submit_safe_model_buy_ask(&book, 10, price)
+            .await
+            .is_err());
+        assert!(chain
+            .quote_matched_buy(&book, Some(10), None)
+            .await
+            .is_err());
+        let (listed, reason) = chain
+            .submit_safe_executable_book_asks(&book, 10, price)
+            .await
+            .unwrap();
+        assert!(listed.is_empty() && reason.unwrap().contains("order "));
+
+        first_ask.flags = crate::market::flags::AON;
+        let book = executable_filter_snapshot(&[first_ask, later_ask]);
+        assert_eq!(
+            chain
+                .submit_safe_model_buy_ask(&book, 10, price)
+                .await
+                .unwrap()
+                .order_id,
+            3236
+        );
+        let (listed, _) = chain
+            .submit_safe_executable_book_asks(&book, 10, price)
+            .await
+            .unwrap();
+        assert_eq!(listed[0].order_id, 3236);
+        let budget = crate::market::required_escrow_for_buy(10, price);
+        let quote = chain
+            .quote_matched_buy(&book, None, Some(budget))
+            .await
+            .unwrap();
+        assert_eq!(quote.fills[0].order_id, 3236);
+    }
+
+    #[tokio::test]
+    async fn issue_2242_budget_survives_expiry_during_the_reserve_read() {
+        use super::{buy_deadline_now_secs, ChainError};
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let first = format!("0:{}", "6".repeat(64));
+        let later = format!("0:{}", "7".repeat(64));
+        let price = 3 * crate::params::SHELL_UNIT;
+        let dear_price = 4 * crate::params::SHELL_UNIT;
+        let ticks = 10;
+        let mut first_ask = parsed_ask(3235, &first, price, ticks);
+        first_ask.flags = crate::market::flags::AON;
+        let now = buy_deadline_now_secs().unwrap();
+        first_ask.deadline = now + 60;
+        let later_ask = parsed_ask(3236, &later, dear_price, ticks);
+        let fixtures = [&first, &later]
+            .into_iter()
+            .map(|address| {
+                (
+                    address.trim_start_matches("0:").to_string(),
+                    token_contract_account_fixture(
+                        address,
+                        &fresh_tc_state(),
+                        0,
+                        350_000_000,
+                        100,
+                        false,
+                    ),
+                )
+            })
+            .collect();
+        let (chain, _server) = executable_fixture_backend(fixtures).await;
+        let budget = crate::market::required_escrow_for_buy(ticks, price);
+        let one = executable_filter_snapshot(std::slice::from_ref(&first_ask));
+        for (budget, expected) in [(budget - 1, 0), (budget, ticks)] {
+            let quote = chain
+                .quote_matched_buy_with_clock(&one, None, Some(budget), || Ok(now))
+                .await
+                .unwrap();
+            assert_eq!(quote.filled_ticks, expected);
+            assert_eq!(quote.total_with_fee, if expected == 0 { 0 } else { budget });
+        }
+
+        let deadline = first_ask.deadline;
+        let book = executable_filter_snapshot(&[first_ask, later_ask]);
+        let samples = AtomicUsize::new(0);
+        let error = chain
+            .quote_matched_buy_with_clock(&book, None, Some(budget), || {
+                Ok(if samples.fetch_add(1, Ordering::Relaxed) < 2 {
+                    now
+                } else {
+                    deadline
+                })
+            })
+            .await
+            .unwrap_err();
+        assert!(matches!(
+            error.downcast_ref::<ChainError>(),
+            Some(ChainError::OrderUnavailable(_))
+        ));
+        assert_eq!(samples.load(Ordering::Relaxed), 3);
+        // Control: the later offer is eligible at that same clock with a sufficient budget.
+        let quote = chain
+            .quote_matched_buy_with_clock(
+                &book,
+                None,
+                Some(crate::market::required_escrow_for_buy(ticks, dear_price)),
+                || Ok(deadline),
+            )
+            .await
+            .unwrap();
+        assert_eq!(quote.fills[0].order_id, 3236);
+    }
+
+    #[tokio::test]
+    async fn issue_2242_subscription_cross_reserves_weekly_settlement() {
+        let price = 3 * crate::params::SHELL_UNIT;
+        let ticks = u128::from(crate::params::SUBSCRIPTION_WEEKS);
+        let required = crate::params::matched_buy_reserve_raw(ticks, false, true);
+        for have in [required - 1, required] {
+            let (buyer, tc, _server) = gas_2196_backend(100, have, 0, false).await;
+            let mut ask = parsed_ask(3235, &tc.with_workchain(), price, 100);
+            ask.flags = crate::market::flags::SUBSCRIPTION | crate::market::flags::AON;
+            ask.ticks = ticks;
+            let book = executable_filter_snapshot(&[ask]);
+            assert_eq!(
+                buyer
+                    .chain
+                    .check_resting_buy_cross(&book.orders, ticks, price, true)
+                    .await
+                    .is_ok(),
+                have >= required,
+            );
+            assert!(buyer
+                .chain
+                .check_resting_buy_cross(&book.orders, ticks, price, false)
+                .await
+                .is_ok());
         }
     }
 
@@ -2841,8 +3229,10 @@ mod offer_rested_match_tests {
     #[tokio::test]
     async fn gas_2196_unreadable_inactive_and_invalid_terms_still_refuse() {
         let (buyer, tc, _server) = gas_2196_backend(0, 1_000_000_000_000, 0, false).await;
+        let ask = parsed_ask(15, &tc.with_workchain(), crate::params::SHELL_UNIT, 2);
         assert!(buyer
-            .require_tc_gas(&tc, TcGasOperation::Buy)
+            .chain
+            .require_matched_buy_reserve(&ask, 2)
             .await
             .unwrap_err()
             .to_string()
@@ -2865,8 +3255,10 @@ mod offer_rested_match_tests {
             .to_string()
             .contains("not Active"));
         let missing = Address::parse(&format!("0:{}", "8".repeat(64))).unwrap();
+        let ask = parsed_ask(15, &missing.with_workchain(), crate::params::SHELL_UNIT, 2);
         assert!(buyer
-            .require_tc_gas(&missing, TcGasOperation::Buy)
+            .chain
+            .require_matched_buy_reserve(&ask, 2)
             .await
             .is_err());
     }
@@ -3734,7 +4126,7 @@ mod offer_rested_match_tests {
         states.insert(starved.to_ascii_lowercase(), fresh_tc_state());
         let balances = BTreeMap::from([(
             starved.to_ascii_lowercase(),
-            crate::params::deal_buy_reserve_raw(2, false) - 1,
+            crate::params::matched_buy_reserve_raw(2, false, false) - 1,
         )]);
 
         let (chain, _server) = executable_filter_backend(&states, &balances).await;
@@ -4672,7 +5064,7 @@ mod expired_ask_selection_wiring_tests {
         // never the copy of itself that this test carries as a string literal. Without that the
         // slice below starts inside this very module - which sits earlier in the file than the
         // function - and the test passes by matching its own literals in their written order.
-        const ANCHOR: &str = "\n    pub async fn submit_safe_model_buy_ask(";
+        const ANCHOR: &str = "\n    async fn submit_safe_model_buy_ask_with_clock(";
         assert_eq!(
             source.matches(ANCHOR).count(),
             1,
@@ -4687,13 +5079,13 @@ mod expired_ask_selection_wiring_tests {
             .map_or(body, |(body, _)| body);
 
         let fetch = body
-            .find("\n        let fetch_now = buy_deadline_now_secs()?;")
+            .find("\n        let fetch_now = clock()?;")
             .expect("a fetch-time clock sample");
         let chain_read = body
-            .find("\n        let executable_asks = self.executable_resting_asks(")
+            .find(".executable_resting_asks_for_fill(")
             .expect("the executable-depth chain read");
         let selection_clock = body
-            .find("\n        let now = buy_deadline_now_secs()?;")
+            .find("\n        let now = clock()?;")
             .expect("a selection-time clock sample");
         let selection = body
             .find("\n        let error = match selected_model_buy_ask_matching_executable_depth(")
@@ -5458,7 +5850,8 @@ where
     PauseFuture: std::future::Future<Output = ()>,
 {
     let tc = display_token_contract(tc);
-    match claim_high_water_read(&tc, read().await?.as_ref(), cumulative_tokens)? {
+    let before_submit = match claim_high_water_read(&tc, read().await?.as_ref(), cumulative_tokens)?
+    {
         ClaimHighWaterRead::Equal => return Ok(()),
         ClaimHighWaterRead::Ahead(on_chain) => {
             return Err(ChainError::ClaimHighWaterResync {
@@ -5466,29 +5859,83 @@ where
                 on_chain,
             });
         }
-        ClaimHighWaterRead::Behind(_) => {}
-    }
+        ClaimHighWaterRead::Behind(on_chain) => on_chain,
+    };
 
     // A transport failure can mean only that the submit RESPONSE was lost. Reconcile by authoritative state
     // before deciding: equality proves the write landed, a higher value asks the driver to resynchronise, and
     // an unchanged lower value remains a fail-closed error.
     let submit_error = match submit().await {
         Ok(()) => None,
-        Err(error @ (ChainError::Transport(_) | ChainError::AmbiguousSubmit(_))) => Some(error),
+        Err(
+            error @ (ChainError::Transport(_)
+            | ChainError::AmbiguousSubmit(_)
+            | ChainError::ClaimReplayRecovery { .. }),
+        ) => Some(error),
         Err(error) => return Err(error),
+    };
+    let replay_refusal = match &submit_error {
+        Some(ChainError::ClaimReplayRecovery { message, .. }) => Some(message),
+        _ => None,
+    };
+    let confirmed_replay = |on_chain| {
+        replay_refusal.map(|message| ChainError::ClaimReplayRecovery {
+            message: message.clone(),
+            observed: Some(on_chain),
+            read_failure: None,
+        })
     };
     let mut last_observed = None;
     let confirmation = ClaimConfirmationParams::canonical();
     for attempt in 0..confirmation.max_reads {
-        match claim_high_water_read(&tc, read().await?.as_ref(), cumulative_tokens)? {
-            ClaimHighWaterRead::Equal => return Ok(()),
-            ClaimHighWaterRead::Ahead(on_chain) => {
-                return Err(ChainError::ClaimHighWaterResync {
-                    attempted: cumulative_tokens,
-                    on_chain,
-                });
+        let observed = read()
+            .await
+            .and_then(|state| claim_high_water_read(&tc, state.as_ref(), cumulative_tokens))
+            .map_err(|read_error| {
+                let Some(submit_error) = &submit_error else {
+                    return read_error;
+                };
+                let message = format!(
+                    "TC {tc}: claimTokens({cumulative_tokens}) readback failed after ambiguous submit \
+                     ({submit_error}): {read_error}"
+                );
+                if replay_refusal.is_some() {
+                    return ChainError::ClaimReplayRecovery {
+                        message,
+                        observed: Some(last_observed.unwrap_or(before_submit)),
+                        read_failure: Some(Box::new(read_error)),
+                    };
+                }
+                match read_error {
+                    ChainError::Transport(_) => ChainError::Transport(message),
+                    ChainError::Contract(_) => ChainError::Contract(message),
+                    _ => ChainError::Chain(message),
+                }
+            })?;
+        match observed {
+            // Keep the replay context through the coherent seller snapshot, even after a
+            // raw getter has proved that the cumulative claim is on-chain.
+            ClaimHighWaterRead::Equal => {
+                return confirmed_replay(cumulative_tokens).map_or(Ok(()), Err)
             }
-            ClaimHighWaterRead::Behind(on_chain) => last_observed = Some(on_chain),
+            ClaimHighWaterRead::Ahead(on_chain) => {
+                return Err(confirmed_replay(on_chain).unwrap_or(
+                    ChainError::ClaimHighWaterResync {
+                        attempted: cumulative_tokens,
+                        on_chain,
+                    },
+                ));
+            }
+            ClaimHighWaterRead::Behind(on_chain) => {
+                let previous = last_observed.unwrap_or(before_submit);
+                if replay_refusal.is_some() && on_chain < previous {
+                    return Err(ChainError::Chain(format!(
+                        "TC {tc}: tokensPending regressed from {previous} to {on_chain} \
+                         while reconciling a replay-refused claim"
+                    )));
+                }
+                last_observed = Some(on_chain);
+            }
         }
         if attempt + 1 < confirmation.max_reads {
             pause().await;
@@ -5496,13 +5943,22 @@ where
     }
 
     let lost_response = submit_error
+        .as_ref()
         .map(|error| format!(" after ambiguous submit ({error})"))
         .unwrap_or_default();
-    Err(ChainError::Chain(format!(
-        "TC {tc}: claimTokens({cumulative_tokens}) did not apply{lost_response}; authoritative \
-         tokensPending remained below it at {}",
+    let message = format!(
+        "TC {tc}: claimTokens({cumulative_tokens}) was not confirmed within the readback \
+         budget{lost_response}. Authoritative tokensPending remained below target at {}",
         last_observed.unwrap_or(0)
-    )))
+    );
+    if replay_refusal.is_some() {
+        return Err(ChainError::ClaimReplayRecovery {
+            message,
+            observed: last_observed,
+            read_failure: None,
+        });
+    }
+    Err(ChainError::Chain(message))
 }
 
 /// Submit a cumulative consumption claim and confirm BY FACT that it landed.
@@ -5521,7 +5977,7 @@ async fn submit_claim_confirmed(
     submit_claim_confirmed_with(
         &tc.to_string(),
         cumulative_tokens,
-        || async { chain.token_contract_state(tc).await.map_err(map_err) },
+        || async { chain.token_contract_state(tc).await.map_err(map_read_err) },
         || async {
             chain
                 .claim_tokens(tc, seller_keys, cumulative_tokens)
@@ -5546,7 +6002,11 @@ mod claim_confirmation_tests {
         Some(json!({ "tokensPending": tokens_pending }))
     }
 
-    async fn accepted_post_decode_error(posts_received: Arc<AtomicUsize>) -> ChainError {
+    async fn claim_post_response_error(
+        posts_received: Arc<AtomicUsize>,
+        status: &'static str,
+        response_body: String,
+    ) -> anyhow::Error {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
             .await
             .expect("bind claim submit endpoint");
@@ -5555,14 +6015,16 @@ mod claim_confirmation_tests {
             let (mut socket, _) = listener.accept().await.expect("accept claim POST");
             let mut request = [0u8; 8192];
             let read = socket.read(&mut request).await.expect("read claim POST");
-            assert!(read > 0, "the claim POST must reach the endpoint");
+            assert!(request[..read].starts_with(b"POST /v2/messages HTTP/1.1\r\n"));
             posts_received.fetch_add(1, Ordering::Relaxed);
+            let response = format!(
+                "HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{response_body}",
+                response_body.len()
+            );
             socket
-                .write_all(
-                    b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 8\r\nConnection: close\r\n\r\nnot-json",
-                )
+                .write_all(response.as_bytes())
                 .await
-                .expect("write invalid success response");
+                .expect("write claim POST response");
         });
 
         let client = reqwest::Client::builder()
@@ -5576,11 +6038,12 @@ mod claim_confirmation_tests {
             "0:11",
             "0:22",
             None,
+            super::super::client::SubmitKind::Claim,
         )
         .await
-        .expect_err("invalid JSON after HTTP 200 must fail");
+        .expect_err("the scripted claim POST response must fail");
         server.await.expect("claim submit server");
-        map_claim_submit_err(error)
+        error
     }
 
     async fn reconcile_accepted_decode(
@@ -5614,7 +6077,11 @@ mod claim_confirmation_tests {
                 let posts = Arc::clone(&posts);
                 move || {
                     let posts = Arc::clone(&posts);
-                    async move { Err(accepted_post_decode_error(posts).await) }
+                    async move {
+                        Err(map_claim_submit_err(
+                            claim_post_response_error(posts, "200 OK", "not-json".into()).await,
+                        ))
+                    }
                 }
             },
             || async {},
@@ -5728,6 +6195,224 @@ mod claim_confirmation_tests {
             "{malformed}"
         );
         assert_eq!(posts, 1);
+    }
+
+    async fn reconcile_claim_refusal(
+        code: &str,
+        exit_code: u64,
+        readback: Result<Option<Value>, &'static str>,
+    ) -> (Result<(), ChainError>, usize) {
+        let response = json!({"error": {
+            "code": code,
+            "message": "DUPLICATE_MESSAGE mentioned in the response text",
+            "data": {
+                "exit_code": exit_code,
+                "current_time": 1794158795333u64,
+                "message_hash": "example-message-hash"
+            }
+        }});
+        let reads = std::cell::Cell::new(0);
+        let posts = Arc::new(AtomicUsize::new(0));
+        let result = submit_claim_confirmed_with(
+            "0:tc",
+            2 * TICK_SIZE,
+            || async {
+                reads.set(reads.get() + 1);
+                if reads.get() == 1 {
+                    Ok(state(json!(TICK_SIZE.to_string())))
+                } else {
+                    readback
+                        .clone()
+                        .map_err(|message| ChainError::Transport(message.into()))
+                }
+            },
+            || async {
+                Err(map_claim_submit_err(
+                    claim_post_response_error(Arc::clone(&posts), "200 OK", response.to_string())
+                        .await,
+                ))
+            },
+            || async {},
+        )
+        .await;
+        assert_eq!(posts.load(Ordering::Relaxed), 1);
+        (result, reads.get())
+    }
+
+    #[tokio::test]
+    async fn duplicate_claim_response_uses_authoritative_readback() {
+        let target = 2 * TICK_SIZE;
+        let (equal, reads) =
+            reconcile_claim_refusal("DUPLICATE_MESSAGE", 0, Ok(state(json!(target.to_string()))))
+                .await;
+        equal.expect("equal readback confirms the duplicate claim");
+        assert_eq!(reads, 2);
+
+        let higher = target + TICK_SIZE;
+        let (ahead, reads) =
+            reconcile_claim_refusal("DUPLICATE_MESSAGE", 0, Ok(state(json!(higher.to_string()))))
+                .await;
+        assert!(
+            matches!(ahead, Err(ChainError::ClaimHighWaterResync { attempted, on_chain })
+            if attempted == target && on_chain == higher)
+        );
+        assert_eq!(reads, 2);
+
+        let (behind, reads) = reconcile_claim_refusal(
+            "DUPLICATE_MESSAGE",
+            0,
+            Ok(state(json!((target - 1).to_string()))),
+        )
+        .await;
+        let message = behind.unwrap_err().to_string();
+        assert!(message.contains("remained below") && message.contains("DUPLICATE_MESSAGE"));
+        assert_eq!(reads, 1 + ClaimConfirmationParams::canonical().max_reads);
+
+        for (readback, reason) in [
+            (Ok(None), "getState() returned no data"),
+            (
+                Ok(state(json!("invalid"))),
+                "tokensPending value \"invalid\" is malformed",
+            ),
+            (Err("read unavailable"), "read unavailable"),
+        ] {
+            let (result, reads) = reconcile_claim_refusal("DUPLICATE_MESSAGE", 0, readback).await;
+            let message = result
+                .expect_err("an inconclusive getter must not confirm the duplicate")
+                .to_string();
+            for detail in ["DUPLICATE_MESSAGE", "example-message-hash", reason] {
+                assert!(message.contains(detail), "missing {detail:?} in {message}");
+            }
+            assert_eq!(reads, 2);
+        }
+    }
+
+    #[tokio::test]
+    async fn replay_refused_claim_uses_authoritative_readback() {
+        for confirmed in [2 * TICK_SIZE, 3 * TICK_SIZE] {
+            let (result, reads) =
+                reconcile_claim_refusal("TVM_ERROR", 52, Ok(state(json!(confirmed.to_string()))))
+                    .await;
+            assert!(matches!(
+                result,
+                Err(ChainError::ClaimReplayRecovery { observed: Some(observed), read_failure: None, .. })
+                    if observed == confirmed
+            ));
+            assert_eq!(reads, 2);
+        }
+
+        for (readback, expected_reads, detail) in [
+            (
+                Ok(state(json!(TICK_SIZE.to_string()))),
+                1 + ClaimConfirmationParams::canonical().max_reads,
+                "remained below",
+            ),
+            (Err("read unavailable"), 2, "read unavailable"),
+            (Ok(state(json!("invalid"))), 2, "is malformed"),
+        ] {
+            let (result, reads) = reconcile_claim_refusal("TVM_ERROR", 52, readback).await;
+            assert!(matches!(
+                result,
+                Err(ChainError::ClaimReplayRecovery { message, observed: Some(observed), .. })
+                    if observed == TICK_SIZE && message.contains(detail) && message.contains("exit_code=52")
+            ));
+            assert_eq!(reads, expected_reads);
+        }
+
+        let (exhausted, reads) = reconcile_claim_refusal(
+            "TVM_ERROR",
+            52,
+            Err(crate::CHAIN_READ_EXHAUSTED_MESSAGE_PREFIX),
+        )
+        .await;
+        assert!(matches!(
+            exhausted,
+            Err(ChainError::ClaimReplayRecovery { read_failure: Some(error), .. })
+                if matches!(*error, ChainError::Transport(ref reason)
+                    if reason == crate::CHAIN_READ_EXHAUSTED_MESSAGE_PREFIX)
+        ));
+        assert_eq!(reads, 2);
+
+        let (regressed, reads) = reconcile_claim_refusal(
+            "TVM_ERROR",
+            52,
+            Ok(state(json!((TICK_SIZE - 1).to_string()))),
+        )
+        .await;
+        assert!(
+            matches!(regressed, Err(ChainError::Chain(message)) if message.contains("regressed"))
+        );
+        assert_eq!(reads, 2);
+
+        let (other, reads) = reconcile_claim_refusal("INTERNAL_ERROR", 52, Ok(None)).await;
+        assert!(matches!(other, Err(ChainError::Contract(_))));
+        assert_eq!(reads, 1);
+    }
+
+    #[tokio::test]
+    async fn ordinary_claim_refusal_does_not_trigger_duplicate_readback() {
+        let (result, reads) = reconcile_claim_refusal(
+            "TVM_ERROR",
+            151,
+            Ok(state(json!((2 * TICK_SIZE).to_string()))),
+        )
+        .await;
+        assert!(matches!(result, Err(ChainError::Contract(_))));
+        assert_eq!(reads, 1);
+    }
+
+    #[tokio::test]
+    async fn claim_2262_only_recovers_confirmed_window_refusals() {
+        for (code, is_window_refusal) in [("TVM_ERROR", true), ("INTERNAL_ERROR", false)] {
+            let (result, reads) = reconcile_claim_refusal(code, 323, Ok(None)).await;
+            assert_eq!(
+                matches!(result, Err(ChainError::ClaimWindowRefused(_))),
+                is_window_refusal,
+                "{code}: {result:?}"
+            );
+            assert_eq!(reads, 1, "the seller will read the coherent deal state");
+        }
+        let error = crate::validate_onchain_submit_response(json!({
+            "result": {"aborted": true, "compute": {"exit_code": 323}}
+        }))
+        .unwrap_err();
+        assert!(matches!(
+            map_claim_submit_err(anyhow::Error::new(error)),
+            ChainError::ClaimWindowRefused(_)
+        ));
+    }
+
+    #[tokio::test]
+    async fn claim_2262_inconclusive_http_response_requires_readback() {
+        let posts = Arc::new(AtomicUsize::new(0));
+        let reads = std::cell::Cell::new(0);
+        let target = 2 * TICK_SIZE;
+        let result = submit_claim_confirmed_with(
+            "0:tc",
+            target,
+            || async {
+                reads.set(reads.get() + 1);
+                let pending = if reads.get() == 1 { TICK_SIZE } else { target };
+                Ok(state(json!(pending.to_string())))
+            },
+            || async {
+                let error = claim_post_response_error(
+                    Arc::clone(&posts),
+                    "503 Service Unavailable",
+                    "{}".into(),
+                )
+                .await;
+                assert!(!super::super::client::is_transient_claim_submit_failure(
+                    &error
+                ));
+                Err(map_claim_submit_err(error))
+            },
+            || async {},
+        )
+        .await;
+        assert!(result.is_ok());
+        assert_eq!(posts.load(Ordering::Relaxed), 1);
+        assert_eq!(reads.get(), 2);
     }
 
     #[tokio::test]
@@ -5991,8 +6676,27 @@ where
     ReadFuture: std::future::Future<Output = Result<Option<DealChainState>, ChainError>> + Send,
 {
     let display_tc = display_token_contract(tc);
-    for _ in 0..crate::params::TC_BOOL_CONFIRM_MAX_READS {
-        if let Some(st) = read().await? {
+    let mut reads = 0;
+    while reads < crate::params::TC_BOOL_CONFIRM_MAX_READS {
+        let state = match read().await {
+            Ok(state) => {
+                reads += 1;
+                state
+            }
+            // A failed read says nothing about the already submitted open. Keep the original
+            // budget of authoritative reads before the caller can consider another submit.
+            Err(ChainError::Transport(error)) if key == "opened" && want => {
+                tracing::warn!(
+                    token_contract = %display_tc,
+                    %error,
+                    "seller open readback failed; retaining submitted open"
+                );
+                tokio::time::sleep(crate::params::TC_BOOL_CONFIRM_POLL_INTERVAL).await;
+                continue;
+            }
+            Err(error) => return Err(error),
+        };
+        if let Some(st) = state {
             let actual = match key {
                 "funded" => st.funded,
                 "opened" => st.opened,
@@ -6011,6 +6715,7 @@ where
         tokio::time::sleep(crate::params::TC_BOOL_CONFIRM_POLL_INTERVAL).await;
     }
     if key == "opened" && want {
+        super::call_errors::unconfirmed(tc, TOKENCONTRACT_ABI, "open");
         return Err(ChainError::OpenUnconfirmed(tc.with_workchain()));
     }
     Err(ChainError::Chain(format!(
@@ -7980,35 +8685,6 @@ impl RealChainBackend {
         }
         let have = self.active_deal_reserve_ecc(tc).await?;
         let (required, action) = match operation {
-            TcGasOperation::Buy => {
-                let (tick_size, price, max_ticks) =
-                    self.token_contract_deal_terms(tc).await?.ok_or_else(|| {
-                        anyhow!(
-                            "TokenContract {}: unreadable getDeal; refusing BUY",
-                            display_token_contract(tc)
-                        )
-                    })?;
-                anyhow::ensure!(
-                    tick_size == TICK_SIZE
-                        && price > 0
-                        && max_ticks >= crate::params::MIN_STREAM_BUY_TICKS,
-                    "TokenContract {}: invalid getDeal terms; refusing BUY",
-                    display_token_contract(tc)
-                );
-                let bond = self
-                    .token_contract_deal_seller_bond(tc)
-                    .await?
-                    .ok_or_else(|| {
-                        anyhow!(
-                            "TokenContract {}: unreadable getSellerBond; refusing BUY",
-                            display_token_contract(tc)
-                        )
-                    })?;
-                (
-                    crate::params::deal_buy_reserve_raw(max_ticks, bond.bond_funded),
-                    "BUY",
-                )
-            }
             TcGasOperation::SettleWeek => (crate::params::DEAL_BURN_SETTLE_RAW, "settleWeek"),
             TcGasOperation::Stop(_)
             | TcGasOperation::Dispute(_)
@@ -8020,9 +8696,44 @@ impl RealChainBackend {
         Ok(())
     }
 
-    pub async fn executable_resting_asks(
+    async fn require_matched_buy_reserve(
+        &self,
+        ask: &OrderBookOrder,
+        fill_ticks: u128,
+    ) -> Result<()> {
+        let tc = Address::parse(
+            ask.token_contract
+                .as_deref()
+                .context("SELL has no TokenContract")?,
+        )?;
+        let snapshot = self.matched_buy_reserve_snapshot(&tc).await?;
+        let have = snapshot.ecc_balance;
+        let (tick_size, price, max_ticks) = snapshot.terms;
+        anyhow::ensure!(
+            tick_size == TICK_SIZE
+                && price > 0
+                && fill_ticks >= crate::params::MIN_STREAM_BUY_TICKS
+                && fill_ticks <= max_ticks,
+            "{}: invalid getDeal terms for {fill_ticks}-tick fill; refusing BUY",
+            describe_buy_ask(ask)
+        );
+        let required = crate::params::matched_buy_reserve_raw(
+            fill_ticks,
+            snapshot.seller_bond_funded,
+            is_subscription_ask(ask),
+        );
+        anyhow::ensure!(
+            have >= required,
+            "{}: ECC[2] reserve {have} raw ECC[2] is below {required} raw ECC[2] required for the {fill_ticks}-tick fill",
+            describe_buy_ask(ask)
+        );
+        Ok(())
+    }
+
+    async fn executable_resting_asks_for_fill(
         &self,
         snapshot: &OrderBookSnapshot,
+        ticks: Option<u128>,
     ) -> Result<Vec<OrderBookOrder>> {
         // an ask past its own deadline is not executable, whatever its deal TokenContract says.
         // Expiry is lazy on chain (`expireOrder` is permissionless and nobody may ever call it), so a
@@ -8062,7 +8773,15 @@ impl RealChainBackend {
             let state = self.token_contract_deal_state(&tc).await?;
             let non_executable = token_contract_non_executable_reason(state);
             if non_executable.is_none() {
-                match self.require_tc_gas(&tc, TcGasOperation::Buy).await {
+                let minimum = if ask.flags & crate::market::flags::AON != 0 {
+                    ask.ticks
+                } else if is_subscription_ask(&ask) {
+                    u128::from(crate::params::SUBSCRIPTION_WEEKS)
+                } else {
+                    crate::params::MIN_STREAM_BUY_TICKS
+                };
+                let fill_ticks = ticks.unwrap_or(minimum).min(ask.ticks);
+                match self.require_matched_buy_reserve(&ask, fill_ticks).await {
                     Ok(()) => executable.push(ask),
                     Err(error) => tracing::warn!(
                         order_id = %ask.order_id,
@@ -8074,6 +8793,14 @@ impl RealChainBackend {
             }
         }
         Ok(executable)
+    }
+
+    /// General depth includes asks executable at their smallest supported fill.
+    pub async fn executable_resting_asks(
+        &self,
+        snapshot: &OrderBookSnapshot,
+    ) -> Result<Vec<OrderBookOrder>> {
+        self.executable_resting_asks_for_fill(snapshot, None).await
     }
 
     async fn explain_buy_reserve_refusal(
@@ -8096,8 +8823,8 @@ impl RealChainBackend {
                 {
                     return reason;
                 }
-                if let Err(error) = self.require_tc_gas(&tc, TcGasOperation::Buy).await {
-                    return format!("{reason}; {}: {error}", describe_buy_ask(&ask));
+                if let Err(error) = self.require_matched_buy_reserve(&ask, ticks).await {
+                    return format!("{reason}; {error}");
                 }
             }
         }
@@ -8110,6 +8837,22 @@ impl RealChainBackend {
         ticks: u128,
         max_price_per_tick: u128,
     ) -> Result<OrderBookOrder> {
+        self.submit_safe_model_buy_ask_with_clock(
+            snapshot,
+            ticks,
+            max_price_per_tick,
+            buy_deadline_now_secs,
+        )
+        .await
+    }
+
+    async fn submit_safe_model_buy_ask_with_clock(
+        &self,
+        snapshot: &OrderBookSnapshot,
+        ticks: u128,
+        max_price_per_tick: u128,
+        clock: impl Fn() -> Result<u64, ChainError>,
+    ) -> Result<OrderBookOrder> {
         // two clock samples, because the chain reads below take real time.
 
         // The first decides only WHAT TO FETCH. An ask the matcher has already dropped is not
@@ -8117,17 +8860,19 @@ impl RealChainBackend {
         // have all lapsed is refused before a single chain read -- therefore before any money-moving
         // POST. The unfiltered `raw_asks` still goes into the selection so expired rows can be
         // skipped consistently without being exposed as a separate buyer outcome.
-        let fetch_now = buy_deadline_now_secs()?;
+        let fetch_now = clock()?;
         let raw_asks: Vec<OrderBookOrder> = snapshot.resting_asks().cloned().collect();
         let live_snapshot = OrderBookSnapshot {
             orders: live_selection_candidates(&raw_asks, fetch_now).0,
             ..snapshot.clone()
         };
-        let executable_asks = self.executable_resting_asks(&live_snapshot).await?;
+        let executable_asks = self
+            .executable_resting_asks_for_fill(&live_snapshot, Some(ticks))
+            .await?;
         // The second decides WHAT TO BUY, and is taken after those awaited reads. Reusing
         // `fetch_now` here would accept an ask that expired while the TC state and balance were
         // being read -- the original incident through a narrower window.
-        let now = buy_deadline_now_secs()?;
+        let now = clock()?;
         let error = match selected_model_buy_ask_matching_executable_depth(
             &raw_asks,
             &executable_asks,
@@ -8152,6 +8897,108 @@ impl RealChainBackend {
         ))))
     }
 
+    /// Quote a single ordinary fill, using the same matcher and reserve gate as BUY.
+    pub async fn quote_matched_buy(
+        &self,
+        snapshot: &OrderBookSnapshot,
+        ticks: Option<u128>,
+        budget: Option<u128>,
+    ) -> Result<crate::market::ExecutableQuote> {
+        self.quote_matched_buy_with_clock(snapshot, ticks, budget, buy_deadline_now_secs)
+            .await
+    }
+
+    async fn quote_matched_buy_with_clock(
+        &self,
+        snapshot: &OrderBookSnapshot,
+        ticks: Option<u128>,
+        budget: Option<u128>,
+        clock: impl Fn() -> Result<u64, ChainError> + Sync,
+    ) -> Result<crate::market::ExecutableQuote> {
+        use crate::market::checked_required_escrow_for_buy;
+        let raw: Vec<_> = snapshot.resting_asks().cloned().collect();
+        let (live, _) = coalesced_live_candidates(&raw, clock()?).map_err(anyhow::Error::msg)?;
+        let ticks = match (ticks, budget) {
+            (Some(ticks), None) => Some(ticks),
+            (None, Some(budget)) => live
+                .iter()
+                .filter(|ask| !is_subscription_ask(ask))
+                .find_map(|ask| {
+                    let unit = checked_required_escrow_for_buy(1, ask.price_per_tick)?;
+                    let fill = ask.ticks.min(budget.checked_div(unit)?);
+                    (fill >= crate::params::MIN_STREAM_BUY_TICKS && ask_matches_buy_size(ask, fill))
+                        .then_some(fill)
+                }),
+            _ => anyhow::bail!("set exactly one of ticks or budget"),
+        };
+        if let Some(ticks) = ticks.filter(|ticks| *ticks >= crate::params::MIN_STREAM_BUY_TICKS) {
+            let ordinary: Vec<_> = live
+                .into_iter()
+                .filter(|ask| !is_subscription_ask(ask))
+                .collect();
+            // This preflight reselects only from this snapshot. Bound the price by the
+            // highest maker price in it whose exact fee-inclusive fill fits the budget.
+            let ceiling = budget.map_or(u128::MAX, |budget| {
+                ordinary
+                    .iter()
+                    .filter(|ask| {
+                        checked_required_escrow_for_buy(ticks, ask.price_per_tick)
+                            .is_some_and(|cost| cost <= budget)
+                    })
+                    .map(|ask| ask.price_per_tick)
+                    .max()
+                    .unwrap_or(0)
+            });
+            if next_matching_ask(&ordinary, ceiling, ticks).is_some() {
+                let ask = self
+                    .submit_safe_model_buy_ask_with_clock(snapshot, ticks, ceiling, &clock)
+                    .await?;
+                return crate::market::executable_quote(&[ask], Some(ticks), None)
+                    .map_err(anyhow::Error::msg);
+            }
+        }
+        Ok(crate::market::ExecutableQuote {
+            filled_ticks: 0,
+            total_with_fee: 0,
+            complete: false,
+            fills: Vec::new(),
+        })
+    }
+
+    /// A resting-capable BUY may proceed with no cross, but cannot bypass a blocked current fill.
+    pub(super) async fn check_resting_buy_cross(
+        &self,
+        orders: &[OrderBookOrder],
+        ticks: u128,
+        max_price_per_tick: u128,
+        subscription: bool,
+    ) -> Result<()> {
+        let (mut asks, _) = coalesced_live_candidates(orders, buy_deadline_now_secs()?)
+            .map_err(anyhow::Error::msg)?;
+        asks.retain(|ask| is_subscription_ask(ask) == subscription);
+        if let Some(ask) = next_matching_ask(&asks, max_price_per_tick, ticks) {
+            let tc = Address::parse(
+                ask.token_contract
+                    .as_deref()
+                    .context("SELL has no TokenContract")?,
+            )?;
+            let state = self.token_contract_deal_state(&tc).await?;
+            if let Some(reason) = token_contract_non_executable_reason(state) {
+                return Err(anyhow!(ChainError::OrderUnavailable(format!(
+                    "{} cannot execute: {reason}",
+                    describe_buy_ask(ask)
+                ))));
+            }
+            self.require_matched_buy_reserve(ask, ticks).await?;
+            anyhow::ensure!(
+                ask.is_live_resting_ask_at(buy_deadline_now_secs()?),
+                "{} expired during the BUY preflight",
+                describe_buy_ask(ask)
+            );
+        }
+        Ok(())
+    }
+
     pub async fn submit_safe_executable_book_asks(
         &self,
         snapshot: &OrderBookSnapshot,
@@ -8159,7 +9006,9 @@ impl RealChainBackend {
         max_price_per_tick: u128,
     ) -> Result<(Vec<OrderBookOrder>, Option<String>)> {
         let raw_asks: Vec<OrderBookOrder> = snapshot.resting_asks().cloned().collect();
-        let executable_asks = self.executable_resting_asks(snapshot).await?;
+        let executable_asks = self
+            .executable_resting_asks_for_fill(snapshot, Some(ticks))
+            .await?;
         let now = now_secs()?;
         let (asks, reason) = submit_safe_executable_book_asks(
             &raw_asks,
@@ -8187,6 +9036,14 @@ impl RealChainBackend {
 
 #[async_trait]
 impl ChainBackend for RealDealBackend {
+    async fn observed_chain_timestamp(&self) -> Result<Option<u64>, ChainError> {
+        self.chain
+            .observed_chain_timestamp()
+            .await
+            .map(Some)
+            .map_err(map_read_err)
+    }
+
     async fn deal_purchase_terms(
         &self,
         token_contract: &TokenContract,
@@ -8405,7 +9262,7 @@ impl ChainBackend for RealDealBackend {
         self.chain
             .token_contract_deal_snapshot(&tc)
             .await
-            .map_err(map_err)
+            .map_err(map_seller_deal_read_err)
     }
 
     async fn deal_subscription(
@@ -8567,6 +9424,7 @@ impl ChainBackend for RealDealBackend {
 /// exact `2P` seller bond. It reuses [`RealChainBackend`] helpers -- it does not duplicate
 /// submit/provisioning. Provisioning (note/keys) is NOT here: the backend only reads/signs.
 pub struct RealSellerBackend {
+    signing_note: Option<std::sync::Arc<dyn Note>>,
     chain: RealChainBackend,
     note: Address,
     keys: KeyPair,
@@ -8581,6 +9439,12 @@ pub struct RealSellerBackend {
     offer_post_started_at: std::sync::Mutex<Option<u64>>,
     offer_journal_dir: Option<std::path::PathBuf>,
     pending_offer: tokio::sync::Mutex<Option<super::client::SellerPlacement>>,
+}
+
+#[derive(Debug)]
+pub(super) enum ReconciledSell {
+    Existing,
+    Vacant { previous: Option<String> },
 }
 
 impl RealSellerBackend {
@@ -8611,6 +9475,7 @@ impl RealSellerBackend {
         _supplied_deal_gas_overhead_raw: Option<u128>,
     ) -> Self {
         Self {
+            signing_note: None,
             chain,
             note,
             keys,
@@ -8622,6 +9487,11 @@ impl RealSellerBackend {
             offer_journal_dir: None,
             pending_offer: tokio::sync::Mutex::new(None),
         }
+    }
+
+    pub fn with_signing_note(mut self, note: std::sync::Arc<dyn Note>) -> Self {
+        self.signing_note = Some(note);
+        self
     }
 
     /// The CLI uses its existing seller-watch directory for per-deal submission recovery.
@@ -8712,18 +9582,27 @@ impl RealSellerBackend {
         &self,
         tc: &Address,
         book: &Address,
-    ) -> Result<bool, ChainError> {
+    ) -> Result<ReconciledSell, ChainError> {
         self.load_pending_offer(tc, book).await?;
         let mut pending = self.pending_offer.lock().await;
         let Some(post) = pending.as_mut() else {
-            return Ok(false);
+            return Ok(ReconciledSell::Vacant { previous: None });
         };
         let path = self.offer_journal_path(tc);
         let message_id = post.message_id.clone();
-        let trace = tokio::time::timeout(
-            OFFER_ACCEPTANCE_TIMEOUT,
-            self.chain.reconcile_seller_placement(post, path.as_deref()),
-        )
+        let trace = tokio::time::timeout(OFFER_ACCEPTANCE_TIMEOUT, async {
+            let result = self
+                .chain
+                .reconcile_seller_placement_with_expiry(post, path.as_deref(), true)
+                .await;
+            if let Err(error) = &result {
+                self.chain
+                    .ensure_seller_expiry_anchor(post, path.as_deref(), &self.keys)
+                    .await
+                    .with_context(|| format!("{error:#}"))?;
+            }
+            result
+        })
         .await;
         // The closure below deliberately uses the immutable id: the execution cursor advances.
         let unresolved = |detail: String| {
@@ -8751,19 +9630,19 @@ impl RealSellerBackend {
             .map_err(|error| unresolved(format!("TokenContract.getState: {error:#}")))?
             .ok_or_else(|| unresolved("missing TokenContract.getState".into()))?;
         if state.funded {
-            return Ok(true);
+            return Ok(ReconciledSell::Existing);
         }
         // The exact execution above is already checkpointed under the pending-offer lock.
         if !retry_seller_read("seller reconciled exact-TC SELL rows", || async {
             self.chain
                 .raw_resting_sell_orders_for_tc(book, tc)
                 .await
-                .map_err(map_err)
+                .map_err(map_read_err)
         })
         .await?
         .is_empty()
         {
-            return Ok(true);
+            return Ok(ReconciledSell::Existing);
         }
         if self
             .chain
@@ -8779,11 +9658,13 @@ impl RealSellerBackend {
         tracing::info!(event = "seller_offer_submission_terminal", %message_id,
             token_contract = %display_token_contract(tc), result = ?post.terminal,
             "previous SELL execution reconciled; book empty and offer latch released");
-        if let Some(path) = path {
-            std::fs::remove_file(path).map_err(|error| ChainError::Chain(error.to_string()))?;
-        }
-        *pending = None;
-        Ok(false)
+        // Keep restart eligibility through later getters and BOC preparation. The next
+        // before_post checkpoint replaces this record atomically.
+        post.replacement_pending = true;
+        post.save(path.as_deref()).map_err(map_err)?;
+        Ok(ReconciledSell::Vacant {
+            previous: Some(message_id),
+        })
     }
 
     /// Assemble the seller backend and the seller's note from the `--note-key` seed. Directive: the
@@ -8962,6 +9843,18 @@ impl RealSellerBackend {
 
 #[async_trait]
 impl ChainBackend for RealSellerBackend {
+    async fn observed_chain_timestamp(&self) -> Result<Option<u64>, ChainError> {
+        self.chain
+            .observed_chain_timestamp()
+            .await
+            .map(Some)
+            .map_err(map_read_err)
+    }
+
+    fn seller_signing_note(&self) -> Option<&std::sync::Arc<dyn Note>> {
+        self.signing_note.as_ref()
+    }
+
     fn network(&self) -> &str {
         self.chain.network()
     }
@@ -9006,7 +9899,7 @@ impl ChainBackend for RealSellerBackend {
             self.chain
                 .assert_note_can_post_sell_offer(&self.note)
                 .await
-                .map_err(map_err)
+                .map_err(map_read_err)
         })
         .await
     }
@@ -9033,14 +9926,14 @@ impl ChainBackend for RealSellerBackend {
             self.chain
                 .token_contract_settlement_receipts_if_present(&addr)
                 .await
-                .map_err(map_err)
+                .map_err(map_read_err)
         })
         .await?;
         let state = retry_seller_read("seller TokenContract freshness", || async {
             self.chain
                 .token_contract_deal_state(&addr)
                 .await
-                .map_err(map_err)
+                .map_err(map_read_err)
         })
         .await?;
         let Some(receipts) = receipts else {
@@ -9077,6 +9970,7 @@ impl ChainBackend for RealSellerBackend {
     async fn post_offer(&self, offer: SellOffer, _note: &dyn Note) -> Result<(), ChainError> {
         let tc = parse_tc(&offer.token_contract)?;
         self.assert_note_can_post_sell_offer().await?;
+        self.assert_note_current().await?;
         // (symmetric branch-3 guard): fail closed if this note's on-chain owner key
         // (`getDetails().ephemeralPubkey`) is not the key we sign `postSellOffer` with -- otherwise
         // `onlyOwnerPubkey` reverts pre-accept (ERR_INVALID_SENDER 101) and the ask never rests (only an
@@ -9085,7 +9979,7 @@ impl ChainBackend for RealSellerBackend {
             self.chain
                 .assert_note_owner_matches("seller post_offer", &self.note, &self.keys)
                 .await
-                .map_err(map_err)
+                .map_err(map_read_err)
         })
         .await?;
         // An operate exception: if the per-model `InferenceOrderBook` is not yet deployed --
@@ -9094,7 +9988,7 @@ impl ChainBackend for RealSellerBackend {
             self.chain
                 .inference_orderbook_address(&self.note, &self.model_hash, self.tick_size)
                 .await
-                .map_err(map_err)
+                .map_err(map_read_err)
         })
         .await?;
         let recovered = tokio::time::timeout(
@@ -9104,14 +9998,18 @@ impl ChainBackend for RealSellerBackend {
             "SELL reserve recovery checks timed out for {}; original submission retained; no new SELL submitted",
             display_token_contract(&tc),
         )))??;
-        if recovered.is_none() && self.reconcile_pending_offer(&tc, &ob).await? {
-            return Ok(());
-        }
+        let previous_id = match recovered {
+            Some(message_id) => Some(message_id),
+            None => match self.reconcile_pending_offer(&tc, &ob).await? {
+                ReconciledSell::Existing => return Ok(()),
+                ReconciledSell::Vacant { previous } => previous,
+            },
+        };
         if retry_seller_read("seller order-book state", || async {
             self.chain
                 .inference_orderbook_stats(&ob)
                 .await
-                .map_err(map_err)
+                .map_err(map_read_err)
         })
         .await?
         .is_none()
@@ -9155,17 +10053,15 @@ impl ChainBackend for RealSellerBackend {
         let path = self.offer_journal_path(&tc);
         let mut pending = self.pending_offer.lock().await;
         let since = now_secs()?.saturating_sub(crate::params::SELLER_OFFER_EVENT_LOOKBACK_SECS);
+        if pending.as_ref().map(|post| post.message_id.as_str()) != previous_id.as_deref() {
+            return Err(ChainError::AmbiguousSubmit(
+                "SELL submission changed during preparation; reconcile it before retrying".into(),
+            ));
+        }
         let mut checkpointed = false;
-        let submitted = {
-            let mut before_post = |message_id| {
-                if let Some(previous) = recovered.as_deref() {
-                    if pending
-                        .as_ref()
-                        .is_none_or(|post| post.message_id != previous)
-                    {
-                        return Err(anyhow::anyhow!("SELL submission changed during reserve recovery; reconcile it before retrying"));
-                    }
-                }
+        let mut previous = None;
+        let submitted = tokio::time::timeout(POST_SELL_OFFER_SUBMIT_TIMEOUT, async {
+            let mut before_post = |message_id, expire| {
                 let post = super::client::SellerPlacement::new(
                     self.chain.network(),
                     &self.note,
@@ -9173,41 +10069,39 @@ impl ChainBackend for RealSellerBackend {
                     &ob,
                     message_id,
                     since,
+                    Some(expire),
                 );
                 post.save(path.as_deref())?;
-                *pending = Some(post);
+                previous = pending.replace(post);
                 checkpointed = true;
                 Ok(())
             };
-            tokio::time::timeout(
-                POST_SELL_OFFER_SUBMIT_TIMEOUT,
-                // One seller call: postSellOffer(flags, nonce, ttl). The note derives the canonical TC and
-                // hands it the baked book hash; the TC posts its own ask. The on-chain terms read + drift check
-                // above stay as a pre-post sanity check. The ttl is mandatory; ask for the maximum the
-                // contract allows so the offer is not cut short by our own default.
-                self.chain.post_sell_offer_with_identity(
+            // The note derives the canonical TC and hands it the baked book hash; the TC posts
+            // its own ask. Use the maximum contract TTL so our default does not shorten the offer.
+            self.chain
+                .post_sell_offer_with_identity(
                     &self.note,
                     &self.keys,
                     offer.flags,
                     self.nonce,
                     crate::params::MAX_SELL_TTL.as_secs(),
                     &mut before_post,
-                ),
-            )
-            .await
-        };
+                )
+                .await
+        })
+        .await;
         if let Ok(Err(error)) = &submitted {
-            // Before checkpointing, pending can still be the original rejected SELL.
             if checkpointed
                 && error
                     .downcast_ref::<super::client::MoneySubmitError>()
                     .is_some_and(|error| error.clears_journal())
-                && pending.is_some()
             {
-                if let Some(path) = path.as_ref() {
+                if let Some(post) = previous.as_ref() {
+                    post.save(path.as_deref()).map_err(map_err)?;
+                } else if let Some(path) = path.as_ref() {
                     std::fs::remove_file(path).map_err(|error| map_err(error.into()))?;
                 }
-                *pending = None;
+                *pending = previous;
             }
         }
         drop(pending);
@@ -9215,6 +10109,13 @@ impl ChainBackend for RealSellerBackend {
             Ok(Ok(_)) => {}
             Ok(Err(e)) => return Err(map_sell_offer_submit_err(e)),
             Err(_) => {
+                super::call_errors::unconfirmed(&self.note, PRIVATENOTE_ABI, "postSellOffer");
+                if checkpointed {
+                    return Err(ChainError::AmbiguousSubmit(format!(
+                        "SELL submission for TokenContract {} timed out; reconciling the signed message in the background",
+                        display_token_contract(&tc),
+                    )));
+                }
                 let (canonical_evidence, tc_state_evidence) =
                     self.post_offer_failure_evidence(&tc).await;
                 return Err(ChainError::AmbiguousSubmit(
@@ -9244,7 +10145,7 @@ impl ChainBackend for RealSellerBackend {
         Ok(pending
             .iter()
             .chain(saved.iter())
-            .any(|post| post.terminal.is_none()))
+            .any(super::client::SellerPlacement::needs_recovery))
     }
 
     async fn confirm_offer_outcome(
@@ -9255,7 +10156,7 @@ impl ChainBackend for RealSellerBackend {
             self.chain
                 .inference_orderbook_address(&self.note, &self.model_hash, self.tick_size)
                 .await
-                .map_err(map_err)
+                .map_err(map_read_err)
         })
         .await?;
         let tc_addr = parse_tc(tc)?;
@@ -9287,6 +10188,7 @@ impl ChainBackend for RealSellerBackend {
                     return Ok(Some(SellOfferOutcome::Rested { order_id }));
                 }
                 if post.terminal.is_some() || started.elapsed() >= OFFER_ACCEPTANCE_TIMEOUT {
+                    super::call_errors::unconfirmed(&self.note, PRIVATENOTE_ABI, "postSellOffer");
                     return Err(ChainError::AmbiguousSubmit(format!(
                         "SELL submission {}: terminal={:?}; execution_read={trace:?}; \
                          preserving submission identity for recovery; no successor accepted yet",
@@ -9312,7 +10214,7 @@ impl ChainBackend for RealSellerBackend {
                 self.chain
                     .seller_offer_events_since(&self.note, &ob, &tc_addr, since)
                     .await
-                    .map_err(map_err)
+                    .map_err(map_read_err)
             })
             .await?;
             let matched_state = retry_seller_read("seller immediate-match state", || async {
@@ -9339,6 +10241,7 @@ impl ChainBackend for RealSellerBackend {
             }
             tokio::time::sleep(crate::params::SELLER_OFFER_OUTCOME_POLL_INTERVAL).await;
         }
+        super::call_errors::unconfirmed(&self.note, PRIVATENOTE_ABI, "postSellOffer");
         Err(ChainError::AmbiguousSubmit(format!(
             "seller postSellOffer outcome is not yet confirmed for TokenContract {}; no placement, match, or returned placement value was observed",
             display_token_contract(tc)
@@ -9442,7 +10345,7 @@ impl ChainBackend for RealSellerBackend {
             self.chain
                 .inference_orderbook_address(&self.note, &self.model_hash, self.tick_size)
                 .await
-                .map_err(map_err)
+                .map_err(map_read_err)
         })
         .await?;
         self.chain
@@ -9639,7 +10542,13 @@ impl ChainBackend for RealSellerBackend {
                     map_err(error)
                 }
             })?;
-        wait_tc_bool(&self.chain, &tc, "opened", true).await
+        wait_tc_bool_with(&tc, "opened", true, || async {
+            self.chain
+                .token_contract_deal_state(&tc)
+                .await
+                .map_err(map_read_err)
+        })
+        .await
     }
 
     async fn read_handover(
@@ -9752,7 +10661,7 @@ impl ChainBackend for RealSellerBackend {
         self.chain
             .token_contract_deal_snapshot(&tc)
             .await
-            .map_err(map_read_err)
+            .map_err(map_seller_deal_read_err)
     }
 
     async fn deal_subscription(
@@ -9776,7 +10685,7 @@ impl ChainBackend for RealSellerBackend {
             .chain
             .token_contract_config(&tc)
             .await
-            .map_err(map_err)?
+            .map_err(map_read_err)?
             .ok_or_else(|| {
                 ChainError::Chain(format!(
                     "TC {}: getConfig() returned no data for claim bounds",
@@ -10106,6 +11015,10 @@ impl RealBuyerBackend {
     ) -> Result<(String, Option<OrderBookOrder>), ChainError> {
         let snapshot = self.orderbook_snapshot().await?;
         if self.wait_for_seller {
+            self.chain
+                .check_resting_buy_cross(&snapshot.orders, ticks, max_price_per_tick, false)
+                .await
+                .map_err(map_err)?;
             return Ok((snapshot.order_book, None));
         }
         let selected = self
@@ -10121,22 +11034,23 @@ impl RealBuyerBackend {
         tc: &Address,
         ticks: u128,
         max_price_per_tick: u128,
-    ) -> Result<String, ChainError> {
+    ) -> Result<(String, OrderBookOrder), ChainError> {
         let snapshot = self.orderbook_snapshot().await?;
         let asks: Vec<OrderBookOrder> = snapshot.resting_asks().cloned().collect();
         let want = tc.with_workchain().to_ascii_lowercase();
         let now = buy_deadline_now_secs()?;
-        check_expected_buy_target(&asks, &want, max_price_per_tick, ticks, now).map_err(|e| {
-            ChainError::OrderUnavailable(format!(
-                "buyer target preflight failed for InferenceOrderBook {}: {e}. IOB stats {}",
-                display_dexdo_address(&snapshot.order_book),
-                snapshot
-                    .stats
-                    .map(|s| format!("{s:?}"))
-                    .unwrap_or_else(|| "<book not active>".to_string())
-            ))
-        })?;
-        Ok(snapshot.order_book)
+        let selected = check_expected_buy_target(&asks, &want, max_price_per_tick, ticks, now)
+            .map_err(|e| {
+                ChainError::OrderUnavailable(format!(
+                    "buyer target preflight failed for InferenceOrderBook {}: {e}. IOB stats {}",
+                    display_dexdo_address(&snapshot.order_book),
+                    snapshot
+                        .stats
+                        .map(|s| format!("{s:?}"))
+                        .unwrap_or_else(|| "<book not active>".to_string())
+                ))
+            })?;
+        Ok((snapshot.order_book, selected))
     }
 
     async fn assert_selected_tc_unused(
@@ -10249,7 +11163,6 @@ impl ChainBackend for RealBuyerBackend {
             )
         })?;
         let expected = parse_tc(token_contract)?;
-        self.require_tc_gas(&expected, TcGasOperation::Buy).await?;
         // (branch-3 guard): fail closed if this note's on-chain owner key (`getDetails().ephemeralPubkey`)
         // is not the `--note-key` we sign `placeInferenceBuy` with -- otherwise `onlyOwnerPubkey` reverts
         // pre-accept (ERR_INVALID_SENDER 101) and the buyer silently 300s-times out in `read_match`.
@@ -10263,12 +11176,22 @@ impl ChainBackend for RealBuyerBackend {
             .map_err(map_err)?;
         // `placeInferenceBuy` is model-book-wide and cannot name a target TC. Fail before moving escrow
         // unless the book's price->time matcher would fund the TC from this market manifest.
-        let order_book = self
+        let (order_book, selected) = self
             .assert_expected_buy_target(&expected, budget.ticks, budget.max_price_per_tick)
             .await?;
         let expected_tc = expected.with_workchain();
         self.assert_selected_tc_unused(&expected_tc, &order_book)
             .await?;
+        self.chain
+            .require_matched_buy_reserve(&selected, budget.ticks)
+            .await
+            .map_err(map_err)?;
+        if selected.deadline != 0 && selected.deadline <= buy_deadline_now_secs()? {
+            return Err(ChainError::OrderUnavailable(format!(
+                "{} expired during the BUY preflight",
+                describe_buy_ask(&selected)
+            )));
+        }
         let deadline = canonical_cli_buy_deadline("buyer place_buy")?;
         // A limit buy by `model_hash`; the book matches the preflighted ask and funds the seller's TC
         // (`fundFromOrderBook`).
@@ -10315,7 +11238,6 @@ impl ChainBackend for RealBuyerBackend {
         max_price_per_tick: u128,
     ) -> Result<(), ChainError> {
         let expected = parse_tc(token_contract)?;
-        self.require_tc_gas(&expected, TcGasOperation::Buy).await?;
         self.chain
             .assert_note_owner_matches(
                 "buyer explicit-token quote preflight",
@@ -10324,12 +11246,16 @@ impl ChainBackend for RealBuyerBackend {
             )
             .await
             .map_err(map_err)?;
-        let order_book = self
+        let (order_book, selected) = self
             .assert_expected_buy_target(&expected, ticks, max_price_per_tick)
             .await?;
         let expected_tc = expected.with_workchain();
         self.assert_selected_tc_unused(&expected_tc, &order_book)
+            .await?;
+        self.chain
+            .require_matched_buy_reserve(&selected, ticks)
             .await
+            .map_err(map_err)
     }
 
     async fn submit_safe_explicit_buy_quote_order(
@@ -10339,7 +11265,6 @@ impl ChainBackend for RealBuyerBackend {
         max_price_per_tick: u128,
     ) -> Result<Option<OrderBookOrder>, ChainError> {
         let expected = parse_tc(token_contract)?;
-        self.require_tc_gas(&expected, TcGasOperation::Buy).await?;
         self.chain
             .assert_note_owner_matches(
                 "buyer explicit-token quote preflight",

@@ -60,6 +60,9 @@ fn history(count: usize) -> (tempfile::TempDir, Arc<UsageStore>) {
     drop(store);
     let mut connection = rusqlite::Connection::open(&path).unwrap();
     let transaction = connection.transaction().unwrap();
+    transaction
+        .execute_batch(include_str!("../../drop_usage_change_journal.sql"))
+        .unwrap();
     let at = chrono::Utc::now().timestamp_millis() - 1000;
     transaction.execute(
         "WITH RECURSIVE ids(i) AS(VALUES(1) UNION ALL SELECT i+1 FROM ids WHERE i<?1)

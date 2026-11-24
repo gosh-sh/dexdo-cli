@@ -152,15 +152,6 @@ impl SessionSettle {
             }
             None => diagnostics.recovery_state,
         };
-        // Accounting uncertainty overrides local policy closure, not authoritative terminal facts.
-        if !matches!(
-            state,
-            RecoveryState::TerminalConfirmed | RecoveryState::Disputed
-        ) {
-            if let Some(error) = self.unresolved_usage_rejection() {
-                return Some(error.response(http::StatusCode::SERVICE_UNAVAILABLE, anthropic));
-            }
-        }
         let terminal_action = match state {
             RecoveryState::TerminalConfirmed => Some(match terminal_action {
                 None | Some(SessionTerminalAction::StreamDispute) => {

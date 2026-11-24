@@ -1746,7 +1746,7 @@ mod issue_2163 {
                 }),
                 state.deals.clone(),
                 book.clone(),
-                args,
+                Some(args),
             );
             let (addr, mut server) =
                 dexdo::buyer::api::serve("127.0.0.1:0".parse().unwrap(), state, shutdown)
@@ -1839,7 +1839,7 @@ mod issue_2163 {
             }),
             state.deals.clone(),
             book.clone(),
-            args,
+            Some(args),
         );
         let (addr, mut server) =
             dexdo::buyer::api::serve("127.0.0.1:0".parse().unwrap(), state, shutdown)

@@ -118,6 +118,11 @@ pub trait ChainBackend: Send + Sync {
         "mock"
     }
 
+    /// The signer and handover identity bound to this seller backend, when it carries one.
+    fn seller_signing_note(&self) -> Option<&std::sync::Arc<dyn Note>> {
+        None
+    }
+
     /// Book discovery: the list of current offers with their sellers. The buyer
     /// filters/ranks against its frame (`buyer::routing::eligible_ranked`). Mock -- all offers;
     /// real -- reading `InferenceOrderBook`.
@@ -729,6 +734,10 @@ pub trait ChainBackend: Send + Sync {
         &self,
         _token_contract: &TokenContract,
     ) -> Result<Option<DealChainState>, ChainError> {
+        Ok(None)
+    }
+    /// Latest observed block timestamp for scheduling seller claims. Offline backends have no chain clock.
+    async fn observed_chain_timestamp(&self) -> Result<Option<u64>, ChainError> {
         Ok(None)
     }
     /// Read the deal SHAPE (`getSubscription`): subscription term, weekly quota, weeks already settled.

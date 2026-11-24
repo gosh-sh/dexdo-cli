@@ -8,7 +8,7 @@ proptest::proptest! {
         new_output in proptest::bool::ANY,
     ) {
         let deal = heartbeat_test_deal();
-        deal.record_billable(prior_usage).unwrap();
+        deal.commit_billable(prior_usage);
         deal.record_accepted_output(100);
         let mut request = deal.begin_request(101);
         request.arm_upstream_failure();

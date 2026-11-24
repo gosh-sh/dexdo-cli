@@ -3,6 +3,49 @@ use super::*;
 use proptest::prelude::*;
 
 #[tokio::test]
+async fn probe_backpressure_2194_locally_spent_trial_returns_the_retry_response() {
+    let note = Arc::new(dexdo_core::LocalNote::generate());
+    let tc = "tc-spent-trial".to_string();
+    let session = Arc::new(SessionSettle::new(
+        Arc::new(RecordingSettleChain::default()),
+        tc.clone(),
+        note.clone(),
+    ));
+    session.disable_drop_backup();
+    let tick = dexdo_core::TICK_SIZE as u64;
+    let deal = ApiDeal::new(
+        Route {
+            handover: Handover {
+                endpoint: "https://127.0.0.1:1".into(),
+                tls_fingerprint: "00".repeat(32),
+            },
+            token_contract: tc,
+            max_tokens: 10 * tick,
+        },
+        session,
+        Arc::new(ContentGate::skip()),
+    );
+    deal.commit_billable(tick);
+    let RouteBudget::Exhausted(error) = deal.admit_with_probe_observation(false).await else {
+        panic!("the trial has no local admission capacity left");
+    };
+    let api = ApiState::single_deal(Arc::new(Buyer::from_note(note)), "mock".into(), deal);
+    let response = api.budget_rejection(error, false);
+    assert_eq!(response.status(), http::StatusCode::TOO_MANY_REQUESTS);
+    assert_eq!(response.headers()["dexdo-limit"], "onchain_deal_limit");
+    assert!(response.headers().contains_key("retry-after"));
+    let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let body: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(body["error"]["code"], "onchain_deal_limit");
+    assert_eq!(
+        body["error"]["recovery_action"],
+        "retry_after_reconciliation"
+    );
+}
+
+#[tokio::test]
 async fn seller_retry_metadata_reaches_both_error_formats_2231() {
     for anthropic in [false, true] {
         for (busy, onchain, expected) in [
@@ -26,6 +69,7 @@ async fn seller_retry_metadata_reaches_both_error_formats_2231() {
                     .insert("dexdo-limit", "onchain_deal_limit".parse().unwrap());
             }
             let response = capacity_response(&anyhow::Error::new(status), anthropic);
+            assert_eq!(response.status(), http::StatusCode::TOO_MANY_REQUESTS);
             assert_eq!(response.headers()["retry-after"], "62");
             assert_eq!(response.headers()["retry-after-ms"], "61001");
             assert_eq!(response.headers().contains_key("dexdo-limit"), onchain);
@@ -34,6 +78,16 @@ async fn seller_retry_metadata_reaches_both_error_formats_2231() {
                 .unwrap();
             let body: serde_json::Value = serde_json::from_slice(&body).unwrap();
             assert_eq!(body["error"]["code"], expected);
+            if onchain {
+                assert_eq!(
+                    body["error"]["message"],
+                    "the deal is temporarily paused. Retry after accepted requests finish and billing is reconciled"
+                );
+                assert_eq!(
+                    body["error"]["recovery_action"],
+                    "retry_after_reconciliation"
+                );
+            }
         }
     }
 }

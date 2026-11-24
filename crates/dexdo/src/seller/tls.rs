@@ -6,7 +6,10 @@
 //! `Identity` into `ServerTlsConfig`; pinning on the buyer's side is in `buyer` (custom verifier).
 
 use anyhow::{Context, Result};
+use dexdo_core::Handover;
 use sha2::{Digest, Sha256};
+use std::io::Write as _;
+use std::path::{Path, PathBuf};
 use tokio_rustls::rustls::pki_types::{pem::PemObject, CertificateDer, PrivateKeyDer};
 
 /// The gateway's self-signed certificate + its fingerprint for the handover.
@@ -48,6 +51,58 @@ impl GatewayTls {
     pub fn pem_bundle(&self) -> String {
         format!("{}{}", self.cert_pem, self.key_pem)
     }
+}
+
+fn handover_path(cursor: &Path, ciphertext: &[u8]) -> PathBuf {
+    cursor.with_extension(format!(
+        "{}.handover.json",
+        hex::encode(Sha256::digest(ciphertext))
+    ))
+}
+
+/// A rollback can open a deal with a different certificate. Only trust local handover data
+/// whose ciphertext was actually accepted by the contract.
+pub fn read_handover(cursor: &Path, ciphertext: &[u8]) -> Result<Option<Handover>> {
+    let path = handover_path(cursor, ciphertext);
+    match std::fs::read(&path) {
+        Ok(bytes) => serde_json::from_slice(&bytes)
+            .map(Some)
+            .with_context(|| format!("parse seller handover {}", path.display())),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(error) => {
+            Err(error).with_context(|| format!("read seller handover {}", path.display()))
+        }
+    }
+}
+
+/// Save the exact endpoint and pin before submitting the encrypted handover. Keep the data beside
+/// the cursor so an older seller can still read its own state after a rollback.
+pub fn persist_handover(cursor: &Path, ciphertext: &[u8], handover: &Handover) -> Result<()> {
+    let path = handover_path(cursor, ciphertext);
+    let dir = path
+        .parent()
+        .filter(|p| !p.as_os_str().is_empty())
+        .unwrap_or(Path::new("."));
+    std::fs::create_dir_all(dir)?;
+    let tmp = path.with_extension(format!("tmp.{}", std::process::id()));
+    let write = || -> Result<()> {
+        let mut options = std::fs::OpenOptions::new();
+        options.write(true).create(true).truncate(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt as _;
+            options.mode(0o600);
+        }
+        let mut file = options.open(&tmp)?;
+        file.write_all(&serde_json::to_vec(handover)?)?;
+        file.sync_all()?;
+        drop(file);
+        std::fs::rename(&tmp, &path)?;
+        #[cfg(unix)]
+        std::fs::File::open(dir)?.sync_all()?;
+        Ok(())
+    };
+    write().with_context(|| format!("persist seller handover {}", path.display()))
 }
 
 /// Pin the process rustls CryptoProvider (`ring`) once. Both providers (ring and aws-lc-rs)

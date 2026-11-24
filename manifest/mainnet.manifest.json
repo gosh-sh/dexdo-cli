@@ -2,7 +2,7 @@
   "network": "mainnet",
   "endpoint": "https://dd-mainnet.ackinacki.org",
   "goshai_onboarding_url": "https://gosh.ai/subscription/login/?utm_source=dexdo",
-  "requests_per_second": 3,
+  "requests_per_second": 10,
   "indexer": "https://indexer.dex.do",
   "version": "4.0.36",
   "dapp_id": "0000000000000000000000000000000000000000000000000000000000000004",

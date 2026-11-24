@@ -40,7 +40,6 @@ pub enum ConsumerErrorCode {
     DealCapacityUnavailable,
     OnchainDealLimit,
     UpstreamRetryable,
-    UpstreamUsageUnresolved,
     UnsupportedApiPath,
     SellerUpdateRequired,
 }
@@ -59,7 +58,6 @@ impl ConsumerErrorCode {
             | Self::PurchaseReconciliationRequired
             | Self::SubscriptionStateUnavailable => "read_only_reconciliation",
             Self::DealCapacityUnavailable | Self::OnchainDealLimit => "retry_after_reconciliation",
-            Self::UpstreamUsageUnresolved => "read_only_reconciliation",
             Self::InvalidBuyTicks | Self::UnsupportedApiPath => "change_request",
             Self::SellerUpdateRequired => "wait_for_seller_update",
             Self::DealUnavailable
@@ -97,11 +95,6 @@ impl ConsumerError {
     }
 
     pub(super) fn response(&self, status: http::StatusCode, anthropic: bool) -> Response {
-        let status = if self.code == ConsumerErrorCode::UpstreamUsageUnresolved {
-            http::StatusCode::SERVICE_UNAVAILABLE
-        } else {
-            status
-        };
         (status, axum::Json(self.body(anthropic))).into_response()
     }
 }
@@ -150,6 +143,13 @@ impl DealInitError {
 
 impl ApiState {
     pub(super) fn budget_rejection(&self, mut error: ConsumerError, anthropic: bool) -> Response {
+        if error.code == ConsumerErrorCode::OnchainDealLimit {
+            return capacity_limit_response(
+                error,
+                anthropic,
+                Some(dexdo_core::params::CAPACITY_RETRY_DEFAULT.as_millis() as u64),
+            );
+        }
         if error.code == ConsumerErrorCode::DealBudgetExhausted && self.renewal_enabled {
             error.code = ConsumerErrorCode::RenewalPending;
             error.message =
@@ -176,7 +176,7 @@ pub(super) fn capacity_rejection(error: &anyhow::Error) -> ConsumerError {
     });
     if onchain {
         ConsumerError::new(ConsumerErrorCode::OnchainDealLimit,
-            "the deal's unclaimed billable backlog reached its on-chain throughput limit; retry after the next claim is reconciled")
+            "the deal is temporarily paused. Retry after accepted requests finish and billing is reconciled")
     } else if busy {
         ConsumerError::new(ConsumerErrorCode::DealBusy,
             "the deal's concurrent request limit is reached; retry with backoff after an active request finishes")
@@ -187,20 +187,27 @@ pub(super) fn capacity_rejection(error: &anyhow::Error) -> ConsumerError {
 }
 
 pub(super) fn capacity_response(error: &anyhow::Error, anthropic: bool) -> Response {
-    let refusal = capacity_rejection(error);
+    let delay = error
+        .downcast_ref::<tonic::Status>()
+        .and_then(|status| status.metadata().get("dexdo-retry-after-ms"))
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.parse::<u64>().ok())
+        .filter(|delay| *delay > 0);
+    capacity_limit_response(capacity_rejection(error), anthropic, delay)
+}
+
+fn capacity_limit_response(
+    refusal: ConsumerError,
+    anthropic: bool,
+    delay: Option<u64>,
+) -> Response {
     let mut response = refusal.response(http::StatusCode::TOO_MANY_REQUESTS, anthropic);
     if refusal.code == ConsumerErrorCode::OnchainDealLimit {
         response
             .headers_mut()
             .insert("dexdo-limit", "onchain_deal_limit".parse().unwrap());
     }
-    if let Some(delay) = error
-        .downcast_ref::<tonic::Status>()
-        .and_then(|status| status.metadata().get("dexdo-retry-after-ms"))
-        .and_then(|value| value.to_str().ok())
-        .and_then(|value| value.parse::<u64>().ok())
-        .filter(|delay| *delay > 0)
-    {
+    if let Some(delay) = delay {
         retry_headers(response.headers_mut(), delay);
     }
     response

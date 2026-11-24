@@ -31,7 +31,9 @@ use dexdo_core::{
     Handover, LocalNote, Match, MatchWatchCursor, MatchedFill, Note, OrderBookOrder, SellOffer,
     SellOfferOutcome, TokenContract, SUBSCRIPTION_MAX_TICKS, SUBSCRIPTION_WEEKS,
 };
+use futures::StreamExt as _;
 use gateway::{GatewayService, GatewayState};
+use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -84,6 +86,12 @@ pub enum SellerOfferInspection {
     Vacant,
 }
 
+/// The public endpoint authority and local socket serving a migrated deal.
+pub struct SellerGatewayRoute {
+    pub advertise: String,
+    pub listen: SocketAddr,
+}
+
 /// A running seller gateway: state handle + handle to the server's background task.
 pub struct RunningSeller {
     pub state: Arc<GatewayState>,
@@ -94,8 +102,20 @@ pub struct RunningSeller {
     pub server_task: tokio::task::JoinHandle<()>,
     /// The socket address actually bound before the server task was spawned.
     pub listen_addr: SocketAddr,
+    /// Original routes for open deals restored through a gateway migration.
+    pub migrated_routes: HashMap<String, SellerGatewayRoute>,
     /// Fingerprint of the gateway's self-signed TLS certificate -- goes into the handover.
     pub tls_fingerprint: String,
+}
+
+impl RunningSeller {
+    pub fn signing_note<'a>(&'a self, chain: &'a dyn ChainBackend) -> &'a dyn Note {
+        self.signing_note_handle(chain).as_ref()
+    }
+
+    pub fn signing_note_handle<'a>(&'a self, chain: &'a dyn ChainBackend) -> &'a Arc<dyn Note> {
+        chain.seller_signing_note().unwrap_or(&self.note)
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -119,6 +139,8 @@ struct SellerMatchWatchCursor {
     /// never be posted again, including through the parent's saved residual link.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     unsold_retired: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    subscription: Option<bool>,
 }
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
@@ -166,6 +188,7 @@ impl SellerMatchWatchCursor {
             opened_at_unix: None,
             fill: None,
             unsold_retired: false,
+            subscription: None,
         })
     }
 
@@ -312,6 +335,19 @@ pub fn read_seller_fill_lineage(
     Ok(fill)
 }
 
+pub fn read_seller_offer_mode(cursor: &Path, tc: &TokenContract) -> Result<Option<bool>> {
+    Ok(SellerMatchWatchCursor::load_or_new(cursor, tc)?.subscription)
+}
+
+pub fn persist_seller_offer_mode(cursor: &Path, tc: &TokenContract, mode: bool) -> Result<()> {
+    let mut state = SellerMatchWatchCursor::load_or_new(cursor, tc)?;
+    if state.subscription != Some(mode) {
+        state.subscription = Some(mode);
+        state.save(cursor)?;
+    }
+    Ok(())
+}
+
 pub fn seller_unsold_is_retired(
     cursor_path: &Path,
     token_contract: &TokenContract,
@@ -428,7 +464,7 @@ pub async fn start_gateway_with_note_tls(
     note: Arc<dyn Note>,
     gw_tls: GatewayTls,
 ) -> Result<RunningSeller> {
-    start_gateway_with_note_and_capacity_dir(addr, upstream, note, None, gw_tls).await
+    start_gateway_with_note_and_capacity_dir(addr, upstream, note, None, gw_tls, Vec::new()).await
 }
 
 /// Production seller gateway with crash-safe subscription capacity stored beside deal handles.
@@ -444,6 +480,7 @@ pub async fn start_gateway_with_note_and_deals_dir(
         note,
         Some(deals_dir),
         GatewayTls::generate()?,
+        Vec::new(),
     )
     .await
 }
@@ -456,7 +493,27 @@ pub async fn start_gateway_with_note_tls_and_deals_dir(
     deals_dir: PathBuf,
     gw_tls: GatewayTls,
 ) -> Result<RunningSeller> {
-    start_gateway_with_note_and_capacity_dir(addr, upstream, note, Some(deals_dir), gw_tls).await
+    start_gateway_with_note_tls_listeners(addr, upstream, note, deals_dir, gw_tls, Vec::new()).await
+}
+
+/// Mount the same seller state on the primary and the explicitly migrated TLS listeners.
+pub async fn start_gateway_with_note_tls_listeners(
+    addr: SocketAddr,
+    upstream: UpstreamConfig,
+    note: Arc<dyn Note>,
+    deals_dir: PathBuf,
+    gw_tls: GatewayTls,
+    additional: Vec<(SocketAddr, GatewayTls)>,
+) -> Result<RunningSeller> {
+    start_gateway_with_note_and_capacity_dir(
+        addr,
+        upstream,
+        note,
+        Some(deals_dir),
+        gw_tls,
+        additional,
+    )
+    .await
 }
 
 async fn start_gateway_with_note_and_capacity_dir(
@@ -465,6 +522,7 @@ async fn start_gateway_with_note_and_capacity_dir(
     note: Arc<dyn Note>,
     deals_dir: Option<PathBuf>,
     gw_tls: GatewayTls,
+    additional: Vec<(SocketAddr, GatewayTls)>,
 ) -> Result<RunningSeller> {
     // this process is about to serve buyers, and a buyer that hangs up mid-stream must give
     // this gateway an `EPIPE` to handle rather than a signal that kills it. Since process entry
@@ -476,32 +534,37 @@ async fn start_gateway_with_note_and_capacity_dir(
         Some(deals_dir) => GatewayState::with_upstream_and_deals_dir(upstream, deals_dir),
         None => GatewayState::with_upstream(upstream),
     });
-    let service = GatewayService::new(state.clone()).into_server();
 
     // Both rustls providers (ring/aws-lc-rs) are present in the tree; pin the process
     // default explicitly (ring) -- otherwise rustls panics, unable to pick on its own. Idempotent.
     tls::ensure_crypto_provider();
 
     let tls_fingerprint = gw_tls.fingerprint.clone();
-    let identity = Identity::from_pem(gw_tls.cert_pem, gw_tls.key_pem);
-    let tls_config = ServerTlsConfig::new().identity(identity);
-    let listener = tokio::net::TcpListener::bind(addr)
-        .await
-        .map_err(|error| anyhow!("bind seller gateway {addr}: {error}"))?;
-    let listen_addr = listener
-        .local_addr()
-        .map_err(|error| anyhow!("read bound seller gateway address: {error}"))?;
-    let incoming = TcpListenerStream::new(listener);
-    let mut builder = Server::builder()
-        .tls_config(tls_config)
-        .map_err(|error| anyhow!("configure seller gateway TLS: {error}"))?;
+    let mut listen_addr = None;
+    let mut servers = futures::stream::FuturesUnordered::new();
+    for (addr, tls) in std::iter::once((addr, gw_tls)).chain(additional) {
+        let listener = tokio::net::TcpListener::bind(addr)
+            .await
+            .map_err(|error| anyhow!("bind seller gateway {addr}: {error}"))?;
+        if listen_addr.is_none() {
+            listen_addr = Some(listener.local_addr()?);
+        }
+        let identity = Identity::from_pem(tls.cert_pem, tls.key_pem);
+        let mut builder = Server::builder()
+            .tls_config(ServerTlsConfig::new().identity(identity))
+            .map_err(|error| anyhow!("configure seller gateway TLS on {addr}: {error}"))?;
+        let service = GatewayService::new(state.clone()).into_server();
+        let incoming = TcpListenerStream::new(listener);
+        servers.push(async move {
+            builder
+                .add_service(service)
+                .serve_with_incoming(incoming)
+                .await
+        });
+    }
 
     let server_task = tokio::spawn(async move {
-        if let Err(error) = builder
-            .add_service(service)
-            .serve_with_incoming(incoming)
-            .await
-        {
+        if let Some(Err(error)) = servers.next().await {
             tracing::error!("gateway server stopped: {error}");
         }
     });
@@ -509,7 +572,8 @@ async fn start_gateway_with_note_and_capacity_dir(
         state,
         note,
         server_task,
-        listen_addr,
+        listen_addr: listen_addr.expect("the primary listener was bound"),
+        migrated_routes: HashMap::new(),
         tls_fingerprint,
     })
 }
@@ -521,11 +585,11 @@ pub async fn post_offer(
     chain: &dyn ChainBackend,
     cfg: &SellerConfig,
 ) -> Result<()> {
-    post_offer_with_note(seller.note.as_ref(), chain, cfg).await
+    post_offer_with_note(seller.signing_note(chain), chain, cfg).await
 }
 
 /// Like [`post_offer`], but uses a note directly. The CLI calls this only after
-/// gateway, advertised endpoint and exact upstream readiness have passed.
+/// gateway and advertised endpoint readiness have passed.
 pub async fn post_offer_with_note(
     note: &dyn Note,
     chain: &dyn ChainBackend,
@@ -691,7 +755,7 @@ fn validate_resting_offer(
     Ok(())
 }
 
-/// Read the authoritative seller state without posting. This lets gateway/upstream readiness run
+/// Read the authoritative seller state without posting. This lets gateway readiness run
 /// before a fresh SELL while still identifying an existing resting SELL that must be cancelled on
 /// failed restart readiness.
 pub async fn inspect_seller_offer(
@@ -704,29 +768,43 @@ pub async fn inspect_seller_offer(
         Ok(Some(_)) => return Ok(SellerOfferInspection::Funded),
         Ok(None) => {}
         Err(error) => {
-            return Err(anyhow!(
+            let message = format!(
                 "seller: existing-match resume preflight failed for {}: {error}",
                 display_token_contract(&cfg.token_contract)
-            ));
+            );
+            return Err(anyhow::Error::new(error).context(message));
         }
     }
 
+    Ok(
+        match read_resting_seller_order(chain, cfg, expected_owner).await? {
+            Some(order_id) => SellerOfferInspection::Resting { order_id },
+            None => SellerOfferInspection::Vacant,
+        },
+    )
+}
+
+/// Read and validate the exact resting order before queuing a deal for pool startup.
+pub async fn read_resting_seller_order(
+    chain: &dyn ChainBackend,
+    cfg: &SellerConfig,
+    expected_owner: Option<&str>,
+) -> Result<Option<u128>> {
     let raw_orders = chain
         .raw_resting_sell_orders_for_tc(&cfg.token_contract)
         .await
         .map_err(|error| {
-            resting_offer_error(
+            let message = resting_offer_error(
                 &cfg.token_contract,
                 format!("authoritative raw order-book read failed: {error}"),
-            )
+            );
+            anyhow::Error::new(error).context(message)
         })?;
     match raw_orders.as_slice() {
-        [] => Ok(SellerOfferInspection::Vacant),
+        [] => Ok(None),
         [order] => {
             validate_resting_offer(order, expected_owner, cfg)?;
-            Ok(SellerOfferInspection::Resting {
-                order_id: order.order_id,
-            })
+            Ok(Some(order.order_id))
         }
         orders => {
             let ids = orders
@@ -754,8 +832,22 @@ pub async fn prepare_seller_offer(
     cfg: &SellerConfig,
     expected_owner: Option<&str>,
 ) -> Result<SellerOfferStartup> {
+    prepare_seller_offer_with_resting_order(note, chain, cfg, expected_owner, None).await
+}
+
+async fn prepare_seller_offer_with_resting_order(
+    note: &dyn Note,
+    chain: &dyn ChainBackend,
+    cfg: &SellerConfig,
+    expected_owner: Option<&str>,
+    resting_order: Option<u128>,
+) -> Result<SellerOfferStartup> {
     match inspect_seller_offer(chain, cfg, expected_owner).await? {
         SellerOfferInspection::Vacant => {
+            if let Some(order_id) = resting_order {
+                // The watcher reconciles disappearance of this exact order before any relist.
+                return Ok(SellerOfferStartup::ResumedResting { order_id });
+            }
             chain
                 .assert_token_contract_fresh(&cfg.token_contract)
                 .await?;
@@ -796,6 +888,7 @@ async fn read_opened_with_retry(
             Ok(None) => {
                 last_failure = "getState returned no TokenContract state".to_string();
             }
+            Err(error @ dexdo_core::ChainError::Transport(_)) => return Err(error.into()),
             Err(error) => {
                 last_failure = format!("getState failed: {error}");
             }
@@ -818,6 +911,101 @@ async fn read_opened_with_retry(
     )
 }
 
+async fn retry_funded_match_read<T, F, Fut>(
+    seller: &RunningSeller,
+    token_contract: &TokenContract,
+    mut read: F,
+) -> Result<T>
+where
+    F: FnMut() -> Fut,
+    Fut: std::future::Future<Output = Result<T>>,
+{
+    loop {
+        match read().await {
+            Err(error)
+                if matches!(
+                    error.downcast_ref::<dexdo_core::ChainError>(),
+                    Some(dexdo_core::ChainError::Transport(_))
+                ) && !seller.server_task.is_finished() =>
+            {
+                tracing::warn!(
+                    token_contract = %display_token_contract(token_contract),
+                    %error,
+                    "seller match setup read failed; retaining funded deal"
+                );
+                tokio::time::sleep(dexdo_core::params::DEFAULT_MATCH_POLL_INTERVAL).await;
+            }
+            result => return result,
+        }
+    }
+}
+
+#[derive(Debug)]
+pub enum OpenedDealPlan {
+    Drive {
+        bounds: dexdo_core::ClaimBounds,
+        snapshot: Box<dexdo_core::DealChainSnapshot>,
+    },
+    Disputed,
+    RetireSettled,
+}
+
+/// Read the inputs for settling an opened match while its gateway authorization stays live.
+pub async fn plan_opened_deal(
+    seller: &RunningSeller,
+    chain: &dyn ChainBackend,
+    token_contract: &TokenContract,
+) -> Result<OpenedDealPlan> {
+    let Some(state) = retry_funded_match_read(seller, token_contract, || async {
+        Ok(chain.deal_state(token_contract).await?)
+    })
+    .await?
+    else {
+        return Ok(OpenedDealPlan::RetireSettled);
+    };
+    if state.disputed {
+        return Ok(OpenedDealPlan::Disputed);
+    }
+    let Some(bounds) = retry_funded_match_read(seller, token_contract, || async {
+        let error = match chain.deal_claim_bounds(token_contract).await {
+            Ok(bounds) => return Ok(Some(bounds)),
+            Err(error @ dexdo_core::ChainError::Transport(_)) => return Err(error.into()),
+            Err(error) => error,
+        };
+        // STOP destroys the contract. A failed getConfig alone cannot distinguish that from
+        // invalid config on an active deal, so confirm absence before retiring the route.
+        if chain.deal_state(token_contract).await?.is_none() {
+            return Ok(None);
+        }
+        Err(anyhow::Error::new(error).context(format!(
+            "--token-contract {}: getConfig() claim bounds are unreadable, refusing to start \
+             by-fact claiming on a guessed cadence",
+            display_token_contract(token_contract)
+        )))
+    })
+    .await?
+    else {
+        return Ok(OpenedDealPlan::RetireSettled);
+    };
+    let snapshot = retry_funded_match_read(seller, token_contract, || async {
+        chain.deal_snapshot(token_contract).await.map_err(|error| {
+            anyhow::Error::new(error).context(format!(
+                "--token-contract {}: strict coherent deal snapshot is unreadable, refusing to \
+                 choose the settlement driver from guessed deal shape",
+                display_token_contract(token_contract)
+            ))
+        })
+    })
+    .await?;
+    Ok(match snapshot {
+        Some(snapshot) => OpenedDealPlan::Drive {
+            bounds,
+            snapshot: Box::new(snapshot),
+        },
+        None => OpenedDealPlan::RetireSettled,
+    })
+}
+
 /// Provision access for a known match: register gateway authorization, then open the stream only when the
 /// authoritative on-chain `getState.opened` flag is false. A restarted gateway always rebuilds in-memory auth,
 /// while an already-opened deal skips the duplicate chain write.
@@ -826,6 +1014,16 @@ pub async fn provision_match(
     chain: &dyn ChainBackend,
     cfg: &SellerConfig,
     m: Match,
+) -> Result<()> {
+    provision_match_with_cursor(seller, chain, cfg, m, None).await
+}
+
+async fn provision_match_with_cursor(
+    seller: &RunningSeller,
+    chain: &dyn ChainBackend,
+    cfg: &SellerConfig,
+    m: Match,
+    cursor: Option<&Path>,
 ) -> Result<()> {
     if m.token_contract != cfg.token_contract {
         bail!(
@@ -842,7 +1040,7 @@ pub async fn provision_match(
     };
     // The payload names the deal it is written for, so the buyer can refuse it on any other deal
     // (E2E-OPEN-07 wrong-deal replay) before it treats that deal as opened.
-    let enc = seller.note.encrypt_to(
+    let enc = seller.signing_note(chain).encrypt_to(
         &m.buyer_pubkey,
         &handover.to_deal_bytes(&cfg.token_contract),
     );
@@ -852,24 +1050,31 @@ pub async fn provision_match(
     // after reading the on-chain ciphertext (written by `open_stream`), so register-before-open rules out a race. Otherwise on a
     // real (slow) chain the buyer manages to knock in the window between open_stream and register_stream
     // -> the gateway still has no pubkey -> `challenge-response failed` (the mock timing did not expose this).
-    let (state, deal) = read_coherent_deal_capacity(chain, &cfg.token_contract).await?;
-    if cfg.subscription != deal.is_subscription() {
-        let expected = if cfg.subscription {
-            "subscription"
-        } else {
-            "ordinary"
-        };
-        let observed = if deal.is_subscription() {
-            "subscription"
-        } else {
-            "ordinary"
-        };
-        bail!(
-            "TokenContract {}: seller configured {expected} mode but strict deal snapshot is {observed}",
-            display_token_contract(&cfg.token_contract)
-        );
-    }
-    let bounds = chain.deal_claim_bounds(&cfg.token_contract).await?;
+    // A paid match survives exhaustion of an individual read budget. Retry this read-only
+    // preparation for the same match before registering the route or submitting open.
+    let (state, deal, bounds, opened) =
+        retry_funded_match_read(seller, &cfg.token_contract, || async {
+            let (state, deal) = read_coherent_deal_capacity(chain, &cfg.token_contract).await?;
+            if cfg.subscription != deal.is_subscription() {
+                let mode = |subscription| {
+                    if subscription {
+                        "subscription"
+                    } else {
+                        "ordinary"
+                    }
+                };
+                bail!(
+                    "TokenContract {}: seller configured {} mode but strict deal snapshot is {}",
+                    display_token_contract(&cfg.token_contract),
+                    mode(cfg.subscription),
+                    mode(deal.is_subscription()),
+                );
+            }
+            let bounds = chain.deal_claim_bounds(&cfg.token_contract).await?;
+            let opened = read_opened_with_retry(chain, &cfg.token_contract).await?;
+            Ok((state, deal, bounds, opened))
+        })
+        .await?;
     seller.state.register_stream_with_claim_bounds(
         &cfg.token_contract,
         m.buyer_pubkey,
@@ -878,10 +1083,13 @@ pub async fn provision_match(
         deal,
         bounds,
     )?;
-    if !read_opened_with_retry(chain, &cfg.token_contract).await? {
+    if !opened {
+        if let Some(cursor) = cursor {
+            tls::persist_handover(cursor, &enc, &handover)?;
+        }
         loop {
             match chain
-                .open_stream(&cfg.token_contract, enc.clone(), seller.note.as_ref())
+                .open_stream(&cfg.token_contract, enc.clone(), seller.signing_note(chain))
                 .await
             {
                 Ok(()) => break,
@@ -964,7 +1172,7 @@ async fn poll_match(
         }
     }
     let fills = chain
-        .poll_seller_fills(seller.note.as_ref(), &mut cursor.source)
+        .poll_seller_fills(seller.signing_note(chain), &mut cursor.source)
         .await?;
     let mut matching = fills
         .into_iter()
@@ -999,7 +1207,7 @@ async fn poll_match(
         if known_matched || cursor.opened_at_unix.is_some() || openable_match.is_some() {
             let mut history = MatchWatchCursor::new(0);
             let mut fills = chain
-                .poll_seller_fills(seller.note.as_ref(), &mut history)
+                .poll_seller_fills(seller.signing_note(chain), &mut history)
                 .await?
                 .into_iter()
                 .filter(|fill| {
@@ -1057,7 +1265,7 @@ pub async fn poll_match_and_maybe_open(
     let (mut cursor, found) = poll_match(seller, chain, cfg, cursor_path, false).await?;
     cursor.save(cursor_path)?;
     if let Some(m) = found {
-        provision_match(seller, chain, cfg, m.clone()).await?;
+        provision_match_with_cursor(seller, chain, cfg, m.clone(), Some(cursor_path)).await?;
         cursor.opened_at_unix.get_or_insert(now_unix()?);
         cursor.save(cursor_path)?;
         Ok(Some(m))
@@ -1158,7 +1366,14 @@ pub async fn serve_watched_match(
     matched: Match,
 ) -> Result<Match> {
     recover_known_match_fill(seller, chain, cfg, watch, &matched).await?;
-    provision_match(seller, chain, cfg, matched.clone()).await?;
+    provision_match_with_cursor(
+        seller,
+        chain,
+        cfg,
+        matched.clone(),
+        Some(&watch.cursor_path),
+    )
+    .await?;
     let mut cursor = SellerMatchWatchCursor::load_or_new(&watch.cursor_path, &cfg.token_contract)?;
     cursor.opened_at_unix.get_or_insert(now_unix()?);
     cursor.save(&watch.cursor_path)?;
@@ -1237,6 +1452,7 @@ mod tests {
         polls: AtomicU64,
         state_failures_remaining: AtomicU64,
         state_reads: AtomicU64,
+        snapshot_outage: AtomicBool,
         subscription: bool,
         expect_last_seen: Option<i64>,
         record_created_at: i64,
@@ -1268,6 +1484,7 @@ mod tests {
                 polls: AtomicU64::new(0),
                 state_failures_remaining: AtomicU64::new(0),
                 state_reads: AtomicU64::new(0),
+                snapshot_outage: AtomicBool::new(false),
                 subscription: false,
                 expect_last_seen,
                 record_created_at,
@@ -1295,6 +1512,7 @@ mod tests {
                 polls: AtomicU64::new(0),
                 state_failures_remaining: AtomicU64::new(0),
                 state_reads: AtomicU64::new(0),
+                snapshot_outage: AtomicBool::new(false),
                 subscription: false,
                 expect_last_seen: None,
                 record_created_at: 1,
@@ -1539,6 +1757,11 @@ mod tests {
             _: &TokenContract,
         ) -> Result<Option<DealChainSnapshot>, ChainError> {
             self.state_reads.fetch_add(1, Ordering::Relaxed);
+            if self.snapshot_outage.swap(false, Ordering::Relaxed) {
+                return Err(ChainError::Transport(
+                    "BK snapshot read budget exhausted".into(),
+                ));
+            }
             let state = DealChainState {
                 funded: true,
                 opened: self.opened.load(Ordering::Relaxed),
@@ -1895,6 +2118,7 @@ mod tests {
             note: Arc::new(LocalNote::generate()),
             server_task: tokio::spawn(std::future::pending()),
             listen_addr: "127.0.0.1:0".parse().unwrap(),
+            migrated_routes: Default::default(),
             tls_fingerprint: "test-fingerprint".to_string(),
         }
     }
@@ -3088,6 +3312,34 @@ mod tests {
         assert_eq!(matched.token_contract, "tc-classified-transient-network");
         assert_eq!(backend.polls.load(Ordering::Relaxed), 2);
         assert_eq!(backend.opens.load(Ordering::Relaxed), 0);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn issue_2206_funded_match_survives_exhausted_setup_read() {
+        let (_dir, cursor_path) = temp_cursor_path("2206-setup-read");
+        let seller = test_seller();
+        let cfg = test_cfg("tc-2206-setup");
+        let buyer = LocalNote::generate();
+        let backend = PollBackend::new(
+            Some(sample_match(&cfg.token_contract, buyer.pubkey())),
+            None,
+            now_unix().unwrap() as i64 + 1,
+        );
+        backend.snapshot_outage.store(true, Ordering::Relaxed);
+        let watch = SellerMatchWatchConfig {
+            cursor_path,
+            poll_interval: dexdo_core::params::DEFAULT_MATCH_POLL_INTERVAL,
+        };
+        let served = watch_and_serve_match(&seller, &backend, &cfg, &watch)
+            .await
+            .unwrap();
+        assert_eq!(served.token_contract, cfg.token_contract);
+        assert_eq!(served.buyer_pubkey, buyer.pubkey());
+        assert_eq!(backend.polls.load(Ordering::Relaxed), 1);
+        assert_eq!(backend.state_reads.load(Ordering::Relaxed), 3);
+        assert_eq!(backend.opens.load(Ordering::Relaxed), 1);
+        assert!(backend.handover.lock().unwrap().is_some());
+        seller.server_task.abort();
     }
 
     #[tokio::test(start_paused = true)]

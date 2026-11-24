@@ -59,6 +59,10 @@ proptest! {
 // Drive the pinned SDK, which flattens errors[] into a string, through a real HTTP response.
 #[tokio::test]
 async fn issue_2122_sdk_account_read_recovers_without_submitting_anything() {
+    sdk_account_read_recovers(bm_refused).await;
+}
+
+pub(super) async fn sdk_account_read_recovers(failure_message: fn(&str) -> String) {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let endpoint = format!("http://{}", listener.local_addr().unwrap());
     let calls = Arc::new(AtomicUsize::new(0));
@@ -99,7 +103,7 @@ async fn issue_2122_sdk_account_read_recovers_without_submitting_anything() {
             }
             observed.fetch_add(1, Ordering::SeqCst);
             let body = if attempt == 0 {
-                json!({"data": null, "errors": [{"message": bm_refused(&wanted)}]})
+                json!({"data": null, "errors": [{"message": failure_message(&wanted)}]})
             } else {
                 json!({"data":{"blockchain":{"account":{"info": {
                     "acc_type_name":"Active", "balance":"0x0", "balance_other":[]

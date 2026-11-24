@@ -196,7 +196,7 @@ fn earlier_schema_is_rejected_without_rewriting_history() {
     drop(store);
     let path = dir.path().join("usage.sqlite3");
     let connection = Connection::open(&path).unwrap();
-    for version in 1..BUYER_USAGE_SCHEMA_VERSION {
+    for version in [1, 2, BUYER_USAGE_SCHEMA_VERSION + 1] {
         connection
             .pragma_update(None, "user_version", version)
             .unwrap();

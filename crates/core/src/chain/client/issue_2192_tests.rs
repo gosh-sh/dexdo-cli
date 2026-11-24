@@ -390,3 +390,30 @@ async fn issue_2192_review_later_page_retry_preserves_cursor_and_decoded_orders(
     assert_eq!(requests[1], requests[2]);
     assert_eq!(backend.client.gate().admissions(), 3);
 }
+
+// The shared pager owns retries after admission; the book fold must not retry it again.
+#[tokio::test]
+async fn issue_2284_book_history_exhausts_each_admitted_page_only_once() {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let endpoint = format!("http://{}", listener.local_addr().unwrap());
+    let mut replies = vec![(200, json!({"dapp_id": crate::address::DEXDO_DAPP_ID}))];
+    replies.extend((0..crate::params::TRANSIENT_READ_ATTEMPTS).map(|_| (502, json!({}))));
+    let (requests, task) = issue_2030_producer_server(listener, replies);
+    let backend = issue_2030_backend(&endpoint);
+    let account = Address::parse(&format!("0:{}", "a".repeat(64))).unwrap();
+    let error = backend
+        .fold_order_book_events(&account.with_workchain(), BookEventFold::default())
+        .await
+        .unwrap_err();
+    task.await.unwrap();
+    let expected = 1 + crate::params::TRANSIENT_READ_ATTEMPTS;
+    assert_eq!(requests.lock().unwrap().len(), expected);
+    assert_eq!(backend.client.gate().admissions(), expected);
+    assert!(
+        error.downcast_ref::<reqwest::Error>().is_some_and(|error| {
+            error.status() == Some(reqwest::StatusCode::BAD_GATEWAY)
+        }),
+        "{error:#}"
+    );
+    assert!(format!("{error:#}").contains(crate::CHAIN_READ_EXHAUSTED_MESSAGE_PREFIX));
+}

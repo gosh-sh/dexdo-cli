@@ -133,14 +133,13 @@ async fn assert_control_closes(harness: &WeeklyRouteHarness, path: &str, stream:
     assert_eq!(status, reqwest::StatusCode::GONE, "{case}: {body}");
 }
 
-/// A gateway failure before the first token. Since a provider failure is request-scoped by
-/// itself, so this is the gateway's own untagged transport failure, the one `dead_gateway` owns.
+/// A temporary gRPC failure before the provider head fails only the current request.
 #[tokio::test]
-async fn keep_open_dead_gateway_before_the_first_token_keeps_serving_the_deal() {
+async fn issue_2266_temporary_gateway_status_before_head_keeps_serving() {
     for path in PATHS {
         for stream in [false, true] {
-            for (policy, kept) in [(keep_open(), true), (closing(), false)] {
-                let case = format!("dead_gateway {path} stream={stream} keep_open={kept}");
+            for policy in [keep_open(), closing()] {
+                let case = format!("dead_gateway {path} stream={stream} policy={policy:?}");
                 let harness = harness(
                     crate::seller::UpstreamConfig::Mock,
                     ContentGate::skip(),
@@ -154,16 +153,11 @@ async fn keep_open_dead_gateway_before_the_first_token_keeps_serving_the_deal() 
                     .seller
                     .set_probe_output_fixture(false, "DEXDO_FIXTURE_TRANSPORT_BEFORE_OUTPUT");
                 let (status, body) = harness.ask_full(path, 4, "question", stream).await;
-                if kept {
-                    assert_kept_open(&harness, &deal, (status, &body), &case);
-                    // The gateway answers again; this marker selects no failure.
-                    harness
-                        .seller
-                        .set_probe_output_fixture(false, "DEXDO_2148_GATEWAY_BACK");
-                    assert_next_served(&harness, &tc, path, stream, &case).await;
-                } else {
-                    assert_control_closes(&harness, path, stream, &case).await;
-                }
+                assert_kept_open(&harness, &deal, (status, &body), &case);
+                harness
+                    .seller
+                    .set_probe_output_fixture(false, "DEXDO_2148_GATEWAY_BACK");
+                assert_next_served(&harness, &tc, path, stream, &case).await;
                 harness.shutdown().await;
             }
         }
@@ -174,10 +168,10 @@ async fn keep_open_dead_gateway_before_the_first_token_keeps_serving_the_deal() 
 /// gateway path. Each request reconnects: the second one reaches the dead gateway again instead of
 /// being refused by a latched local API.
 #[tokio::test]
-async fn keep_open_dead_gateway_at_stream_open_reconnects_on_every_request() {
+async fn issue_2266_unreachable_gateway_is_request_scoped() {
     for path in PATHS {
-        for (policy, kept) in [(keep_open(), true), (closing(), false)] {
-            let case = format!("dead_gateway open {path} keep_open={kept}");
+        for policy in [keep_open(), closing()] {
+            let case = format!("dead_gateway open {path} policy={policy:?}");
             let harness = harness(
                 crate::seller::UpstreamConfig::Mock,
                 ContentGate::skip(),
@@ -198,20 +192,104 @@ async fn keep_open_dead_gateway_at_stream_open_reconnects_on_every_request() {
             }
             let (status, body) = harness.ask_full(path, 4, "question", false).await;
             assert_eq!(status, reqwest::StatusCode::BAD_GATEWAY, "{case}: {body}");
-            if kept {
+            assert_kept_open(&harness, &deal, (status, &body), &case);
+            for _ in 0..2 {
+                let (status, body) = harness.ask_full(path, 4, "question", false).await;
+                assert_eq!(status, reqwest::StatusCode::BAD_GATEWAY, "{case}: {body}");
+                assert!(body.contains("upstream open failed"), "{case}: {body}");
                 assert_kept_open(&harness, &deal, (status, &body), &case);
-                for _ in 0..2 {
-                    let (status, body) = harness.ask_full(path, 4, "question", false).await;
-                    assert_eq!(status, reqwest::StatusCode::BAD_GATEWAY, "{case}: {body}");
-                    assert!(body.contains("upstream open failed"), "{case}: {body}");
-                    assert_kept_open(&harness, &deal, (status, &body), &case);
-                }
-            } else {
-                assert_control_closes(&harness, path, false, &case).await;
             }
             harness.shutdown().await;
         }
     }
+}
+
+#[tokio::test]
+async fn issue_2275_stalled_gateway_returns_502_and_the_next_request_recovers() {
+    issue_2275_gateway_returns_502_and_recovers(false).await;
+}
+
+#[tokio::test]
+async fn issue_2275_closed_ready_gateway_returns_502_without_redial_and_recovers() {
+    issue_2275_gateway_returns_502_and_recovers(true).await;
+}
+
+async fn issue_2275_gateway_returns_502_and_recovers(close_ready_channel: bool) {
+    use crate::buyer::tls::{
+        test_tls_acceptor, wait_for_client_settings_ack, EMPTY_SERVER_SETTINGS,
+    };
+    use dexdo_core::params::BUYER_GATEWAY_DIAL_TIMEOUT;
+    use tokio::io::AsyncWriteExt;
+    use tokio::net::{TcpListener, TcpStream};
+
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let harness = weekly_route_harness_with_seller_shape(
+        WeeklyRouteScenario {
+            claimed: PROBE_CLAIM,
+            subscription: false,
+            expires_in: SUB_WEEK_LEN.as_secs(),
+            upstream_tokens: UNCONSTRAINED_UPSTREAM,
+            content_gate: ContentGate::skip(),
+            upstream: crate::seller::UpstreamConfig::Mock,
+            failure_policy: keep_open(),
+            lifetime: SessionLifetimePolicy::SettleOnExit,
+        },
+        None,
+        Some(listener.local_addr().unwrap()),
+    )
+    .await;
+    let deal = harness.deals.current().await.unwrap();
+    let path = "/v1/chat/completions";
+    let started = tokio::time::Instant::now();
+    let fault = async {
+        let (socket, _) = listener.accept().await.unwrap();
+        if !close_ready_channel {
+            // Keep the socket open and silent until the request has failed.
+            return Some(socket);
+        }
+        let acceptor = test_tls_acceptor(&harness.seller.tls);
+        let mut stream = acceptor.accept(socket).await.unwrap();
+        stream.write_all(&EMPTY_SERVER_SETTINGS).await.unwrap();
+        stream.flush().await.unwrap();
+        wait_for_client_settings_ack(&mut stream).await;
+        stream.shutdown().await.unwrap();
+        None
+    };
+    let ((status, body), stalled) = tokio::time::timeout(2 * BUYER_GATEWAY_DIAL_TIMEOUT, async {
+        tokio::join!(harness.ask_full(path, 4, "question", false), fault)
+    })
+    .await
+    .expect("keep_open must answer after one dial timeout");
+    drop(stalled);
+    assert_eq!(status, reqwest::StatusCode::BAD_GATEWAY, "{body}");
+    if !close_ready_channel {
+        assert!(started.elapsed() >= BUYER_GATEWAY_DIAL_TIMEOUT);
+        assert!(body.contains("E_GATEWAY_UNREACHABLE"), "{body}");
+        assert!(body.contains("tls_handshake"), "{body}");
+    }
+    assert!(futures::poll!(Box::pin(listener.accept())).is_pending());
+    assert_deal_kept_open(&harness, &deal, "gateway connection failed");
+
+    // Restore the route at the advertised address, preserving the pinned TLS identity.
+    let seller_addr = harness.seller.listen_addr;
+    let forward = tokio::spawn(async move {
+        while let Ok((mut client, _)) = listener.accept().await {
+            tokio::spawn(async move {
+                let mut seller = TcpStream::connect(seller_addr).await.unwrap();
+                let _ = tokio::io::copy_bidirectional(&mut client, &mut seller).await;
+            });
+        }
+    });
+    assert_next_served(
+        &harness,
+        &deal.route.token_contract,
+        path,
+        false,
+        "gateway restored",
+    )
+    .await;
+    forward.abort();
+    harness.shutdown().await;
 }
 
 #[tokio::test]
@@ -257,77 +335,59 @@ async fn keep_open_empty_stream_keeps_serving_the_deal() {
     }
 }
 
-/// A gateway failure after output was accepted. The provider-tagged variant of the same shape is
-/// 's unresolved-usage pause, checked separately below.
+/// An untagged transport failure after partial output leaves the deal open.
 #[tokio::test]
-async fn keep_open_seller_stall_mid_stream_keeps_serving_the_deal() {
+async fn issue_2266_gateway_interruption_keeps_serving_the_same_deal() {
     for path in PATHS {
-        for stream in [false, true] {
-            for (policy, kept) in [(keep_open(), true), (closing(), false)] {
-                let case =
-                    format!("seller_stalls_mid_stream {path} stream={stream} keep_open={kept}");
-                let harness = harness(
-                    crate::seller::UpstreamConfig::Mock,
-                    ContentGate::skip(),
-                    policy,
-                    SessionLifetimePolicy::SettleOnExit,
-                )
-                .await;
-                let deal = harness.deals.current().await.unwrap();
-                let tc = deal.route.token_contract.clone();
-                let (status, body) = harness
-                    .ask_full(path, 8, "DEXDO_FIXTURE_USAGE_THEN_ERROR", stream)
-                    .await;
-                if kept {
-                    assert_kept_open(&harness, &deal, (status, &body), &case);
-                    assert_next_served(&harness, &tc, path, stream, &case).await;
-                } else {
-                    assert_eq!(harness.chain.dispute_calls(), 1, "{case}");
-                    assert_control_closes(&harness, path, stream, &case).await;
-                }
-                harness.shutdown().await;
-            }
-        }
-    }
-}
-
-/// Provider output that ended without terminal usage pauses the deal until that request is
-/// reconciled. `keep_open` writes nothing and closes nothing, and it does not lift the
-/// pause either: what is refused for lack of authoritative usage stays refused.
-#[tokio::test]
-async fn keep_open_does_not_lift_the_unresolved_usage_pause() {
-    for path in PATHS {
-        for stream in [false, true] {
-            let case = format!("unresolved usage {path} stream={stream}");
+        for policy in [keep_open(), closing()] {
+            let case = format!("seller_stalls_mid_stream {path} SSE policy={policy:?}");
             let harness = harness(
                 crate::seller::UpstreamConfig::Mock,
                 ContentGate::skip(),
-                keep_open(),
+                policy,
                 SessionLifetimePolicy::SettleOnExit,
             )
             .await;
             let deal = harness.deals.current().await.unwrap();
+            let tc = deal.route.token_contract.clone();
             let (status, body) = harness
-                .ask_full(
-                    path,
-                    8,
-                    "DEXDO_FIXTURE_STRADDLE DEXDO_FIXTURE_ERROR_BEFORE_USAGE",
-                    stream,
-                )
+                .ask_full(path, 8, "DEXDO_FIXTURE_CUT_AFTER_OUTPUT", true)
                 .await;
             assert_kept_open(&harness, &deal, (status, &body), &case);
-            let (status, body) = harness.ask_full(path, 4, "question", stream).await;
-            assert_eq!(
-                status,
-                reqwest::StatusCode::SERVICE_UNAVAILABLE,
-                "{case}: {body}"
-            );
-            assert!(body.contains("upstream_usage_unresolved"), "{case}: {body}");
-            assert!(!deal.session.is_closed(), "{case}");
-            assert_eq!(harness.chain.foreign_money_calls(), 0, "{case}");
-            assert_eq!(harness.chain.dispute_calls(), 0, "{case}");
+            assert!(body.contains("upstream_retryable"), "{case}: {body}");
+            assert_eq!(deal.billable_tokens(), 0, "{case}");
+            assert_next_served(&harness, &tc, path, true, &case).await;
             harness.shutdown().await;
         }
+    }
+}
+
+/// A provider-tagged interruption without terminal billing also keeps the deal open.
+#[tokio::test]
+async fn issue_2266_provider_interruption_keeps_serving_the_same_deal() {
+    for path in PATHS {
+        let case = format!("interrupted answer {path} SSE");
+        let harness = harness(
+            crate::seller::UpstreamConfig::Mock,
+            ContentGate::skip(),
+            keep_open(),
+            SessionLifetimePolicy::SettleOnExit,
+        )
+        .await;
+        let deal = harness.deals.current().await.unwrap();
+        let (status, body) = harness
+            .ask_full(
+                path,
+                8,
+                "DEXDO_FIXTURE_STRADDLE DEXDO_FIXTURE_ERROR_BEFORE_USAGE",
+                true,
+            )
+            .await;
+        assert_kept_open(&harness, &deal, (status, &body), &case);
+        assert!(body.contains("upstream_retryable"), "{case}: {body}");
+        assert_eq!(deal.billable_tokens(), 0, "{case}");
+        assert_next_served(&harness, &deal.route.token_contract, path, true, &case).await;
+        harness.shutdown().await;
     }
 }
 

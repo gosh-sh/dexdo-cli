@@ -1,0 +1,14 @@
+DROP TRIGGER usage_journal_requests_insert;
+DROP TRIGGER usage_journal_requests_update;
+DROP TRIGGER usage_journal_requests_delete;
+DROP TRIGGER usage_journal_request_usage_insert;
+DROP TRIGGER usage_journal_request_usage_update;
+DROP TRIGGER usage_journal_request_usage_delete;
+DROP TRIGGER usage_journal_deal_prices_insert;
+DROP TRIGGER usage_journal_deal_prices_update;
+DROP TRIGGER usage_journal_deal_prices_delete;
+DROP TRIGGER usage_journal_deal_quota_insert;
+DROP TRIGGER usage_journal_deal_quota_update;
+DROP TRIGGER usage_journal_deal_quota_delete;
+DROP TABLE usage_changes;
+DROP TABLE usage_change_journal;

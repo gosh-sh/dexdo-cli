@@ -44,9 +44,10 @@ async fn issue_2115_all_preflight_reads_finish_before_the_journal_boundary() {
             0,
             1,
             crate::params::MAX_SELL_TTL.as_secs(),
-            &mut |hash| {
+            &mut |hash, expire| {
                 let mut post = issue_2115_post();
                 post.message_id = hash;
+        post.expire_at_unix = Some(expire);
                 post.save(Some(&path))
             },
         )
@@ -76,9 +77,10 @@ async fn issue_2115_failed_preflight_allows_one_healthy_post_after_restart() {
     );
     let directory = tempfile::tempdir().unwrap();
     let path = directory.path().join("pending.sell.json");
-    let mut journal = |hash| {
+    let mut journal = |hash, expire| {
         let mut post = issue_2115_post();
         post.message_id = hash;
+        post.expire_at_unix = Some(expire);
         post.save(Some(&path))
     };
     for healthy in [false, true] {
@@ -147,9 +149,10 @@ async fn issue_2115_cancelled_dispatched_post_keeps_durable_identity() {
     let chain = issue_2030_backend(&endpoint);
     let keys = KeyPair::from_secret_hex(&"3a".repeat(32)).unwrap();
     let note = issue_2115_address('a');
-    let mut journal = |hash| {
+    let mut journal = |hash, expire| {
         let mut post = issue_2115_post();
         post.message_id = hash;
+        post.expire_at_unix = Some(expire);
         post.save(Some(&path))
     };
     {
@@ -222,17 +225,71 @@ fn issue_2115_account_fixture(address: &Address, abi: &str, tvc: &[u8], override
         "boc":base64::engine::general_purpose::STANDARD.encode(tvm_types::write_boc(&account.serialize().unwrap()).unwrap())})
 }
 
+fn issue_2115_seller_chain(endpoint: &str) -> RealChainBackend {
+    let mut chain = issue_2030_backend(endpoint);
+    chain.deployed.version = Some(GENERATION_PINS[0].version.to_owned());
+    chain
+}
+
+fn issue_2115_seller_note_fixture(note: &Address) -> Value {
+    let keys = KeyPair::from_secret_hex(&"3a".repeat(32)).unwrap();
+    let mut info = issue_2115_account_fixture(
+        note,
+        PRIVATENOTE_ABI,
+        PRIVATENOTE_TVC,
+        json!({
+            "_constructorFlag": true,
+            "_ephemeralPubkey": format!("0x{}", keys.public_hex()),
+            "_inferenceOrderBookCode": RealChainBackend::inference_orderbook_code_b64().unwrap()
+        }),
+    );
+    info["code_hash"] = json!(PRIVATENOTE_PINNED_CODE_HASH);
+    info
+}
+
 #[derive(Default)]
 struct Issue2115RestingState {
     order: Option<u128>,
     pruned: bool,
     posts: Vec<String>,
     roots_read: usize,
+    note_history: Vec<Value>,
+    note_history_reads: usize,
+    note_history_error: bool,
+    late_message_on_history_read: Option<String>,
+    book_reads_before_failure: Option<usize>,
     unknown: bool,
     reject_posts: bool,
     invalid_post_reply: bool,
     rejected_hashes: Vec<String>,
+    rejected_boc: Option<String>,
     post_replies: std::collections::VecDeque<(u16, Value)>,
+    expiry_anchors: Vec<String>,
+    expiry_anchor_unknown_ack: bool,
+}
+
+fn issue_2264_history_tx(lt: u64, now: u32, previous: Option<(&Value, u64)>, inbound_boc: Option<&str>) -> Value {
+    use tvm_block::{AccountStatus, Serializable, Transaction};
+    let note = issue_2115_address('a');
+    let mut tx = Transaction::with_address_and_status(
+        tvm_types::SliceData::from_string(note.bare()).unwrap(),
+        AccountStatus::AccStateActive,
+    );
+    tx.set_logical_time(lt);
+    tx.set_now(now);
+    if let Some((previous, prev_lt)) = previous {
+        tx.set_prev_trans_hash(previous["id"].as_str().unwrap().parse().unwrap());
+        tx.set_prev_trans_lt(prev_lt);
+    }
+    if let Some(boc) = inbound_boc {
+        let bytes = base64::engine::general_purpose::STANDARD.decode(boc).unwrap();
+        tx.set_in_msg_cell(tvm_types::read_single_root_boc(&bytes).unwrap());
+    }
+    let cell = tx.serialize().unwrap();
+    json!({
+        "id":cell.repr_hash().to_hex_string(), "status":3, "account_addr":note.bare(),
+        "boc":base64::engine::general_purpose::STANDARD.encode(tvm_types::write_boc(&cell).unwrap())
+    })
 }
 
 async fn issue_2115_resting_backend() -> (
@@ -265,14 +322,25 @@ async fn issue_2115_resting_backend() -> (
             let reply = {
                 let mut state = server_state.lock().unwrap();
                 if input.is_array() {
-                    let hash = external_message_hash(input[0]["body"].as_str().unwrap()).unwrap();
-                    if state.invalid_post_reply {
+                    let boc = input[0]["body"].as_str().unwrap();
+                    let hash = external_message_hash(boc).unwrap();
+                    let call = decode_external_abi_message_boc(boc, PRIVATENOTE_ABI, true).unwrap();
+                    if call.function_name == "creditFromBook" {
+                        assert_eq!(decoded_u128(&call.tokens, "amount"), Some(0));
+                        state.expiry_anchors.push(boc.to_owned());
+                        if state.expiry_anchor_unknown_ack {
+                            json!({"error":{"code":"INTERNAL_ERROR", "message":"fixture lost anchor acknowledgement"}})
+                        } else {
+                            json!({"result":{}})
+                        }
+                    } else if state.invalid_post_reply {
                         invalid_payload = true;
                         state.rejected_hashes.push(hash);
                         Value::Null
                     } else if let Some((reply_status, reply)) = state.post_replies.pop_front() {
                         status = reply_status;
                         state.rejected_hashes.push(hash);
+                        state.rejected_boc = Some(boc.to_owned());
                         reply
                     } else if state.reject_posts {
                         state.rejected_hashes.push(hash);
@@ -282,6 +350,10 @@ async fn issue_2115_resting_backend() -> (
                         state.order = Some(103);
                         json!({"result":{}})
                     }
+                } else if input["query"].as_str().unwrap().contains("transaction(hash:") {
+                    let hash = input["variables"]["hash"].as_str().unwrap();
+                    let node = state.note_history.iter().find(|node| node["id"] == hash);
+                    json!({"data":{"blockchain":{"transaction":node}}})
                 } else if let Some(hash) = input["variables"]["hash"].as_str() {
                     let initial = hash == "1".repeat(64);
                     if initial { state.roots_read += 1; }
@@ -308,6 +380,20 @@ async fn issue_2115_resting_backend() -> (
                         }
                         reply
                     }
+                } else if input["query"].as_str().unwrap().contains("transactions(last: 1)") {
+                    assert_eq!(input["variables"]["account"], issue_2115_address('a').bare());
+                    assert_eq!(input["variables"]["dapp"], crate::address::DEXDO_DAPP_ID);
+                    state.note_history_reads += 1;
+                    if state.note_history_error {
+                        json!({"errors":[{"message":"fixture note history unavailable"}]})
+                    } else {
+                        if let Some(id) = state.late_message_on_history_read.take() {
+                            state.order = Some(103);
+                            state.posts.push(id);
+                        }
+                        let rows = state.note_history.last().map(|node| json!({"node":node})).into_iter().collect::<Vec<_>>();
+                        json!({"data":{"blockchain":{"account":{"transactions":{"edges":rows}}}}})
+                    }
                 } else if input["query"].as_str().unwrap().contains("blocks") {
                     issue_2115_clock_reply()
                 } else {
@@ -315,10 +401,7 @@ async fn issue_2115_resting_backend() -> (
                     let note = issue_2115_address('a');
                     let tc = issue_2115_address('c');
                     let info = if query.contains(note.bare()) {
-                        issue_2115_account_fixture(&note, PRIVATENOTE_ABI, PRIVATENOTE_TVC, json!({
-                            "_constructorFlag":true,"_ephemeralPubkey":format!("0x{}", KeyPair::from_secret_hex(&"3a".repeat(32)).unwrap().public_hex()),
-                            "_inferenceOrderBookCode":RealChainBackend::inference_orderbook_code_b64().unwrap()
-                        }))
+                        issue_2115_seller_note_fixture(&note)
                     } else if query.contains(tc.bare()) {
                         issue_2115_account_fixture(&tc, TOKENCONTRACT_ABI, TOKENCONTRACT_TVC, json!({
                             "_constructorFlag":true,"_modelName":"fixture--model--v1","_modelHash":model,
@@ -327,6 +410,13 @@ async fn issue_2115_resting_backend() -> (
                         }))
                     } else {
                         assert!(query.contains(server_book.bare()), "unexpected query: {query}");
+                        if let Some(remaining) = &mut state.book_reads_before_failure {
+                            if *remaining == 0 {
+                                status = 503;
+                            } else {
+                                *remaining -= 1;
+                            }
+                        }
                         let orders = state.order.map(|id| json!({id.to_string():{
                             "note":note.with_workchain(),"buyerPubkey":"0","tokenContract":tc.with_workchain(),
                             "price":PRICE_STEP.to_string(),"amount":"100","initialAmount":"100","filledAccum":"0","escrow":"0",
@@ -346,7 +436,7 @@ async fn issue_2115_resting_backend() -> (
             socket.write_all(format!("HTTP/1.1 {status} fixture\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{reply}", reply.len()).as_bytes()).await.unwrap();
         }
     });
-    let chain = issue_2030_backend(&endpoint);
+    let chain = issue_2115_seller_chain(&endpoint);
     let mut post = issue_2115_post();
     post.network = chain.network().to_string();
     post.order_book = book.with_workchain();
@@ -405,7 +495,7 @@ async fn issue_2115_normal_rested_and_restart_checkpoint_before_history_pruning(
             state.order = None;
         }
         let seller = super::super::backends::RealSellerBackend::new(
-            issue_2030_backend(&endpoint),
+            issue_2115_seller_chain(&endpoint),
             issue_2115_address('a'),
             KeyPair::from_secret_hex(&"3a".repeat(32)).unwrap(),
             model_hash_for("fixture--model--v1"),
@@ -445,10 +535,10 @@ async fn issue_2115_normal_rested_and_restart_checkpoint_before_history_pruning(
             roots,
             "pruned predecessor must not be read again"
         );
-        assert!(seller
+        assert!(matches!(seller
             .reconcile_pending_offer(&issue_2115_address('c'), &book)
             .await
-            .unwrap());
+            .unwrap(), super::super::backends::ReconciledSell::Existing));
         server.abort();
     }
 }

@@ -16,7 +16,10 @@ enum ReadFailure {
     OneAttempt,
 }
 
-struct RequiredReadFailure(ReadFailure);
+struct RequiredReadFailure {
+    failure: ReadFailure,
+    replay_posts: Option<AtomicU64>,
+}
 
 #[async_trait::async_trait]
 impl ChainBackend for RequiredReadFailure {
@@ -49,11 +52,26 @@ impl ChainBackend for RequiredReadFailure {
     }
 
     async fn claim_tokens(&self, _: &String, _: &dyn Note, _: u128) -> Result<(), ChainError> {
-        unimplemented!()
+        self.replay_posts
+            .as_ref()
+            .unwrap()
+            .fetch_add(1, Ordering::Relaxed);
+        Err(ChainError::ClaimReplayRecovery {
+            message: "TVM_ERROR exit_code=52".into(),
+            observed: Some(TICK_SIZE),
+            read_failure: None,
+        })
     }
 
     async fn deal_state(&self, _: &String) -> Result<Option<DealChainState>, ChainError> {
-        Err(match self.0 {
+        if self
+            .replay_posts
+            .as_ref()
+            .is_some_and(|posts| posts.load(Ordering::Relaxed) == 0)
+        {
+            return Ok(Some(open_state(TICK_SIZE)));
+        }
+        Err(match self.failure {
             ReadFailure::ExhaustedBudget => ChainError::Chain(format!(
                 "TokenContract 0:1196: could not obtain a coherent TokenContract snapshot after 3 attempts: attempt 3: bracketed read failed: {}5 attempt(s) in 45s",
                 CHAIN_READ_EXHAUSTED_MESSAGE_PREFIX
@@ -73,17 +91,31 @@ impl ChainBackend for RequiredReadFailure {
     }
 }
 
-struct GatewayAvailabilityObserver {
+struct GatewayAvailabilityObserver<'a> {
     state: Arc<GatewayState>,
+    claim_retry: Option<&'a tokio::sync::Notify>,
 }
 
-impl ClaimStateObserver for GatewayAvailabilityObserver {
-    fn observe(&self, _: &String, _: DealChainState) -> Result<(), ChainError> {
-        Ok(())
+impl ClaimStateObserver for GatewayAvailabilityObserver<'_> {
+    fn observe(&self, tc: &String, state: DealChainState) -> Result<(), ChainError> {
+        self.state
+            .reconcile_ordinary_capacity(tc, state)
+            .map(|_| ())
+            .map_err(|error| ChainError::Chain(error.to_string()))
     }
 
-    fn observe_chain_unavailable(&self, token_contract: &String, _: &ChainError) {
-        self.state.report_chain_unavailable(token_contract);
+    fn observe_chain_unavailable(
+        &self,
+        token_contract: &String,
+        _: &ChainError,
+    ) -> ChainUnavailableAction {
+        self.state.report_chain_unavailable(token_contract)
+    }
+
+    fn observe_retry_after(&self, _: &String, _: Duration) {
+        if let Some(retry) = self.claim_retry {
+            retry.notify_one();
+        }
     }
 }
 
@@ -99,7 +131,10 @@ fn instant_windows() -> AdvanceWindows {
 async fn fail_required_read(state: Arc<GatewayState>, failure: ReadFailure) {
     let delivery = state.delivery(TC);
     let result = drive_advance_with_observer(
-        &RequiredReadFailure(failure),
+        &RequiredReadFailure {
+            failure,
+            replay_posts: None,
+        },
         &TC.to_string(),
         &LocalNote::generate(),
         instant_windows(),
@@ -108,7 +143,10 @@ async fn fail_required_read(state: Arc<GatewayState>, failure: ReadFailure) {
         true,
         delivery.count,
         delivery.done,
-        &GatewayAvailabilityObserver { state },
+        &GatewayAvailabilityObserver {
+            state,
+            claim_retry: None,
+        },
     )
     .await;
     assert!(
@@ -257,6 +295,105 @@ async fn keep_serving_preserves_the_existing_clean_relay_behavior() {
     );
     assert!(buyer_rx.recv().await.is_none());
     relay.await.unwrap();
+}
+
+#[tokio::test(start_paused = true)]
+async fn claim_replay_recovery_keeps_serving_after_exhausted_reads() {
+    for action in [
+        ChainUnavailableAction::Stop,
+        ChainUnavailableAction::KeepServing,
+    ] {
+        let state = Arc::new(GatewayState::new());
+        state.set_chain_unavailable_action(action);
+        let tc = TC.to_owned();
+        let buyer = LocalNote::generate();
+        state
+            .register_stream(
+                TC,
+                buyer.pubkey(),
+                1,
+                open_state(TICK_SIZE),
+                ordinary_shape(),
+            )
+            .unwrap();
+        let capacity = state
+            .capacity_snapshot(TC)
+            .unwrap()
+            .expect("registered deal capacity");
+        let (up_tx, mut buyer_rx, relay) = controlled_relay(&state, TC).await;
+        assert!(buyer_rx.recv().await.unwrap().unwrap().head.is_some());
+
+        let backend = RequiredReadFailure {
+            failure: ReadFailure::ExhaustedBudget,
+            replay_posts: Some(AtomicU64::new(0)),
+        };
+        let seller = LocalNote::generate();
+        let delivery = state.delivery(TC);
+        delivery
+            .count
+            .store(TICK_SIZE as u64 + 1, Ordering::Relaxed);
+        let retry = tokio::sync::Notify::new();
+        let observer = GatewayAvailabilityObserver {
+            state: state.clone(),
+            claim_retry: Some(&retry),
+        };
+        let recovery = drive_advance_with_observer(
+            &backend,
+            &tc,
+            &seller,
+            instant_windows(),
+            2,
+            TICK_SIZE as u64,
+            true,
+            delivery.count,
+            delivery.done,
+            &observer,
+        );
+        tokio::pin!(recovery);
+        let poll = dexdo_core::params::ClaimConfirmationParams::canonical().poll_interval;
+        for _ in 0..2 {
+            tokio::select! {
+                _ = retry.notified() => {},
+                result = &mut recovery => panic!("exhaustion must not isolate the deal: {result:?}"),
+                _ = tokio::time::sleep(2 * poll) => {
+                    panic!("recovery must keep polling for a coherent claim state");
+                }
+            }
+        }
+        assert!(
+            !state.chain_unavailable(),
+            "{action:?} must not stop claim recovery"
+        );
+        assert_eq!(
+            backend
+                .replay_posts
+                .as_ref()
+                .unwrap()
+                .load(Ordering::Relaxed),
+            1
+        );
+        assert!(state.limits(TC).is_some());
+        assert_eq!(state.capacity_snapshot(TC).unwrap(), Some(capacity));
+
+        up_tx.send(Ok(chunk("still serving"))).await.unwrap();
+        up_tx
+            .send(Ok(UpstreamEvent::Usage(
+                BillingUsage::new(0, 1, None).unwrap(),
+            )))
+            .await
+            .unwrap();
+        drop(up_tx);
+        assert_eq!(
+            text(buyer_rx.recv().await.unwrap().unwrap()),
+            "still serving"
+        );
+        assert_eq!(
+            buyer_rx.recv().await.unwrap().unwrap().usage,
+            Some(BillingUsage::new(0, 1, None).unwrap())
+        );
+        assert!(buyer_rx.recv().await.is_none());
+        relay.await.unwrap();
+    }
 }
 
 fn authorized_request(

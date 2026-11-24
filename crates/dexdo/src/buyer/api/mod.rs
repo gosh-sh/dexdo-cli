@@ -748,6 +748,7 @@ pub struct ApiDeal {
     active_requests: Arc<AtomicU64>,
     last_request_started_unix_secs: Arc<AtomicU64>,
     purchase_terms: Arc<OnceCell<(u128, u128)>>,
+    confirmed_usage_loaded: Arc<OnceLock<()>>,
     /// Whether a chain read of this deal has shown its trial tick accepted. Set by
     /// [`Self::observe_deal_state`], never cleared: the request path reads no chain state.
     probe_accepted: Arc<AtomicBool>,
@@ -776,6 +777,7 @@ impl ApiDeal {
             active_requests: Arc::new(AtomicU64::new(0)),
             last_request_started_unix_secs: Arc::new(AtomicU64::new(0)),
             purchase_terms: Arc::new(OnceCell::new()),
+            confirmed_usage_loaded: Arc::new(OnceLock::new()),
             probe_accepted: Arc::new(AtomicBool::new(false)),
         }
     }
@@ -900,9 +902,6 @@ impl ApiDeal {
 
     /// Admit using the trial-tick acceptance observed for this deal ([`Self::observe_deal_state`]).
     async fn admit_with_probe_observation(&self, probe_accepted: bool) -> RouteBudget {
-        if let Some(error) = self.session.unresolved_usage_rejection() {
-            return RouteBudget::Exhausted(error);
-        }
         // Provider-native input is known only at terminal usage. The grant limits this request's
         // authorized payment; the shared seller ledger allocates the paid remainder exactly once.
         let Some(weekly) = self.weekly.as_ref() else {
@@ -931,7 +930,23 @@ impl ApiDeal {
                 return RouteBudget::Admitted(reservation);
             }
         }
-        let _guard = weekly.refresh_lock.lock().await;
+        let trial_refusal =
+            if weekly.anchored_before_probe() && self.try_reserve(probe_accepted).is_none() {
+                let reason = self.exhausted_reason(probe_accepted);
+                (reason.code == ConsumerErrorCode::OnchainDealLimit).then_some(reason)
+            } else {
+                None
+            };
+        let _guard = match trial_refusal {
+            // The buyer monitor observes acceptance. Until then, a spent trial pushes back
+            // even when the refresh lock is free.
+            Some(reason) if !probe_accepted => return RouteBudget::Exhausted(reason),
+            Some(reason) => match weekly.refresh_lock.try_lock() {
+                Ok(guard) => guard,
+                Err(_) => return RouteBudget::Exhausted(reason),
+            },
+            None => weekly.refresh_lock.lock().await,
+        };
         // The reconciliation that held the lock may already have published this week's ceiling.
         if self.remaining_tokens() > 0
             && !weekly.published_week_ran_out()
@@ -966,7 +981,7 @@ impl ApiDeal {
                 > verification_tokens
         {
             ConsumerError::new(
-                ConsumerErrorCode::DealCapacityUnavailable,
+                ConsumerErrorCode::OnchainDealLimit,
                 "the trial tick's admission capacity cannot serve this request yet; retry after \
                  authoritative probe acceptance and capacity reconciliation",
             )
@@ -988,23 +1003,22 @@ impl ApiDeal {
         }
     }
 
-    /// Account one terminal input+output total without crossing the published route ceiling. Reached
-    /// only through [`ConsumerRequestGuard::record_billing`], which validates the request's held
-    /// reservation first and commits that reservation only after this atomic update succeeds.
-    fn record_billable(&self, n: u64) -> Result<(), String> {
+    // Serialize checked terminal charges before updating the shared route counter.
+    fn check_billable(&self, n: u64) -> Result<(), String> {
         let ceiling = self.token_ceiling.load(Ordering::SeqCst);
-        self.billable_tokens
-            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |billable| {
-                billable.checked_add(n).filter(|next| *next <= ceiling)
-            })
-            .map(|_| ())
-            .map_err(|billable| match billable.checked_add(n) {
-                Some(next) => format!(
-                    "terminal usage would raise cumulative billing from {billable} to {next} \
-                     tokens above the currently published route ceiling {ceiling}"
-                ),
-                None => "cumulative billable-token accounting overflow".to_string(),
-            })
+        let billable = self.billable_tokens.load(Ordering::SeqCst);
+        match billable.checked_add(n) {
+            Some(next) if next <= ceiling => Ok(()),
+            Some(next) => Err(format!(
+                "terminal usage would raise cumulative billing from {billable} to {next} \
+                 tokens above the currently published route ceiling {ceiling}"
+            )),
+            None => Err("cumulative billable-token accounting overflow".to_string()),
+        }
+    }
+
+    fn commit_billable(&self, n: u64) {
+        self.billable_tokens.fetch_add(n, Ordering::SeqCst);
     }
 
     /// Record output immediately before a streaming adapter yields it to its consumer.
@@ -1025,7 +1039,6 @@ impl ApiDeal {
 
     pub fn accepted_output_guard(&self) -> dexdo_core::market::HeartbeatGuard {
         dexdo_core::market::HeartbeatGuard::new(self.accepted_output_generation.clone())
-            .with_stop_veto(self.session.unresolved_output_usage.clone())
     }
 
     pub(crate) fn begin_request(&self, now_secs: u64) -> ConsumerRequestGuard {
@@ -1042,6 +1055,7 @@ impl ApiDeal {
             usage_phase: "answer",
             request_usage: BillingUsage {
                 charged_tokens: None,
+                cumulative_billable_tokens: None,
                 cache_read_tokens: 0,
                 cache_write_tokens: 0,
                 input_tokens: 0,
@@ -1091,35 +1105,33 @@ pub(crate) struct RequestDeliveryFinalizer {
     pending: Arc<StdMutex<Option<PendingRequestDelivery>>>,
 }
 
-// The phase scope belongs only to the OnceCell initializer, never its cached waiters.
-// Observation is durable before EOF; the existing billing callback remains the acceptance gate.
+// Observe verification usage before EOF. Only the OnceCell initializer runs a paid check.
 tokio::task_local! {
-    static VERIFICATION_USAGE: (Option<RequestDeliveryFinalizer>, &'static str);
+    static PAID_PHASE: (Option<RequestDeliveryFinalizer>, &'static str);
 }
 
 pub(super) fn observe_verification_usage(record: Option<BillingUsage>) {
-    let _ = VERIFICATION_USAGE.try_with(|(finalizer, phase)| {
+    let _ = PAID_PHASE.try_with(|(finalizer, phase)| {
         if let Some(finalizer) = finalizer {
-            match record {
-                Some(record) => finalizer.persist_usage(phase, phase, record, false),
-                // A zero-valued state row carries only completeness, not invented provider work.
-                None => {
-                    finalizer.persist_usage(phase, "in_progress", BillingUsage::default(), false)
-                }
-            }
+            let (call_id, record) = match record {
+                Some(record) => (*phase, record),
+                // A zero-valued state row carries only completeness.
+                None => ("in_progress", BillingUsage::default()),
+            };
+            finalizer.observe_usage(phase, call_id, record);
         }
     });
 }
 
 impl RequestDeliveryFinalizer {
-    fn persist_usage(&self, phase: &str, call_id: &str, record: BillingUsage, accepted: bool) {
+    fn observe_usage(&self, phase: &str, call_id: &str, record: BillingUsage) {
         self.with_pending(|pending| {
             if let Some(store) = pending.usage.as_ref() {
                 if let Err(error) =
-                    store.record_call_usage(&pending.request_id, phase, call_id, record, accepted)
+                    store.record_call_usage(&pending.request_id, phase, call_id, record, false)
                 {
                     pending.usage_history_complete = false;
-                    tracing::error!(%error, "buyer usage: could not persist call usage/state");
+                    tracing::error!(%error, "buyer usage: could not persist observed usage");
                 }
             }
         });
@@ -1373,11 +1385,11 @@ impl ConsumerRequestGuard {
                 .checked_add(usage.billable_tokens())
                 .ok_or_else(|| "consumer request charged-token accounting overflow".to_string())?,
         );
-        self.persist_usage("answer", usage, false);
         let finalizer = self
             .delivery_finalizer
             .as_ref()
             .ok_or_else(|| "request delivery finalizer is not armed".to_string())?;
+        finalizer.observe_usage("answer", "answer", usage);
         finalizer
             .with_pending(|pending| {
                 if pending.observed_request_usage.is_some() {
@@ -1443,6 +1455,11 @@ impl ConsumerRequestGuard {
                 .checked_add(usage.billable_tokens())
                 .ok_or_else(|| "consumer request charged-token accounting overflow".to_string())?,
         );
+        let _accounting = deal
+            .session
+            .billing_lock
+            .lock()
+            .expect("billing lock poisoned");
         // The existing anchor mutex is the acceptance cutover mutex. Every subscription chunk takes
         // it, including chunks from old reservations after the pre-probe flag has been cleared: a
         // chunk either commits before the cutover samples delivery, or validates the new ceiling.
@@ -1459,10 +1476,39 @@ impl ConsumerRequestGuard {
             "accepted billing usage has no admitted route reservation".to_string()
         })?;
         let next_used = reservation.checked_used_after(usage.billable_tokens())?;
-        deal.record_billable(usage.billable_tokens())?;
+        deal.check_billable(usage.billable_tokens())?;
+        if let Some(finalizer) = self.delivery_finalizer.as_ref() {
+            let buyer_billable_floor = _cutover
+                .as_deref()
+                .filter(|_| usage.cumulative_billable_tokens.is_none())
+                .map(|anchor| {
+                    let next =
+                        deal.billable_tokens.load(Ordering::SeqCst) + usage.billable_tokens();
+                    u64::try_from(*anchor + u128::from(next))
+                        .map_err(|_| "buyer billable position overflows u64".to_string())
+                })
+                .transpose()?;
+            finalizer
+                .with_pending(|pending| -> Result<(), String> {
+                    if let Some(store) = pending.usage.as_ref() {
+                        store
+                            .record_confirmed_usage(
+                                &pending.request_id,
+                                self.usage_phase,
+                                usage,
+                                buyer_billable_floor,
+                            )
+                            .map_err(|error| {
+                                format!("could not persist confirmed billing: {error:#}")
+                            })?;
+                    }
+                    Ok(())
+                })
+                .unwrap_or(Ok(()))?;
+        }
+        deal.commit_billable(usage.billable_tokens());
         reservation.used = next_used;
         self.request_usage = request_usage;
-        self.persist_usage(self.usage_phase, usage, true);
         if let Some(finalizer) = self.delivery_finalizer.as_ref() {
             finalizer.with_pending(|pending| {
                 if pending.observed_answer_usage.is_some() {
@@ -1472,50 +1518,6 @@ impl ConsumerRequestGuard {
             });
         }
         Ok(())
-    }
-
-    fn persist_usage(&self, phase: &str, record: BillingUsage, accepted: bool) {
-        if let Some(finalizer) = self.delivery_finalizer.as_ref() {
-            finalizer.persist_usage(phase, phase, record, accepted);
-            if accepted && phase != "answer" {
-                finalizer.persist_usage(phase, "in_progress", BillingUsage::default(), true);
-            }
-        }
-    }
-
-    fn pause_unresolved_usage(&mut self) {
-        self.session
-            .unresolved_output_usage
-            .store(true, Ordering::SeqCst);
-        self.session.disable_drop_backup();
-        if let Some(finalizer) = self.delivery_finalizer.as_ref() {
-            // On write failure the existing incomplete/unfinished request is the durable fallback.
-            finalizer.persist_usage(
-                self.usage_phase,
-                "in_progress",
-                BillingUsage::default(),
-                false,
-            );
-        }
-        self.complete();
-    }
-
-    fn verification_failure(&mut self, error: &anyhow::Error, output_started: bool) -> String {
-        let provider_output = error
-            .downcast_ref::<tonic::Status>()
-            .and_then(dexdo_proto::upstream_output_started);
-        if output_started || provider_output == Some(true) {
-            self.pause_unresolved_usage();
-        } else if let Some(finalizer) = self.delivery_finalizer.as_ref() {
-            // A failure before any output completes only this phase's state row.
-            finalizer.persist_usage(
-                self.usage_phase,
-                "in_progress",
-                BillingUsage::default(),
-                true,
-            );
-        }
-        error.to_string()
     }
 
     pub(crate) fn arm_upstream_failure(&mut self) {
@@ -1586,7 +1588,6 @@ pub(crate) fn aggregate_body_response(
 
 impl Drop for ConsumerRequestGuard {
     fn drop(&mut self) {
-        self.active_requests.fetch_sub(1, Ordering::SeqCst);
         let request_usage = self.request_usage();
         if let Some(finalizer) = self.delivery_finalizer.take() {
             finalizer.report_cancelled(
@@ -1595,8 +1596,8 @@ impl Drop for ConsumerRequestGuard {
                 self.session.route_billable_tokens(),
             );
         }
+        self.active_requests.fetch_sub(1, Ordering::SeqCst);
         if self.failure_observed
-            && self.session.unresolved_usage_rejection().is_none()
             && self
                 .failure_heartbeat
                 .as_ref()
@@ -1761,9 +1762,6 @@ impl RouteManager {
     ) -> Result<(), dexdo_core::ChainError> {
         let mut active = self.active.write().await;
         if let Some(previous) = active.as_ref() {
-            if let Some(error) = previous.session.unresolved_usage_rejection() {
-                return Err(dexdo_core::ChainError::Chain(error.message));
-            }
             if previous.session.implicit_terminal_lacks_delivery() {
                 previous
                     .session
@@ -2033,7 +2031,6 @@ pub(crate) fn report_pre_answer_failure(
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum StreamErrorPolicyAction {
     RequestScoped,
-    ReconcileUsage,
     DeadGateway,
     SellerStallsMidStream,
 }
@@ -2052,12 +2049,10 @@ async fn handle_stream_error_policy(
     deal: &ApiDeal,
     received: u64,
     error: &stream::StreamError,
-    request_guard: &mut ConsumerRequestGuard,
 ) -> StreamErrorPolicyAction {
     let action = error.policy_action(received);
     match action {
         StreamErrorPolicyAction::RequestScoped => {}
-        StreamErrorPolicyAction::ReconcileUsage => request_guard.pause_unresolved_usage(),
         StreamErrorPolicyAction::DeadGateway => {
             let heartbeat = deal.accepted_output_guard();
             deal.session
@@ -2283,14 +2278,10 @@ impl ContentGate {
                             verification_stream_limits(request_guard.remaining_grant());
                         request_guard.usage_phase = "verification_b8";
                         let history = request_guard.delivery_finalizer();
-                        let mut b8_output_started = false;
-                        let v8 = VERIFICATION_USAGE
+                        let v8 = PAID_PHASE
                             .scope((history, "verification_b8"), async {
                                 let mut charge = |usage| request_guard.record_billing(deal, usage);
-                                let mut record_output = |tokens| {
-                                    b8_output_started |= tokens > 0;
-                                    deal.record_visible_output(tokens)
-                                };
+                                let mut record_output = |tokens| deal.record_visible_output(tokens);
                                 buyer
                                     .behavioral_probe(
                                         &deal.route.handover,
@@ -2305,12 +2296,7 @@ impl ContentGate {
                                     )
                                     .await
                             })
-                            .await
-                            .map_err(|error| {
-                                anyhow::anyhow!(
-                                    request_guard.verification_failure(&error, b8_output_started)
-                                )
-                            })?;
+                            .await?;
                         if let Verdict::Bail(r) = v8 {
                             deal.session
                                 .settle_verification_bail("content-identity-bail")
@@ -2327,14 +2313,10 @@ impl ContentGate {
                             verification_stream_limits(request_guard.remaining_grant());
                         request_guard.usage_phase = "verification_b7";
                         let history = request_guard.delivery_finalizer();
-                        let mut b7_output_started = false;
-                        let v7 = VERIFICATION_USAGE
+                        let v7 = PAID_PHASE
                             .scope((history, "verification_b7"), async {
                                 let mut charge = |usage| request_guard.record_billing(deal, usage);
-                                let mut record_output = |tokens| {
-                                    b7_output_started |= tokens > 0;
-                                    deal.record_visible_output(tokens)
-                                };
+                                let mut record_output = |tokens| deal.record_visible_output(tokens);
                                 buyer
                                     .reference_spotcheck(
                                         &deal.route.handover,
@@ -2349,12 +2331,7 @@ impl ContentGate {
                                     )
                                     .await
                             })
-                            .await
-                            .map_err(|error| {
-                                anyhow::anyhow!(
-                                    request_guard.verification_failure(&error, b7_output_started)
-                                )
-                            })?;
+                            .await?;
                         if let Verdict::Bail(r) = v7 {
                             deal.session
                                 .settle_verification_bail("content-identity-bail")
@@ -2435,7 +2412,7 @@ pub struct SessionSettle {
     /// route (the one-shot terminal), which has no route-billing model here at all.
     route_billing: OnceLock<Arc<AtomicU64>>,
     usage_quota: OnceLock<Arc<crate::buyer::usage::UsageStore>>,
-    unresolved_output_usage: Arc<AtomicBool>,
+    billing_lock: StdMutex<()>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -2628,7 +2605,7 @@ impl SessionSettle {
             route_delivery: OnceLock::new(),
             route_billing: OnceLock::new(),
             usage_quota: OnceLock::new(),
-            unresolved_output_usage: Arc::new(AtomicBool::new(false)),
+            billing_lock: StdMutex::new(()),
         }
     }
 
@@ -2718,15 +2695,12 @@ impl SessionSettle {
     }
 
     async fn settle_on_exit(&self, reason: &str) -> Result<bool, dexdo_core::ChainError> {
-        if self.unresolved_usage_rejection().is_some() {
-            return Ok(false);
-        }
         match self.lifetime {
             SessionLifetimePolicy::SettleOnExit => {
                 if self.veto_implicit_terminal_without_delivery(reason) {
                     return Ok(false);
                 }
-                self.settle_guarded(reason, Some(&self.usage_stop_guard()))
+                self.settle_guarded(reason, Some(&Self::settlement_guard()))
                     .await
             }
             SessionLifetimePolicy::Preserve => {
@@ -2746,9 +2720,6 @@ impl SessionSettle {
         category: ClosureCategory,
         policy_action: Option<&str>,
     ) -> bool {
-        if self.unresolved_usage_rejection().is_some() {
-            return true;
-        }
         if self.lifetime != SessionLifetimePolicy::Preserve {
             return false;
         }
@@ -2765,9 +2736,6 @@ impl SessionSettle {
 
     /// Recheck admission after an async gate, before starting another paid phase.
     fn ensure_paid_phase(&self) -> Result<(), ConsumerError> {
-        if let Some(error) = self.unresolved_usage_rejection() {
-            return Err(error);
-        }
         if self.is_closed() {
             return Err(ConsumerError::new(
                 ConsumerErrorCode::DealUnavailable,
@@ -2777,29 +2745,8 @@ impl SessionSettle {
         Ok(())
     }
 
-    /// These automatic STOPs depend on accounting, not on whether fresh output arrived.
-    fn usage_stop_guard(&self) -> dexdo_core::market::HeartbeatGuard {
+    fn settlement_guard() -> dexdo_core::market::HeartbeatGuard {
         dexdo_core::market::HeartbeatGuard::new(Arc::new(AtomicU64::new(0)))
-            .with_stop_veto(self.unresolved_output_usage.clone())
-    }
-
-    fn unresolved_usage_rejection(&self) -> Option<ConsumerError> {
-        let pending = self.unresolved_output_usage.load(Ordering::SeqCst)
-            || self.usage_quota.get().is_some_and(|store| {
-                store.has_unresolved_output_usage(&self.token_contract).unwrap_or_else(|error| {
-                    tracing::error!(%error, "buyer usage: cannot verify unresolved output usage");
-                    true
-                })
-            });
-        if !pending {
-            return None;
-        }
-        self.unresolved_output_usage.store(true, Ordering::SeqCst);
-        self.disable_drop_backup();
-        Some(ConsumerError::new(
-            ConsumerErrorCode::UpstreamUsageUnresolved,
-            "provider output has no reconciled terminal usage; preserve this deal and reconcile the failed request before resuming",
-        ))
     }
 
     pub fn dead_gateway_action(&self) -> DeadGatewayAction {
@@ -3072,9 +3019,6 @@ impl SessionSettle {
             }
         };
         if state.funded && state.opened && !state.disputed {
-            if let Some(error) = self.unresolved_usage_rejection() {
-                return Err(error);
-            }
             return Ok(state);
         }
 
@@ -3218,7 +3162,7 @@ impl SessionSettle {
             return Ok(None);
         }
         let _guard = self.settle_lock.lock().await;
-        if self.unresolved_usage_rejection().is_some() || self.settled.load(Ordering::SeqCst) {
+        if self.settled.load(Ordering::SeqCst) {
             return Ok(None);
         }
         if !self.begin_recovery_attempt(
@@ -3277,7 +3221,7 @@ impl SessionSettle {
             return Ok(None);
         }
         let _guard = self.settle_lock.lock().await;
-        if self.unresolved_usage_rejection().is_some() || self.settled.load(Ordering::SeqCst) {
+        if self.settled.load(Ordering::SeqCst) {
             return Ok(None);
         }
         if !self.begin_recovery_attempt(
@@ -3339,9 +3283,6 @@ impl SessionSettle {
         heartbeat: Option<&dexdo_core::market::HeartbeatGuard>,
     ) -> Result<bool, dexdo_core::ChainError> {
         let _guard = self.settle_lock.lock().await;
-        if heartbeat.is_some() && self.unresolved_usage_rejection().is_some() {
-            return Ok(false);
-        }
         if self.settled.load(Ordering::SeqCst) {
             return Ok(false); // already settled by an earlier bail / shutdown / Drop
         }
@@ -3552,7 +3493,7 @@ impl SessionSettle {
             return false;
         }
         let _guard = self.settle_lock.lock().await;
-        if self.unresolved_usage_rejection().is_some() || self.settled.load(Ordering::SeqCst) {
+        if self.settled.load(Ordering::SeqCst) {
             return false;
         }
         self.close_local_api(ClosureCategory::failure_class(failure_class), Some(action));
@@ -3611,9 +3552,6 @@ impl SessionSettle {
         if self.settled.load(Ordering::SeqCst) {
             return false;
         }
-        if self.unresolved_usage_rejection().is_some() {
-            return false;
-        }
         if action == VerificationBailAction::Dispute {
             self.recovery_pending();
         }
@@ -3637,13 +3575,12 @@ impl SessionSettle {
                     .stop_if_heartbeat(
                         &self.token_contract,
                         self.note.as_ref(),
-                        &self.usage_stop_guard(),
+                        &Self::settlement_guard(),
                     )
                     .await;
                 if matches!(result, Ok(None)) {
                     return false;
                 }
-                // Serving stays closed on the known verdict; a veto leaves quota nonterminal.
                 self.recovery_pending();
                 match result {
                     Ok(Some(s)) => {
@@ -3884,8 +3821,7 @@ impl Drop for SessionSettle {
         // funds-safety guarantee. If the session ended with no explicit settle (abnormal teardown), spawn a
         // last-chance STOP -- a crash/SIGKILL/runtime teardown may still skip it, and the on-chain
         // `seller_timeout` is the ultimate backstop.
-        if self.unresolved_usage_rejection().is_some()
-            || self.lifetime == SessionLifetimePolicy::Preserve
+        if self.lifetime == SessionLifetimePolicy::Preserve
             || self.settled.load(Ordering::SeqCst)
             || !self.drop_backup_enabled.load(Ordering::SeqCst)
             || self.recovery_submit_may_have_landed.load(Ordering::SeqCst)
@@ -4100,11 +4036,33 @@ pub async fn serve(
     let listener = tokio::net::TcpListener::bind(bind).await?;
     let local_addr = listener.local_addr()?;
     let deals = state.deals.clone();
-    let app = router(state);
+    let app = router(state.clone());
     let task = tokio::spawn(async move {
         let server = axum::serve(listener, app).with_graceful_shutdown(shutdown);
-        if let Err(e) = server.await {
+        let result = tokio::select! {
+            result = async { server.await } => result,
+            () = async {
+                let Some(store) = state.usage.as_ref() else {
+                    std::future::pending::<()>().await;
+                    return;
+                };
+                let mut interval = tokio::time::interval(dexdo_core::params::BUYER_USAGE_RECONCILE_INTERVAL);
+                interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+                loop {
+                    interval.tick().await;
+                    if let Err(error) = store.flush_confirmed_usage() {
+                        tracing::warn!(%error, "buyer usage: confirmed billing still awaits SQLite");
+                    }
+                }
+            } => unreachable!("local billing writes retry while serving"),
+        };
+        if let Err(e) = result {
             tracing::error!("consumer API server stopped: {e}");
+        }
+        if let Some(store) = state.usage.as_ref() {
+            if let Err(error) = store.flush_confirmed_usage() {
+                tracing::warn!(%error, "buyer usage: confirmed billing remains journaled for restart");
+            }
         }
         // Awaited session terminal: after graceful shutdown drains in-flight requests, STOP the
         // deal once before exit. This awaited path -- not `Drop` -- is the funds-safety guarantee.
@@ -6363,6 +6321,7 @@ mod tests {
         /// What the last read would have returned had it not been served stale.
         pre_booking: std::sync::Mutex<Option<dexdo_core::DealChainSnapshot>>,
         snapshot_reads: std::sync::atomic::AtomicUsize,
+        block_snapshot_reads: std::sync::atomic::AtomicBool,
         /// `deal_state` reads, answered or refused. The production backend admits every one of
         /// them through the per-process chain request ceiling.
         deal_state_reads: std::sync::atomic::AtomicUsize,
@@ -6401,6 +6360,7 @@ mod tests {
                 stale_reads: std::sync::atomic::AtomicUsize::new(0),
                 pre_booking: std::sync::Mutex::new(None),
                 snapshot_reads: std::sync::atomic::AtomicUsize::new(0),
+                block_snapshot_reads: std::sync::atomic::AtomicBool::new(false),
                 deal_state_reads: std::sync::atomic::AtomicUsize::new(0),
                 transient_deal_state: std::sync::atomic::AtomicBool::new(false),
                 settle_calls: std::sync::atomic::AtomicUsize::new(0),
@@ -6699,6 +6659,9 @@ mod tests {
         ) -> Result<Option<dexdo_core::DealChainSnapshot>, dexdo_core::ChainError> {
             assert_eq!(token_contract, &self.token_contract);
             self.snapshot_reads.fetch_add(1, Ordering::SeqCst);
+            if self.block_snapshot_reads.load(Ordering::SeqCst) {
+                std::future::pending::<()>().await;
+            }
             if self
                 .stale_reads
                 .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |left| {
@@ -7138,12 +7101,13 @@ mod tests {
     async fn weekly_route_harness_gated_with_policy(
         scenario: WeeklyRouteScenario,
     ) -> WeeklyRouteHarness {
-        weekly_route_harness_with_seller_shape(scenario, None).await
+        weekly_route_harness_with_seller_shape(scenario, None, None).await
     }
 
     async fn weekly_route_harness_with_seller_shape(
         scenario: WeeklyRouteScenario,
         seller_shape: Option<dexdo_core::DealSubscription>,
+        advertised_gateway: Option<SocketAddr>,
     ) -> WeeklyRouteHarness {
         let WeeklyRouteScenario {
             claimed,
@@ -7215,8 +7179,8 @@ mod tests {
                 .expect("recorded week headroom");
         let route = Route {
             handover: Handover {
-                endpoint: format!("https://{gateway_addr}"),
-                tls_fingerprint: seller.tls_fingerprint.clone(),
+                endpoint: format!("https://{}", advertised_gateway.unwrap_or(gateway_addr)),
+                tls_fingerprint: seller.tls.fingerprint.clone(),
             },
             token_contract: token_contract.clone(),
             max_tokens: u64::try_from(headroom).unwrap(),
@@ -7507,6 +7471,7 @@ mod tests {
                 lifetime: SessionLifetimePolicy::Preserve,
             },
             Some(weekly_subscription(unix_now_secs(), 0, 0)),
+            None,
         )
         .await;
         assert_eq!(harness.remaining().await, 12);

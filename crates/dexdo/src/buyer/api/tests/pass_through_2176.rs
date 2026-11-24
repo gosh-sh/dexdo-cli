@@ -954,10 +954,10 @@ async fn closed_session_records_demand_only_for_valid_requests() {
     }
 }
 
-/// A seller that cannot answer the capability query is a dead gateway, under every policy, and
-/// the provider is never called.
+/// An unavailable capability endpoint leaves the existing deal open under every policy and
+/// never reaches the provider.
 #[tokio::test]
-async fn capability_transport_failure_preserves_dead_gateway_policy() {
+async fn issue_2266_capability_transport_failure_keeps_the_same_deal_open() {
     use dexdo_core::params::{BUYER_UPSTREAM_OPEN_RETRIES, CONSUMER_DEMAND_RECENT_SECS};
     for (path, native) in ROUTES {
         for action in [
@@ -997,17 +997,15 @@ async fn capability_transport_failure_preserves_dead_gateway_policy() {
                 }
                 let deal = harness.deals.current().await.unwrap();
                 assert!(
-                    deal.session.is_closed(),
-                    "{path}, {action:?}, {lifetime:?}: an ordinary dead gateway closes locally"
+                    !deal.session.is_closed(),
+                    "{path}, {action:?}, {lifetime:?}: an unavailable seller leaves the deal open"
                 );
                 assert!(
                     deal.has_active_or_recent_request(unix_now_secs(), CONSUMER_DEMAND_RECENT_SECS)
                 );
                 assert!(captures.lock().unwrap().is_empty());
                 assert_eq!(harness.remaining().await, before);
-                if lifetime == SessionLifetimePolicy::Preserve {
-                    assert_eq!(harness.chain.foreign_money_calls(), 0);
-                }
+                assert_eq!(harness.chain.foreign_money_calls(), 0);
                 harness.shutdown().await;
                 task.abort();
             }

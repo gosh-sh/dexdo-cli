@@ -1,12 +1,13 @@
 use super::{
-    inspect_seller_offer, prepare_seller_offer, validate_resting_offer, wait_for_match,
-    RunningSeller, SellerConfig, SellerMatchWatchConfig, SellerOfferInspection, SellerOfferStartup,
+    inspect_seller_offer, prepare_seller_offer_with_resting_order, validate_resting_offer,
+    wait_for_match, RunningSeller, SellerConfig, SellerMatchWatchConfig, SellerOfferInspection,
+    SellerOfferStartup,
 };
 use anyhow::Result;
 use dexdo_core::{
     market::{RestingSellCancelStartError, RestingSellCancelWatch},
     params::{
-        SellerLivenessParams, SELLER_UPSTREAM_HEALTH_TIMEOUT_MAX_ATTEMPTS,
+        SellerLivenessParams, SELLER_GATEWAY_HEALTH_TIMEOUT_MAX_ATTEMPTS,
         TRANSIENT_READ_TOTAL_BUDGET,
     },
     ChainBackend, Match,
@@ -29,19 +30,6 @@ fn display_dexdo_address(address: &str) -> String {
 pub enum HealthComponent {
     GatewayTask,
     AdvertisedGateway,
-    UpstreamModel,
-}
-
-/// Classify an upstream readiness error for uptime metrics. A provider HTTP 429 proves
-/// connectivity and is reported as throttled rather than unavailable.
-pub fn upstream_uptime_outcome(error: &anyhow::Error) -> &'static str {
-    error
-        .downcast_ref::<tonic::Status>()
-        .filter(|status| {
-            dexdo_proto::is_retryable_upstream(status)
-                && status.message().starts_with("upstream HTTP 429 ")
-        })
-        .map_or("fail", |_| "throttled")
 }
 
 impl HealthComponent {
@@ -49,7 +37,6 @@ impl HealthComponent {
         match self {
             Self::GatewayTask => "gateway_task",
             Self::AdvertisedGateway => "advertised_gateway",
-            Self::UpstreamModel => "upstream_authentication_and_model",
         }
     }
 }
@@ -80,28 +67,6 @@ impl HealthFailure {
         self
     }
 
-    fn is_upstream_throttled(&self) -> bool {
-        self.component == HealthComponent::UpstreamModel
-            && self
-                .source
-                .as_deref()
-                .and_then(|source| source.downcast_ref::<tonic::Status>())
-                .is_some_and(|status| {
-                    dexdo_proto::is_retryable_upstream(status)
-                        && status.message().starts_with("upstream HTTP 429 ")
-                })
-    }
-
-    fn is_transient_upstream(&self) -> bool {
-        self.component == HealthComponent::UpstreamModel
-            && (self.timed_out
-                || self
-                    .source
-                    .as_deref()
-                    .and_then(|source| source.downcast_ref::<tonic::Status>())
-                    .is_some_and(dexdo_proto::is_retryable_upstream))
-    }
-
     fn into_startup_error(self, advertised: &str) -> anyhow::Error {
         let probe = self
             .source
@@ -112,16 +77,7 @@ impl HealthFailure {
             Some((stage, wrong_endpoint)) => anyhow::Error::new(
                 advertise_probe_fault(advertised, stage, wrong_endpoint).with_source(self),
             ),
-            None => {
-                let context = if self.component == HealthComponent::UpstreamModel
-                    && self.detail.contains("startup capability probe")
-                {
-                    format!("seller readiness failed before SELL: {}", self.detail)
-                } else {
-                    "seller readiness failed before SELL".to_string()
-                };
-                anyhow::Error::new(self).context(context)
-            }
+            None => anyhow::Error::new(self).context("seller readiness failed before SELL"),
         }
     }
 }
@@ -557,7 +513,8 @@ pub async fn probe_gateway(
     }
     // Stage 3 -- pinned TLS + h2. Pinning is NOT relaxed: a fingerprint mismatch is a wrong-endpoint
     // proof and stays fatal.
-    let channel = match crate::buyer::tls::connect_pinned(endpoint, tls_fingerprint).await {
+    let channel = match crate::buyer::tls::connect_pinned_for_probe(endpoint, tls_fingerprint).await
+    {
         Ok(channel) => channel,
         Err(error) => {
             // The same typed pin-mismatch check the buyer dial uses, and the same typed stage:
@@ -565,7 +522,7 @@ pub async fn probe_gateway(
             // about what a wrong endpoint is or about which step of the dial failed. The stage
             // used to be inferred here from "is there an `io::Error` anywhere in the chain",
             // which cannot tell a refused TCP connect from a failed TLS handshake and called
-            // both `tls_handshake`; `connect_pinned` tags the step it was actually on
+            // both `tls_handshake`; the pinned dial tags the step it was actually on
             // (`DialStageError`), which is the whole point of's staging.
             let wrong_endpoint = crate::buyer::tls::dial_reached_wrong_endpoint(&error);
             return Err(if wrong_endpoint {
@@ -651,31 +608,6 @@ pub async fn check_readiness(
     .await
 }
 
-async fn check_startup_readiness(
-    seller: &RunningSeller,
-    advertised: &str,
-    timeout: Duration,
-    identity: Option<&RestingOfferIdentity>,
-    token_contract: &str,
-    _advertise_probe: AdvertiseProbePolicy,
-) -> std::result::Result<(), HealthFailure> {
-    let upstream = seller.state.upstream(token_contract);
-    let upstream_timeout_detail = upstream.startup_capability_timeout_detail();
-    check_readiness_with_probes(
-        ReadinessTarget {
-            seller,
-            advertised,
-            identity,
-            token_contract,
-        },
-        timeout,
-        probe_advertised_gateway(seller, advertised),
-        upstream.check_startup_market_readiness(),
-        upstream_timeout_detail.as_deref(),
-    )
-    .await
-}
-
 async fn check_readiness_with_probe(
     seller: &RunningSeller,
     advertised: &str,
@@ -689,42 +621,6 @@ async fn check_readiness_with_probe(
     _advertise_probe: AdvertiseProbePolicy,
     probe: impl Future<Output = std::result::Result<(), ProbeFault>>,
 ) -> std::result::Result<(), HealthFailure> {
-    let upstream = seller.state.upstream(token_contract);
-    check_readiness_with_probes(
-        ReadinessTarget {
-            seller,
-            advertised,
-            identity,
-            token_contract,
-        },
-        timeout,
-        probe,
-        upstream.check_market_readiness(),
-        None,
-    )
-    .await
-}
-
-struct ReadinessTarget<'a> {
-    seller: &'a RunningSeller,
-    advertised: &'a str,
-    identity: Option<&'a RestingOfferIdentity>,
-    token_contract: &'a str,
-}
-
-async fn check_readiness_with_probes(
-    target: ReadinessTarget<'_>,
-    timeout: Duration,
-    probe: impl Future<Output = std::result::Result<(), ProbeFault>>,
-    upstream_probe: impl Future<Output = Result<()>>,
-    upstream_timeout_detail: Option<&str>,
-) -> std::result::Result<(), HealthFailure> {
-    let ReadinessTarget {
-        seller,
-        advertised,
-        identity,
-        token_contract,
-    } = target;
     let metrics_upstream = seller.state.upstream(token_contract);
     let metrics_model = metrics_upstream.startup_market_model().unwrap_or("mock");
     crate::telemetry::register(token_contract, metrics_model);
@@ -761,34 +657,9 @@ async fn check_readiness_with_probes(
         "pass",
     );
 
-    // Both readiness components share the canonical per-cycle deadline. Poll them concurrently so
-    // a tolerated stalled self-probe cannot starve an already-healthy exact-model check.
-
-    // E2E-ADV-02: readiness asks a strictly LARGER question than provider health -- "may I sell on
-    // this market?" -- so this component is `check_market_readiness`, not `check_health`. Provider health is
-    // one half of it; the other half is that the model which actually answered is the model this market
-    // sells. `check_health` cannot make that call: it is not told which market it is being asked about, and
-    // the seller's own outbound slug (which an OpenAI-compatible provider echoes) certified itself there.
-    // Boxed: the timing wrappers hold both probes, and inline they pushed seller startup past 2 MiB
-    // test stacks whether metrics are on or off.
-    let ((probe_result, probe_elapsed), (upstream_result, upstream_elapsed)) = tokio::join!(
-        Box::pin(async {
-            let started = std::time::Instant::now();
-            let result = tokio::time::timeout_at(deadline, probe).await;
-            (result, started.elapsed())
-        }),
-        Box::pin(async {
-            let started = std::time::Instant::now();
-            let result = tokio::time::timeout_at(deadline, upstream_probe).await;
-            (result, started.elapsed())
-        }),
-    );
-    let upstream_uptime = match &upstream_result {
-        Ok(Ok(())) => "pass",
-        Ok(Err(error)) => upstream_uptime_outcome(error),
-        Err(_) => "timeout",
-    };
-    crate::telemetry::uptime(metrics_model, "upstream", upstream_uptime);
+    let started = std::time::Instant::now();
+    let probe_result = tokio::time::timeout_at(deadline, probe).await;
+    let probe_elapsed = started.elapsed();
     crate::telemetry::health(
         token_contract,
         metrics_model,
@@ -799,18 +670,6 @@ async fn check_readiness_with_probes(
             Err(_) => "timeout",
         },
         Some(probe_elapsed),
-    );
-    // Record both concurrent results even when the gateway verdict returns early below.
-    crate::telemetry::health(
-        token_contract,
-        metrics_model,
-        "upstream_authentication_and_model",
-        match &upstream_result {
-            Ok(Ok(())) => "pass",
-            Ok(Err(_)) => "fail",
-            Err(_) => "timeout",
-        },
-        Some(upstream_elapsed),
     );
     let probe = match probe_result {
         Ok(Ok(())) => None,
@@ -857,42 +716,6 @@ async fn check_readiness_with_probes(
                 format!("pinned-TLS (h2) self-probe of {advertised}"),
             )
             .with_source(fault));
-        }
-    }
-
-    match upstream_result {
-        Ok(Ok(())) => trace_health(
-            identity,
-            token_contract,
-            HealthComponent::UpstreamModel,
-            "pass",
-        ),
-        Ok(Err(error)) => {
-            trace_health(
-                identity,
-                token_contract,
-                HealthComponent::UpstreamModel,
-                "fail",
-            );
-            let mut failure =
-                HealthFailure::new(HealthComponent::UpstreamModel, false, error.to_string());
-            if let Some(status) = error.downcast_ref::<tonic::Status>() {
-                failure = failure.with_source(status.clone());
-            }
-            return Err(failure);
-        }
-        Err(_) => {
-            trace_health(
-                identity,
-                token_contract,
-                HealthComponent::UpstreamModel,
-                "timeout",
-            );
-            return Err(HealthFailure::new(
-                HealthComponent::UpstreamModel,
-                true,
-                upstream_timeout_detail.unwrap_or("bounded upstream model probe expired"),
-            ));
         }
     }
 
@@ -1243,8 +1066,8 @@ async fn reap_expired_offer(
     }
     RelistDecision::Unproven {
         known_result: format!(
-            "expiry_submit={expiry_submit}; {last}; operator_action=run `dexdo orders list` with the same \
-             `--note-addr` and `--market` or `--model` this seller was started with, and confirm \
+            "expiry_submit={expiry_submit}; {last}; operator_action=run `dexdo orders list` with \
+             the deal's `--note-addr` and its `--market` or `--model`, and confirm \
              TokenContract {} carries no live SELL before restarting the seller",
             display_token_contract(&identity.token_contract)
         ),
@@ -1454,8 +1277,8 @@ fn trace_offer_relisted(
 /// rather than printing a line that looks runnable and is not.
 fn manual_cancel_action(order_id: u128) -> String {
     format!(
-        "cancel resting order {order_id} by hand: run `dexdo orders cancel` with the same \
-         `--note-addr` and `--market` or `--model` this seller was started with, plus `--note-key` \
+        "cancel resting order {order_id} by hand: run `dexdo orders cancel` with \
+         the deal's `--note-addr` and its `--market` or `--model`, plus `--note-key` \
          to sign, then verify the book"
     )
 }
@@ -1680,7 +1503,6 @@ async fn watch_accepted_cancel(
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum CycleDeadlineSite {
     HealthCheck,
-    UpstreamGrace,
     Cancel,
 }
 
@@ -2094,32 +1916,16 @@ async fn resolve_interrupted_startup(
     }
 }
 
-/// Startup readiness, with the same bounded tolerance for an isolated stall the periodic path has.
-
-/// The periodic check retries a TIMED-OUT probe once
-/// (`SELLER_UPSTREAM_HEALTH_TIMEOUT_MAX_ATTEMPTS`, "two attempts absorb one isolated stall"). Startup
-/// had no retry at all, and it is where a stall costs the most: no ask is posted, the seller exits,
-/// and the market stays empty until an operator notices. Observed against a provider answering a
-/// plain completion in two seconds: `upstream_authentication_and_model timed out: bounded upstream
-/// model probe expired`, and the offer was never placed.
-
-/// Ordinary startup shares its existing attempt cap between timeouts and a typed HTTP 429.
-/// Throttling waits the canonical health interval before the retry. After an upstream withdrawal or a
-/// failed successor post, every upstream failure keeps the deal off the book and
-/// repeats full readiness at the health cadence; an error string never authorizes an offer.
+/// A second gateway probe absorbs an isolated startup timeout.
 async fn startup_readiness_with_retries(
     seller: &RunningSeller,
     cfg: &SellerConfig,
     existing_identity: Option<&RestingOfferIdentity>,
     timing: SupervisionTiming,
-    recover_upstream: bool,
 ) -> std::result::Result<(), HealthFailure> {
-    if recover_upstream {
-        tokio::time::sleep(timing.health_interval).await;
-    }
     let mut attempt = 1;
     loop {
-        let outcome = check_startup_readiness(
+        let outcome = check_readiness(
             seller,
             &cfg.gateway_advertise,
             timing.health_timeout,
@@ -2131,40 +1937,19 @@ async fn startup_readiness_with_retries(
         match outcome {
             Ok(()) => return Ok(()),
             Err(failure)
-                if recover_upstream && failure.component == HealthComponent::UpstreamModel =>
+                if failure.timed_out && attempt < SELLER_GATEWAY_HEALTH_TIMEOUT_MAX_ATTEMPTS =>
             {
                 tracing::warn!(
-                    event = "seller_upstream_recovery_wait",
-                    token_contract = %display_token_contract(&cfg.token_contract),
-                    reason = %failure,
-                    retry_interval_ms = timing.health_interval.as_millis() as u64,
-                    "SELL remains withdrawn; waiting for full model readiness before relisting"
-                );
-                tokio::time::sleep(timing.health_interval).await;
-            }
-            Err(failure)
-                if (failure.timed_out || failure.is_upstream_throttled())
-                    && attempt < SELLER_UPSTREAM_HEALTH_TIMEOUT_MAX_ATTEMPTS =>
-            {
-                let throttled = failure.is_upstream_throttled();
-                tracing::warn!(
-                    event = if throttled {
-                        "seller_startup_readiness_throttle_retry"
-                    } else {
-                        "seller_startup_readiness_timeout_retry"
-                    },
+                    event = "seller_startup_readiness_timeout_retry",
                     component = failure.component.as_str(),
                     timestamp = unix_timestamp(),
                     token_contract = %cfg.token_contract,
                     failed_attempt = attempt,
                     next_attempt = attempt + 1,
-                    max_attempts = SELLER_UPSTREAM_HEALTH_TIMEOUT_MAX_ATTEMPTS,
+                    max_attempts = SELLER_GATEWAY_HEALTH_TIMEOUT_MAX_ATTEMPTS,
                     reason = %failure,
                     "transient startup readiness failure; retrying before refusing to post the SELL"
                 );
-                if throttled {
-                    tokio::time::sleep(timing.health_interval).await;
-                }
                 attempt += 1;
             }
             Err(failure) => return Err(failure),
@@ -2180,33 +1965,6 @@ async fn prepare_seller_offer_with_timing<S>(
     existing_identity: Option<&RestingOfferIdentity>,
     shutdown: S,
     timing: SupervisionTiming,
-) -> Result<SellerStartupOutcome>
-where
-    S: Future<Output = ()>,
-{
-    prepare_seller_offer_with_recovery(
-        seller,
-        chain,
-        cfg,
-        expected_owner,
-        existing_identity,
-        shutdown,
-        timing,
-        false,
-    )
-    .await
-}
-
-#[allow(clippy::too_many_arguments)]
-async fn prepare_seller_offer_with_recovery<S>(
-    seller: &RunningSeller,
-    chain: &dyn ChainBackend,
-    cfg: &SellerConfig,
-    expected_owner: &str,
-    existing_identity: Option<&RestingOfferIdentity>,
-    shutdown: S,
-    timing: SupervisionTiming,
-    recover_upstream: bool,
 ) -> Result<SellerStartupOutcome>
 where
     S: Future<Output = ()>,
@@ -2235,7 +1993,6 @@ where
         existing_identity,
         shutdown,
         timing,
-        recover_upstream,
     )
     .await
 }
@@ -2249,7 +2006,6 @@ async fn prepare_cold_seller_offer<S>(
     existing_identity: Option<&RestingOfferIdentity>,
     shutdown: S,
     timing: SupervisionTiming,
-    recover_upstream: bool,
 ) -> Result<SellerStartupOutcome>
 where
     S: Future<Output = ()>,
@@ -2264,8 +2020,7 @@ where
         .assert_note_covers_seller_bond(&cfg.token_contract)
         .await?;
     let readiness_deadline = tokio::time::Instant::now() + timing.cycle_timeout;
-    let readiness =
-        startup_readiness_with_retries(seller, cfg, existing_identity, timing, recover_upstream);
+    let readiness = startup_readiness_with_retries(seller, cfg, existing_identity, timing);
     let gateway_stopped = wait_for_gateway_task_stop(seller);
     tokio::pin!(readiness);
     tokio::pin!(gateway_stopped);
@@ -2317,7 +2072,13 @@ where
         };
     }
 
-    let startup = prepare_seller_offer(seller.note.as_ref(), chain, cfg, Some(expected_owner));
+    let startup = prepare_seller_offer_with_resting_order(
+        seller.signing_note(chain),
+        chain,
+        cfg,
+        Some(expected_owner),
+        existing_identity.map(|identity| identity.order_id),
+    );
     tokio::pin!(startup);
     let interruption = tokio::select! {
         biased;
@@ -2390,6 +2151,16 @@ where
                 Ok(startup) => Ok(SellerStartupOutcome::Ready(startup)),
                 Err(error) => {
                     let reason = offer_post_stop_reason(&error);
+                    if chain.has_pending_sell_offer(&cfg.token_contract).await.unwrap_or(true) {
+                        // The deal's watcher reconciles the signed message or adopts a late SELL.
+                        return Ok(SellerStartupOutcome::Stopped {
+                            identity: None,
+                            reason,
+                            disposition: CancellationDisposition::UnknownFailure {
+                                known_result: format!("pending_sell_submit={error:#}"),
+                            },
+                        });
+                    }
                     resolve_interrupted_startup(
                         seller,
                         chain,
@@ -2532,7 +2303,7 @@ where
                 abort_gateway_on_stop: false,
                 ..timing
             };
-            match prepare_cold_seller_offer(
+            let outcome = prepare_cold_seller_offer(
                 seller,
                 chain,
                 cfg,
@@ -2540,28 +2311,22 @@ where
                 identity.as_ref(),
                 std::future::pending(),
                 pending_timing,
-                false,
             )
-            .await
-            {
-                Ok(outcome) => Ok(outcome),
-                Err(error) => {
-                    resolve_interrupted_startup(
+            .await;
+            match (outcome, identity) {
+                (Err(error), Some(identity)) => {
+                    stop_exact_offer(
                         seller,
                         chain,
                         cfg,
-                        expected_owner,
-                        identity.map(|id| SellerOfferStartup::ResumedResting {
-                            order_id: id.order_id,
-                        }),
-                        (
-                            offer_post_stop_reason(&error),
-                            tokio::time::Instant::now() + timing.cycle_timeout,
-                        ),
+                        &identity,
+                        offer_post_stop_reason(&error),
+                        tokio::time::Instant::now() + timing.cycle_timeout,
                         pending_timing,
                     )
                     .await
                 }
+                (outcome, _) => outcome,
             }
         };
         let outcome = tokio::select! {
@@ -2585,9 +2350,8 @@ where
                 }
             }
         };
-        let retry = matches!(&outcome, SellerStartupOutcome::Stopped { disposition, reason, .. }
-            if !disposition.proven_unmatchable()
-                || matches!(reason, RestingStopReason::Health(failure) if failure.component == HealthComponent::UpstreamModel));
+        let retry = matches!(&outcome, SellerStartupOutcome::Stopped { disposition, .. }
+            if !disposition.proven_unmatchable());
         if !retry {
             if timing.abort_gateway_on_stop
                 && matches!(&outcome, SellerStartupOutcome::Stopped { disposition, .. } if disposition.proven_unmatchable())
@@ -2612,7 +2376,6 @@ where
 struct SupervisionTiming {
     health_interval: Duration,
     health_timeout: Duration,
-    upstream_grace: Duration,
     cycle_timeout: Duration,
     cancel_poll: Duration,
     /// how often the supervised order's own deadline is re-read from the book.
@@ -2655,7 +2418,7 @@ where
         let mut health = tokio::time::interval_at(start, timing.health_interval);
         health.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         // expiry gets its own timer. `wait_for_match` never returns for an order that simply
-        // died, and health checks only ask about the gateway and the upstream -- without this branch a
+        // died, and health checks only ask about the gateway -- without this branch a
         // seller whose offer expired keeps logging healthy cycles and waiting for a match that can no
         // longer happen, which is exactly what the live incident showed.
         let mut expiry = tokio::time::interval_at(
@@ -2671,7 +2434,6 @@ where
         let mut consecutive_expiry_read_failures = 0_u64;
         let mut last_successful_expiry_read = tokio::time::Instant::now();
 
-        let mut upstream_failure: Option<(tokio::time::Instant, HealthFailure)> = None;
         let mut health_check: Option<
             futures::future::BoxFuture<
                 '_,
@@ -2682,7 +2444,6 @@ where
             futures::future::BoxFuture<'_, Option<Result<SupervisedOfferPoll>>>,
         > = None;
         loop {
-            let grace_deadline = upstream_failure.as_ref().map(|(deadline, _)| *deadline);
             tokio::select! {
                 match_result = &mut matched => {
                     break match match_result {
@@ -2697,54 +2458,13 @@ where
                     Trigger::Shutdown,
                     tokio::time::Instant::now() + timing.cycle_timeout,
                 )),
-                _ = tokio::time::sleep_until(
-                    grace_deadline.unwrap_or_else(tokio::time::Instant::now)
-                ), if grace_deadline.is_some() => {
-                    let (_, failure) = upstream_failure.take().expect("active upstream grace");
-                    break Err((Trigger::Health(failure),
-                        tokio::time::Instant::now() + timing.cycle_timeout));
-                }
                 result = async {
                     health_check.as_mut().expect("active readiness check").await
                 }, if health_check.is_some() => {
                     health_check = None;
-                    if grace_deadline.is_some_and(|deadline| tokio::time::Instant::now() >= deadline) {
-                        let (_, failure) = upstream_failure.take().expect("active upstream grace");
-                        break Err((Trigger::Health(failure),
-                            tokio::time::Instant::now() + timing.cycle_timeout));
-                    }
-                    // A bounded pause after the completed probe, including timeouts and throttling.
                     health.reset();
                     match result {
-                        Ok(()) => {
-                            last_healthy = tokio::time::Instant::now();
-                            if upstream_failure.take().is_some() {
-                                tracing::info!(
-                                    event = "seller_upstream_grace_recovered",
-                                    token_contract = %display_token_contract(&identity.token_contract),
-                                    order_id = identity.order_id,
-                                    "full readiness recovered; retaining exact SELL"
-                                );
-                            }
-                        }
-                        Err((failure, _)) if failure.is_transient_upstream() => {
-                            let deadline = grace_deadline.unwrap_or_else(||
-                                tokio::time::Instant::now() + timing.upstream_grace);
-                            #[cfg(test)]
-                            observe_cycle_deadline(CycleDeadlineSite::UpstreamGrace, deadline);
-                            tracing::warn!(
-                                event = "seller_upstream_grace_wait",
-                                token_contract = %display_token_contract(&identity.token_contract),
-                                order_id = identity.order_id,
-                                remaining_ms = deadline.saturating_duration_since(
-                                    tokio::time::Instant::now()).as_millis() as u64,
-                                retry_interval_ms = timing.health_interval.as_millis() as u64,
-                                reason = %failure,
-                                "transient upstream failure; retaining exact SELL during bounded grace"
-                            );
-                            // Further failures update the reason, never the original deadline.
-                            upstream_failure = Some((deadline, failure));
-                        }
+                        Ok(()) => last_healthy = tokio::time::Instant::now(),
                         Err((failure, deadline)) => break Err((Trigger::Health(failure), deadline)),
                     }
                 }
@@ -2771,7 +2491,7 @@ where
                         #[cfg(test)]
                         observe_cycle_deadline(CycleDeadlineSite::HealthCheck, deadline);
                         let timeout_deadline = deadline + timing.health_timeout.saturating_mul(
-                            SELLER_UPSTREAM_HEALTH_TIMEOUT_MAX_ATTEMPTS.saturating_sub(1));
+                            SELLER_GATEWAY_HEALTH_TIMEOUT_MAX_ATTEMPTS.saturating_sub(1));
                         let mut attempt = 1;
                         let mut check_deadline = deadline;
                         loop {
@@ -2783,10 +2503,10 @@ where
                                 &identity.token_contract, timing.advertise_probe,
                             ).await {
                                 // Preserve the existing bounded tolerance for a gateway self-probe
-                                // timeout. Upstream faults instead retry at the health cadence above.
+                                // timeout.
                                 Err(failure) if failure.timed_out
                                     && failure.component == HealthComponent::AdvertisedGateway
-                                    && attempt < SELLER_UPSTREAM_HEALTH_TIMEOUT_MAX_ATTEMPTS => {
+                                    && attempt < SELLER_GATEWAY_HEALTH_TIMEOUT_MAX_ATTEMPTS => {
                                     tracing::warn!(
                                         event = "seller_health_timeout_retry",
                                         component = failure.component.as_str(),
@@ -2796,7 +2516,7 @@ where
                                         order_id = identity.order_id,
                                         failed_attempt = attempt,
                                         next_attempt = attempt + 1,
-                                        max_attempts = SELLER_UPSTREAM_HEALTH_TIMEOUT_MAX_ATTEMPTS,
+                                        max_attempts = SELLER_GATEWAY_HEALTH_TIMEOUT_MAX_ATTEMPTS,
                                         reason = %failure,
                                         "timed-out gateway readiness probe; retrying before retiring exact SELL"
                                     );
@@ -2880,19 +2600,6 @@ where
         Err(trigger) => trigger,
     };
 
-    if let Trigger::Health(failure) = &trigger {
-        if failure.is_transient_upstream() {
-            tracing::warn!(
-                event = "seller_upstream_grace_expired",
-                token_contract = %display_token_contract(&identity.token_contract),
-                order_id = identity.order_id,
-                grace_ms = timing.upstream_grace.as_millis() as u64,
-                reason = %failure,
-                "upstream did not recover within grace; withdrawing exact SELL"
-            );
-        }
-    }
-
     // expiry is terminal on its own and needs no write. The order is already unmatchable on
     // chain, so cancelling it would spend gas to remove something the matcher already skips, and the
     // cancel would race the permissionless sweep for no gain. Readiness ends here, before any cleanup
@@ -2939,14 +2646,12 @@ where
 }
 
 /// Supervise one resting ask and, when it dies of its own deadline, reap it and carry the deal's
-/// remaining capacity into exactly one successor. An upstream failure withdraws the
-/// offer first, then waits for full readiness before re-offering the same unsold deal.
+/// remaining capacity into exactly one successor.
 
 /// A SELL's deadline is mandatory and capped at `MAX_SELL_TTL = 3600`
 /// (`contracts/dex/PrivateNote.sol:41,792`), so an alive seller meets it by design rather than by
 /// fault. Every iteration of this loop supervises ONE generation: the loop only turns after the
-/// previous generation is authoritatively off the book, and it stops for good at the first outcome
-/// that is neither an expiry nor a confirmed upstream withdrawal.
+/// previous generation is authoritatively off the book.
 
 /// The successor rests on the SAME deal, and that is not a shortcut. A `TokenContract`'s
 /// `_maxTicks` and `_pricePerTick` are constructor statics -- `postFromNote` re-posts exactly them
@@ -3045,7 +2750,7 @@ where
                         },
                     ).await? {
                         SellerStartupOutcome::Ready(_) => Ok(RestingSellerOutcome::Matched(
-                            chain.read_match(&identity.token_contract).await?,
+                            read_confirmed_relist_match(seller, chain, &cfg, watch).await?,
                         )),
                         SellerStartupOutcome::Stopped {
                             identity: stopped_identity,
@@ -3070,7 +2775,7 @@ where
             match inspection {
                 Ok(Ok(SellerOfferInspection::Funded)) => {
                     return Ok(RestingSellerOutcome::Matched(
-                        chain.read_match(&identity.token_contract).await?,
+                        read_confirmed_relist_match(seller, chain, &cfg, watch).await?,
                     ));
                 }
                 Ok(Ok(SellerOfferInspection::Resting { order_id })) => {
@@ -3098,17 +2803,6 @@ where
         let expired = match &reason {
             RestingStopReason::Expired(expired) => Some(*expired),
             RestingStopReason::OfferPost(_) => None,
-            RestingStopReason::Health(failure)
-                if failure.component == HealthComponent::UpstreamModel
-                    && matches!(
-                        disposition,
-                        CancellationDisposition::Cancelled
-                            | CancellationDisposition::AlreadyAbsent
-                            | CancellationDisposition::NotAttemptedExpired
-                    ) =>
-            {
-                None
-            }
             _ => {
                 if timing.abort_gateway_on_stop && disposition.proven_unmatchable() {
                     seller.server_task.abort();
@@ -3119,7 +2813,6 @@ where
                 });
             }
         };
-        let recover_upstream = recovering_offer || matches!(reason, RestingStopReason::Health(_));
 
         let reap_deadline = tokio::time::Instant::now() + timing.reap_timeout;
         let relist = if expired.is_some()
@@ -3198,7 +2891,7 @@ where
 
         cfg.price_per_tick = price_per_tick;
         cfg.max_ticks = remaining_ticks;
-        let startup = prepare_seller_offer_with_recovery(
+        let startup = prepare_seller_offer_with_timing(
             seller,
             chain,
             &cfg,
@@ -3210,7 +2903,6 @@ where
                 abort_gateway_on_stop: false,
                 ..timing
             },
-            recover_upstream,
         )
         .await;
         let startup = match startup {
@@ -3235,7 +2927,7 @@ where
                 outcome: Some(dexdo_core::SellOfferOutcome::Matched),
             }) => {
                 return Ok(RestingSellerOutcome::Matched(
-                    chain.read_match(&identity.token_contract).await?,
+                    read_confirmed_relist_match(seller, chain, &cfg, watch).await?,
                 ))
             }
             SellerStartupOutcome::Ready(SellerOfferStartup::Posted {
@@ -3290,18 +2982,41 @@ where
                 },
             });
         }
-        let successor_identity = RestingOfferIdentity {
-            order_id: successor,
-            ..(*identity).clone()
+        // Acceptance already establishes which exact row the watcher and shutdown own.
+        // Advance the identity before any read of the new deadline can fail.
+        let previous_identity = identity.clone();
+        identity.order_id = successor;
+        tracing::event!(name: "seller_successor_accepted", tracing::Level::DEBUG,
+            token_contract = %display_token_contract(&identity.token_contract),
+            order_id = successor, "checking accepted successor deadline");
+        let deadline_result = tokio::select! {
+            biased;
+            _ = shutdown.as_mut() => {
+                return match stop_exact_offer(
+                    seller,
+                    chain,
+                    &cfg,
+                    identity,
+                    RestingStopReason::Shutdown,
+                    tokio::time::Instant::now() + timing.cycle_timeout,
+                    timing,
+                ).await? {
+                    SellerStartupOutcome::Ready(_) => Ok(RestingSellerOutcome::Matched(
+                        read_confirmed_relist_match(seller, chain, &cfg, watch).await?,
+                    )),
+                    SellerStartupOutcome::Stopped { reason, disposition, .. } => {
+                        Ok(RestingSellerOutcome::Stopped { reason, disposition })
+                    }
+                };
+            }
+            result = successor_absolute_deadline(
+                chain,
+                identity,
+                tokio::time::Instant::now() + timing.reap_timeout,
+                timing.reap_poll,
+            ) => result,
         };
-        let successor_deadline = match successor_absolute_deadline(
-            chain,
-            &successor_identity,
-            tokio::time::Instant::now() + timing.reap_timeout,
-            timing.reap_poll,
-        )
-        .await
-        {
+        let successor_deadline = match deadline_result {
             Ok(deadline) if expired.is_none_or(|expired| deadline > expired.deadline) => deadline,
             Ok(deadline) => {
                 return Ok(RestingSellerOutcome::Stopped {
@@ -3309,8 +3024,7 @@ where
                     disposition: CancellationDisposition::UnknownFailure {
                         known_result: format!(
                             "successor order {successor} carries deadline {deadline}, which does not \
-                             advance past the reaped {}; TokenContract {} now rests an offer this \
-                             seller will not supervise",
+                             advance past the reaped {}; TokenContract {} still owns the confirmed offer",
                             expired.expect("only expiry requires advancing the deadline").deadline,
                             display_token_contract(&identity.token_contract)
                         ),
@@ -3325,7 +3039,7 @@ where
             }
         };
         trace_offer_relisted(
-            &*identity,
+            &previous_identity,
             expired.as_ref(),
             successor,
             successor_deadline,
@@ -3338,7 +3052,21 @@ where
                 "upstream_recovery"
             },
         );
-        *identity = successor_identity;
+    }
+}
+
+async fn read_confirmed_relist_match(
+    seller: &RunningSeller,
+    chain: &dyn ChainBackend,
+    cfg: &SellerConfig,
+    watch: &SellerMatchWatchConfig,
+) -> Result<Match> {
+    match chain.read_match(&cfg.token_contract).await {
+        Ok(matched) => Ok(matched),
+        Err(dexdo_core::ChainError::Transport(_) | dexdo_core::ChainError::NoMatch(_)) => {
+            super::wait_for_known_match(seller, chain, cfg, watch).await
+        }
+        Err(error) => Err(error.into()),
     }
 }
 
@@ -3478,7 +3206,6 @@ fn canonical_timing(
     SupervisionTiming {
         health_interval: params.health_interval,
         health_timeout: params.health_check_timeout,
-        upstream_grace: params.upstream_unavailable_grace,
         cycle_timeout: params.health_cycle_timeout,
         cancel_poll: params.cancel_confirmation_poll,
         expiry_poll: params.offer_expiry_poll,
@@ -3493,8 +3220,6 @@ fn canonical_timing(
 #[cfg(test)]
 mod tests {
     include!("expiry_confirmation_2050_tests.rs");
-    include!("upstream_recovery_2077_tests.rs");
-    include!("upstream_grace_2222_tests.rs");
     include!("offer_recovery_2096_tests.rs");
     include!("watch_read_recovery_2122_tests.rs");
 
@@ -3539,31 +3264,6 @@ mod tests {
     use std::sync::{Arc, Mutex};
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
-    #[test]
-    fn uptime_probe_classifies_retryable_429_as_throttled_only() {
-        let rate_limited = dexdo_proto::retryable_upstream_status(tonic::Status::unavailable(
-            "upstream HTTP 429 Too Many Requests",
-        ));
-        assert_eq!(
-            super::upstream_uptime_outcome(&anyhow::Error::new(rate_limited)),
-            "throttled"
-        );
-
-        let other_retryable = dexdo_proto::retryable_upstream_status(tonic::Status::unavailable(
-            "upstream HTTP 503 Service Unavailable",
-        ));
-        assert_eq!(
-            super::upstream_uptime_outcome(&anyhow::Error::new(other_retryable)),
-            "fail"
-        );
-
-        let unclassified_429 = tonic::Status::unavailable("upstream HTTP 429 Too Many Requests");
-        assert_eq!(
-            super::upstream_uptime_outcome(&anyhow::Error::new(unclassified_429)),
-            "fail"
-        );
-    }
-
     #[derive(Clone, Copy)]
     enum CancelBehavior {
         Remove,
@@ -3593,7 +3293,6 @@ mod tests {
         hang_reads: bool,
         watch_fails: bool,
         confirm_delay: Duration,
-        confirm_ready: Option<Arc<tokio::sync::Notify>>,
         post_visibility: PostVisibility,
         pending_post: Mutex<Option<OrderBookOrder>>,
         post_visibility_reads: AtomicU64,
@@ -3627,7 +3326,6 @@ mod tests {
                 hang_reads: false,
                 watch_fails: false,
                 confirm_delay: Duration::ZERO,
-                confirm_ready: None,
                 post_visibility: PostVisibility::Immediate,
                 pending_post: Mutex::new(None),
                 post_visibility_reads: AtomicU64::new(0),
@@ -3657,11 +3355,6 @@ mod tests {
 
         fn with_confirm_delay(mut self, delay: Duration) -> Self {
             self.confirm_delay = delay;
-            self
-        }
-
-        fn with_confirmation_ready(mut self, ready: Arc<tokio::sync::Notify>) -> Self {
-            self.confirm_ready = Some(ready);
             self
         }
 
@@ -3754,11 +3447,7 @@ mod tests {
             &self,
             _: &TokenContract,
         ) -> Result<Option<SellOfferOutcome>, ChainError> {
-            if let Some(ready) = &self.confirm_ready {
-                ready.notified().await;
-            } else {
-                tokio::time::sleep(self.confirm_delay).await;
-            }
+            tokio::time::sleep(self.confirm_delay).await;
             Ok(Some(SellOfferOutcome::Rested {
                 order_id: self.posted_order_id,
             }))
@@ -4146,521 +3835,18 @@ mod tests {
         (format!("http://{addr}"), task)
     }
 
-    async fn counted_http_server(
-        status: &'static str,
-        body: String,
-        response_count: usize,
-    ) -> (
-        String,
-        Arc<tokio::sync::Notify>,
-        tokio::task::JoinHandle<()>,
-    ) {
-        assert!(response_count > 0, "the server must answer at least once");
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let addr = listener.local_addr().unwrap();
-        let response_complete = Arc::new(tokio::sync::Notify::new());
-        let task_complete = response_complete.clone();
-        let task = tokio::spawn(async move {
-            let mut listener = Some(listener);
-            for response_index in 0..response_count {
-                let (mut socket, _) = listener.as_ref().unwrap().accept().await.unwrap();
-                let mut request = vec![0_u8; 8192];
-                let _ = socket.read(&mut request).await;
-                let response = format!(
-                    "HTTP/1.1 {status}\r\ncontent-type: text/event-stream\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
-                    body.len()
-                );
-                socket.write_all(response.as_bytes()).await.unwrap();
-                socket.shutdown().await.unwrap();
-                if response_index + 1 == response_count {
-                    drop(listener.take());
-                }
-                task_complete.notify_one();
-            }
-        });
-        (format!("http://{addr}"), response_complete, task)
-    }
-
     fn healthy_sse() -> String {
         "data: {\"choices\":[{\"delta\":{\"content\":\"OK\"},\"logprobs\":{\"content\":[{\"token\":\"OK\",\"logprob\":-0.1,\"top_logprobs\":[]}]}}]}\n\ndata: {\"choices\":[],\"usage\":{\"prompt_tokens\":0,\"completion_tokens\":1,\"total_tokens\":1}}\n\ndata: [DONE]\n\n".to_string()
     }
 
-    async fn read_recorded_request_body(socket: &mut tokio::net::TcpStream) -> String {
-        let mut request = Vec::new();
-        let mut next = [0_u8; 4096];
-        loop {
-            let read = socket
-                .read(&mut next)
-                .await
-                .expect("read capability probe request");
-            assert_ne!(read, 0, "capability probe request ended before its body");
-            request.extend_from_slice(&next[..read]);
-            let Some(header_end) = request.windows(4).position(|part| part == b"\r\n\r\n") else {
-                continue;
-            };
-            let headers = std::str::from_utf8(&request[..header_end])
-                .expect("capability probe request headers are UTF-8");
-            let content_length = headers
-                .lines()
-                .find_map(|line| {
-                    let (name, value) = line.split_once(':')?;
-                    name.eq_ignore_ascii_case("content-length").then(|| {
-                        value
-                            .trim()
-                            .parse::<usize>()
-                            .expect("numeric content length")
-                    })
-                })
-                .unwrap_or(0);
-            let body_start = header_end + 4;
-            if request.len() >= body_start + content_length {
-                return String::from_utf8(
-                    request[body_start..body_start + content_length].to_vec(),
-                )
-                .expect("capability probe request body is UTF-8");
-            }
-        }
-    }
-
-    fn recording_http_server(
-        script: Vec<String>,
-        reject_sample_control: bool,
-    ) -> (String, Arc<Mutex<Vec<String>>>, tokio::task::JoinHandle<()>) {
-        assert!(
-            !script.is_empty(),
-            "capability probe server needs a response"
-        );
-        let listener =
-            std::net::TcpListener::bind("127.0.0.1:0").expect("bind capability probe upstream");
-        listener
-            .set_nonblocking(true)
-            .expect("capability probe upstream must be non-blocking");
-        let address = listener.local_addr().expect("capability probe address");
-        let listener =
-            tokio::net::TcpListener::from_std(listener).expect("adopt capability probe upstream");
-        let requests = Arc::new(Mutex::new(Vec::new()));
-        let recorded = requests.clone();
-        let server = tokio::spawn(async move {
-            let mut index = 0_usize;
-            loop {
-                let Ok((mut socket, _)) = listener.accept().await else {
-                    return;
-                };
-                let request = read_recorded_request_body(&mut socket).await;
-                let sample_control_was_sent = ["seed", "random_seed", "do_sample", "top_k"]
-                    .iter()
-                    .any(|field| capability_request(&request).get(*field).is_some());
-                recorded.lock().unwrap().push(request);
-                let scripted_body = &script[std::cmp::min(index, script.len() - 1)];
-                index += 1;
-                let (status, content_type, body) =
-                    if reject_sample_control && sample_control_was_sent {
-                        (
-                            "400 Bad Request",
-                            "application/json",
-                            r#"{"error":{"message":"unsupported determinism field"}}"#,
-                        )
-                    } else {
-                        ("200 OK", "text/event-stream", scripted_body.as_str())
-                    };
-                let response = format!(
-                    "HTTP/1.1 {status}\r\ncontent-type: {content_type}\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
-                    body.len()
-                );
-                socket
-                    .write_all(response.as_bytes())
-                    .await
-                    .expect("write capability probe response");
-            }
-        });
-        (format!("http://{address}"), requests, server)
-    }
-
-    fn capability_plain_sse() -> String {
-        "data: {\"model\":\"exact-model\",\"choices\":[{\"delta\":{\"content\":\"OK\"}}]}\n\ndata: {\"choices\":[],\"usage\":{\"prompt_tokens\":0,\"completion_tokens\":1,\"total_tokens\":1}}\n\ndata: [DONE]\n\n".to_string()
-    }
-
-    fn capability_tool_sse() -> String {
-        "data: {\"model\":\"exact-model\",\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"call_probe\",\"type\":\"function\",\"function\":{\"name\":\"dexdo_capability_probe\",\"arguments\":\"{}\"}}]}}]}\n\ndata: {\"choices\":[],\"usage\":{\"prompt_tokens\":0,\"completion_tokens\":4,\"total_tokens\":4}}\n\ndata: [DONE]\n\n".to_string()
-    }
-
-    fn capability_wrong_tool_sse() -> String {
-        "data: {\"model\":\"exact-model\",\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"call_wrong\",\"type\":\"function\",\"function\":{\"name\":\"different_tool\",\"arguments\":\"{}\"}}]}}]}\n\ndata: {\"choices\":[],\"usage\":{\"prompt_tokens\":0,\"completion_tokens\":4,\"total_tokens\":4}}\n\ndata: [DONE]\n\n".to_string()
-    }
-
-    fn capability_think_sse() -> String {
-        "data: {\"model\":\"exact-model\",\"choices\":[{\"delta\":{\"reasoning\":\"checked the request\"}}]}\n\ndata: {\"choices\":[],\"usage\":{\"prompt_tokens\":0,\"completion_tokens\":4,\"total_tokens\":4,\"completion_tokens_details\":{\"reasoning_tokens\":3}}}\n\ndata: [DONE]\n\n".to_string()
-    }
-
-    struct CapabilityStartupResult {
-        outcome: Result<SellerStartupOutcome>,
-        posts: u64,
-        order_ids: Vec<u128>,
-        request_bodies: Vec<String>,
-    }
-
-    async fn run_capability_startup(
-        frame_model: &str,
-        first_response: String,
-    ) -> CapabilityStartupResult {
-        run_capability_startup_with(frame_model, first_response).await
-    }
-
-    async fn run_capability_startup_with(
-        frame_model: &str,
-        first_response: String,
-    ) -> CapabilityStartupResult {
-        let (base_url, requests, upstream_server) =
-            recording_http_server(vec![first_response, capability_plain_sse()], true);
-        let mut upstream = openai(base_url);
-        let UpstreamConfig::OpenAi(config) = &mut upstream else {
-            unreachable!("capability fixture is OpenAI-compatible")
-        };
-        config.frame_model = frame_model.to_string();
-        config.identity_aliases = vec!["exact-model".to_string()];
-
-        let seller = super::super::start_gateway_with_note(
+    async fn issue_2264_seller(base_url: String) -> RunningSeller {
+        super::super::start_gateway_with_note(
             "127.0.0.1:0".parse().unwrap(),
-            upstream,
+            openai(base_url),
             Arc::new(LocalNote::generate()),
         )
         .await
-        .expect("start capability fixture seller");
-        let owner = address('7');
-        let token_contract = address('8');
-        let backend = CancelBackend::new(Vec::new(), owner.clone(), 1227, CancelBehavior::Remove);
-        let outcome = prepare_seller_offer_with_timing(
-            &seller,
-            &backend,
-            &cfg_for_seller(&token_contract, &seller),
-            &owner,
-            None,
-            std::future::pending(),
-            fast_timing(),
-        )
-        .await;
-        let result = CapabilityStartupResult {
-            outcome,
-            posts: backend.posts.load(Ordering::Relaxed),
-            order_ids: backend.order_ids(),
-            request_bodies: requests.lock().unwrap().clone(),
-        };
-        seller.server_task.abort();
-        upstream_server.abort();
-        result
-    }
-
-    fn capability_request(body: &str) -> serde_json::Value {
-        serde_json::from_str(body).expect("capability probe request is JSON")
-    }
-
-    #[tokio::test]
-    async fn issue_1227_tools_flag_with_tool_call_proceeds_to_sell() {
-        let result =
-            run_capability_startup("vendor--exact--v1--tools", capability_tool_sse()).await;
-        let rendered = render_startup(&result.outcome);
-        assert!(
-            matches!(result.outcome, Ok(SellerStartupOutcome::Ready(_))),
-            "a tools-capable upstream must pass startup: {rendered}"
-        );
-        assert_eq!(result.posts, 1, "capability passed but SELL was not posted");
-        assert_eq!(result.order_ids, vec![1227]);
-        assert_eq!(
-            result.request_bodies.len(),
-            2,
-            "startup must add no second capability request"
-        );
-        let capability = capability_request(&result.request_bodies[0]);
-        assert_eq!(capability["tools"][0]["type"], "function");
-        assert_eq!(
-            capability["tools"][0]["function"]["name"],
-            "dexdo_capability_probe"
-        );
-        assert_eq!(
-            capability["tool_choice"]["function"]["name"],
-            "dexdo_capability_probe"
-        );
-        // the capability probe is unbounded, so a model that thinks before it answers is
-        // never cut off and reported as incapable.
-        assert!(capability.get("max_tokens").is_none());
-        let after_post = capability_request(&result.request_bodies[1]);
-        assert!(after_post.get("tools").is_none());
-        assert!(after_post.get("tool_choice").is_none());
-    }
-
-    #[tokio::test]
-    async fn issue_1227_tools_flag_with_wrong_tool_call_refuses_before_sell() {
-        let result =
-            run_capability_startup("vendor--exact--v1--tools", capability_wrong_tool_sse()).await;
-        let rendered = render_startup(&result.outcome);
-        assert!(
-            result.outcome.is_err(),
-            "a call to an unoffered tool passed --tools: {rendered}"
-        );
-        assert_eq!(result.posts, 0, "wrong tool call posted a SELL");
-        assert!(
-            result.order_ids.is_empty(),
-            "wrong tool call reached the book"
-        );
-        assert_eq!(result.request_bodies.len(), 1);
-        assert!(rendered.contains("--tools"), "{rendered}");
-        assert!(rendered.contains("tool_call=false"), "{rendered}");
-    }
-
-    #[tokio::test]
-    async fn issue_1227_tools_flag_with_plain_content_refuses_before_sell() {
-        let result =
-            run_capability_startup("vendor--exact--v1--tools", capability_plain_sse()).await;
-        let rendered = render_startup(&result.outcome);
-        assert!(
-            result.outcome.is_err(),
-            "plain content passed --tools: {rendered}"
-        );
-        assert_eq!(result.posts, 0, "failed --tools preflight posted a SELL");
-        assert!(
-            result.order_ids.is_empty(),
-            "failed --tools preflight reached the book"
-        );
-        assert_eq!(result.request_bodies.len(), 1);
-        for required in ["--tools", "asked", "returned"] {
-            assert!(
-                rendered.contains(required),
-                "--tools refusal must say what was asked and returned: {rendered}"
-            );
-        }
-    }
-
-    #[tokio::test]
-    async fn issue_1227_think_flag_with_reasoning_and_usage_proceeds_to_sell() {
-        let result =
-            run_capability_startup("vendor--exact--v1--think", capability_think_sse()).await;
-        let rendered = render_startup(&result.outcome);
-        assert!(
-            matches!(result.outcome, Ok(SellerStartupOutcome::Ready(_))),
-            "a reasoning-capable upstream must pass startup: {rendered}"
-        );
-        assert_eq!(result.posts, 1, "capability passed but SELL was not posted");
-        assert_eq!(result.order_ids, vec![1227]);
-        assert_eq!(
-            result.request_bodies.len(),
-            2,
-            "startup must add no second capability request"
-        );
-        let capability = capability_request(&result.request_bodies[0]);
-        assert_eq!(capability["reasoning"]["enabled"], true);
-        assert_eq!(capability["reasoning"]["exclude"], false);
-        // the capability probe is unbounded, so a model that thinks before it answers is
-        // never cut off and reported as incapable.
-        assert!(capability.get("max_tokens").is_none());
-        let after_post = capability_request(&result.request_bodies[1]);
-        assert!(after_post.get("reasoning").is_none());
-    }
-
-    #[tokio::test]
-    async fn issue_1227_think_flag_with_plain_content_refuses_before_sell() {
-        let result =
-            run_capability_startup("vendor--exact--v1--think", capability_plain_sse()).await;
-        let rendered = render_startup(&result.outcome);
-        assert!(
-            result.outcome.is_err(),
-            "plain content passed --think: {rendered}"
-        );
-        assert_eq!(result.posts, 0, "failed --think preflight posted a SELL");
-        assert!(
-            result.order_ids.is_empty(),
-            "failed --think preflight reached the book"
-        );
-        assert_eq!(result.request_bodies.len(), 1);
-        for required in ["--think", "asked", "returned"] {
-            assert!(
-                rendered.contains(required),
-                "--think refusal must say what was asked and returned: {rendered}"
-            );
-        }
-    }
-
-    #[tokio::test]
-    async fn issue_1227_plain_id_uses_one_readiness_shape_and_no_extra_probe() {
-        let result = run_capability_startup("vendor--exact--v1", capability_plain_sse()).await;
-        let rendered = render_startup(&result.outcome);
-        assert!(
-            matches!(result.outcome, Ok(SellerStartupOutcome::Ready(_))),
-            "plain startup changed: {rendered}"
-        );
-        assert_eq!(result.posts, 1);
-        assert_eq!(result.order_ids, vec![1227]);
-        assert_eq!(
-            result.request_bodies.len(),
-            2,
-            "plain startup gained an extra upstream request"
-        );
-        assert_eq!(
-            result.request_bodies[0], result.request_bodies[1],
-            "the pre-SELL and existing post-SELL readiness requests must stay byte-identical"
-        );
-        assert_eq!(
-            capability_request(&result.request_bodies[0]),
-            serde_json::json!({
-                "model": "exact-model",
-                "messages": [{"role": "user", "content": "Reply with OK."}],
-                "stream": true,
-                "stream_options": {"include_usage": true},
-                // the readiness budget moved off 1 -- a model that thinks first spends a
-                // one-token budget inside its reasoning channel and delivers nothing, which the
-                // seller then reads as billed-without-delivery. What THIS test owns is unchanged and
-                // still asserted exactly: the plain path gains no extra request, and the pre-SELL and
-                // post-SELL readiness bodies stay byte-identical.
-                "max_tokens": 64
-            })
-        );
-    }
-
-    /// pin the CAPABILITY probe body the way
-    /// `issue_1227_plain_id_uses_one_readiness_shape_and_no_extra_probe` pins the plain
-    /// one, so a future edit cannot silently change what we ask a provider to prove.
-
-    /// The measurement behind these two fields is on the constants themselves. In one sentence:
-    /// asked with the readiness prompt and the readiness budget, `qwen/qwen3-32b`,
-    /// `qwen/qwen3.6-27b`, `openai/gpt-oss-20b` and `openai/gpt-oss-120b` never called the tool on
-    /// Groq (2026-08-12), so a `--tools` market could not start on any of them.
-
-    /// This asserts the WHOLE body, not the two fields that moved: the tool schema and the forced
-    /// `tool_choice` are what the provider is actually asked to honour, and they were proven
-    /// innocent of precisely by being byte-identical between the failing and passing runs.
-    #[tokio::test]
-    async fn issue_1278_capability_probe_asks_for_the_call_with_its_own_prompt_and_no_limit() {
-        let result =
-            run_capability_startup("vendor--exact--v1--tools", capability_tool_sse()).await;
-        assert!(
-            matches!(result.outcome, Ok(SellerStartupOutcome::Ready(_))),
-            "tools startup changed: {}",
-            render_startup(&result.outcome)
-        );
-        assert_eq!(result.request_bodies.len(), 2);
-        assert_eq!(
-            capability_request(&result.request_bodies[0]),
-            serde_json::json!({
-                "model": "exact-model",
-                "messages": [{
-                    "role": "user",
-                    "content": "Call the dexdo_capability_probe tool with an empty object.",
-                }],
-                "stream": true,
-                "stream_options": {"include_usage": true},
-                "tools": [{
-                    "type": "function",
-                    "function": {
-                        "name": "dexdo_capability_probe",
-                        "description": "Return an empty object to prove tool-call support.",
-                        "parameters": {
-                            "type": "object",
-                            "properties": {},
-                            "additionalProperties": false,
-                        },
-                    },
-                }],
-                "tool_choice": {
-                    "type": "function",
-                    "function": {"name": "dexdo_capability_probe"},
-                },
-            })
-        );
-        assert_eq!(
-            capability_request(&result.request_bodies[0])["messages"][0]["content"],
-            serde_json::json!(dexdo_core::params::CAPABILITY_PROBE_PROMPT),
-            "the pinned body must be the shipped constant, not a copy of its text"
-        );
-        assert!(
-            capability_request(&result.request_bodies[0])
-                .get("max_tokens")
-                .is_none(),
-            "the capability probe is unbounded"
-        );
-    }
-
-    /// the capability prompt and budget are the CAPABILITY probe's alone. The post-SELL
-    /// readiness request in the very same tools startup must still carry the readiness prompt and
-    /// the readiness budget, byte for byte, with no tool fields at all.
-
-    /// Two questions, two constants: is what asking one of them with the other's budget cost,
-    /// and this is the assertion that fails if's fix leaks back into the shared path.
-    #[tokio::test]
-    async fn issue_1278_plain_readiness_body_stays_separate_inside_a_tools_startup() {
-        let result =
-            run_capability_startup("vendor--exact--v1--tools", capability_tool_sse()).await;
-        assert_eq!(result.request_bodies.len(), 2);
-        assert_eq!(
-            capability_request(&result.request_bodies[1]),
-            serde_json::json!({
-                "model": "exact-model",
-                "messages": [{"role": "user", "content": "Reply with OK."}],
-                "stream": true,
-                "stream_options": {"include_usage": true},
-                "max_tokens": 64
-            }),
-            "the plain readiness request must stay free of capability-only fields"
-        );
-        assert_ne!(
-            capability_request(&result.request_bodies[0])["max_tokens"],
-            capability_request(&result.request_bodies[1])["max_tokens"],
-            "the two probes must not share a budget"
-        );
-        assert_ne!(
-            dexdo_core::params::CAPABILITY_PROBE_PROMPT,
-            dexdo_core::params::UPSTREAM_HEALTH_PROBE_PROMPT,
-            "the two probes must not share a prompt"
-        );
-    }
-
-    /// a `--think`-only probe must not name a tool it does not offer.
-
-    /// `tools`/`tool_choice` are built from `requirements.tools` alone, so this body carries
-    /// `reasoning` and NO tool of any kind. Asking it to "call the dexdo_capability_probe tool"
-    /// would be an incoherent request, and a provider entitled to refuse it would make `--think`
-    /// markets unstartable -- the same class of outage is fixing. So the prompt is chosen by
-    /// whether a tool is OFFERED, and this pins both halves of that choice: the readiness prompt
-    /// here, the capability prompt in
-    /// `issue_1278_capability_probe_asks_for_the_call_with_its_own_prompt_and_no_limit`.
-
-    /// It is still unbounded: reasoning needs the room even when no tool is asked for.
-    #[tokio::test]
-    async fn issue_1278_think_only_probe_keeps_the_readiness_prompt_and_offers_no_tool() {
-        let result =
-            run_capability_startup("vendor--exact--v1--think", capability_think_sse()).await;
-        assert!(
-            matches!(result.outcome, Ok(SellerStartupOutcome::Ready(_))),
-            "think startup changed: {}",
-            render_startup(&result.outcome)
-        );
-        assert_eq!(result.request_bodies.len(), 2);
-        assert_eq!(
-            capability_request(&result.request_bodies[0]),
-            serde_json::json!({
-                "model": "exact-model",
-                "messages": [{"role": "user", "content": "Reply with OK."}],
-                "stream": true,
-                "stream_options": {"include_usage": true},
-                "reasoning": {"enabled": true, "exclude": false},
-            }),
-            "a --think-only probe must ask for reasoning and offer no tool"
-        );
-        let probe = capability_request(&result.request_bodies[0]);
-        assert!(
-            probe.get("tools").is_none() && probe.get("tool_choice").is_none(),
-            "no tool is offered, so none may be named"
-        );
-        assert!(
-            !probe["messages"][0]["content"]
-                .as_str()
-                .expect("probe prompt is a string")
-                .contains("dexdo_capability_probe"),
-            "the prompt must not name a tool absent from the request"
-        );
-        assert_eq!(
-            probe["messages"][0]["content"],
-            serde_json::json!(dexdo_core::params::UPSTREAM_HEALTH_PROBE_PROMPT),
-            "the think-only prompt must be the shipped readiness constant"
-        );
+        .unwrap()
     }
 
     #[derive(Clone)]
@@ -4709,6 +3895,7 @@ mod tests {
                 note: Arc::new(LocalNote::generate()),
                 server_task: task,
                 listen_addr,
+                migrated_routes: Default::default(),
                 tls_fingerprint,
             },
             advertised,
@@ -4737,7 +3924,6 @@ mod tests {
         SupervisionTiming {
             health_interval: Duration::from_millis(5),
             health_timeout: Duration::from_millis(500),
-            upstream_grace: Duration::from_secs(1),
             cycle_timeout: Duration::from_millis(600),
             cancel_poll: Duration::from_millis(1),
             expiry_poll: Duration::from_secs(3_600),
@@ -4995,7 +4181,6 @@ mod tests {
         SupervisionTiming {
             health_interval: Duration::from_millis(5),
             health_timeout: Duration::from_millis(300),
-            upstream_grace: fast_timing().upstream_grace,
             cycle_timeout: Duration::from_secs(3),
             cancel_poll: Duration::from_millis(1),
             expiry_poll: Duration::from_secs(3_600),
@@ -5092,7 +4277,7 @@ mod tests {
             "{rendered}"
         );
         seller.server_task.abort();
-        upstream_server.await.unwrap();
+        upstream_server.abort();
     }
 
     /// E2E-ADV-10, the TIMEOUT arm -- the classification and the book, through production's own
@@ -5170,7 +4355,7 @@ mod tests {
         )
         .await;
         seller.server_task.abort();
-        upstream_server.await.unwrap();
+        upstream_server.abort();
 
         let rendered = render_startup(&outcome);
         if backend.posts.load(Ordering::Relaxed) != 0 {
@@ -5660,97 +4845,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn upstream_unreachable_rejected_missing_model_and_timeout_fail_closed() {
-        // The first case is the UNREACHABLE upstream (refused at connect), a different fail-closed
-        // path from the fourth (a server that answers too slowly). If a bind-and-drop port is taken
-        // by somebody else the two collapse into one and the case stops proving its own name
-        // so the refusing reservation is held for the whole assertion.
-        let (_dead_hold, dead) = crate::test_refusing_endpoint::refusing_endpoint();
-        let cases = [
-            (format!("http://{dead}"), None, Duration::from_secs(1)),
-            (
-                http_server(
-                    "401 Unauthorized",
-                    "{\"error\":{\"message\":\"bad credential\"}}".to_string(),
-                    Duration::ZERO,
-                )
-                .await
-                .0,
-                None,
-                Duration::from_secs(1),
-            ),
-            (
-                http_server(
-                    "404 Not Found",
-                    "{\"error\":{\"message\":\"model absent\"}}".to_string(),
-                    Duration::ZERO,
-                )
-                .await
-                .0,
-                None,
-                Duration::from_secs(1),
-            ),
-            (
-                http_server("200 OK", healthy_sse(), Duration::from_millis(500))
-                    .await
-                    .0,
-                Some(true),
-                Duration::from_millis(100),
-            ),
-        ];
-
-        for (base_url, expect_timeout, timeout) in cases {
-            let seller = super::super::start_gateway_with_note(
-                "127.0.0.1:0".parse().unwrap(),
-                openai(base_url),
-                Arc::new(LocalNote::generate()),
-            )
-            .await
-            .unwrap();
-            let advertised = seller.listen_addr.to_string();
-
-            // the two readiness components share ONE deadline, are polled with `join!`, and
-            // the advertised-gateway verdict is consulted first. So whenever both can expire, the
-            // component that gets reported is decided by which of them finished inside the budget --
-            // an ordering nothing promises. The last case gives readiness 100 ms against an upstream
-            // that answers in 500 ms; on a loaded host the local pinned-TLS self-probe loses that
-            // same 100 ms and the failure reads `AdvertisedGateway` instead of `UpstreamModel`.
-
-            // The subject of this test is the UPSTREAM: a bad upstream must fail readiness, and the
-            // slow one must be reported as a timeout. So the gateway's outcome is ESTABLISHED
-            // instead of raced, the way settled the same class -- run the REAL probe against
-            // the REAL gateway first and assert its REAL result, then hand the readiness call that
-            // settled outcome so the only component still racing the budget is the one under test.
-
-            // This injects no fault and hides none: `probe_gateway` never reaches the upstream (DNS,
-            // TCP, pinned TLS and the gRPC challenge all terminate at the seller's own gateway), so
-            // a probe that stopped detecting a broken gateway fails the assertion below rather than
-            // being concealed by it.
-            probe_advertised_gateway(&seller, &advertised)
-                .await
-                .expect("the gateway must be serving before the upstream bound is exercised");
-
-            let failure = check_readiness_with_probe(
-                &seller,
-                &advertised,
-                timeout,
-                None,
-                &address('c'),
-                AdvertiseProbePolicy::default(),
-                std::future::ready(Ok(())),
-            )
-            .await
-            .expect_err("bad upstream must fail readiness");
-            assert_eq!(failure.component, HealthComponent::UpstreamModel);
-            if expect_timeout.is_some() {
-                assert!(failure.timed_out);
-            }
-            seller.server_task.abort();
-        }
-    }
-
-    #[tokio::test]
-    async fn repeated_health_cycles_leave_no_health_nonces_on_success_or_failure() {
+    async fn repeated_gateway_health_cycles_leave_no_health_nonces() {
         const BUYER_TC: &str = "0:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
         let healthy = super::super::start_gateway_with_note(
             "127.0.0.1:0".parse().unwrap(),
@@ -5804,47 +4899,12 @@ mod tests {
         }
         assert_eq!(healthy.state.auth.outstanding_challenge_count(BUYER_TC), 0);
         healthy.server_task.abort();
-
-        let (base_url, upstream_server) = http_server(
-            "401 Unauthorized",
-            "{\"error\":{\"message\":\"bad credential\"}}".to_string(),
-            Duration::ZERO,
-        )
-        .await;
-        let failing = super::super::start_gateway_with_note(
-            "127.0.0.1:0".parse().unwrap(),
-            openai(base_url),
-            Arc::new(LocalNote::generate()),
-        )
-        .await
-        .unwrap();
-        let failure = check_readiness(
-            &failing,
-            &failing.listen_addr.to_string(),
-            Duration::from_secs(1),
-            None,
-            BUYER_TC,
-            AdvertiseProbePolicy::default(),
-        )
-        .await
-        .expect_err("upstream rejection fails the health cycle");
-        assert_eq!(failure.component, HealthComponent::UpstreamModel);
-        assert_eq!(
-            failing
-                .state
-                .auth
-                .outstanding_challenge_count(HEALTH_CHALLENGE_TC),
-            0,
-            "health challenge is discarded before a later component fails"
-        );
-        failing.server_task.abort();
-        upstream_server.await.unwrap();
     }
 
     /// E2E-ADV-01 positive control: all readiness components pass before exactly one accepted
     /// post. The negative components are the existing exact tests
     /// `a_closed_advertised_port_posts_nothing_even_though_the_gateway_is_bound`,
-    /// `upstream_unreachable_rejected_missing_model_and_timeout_fail_closed`, and
+    /// and
     /// `gateway_task_death_cancels_within_one_health_cycle`.
 
     /// E2E-ADV-01, `tests/e2e/test-specification.md`.
@@ -5939,80 +4999,62 @@ mod tests {
         seller.server_task.abort();
     }
 
-    /// E2E-ADV-02/L0 -- both required adversaries drive the actual readiness-to-post composition.
-    /// The first provider is down. The second accepts the configured `exact-model` request but its
-    /// OpenAI-compatible response identifies the model which actually served it as
-    /// `foreign-provider-model`; changing the signal manifest is deliberately not used as a
-    /// substitute for provider identity. Both arms assert the submit counter and authoritative
-    /// book. L1/L2 remain live gates and are not claimed by this deterministic row.
-
-    /// E2E-ADV-02, `tests/e2e/test-specification.md`.
     /// E2E-ROW: E2E-ADV-02/L0
     #[tokio::test]
-    async fn e2e_adv_02_different_upstream_model_never_reaches_the_book() {
-        let owner = address('3');
-        let tc = address('4');
-
-        let (_down_hold, down_address) = crate::test_refusing_endpoint::refusing_endpoint();
-        let down_seller = super::super::start_gateway_with_note(
-            "127.0.0.1:0".parse().unwrap(),
-            openai(format!("http://{down_address}")),
-            Arc::new(LocalNote::generate()),
-        )
-        .await
-        .unwrap();
-        let down_backend =
-            CancelBackend::new(Vec::new(), owner.clone(), 211, CancelBehavior::Remove);
-        let down_outcome = prepare_seller_offer_with_timing(
-            &down_seller,
-            &down_backend,
-            &cfg_for_seller(&tc, &down_seller),
-            &owner,
-            None,
-            std::future::pending(),
-            fast_timing(),
-        )
-        .await;
-        assert_nothing_was_posted(
-            &down_backend,
-            "E2E-ADV-02 unavailable upstream",
-            &render_startup(&down_outcome),
-        );
-        assert!(down_outcome.is_err(), "unavailable upstream became ready");
-        down_seller.server_task.abort();
-
-        let foreign_sse = "data: {\"model\":\"foreign-provider-model\",\"choices\":[{\"delta\":{\"content\":\"OK\"},\"logprobs\":{\"content\":[{\"token\":\"OK\",\"logprob\":-0.1,\"top_logprobs\":[]}]}}]}\n\ndata: {\"choices\":[],\"usage\":{\"prompt_tokens\":0,\"completion_tokens\":1,\"total_tokens\":1}}\n\ndata: [DONE]\n\n".to_string();
-        let (base_url, _probes, foreign_server) = scripted_http_server(vec![
-            ("200 OK", foreign_sse.clone(), Duration::ZERO),
-            ("200 OK", foreign_sse, Duration::ZERO),
-        ]);
-        let foreign_seller = super::super::start_gateway_with_note(
-            "127.0.0.1:0".parse().unwrap(),
-            openai(base_url),
-            Arc::new(LocalNote::generate()),
-        )
-        .await
-        .unwrap();
-        let foreign_backend =
-            CancelBackend::new(Vec::new(), owner.clone(), 212, CancelBehavior::Remove);
-        let foreign_outcome = prepare_seller_offer_with_timing(
-            &foreign_seller,
-            &foreign_backend,
-            &cfg_for_seller(&tc, &foreign_seller),
-            &owner,
-            None,
-            std::future::pending(),
-            fast_timing(),
-        )
-        .await;
-        assert!(
-            foreign_backend.posts.load(Ordering::Relaxed) == 0
-                && foreign_backend.order_ids().is_empty()
-                && foreign_outcome.is_err(),
-            "E2E-ADV-02 different served model reached postSellOffer"
-        );
-        foreign_seller.server_task.abort();
-        foreign_server.abort();
+    async fn issue_2264_startup_posts_plain_and_flagged_models_without_probing() {
+        let (url, probes, upstream) = scripted_http_server(vec![(
+            "429 Too Many Requests",
+            "{}".to_string(),
+            Duration::ZERO,
+        )]);
+        for market in [
+            "vendor--model--v1",
+            "vendor--model--v1--tools",
+            "vendor--model--v1--think",
+            "vendor--model--v1--tools--think",
+        ] {
+            let mut provider = openai(url.clone());
+            let UpstreamConfig::OpenAi(config) = &mut provider else {
+                unreachable!()
+            };
+            config.frame_model = market.into();
+            let seller = super::super::start_gateway_with_note(
+                "127.0.0.1:0".parse().unwrap(),
+                provider,
+                Arc::new(LocalNote::generate()),
+            )
+            .await
+            .unwrap();
+            let owner = address('3');
+            let tc = address('4');
+            let backend =
+                CancelBackend::new(Vec::new(), owner.clone(), 2264, CancelBehavior::Remove);
+            let result = prepare_seller_offer_with_timing(
+                &seller,
+                &backend,
+                &cfg_for_seller(&tc, &seller),
+                &owner,
+                None,
+                std::future::pending(),
+                fast_timing(),
+            )
+            .await
+            .unwrap();
+            assert!(
+                matches!(
+                    result,
+                    SellerStartupOutcome::Ready(SellerOfferStartup::Posted {
+                        outcome: Some(dexdo_core::SellOfferOutcome::Rested { order_id: 2264 }),
+                    })
+                ),
+                "{market}: {result:?}"
+            );
+            assert_eq!(backend.order_ids(), vec![2264]);
+            assert_eq!(backend.posts.load(Ordering::SeqCst), 1);
+            assert_eq!(probes.load(Ordering::SeqCst), 0, "{market}");
+            seller.server_task.abort();
+        }
+        upstream.abort();
     }
 
     /// E2E-ADV-06 -- reachability is an invariant for the whole resting lifetime, not a startup
@@ -6078,133 +5120,6 @@ mod tests {
             "E2E-ADV-06 undialable address retained its resting offer"
         );
         seller.server_task.abort();
-    }
-
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn delayed_fresh_resting_confirmation_rechecks_health_before_ready() {
-        let (base_url, first_response_complete, upstream_server) =
-            counted_http_server("200 OK", healthy_sse(), 1).await;
-        let owner = address('d');
-        let tc = address('e');
-        let order_id = 90;
-        let backend =
-            CancelBackend::new(Vec::new(), owner.clone(), order_id, CancelBehavior::Remove)
-                .with_confirmation_ready(first_response_complete);
-        let seller = super::super::start_gateway_with_note(
-            "127.0.0.1:0".parse().unwrap(),
-            openai(base_url),
-            Arc::new(LocalNote::generate()),
-        )
-        .await
-        .unwrap();
-        wait_for_gateway_ready(&seller).await;
-
-        let outcome = prepare_seller_offer_with_timing(
-            &seller,
-            &backend,
-            &cfg_for_seller(&tc, &seller),
-            &owner,
-            None,
-            std::future::pending(),
-            SupervisionTiming {
-                health_interval: Duration::from_millis(5),
-                health_timeout: Duration::from_millis(100),
-                cycle_timeout: Duration::from_millis(300),
-                cancel_poll: Duration::from_millis(1),
-                expiry_poll: Duration::from_secs(3_600),
-                abort_gateway_on_stop: true,
-                advertise_probe: AdvertiseProbePolicy::default(),
-                ..fast_timing()
-            },
-        )
-        .await
-        .unwrap();
-
-        assert!(matches!(
-            outcome,
-            SellerStartupOutcome::Stopped {
-                identity: Some(RestingOfferIdentity { order_id: 90, .. }),
-                reason: RestingStopReason::Health(HealthFailure {
-                    component: HealthComponent::UpstreamModel,
-                    ..
-                }),
-                disposition: CancellationDisposition::Cancelled,
-            }
-        ));
-        assert_eq!(backend.posts.load(Ordering::Relaxed), 1);
-        assert_eq!(backend.calls(), vec![(tc, order_id)]);
-        assert!(backend.order_ids().is_empty());
-        upstream_server.await.unwrap();
-    }
-
-    /// A seller whose provider answers the way a REAL provider answers reaches the book.
-
-    /// Every readiness row above this one is fed a hand-written stream, and every one of them closes
-    /// with a single terminal usage record. A live Groq `qwen/qwen3-32b` does not: it states the same
-    /// total twice, on the `finish_reason` chunk and again on the dedicated
-    /// `stream_options.include_usage` chunk. The adapter counted that as a contradiction, readiness
-    /// failed the `upstream_authentication_and_model` component, and the seller exited with
-    /// "seller readiness failed before SELL" -- so the book stayed empty and no buyer had anywhere to
-    /// go. Offline the whole suite was green, because no fixture had ever been the real wire.
-
-    /// So this row is fed `LIVE_GROQ_READINESS_CAPTURE` -- the exact recorded bytes, unedited -- and
-    /// drives production's own composition (`prepare_seller_offer_with_timing`: readiness, then the
-    /// post). The claim is the one the campaign falsified: the seller becomes ready and the SELL is
-    /// posted.
-    #[tokio::test]
-    async fn a_live_provider_stream_reaches_readiness_and_posts_the_sell() {
-        // The scripted server keeps serving, so every health cycle in the startup path sees the same
-        // real stream; a single-shot listener would prove only the first probe.
-        let (base_url, _probes, upstream_server) = scripted_http_server(vec![(
-            "200 OK",
-            crate::seller::upstream::openai::LIVE_GROQ_READINESS_CAPTURE.to_string(),
-            Duration::ZERO,
-        )]);
-        // the capture is a real `qwen/qwen3-32b` stream, so this row must SELL the model it
-        // actually replays -- readiness refuses a market whose provider answers as another model. The
-        // market id is the knob, not the outbound slug: the slug is what we ask the provider for, and a
-        // provider that echoes it cannot thereby prove anything about the market (E2E-ADV-02/L2).
-        let mut upstream = openai(base_url);
-        if let UpstreamConfig::OpenAi(cfg) = &mut upstream {
-            cfg.frame_model = crate::seller::upstream::openai::DEFAULT_MODEL.to_string();
-        }
-        let seller = super::super::start_gateway_with_note(
-            "127.0.0.1:0".parse().unwrap(),
-            upstream,
-            Arc::new(LocalNote::generate()),
-        )
-        .await
-        .unwrap();
-        let owner = address('c');
-        let tc = address('f');
-        let order_id = 861;
-        let backend =
-            CancelBackend::new(Vec::new(), owner.clone(), order_id, CancelBehavior::Remove);
-
-        let outcome = prepare_seller_offer_with_timing(
-            &seller,
-            &backend,
-            &cfg_for_seller(&tc, &seller),
-            &owner,
-            None,
-            std::future::pending(),
-            fast_timing(),
-        )
-        .await;
-
-        let rendered = render_startup(&outcome);
-        assert!(
-            matches!(outcome, Ok(SellerStartupOutcome::Ready(_))),
-            "a real provider stream must reach readiness: {rendered}"
-        );
-        assert_eq!(
-            backend.posts.load(Ordering::Relaxed),
-            1,
-            "readiness that passes must leave the SELL on the book: {rendered}"
-        );
-        assert_eq!(backend.order_ids(), vec![order_id]);
-        seller.server_task.abort();
-        upstream_server.abort();
     }
 
     #[tokio::test]
@@ -6354,7 +5269,9 @@ mod tests {
             },
             SupervisionTiming {
                 health_interval: Duration::from_millis(5),
-                health_timeout: Duration::from_millis(100),
+                // The TLS self-probe uses real sockets; only the scripted cancellation needs
+                // the short cycle below, so keep the canonical readiness budget.
+                health_timeout: SellerLivenessParams::canonical().health_check_timeout,
                 cycle_timeout: Duration::from_millis(300),
                 cancel_poll: Duration::from_millis(1),
                 expiry_poll: Duration::from_secs(3_600),
@@ -6705,11 +5622,14 @@ mod tests {
         pending_submission: std::sync::atomic::AtomicBool,
         checkpoint_fails: std::sync::atomic::AtomicBool,
         cover_failure: std::sync::atomic::AtomicBool,
+        cover_outage_after_reap: std::sync::atomic::AtomicBool,
         post_failures: AtomicU64,
         failed_post_lands: bool,
         reject_post: bool,
         post_times: Mutex<Vec<tokio::time::Instant>>,
         confirmation_failures: AtomicU64,
+        match_on_successor_confirmation: Option<Match>,
+        successor_deadline_outage: std::sync::atomic::AtomicBool,
         reconciliation_read_failures: AtomicU64,
         late_successor_on_latch_read: std::sync::atomic::AtomicBool,
         expire_calls: Mutex<Vec<u128>>,
@@ -6777,11 +5697,14 @@ mod tests {
                 pending_submission: std::sync::atomic::AtomicBool::new(false),
                 checkpoint_fails: std::sync::atomic::AtomicBool::new(false),
                 cover_failure: std::sync::atomic::AtomicBool::new(false),
+                cover_outage_after_reap: std::sync::atomic::AtomicBool::new(false),
                 post_failures: AtomicU64::new(0),
                 failed_post_lands: true,
                 reject_post: false,
                 post_times: Mutex::new(Vec::new()),
                 confirmation_failures: AtomicU64::new(0),
+                match_on_successor_confirmation: None,
+                successor_deadline_outage: std::sync::atomic::AtomicBool::new(false),
                 reconciliation_read_failures: AtomicU64::new(0),
                 late_successor_on_latch_read: std::sync::atomic::AtomicBool::new(false),
                 expire_calls: Mutex::new(Vec::new()),
@@ -6925,7 +5848,14 @@ mod tests {
             &self,
             _: &TokenContract,
         ) -> Result<(), ChainError> {
-            if self.cover_failure.load(Ordering::SeqCst) {
+            if self.rows.lock().unwrap().is_empty()
+                && !self.expire_calls.lock().unwrap().is_empty()
+                && self.cover_outage_after_reap.swap(false, Ordering::SeqCst)
+            {
+                Err(ChainError::Transport(
+                    "BK bond read budget exhausted".into(),
+                ))
+            } else if self.cover_failure.load(Ordering::SeqCst) {
                 Err(ChainError::Chain("fixture mirror bond shortfall".into()))
             } else {
                 Ok(())
@@ -6989,6 +5919,16 @@ mod tests {
             {
                 return Err(ChainError::Transport("confirmation read timed out".into()));
             }
+            if let Some(matched) = &self.match_on_successor_confirmation {
+                self.rows.lock().unwrap().clear();
+                *self.matched.lock().unwrap() = Some(matched.clone());
+                let (price, ticks) = self.deal_terms.unwrap();
+                let mut state = self.state.lock().unwrap();
+                state.funded = true;
+                state.funded_time = Some(1);
+                state.deposit =
+                    dexdo_core::required_escrow_for_buy(u128::from(ticks), u128::from(price));
+            }
             if self.matched.lock().unwrap().is_some() {
                 return Ok(Some(SellOfferOutcome::Matched));
             }
@@ -7002,6 +5942,14 @@ mod tests {
             token_contract: &TokenContract,
         ) -> Result<Vec<OrderBookOrder>, ChainError> {
             self.observe_read()?;
+            if self.posts.load(Ordering::SeqCst) > 0
+                && self.successor_deadline_outage.load(Ordering::SeqCst)
+            {
+                self.failed_reads.fetch_add(1, Ordering::SeqCst);
+                return Err(ChainError::Transport(
+                    "BK successor deadline unavailable".into(),
+                ));
+            }
             if self.posts.load(Ordering::SeqCst) > 0
                 && self
                     .reconciliation_read_failures
@@ -7178,6 +6126,10 @@ mod tests {
             let Some(ticks) = self.fill_ticks else {
                 return Ok(Vec::new());
             };
+            if self.match_on_successor_confirmation.is_some() && !self.state.lock().unwrap().funded
+            {
+                return Ok(Vec::new());
+            }
             // The event is not visible until AFTER the later state getter observes funding.
             if self.state_reads.load(Ordering::SeqCst) == 0
                 || self
@@ -7195,7 +6147,7 @@ mod tests {
                 return Err(ChainError::Transport("delayed owner fill read".into()));
             }
             Ok(vec![dexdo_core::MatchedFill {
-                order_id: 11,
+                order_id: self.postings.lock().unwrap().last().unwrap().order_id,
                 token_contract: self.token_contract.clone(),
                 ticks: u128::from(ticks),
                 price_per_tick: u128::from(self.deal_terms.unwrap().0),
@@ -7281,7 +6233,6 @@ mod tests {
         SupervisionTiming {
             health_interval: Duration::from_secs(3_600),
             health_timeout: Duration::from_secs(2),
-            upstream_grace: fast_timing().upstream_grace,
             cycle_timeout: Duration::from_secs(2),
             cancel_poll: Duration::from_millis(1),
             expiry_poll: Duration::from_millis(1),
@@ -8759,117 +7710,6 @@ mod tests {
         assert!(!known_result.contains("--order-id"));
     }
 
-    /// E2E-SELL-03 -- a deterministic upstream rejection cancels the exact id at occurrence one.
-    /// `timed_out=false` is the structured class distinction from E2E-SELL-01/02 timeouts; the
-    /// existing gateway-task and watcher tests pin the other deterministic classes.
-
-    /// E2E-SELL-03, `tests/e2e/test-specification.md`.
-    #[tokio::test]
-    async fn e2e_sell_03_deterministic_failure_cancels_exact_offer_once() {
-        let (base_url, server) = http_server(
-            "401 Unauthorized",
-            "{\"error\":{\"message\":\"credential rejected\"}}".to_string(),
-            Duration::ZERO,
-        )
-        .await;
-        let owner = address('3');
-        let tc = address('4');
-        let id = identity(&owner, &tc, 102);
-        let backend = CancelBackend::new(
-            vec![order(id.order_id, &owner, &tc)],
-            owner,
-            id.order_id,
-            CancelBehavior::Remove,
-        );
-        let seller = super::super::start_gateway_with_note(
-            "127.0.0.1:0".parse().unwrap(),
-            openai(base_url),
-            Arc::new(LocalNote::generate()),
-        )
-        .await
-        .unwrap();
-
-        let outcome = supervise_with_timing(
-            &seller,
-            &backend,
-            &cfg_for_seller(&tc, &seller),
-            &watch("upstream-failure").1,
-            &id,
-            std::future::pending(),
-            fast_timing(),
-        )
-        .await
-        .unwrap();
-
-        assert!(matches!(
-            &outcome,
-            RestingSellerOutcome::Stopped {
-                reason: RestingStopReason::Health(HealthFailure {
-                    component: HealthComponent::UpstreamModel,
-                    timed_out: false,
-                    ..
-                }),
-                disposition: CancellationDisposition::Cancelled,
-            }
-        ));
-        assert_eq!(backend.calls(), vec![(tc, id.order_id)]);
-        assert!(backend.order_ids().is_empty());
-        assert_eq!(backend.posts.load(Ordering::Relaxed), 0);
-        server.abort();
-    }
-
-    #[tokio::test]
-    async fn failed_restart_readiness_cancels_existing_resting_sell_without_post() {
-        let (base_url, upstream_server) = http_server(
-            "401 Unauthorized",
-            "{\"error\":{\"message\":\"credential rejected\"}}".to_string(),
-            Duration::ZERO,
-        )
-        .await;
-        let owner = address('e');
-        let tc = address('f');
-        let id = identity(&owner, &tc, 107);
-        let backend = CancelBackend::new(
-            vec![order(id.order_id, &owner, &tc)],
-            owner,
-            id.order_id,
-            CancelBehavior::Remove,
-        );
-        let seller = super::super::start_gateway_with_note(
-            "127.0.0.1:0".parse().unwrap(),
-            openai(base_url),
-            Arc::new(LocalNote::generate()),
-        )
-        .await
-        .unwrap();
-
-        let failure = check_readiness(
-            &seller,
-            &seller.listen_addr.to_string(),
-            Duration::from_secs(1),
-            Some(&id),
-            &tc,
-            AdvertiseProbePolicy::default(),
-        )
-        .await
-        .expect_err("restart readiness must fail");
-        assert_eq!(failure.component, HealthComponent::UpstreamModel);
-        let disposition = cancel_and_confirm_with_timing(
-            &backend,
-            &cfg(&tc),
-            &id,
-            Duration::from_millis(20),
-            Duration::from_millis(1),
-        )
-        .await;
-
-        assert!(matches!(disposition, CancellationDisposition::Cancelled));
-        assert_eq!(backend.posts.load(Ordering::Relaxed), 0);
-        assert!(backend.order_ids().is_empty());
-        seller.server_task.abort();
-        upstream_server.abort();
-    }
-
     #[tokio::test]
     async fn graceful_shutdown_confirms_cancel_before_return() {
         let owner = address('5');
@@ -9252,158 +8092,71 @@ mod tests {
 
     /// `order()` above always says zero, which for a sell offer means malformed rather than "never
     /// expires", so anything about expiry needs a real second here.
-    fn now_unix() -> u64 {
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .expect("system clock is after the epoch")
-            .as_secs()
-    }
-
-    /// E2E-SELL-01 -- when the model is slow to answer once and fine the next time, the seller's
-    /// offer stays on sale.
-
-    /// Setup: an offer already on sale, a model that answers the first check too slowly and the
-    /// second check normally. Do: run the seller's periodic checking. Observe: the offer with that
-    /// exact number is still listed, no withdrawal was submitted, and the model was asked more
-    /// than once.
-
-    /// E2E-SELL-01, `tests/e2e/test-specification.md`.
-    /// E2E-ROW: E2E-SELL-01/L0
     #[tokio::test]
-    async fn e2e_sell_01_transient_timeout_leaves_exact_order_resting() {
-        let (base_url, probes, upstream) = scripted_http_server(vec![
-            // Probe 1: answers far past the per-cycle health bound below -> a TIMEOUT class fault.
-            ("200 OK", healthy_sse(), Duration::from_millis(400)),
-            // Probe 2: the same endpoint, healthy and immediate -- as measured it afterwards.
-            ("200 OK", healthy_sse(), Duration::ZERO),
-            // Probe 3: observing this request proves probe 2 completed successfully and supervision
-            // entered another health cycle; the counter increments before a response is processed.
+    async fn issue_2264_background_probe_reports_throttling_stream_error_timeout_and_recovery() {
+        let (url, probes, server) = scripted_http_server(vec![
+            ("429 Too Many Requests", "{}".into(), Duration::ZERO),
+            ("429 Too Many Requests", "{}".into(), Duration::ZERO),
+            (
+                "200 OK",
+                "data: {\"choices\":[]}\n\n".into(),
+                Duration::ZERO,
+            ),
+            ("200 OK", healthy_sse(), Duration::from_secs(5)),
             ("200 OK", healthy_sse(), Duration::ZERO),
         ]);
-        let owner = address('1');
-        let tc = address('2');
-        let id = identity(&owner, &tc, 8);
-        let backend = CancelBackend::new(
-            vec![order_with_deadline(
-                id.order_id,
-                &owner,
-                &tc,
-                now_unix() + dexdo_core::params::MAX_SELL_TTL.as_secs(),
-            )],
-            owner.clone(),
-            id.order_id,
-            CancelBehavior::Remove,
-        );
-        let seller = super::super::start_gateway_with_note(
-            "127.0.0.1:0".parse().unwrap(),
-            openai(base_url),
-            Arc::new(LocalNote::generate()),
-        )
-        .await
-        .unwrap();
+        let upstream = openai(url);
+        for expected in ["throttled", "throttled", "fail", "timeout", "pass"] {
+            assert_eq!(
+                crate::telemetry::probe_upstream(&upstream, Duration::from_millis(250)).await,
+                expected,
+            );
+        }
+        assert_eq!(probes.load(Ordering::SeqCst), 5);
+        server.abort();
+    }
 
-        let timing = SupervisionTiming {
-            health_interval: Duration::from_millis(20),
-            health_timeout: Duration::from_millis(120),
-            cycle_timeout: Duration::from_millis(600),
-            cancel_poll: Duration::from_millis(1),
-            expiry_poll: Duration::from_millis(1),
-            abort_gateway_on_stop: true,
-            advertise_probe: AdvertiseProbePolicy::default(),
-            ..fast_timing()
-        };
-        let config = cfg_for_seller(&tc, &seller);
-        let (_watch_dir, watch_config) = watch("sell01-transient");
-        {
-            let supervisor = supervise_with_timing(
+    /// E2E-ROW: E2E-SELL-01/L0
+    #[tokio::test]
+    async fn issue_2264_resting_offer_has_no_upstream_health_traffic() {
+        let (url, probes, upstream) = scripted_http_server(vec![(
+            "429 Too Many Requests",
+            "{}".to_string(),
+            Duration::ZERO,
+        )]);
+        let seller = issue_2264_seller(url).await;
+        wait_for_gateway_ready(&seller).await;
+        let owner = address('3');
+        let tc = address('4');
+        let id = identity(&owner, &tc, 2264);
+        let mut row = order(id.order_id, &owner, &tc);
+        row.deadline = unix_timestamp() + dexdo_core::params::MAX_SELL_TTL.as_secs();
+        let backend = CancelBackend::new(vec![row], owner, id.order_id, CancelBehavior::Remove);
+        let cfg = cfg_for_seller(&tc, &seller);
+        let (_dir, watch) = watch("telemetry-only");
+        let timing = fast_timing();
+        let result = tokio::time::timeout(
+            timing.health_interval * 4,
+            supervise_with_timing(
                 &seller,
                 &backend,
-                &config,
-                &watch_config,
+                &cfg,
+                &watch,
                 &id,
                 std::future::pending(),
                 timing,
-            );
-            tokio::pin!(supervisor);
-
-            tokio::select! {
-                _outcome = &mut supervisor => {
-                    panic!("E2E-SELL-01 supervisor returned before the third upstream probe");
-                }
-                observed = tokio::time::timeout(Duration::from_secs(5), async {
-                    while probes.load(Ordering::SeqCst) < 3 {
-                        tokio::time::sleep(Duration::from_millis(5)).await;
-                    }
-                }) => {
-                    observed.unwrap_or_else(|_| {
-                        panic!("E2E-SELL-01 timed out waiting for the third upstream probe")
-                    });
-                }
-            }
-
-            assert_eq!(
-                backend.order_ids(),
-                vec![id.order_id],
-                "E2E-SELL-01 exact order must still rest after the healthy retry"
-            );
-            assert!(
-                backend.calls().is_empty(),
-                "E2E-SELL-01 must submit no cancellation before the healthy retry completes"
-            );
-        }
+            ),
+        )
+        .await;
+        assert!(
+            result.is_err(),
+            "upstream interrupted the exact SELL: {result:?}"
+        );
+        assert_eq!(backend.order_ids(), vec![2264]);
+        assert!(backend.calls().is_empty());
+        assert_eq!(probes.load(Ordering::SeqCst), 0);
         seller.server_task.abort();
         upstream.abort();
-    }
-
-    /// E2E-SELL-01 diagnostic contract -- the first timeout classification carries one-based
-    /// `attempt=1`, the exact transient failure class, and a positive remaining budget. This is a
-    /// schema/semantics oracle only; it claims neither a canonical numeric value nor provenance.
-
-    /// E2E-SELL-01, `tests/e2e/test-specification.md`.
-    /// E2E-ROW: E2E-SELL-01/L0
-    #[ignore = "EXPECTED TO FAIL until timeout health failures expose first attempt class and positive remaining budget"]
-    #[tokio::test]
-    async fn e2e_sell_01_timeout_diagnostic_carries_attempt_class_and_budget() {
-        let owner = address('1');
-        let tc = address('2');
-        let id = identity(&owner, &tc, 8);
-        let (diagnostic_url, diagnostic_server) =
-            http_server("200 OK", healthy_sse(), Duration::from_millis(400)).await;
-        let diagnostic_seller = super::super::start_gateway_with_note(
-            "127.0.0.1:0".parse().unwrap(),
-            openai(diagnostic_url),
-            Arc::new(LocalNote::generate()),
-        )
-        .await
-        .unwrap();
-        let failure = check_readiness(
-            &diagnostic_seller,
-            &diagnostic_seller.listen_addr.to_string(),
-            Duration::from_millis(120),
-            Some(&id),
-            &tc,
-            AdvertiseProbePolicy::Required,
-        )
-        .await
-        .expect_err("the scripted probe is slower than the readiness bound");
-        let fields = failure
-            .detail
-            .split_ascii_whitespace()
-            .filter_map(|field| field.split_once('='))
-            .collect::<Vec<_>>();
-        assert!(
-            fields.len() == 3
-                && fields[0] == ("attempt", "1")
-                && fields[1] == ("failure_class", "timeout")
-                && fields[2].0 == "remaining_budget"
-                && fields[2]
-                    .1
-                    .parse::<u64>()
-                    .is_ok_and(|remaining| remaining > 0),
-            "E2E-SELL-01 timeout diagnostic omitted attempt class or remaining budget"
-        );
-        diagnostic_seller.server_task.abort();
-        diagnostic_server.abort();
     }
 
     #[tokio::test]
@@ -9718,7 +8471,6 @@ mod tests {
             SupervisionTiming {
                 health_interval: Duration::from_secs(3_600),
                 health_timeout: Duration::from_secs(1),
-                upstream_grace: fast_timing().upstream_grace,
                 cycle_timeout: Duration::from_secs(2),
                 cancel_poll: Duration::from_millis(1),
                 expiry_poll: SellerLivenessParams::canonical().offer_expiry_poll,

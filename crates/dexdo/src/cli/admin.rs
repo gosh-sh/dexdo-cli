@@ -1780,6 +1780,7 @@ pub(crate) async fn run_market_deploy(args: MarketDeployArgs) -> Result<()> {
     // and it is the same class as the `--note-addr` refusal this branch replaced.
     let seed = crate::cli::support::note_owner_secret_from_pool_only(
         &note_addr,
+        None,
         "deploy-market",
         "the note's owner key",
     )?;

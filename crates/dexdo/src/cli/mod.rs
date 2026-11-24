@@ -120,6 +120,7 @@ pub(crate) mod reports;
 // seller runs headless, and a headless server has no keychain.
 pub(crate) mod secret_store;
 pub(crate) mod seller;
+pub(crate) mod seller_note_metrics;
 pub(crate) mod seller_policy;
 pub(crate) mod settlement_receipt;
 pub(crate) mod style;

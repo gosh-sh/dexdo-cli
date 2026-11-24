@@ -15,7 +15,7 @@ use dexdo_core::note::{NotePubkey, Signature};
 use dexdo_core::params::{GATEWAY_CLIENT_CHANNEL_CAPACITY, GATEWAY_UPSTREAM_CHANNEL_CAPACITY};
 use dexdo_core::{DealChainState, DealSubscription};
 use dexdo_proto::{
-    Challenge, ChallengeRequest, Gateway, GatewayServer, StreamFrame, StreamRequest,
+    BillingUsage, Challenge, ChallengeRequest, Gateway, GatewayServer, StreamFrame, StreamRequest,
 };
 use serde_json::Value;
 use std::net::SocketAddr;
@@ -33,12 +33,13 @@ pub(super) struct RunningFixtureSeller {
     fixture_auth: Arc<AuthRegistry>,
     pub(super) server_task: tokio::task::JoinHandle<()>,
     pub(super) listen_addr: SocketAddr,
-    pub(super) tls_fingerprint: String,
+    pub(super) tls: GatewayTls,
     delayed_eof_release: Arc<Semaphore>,
     held_open: Arc<Notify>,
     legacy_challenge: Arc<AtomicBool>,
     probe_output_fixture: Arc<Mutex<Option<(bool, &'static str)>>>,
     calls: Arc<AtomicUsize>,
+    recovery_calls: Arc<AtomicUsize>,
 }
 
 impl RunningFixtureSeller {
@@ -61,8 +62,15 @@ impl RunningFixtureSeller {
         self.calls.load(Ordering::SeqCst)
     }
 
+    pub(super) fn recovery_calls(&self) -> usize {
+        self.recovery_calls.load(Ordering::SeqCst)
+    }
+
     pub(super) fn set_probe_output_fixture(&self, greedy: bool, marker: &'static str) {
         *self.probe_output_fixture.lock().unwrap() = Some((greedy, marker));
+    }
+    pub(super) fn clear_probe_output_fixture(&self) {
+        *self.probe_output_fixture.lock().unwrap() = None;
     }
     pub(super) fn set_concurrency(&self, limit: std::num::NonZeroU32) {
         self.state.set_max_concurrent_requests_per_deal(limit);
@@ -176,7 +184,191 @@ impl Gateway for FixtureGateway {
             let hold_open = body_text(request.get_ref()).contains("DEXDO_FIXTURE_HOLD_STREAM_OPEN");
             let hold_response =
                 body_text(request.get_ref()).contains("DEXDO_FIXTURE_HOLD_SHARED_RESPONSE");
+            let lose_usage =
+                body_text(request.get_ref()).contains("DEXDO_FIXTURE_LOSE_BILLING_FRAME");
+            let lost_open = body_text(request.get_ref()).contains("DEXDO_FIXTURE_LOSE_STREAM_OPEN");
+            let deny_output = body_text(request.get_ref()).contains("DEXDO_FIXTURE_DENY_OUTPUT");
+            let duplicate_open =
+                body_text(request.get_ref()).contains("DEXDO_FIXTURE_DUPLICATE_STREAM_OPEN");
+            let lose_first_frame =
+                body_text(request.get_ref()).contains("DEXDO_FIXTURE_LOSE_FIRST_FRAME");
+            let hold_usage =
+                body_text(request.get_ref()).contains("DEXDO_FIXTURE_HOLD_BILLING_FRAME");
+            if body_text(request.get_ref()).contains("DEXDO_FIXTURE_REFUSE_OPEN") {
+                return Err(Status::resource_exhausted(
+                    "fixture refused before inference",
+                ));
+            }
+            let prompt = body_text(request.get_ref());
+            let committed_response = prompt.contains("DEXDO_FIXTURE_COMMITTED_RESPONSE");
+            let split_json = prompt.contains("DEXDO_FIXTURE_SPLIT_JSON");
+            let bad_status = prompt.contains("DEXDO_FIXTURE_COMMITTED_BAD_STATUS");
+            let data_before_head = prompt.contains("DEXDO_FIXTURE_COMMITTED_DATA_BEFORE_HEAD");
+            let duplicate_head = prompt.contains("DEXDO_FIXTURE_COMMITTED_DUPLICATE_HEAD");
+            let invalid_usage = prompt.contains("DEXDO_FIXTURE_COMMITTED_INVALID_USAGE");
+            let omit_charge = prompt.contains("DEXDO_FIXTURE_OMIT_CHARGED_TOKENS");
+            let omit_cumulative = prompt.contains("DEXDO_FIXTURE_OMIT_CUMULATIVE_TOKENS");
+            if prompt.contains("DEXDO_FIXTURE_CUT_AT_OPEN") {
+                return Err(Status::unavailable(
+                    "gateway restarted before opening stream",
+                ));
+            }
+            if prompt.contains("DEXDO_FIXTURE_CUT_BEFORE_HEAD") {
+                let status = if prompt.contains("BEFORE_HEAD_UNKNOWN") {
+                    Status::unknown("gateway interrupted before response head")
+                } else {
+                    Status::unavailable("gateway restarted before response head")
+                };
+                let stream = async_stream::stream! {
+                    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+                    yield Err(status);
+                };
+                return Ok(Response::new(Box::pin(stream)));
+            }
+            if prompt.contains("DEXDO_FIXTURE_CUT_AFTER_ERROR_HEAD") {
+                let frames = [
+                    Ok(StreamFrame {
+                        head: Some(dexdo_proto::ResponseHead {
+                            status: 503,
+                            headers: Vec::new(),
+                        }),
+                        ..Default::default()
+                    }),
+                    Err(Status::unavailable(
+                        "gateway interrupted the provider error body",
+                    )),
+                ];
+                return Ok(Response::new(Box::pin(tokio_stream::iter(frames))));
+            }
+            let cut_output = prompt.contains("DEXDO_FIXTURE_CUT_AFTER_OUTPUT");
+            let cut_billing = prompt.contains("DEXDO_FIXTURE_CUT_BEFORE_BILLING");
+            let cut_eof = prompt.contains("DEXDO_FIXTURE_CUT_BEFORE_EOF");
             let response = self.production.open_stream(request).await?;
+            if cut_output || cut_billing || cut_eof {
+                let mut upstream = response.into_inner();
+                let stream = async_stream::try_stream! {
+                    while let Some(frame) = upstream.next().await {
+                        let frame = frame?;
+                        if cut_billing && frame.usage.is_some() {
+                            Err(Status::unavailable("gateway restarted before billing"))?;
+                        }
+                        let cut = cut_output && !frame.data.is_empty() || cut_eof && frame.usage.is_some();
+                        yield frame;
+                        if cut {
+                            Err(Status::unavailable("gateway restarted before EOF"))?;
+                        }
+                    }
+                };
+                return Ok(Response::new(Box::pin(stream)));
+            }
+            if lost_open || duplicate_open {
+                let mut stream = response.into_inner();
+                while let Some(frame) = stream.next().await {
+                    frame?;
+                }
+                return Err(if duplicate_open {
+                    Status::already_exists("fixture found the committed stream response")
+                } else {
+                    Status::unknown("fixture lost the committed stream response")
+                });
+            }
+            if committed_response
+                || bad_status
+                || data_before_head
+                || duplicate_head
+                || invalid_usage
+                || split_json
+                || omit_charge
+                || omit_cumulative
+            {
+                let mut stream = response.into_inner();
+                let mut frames = Vec::new();
+                while let Some(frame) = stream.next().await {
+                    frames.push(frame?);
+                }
+                if bad_status {
+                    frames[0].head.as_mut().unwrap().status = 42;
+                } else if data_before_head {
+                    frames[0] = StreamFrame {
+                        data: b"content before head".to_vec(),
+                        ..StreamFrame::default()
+                    };
+                } else if duplicate_head {
+                    frames[1] = frames[0].clone();
+                } else if invalid_usage {
+                    frames[1] = StreamFrame {
+                        usage: Some(BillingUsage {
+                            input_tokens: 1,
+                            output_tokens: 1,
+                            ..BillingUsage::default()
+                        }),
+                        ..StreamFrame::default()
+                    };
+                } else if split_json {
+                    let midpoint = frames[1].data.len() / 2;
+                    let tail = frames[1].data.split_off(midpoint);
+                    frames.insert(
+                        2,
+                        StreamFrame {
+                            data: tail,
+                            ..StreamFrame::default()
+                        },
+                    );
+                    if lose_usage || deny_output {
+                        assert!(frames.pop().unwrap().usage.is_some());
+                    }
+                }
+                if omit_charge || omit_cumulative {
+                    let usage = frames.last_mut().unwrap().usage.as_mut().unwrap();
+                    if omit_charge {
+                        usage.charged_tokens = None;
+                    }
+                    if omit_cumulative {
+                        usage.cumulative_billable_tokens = None;
+                    }
+                }
+                let mut frames: Vec<_> = frames.into_iter().map(Ok).collect();
+                if split_json && deny_output {
+                    frames.push(Err(dexdo_proto::upstream_failure_status(
+                        Status::unavailable("fixture incorrectly denied output"),
+                        false,
+                    )));
+                }
+                return Ok(Response::new(Box::pin(tokio_stream::iter(frames))));
+            }
+            if lose_first_frame || hold_usage || deny_output {
+                let mut stream = response.into_inner();
+                let committed = self.held_open.clone();
+                let release = self.delayed_eof_release.clone();
+                let stream = async_stream::try_stream! {
+                    while let Some(frame) = stream.next().await {
+                        let frame = frame?;
+                        if frame.usage.is_some() {
+                            if deny_output {
+                                Err(dexdo_proto::upstream_failure_status(
+                                    Status::unavailable("fixture incorrectly denied output"), false,
+                                ))?;
+                            }
+                            committed.notify_one();
+                            release.acquire().await
+                                .map_err(|_| Status::cancelled("fixture release closed"))?.forget();
+                            if lose_first_frame {
+                                Err(Status::resource_exhausted("fixture lost the first stream frame"))?;
+                            }
+                        }
+                        if !lose_first_frame {
+                            yield frame;
+                        }
+                    }
+                };
+                return Ok(Response::new(Box::pin(stream)));
+            }
+            if lose_usage {
+                let stream = response
+                    .into_inner()
+                    .take_while(|frame| !frame.as_ref().is_ok_and(|frame| frame.usage.is_some()));
+                return Ok(Response::new(Box::pin(stream)));
+            }
             if hold_open {
                 self.held_open.notify_one();
                 self.delayed_eof_release
@@ -466,6 +658,35 @@ fn authorize_fixture_request(
     Ok(())
 }
 
+#[derive(Clone)]
+struct CountRecoveryCalls<S> {
+    service: S,
+    calls: Arc<AtomicUsize>,
+}
+
+impl<S, B> tower::Service<http::Request<B>> for CountRecoveryCalls<S>
+where
+    S: tower::Service<http::Request<B>>,
+{
+    type Response = S::Response;
+    type Error = S::Error;
+    type Future = S::Future;
+
+    fn poll_ready(
+        &mut self,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Result<(), Self::Error>> {
+        self.service.poll_ready(cx)
+    }
+
+    fn call(&mut self, request: http::Request<B>) -> Self::Future {
+        if request.uri().path() == "/dexdo.v1.Gateway/ReadUsageOutcome" {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+        }
+        self.service.call(request)
+    }
+}
+
 pub(super) async fn start_gateway_with(
     addr: SocketAddr,
     upstream: UpstreamConfig,
@@ -477,6 +698,7 @@ pub(super) async fn start_gateway_with(
     let legacy_challenge = Arc::new(AtomicBool::new(false));
     let probe_output_fixture = Arc::new(Mutex::new(None));
     let calls = Arc::new(AtomicUsize::new(0));
+    let recovery_calls = Arc::new(AtomicUsize::new(0));
     let service = GatewayServer::new(FixtureGateway {
         production: GatewayService::new(state.clone()),
         fixture_auth: fixture_auth.clone(),
@@ -490,8 +712,7 @@ pub(super) async fn start_gateway_with(
     let tls = GatewayTls::generate()?;
 
     crate::seller::tls::ensure_crypto_provider();
-    let tls_fingerprint = tls.fingerprint.clone();
-    let identity = Identity::from_pem(tls.cert_pem, tls.key_pem);
+    let identity = Identity::from_pem(&tls.cert_pem, &tls.key_pem);
     let tls_config = ServerTlsConfig::new().identity(identity);
     let listener = tokio::net::TcpListener::bind(addr)
         .await
@@ -502,7 +723,14 @@ pub(super) async fn start_gateway_with(
     let incoming = TcpListenerStream::new(listener);
     let mut builder = Server::builder()
         .tls_config(tls_config)
-        .map_err(|error| anyhow!("configure fixture seller gateway TLS: {error}"))?;
+        .map_err(|error| anyhow!("configure fixture seller gateway TLS: {error}"))?
+        .layer({
+            let calls = recovery_calls.clone();
+            tower::layer::layer_fn(move |service| CountRecoveryCalls {
+                service,
+                calls: calls.clone(),
+            })
+        });
     let server_task = tokio::spawn(async move {
         if let Err(error) = builder
             .add_service(service)
@@ -518,11 +746,12 @@ pub(super) async fn start_gateway_with(
         fixture_auth,
         server_task,
         listen_addr,
-        tls_fingerprint,
+        tls,
         delayed_eof_release,
         held_open,
         legacy_challenge,
         probe_output_fixture,
         calls,
+        recovery_calls,
     })
 }

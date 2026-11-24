@@ -33,6 +33,10 @@ pub fn set_model(model: &str) {
     let _ = MODEL.set(model.to_owned());
 }
 
+pub(super) fn model() -> Option<String> {
+    MODEL.get().cloned()
+}
+
 fn labels() -> Vec<KeyValue> {
     MODEL
         .get()
@@ -237,15 +241,17 @@ pub(crate) fn connect(started: Instant, failure: Option<&anyhow::Error>) {
 }
 
 /// The stage a pinned dial failed at, or `None` when it failed before any connection was tried.
-/// Only the dial itself returns a tonic transport error; untagged inside one, it is the h2
-/// handshake.
+/// The dial tags its own failures. Untagged tonic transport errors come from the h2 handshake.
 fn failed_stage(error: &anyhow::Error) -> Option<&'static str> {
     if crate::buyer::tls::dial_reached_wrong_endpoint(error) {
         return Some("tls_certificate_pin");
     }
     error
         .chain()
-        .any(|source| source.is::<tonic::transport::Error>())
+        .any(|source| {
+            source.is::<crate::buyer::tls::DialStageError>()
+                || source.is::<tonic::transport::Error>()
+        })
         .then(|| crate::buyer::tls::dial_stage(error))
 }
 
@@ -335,8 +341,8 @@ impl Call {
             Err(status) => self.refused(status),
         }
     }
-    pub(crate) fn refused(self, status: &tonic::Status) {
-        self.finish(status.code())
+    pub(crate) fn refused(mut self, status: &tonic::Status) {
+        self.fail(status.code());
     }
     fn finish(mut self, code: tonic::Code) {
         self.end(code)
@@ -345,19 +351,34 @@ impl Call {
     pub(crate) fn watch<S>(self, stream: S) -> CallStream<S> {
         CallStream { stream, call: self }
     }
+    fn fail(&mut self, code: tonic::Code) {
+        if !self.ended {
+            let name = super::grpc_status_name(code);
+            tracing::event!(
+                name: "dexdo.buyer.rpc.client.call.failed", target: module_path!(), tracing::Level::WARN, {
+                "rpc.system.name" = "grpc",
+                "rpc.method" = self.method,
+                "rpc.status_code" = name,
+                "error.type" = name,
+                }, "seller gateway call failed"
+            );
+        }
+        self.end(code);
+    }
+
     fn end(&mut self, code: tonic::Code) {
         if std::mem::replace(&mut self.ended, true) {
             return;
         }
+        let name = super::grpc_status_name(code);
         let Some(metrics) = METRICS.get() else {
             return;
         };
-        let name = code_name(code);
         let mut attributes = labels();
         attributes.extend([
             KeyValue::new("rpc.system.name", "grpc"),
             KeyValue::new("rpc.method", self.method),
-            KeyValue::new("rpc.response.status_code", name),
+            KeyValue::new("rpc.status_code", name),
         ]);
         if let Some(purpose) = self.purpose {
             attributes.push(KeyValue::new("purpose", purpose));
@@ -402,32 +423,10 @@ where
         let polled = Pin::new(&mut self.stream).poll_next(cx);
         match &polled {
             Poll::Ready(None) => self.call.end(tonic::Code::Ok),
-            Poll::Ready(Some(Err(status))) => self.call.end(status.code()),
+            Poll::Ready(Some(Err(status))) => self.call.fail(status.code()),
             _ => (),
         }
         polled
-    }
-}
-
-fn code_name(code: tonic::Code) -> &'static str {
-    match code {
-        tonic::Code::Ok => "OK",
-        tonic::Code::Cancelled => "CANCELLED",
-        tonic::Code::Unknown => "UNKNOWN",
-        tonic::Code::InvalidArgument => "INVALID_ARGUMENT",
-        tonic::Code::DeadlineExceeded => "DEADLINE_EXCEEDED",
-        tonic::Code::NotFound => "NOT_FOUND",
-        tonic::Code::AlreadyExists => "ALREADY_EXISTS",
-        tonic::Code::PermissionDenied => "PERMISSION_DENIED",
-        tonic::Code::ResourceExhausted => "RESOURCE_EXHAUSTED",
-        tonic::Code::FailedPrecondition => "FAILED_PRECONDITION",
-        tonic::Code::Aborted => "ABORTED",
-        tonic::Code::OutOfRange => "OUT_OF_RANGE",
-        tonic::Code::Unimplemented => "UNIMPLEMENTED",
-        tonic::Code::Internal => "INTERNAL",
-        tonic::Code::Unavailable => "UNAVAILABLE",
-        tonic::Code::DataLoss => "DATA_LOSS",
-        tonic::Code::Unauthenticated => "UNAUTHENTICATED",
     }
 }
 
@@ -523,9 +522,12 @@ mod tests {
         );
         assert_eq!(alert_name(AlertDescription::UnknownCA), "unknown_ca");
         assert_eq!(alert_name(AlertDescription::Unknown(0xff)), "_OTHER");
-        assert_eq!(code_name(tonic::Code::DataLoss), "DATA_LOSS");
         assert_eq!(
-            code_name(tonic::Code::ResourceExhausted),
+            crate::telemetry::grpc_status_name(tonic::Code::DataLoss),
+            "DATA_LOSS"
+        );
+        assert_eq!(
+            crate::telemetry::grpc_status_name(tonic::Code::ResourceExhausted),
             "RESOURCE_EXHAUSTED"
         );
     }

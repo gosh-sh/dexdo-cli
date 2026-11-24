@@ -602,6 +602,8 @@ mod retirement_2073 {
             fixture.deals[2].clone(),
             2,
             None,
+            seller_market_handle_records(Some(fixture.root.path()), &fixture.note).unwrap(),
+            (&fixture.note, false),
             |market| {
                 Ok((
                     fixture.chains[&deals::normalize_addr(&market.token_contract)].clone(),
@@ -611,13 +613,14 @@ mod retirement_2073 {
         )
         .await
         .unwrap();
-        assert_eq!(
-            loaded.pending_provisions, 0,
+        assert!(
+            loaded.pending_provisions.is_empty(),
             "retirement must not leave a phantom startup slot"
         );
         assert_eq!(
             seller_pool_occupied_capacity(
                 Some(fixture.root.path()),
+                &fixture.note,
                 &fixture.note,
                 &Default::default(),
             )

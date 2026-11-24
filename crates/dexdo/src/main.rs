@@ -133,8 +133,6 @@ mod wallet_onboard_cli_tests {
             vec![
                 "dexdo",
                 "seller",
-                "--note-addr",
-                "0:note",
                 "--token-contract",
                 "0:tc",
                 "--model",
@@ -2396,12 +2394,18 @@ mod deal_handle_cli_tests {
         );
     }
 
+    #[test]
+    fn seller_rejects_the_removed_note_address_flag() {
+        let error = Cli::try_parse_from(["dexdo", "seller", "--note-addr", "0:note"])
+            .err()
+            .expect("seller must reject --note-addr");
+        assert_eq!(error.kind(), clap::error::ErrorKind::UnknownArgument);
+    }
+
     fn seller_args(extra: &[&str]) -> crate::SellerArgs {
         let mut argv = vec![
             "dexdo",
             "seller",
-            "--note-addr",
-            "0:note",
             "--token-contract",
             "0:tc",
             "--model",

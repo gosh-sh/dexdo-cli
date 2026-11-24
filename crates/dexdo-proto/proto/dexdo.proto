@@ -25,7 +25,8 @@ message Challenge {
   bytes nonce = 1;
   string token_contract = 2;
   // Field numbers an older peer still reads; never reuse them.
-  reserved 3, 4;
+  reserved 3, 4, 6;
+  reserved "usage_recovery_network";
   // Consumer API paths this deal's upstream serves, e.g. "/v1/chat/completions".
   repeated string api_paths = 5;
 }
@@ -37,7 +38,8 @@ message StreamRequest {
   // ed25519 signature (challenge_bytes) with the buyer's note private key.
   bytes signature = 3;
   // A field number an older peer still reads; never reuse it.
-  reserved 4;
+  reserved 4, 10, 11;
+  reserved "usage_key", "usage_acknowledged_through";
   // Maximum non-cached input + output tokens this request may bill.
   uint64 billing_grant_tokens = 5;
   // Opt in to concurrent requests drawing from one shared deal budget.
@@ -83,4 +85,6 @@ message BillingUsage {
   // Disjoint cache subsets of input_tokens; neither reads nor writes are billable.
   uint64 cache_read_tokens = 5;
   uint64 cache_write_tokens = 6;
+  // Cumulative seller billing at this commit, supplied on shared-budget streams.
+  optional uint64 cumulative_billable_tokens = 7;
 }

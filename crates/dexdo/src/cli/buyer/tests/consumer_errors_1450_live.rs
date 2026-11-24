@@ -120,6 +120,7 @@ async fn held_gateway(
             note,
             server_task,
             listen_addr,
+            migrated_routes: Default::default(),
             tls_fingerprint,
         },
         entered,

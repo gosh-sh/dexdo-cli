@@ -8,7 +8,6 @@ struct Issue2147Fixture {
     owner: String,
     candidate: Arc<PoolTestBackend>,
     deal: SellerPoolDeal,
-    ready: Arc<AtomicBool>,
     attempts: Arc<AtomicU64>,
     provider: tokio::task::JoinHandle<()>,
 }
@@ -22,21 +21,14 @@ impl Drop for Issue2147Fixture {
 
 impl Issue2147Fixture {
     async fn new() -> Self {
-        Self::with_candidate_responses(http::StatusCode::UNAUTHORIZED, u64::MAX).await
-    }
-
-    async fn with_candidate_responses(status: http::StatusCode, failures: u64) -> Self {
         use axum::{extract::State, response::IntoResponse, routing::post, Json, Router};
-        let ready = Arc::new(AtomicBool::new(false));
         let attempts = Arc::new(AtomicU64::new(0));
         let app = Router::new().route("/v1/chat/completions", post(
-            |State((ready, attempts, status, failures)): State<(Arc<AtomicBool>, Arc<AtomicU64>, http::StatusCode, u64)>,
+            |State(attempts): State<Arc<AtomicU64>>,
              Json(request): Json<serde_json::Value>| async move {
                 if request["model"] == "candidate" {
-                    let attempt = attempts.fetch_add(1, Ordering::SeqCst) + 1;
-                    if !ready.load(Ordering::SeqCst) && attempt <= failures {
-                        return (status, "candidate readiness refused").into_response();
-                    }
+                    attempts.fetch_add(1, Ordering::SeqCst);
+                    return http::StatusCode::TOO_MANY_REQUESTS.into_response();
                 }
                 let body = concat!(
                     "data: {\"choices\":[{\"delta\":{\"content\":\"OK\"}}]}\n\n",
@@ -45,7 +37,7 @@ impl Issue2147Fixture {
                 );
                 ([(http::header::CONTENT_TYPE, "text/event-stream")], body).into_response()
             }
-        )).with_state((ready.clone(), attempts.clone(), status, failures));
+        )).with_state(attempts.clone());
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let url = format!("http://{}/v1", listener.local_addr().unwrap());
         let provider = tokio::spawn(async move {
@@ -132,7 +124,6 @@ impl Issue2147Fixture {
             owner,
             candidate,
             deal,
-            ready,
             attempts,
             provider,
         }
@@ -207,6 +198,7 @@ async fn issue_2147_failed_pool_candidate_preserves_active_requests_and_can_reco
     fixture.request_a().await;
     let state_before = std::fs::read(fixture.root.path().join("active.chainstate.json")).unwrap();
     for attempt in 1..=2 {
+        fixture.candidate.inspection_fail_once.store(true, Ordering::Relaxed);
         let shutdown = std::future::pending::<()>().fuse();
         tokio::pin!(shutdown);
         let mut shutdown_requested = false;
@@ -220,9 +212,9 @@ async fn issue_2147_failed_pool_candidate_preserves_active_requests_and_can_reco
         )
         .await
         .err()
-        .expect("B's upstream failure must refuse admission");
-        assert!(format!("{error:#}").contains("401"), "{error:#}");
-        assert_eq!(fixture.attempts.load(Ordering::SeqCst), attempt);
+        .expect("B's chain read failure must refuse admission");
+        assert!(format!("{error:#}").contains("injected restart after provision"), "{error:#}");
+        assert_eq!(fixture.attempts.load(Ordering::SeqCst), 0);
         assert_eq!(fixture.candidate.post_calls.load(Ordering::Relaxed), 0);
         assert!(!fixture.candidate.cancel_submitted.load(Ordering::Relaxed));
         assert!(!shutdown_requested);
@@ -241,7 +233,6 @@ async fn issue_2147_failed_pool_candidate_preserves_active_requests_and_can_reco
         assert!(!delivery.done.load(Ordering::Acquire));
         fixture.request_a().await;
     }
-    fixture.ready.store(true, Ordering::SeqCst);
     let shutdown = std::future::pending::<()>().fuse();
     tokio::pin!(shutdown);
     assert!(matches!(
@@ -350,7 +341,7 @@ async fn issue_2147_explicit_pool_shutdown_still_stops_the_shared_gateway() {
     let shutdown = std::future::ready(()).fuse();
     tokio::pin!(shutdown);
     let mut shutdown_requested = false;
-    let mut provision = |_: String, _: u64, _: u64, _: u64| {
+    let mut provision = |_: String, _: String, _: u64, _: u64, _: u64| {
         futures::future::ready(Err(anyhow::anyhow!(
             "shutdown must not provision residuals"
         )))
@@ -387,10 +378,8 @@ async fn issue_2147_explicit_pool_shutdown_still_stops_the_shared_gateway() {
 #[tokio::test]
 async fn issue_2147_standalone_readiness_failure_still_stops_its_gateway() {
     let mut fixture = Issue2147Fixture::new().await;
-    fixture.seller.state.route_stream(
-        &fixture.deal.cfg.token_contract,
-        fixture.deal.upstream.clone(),
-    );
+    let (_reserved, advertise) = crate::test_refusing_endpoint::refusing_endpoint();
+    fixture.deal.cfg.gateway_advertise = advertise;
     dexdo::seller::liveness::prepare_seller_offer_with_liveness(
         &fixture.seller,
         fixture.deal.chain.as_ref(),
@@ -409,113 +398,109 @@ async fn issue_2147_standalone_readiness_failure_still_stops_its_gateway() {
 }
 
 #[tokio::test]
-async fn issue_2147_startup_429_then_ready_posts_once_and_keeps_a_serving() {
-    let fixture =
-        Issue2147Fixture::with_candidate_responses(http::StatusCode::TOO_MANY_REQUESTS, 1).await;
+async fn issue_2264_candidate_is_admitted_during_reported_throttling() {
+    let fixture = Issue2147Fixture::new().await;
     fixture.request_a().await;
+    let timeout = SellerLivenessParams::canonical().health_check_timeout;
+    assert_eq!(dexdo::telemetry::probe_upstream(&fixture.deal.upstream, timeout).await, "throttled");
     let before = std::fs::read(fixture.root.path().join("active.chainstate.json")).unwrap();
     let shutdown = std::future::pending::<()>().fuse();
     tokio::pin!(shutdown);
-    let started = tokio::time::Instant::now();
     assert!(matches!(
         prepare_pool_deal_reporting_identity(
-            &fixture.seller,
-            &fixture.deal,
-            &fixture.context(),
-            false,
-            shutdown.as_mut(),
-            &mut false,
-        )
-        .await
-        .expect("one 429 must not fail candidate admission"),
+            &fixture.seller, &fixture.deal, &fixture.context(), false, shutdown.as_mut(), &mut false,
+        ).await.unwrap(),
         PoolDealStart::Watching(None)
     ));
-    assert_eq!(fixture.attempts.load(Ordering::SeqCst), 2);
-    assert!(started.elapsed() >= SellerLivenessParams::canonical().health_interval);
+    assert_eq!(fixture.attempts.load(Ordering::SeqCst), 1);
     assert_eq!(fixture.candidate.post_calls.load(Ordering::Relaxed), 1);
-    assert_eq!(
-        std::fs::read(fixture.root.path().join("active.chainstate.json")).unwrap(),
-        before
-    );
+    assert_eq!(std::fs::read(fixture.root.path().join("active.chainstate.json")).unwrap(), before);
     fixture.request_a().await;
+    assert_eq!(dexdo::telemetry::probe_upstream(&fixture.deal.upstream, timeout).await, "throttled");
+    assert!(!fixture.candidate.cancel_submitted.load(Ordering::Relaxed));
 }
 
 #[tokio::test]
-async fn issue_2147_persistent_startup_429_is_bounded_and_keeps_a_serving() {
-    let fixture =
-        Issue2147Fixture::with_candidate_responses(http::StatusCode::TOO_MANY_REQUESTS, u64::MAX)
-            .await;
-    fixture.request_a().await;
-    let shutdown = std::future::pending::<()>().fuse();
+async fn issue_2264_resting_deal_opens_while_another_sell_waits_for_its_ack() {
+    for fresh_first in [true, false] {
+        issue_2264_admission_order(fresh_first).await;
+    }
+}
+
+async fn issue_2264_admission_order(fresh_first: bool) {
+    let root = tempfile::tempdir().unwrap();
+    let seller = dexdo::seller::start_gateway("127.0.0.1:0".parse().unwrap()).await.unwrap();
+    let gateway = seller.listen_addr.to_string();
+    let fills = Arc::new(Mutex::new(Vec::new()));
+    let a = Arc::new(PoolTestBackend::new(
+        fills.clone(), format!("0:{}", "1".repeat(64)), 4, 4, false, i64::MAX - 2,
+    ).resting_unexpired(true));
+    let ack = Arc::new(tokio::sync::Semaphore::new(0));
+    let mut b = PoolTestBackend::new(
+        fills, format!("0:{}", "2".repeat(64)), 4, 4, false, i64::MAX - 1,
+    );
+    b.ambiguous_post_once.store(true, Ordering::Relaxed);
+    b.post_ack = Some(ack.clone());
+    let b = Arc::new(b);
+    let deal_a = advertise_pool_deal(a.clone(), &gateway, root.path().join("a.json"));
+    let mut deal_b = advertise_pool_deal(b.clone(), &gateway, root.path().join("b.json"));
+    deal_b.nonce += 1;
+    let context = SellerPoolContext {
+        deals_dir: Some(root.path()),
+        contracts: std::path::Path::new("manifest/deployed.manifest.json"),
+        note_addr: &a.resting_owner,
+        frame_model: "mock",
+        gateway_advertise: &gateway,
+        advertise_probe: dexdo::seller::liveness::AdvertiseProbePolicy::Required,
+    };
+    let (stop, stopped) = tokio::sync::oneshot::channel();
+    let shutdown = async { stopped.await.unwrap() }.fuse();
     tokio::pin!(shutdown);
-    let started = tokio::time::Instant::now();
-    let error = tokio::time::timeout(
-        SellerLivenessParams::canonical().health_cycle_timeout,
-        prepare_pool_deal_reporting_identity(
-            &fixture.seller,
-            &fixture.deal,
-            &fixture.context(),
-            false,
-            shutdown.as_mut(),
-            &mut false,
-        ),
-    )
-    .await
-    .expect("startup throttling must stay within the canonical cycle budget")
-    .err()
-    .expect("persistent throttling must not post an unready B");
-    assert!(format!("{error:#}").contains("429"), "{error:#}");
-    assert_eq!(
-        fixture.attempts.load(Ordering::SeqCst),
-        u64::from(dexdo_core::params::SELLER_UPSTREAM_HEALTH_TIMEOUT_MAX_ATTEMPTS)
+    let mut provision = |_: String, _: String, _: u64, _: u64, _: u64| {
+        futures::future::ready(Err(anyhow::anyhow!("these full fills have no residual")))
+    };
+    let policy = pool_test_policy(2);
+    let mut shutdown_requested = false;
+    let candidates = if fresh_first { vec![deal_b, deal_a] } else { vec![deal_a, deal_b] };
+    let pool = run_seller_pool(
+        &seller, candidates, context, &policy, &mut provision,
+        shutdown.as_mut(), &mut shutdown_requested,
     );
-    assert!(started.elapsed() >= SellerLivenessParams::canonical().health_interval);
-    assert_eq!(fixture.candidate.post_calls.load(Ordering::Relaxed), 0);
-    assert_eq!(
-        fixture.candidate.seller_stop_calls.load(Ordering::Relaxed),
-        0
-    );
-    assert!(!fixture
-        .seller
-        .state
-        .delivery(&fixture.active_tc)
-        .done
-        .load(Ordering::Acquire));
-    fixture.request_a().await;
-}
-
-#[tokio::test]
-async fn issue_2147_shutdown_interrupts_throttled_admission_without_stopping_a() {
-    let fixture =
-        Issue2147Fixture::with_candidate_responses(http::StatusCode::TOO_MANY_REQUESTS, u64::MAX)
-            .await;
-    fixture.request_a().await;
-    let shutdown = async {
-        while fixture.attempts.load(Ordering::SeqCst) == 0 {
+    let match_deal = |backend: &PoolTestBackend, order_id| {
+        backend.owner_fills.lock().unwrap().push((
+            backend.created_at, MatchedFill {
+                order_id, token_contract: backend.token_contract.clone(),
+                ticks: u128::from(backend.matched_ticks),
+                price_per_tick: u128::from(backend.price_per_tick),
+            },
+        ));
+        backend.rests.store(false, Ordering::Release);
+        backend.matched.store(true, Ordering::Release);
+    };
+    let buyer = async {
+        while b.post_calls.load(Ordering::Acquire) == 0 {
             tokio::task::yield_now().await;
         }
-        // A new real buyer request completes while B is still being admitted.
-        fixture.request_a().await;
-    }
-    .fuse();
-    tokio::pin!(shutdown);
-    let mut shutdown_requested = false;
-    let started = tokio::time::Instant::now();
-    let error = prepare_pool_deal_reporting_identity(
-        &fixture.seller,
-        &fixture.deal,
-        &fixture.context(),
-        false,
-        shutdown.as_mut(),
-        &mut shutdown_requested,
-    )
-    .await
-    .err()
-    .expect("shutdown must interrupt throttled admission");
-    assert!(error.to_string().contains("shutdown"), "{error:#}");
-    assert!(shutdown_requested);
-    assert!(started.elapsed() < SellerLivenessParams::canonical().health_interval);
-    assert_eq!(fixture.attempts.load(Ordering::SeqCst), 1);
-    assert_eq!(fixture.candidate.post_calls.load(Ordering::Relaxed), 0);
-    fixture.request_a().await;
+        match_deal(&a, 1);
+        while !a.opened.load(Ordering::Acquire) {
+            tokio::task::yield_now().await;
+        }
+        assert!(b.pending_sell.load(Ordering::Acquire));
+        assert_eq!(ack.available_permits(), 0);
+        assert_eq!(b.open_calls.load(Ordering::Acquire), 0);
+
+        // The original B submission matched even though its acknowledgement was lost.
+        match_deal(&b, 2);
+        ack.add_permits(1);
+        while !b.opened.load(Ordering::Acquire) {
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(a.post_calls.load(Ordering::Acquire), 0);
+        assert_eq!(b.post_calls.load(Ordering::Acquire), 1);
+        stop.send(()).unwrap();
+    };
+    let (result, ()) = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        tokio::join!(pool, buyer)
+    }).await.expect("A must open before B is released, then B must recover its own match");
+    result.unwrap();
 }

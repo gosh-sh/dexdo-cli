@@ -18,6 +18,15 @@ pub(crate) async fn apply_seller_dispute_policy(
     if !state.disputed {
         return Ok(false);
     }
+    apply_confirmed_seller_dispute(chain, token_contract, policy, reason).await
+}
+
+pub(crate) async fn apply_confirmed_seller_dispute(
+    chain: &dyn ChainBackend,
+    token_contract: &dexdo_core::TokenContract,
+    policy: &policy::SellerRuntimePolicy,
+    reason: &str,
+) -> Result<bool> {
     match policy.dispute_against_me {
         policy::SellerDisputeAgainstMeAction::ReleaseIfClean => {
             let settlement = chain.release_dispute(token_contract).await?;

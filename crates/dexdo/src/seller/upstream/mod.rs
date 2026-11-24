@@ -9,7 +9,7 @@
 
 pub mod anthropic;
 mod forward;
-mod meter;
+pub(crate) mod meter;
 pub mod mock;
 pub mod openai;
 
@@ -214,11 +214,8 @@ impl UpstreamConfig {
         self.probe(self.market_model(), None).await
     }
 
-    /// The one pre-SELL readiness probe. For a canonical market carrying `--tools` and/or
-    /// `--think`, augment the existing authentication/model request and refuse unless the same
-    /// response proves the declared capability. Runtime health checks intentionally keep calling
-    /// [`Self::check_market_readiness`] so a seller already serving is never torn down by this
-    /// startup-only verdict.
+    /// Explicit capability probe for the reference spotcheck. For a market declaring tools
+    /// or reasoning, the provider response must prove the requested capability.
     pub async fn check_startup_market_readiness(&self) -> Result<()> {
         let market = self.startup_market_model();
         let requirements = market.and_then(StartupCapabilityRequirements::from_market);
@@ -234,17 +231,6 @@ impl UpstreamConfig {
             }
         }
         self.probe(market, requirements).await
-    }
-
-    pub(crate) fn startup_capability_timeout_detail(&self) -> Option<String> {
-        let requirements = self
-            .startup_market_model()
-            .and_then(StartupCapabilityRequirements::from_market)?;
-        Some(format!(
-            "startup capability probe for {} asked the upstream for {}; the upstream returned no response before the bounded startup timeout",
-            requirements.flags(),
-            requirements.asked_for()
-        ))
     }
 
     /// The market identity this upstream was built to serve, when it has one.

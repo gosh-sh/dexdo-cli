@@ -233,7 +233,8 @@ async fn live_2196_small_buy_ecc_boundary() {
         .await
         .unwrap();
     fs::write(dir.join("small-address.txt"), tc.with_workchain()).unwrap();
-    let gas = deal_gas_reserve_raw(875) - 1;
+    let required = matched_buy_reserve_raw(2, false, false);
+    let gas = required + DEAL_BURN_DEPLOY_RAW + DEAL_BURN_POST_FROM_NOTE_RAW - 1;
     let have = account_ecc(&chain, &seller, true).await;
     if have < gas {
         chain
@@ -284,7 +285,6 @@ async fn live_2196_small_buy_ecc_boundary() {
             .await
             .unwrap();
     }
-    let required = deal_buy_reserve_raw(875, false);
     assert_eq!(account_ecc(&chain, &tc, true).await, required - 1);
     let error = chain
         .submit_safe_model_buy_ask(&snapshot, 2, 50 * SHELL_UNIT)
@@ -306,6 +306,11 @@ async fn live_2196_small_buy_ecc_boundary() {
             .await
             .unwrap();
         assert!(reason.is_none() && listed.iter().any(|row| row.order_id == ask.order_id));
+        let quote = chain
+            .quote_matched_buy(&snapshot, Some(2), None)
+            .await
+            .unwrap();
+        assert_eq!(quote.fills[0].order_id, ask.order_id);
         println!(
             "2196 small BUY boundary {} ECC[2]={target} maxTicks=875 requested=2 price=50",
             tc.with_workchain()
@@ -678,6 +683,10 @@ async fn live_2196_low_ecc_exit_gates_and_cleanup() {
                 .await
                 .unwrap();
             wait_ecc(&chain, &buyer, DEAL_BURN_TERMINAL_RAW, true).await;
+            assert!(
+                account_ecc(&chain, &tc, true).await < DEAL_BURN_TERMINAL_RAW,
+                "the buyer must receive the low-reserve warning while still opening the dispute"
+            );
             backend
                 .dispute(
                     &tc.with_workchain(),
@@ -956,10 +965,6 @@ async fn live_2196_prepare_two_notes_and_large_offer() {
         account.ecc_balance(crate::params::SHELL_CURRENCY_ID)
     );
     assert!(account.balance < crate::params::deal_gas_reserve_raw(terms.2));
-    chain
-        .require_tc_gas(&tc, TcGasOperation::Buy)
-        .await
-        .unwrap();
     let selected = chain
         .submit_safe_model_buy_ask(&snapshot, 57_500, crate::params::SHELL_UNIT)
         .await

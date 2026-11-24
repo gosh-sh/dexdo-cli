@@ -133,8 +133,6 @@ fn mismatch_rejection(mismatch: &SellerApiMismatch, anthropic: bool) -> Response
     }
 }
 
-/// The seller refused the request itself (`InvalidArgument`): it is reachable and correct, so the
-/// refusal is request-scoped.
 fn seller_request_refusal(error: &anyhow::Error) -> Option<&tonic::Status> {
     error
         .downcast_ref::<tonic::Status>()
@@ -199,9 +197,6 @@ async fn handle_with_id(
     }
     // No chain read on the request path: the handover routing this request was written for
     // this deal alone, and a seller that no longer serves it fails the capability query below.
-    if let Some(error) = deal.session.unresolved_usage_rejection() {
-        return error.response(StatusCode::BAD_GATEWAY, anthropic);
-    }
     let retry_limit = if deal.session.dead_gateway_action() == DeadGatewayAction::RetryThenReclaim {
         BUYER_UPSTREAM_OPEN_RETRIES
     } else {
@@ -239,9 +234,14 @@ async fn handle_with_id(
             );
             continue;
         }
-        request_guard.observe_policy_failure(ClosureCategory::DeadGateway);
-        let reason =
-            settle_upstream_open_failure(&deal, &error, retries, capability_heartbeat).await;
+        let reason = upstream_open_failure(
+            &deal,
+            &mut request_guard,
+            &error,
+            retries,
+            capability_heartbeat,
+        )
+        .await;
         return reject(StatusCode::BAD_GATEWAY, &reason, anthropic);
     }
     request_guard.complete();
@@ -354,6 +354,7 @@ async fn handle_with_id(
             Err(error)
                 if retries < retry_limit
                     && seller_request_refusal(&error).is_none()
+                    && !error.is::<crate::buyer::OpenStreamInterrupted>()
                     && error.downcast_ref::<SellerApiMismatch>().is_none()
                     && !is_capacity_backpressure(&error) =>
             {
@@ -370,7 +371,13 @@ async fn handle_with_id(
     let upstream = match upstream {
         Ok(stream) => stream,
         Err(error) => {
-            let (status, response) = if let Some(refusal) = seller_request_refusal(&error) {
+            let (status, response) = if error.is::<crate::buyer::OpenStreamInterrupted>() {
+                request_guard.complete();
+                (
+                    StatusCode::BAD_GATEWAY,
+                    reject(StatusCode::BAD_GATEWAY, &error.to_string(), anthropic),
+                )
+            } else if let Some(refusal) = seller_request_refusal(&error) {
                 // The seller answered, and refused this request: request-scoped.
                 request_guard.complete();
                 (
@@ -390,9 +397,14 @@ async fn handle_with_id(
                     capacity_response(&error, anthropic),
                 )
             } else {
-                request_guard.observe_policy_failure(ClosureCategory::DeadGateway);
-                let reason =
-                    settle_upstream_open_failure(&deal, &error, retries, reclaim_heartbeat).await;
+                let reason = upstream_open_failure(
+                    &deal,
+                    &mut request_guard,
+                    &error,
+                    retries,
+                    reclaim_heartbeat,
+                )
+                .await;
                 (
                     StatusCode::BAD_GATEWAY,
                     reject(StatusCode::BAD_GATEWAY, &reason, anthropic),
@@ -453,24 +465,38 @@ async fn handle_with_id(
     }
 }
 
-// Capability queries and stream opens share the existing guarded dead-gateway
-// policy and diagnostics.
-async fn settle_upstream_open_failure(
+// Temporary outages fail the current request. Other gateway failures still use
+// the configured policy and the same diagnostics.
+async fn upstream_open_failure(
     deal: &ApiDeal,
+    request_guard: &mut ConsumerRequestGuard,
     error: &anyhow::Error,
     retries: usize,
     reclaim_heartbeat: dexdo_core::market::HeartbeatGuard,
 ) -> String {
-    tracing::error!(
+    let unreachable = error
+        .downcast_ref::<dexdo_core::DexdoError>()
+        .is_some_and(|error| error.code() == dexdo_core::error_codes::E_GATEWAY_UNREACHABLE.code());
+    let unavailable = error
+        .downcast_ref::<tonic::Status>()
+        .is_some_and(crate::buyer::gateway_temporarily_unavailable);
+    if unreachable || unavailable {
+        request_guard.complete();
+    } else {
+        request_guard.observe_policy_failure(ClosureCategory::DeadGateway);
+        deal.session
+            .settle_dead_gateway("dead-gateway", &reclaim_heartbeat)
+            .await;
+    }
+    tracing::event!(
+        name: "dexdo.buyer.upstream.open.failed", target: module_path!(), tracing::Level::ERROR, {
+        "error.type" = if unreachable || unavailable { "unavailable" } else { "upstream_open" },
         error = %error,
         endpoint = %deal.route.handover.endpoint,
         token_contract = %super::display_token_contract(&deal.route.token_contract),
         retries,
-        "consumer API: upstream open failed definitively; settling the deal as a dead gateway"
+        }, "consumer API: upstream open failed"
     );
-    deal.session
-        .settle_dead_gateway("dead-gateway", &reclaim_heartbeat)
-        .await;
     let detail = crate::buyer::tls::dial_failure_detail(error);
     if retries == 0 {
         format!("upstream open failed: {detail}")
@@ -562,9 +588,8 @@ async fn pre_head_failure(
             return capacity_response(&anyhow::Error::new(status.clone()), anthropic);
         }
     }
-    if handle_stream_error_policy(deal, 0, &error, &mut request_guard).await
-        == StreamErrorPolicyAction::RequestScoped
-    {
+    let action = handle_stream_error_policy(deal, 0, &error).await;
+    if action == StreamErrorPolicyAction::RequestScoped {
         request_guard.complete();
     }
     report_pre_answer_failure(
@@ -643,15 +668,13 @@ fn streamed_answer(
                 }
                 FrameNext::Usage(usage) => {
                     if rendered == 0 {
-                        stream_error = Some(
-                            "terminal billing usage has no preceding delivered output"
-                                .to_string()
-                                .into(),
-                        );
+                        stream_error = Some(StreamError::protocol_error(
+                            "terminal billing usage has no preceding delivered output",
+                        ));
                         break;
                     }
                     if let Err(error) = request_guard.observe_answer_usage(usage) {
-                        stream_error = Some(error.into());
+                        stream_error = Some(StreamError::protocol_error(error));
                         break;
                     }
                     billing_usage = Some(usage);
@@ -674,7 +697,7 @@ fn streamed_answer(
         if bailed.is_none() && stream_error.is_none() {
             if let Some(usage) = billing_usage.as_ref() {
                 if let Err(error) = request_guard.record_billing(deal, *usage) {
-                    stream_error = Some(error.into());
+                    stream_error = Some(StreamError::protocol_error(error));
                 }
             }
         }
@@ -684,7 +707,7 @@ fn streamed_answer(
         } else if let Some(error) = &stream_error {
             request_guard.observe_upstream_failure();
             if error.is_capacity()
-                || handle_stream_error_policy(deal, rendered, error, &mut request_guard).await
+                || handle_stream_error_policy(deal, rendered, error).await
                     == StreamErrorPolicyAction::RequestScoped
             {
                 request_guard.complete();
@@ -744,10 +767,18 @@ fn streamed_answer(
                 yield Ok(Bytes::from(held));
             }
         } else {
-            let retryable = stream_error
-                .as_ref()
-                .filter(|error| rendered == 0 && error.is_retryable_upstream())
-                .map(StreamError::retryable_rejection);
+            let retryable = stream_error.as_ref().and_then(|error| {
+                if error.answer_interrupted() {
+                    Some(ConsumerError::new(
+                        ConsumerErrorCode::UpstreamRetryable,
+                        "seller interrupted the answer; retry this request on the same deal",
+                    ))
+                } else if rendered == 0 && error.is_retryable_upstream() {
+                    Some(error.retryable_rejection())
+                } else {
+                    None
+                }
+            });
             let mut ending = if facts.unterminated {
                 // Close the seller's unfinished frame so the ending parses as its own events.
                 b"\n\n".to_vec()
@@ -797,11 +828,9 @@ async fn whole_answer(
                 body.extend_from_slice(&bytes);
                 frames += 1;
                 if body.len() > UPSTREAM_RESPONSE_BODY_MAX_BYTES {
-                    stream_error = Some(
-                        "the seller's answer exceeds the buyer's response size limit"
-                            .to_string()
-                            .into(),
-                    );
+                    stream_error = Some(StreamError::protocol_error(
+                        "the seller's answer exceeds the buyer's response size limit",
+                    ));
                     break;
                 }
                 // An honest seller sends a whole answer as one frame, so it is inspected on
@@ -831,7 +860,6 @@ async fn whole_answer(
             FrameNext::Bailed(_) | FrameNext::End => break,
         }
     }
-    drop(driver);
     let headers = head.headers.clone();
     // The provider's own error answer, relayed as it is. Nothing was delivered or billed. An error
     // body cut short or over the size limit is not the provider's answer and fails below.
@@ -861,10 +889,11 @@ async fn whole_answer(
             }
         }
     }
+    drop(driver);
     // Usage the seller stated for that output is the seller's claim even when the stream then fails.
     if let Some(usage) = billing_usage.filter(|_| output > 0) {
         if let Err(error) = request_guard.observe_answer_usage(usage) {
-            stream_error.get_or_insert(error.into());
+            stream_error.get_or_insert(StreamError::protocol_error(error));
         }
     }
     let facts = match (stream_error, facts) {
@@ -877,28 +906,34 @@ async fn whole_answer(
                 Err(error) => format!("provider response is not JSON: {error}"),
                 Ok(_) => "provider response is not a complete answer".to_string(),
             };
-            return whole_answer_failure(&context, request_guard, error.into(), 0, anthropic).await;
+            return whole_answer_failure(
+                &context,
+                request_guard,
+                StreamError::protocol_error(error),
+                0,
+                anthropic,
+            )
+            .await;
         }
     };
     let visible = u64::from(facts.has_visible_output());
     let usage = match billing_usage {
         Some(usage) if output > 0 => usage,
         Some(_) => {
-            let error = "terminal billing usage has no preceding delivered output"
-                .to_string()
-                .into();
+            let error = StreamError::protocol_error(
+                "terminal billing usage has no preceding delivered output",
+            );
             return whole_answer_failure(&context, request_guard, error, output, anthropic).await;
         }
         None => {
-            let error = "response stream ended without terminal billing usage"
-                .to_string()
-                .into();
+            let error =
+                StreamError::protocol_error("response stream ended without terminal billing usage");
             return whole_answer_failure(&context, request_guard, error, output, anthropic).await;
         }
     };
     if let Err(error) = request_guard.record_billing(deal, usage) {
-        return whole_answer_failure(&context, request_guard, error.into(), output, anthropic)
-            .await;
+        let error = StreamError::protocol_error(error);
+        return whole_answer_failure(&context, request_guard, error, output, anthropic).await;
     }
     if visible == 0 {
         request_guard.observe_policy_failure(ClosureCategory::EmptyStream);
@@ -1014,9 +1049,8 @@ async fn whole_answer_failure(
         )
         .response(StatusCode::TOO_MANY_REQUESTS, anthropic);
     }
-    if handle_stream_error_policy(deal, received, &error, &mut request_guard).await
-        == StreamErrorPolicyAction::RequestScoped
-    {
+    let action = handle_stream_error_policy(deal, received, &error).await;
+    if action == StreamErrorPolicyAction::RequestScoped {
         request_guard.complete();
     }
     let delivery = context.delivery(

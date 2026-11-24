@@ -597,6 +597,9 @@ pub fn buy_refusal_class(reason: &str) -> &'static str {
     book_refusal_class(reason).unwrap_or(NO_EXECUTABLE_ASK_CLASS)
 }
 
+/// Deadline for one buyer gateway dial, including address resolution, TCP, TLS and HTTP/2 setup.
+pub const BUYER_GATEWAY_DIAL_TIMEOUT: Duration = Duration::from_secs(5);
+
 /// Additional upstream-open attempts after the first buyer request fails.
 pub const BUYER_UPSTREAM_OPEN_RETRIES: usize = 1;
 
@@ -812,14 +815,6 @@ pub const GATEWAY_RESPONSE_MAX_BYTES: usize = UPSTREAM_RESPONSE_BODY_MAX_BYTES +
 /// GraphQL history page size for order-book event reads.
 pub const BOOK_EVENT_PAGE_SIZE: u32 = 50;
 
-/// Delays between transient order-book event-history read attempts.
-pub const BOOK_EVENT_READ_BACKOFFS: [Duration; 4] = [
-    Duration::from_millis(250),
-    Duration::from_millis(500),
-    Duration::from_secs(1),
-    Duration::from_secs(2),
-];
-
 /// Balance floor that triggers an active-contract gas top-up, in nanovmshell.
 
 /// Generic. A per-deal `TokenContract` is held to its OWN floor ([`deal_gas_health_floor_raw`]),
@@ -876,8 +871,8 @@ pub const TRANSIENT_READ_INITIAL_BACKOFF: Duration = Duration::from_millis(500);
 /// Maximum delay between chain read attempts.
 pub const TRANSIENT_READ_MAX_BACKOFF: Duration = Duration::from_secs(8);
 
-/// Total wall-clock budget for one chain read including every retry. Without it a server that
-/// accepts and never answers keeps the first attempt alive forever and the second never happens.
+/// Network/backoff budget for one chain read including every retry, excluding local admission
+/// waiting. Per-attempt timeouts bound a server that accepts but never answers.
 pub const TRANSIENT_READ_TOTAL_BUDGET: Duration = Duration::from_secs(45);
 
 /// Per-attempt ceiling for one chain read. The pinned SDK builds its HTTP client with no timeout
@@ -986,6 +981,9 @@ pub const SELLER_OFFER_EVENT_LOOKBACK_SECS: u64 = 1;
 
 /// Interval between seller-offer outcome reads.
 pub const SELLER_OFFER_OUTCOME_POLL_INTERVAL: Duration = Duration::from_secs(2);
+
+/// Maximum linked PrivateNote transactions read per attempt to prove a signed SELL expired unused.
+pub const SELLER_EXPIRY_HISTORY_LIMIT: u32 = 50;
 
 /// Inclusive lower bound accepted by CLI arguments that require a positive `u64`.
 pub const CLI_POSITIVE_U64_MIN: u64 = 1;
@@ -1910,9 +1908,9 @@ pub fn deal_gas_reserve_raw(max_ticks: u128) -> u128 {
     once.saturating_add(DEAL_BURN_CLAIM_RAW.saturating_mul(max_ticks.max(1)))
 }
 
-/// ECC[2] still reserved when a fresh SELL rests. The constructor and `postFromNote`
+/// Historical lifetime threshold for a fresh SELL. The constructor and `postFromNote`
 /// have already burned their charges; the seller bond may also have been posted.
-/// Use constructor `getDeal().maxTicks`, never the buyer's requested fill size.
+/// Retained for the historical reserve receipts and harness accounting.
 pub fn deal_buy_reserve_raw(max_ticks: u128, seller_bond_funded: bool) -> u128 {
     let spent = DEAL_BURN_DEPLOY_RAW
         + DEAL_BURN_POST_FROM_NOTE_RAW
@@ -1922,6 +1920,40 @@ pub fn deal_buy_reserve_raw(max_ticks: u128, seller_bond_funded: bool) -> u128 {
             0
         };
     deal_gas_reserve_raw(max_ticks).saturating_sub(spent)
+}
+
+/// Remaining ECC[2] paid by the TokenContract for the matched volume.
+pub fn matched_buy_reserve_raw(
+    fill_ticks: u128,
+    seller_bond_funded: bool,
+    subscription: bool,
+) -> u128 {
+    // fundFromOrderBook is free. The buyer note attaches the charge for its bond,
+    // STOP and dispute opening. The seller bond only costs reserve if still unfunded.
+    let bond = if seller_bond_funded {
+        0
+    } else {
+        DEAL_BURN_FUND_DEAL_RAW
+    };
+    // The probe is already the first tick. For BUY admission, budget one claim
+    // per further tick. Fractional claims can cost more during actual delivery.
+    let claims = DEAL_BURN_CLAIM_RAW.saturating_mul(fill_ticks.saturating_sub(1));
+    // Ordinary deals have a final promotion. Subscriptions can settle each week
+    // separately and need one more call if the last claim is still contestable.
+    let settlements = if subscription {
+        // The subscription keeper promotes a mature pending claim independently of weekly billing.
+        fill_ticks
+            .saturating_sub(1)
+            .saturating_add(u128::from(SUBSCRIPTION_WEEKS) + 1)
+    } else {
+        1
+    };
+    // Keep one terminal charge for releaseDispute OR resolveDisputeTimeout.
+    claims
+        .saturating_add(settlements.saturating_mul(DEAL_BURN_SETTLE_RAW))
+        .saturating_add(
+            bond + DEAL_BURN_OPEN_RAW + DEAL_BURN_ACCEPT_PROBE_RAW + DEAL_BURN_TERMINAL_RAW,
+        )
 }
 
 /// Historical, and kept only because [`deal_gas_requirement_raw_with_overhead`] still names it in
@@ -2298,22 +2330,15 @@ impl Default for ProtocolConsts {
     }
 }
 
-/// Maximum total attempts for initial readiness and a timed-out periodic gateway self-probe.
-/// Periodic upstream failures instead use `SellerLivenessParams::upstream_unavailable_grace`.
-/// Two attempts absorb one isolated gateway stall, extending that path by one health-check timeout.
-/// Initial SELL readiness shares this cap between timeouts and typed HTTP 429 throttling;
-/// the latter waits `SellerLivenessParams::health_interval` before its one retry.
-pub const SELLER_UPSTREAM_HEALTH_TIMEOUT_MAX_ATTEMPTS: u32 = 2;
+/// Maximum total attempts for a timed-out gateway self-probe at startup or while watching a SELL.
+pub const SELLER_GATEWAY_HEALTH_TIMEOUT_MAX_ATTEMPTS: u32 = 2;
 
 /// Seller CLI liveness timings for a resting SELL.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct SellerLivenessParams {
-    /// Time between complete gateway/upstream health cycles.
+    /// Time between gateway health cycles.
     pub health_interval: Duration,
-    /// Maximum continuous detected transient upstream outage before withdrawing a resting SELL.
-    /// Successful full readiness resets it; failed probes, including throttling, never extend it.
-    pub upstream_unavailable_grace: Duration,
-    /// Per-cycle budget for gateway and exact-model upstream readiness.
+    /// Budget for a gateway readiness check or a background upstream probe.
     pub health_check_timeout: Duration,
     /// Maximum time from the last healthy instant through the initial exact-order read and cancel
     /// preparation/submit. An accepted cancel is watched without a client clock until the chain
@@ -2354,7 +2379,6 @@ impl SellerLivenessParams {
     pub const fn canonical() -> Self {
         Self {
             health_interval: Duration::from_secs(20),
-            upstream_unavailable_grace: Duration::from_secs(60),
             health_check_timeout: Duration::from_secs(20),
             health_cycle_timeout: Duration::from_secs(60),
             cancel_confirmation_timeout: Duration::from_secs(60),
@@ -3462,7 +3486,11 @@ pub const BUYER_USAGE_SQLITE_BUSY_TIMEOUT: Duration = Duration::from_secs(5);
 /// Delay between transient WAL-initialization retries, within the SQLite busy wait budget.
 pub const BUYER_USAGE_SQLITE_INIT_RETRY_INTERVAL: Duration = Duration::from_millis(10);
 /// SQLite format version of the persistent buyer usage history.
-pub const BUYER_USAGE_SCHEMA_VERSION: u32 = 7;
+pub const BUYER_USAGE_SCHEMA_VERSION: u32 = 12;
+/// Number of committed usage change events to keep after pruning.
+pub const BUYER_USAGE_CHANGE_JOURNAL_RETAIN_EVENTS: i64 = 100_000;
+/// Additional usage events to accumulate before pruning the journal prefix.
+pub const BUYER_USAGE_CHANGE_JOURNAL_PRUNE_BATCH: i64 = 1_000;
 /// Default number of financial facts per HTTP page (rows).
 pub const BUYER_USAGE_FACTS_DEFAULT_LIMIT: u32 = 100;
 /// Minimum financial-facts page size (rows).
@@ -3474,7 +3502,7 @@ pub const BUYER_USAGE_FACTS_MAX_CURSOR_BYTES: usize = 4_096;
 /// Delay between buyer usage chain-evidence reconciliation passes.
 pub const BUYER_USAGE_RECONCILE_INTERVAL: Duration = Duration::from_secs(30);
 /// Period between independent upstream readiness probes used for seller uptime metrics.
-pub const SELLER_UPTIME_PROBE_INTERVAL: Duration = Duration::from_secs(30);
+pub const SELLER_UPTIME_PROBE_INTERVAL: Duration = Duration::from_secs(5 * 60);
 /// Opt-in seller OTLP metrics policy, which `dexdo buyer` shares. Durations are milliseconds on the
 /// environment surface.
 /// Default time between metric exports (`OTEL_METRIC_EXPORT_INTERVAL`).
@@ -3489,6 +3517,9 @@ pub const SELLER_METRICS_DEFAULT_ENDPOINT: &str = "http://localhost:4317";
 pub const SELLER_METRICS_SERVICE_NAME: &str = "dexdo-seller";
 /// Buyer `service.name` resource attribute when `OTEL_SERVICE_NAME` is unset.
 pub const BUYER_METRICS_SERVICE_NAME: &str = "dexdo-buyer";
+/// Time between two reads of the trading and gas balances of every note with an active seller
+/// deal, for `dexdo.seller.note.balance`.
+pub const SELLER_METRICS_NOTE_BALANCE_INTERVAL: Duration = Duration::from_secs(60);
 /// Bucket boundaries of `dexdo.buyer.http.server.request.duration`, seconds.
 pub const BUYER_METRICS_HTTP_SERVER_DURATION_BOUNDARIES: [f64; 18] = [
     0.0, 0.5, 1.0, 2.0, 5.0, 10.0, 15.0, 20.0, 30.0, 45.0, 60.0, 75.0, 90.0, 120.0, 150.0, 180.0,
@@ -3514,7 +3545,19 @@ mod buy_reserve_2196_tests {
         assert_eq!(deal_buy_reserve_raw(875, false), 13_300_000_000);
     }
 
+    #[test]
+    fn issue_2242_counts_probe_once_and_separates_bond_and_weekly_charges() {
+        assert_eq!(matched_buy_reserve_raw(10, true, false), 225_000_000);
+        assert_eq!(matched_buy_reserve_raw(10, false, false), 235_000_000);
+        assert_eq!(matched_buy_reserve_raw(4, false, true), 250_000_000);
+    }
+
     proptest! {
+        #[test]
+        fn issue_2242_each_additional_tick_adds_one_claim(ticks in 2u128..1_000_000, bond in any::<bool>()) {
+            prop_assert_eq!(matched_buy_reserve_raw(ticks + 1, bond, false) - matched_buy_reserve_raw(ticks, bond, false), DEAL_BURN_CLAIM_RAW);
+        }
+
         #[test]
         fn gas_2196_remaining_reserve_removes_only_already_paid_entries(ticks in 2u128..1_000_000, bond in any::<bool>()) {
             let spent = DEAL_BURN_DEPLOY_RAW + DEAL_BURN_POST_FROM_NOTE_RAW

@@ -1027,7 +1027,7 @@ fn is_secret_field_name(key: &str) -> bool {
         || key.ends_with("_seed")
 }
 
-fn write_private_atomic(path: &Path, bytes: &[u8]) -> Result<()> {
+pub(super) fn write_private_atomic(path: &Path, bytes: &[u8]) -> Result<()> {
     let dir = path
         .parent()
         .filter(|p| !p.as_os_str().is_empty())

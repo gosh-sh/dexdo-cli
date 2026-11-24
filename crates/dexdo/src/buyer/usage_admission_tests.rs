@@ -1,5 +1,4 @@
 use super::*;
-use rusqlite::StatementStatus;
 
 fn store() -> (tempfile::TempDir, UsageStore) {
     let dir = tempfile::tempdir().unwrap();
@@ -34,115 +33,6 @@ fn completed_history(store: &UsageStore, first: u32, last: u32) {
 }
 
 #[test]
-fn issue_2193_admission_does_not_walk_100000_completed_requests() {
-    let (_dir, store) = store();
-    let steps = |deal: &str| {
-        let connection = store.lock().unwrap();
-        let mut statement = connection.prepare(UNRESOLVED_OUTPUT_USAGE_SQL).unwrap();
-        let pending: bool = statement
-            .query_row(params![store.network(), deal, &*store.runtime_id], |row| {
-                row.get(0)
-            })
-            .unwrap();
-        assert!(!pending);
-        (
-            statement.get_status(StatementStatus::VmStep),
-            statement.get_status(StatementStatus::FullscanStep),
-        )
-    };
-    completed_history(&store, 1, 1000);
-    let small = steps("deal");
-    completed_history(&store, 1001, 100_000);
-    let large = steps("deal");
-    eprintln!("issue 2193: SQLite steps for 1000 requests={small:?}; 100000={large:?}");
-    assert!(
-        large.0 <= small.0 + 100,
-        "completed history increased work: {small:?} -> {large:?}"
-    );
-    assert_eq!(large.1, 0, "admission must not scan history");
-
-    // Unresolved history of another deal must not slow a clean deal either.
-    store
-        .lock()
-        .unwrap()
-        .execute("UPDATE request_usage SET accepted=0", [])
-        .unwrap();
-    let foreign = steps("empty-deal");
-    assert!(
-        foreign.0 <= small.0 + 100,
-        "other deals increased work: {small:?} -> {foreign:?}"
-    );
-
-    let connection = store.lock().unwrap();
-    let plan: Vec<String> = connection
-        .prepare(&format!("EXPLAIN QUERY PLAN {UNRESOLVED_OUTPUT_USAGE_SQL}"))
-        .unwrap()
-        .query_map(
-            params![store.network(), "deal", &*store.runtime_id],
-            |row| row.get(3),
-        )
-        .unwrap()
-        .collect::<rusqlite::Result<_>>()
-        .unwrap();
-    eprintln!("issue 2193 query plan: {plan:#?}");
-    for step in &plan {
-        assert!(
-            !step.starts_with("SCAN r") && !step.starts_with("SCAN u"),
-            "{step}"
-        );
-        if step.starts_with("SEARCH r ") || step.starts_with("SEARCH u ") {
-            assert!(
-                step.contains("deal_id=?") || step.contains("request_id=?"),
-                "{step}"
-            );
-        }
-    }
-}
-
-proptest::proptest! {
-    #[test]
-    fn issue_2193_unresolved_check_preserves_accounting_states(
-        states in proptest::collection::vec(
-            (proptest::bool::ANY, proptest::bool::ANY, proptest::bool::ANY,
-             proptest::bool::ANY, proptest::bool::ANY, proptest::bool::ANY,
-             proptest::bool::ANY, 0u8..3), 0..24),
-    ) {
-        let (_dir, store) = store();
-        let mut expected = false;
-        {
-            let mut connection = store.lock().unwrap();
-            let transaction = connection.transaction().unwrap();
-            for (id, &(same_network, same_deal, complete, finished, old_runtime,
-                       has_state, accepted, phase)) in states.iter().enumerate() {
-                let network = if same_network { store.network() } else { "other-network" };
-                let deal = if same_deal { "deal" } else { "other-deal" };
-                let runtime = if old_runtime { "previous" } else { &*store.runtime_id };
-                let phase = ["answer", "verification_b8", "verification_b7"][phase as usize];
-                let id = id.to_string();
-                transaction.execute(
-                    "INSERT INTO requests(network,request_id,runtime_id,model,protocol,streamed,
-                     deal_id,started_at,finished_at,history_complete)
-                     VALUES(?1,?2,?3,'model','openai',0,?4,0,?5,?6)",
-                    params![network, id, runtime, deal, finished.then_some(1), complete],
-                ).unwrap();
-                if has_state {
-                    transaction.execute(
-                        "INSERT INTO request_usage(network,request_id,phase,call_id,input_tokens,
-                         output_tokens,total_tokens,charged_tokens,accepted,cache_read_tokens,cache_write_tokens,deal_id)
-                         VALUES(?1,?2,?3,'in_progress','0','0','0','0',?4,'0','0',?5)",
-                        params![network, id, phase, accepted, deal],
-                    ).unwrap();
-                }
-                expected |= same_network && same_deal && (!complete || (!finished && old_runtime)
-                    || (has_state && !accepted && (phase == "answer" || finished || old_runtime)));
-            }
-            transaction.commit().unwrap();
-        }
-        proptest::prop_assert_eq!(store.has_unresolved_output_usage("deal").unwrap(), expected);
-    }
-}
-
-#[test]
 fn issue_2193_history_snapshot_does_not_block_request_accounting() {
     let (_dir, store) = store();
     let mut history = store.lock_history().unwrap();
@@ -169,11 +59,6 @@ fn issue_2193_history_snapshot_does_not_block_request_accounting() {
                     BillingUsage::default(),
                     false,
                 )?;
-                // The admission check must see new output despite the old history snapshot.
-                ensure!(
-                    writer.has_unresolved_output_usage("deal")?,
-                    "missing unresolved output"
-                );
                 writer.record_call_usage(
                     "new",
                     "answer",
@@ -182,10 +67,6 @@ fn issue_2193_history_snapshot_does_not_block_request_accounting() {
                     true,
                 )?;
                 writer.finish_request("new", 200, Some("stop"), None)?;
-                ensure!(
-                    !writer.has_unresolved_output_usage("deal")?,
-                    "usage did not reconcile"
-                );
                 Ok(())
             })())
             .unwrap();
@@ -206,68 +87,6 @@ fn issue_2193_history_snapshot_does_not_block_request_accounting() {
         1
     );
     assert!(store.facts(&Default::default()).unwrap().facts.is_empty());
-}
-
-#[test]
-fn issue_2193_existing_database_reopens_with_indexes_and_pending_output() {
-    let (dir, store) = store();
-    store
-        .start_request("pending", "model", "openai", true)
-        .unwrap();
-    store.link_deal("pending", "deal").unwrap();
-    store
-        .record_call_usage(
-            "pending",
-            "answer",
-            "in_progress",
-            BillingUsage::default(),
-            false,
-        )
-        .unwrap();
-    store
-        .finish_request("pending", 502, Some("error"), Some("upstream_stream"))
-        .unwrap();
-    store
-        .lock()
-        .unwrap()
-        .execute_batch(
-            "DROP INDEX requests_incomplete_usage; DROP INDEX requests_unfinished_usage;
-         DROP INDEX request_usage_pending; ALTER TABLE request_usage DROP COLUMN deal_id;
-             DROP TABLE admission_models; DROP TABLE admission_deals; PRAGMA user_version=5;",
-        )
-        .unwrap();
-    drop(store);
-    let path = dir.path().join("usage.sqlite3");
-    let reopened = UsageStore::open(&path, "shellnet").unwrap();
-    assert!(reopened.has_unresolved_output_usage("deal").unwrap());
-    let indexes: u32 = reopened
-        .lock()
-        .unwrap()
-        .query_row(
-            "SELECT count(*) FROM sqlite_schema WHERE type='index' AND name IN
-         ('requests_incomplete_usage','requests_unfinished_usage','request_usage_pending')",
-            [],
-            |row| row.get(0),
-        )
-        .unwrap();
-    assert_eq!(indexes, 3);
-    // A different phase or an unaccepted observation cannot clear the unresolved answer.
-    let usage = BillingUsage::new(1, 1, None).unwrap();
-    reopened
-        .record_call_usage("pending", "verification_b8", "verification_b8", usage, true)
-        .unwrap();
-    reopened
-        .record_call_usage("pending", "answer", "answer", usage, false)
-        .unwrap();
-    assert!(reopened.has_unresolved_output_usage("deal").unwrap());
-    reopened
-        .record_call_usage("pending", "answer", "answer", usage, true)
-        .unwrap();
-    assert!(!reopened.has_unresolved_output_usage("deal").unwrap());
-    drop(reopened);
-    let reopened = UsageStore::open(path, "shellnet").unwrap();
-    assert!(!reopened.has_unresolved_output_usage("deal").unwrap());
-    assert_eq!(reopened.accepted_tokens("deal").unwrap(), 4);
 }
 
 #[test]
@@ -314,10 +133,7 @@ fn issue_2193_late_deal_binding_is_atomic_and_cannot_move_usage() {
         .unwrap();
     store.link_deal("late", "deal").unwrap();
     store.link_deal("late", "deal").unwrap();
-    assert!(store.has_unresolved_output_usage("deal").unwrap());
     assert!(store.link_deal("late", "other-deal").is_err());
-    assert!(!store.has_unresolved_output_usage("other-deal").unwrap());
-    assert!(store.has_unresolved_output_usage("deal").unwrap());
 }
 
 #[test]
@@ -338,7 +154,6 @@ fn issue_2193_fifty_concurrent_accounting_clients() {
                                 let started = std::time::Instant::now();
                                 let id = format!("client-{client}-{request}");
                                 store.start_request(&id, "model", "openai", false).unwrap();
-                                assert!(!store.has_unresolved_output_usage("deal").unwrap());
                                 store
                                     .finish_request(&id, 429, Some("error"), Some("upstream_open"))
                                     .unwrap();
@@ -362,4 +177,162 @@ fn issue_2193_fifty_concurrent_accounting_clients() {
             latencies.len()
         );
     }
+}
+
+#[test]
+fn issue_2269_legacy_usage_closes_locally_and_preserves_confirmed_phases() {
+    let (dir, store) = store();
+    for phase in ["answer", "verification_b7", "verification_b8"] {
+        store.start_request(phase, "model", "openai", true).unwrap();
+        store.link_deal(phase, "deal").unwrap();
+        if phase == "answer" {
+            store
+                .finish_request(phase, 499, Some("cancelled"), Some("consumer_disconnect"))
+                .unwrap();
+        }
+        store
+            .record_call_usage(phase, phase, "in_progress", BillingUsage::default(), false)
+            .unwrap();
+    }
+    let usage = BillingUsage {
+        charged_tokens: Some(5),
+        cumulative_billable_tokens: Some(12),
+        cache_read_tokens: 2,
+        ..BillingUsage::new(4, 3, None).unwrap()
+    };
+    store
+        .record_call_usage(
+            "verification_b7",
+            "verification_b8",
+            "verification_b8",
+            usage,
+            true,
+        )
+        .unwrap();
+    store
+        .lock()
+        .unwrap()
+        .execute_batch(include_str!("drop_usage_change_journal.sql"))
+        .unwrap();
+    store
+        .lock()
+        .unwrap()
+        .execute_batch(
+            "CREATE TABLE request_usage_recovery (request_id TEXT);
+         INSERT INTO request_usage_recovery VALUES ('answer'), ('verification_b8');
+         CREATE TABLE request_usage_sequence (sequence INTEGER);
+         PRAGMA user_version=9;",
+        )
+        .unwrap();
+    drop(store);
+    for expected_interruptions in [2, 0] {
+        let store = UsageStore::open(dir.path().join("usage.sqlite3"), "shellnet").unwrap();
+        assert_eq!(
+            store.recover_interrupted_requests().unwrap(),
+            expected_interruptions
+        );
+        assert_eq!(store.confirmed_usage_above("deal", 0).unwrap(), 5);
+        assert_eq!(store.confirmed_usage_above("deal", 9).unwrap(), 3);
+        let connection = store.lock().unwrap();
+        assert_eq!(
+            connection
+                .query_row(
+                    "SELECT failure_stage FROM requests WHERE request_id='answer'",
+                    [],
+                    |row| row.get::<_, String>(0)
+                )
+                .unwrap(),
+            "consumer_disconnect"
+        );
+        assert_eq!(
+            connection
+                .query_row(
+                    "SELECT count(*) FROM request_usage WHERE accepted=0 OR
+              (call_id='in_progress' AND charged_tokens!='0')",
+                    [],
+                    |row| row.get::<_, i64>(0)
+                )
+                .unwrap(),
+            0
+        );
+        assert_eq!(connection.query_row(
+            "SELECT count(*) FROM sqlite_schema WHERE name IN ('request_usage_recovery','request_usage_sequence')",
+            [], |row| row.get::<_, i64>(0)
+        ).unwrap(), 0);
+    }
+}
+
+#[test]
+fn issue_2269_confirmed_usage_retries_the_local_write_once() {
+    let (dir, store) = store();
+    let accepted = Utc.with_ymd_and_hms(2026, 11, 12, 23, 59, 59).unwrap();
+    let after_midnight = Utc.with_ymd_and_hms(2026, 11, 13, 0, 0, 1).unwrap();
+    store
+        .start_request_at("r", "model", "openai", true, accepted.timestamp_millis())
+        .unwrap();
+    store.link_deal("r", "deal").unwrap();
+    store.record_deal_price("deal", SHELL_UNIT).unwrap();
+    let usage = BillingUsage {
+        charged_tokens: Some(5),
+        cumulative_billable_tokens: Some(17),
+        cache_read_tokens: 2,
+        ..BillingUsage::new(4, 3, None).unwrap()
+    };
+    store
+        .record_call_usage("r", "answer", "answer", usage, false)
+        .unwrap();
+    store
+        .lock()
+        .unwrap()
+        .execute_batch(
+            "CREATE TRIGGER reject_bill BEFORE UPDATE OF accepted ON request_usage
+         WHEN NEW.call_id='answer' BEGIN SELECT RAISE(ABORT, 'temporary write failure'); END;",
+        )
+        .unwrap();
+    store
+        .record_confirmed_bill(ConfirmedBill {
+            request_id: "r".into(),
+            phase: "answer".into(),
+            usage,
+            buyer_billable_floor: None,
+            accepted_at: accepted.timestamp_millis(),
+        })
+        .unwrap();
+    store
+        .finish_request_at("r", 200, Some("stop"), None, accepted.timestamp_millis())
+        .unwrap();
+    assert_eq!(store.accepted_tokens("deal").unwrap(), 0);
+    assert!(store.flush_confirmed_usage().is_err());
+    let path = dir.path().join("usage.sqlite3");
+    drop(store);
+    assert!(UsageStore::open(&path, "shellnet").is_err());
+    let connection = Connection::open(&path).unwrap();
+    connection
+        .execute_batch("DROP TRIGGER reject_bill")
+        .unwrap();
+    drop(connection);
+    let reopened = UsageStore::open(&path, "shellnet").unwrap();
+    reopened.flush_confirmed_usage().unwrap();
+    drop(reopened);
+    let reopened = UsageStore::open(path, "shellnet").unwrap();
+    assert_eq!(reopened.accepted_tokens("deal").unwrap(), 5);
+    assert_eq!(reopened.confirmed_usage_above("deal", 14).unwrap(), 3);
+    assert_eq!(
+        reopened.admission_snapshot("model").unwrap()["accepted"]["cache_read_tokens"],
+        "2"
+    );
+    let query = UsageQuery {
+        from: Some("2026-11-12T00:00:00Z".into()),
+        to: Some("2026-11-13T00:00:00Z".into()),
+        days: Some(2),
+        timezone: Some("UTC".into()),
+        ..Default::default()
+    };
+    let report = reopened.query(&query, after_midnight).unwrap();
+    assert_eq!(report["spend"]["total"]["cost_shell"], "0.000005");
+    assert_eq!(report["spend"]["period"]["cost_shell"], "0.000005");
+    assert_eq!(report["daily_spend"][0]["date"], "2026-11-12");
+    assert_eq!(report["daily_spend"][0]["cost_shell"], "0.000005");
+    assert_eq!(report["daily_spend"][1]["date"], "2026-11-13");
+    assert_eq!(report["daily_spend"][1]["cost_shell"], "0");
 }

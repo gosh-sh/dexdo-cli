@@ -52,3 +52,34 @@ async fn confirmation_keeps_genuine_errors_and_other_bool_timeouts() {
         .unwrap_err();
     assert!(matches!(error, ChainError::Chain(_)));
 }
+
+#[tokio::test(start_paused = true)]
+async fn issue_2206_open_confirmation_preserves_the_budget_after_bk_exhaustion() {
+    let tc = Address::parse(&format!("0:{}", "a".repeat(64))).unwrap();
+    let reads = AtomicUsize::new(0);
+    let sdk_reads = AtomicUsize::new(0);
+    let max_reads = crate::params::TC_BOOL_CONFIRM_MAX_READS;
+    wait_tc_bool_with(&tc, "opened", true, || async {
+        let attempt = reads.fetch_add(1, Ordering::Relaxed);
+        if attempt == 0 {
+            let error = super::super::client::retry_transient_read(|| async {
+                sdk_reads.fetch_add(1, Ordering::Relaxed);
+                Err::<(), _>(super::backends_issue_2122_tests::bk_error())
+            })
+            .await
+            .unwrap_err();
+            return Err(map_read_err(error));
+        }
+        Ok(Some(DealChainState {
+            opened: attempt == max_reads,
+            ..pending()
+        }))
+    })
+    .await
+    .unwrap();
+    assert_eq!(reads.load(Ordering::Relaxed), max_reads + 1);
+    assert_eq!(
+        sdk_reads.load(Ordering::Relaxed),
+        crate::params::TRANSIENT_READ_ATTEMPTS
+    );
+}

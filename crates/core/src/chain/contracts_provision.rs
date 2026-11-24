@@ -119,6 +119,8 @@ pub(super) struct GenerationPins {
     /// The `PrivateNote` code `RootPN.getDetails().privateNoteCodeHash` reports -- the code the root
     /// actually mints, which is what every note guard is held to.
     pub(super) private_note: &'static str,
+    /// Maximum seconds between block time and signed expiry in this PrivateNote's ReplayProtection.
+    pub(super) private_note_expiry_window_secs: u32,
     /// The `TokenContract` code RootPN bakes into every note it mints, read out of its
     /// `_tokenContractCode` storage field (contracts 4.0.36).
 
@@ -159,6 +161,7 @@ pub(super) const GENERATION_PINS: &[GenerationPins] = &[
             "e97227c5d1a8fff171e0c5a1f6aa3e063f663bfcb5c86757392aef82a8775954",
         ),
         private_note: "acf19e140b58469a50165bcbda88cca952b2036678f1f5823b6a6bebd3fc32b1",
+        private_note_expiry_window_secs: 5 * 60,
         token_contract_code: Some(
             "ee4105b4800d852dde1a86cec4e270ecfa2ae0e199f05a46823aed792933e711",
         ),

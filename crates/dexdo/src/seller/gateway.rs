@@ -112,6 +112,16 @@ impl UpstreamFailure {
                     },
                     |code| code == 408 || code == 429 || code >= 500,
                 ));
+        let grpc_code = crate::telemetry::grpc_status_name(status.code());
+        tracing::event!(
+            name: "dexdo.seller.upstream.failed", target: module_path!(), tracing::Level::WARN, {
+            "rpc.system.name" = "grpc",
+            "rpc.method" = "dexdo.v1.Gateway/OpenStream",
+            "rpc.status_code" = grpc_code,
+            "error.type" = grpc_code,
+            "http.response.status_code" = http_status,
+            }, "seller upstream failed"
+        );
         Self {
             token_contract: token_contract.to_string(),
             error_class,
@@ -128,6 +138,12 @@ impl UpstreamFailure {
         http_status: u16,
         event_sequence: Arc<AtomicU64>,
     ) -> Self {
+        tracing::event!(
+            name: "dexdo.seller.upstream.failed", target: module_path!(), tracing::Level::WARN, {
+            "http.response.status_code" = http_status,
+            "error.type" = %http_status,
+            }, "seller upstream returned an error response"
+        );
         Self {
             token_contract: token_contract.to_string(),
             error_class: if matches!(http_status, 401 | 403) {
@@ -149,12 +165,10 @@ impl UpstreamFailure {
 
 /// Per-deal payment tracking. `count` is the cumulative accepted payment in
 /// provider-token units across all of this deal's gRPC streams. Each clean request terminal adds its
-/// charged portion exactly once, excluding excess work borne by the seller. `done` means **no more billable usage will ever arrive for this deal/session**. The ordinary owner
-/// is the buyer **session lifecycle**; a provider bill beyond one request's paid reservation also closes
-/// that lifecycle after committing the capped amount and draining admitted work. `billing_exhausted`
-/// distinguishes only that latter fact,
-/// so an ordinary clean session end never causes a seller-initiated close. The seller's `drive_advance` reads
-/// `count` and `done` (Acquire) so finalized ticks never exceed accepted billable usage.
+/// charged portion exactly once. `done` means no more billable usage will arrive for the session.
+/// `billing_exhausted` requests a seller stop after a subscription overrun beyond the probe.
+/// Ordinary deals reconcile request overruns in the capacity record while claims keep running.
+/// The seller's `drive_advance` reads `count` and `done` so finalized ticks stay within accepted usage.
 #[derive(Clone, Default)]
 pub struct DealDelivery {
     pub count: Arc<AtomicU64>,
@@ -163,9 +177,14 @@ pub struct DealDelivery {
     update_lock: Arc<Mutex<()>>,
     event_sequence: Arc<AtomicU64>,
     terminal_trail_emitted: Arc<AtomicBool>,
+    changed: Arc<tokio::sync::Notify>,
 }
 
 impl DealDelivery {
+    pub fn changed(&self) -> &tokio::sync::Notify {
+        &self.changed
+    }
+
     pub fn next_event_seq(&self) -> u64 {
         self.event_sequence.fetch_add(1, Ordering::Relaxed) + 1
     }
@@ -223,12 +242,21 @@ pub trait AuthoritativeDeliveryRecorder: Send + Sync {
     }
 
     /// Commit the accepted amount together with any provider overrun beyond its grant.
-    fn complete_billing(&self, tokens: NonZeroU64, billing_exhausted: bool) -> Result<u64, Status> {
+    fn complete_billing(&self, tokens: NonZeroU64, over_grant: bool) -> Result<u64, Status> {
         self.record_authoritative_delivery(AuthoritativeDeliveryEvent::Completed(tokens))?;
-        if billing_exhausted {
+        if over_grant {
             self.mark_billing_exhausted();
         }
         Ok(tokens.get())
+    }
+
+    fn complete_response(
+        &self,
+        tokens: NonZeroU64,
+        over_grant: bool,
+    ) -> Result<(u64, Option<u64>), Status> {
+        self.complete_billing(tokens, over_grant)
+            .map(|charged| (charged, None))
     }
 
     /// Mark that the provider's terminal bill exceeded this request's authorized reservation.
@@ -249,6 +277,7 @@ impl AuthoritativeDeliveryRecorder for DealDelivery {
                 })?;
                 let next = checked_authoritative_tokens(&self.count, tokens.get())?;
                 self.count.store(next, Ordering::Release);
+                self.changed.notify_one();
                 Ok(())
             }
             AuthoritativeDeliveryEvent::Finished(_) => Ok(()),
@@ -258,6 +287,7 @@ impl AuthoritativeDeliveryRecorder for DealDelivery {
     fn mark_billing_exhausted(&self) {
         self.billing_exhausted.store(true, Ordering::Release);
         self.done.store(true, Ordering::Release);
+        self.changed.notify_one();
     }
 }
 
@@ -271,33 +301,17 @@ impl AuthoritativeDeliveryRecorder for CapacityDeliveryRecorder {
         self.reservation.is_shared()
     }
 
-    fn complete_billing(&self, tokens: NonZeroU64, billing_exhausted: bool) -> Result<u64, Status> {
-        let _guard = self.delivery.update_lock.lock().map_err(|_| {
-            capacity_status(anyhow!("{POISONED_LOCK_MESSAGE}: {DELIVERY_UPDATE_LOCK}"))
-        })?;
-        // Admission and completion share this lock: close admission before publishing done.
-        // It also serializes the durable allocation and its claim counter.
-        // Check the wider sum before persistence, including the zero-charge case.
-        let before = self.delivery.count.load(Ordering::Acquire);
-        checked_authoritative_tokens(&self.delivery.count, tokens.get())?;
-        let charged = self
-            .reservation
-            .finish_with_delivery(tokens.get())
-            .map_err(capacity_status)?;
-        self.delivery
-            .count
-            .store(before + charged, Ordering::Release);
-        if billing_exhausted || charged < tokens.get() {
-            self.delivery
-                .billing_exhausted
-                .store(true, Ordering::Release);
-        }
-        if self.delivery.billing_exhausted.load(Ordering::Acquire)
-            && self.reservation.active_shared_requests() == 0
-        {
-            self.delivery.done.store(true, Ordering::Release);
-        }
-        Ok(charged)
+    fn complete_billing(&self, tokens: NonZeroU64, over_grant: bool) -> Result<u64, Status> {
+        self.complete_response(tokens, over_grant)
+            .map(|(charged, _)| charged)
+    }
+
+    fn complete_response(
+        &self,
+        tokens: NonZeroU64,
+        over_grant: bool,
+    ) -> Result<(u64, Option<u64>), Status> {
+        self.complete_allocation(tokens, over_grant)
     }
 
     fn record_authoritative_delivery(
@@ -328,9 +342,47 @@ impl AuthoritativeDeliveryRecorder for CapacityDeliveryRecorder {
                 {
                     self.delivery.done.store(true, Ordering::Release);
                 }
+                self.delivery.changed.notify_one();
                 Ok(())
             }
         }
+    }
+}
+
+#[allow(clippy::result_large_err)]
+impl CapacityDeliveryRecorder {
+    fn complete_allocation(
+        &self,
+        tokens: NonZeroU64,
+        over_grant: bool,
+    ) -> Result<(u64, Option<u64>), Status> {
+        let _guard = self.delivery.update_lock.lock().map_err(|_| {
+            capacity_status(anyhow!("{POISONED_LOCK_MESSAGE}: {DELIVERY_UPDATE_LOCK}"))
+        })?;
+        // Admission and completion share this lock: close admission before publishing done.
+        // It also serializes the durable allocation and its claim counter.
+        // Check the wider sum before persistence, including the zero-charge case.
+        let before = self.delivery.count.load(Ordering::Acquire);
+        checked_authoritative_tokens(&self.delivery.count, tokens.get())?;
+        let (charged, cumulative) = self
+            .reservation
+            .finish_response(tokens.get(), over_grant)
+            .map_err(capacity_status)?;
+        self.delivery
+            .count
+            .store(before + charged, Ordering::Release);
+        if self.reservation.stop_on_overrun() && (over_grant || charged < tokens.get()) {
+            self.delivery
+                .billing_exhausted
+                .store(true, Ordering::Release);
+        }
+        if self.delivery.billing_exhausted.load(Ordering::Acquire)
+            && self.reservation.active_shared_requests() == 0
+        {
+            self.delivery.done.store(true, Ordering::Release);
+        }
+        self.delivery.changed.notify_one();
+        Ok((charged, cumulative))
     }
 }
 
@@ -388,14 +440,24 @@ pub struct GatewayState {
     delivered: Mutex<HashMap<String, DealDelivery>>,
     /// Durable per-TC capacity derived only from strict on-chain deal state.
     capacity: CapacityManager,
+
     /// Upstream choice (mock model vs the real adapter). Immutable for the gateway's lifetime.
     upstream: UpstreamConfig,
     upstreams: Mutex<HashMap<String, UpstreamConfig>>,
+    upstream_uptime_tasks: Mutex<HashMap<String, tokio::task::JoinHandle<()>>>,
     upstream_failure_tx: mpsc::UnboundedSender<UpstreamFailure>,
     upstream_failure_rx: tokio::sync::Mutex<mpsc::UnboundedReceiver<UpstreamFailure>>,
     chain_unavailable: watch::Sender<bool>,
     keep_serving_when_chain_unavailable: AtomicBool,
     max_concurrent_requests_per_deal: AtomicU32,
+}
+
+impl Drop for GatewayState {
+    fn drop(&mut self) {
+        for task in lock_or_recover(&self.upstream_uptime_tasks, "upstream uptime tasks").values() {
+            task.abort();
+        }
+    }
 }
 
 impl GatewayState {
@@ -421,8 +483,10 @@ impl GatewayState {
             limits: Mutex::new(HashMap::new()),
             delivered: Mutex::new(HashMap::new()),
             capacity,
+
             upstream,
             upstreams: Mutex::new(HashMap::new()),
+            upstream_uptime_tasks: Mutex::new(HashMap::new()),
             upstream_failure_tx,
             upstream_failure_rx: tokio::sync::Mutex::new(upstream_failure_rx),
             chain_unavailable,
@@ -450,12 +514,12 @@ impl GatewayState {
         );
     }
 
-    pub fn report_chain_unavailable(&self, token_contract: &str) {
+    pub fn report_chain_unavailable(&self, token_contract: &str) -> ChainUnavailableAction {
         if self
             .keep_serving_when_chain_unavailable
             .load(Ordering::Acquire)
         {
-            return;
+            return ChainUnavailableAction::KeepServing;
         }
         tracing::error!(
             event = "seller_chain_unavailable",
@@ -464,6 +528,7 @@ impl GatewayState {
             "required chain read exhausted its retry budget; stopping seller delivery"
         );
         self.chain_unavailable.send_replace(true);
+        ChainUnavailableAction::Stop
     }
 
     fn chain_unavailable(&self) -> bool {
@@ -477,6 +542,19 @@ impl GatewayState {
     pub fn route_stream(&self, token_contract: &str, upstream: UpstreamConfig) {
         lock_or_recover(&self.upstreams, GATEWAY_UPSTREAMS_LOCK)
             .insert(token_contract.to_string(), upstream);
+    }
+
+    /// Pool lanes share this gateway, including across replenishment of a note.
+    pub fn watch_model_uptime(&self, model: &str, upstream: &UpstreamConfig) {
+        if crate::telemetry::enabled() {
+            let mut tasks = lock_or_recover(&self.upstream_uptime_tasks, "upstream uptime tasks");
+            tasks.entry(model.to_owned()).or_insert_with(|| {
+                tokio::spawn(crate::telemetry::run_upstream_uptime(
+                    model.to_owned(),
+                    upstream.clone(),
+                ))
+            });
+        }
     }
 
     /// Register mock/offline capacity with canonical bounds. Production supplies contract bounds below.
@@ -758,7 +836,18 @@ async fn relay_counting_with_chain_availability<R>(
     let mut saw_output = false;
     let mut head_status: Option<u32> = None;
     let mut terminal_usage: Option<BillingUsage> = None;
-    let mut billing_exhausted = false;
+    let mut over_grant = false;
+    let report_upstream_failure = |status, saw_output| {
+        let status = dexdo_proto::upstream_failure_status(status, saw_output);
+        if let Some((token_contract, event_sequence, failure_tx)) = &failure_context {
+            let _ = failure_tx.send(UpstreamFailure::from_status(
+                token_contract,
+                &status,
+                event_sequence.clone(),
+            ));
+        }
+        status
+    };
     let mut terminal_error = None;
     let finish = 'relay: loop {
         let event = if let Some(unavailable) = chain_unavailable.as_mut() {
@@ -797,7 +886,7 @@ async fn relay_counting_with_chain_availability<R>(
                 break 'relay AuthoritativeDeliveryFinish::Interrupted;
             }
             let Some(mut usage) = terminal_usage.take() else {
-                terminal_error = Some(dexdo_proto::upstream_failure_status(
+                terminal_error = Some(report_upstream_failure(
                     Status::data_loss("upstream ended without terminal billing usage"),
                     saw_output,
                 ));
@@ -814,11 +903,13 @@ async fn relay_counting_with_chain_availability<R>(
                 Ok(permit) => permit,
                 Err(_) => break unfinished_delivery_finish(saw_output),
             };
-            let charged = match recorder.complete_billing(tokens, billing_exhausted) {
+            let (charged, cumulative) = match recorder.complete_response(tokens, over_grant) {
                 Ok(charged) => charged,
                 Err(status) => {
-                    terminal_error = Some(status);
-                    break unfinished_delivery_finish(saw_output);
+                    permit.send(Err(dexdo_proto::upstream_failure_status(
+                        status, saw_output,
+                    )));
+                    return;
                 }
             };
             if let Some((model, backend)) = &billing_metrics {
@@ -827,6 +918,7 @@ async fn relay_counting_with_chain_availability<R>(
             if recorder.shared_budget() || charged != usage.non_cached_tokens() {
                 usage.charged_tokens = Some(charged);
             }
+            usage.cumulative_billable_tokens = cumulative;
             permit.send(Ok(StreamFrame {
                 usage: Some(usage),
                 ..StreamFrame::default()
@@ -890,7 +982,7 @@ async fn relay_counting_with_chain_availability<R>(
                     ));
                     break unfinished_delivery_finish(saw_output);
                 }
-                billing_exhausted = usage.non_cached_tokens() > billing_grant_tokens;
+                over_grant = usage.non_cached_tokens() > billing_grant_tokens;
                 if !saw_output || usage.output_tokens == 0 {
                     terminal_error = Some(Status::data_loss(
                         "terminal billing usage has no preceding delivered output",
@@ -900,15 +992,7 @@ async fn relay_counting_with_chain_availability<R>(
                 terminal_usage = Some(usage);
             }
             Err(status) => {
-                let status = dexdo_proto::upstream_failure_status(status, saw_output);
-                if let Some((token_contract, event_sequence, failure_tx)) = &failure_context {
-                    let _ = failure_tx.send(UpstreamFailure::from_status(
-                        token_contract,
-                        &status,
-                        event_sequence.clone(),
-                    ));
-                }
-                terminal_error = Some(status);
+                terminal_error = Some(report_upstream_failure(status, saw_output));
                 break unfinished_delivery_finish(saw_output);
             }
         }
@@ -1155,7 +1239,7 @@ impl Gateway for GatewayService {
             let _guard = delivered.update_lock.lock().map_err(|_| {
                 capacity_status(anyhow!("{POISONED_LOCK_MESSAGE}: {DELIVERY_UPDATE_LOCK}"))
             })?;
-            // An overrun closes admission while accepted work drains, even with paid capacity left.
+            // A terminal subscription overrun closes admission while accepted work drains.
             // The same lock covers completion and its last-active-request check.
             if delivered.billing_exhausted.load(Ordering::Acquire) {
                 return Err(self
@@ -1183,7 +1267,6 @@ impl Gateway for GatewayService {
         let effective_billing_grant = reservation.amount();
         // The per-deal billable tracker is shared across all of this deal's streams (the gateway map returns
         // the same `DealDelivery`), so checked input-plus-output totals accumulate over sequential requests.
-        // An ordinary completion leaves the session open; an overrun closes it after accepted work drains.
         let chain_unavailable = self.state.subscribe_chain_unavailable();
         let failure_context = (
             req.token_contract.clone(),
@@ -1703,6 +1786,26 @@ mod tests {
         let safe = format!("{failure:?}");
         assert!(!safe.contains("provider error"), "{safe}");
         assert!(!safe.contains("Authorization"), "{safe}");
+    }
+
+    #[tokio::test]
+    async fn issue_2266_missing_terminal_billing_reports_data_loss_once() {
+        let (buyer, failure) = relay_with_failure_seam(vec![
+            head(200),
+            Ok(UpstreamEvent::Data {
+                bytes: b"partial answer".to_vec(),
+                output: true,
+            }),
+        ])
+        .await;
+        assert_eq!(data_of(&buyer), "partial answer");
+        let status = buyer.last().unwrap().as_ref().unwrap_err();
+        assert_eq!(status.code(), tonic::Code::DataLoss);
+        assert_eq!(dexdo_proto::upstream_output_started(status), Some(true));
+        let failure = failure.unwrap();
+        assert_eq!(failure.error_class, "upstream");
+        assert_eq!(failure.grpc_status, "DataLoss");
+        assert_eq!(failure.http_status, None);
     }
 
     /// A provider error answer reaches the buyer as received, bills nothing, releases the request and
@@ -2320,8 +2423,8 @@ mod tests {
             state.delivery(tc).count.load(Ordering::Acquire),
             TICK_SIZE as u64 + 2
         );
-        assert!(state.delivery(tc).done.load(Ordering::Acquire));
-        assert!(state.delivery(tc).billing_exhausted.load(Ordering::Acquire));
+        assert!(!state.delivery(tc).done.load(Ordering::Acquire));
+        assert!(!state.delivery(tc).billing_exhausted.load(Ordering::Acquire));
     }
 
     #[tokio::test]
@@ -2376,7 +2479,7 @@ mod tests {
     /// The buyer's grant is reduced to the seller's private remainder; the provider's answer is not
     /// cut, and the charge for its overrun is capped to that remainder.
     #[tokio::test]
-    async fn terminal_total_above_the_private_capacity_is_capped_and_marks_the_deal_done() {
+    async fn terminal_total_above_the_private_capacity_caps_charges_and_exhausts_admission() {
         let state = Arc::new(GatewayState::new());
         let buyer = LocalNote::generate();
         let tc = "0:open-stream-private-cap-overflow";
@@ -2434,8 +2537,14 @@ mod tests {
             state.delivery(tc).count.load(Ordering::Acquire),
             TICK_SIZE as u64 + 3
         );
-        assert!(state.delivery(tc).done.load(Ordering::Acquire));
-        assert!(state.delivery(tc).billing_exhausted.load(Ordering::Acquire));
+        assert!(!state.delivery(tc).billing_exhausted.load(Ordering::Acquire));
+        state
+            .reconcile_ordinary_capacity(tc, subscription_state(TICK_SIZE + 3))
+            .unwrap();
+        let next = authorized_request(&state, &buyer, tc, 1, 100);
+        let refusal = service.open_stream(next).await.err().unwrap();
+        assert_eq!(refusal.code(), tonic::Code::ResourceExhausted);
+        assert!(!refusal.metadata().contains_key("dexdo-limit"));
     }
 
     #[tokio::test]
@@ -3550,6 +3659,233 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn probe_backpressure_2194_drains_65_requests_and_resumes_after_claim_readback() {
+        probe_backpressure_after_last_request(Some(3)).await;
+    }
+
+    #[tokio::test]
+    async fn probe_backpressure_2194_resumes_when_the_last_request_finishes_without_billing() {
+        probe_backpressure_after_last_request(None).await;
+    }
+
+    async fn probe_backpressure_after_last_request(late_charge: Option<u64>) {
+        let state = Arc::new(GatewayState::new());
+        let buyer = LocalNote::generate();
+        let tc = "0:probe-backpressure";
+        let tick = TICK_SIZE as u64;
+        let deal = ordinary_shape(10 * TICK_SIZE);
+        let trial = DealChainState {
+            probe_accepted: false,
+            probe_tick: 1,
+            ..subscription_state(0)
+        };
+        let limit = std::num::NonZeroU32::new(65).unwrap();
+        state.set_max_concurrent_requests_per_deal(limit);
+        state
+            .register_stream(tc, buyer.pubkey(), 1, trial, deal)
+            .unwrap();
+
+        let reservations = (1..limit.get())
+            .map(|_| {
+                state
+                    .capacity
+                    .admit_shared(&tc.into(), tick, limit)
+                    .unwrap()
+            })
+            .collect::<Vec<_>>();
+        let late_grant = late_charge.unwrap_or(3);
+        let late = state
+            .capacity
+            .admit_shared(&tc.into(), late_grant, limit)
+            .unwrap();
+        assert_eq!(state.active_requests(tc), 65);
+        let delivery = state.delivery(tc);
+        let usage_per_request = NonZeroU64::new(tick / reservations.len() as u64 + 1).unwrap();
+        let charged = reservations
+            .into_iter()
+            .map(|reservation| {
+                CapacityDeliveryRecorder {
+                    reservation,
+                    delivery: delivery.clone(),
+                }
+                .complete_billing(usage_per_request, false)
+                .unwrap()
+            })
+            .sum::<u64>();
+        assert!(usage_per_request.get() * u64::from(limit.get() - 1) > tick);
+        assert_eq!(charged, tick, "the probe pays at most one tick");
+        assert!(
+            !delivery.billing_exhausted.load(Ordering::Acquire),
+            "a probe overrun must not terminate the deal"
+        );
+
+        let service = GatewayService::new(state.clone());
+        let open = || {
+            let mut request = authorized_request(&state, &buyer, tc, 1, tick).into_inner();
+            request.shared_budget = true;
+            service.open_stream(Request::new(request))
+        };
+        let assert_backpressure = |status: Status| {
+            assert_eq!(status.code(), tonic::Code::ResourceExhausted);
+            assert_eq!(
+                status.metadata().get("dexdo-limit").unwrap(),
+                "onchain_deal_limit"
+            );
+            assert!(status.metadata().contains_key("dexdo-retry-after-ms"));
+        };
+        assert_backpressure(open().await.err().unwrap());
+        state.reconcile_ordinary_capacity(tc, trial).unwrap();
+        assert_backpressure(open().await.err().unwrap());
+
+        let accepted = subscription_state(TICK_SIZE);
+        state.reconcile_ordinary_capacity(tc, accepted).unwrap();
+        assert_backpressure(open().await.err().unwrap());
+        let late_response = match late_charge {
+            Some(charge) => vec![head(200), output("late response"), usage(0, charge + 1)],
+            None => vec![head(503)],
+        };
+        let frames = relay_events(
+            late_response,
+            CapacityDeliveryRecorder {
+                reservation: late,
+                delivery: delivery.clone(),
+            },
+            late_grant,
+        )
+        .await;
+        assert_eq!(
+            frames
+                .into_iter()
+                .filter_map(|frame| frame.unwrap().usage)
+                .map(|usage| usage.billable_tokens())
+                .next(),
+            late_charge
+        );
+        assert!(!delivery.done.load(Ordering::Acquire));
+        assert!(!delivery.billing_exhausted.load(Ordering::Acquire));
+        assert_eq!(state.active_requests(tc), 0);
+
+        if let Some(charge) = late_charge {
+            assert_backpressure(open().await.err().unwrap());
+            state.reconcile_ordinary_capacity(tc, accepted).unwrap();
+            assert_backpressure(open().await.err().unwrap());
+            state
+                .reconcile_ordinary_capacity(tc, subscription_state(TICK_SIZE + u128::from(charge)))
+                .unwrap();
+        }
+        let resumed = open()
+            .await
+            .expect("the same deal must reopen after its last request and claim readback");
+        let (frames, error) = drain(resumed.into_inner()).await;
+        assert!(error.is_none(), "{error:?}");
+        assert_eq!(terminal(&frames).unwrap().billable_tokens(), 1);
+        assert_eq!(
+            delivery.count.load(Ordering::Acquire),
+            tick + late_charge.unwrap_or(0) + 1
+        );
+    }
+
+    /// E2E-ROW: E2E-UPS-23/L0
+    #[tokio::test]
+    async fn ordinary_2271_request_overrun_resumes_the_same_funded_deal() {
+        const GRANT: u64 = 98_011;
+        const INPUT: u64 = 248_126;
+        const OUTPUT: u64 = 368;
+        let deal = DealSubscription {
+            deal_flags: order_flags::AON,
+            ..ordinary_shape(7_484 * TICK_SIZE)
+        };
+        for shared in [false, true] {
+            let state = Arc::new(GatewayState::new());
+            let buyer = LocalNote::generate();
+            let tc = "0:ordinary-request-overrun";
+            let delivery = state.delivery(tc);
+            let service = GatewayService::new(state.clone());
+            state
+                .register_stream(tc, buyer.pubkey(), 1, subscription_state(TICK_SIZE), deal)
+                .unwrap();
+            let limit = dexdo_core::params::SELLER_MAX_CONCURRENT_REQUESTS_PER_DEAL;
+            let (reservation, late) = if shared {
+                (
+                    state
+                        .capacity
+                        .admit_shared(&tc.into(), GRANT, limit)
+                        .unwrap(),
+                    Some(state.capacity.admit_shared(&tc.into(), 1, limit).unwrap()),
+                )
+            } else {
+                (
+                    state.capacity.reserve_exclusive(&tc.into(), GRANT).unwrap(),
+                    None,
+                )
+            };
+            let frames = relay_events(
+                vec![head(200), output("full answer"), usage(INPUT, OUTPUT)],
+                CapacityDeliveryRecorder {
+                    reservation,
+                    delivery: delivery.clone(),
+                },
+                GRANT,
+            )
+            .await;
+            assert_eq!(data_of(&frames), "full answer");
+            let bill = frames.last().unwrap().as_ref().unwrap().usage.unwrap();
+            assert_eq!(bill.total_tokens, INPUT + OUTPUT);
+            assert_eq!(bill.billable_tokens(), GRANT);
+            let claimed = TICK_SIZE + u128::from(GRANT);
+            let capacity = state.capacity_snapshot(tc).unwrap().unwrap();
+            assert_eq!(capacity.available().unwrap(), deal.funded_tokens - claimed);
+            assert_eq!(u128::from(delivery.count.load(Ordering::Acquire)), claimed);
+            assert!(!delivery.billing_exhausted.load(Ordering::Acquire));
+            assert!(!delivery.done.load(Ordering::Acquire));
+
+            let open = || {
+                let mut request = authorized_request(&state, &buyer, tc, 1, 100).into_inner();
+                request.shared_budget = shared;
+                service.open_stream(Request::new(request))
+            };
+            let assert_paused = |error: Status| {
+                assert_eq!(error.code(), tonic::Code::ResourceExhausted);
+                assert_eq!(
+                    error.message(),
+                    "deal admission is temporarily paused. Retry after accepted requests finish and billing is reconciled"
+                );
+                assert_eq!(
+                    error.metadata().get("dexdo-limit").unwrap(),
+                    "onchain_deal_limit"
+                );
+                assert!(error.metadata().contains_key("dexdo-retry-after-ms"));
+            };
+            assert_paused(open().await.err().unwrap());
+            state
+                .reconcile_ordinary_capacity(tc, subscription_state(claimed))
+                .unwrap();
+            if let Some(late) = late {
+                assert_paused(open().await.err().unwrap());
+                CapacityDeliveryRecorder {
+                    reservation: late,
+                    delivery: delivery.clone(),
+                }
+                .record_authoritative_delivery(AuthoritativeDeliveryEvent::Completed(
+                    NonZeroU64::MIN,
+                ))
+                .unwrap();
+                assert_paused(open().await.err().unwrap());
+                state
+                    .reconcile_ordinary_capacity(tc, subscription_state(claimed + 1))
+                    .unwrap();
+            }
+            let response = open()
+                .await
+                .expect("same funded deal resumes after claim readback");
+            let (frames, error) = drain(response.into_inner()).await;
+            assert!(error.is_none(), "{error:?}");
+            assert_eq!(terminal(&frames).unwrap().billable_tokens(), 1);
+            assert!(!delivery.done.load(Ordering::Acquire));
+        }
+    }
+
+    #[tokio::test]
     async fn shared_budget_2091_preserves_full_usage_and_a_zero_charge_answer() {
         let state = GatewayState::new();
         let tc = "0:shared-zero-charge";
@@ -3573,7 +3909,7 @@ mod tests {
             .unwrap();
         for (index, reservation) in [first, second].into_iter().enumerate() {
             let buyer = relay_events(
-                vec![head(200), output("full answer"), usage(2, 1)],
+                vec![head(200), output("full answer"), usage(1, 1)],
                 CapacityDeliveryRecorder {
                     reservation,
                     delivery: state.delivery(tc),
@@ -3583,9 +3919,9 @@ mod tests {
             .await;
             assert_eq!(data_of(&buyer), "full answer");
             let usage = buyer.last().unwrap().as_ref().unwrap().usage.unwrap();
-            assert_eq!(usage.total_tokens, 3);
+            assert_eq!(usage.total_tokens, 2);
             assert_eq!(usage.billable_tokens(), if index == 0 { 2 } else { 0 });
-            assert_eq!(state.delivery(tc).done.load(Ordering::Acquire), index == 1);
+            assert!(!state.delivery(tc).done.load(Ordering::Acquire));
         }
         assert_eq!(
             state.delivery(tc).count.load(Ordering::Acquire),
@@ -3595,7 +3931,7 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn shared_budget_2091_overrun_closes_admission_before_draining() {
+    async fn subscription_overrun_closes_admission_before_draining() {
         for finish in [
             AuthoritativeDeliveryEvent::Completed(NonZeroU64::MIN),
             AuthoritativeDeliveryEvent::Finished(AuthoritativeDeliveryFinish::Interrupted),
@@ -3615,7 +3951,7 @@ mod tests {
                     buyer.pubkey(),
                     u64::MAX,
                     subscription_state(TICK_SIZE),
-                    ordinary_shape(4 * TICK_SIZE),
+                    subscription_shape(),
                 )
                 .unwrap();
             let limit = dexdo_core::params::SELLER_MAX_CONCURRENT_REQUESTS_PER_DEAL;

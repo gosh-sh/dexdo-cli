@@ -189,6 +189,10 @@ impl GatewayAdvertiseAddr {
     pub(crate) fn as_str(&self) -> &str {
         self.0.as_str()
     }
+
+    pub(crate) fn port(&self) -> u16 {
+        self.0.port_u16().expect("advertised addresses have a port")
+    }
 }
 
 impl fmt::Display for GatewayAdvertiseAddr {
@@ -214,12 +218,22 @@ impl FromStr for GatewayAdvertiseAddr {
     }
 }
 
+#[derive(Args, Clone)]
+pub(crate) struct SellerIdentityArgs {
+    /// Note key for the mock chain or an unrecorded selected deal. Recorded real deals use DEXDO_PN_POOL.
+    #[arg(long)]
+    pub(crate) note_key: Option<PathBuf>,
+    /// Index of the mock sub-note derived from --note-key.
+    #[arg(long, default_value_t = DEFAULT_NOTE_INDEX)]
+    pub(crate) note_index: u32,
+}
+
 #[derive(Args)]
 pub(crate) struct SellerArgs {
     #[command(flatten)]
     pub(crate) mock: MockFlags,
     #[command(flatten)]
-    pub(crate) identity: IdentityArgs,
+    pub(crate) identity: SellerIdentityArgs,
     #[command(flatten)]
     pub(crate) registry: ModelRegistryValidationArgs,
     /// Local bind/listen address for accepting buyer connections; seller-side equivalent of buyer --local-listen.
@@ -314,7 +328,7 @@ impl SellerArgs {
             if self
                 .gateway_advertise
                 .as_ref()
-                .and_then(|address| address.0.port_u16())
+                .map(GatewayAdvertiseAddr::port)
                 == Some(0)
             {
                 return Err(dexdo_core::DexdoError::new(
@@ -2571,8 +2585,6 @@ mod tests {
         let mut argv = vec![
             "dexdo",
             "seller",
-            "--note-addr",
-            "0:note",
             "--token-contract",
             "0:tc",
             "--model",
@@ -2770,8 +2782,6 @@ mod tests {
                 let mut argv = vec![
                     "dexdo",
                     "seller",
-                    "--note-addr",
-                    "0:note",
                     "--token-contract",
                     "0:tc",
                     "--model",

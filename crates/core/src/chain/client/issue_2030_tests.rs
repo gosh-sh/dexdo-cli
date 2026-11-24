@@ -9,10 +9,12 @@ fn issue_2030_producer_server(
             let (mut socket, _) = listener.accept().await.unwrap();
             let request = read_fixture_http_request(&mut socket).await;
             let (_, body_text) = request.split_once("\r\n\r\n").unwrap();
-            captured
-                .lock()
-                .unwrap()
-                .push(serde_json::from_str(body_text).unwrap());
+            let captured_body = if request.starts_with("GET /v2/account?") {
+                Value::Null
+            } else {
+                serde_json::from_str(body_text).unwrap()
+            };
+            captured.lock().unwrap().push(captured_body);
             let body = body.to_string();
             socket.write_all(format!(
                 "HTTP/1.1 {status} fixture\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
@@ -207,6 +209,7 @@ async fn issue_2030_redirect_rereads_each_target_and_preserves_signed_identity()
         &account,
         crate::address::DEXDO_DAPP_ID,
         None,
+        SubmitKind::Ordinary,
     )
     .await
     .unwrap();
@@ -239,6 +242,7 @@ async fn issue_2030_redirect_budget_is_bounded() {
         &"1".repeat(64),
         crate::address::DEXDO_DAPP_ID,
         None,
+        SubmitKind::Ordinary,
     )
     .await
     .unwrap_err();
@@ -321,6 +325,7 @@ async fn issue_2030_invalid_redirect_thread_is_not_replayed() {
             &"1".repeat(64),
             crate::address::DEXDO_DAPP_ID,
             None,
+            SubmitKind::Ordinary,
         )
         .await
         .unwrap_err();

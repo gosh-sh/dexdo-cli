@@ -1,3 +1,94 @@
+## v0.14.0
+
+### Breaking Changes
+
+- The buyer upgrades `usage.sqlite3` to schema 12. Older buyer binaries cannot
+  reopen the upgraded database. Update direct SQLite readers to support schema
+  12 and its change journal for incremental synchronization.
+- Remove `--ack-unknown-usage-request` from buyer commands. Run the upgraded
+  buyer with `--resume` to clear old usage pauses on the same open deal.
+  Upgrade a paused buyer even if the seller has already been upgraded.
+- Remove `--note-addr` and its value from `dexdo seller` launch commands.
+  The seller restores every recorded deal for the selected network with its
+  own note. Keep those notes and their owner keys in `DEXDO_PN_POOL`.
+  Keep the original advertised gateway address and its certificate and key
+  when upgrading with open deals. The seller resumes them on the same
+  TokenContracts. For open legacy deals without a saved handover proof, confirm
+  their original endpoint, listener and TLS pin in
+  `deals/seller-pool/gateway-migration.json`.
+  Select the market explicitly on the first run of a provisioned deal on
+  another note if it has no existing order or saved offer mode.
+
+### New / Improvements
+
+- `dexdo seller` and `dexdo buyer` export `dexdo.seller.contract.call.errors`
+  and `dexdo.buyer.contract.call.errors`: every failed getter or message to a
+  contract, counted once, with labels `error.type` (`transport`, `timeout`,
+  `node_rejected`, `tvm_compute`, `tvm_action`, `unconfirmed`, `decode`,
+  `client`), `contract`, `method` and `model`. Alert on them to see a contract
+  that keeps refusing calls.
+- Buyer gRPC metrics use `rpc.status_code` for the gRPC status. Update queries
+  that filter on `rpc.response.status_code` accordingly.
+- `dexdo seller` exports `dexdo.seller.note.balance`: the trading and the gas
+  SHELL of every note that has a deal the seller is working now, read every 60
+  seconds, with labels `note` (the note's position in the note pool) and
+  `pocket` (`trading`, `gas`).
+
+### Fixes
+
+- Sellers recover funded deals when a low `requests_per_second` limit queues
+  chain reads. Queued reads keep their turn, and waiting for a local request
+  slot no longer consumes the network read timeout. Stopping a seller also
+  cancels queued capacity checks.
+- Sellers recover a timed-out SELL even when its note has no later activity.
+  When needed, the seller sends a zero-credit call to establish a confirmed
+  history checkpoint before deciding whether to retry. The same TokenContract,
+  existing orders and deals are preserved; the extra call consumes gas.
+- Sellers retry chain reads that report a closed connection pool, keeping
+  listed SELL orders and recovering without an operator restart.
+- Each attempt to connect to the seller gateway is limited to five seconds.
+  With `buyer.on.dead_gateway = "keep_open"`, a timed-out attempt returns HTTP
+  502 from the buyer's local API. A new request can use the same deal once
+  the gateway is reachable again.
+- Model provider errors and rate limits no longer stop seller startup or remove
+  listed SELL orders. Update upstream health alerts to use
+  `dexdo.seller.uptime.status` with `component=upstream`.
+- If sending a SELL times out, the seller checks that order in the background
+  and resumes the check after a restart. It takes over an order that appears
+  late. It submits a replacement once finalized note history proves the
+  original expired without executing. On startup, the seller resumes existing
+  orders and matches before sending fresh SELLs.
+- Sellers can claim delivered tokens every 60 seconds, supporting up to
+  1 million tokens per minute per deal. When the interval has already passed,
+  a claim can go out as soon as more billable tokens are available.
+- Sellers keep serving the same deal when the network reports a duplicate token
+  claim and the contract confirms it was already recorded.
+- Sellers recover token claims after a replay-protection error on the same
+  open deal. The existing delivery limits and the configured chain-unavailable
+  policy apply while the seller checks the contract.
+- An interrupted answer or model check no longer pauses the buyer's deal.
+  Only confirmed billing is added to local usage. The seller may still claim
+  work within the paid limit, so the buyer's displayed remainder can be
+  higher until it observes the contract close and sets the remainder to zero.
+- Buyers can upgrade from v0.13.0 and run `buyer --resume` on the same deal.
+  The upgrade preserves request history, recorded usage and the deal's quota.
+- Sellers keep the deal open and retry failed or unconfirmed token claims
+  until they succeed or the deal closes. Each failed attempt increments
+  `dexdo.seller.claim.errors` with an `error.type` label.
+- Deals stay open when heavy traffic uses up the trial tick. Retry the request after the
+  trial is accepted and billing catches up.
+- Sellers keep ordinary deals open when one request exceeds its billing limit.
+  The charge is capped to that limit. If new requests temporarily get HTTP 429,
+  retry on the same deal after billing catches up.
+- Sellers resume watching offers, relisting expired offers and opening funded
+  deals after chain account reads temporarily return "All BK API endpoints
+  failed". Buyers keep their current sessions without running `buyer --resume`.
+- BUY, `quote`, and `executable-book` check the seller's contract reserve against the matched
+  volume. A partially filled offer can pass even when its reserve cannot cover the full listing.
+  The check estimates the remaining costs at BUY time. Fractional claims may cost more during delivery.
+  On-chain quotes use the current order-book snapshot and show the single fill a BUY can match.
+  Opening a dispute warns when the contract's current reserve is too low to resolve it.
+
 ## v0.13.0
 
 ### New / Improvements

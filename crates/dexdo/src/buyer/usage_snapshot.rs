@@ -43,7 +43,7 @@ fn read_model(connection: &Connection, network: &str, model: &str) -> Result<[u1
     Ok(totals)
 }
 
-fn read_deal(connection: &Connection, network: &str, deal: &str) -> Result<u128> {
+pub(super) fn read_deal(connection: &Connection, network: &str, deal: &str) -> Result<u128> {
     connection
         .query_row(DEAL_SQL, params![network, deal], |row| {
             row.get::<_, String>(0)

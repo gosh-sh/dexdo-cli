@@ -1,42 +1,217 @@
 include!("issue_2115_pending_tests.rs");
 
 #[tokio::test]
-async fn issue_2096_cancelled_successor_does_not_retire_the_sale() {
-    let tc = address('e');
-    let owner = address('f');
-    let backend = issue_2096_backend(86);
-    backend.post_failures.store(1, Ordering::SeqCst);
-    let previous = backend.resting_order_id().unwrap();
-    let mut id = identity(&owner, &tc, previous);
+async fn issue_2206_successor_identity_survives_deadline_outage_and_rearm() {
+    let seller = relist_seller().await;
+    wait_for_gateway_ready(&seller).await;
+    for match_during_outage in [false, true] {
+        let mut backend = issue_2096_backend(86);
+        let original = backend.resting_order_id().unwrap();
+        let mut identity = identity(&backend.owner, &backend.token_contract, original);
+        let cfg = issue_2096_cfg(&backend, &seller);
+        let (_dir, watch) = watch("2206-successor-deadline");
+        backend
+            .successor_deadline_outage
+            .store(true, Ordering::SeqCst);
+        let outcome = supervise_and_relist_reporting_identity(
+            &seller,
+            &backend,
+            &cfg,
+            &watch,
+            &mut identity,
+            std::future::pending(),
+            relist_timing(),
+        )
+        .await
+        .unwrap();
+        let successor = backend.successor();
+        assert!(
+            matches!(
+                outcome,
+                RestingSellerOutcome::Stopped {
+                    disposition: CancellationDisposition::UnknownFailure { .. },
+                    ..
+                }
+            ),
+            "{outcome:?}"
+        );
+        assert!(backend.failed_reads.load(Ordering::SeqCst) > 0);
+        assert_ne!(successor.order_id, original);
+        assert_eq!(identity.order_id, successor.order_id);
+        assert_eq!(successor.ticks, 86);
+
+        let mut expected = sample_match(&backend.token_contract);
+        expected.price_per_tick = cfg.price_per_tick;
+        if match_during_outage {
+            backend.fill_ticks = Some(86);
+            backend.rows.lock().unwrap().clear();
+            *backend.matched.lock().unwrap() = Some(expected.clone());
+            backend.state.lock().unwrap().funded = true;
+        }
+        backend
+            .successor_deadline_outage
+            .store(false, Ordering::SeqCst);
+        let outcome = supervise_and_relist_reporting_identity(
+            &seller,
+            &backend,
+            &cfg,
+            &watch,
+            &mut identity,
+            async { backend.successor_observed.notified().await },
+            relist_timing(),
+        )
+        .await
+        .unwrap();
+        if match_during_outage {
+            let RestingSellerOutcome::Matched(matched) = outcome else {
+                panic!("{outcome:?}")
+            };
+            assert_eq!(matched.buyer_pubkey, expected.buyer_pubkey);
+            assert_eq!(matched.token_contract, expected.token_contract);
+        } else {
+            assert!(
+                matches!(
+                    outcome,
+                    RestingSellerOutcome::Stopped {
+                        reason: RestingStopReason::Shutdown,
+                        disposition: CancellationDisposition::Cancelled,
+                    }
+                ),
+                "{outcome:?}"
+            );
+            assert_eq!(backend.cancelled(), vec![successor.order_id]);
+        }
+        assert_eq!(backend.posts.load(Ordering::SeqCst), 1);
+        assert_eq!(backend.expire_calls(), vec![original]);
+        assert_eq!(backend.max_rows_seen.load(Ordering::SeqCst), 1);
+    }
+    seller.server_task.abort();
+}
+
+#[tokio::test]
+async fn issue_2206_immediate_successor_match_recovers_after_read_exhaustion() {
+    let mut backend = issue_2096_backend(86);
+    let original = backend.resting_order_id().unwrap();
+    let mut identity = identity(&backend.owner, &backend.token_contract, original);
     let seller = relist_seller().await;
     wait_for_gateway_ready(&seller).await;
     let cfg = issue_2096_cfg(&backend, &seller);
+    let mut expected = sample_match(&backend.token_contract);
+    expected.price_per_tick = cfg.price_per_tick;
+    backend.match_on_successor_confirmation = Some(expected.clone());
+    backend.fill_ticks = Some(86);
+    *backend.match_read_error.lock().unwrap() = Some(ChainError::Transport(
+        "BK match read budget exhausted".into(),
+    ));
+    let (_dir, mut watch) = watch("2206-immediate-match");
+    watch.poll_interval = relist_timing().reap_poll;
     let outcome = tokio::time::timeout(
         Duration::from_secs(5),
         supervise_and_relist_reporting_identity(
             &seller,
             &backend,
             &cfg,
-            &watch("2096-regression").1,
-            &mut id,
+            &watch,
+            &mut identity,
+            std::future::pending(),
+            relist_timing(),
+        ),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    let RestingSellerOutcome::Matched(matched) = outcome else {
+        panic!("{outcome:?}")
+    };
+    assert_eq!(matched.buyer_pubkey, expected.buyer_pubkey);
+    assert_eq!(matched.token_contract, expected.token_contract);
+    assert!(backend.match_read_error.lock().unwrap().is_none());
+    assert_eq!(backend.posts.load(Ordering::SeqCst), 1);
+    assert_eq!(backend.expire_calls(), vec![original]);
+    assert!(backend.live_rows().is_empty());
+    seller.server_task.abort();
+}
+
+#[tokio::test]
+async fn issue_2206_shutdown_during_successor_deadline_read_cancels_successor() {
+    let backend = issue_2096_backend(86);
+    let original = backend.resting_order_id().unwrap();
+    let mut identity = identity(&backend.owner, &backend.token_contract, original);
+    let seller = relist_seller().await;
+    wait_for_gateway_ready(&seller).await;
+    let cfg = issue_2096_cfg(&backend, &seller);
+    let (_dir, watch) = watch("2206-successor-shutdown");
+    backend
+        .successor_deadline_outage
+        .store(true, Ordering::SeqCst);
+    let outcome = tokio::time::timeout(
+        Duration::from_secs(5),
+        supervise_and_relist_reporting_identity(
+            &seller,
+            &backend,
+            &cfg,
+            &watch,
+            &mut identity,
             async {
-                loop {
-                    if backend.posts.load(Ordering::SeqCst) == 2 && !backend.live_rows().is_empty()
-                    {
-                        assert_eq!(backend.live_rows().len(), 1);
-                        break;
-                    }
-                    tokio::time::sleep(Duration::from_millis(1)).await;
+                while backend.failed_reads.load(Ordering::SeqCst) == 0 {
+                    tokio::time::sleep(relist_timing().reap_poll).await;
                 }
+                backend
+                    .successor_deadline_outage
+                    .store(false, Ordering::SeqCst);
             },
+            relist_timing(),
+        ),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    let successor = backend.successor();
+    assert!(
+        matches!(
+            outcome,
+            RestingSellerOutcome::Stopped {
+                reason: RestingStopReason::Shutdown,
+                disposition: CancellationDisposition::Cancelled,
+            }
+        ),
+        "{outcome:?}"
+    );
+    assert_eq!(identity.order_id, successor.order_id);
+    assert_eq!(backend.cancelled(), vec![successor.order_id]);
+    assert_eq!(backend.posts.load(Ordering::SeqCst), 1);
+    assert!(backend.live_rows().is_empty());
+    seller.server_task.abort();
+}
+
+#[tokio::test]
+async fn issue_2206_reaped_ask_survives_bond_read_outage() {
+    let backend = issue_2096_backend(86);
+    let previous = backend.resting_order_id().unwrap();
+    backend
+        .cover_outage_after_reap
+        .store(true, Ordering::SeqCst);
+    let seller = relist_seller().await;
+    wait_for_gateway_ready(&seller).await;
+    let mut id = identity(&backend.owner, &backend.token_contract, previous);
+    let (_dir, watch) = watch("2206-reaped-ask");
+    let outcome = tokio::time::timeout(
+        Duration::from_secs(5),
+        supervise_and_relist_reporting_identity(
+            &seller,
+            &backend,
+            &issue_2096_cfg(&backend, &seller),
+            &watch,
+            &mut id,
+            async { backend.successor_observed.notified().await },
             SupervisionTiming {
-                cycle_timeout: relist_timing().cycle_timeout,
-                ..issue_2096_timing()
+                health_interval: relist_timing().recovery_backoff,
+                ..relist_timing()
             },
         ),
     )
     .await
-    .expect("the sale must recover without restarting")
+    .unwrap()
     .unwrap();
     assert!(
         matches!(
@@ -46,21 +221,14 @@ async fn issue_2096_cancelled_successor_does_not_retire_the_sale() {
                 disposition: CancellationDisposition::Cancelled,
             }
         ),
-        "recovery must continue until the operator stops it: {outcome:?}"
+        "{outcome:?}"
     );
-    assert_eq!(backend.posts.load(Ordering::SeqCst), 2);
-    assert_eq!(backend.max_rows_seen.load(Ordering::SeqCst), 1);
-    let postings = backend.postings.lock().unwrap();
-    assert_eq!(postings.len(), 3);
-    assert_eq!(
-        backend.cancelled(),
-        vec![postings[1].order_id, postings[2].order_id]
-    );
-    assert_eq!(id.order_id, postings[2].order_id);
-    assert_eq!(postings[2].ticks, 86);
-    assert_eq!(postings[2].price_per_tick, u128::from(cfg.price_per_tick));
-    assert_eq!(postings[2].token_contract.as_deref(), Some(tc.as_str()));
+    assert!(!backend.cover_outage_after_reap.load(Ordering::SeqCst));
     assert_eq!(backend.expire_calls(), vec![previous]);
+    assert_eq!(backend.posts.load(Ordering::SeqCst), 1);
+    assert_eq!(backend.max_rows_seen.load(Ordering::SeqCst), 1);
+    assert_eq!(backend.successor().ticks, 86);
+    assert_eq!(backend.cancelled(), vec![backend.successor().order_id]);
     seller.server_task.abort();
 }
 
@@ -303,10 +471,7 @@ async fn issue_2096_unresolved_cancellation_never_posts_beside_the_successor() {
     let seller = relist_seller().await;
     wait_for_gateway_ready(&seller).await;
     let outcome = issue_2096_run(&backend, &seller, async {
-        while backend.cancelled().is_empty() {
-            tokio::time::sleep(Duration::from_millis(1)).await;
-        }
-        tokio::time::sleep(issue_2096_timing().recovery_backoff * 2).await;
+        backend.successor_observed.notified().await;
     })
     .await;
     assert!(
@@ -336,7 +501,9 @@ async fn issue_2096_a_funded_match_wins_the_failed_post_cancel_race() {
     backend.post_failures.store(1, Ordering::SeqCst);
     let seller = relist_seller().await;
     wait_for_gateway_ready(&seller).await;
-    let outcome = issue_2096_run(&backend, &seller, std::future::pending()).await;
+    let outcome = issue_2096_run(&backend, &seller, async {
+        backend.successor_observed.notified().await;
+    }).await;
     assert!(matches!(outcome, RestingSellerOutcome::Matched(m) if m.token_contract == tc));
     assert_eq!(
         backend.posts.load(Ordering::SeqCst),
@@ -380,9 +547,7 @@ async fn issue_2096_shutdown_after_cleanup_prevents_the_next_post() {
     let seller = relist_seller().await;
     wait_for_gateway_ready(&seller).await;
     let outcome = issue_2096_run(&backend, &seller, async {
-        while backend.cancelled().is_empty() {
-            tokio::time::sleep(Duration::from_millis(1)).await;
-        }
+        backend.successor_observed.notified().await;
     })
     .await;
     assert!(
@@ -456,22 +621,17 @@ async fn issue_2096_contract_rejection_is_not_an_outage_retry() {
 }
 
 #[tokio::test]
-async fn issue_2096_upstream_blip_after_cancelled_post_preserves_sale_intent() {
-    let (url, probes, upstream) = scripted_http_server(vec![
-        ("200 OK", healthy_sse(), Duration::ZERO),
-        ("200 OK", "data: {\"error\":{\"message\":\"temporary upstream outage during offer recovery\"}}\n\n".to_string(), Duration::ZERO),
-        ("200 OK", healthy_sse(), Duration::ZERO),
-    ]);
-    let backend = issue_2096_backend(86);
+async fn issue_2264_relisting_after_failed_post_does_not_probe_upstream() {
+    let (url, probes, upstream) =
+        scripted_http_server(vec![("429 Too Many Requests", "{}".into(), Duration::ZERO)]);
+    let mut backend = issue_2096_backend(86);
+    backend.failed_post_lands = false;
     backend.post_failures.store(1, Ordering::SeqCst);
-    let seller = issue_2077_seller(url).await;
+    let seller = issue_2264_seller(url).await;
     wait_for_gateway_ready(&seller).await;
     let outcome = issue_2096_run(&backend, &seller, async {
         issue_2096_wait_for_post(&backend, 2).await;
-        assert!(
-            probes.load(Ordering::SeqCst) >= 3,
-            "readiness must recover before posting"
-        );
+        assert_eq!(probes.load(Ordering::SeqCst), 0);
         let live = backend.live_rows();
         assert_eq!(live.len(), 1);
         assert_eq!(live[0].price_per_tick, dexdo_core::params::PRICE_STEP);
@@ -497,53 +657,10 @@ async fn issue_2096_upstream_blip_after_cancelled_post_preserves_sale_intent() {
     let posted = backend.postings.lock().unwrap();
     assert_eq!(
         backend.cancelled(),
-        vec![posted[1].order_id, posted[2].order_id]
+        vec![posted[1].order_id]
     );
     let post_times = backend.post_times.lock().unwrap();
     assert!(post_times[1] - post_times[0] >= issue_2096_timing().recovery_backoff);
-    seller.server_task.abort();
-    upstream.abort();
-}
-
-#[tokio::test]
-async fn issue_2096_unavailable_upstream_keeps_recovery_off_book_until_shutdown() {
-    let (url, probes, upstream) = scripted_http_server(vec![
-        ("200 OK", healthy_sse(), Duration::ZERO),
-        ("200 OK", "data: {\"error\":{\"message\":\"upstream remains unavailable during offer recovery\"}}\n\n".to_string(), Duration::ZERO),
-    ]);
-    let backend = issue_2096_backend(86);
-    backend.post_failures.store(1, Ordering::SeqCst);
-    let seller = issue_2077_seller(url).await;
-    wait_for_gateway_ready(&seller).await;
-    let outcome = issue_2096_run(&backend, &seller, async {
-        while probes.load(Ordering::SeqCst) < 3 {
-            tokio::time::sleep(Duration::from_millis(1)).await;
-        }
-        assert_eq!(
-            backend.posts.load(Ordering::SeqCst),
-            1,
-            "unavailable readiness must not publish another SELL"
-        );
-        assert!(backend.live_rows().is_empty());
-        assert_eq!(backend.cancelled(), vec![backend.successor().order_id]);
-    })
-    .await;
-    assert!(
-        matches!(
-            outcome,
-            RestingSellerOutcome::Stopped {
-                reason: RestingStopReason::Shutdown,
-                ..
-            }
-        ),
-        "{outcome:?}"
-    );
-    assert_eq!(backend.posts.load(Ordering::SeqCst), 1);
-    assert!(backend.live_rows().is_empty());
-    assert!(
-        !seller.server_task.is_finished(),
-        "shutdown must preserve the shared gateway"
-    );
     seller.server_task.abort();
     upstream.abort();
 }
@@ -561,9 +678,16 @@ proptest! {
             backend.post_failures.store(failures, Ordering::SeqCst);
             let seller = relist_seller().await;
             wait_for_gateway_ready(&seller).await;
-            let outcome = issue_2096_run(&backend, &seller, issue_2096_wait_for_post(&backend, failures + 1)).await;
+            let posts = if lands { 1 } else { failures + 1 };
+            let outcome = issue_2096_run(&backend, &seller, async {
+                if lands {
+                    backend.successor_observed.notified().await;
+                } else {
+                    issue_2096_wait_for_post(&backend, posts).await;
+                }
+            }).await;
             assert!(matches!(outcome, RestingSellerOutcome::Stopped { reason: RestingStopReason::Shutdown, .. }), "{outcome:?}");
-            assert_eq!(backend.posts.load(Ordering::SeqCst), failures + 1);
+            assert_eq!(backend.posts.load(Ordering::SeqCst), posts);
             assert_eq!(backend.max_rows_seen.load(Ordering::SeqCst), 1);
             for row in backend.postings.lock().unwrap().iter() {
                 assert_eq!(row.ticks, u128::from(ticks));
@@ -599,30 +723,26 @@ async fn issue_2115_pending_shutdown_case(funded: bool, during_readiness: bool) 
         });
     }
     let requested = Arc::new(tokio::sync::Notify::new());
-    let mut upstream_task = None;
-    let seller = if during_readiness {
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let url = format!("http://{}", listener.local_addr().unwrap());
-        let notify = requested.clone();
-        upstream_task = Some(tokio::spawn(async move {
-            let (mut socket, _) = listener.accept().await.unwrap();
-            let mut bytes = [0; 8192];
-            assert!(socket.read(&mut bytes).await.unwrap() > 0);
-            notify.notify_one();
-            std::future::pending::<()>().await;
-        }));
-        super::super::start_gateway_with_note(
-            "127.0.0.1:0".parse().unwrap(),
-            openai(url),
-            Arc::new(LocalNote::generate()),
-        )
-        .await
-        .unwrap()
-    } else {
-        relist_seller().await
-    };
+    let seller = relist_seller().await;
     wait_for_gateway_ready(&seller).await;
-    let cfg = issue_2096_cfg(&backend, &seller);
+    let mut cfg = issue_2096_cfg(&backend, &seller);
+    let probe_task = if during_readiness {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        cfg.gateway_advertise = listener.local_addr().unwrap().to_string();
+        let notify = requested.clone();
+        Some(tokio::spawn(async move {
+            loop {
+                let (mut socket, _) = listener.accept().await.unwrap();
+                let mut bytes = [0; 8192];
+                if matches!(socket.read(&mut bytes).await, Ok(n) if n > 0) {
+                    notify.notify_one();
+                    std::future::pending::<()>().await;
+                }
+            }
+        }))
+    } else {
+        None
+    };
     let shutdown = async {
         if during_readiness { requested.notified().await; }
     };
@@ -670,7 +790,7 @@ async fn issue_2115_pending_shutdown_case(funded: bool, during_readiness: bool) 
         "pool still owns gateway/service"
     );
     seller.server_task.abort();
-    if let Some(task) = upstream_task {
+    if let Some(task) = probe_task {
         task.abort();
     }
 }

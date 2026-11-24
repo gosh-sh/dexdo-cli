@@ -11,9 +11,19 @@
 //! handshake signature verification to the standard rustls webpki provider.
 
 use anyhow::{anyhow, Result};
+use dexdo_core::params::BUYER_GATEWAY_DIAL_TIMEOUT;
 use http::Uri;
 use hyper_util::rt::TokioIo;
-use std::sync::Arc;
+use std::future::Future;
+use std::io;
+use std::pin::Pin;
+use std::sync::{Arc, Mutex};
+use std::task::{Context, Poll};
+use std::time::Duration;
+use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
+use tokio::net::TcpStream;
+use tokio::sync::oneshot;
+use tokio_rustls::client::TlsStream;
 use tokio_rustls::rustls::client::danger::{
     HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier,
 };
@@ -120,7 +130,7 @@ impl DialStageError {
         }
     }
 
-    /// The step that failed: `tcp_connect` or `tls_handshake`.
+    /// The step that failed during channel setup.
     pub const fn stage(&self) -> &'static str {
         self.stage
     }
@@ -140,8 +150,8 @@ impl std::error::Error for DialStageError {
 
 /// The step of the pinned dial that a [`connect_pinned`] failure actually reached.
 
-/// The connector tags its own two steps; anything that fails after the connector returned a
-/// stream is the h2 handshake tonic itself performs.
+/// The connector tags TCP and TLS failures. Untagged errors during channel setup come from
+/// tonic's h2 handshake.
 pub fn dial_stage(error: &anyhow::Error) -> &'static str {
     error
         .chain()
@@ -240,6 +250,161 @@ pub fn gateway_dial_error(endpoint: &str, error: anyhow::Error) -> anyhow::Error
     anyhow::Error::new(structured.with_source(error))
 }
 
+const HTTP2_CLIENT_PREFACE: &[u8; 24] = b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n";
+
+/// Tonic hands back the channel before h2 processes server SETTINGS. Check the first incoming
+/// frame and wait for h2 to validate it and flush its SETTINGS ACK.
+struct ServerPrefaceIo {
+    stream: TlsStream<TcpStream>,
+    preface: Option<ServerPreface>,
+}
+
+struct ServerPreface {
+    server_header: Http2FrameHeader,
+    client_ack: ClientSettingsAck,
+    ready: oneshot::Sender<io::Result<()>>,
+}
+
+#[derive(Default)]
+struct Http2FrameHeader {
+    bytes: [u8; 9],
+    used: usize,
+}
+
+impl Http2FrameHeader {
+    fn read_from(&mut self, input: &mut &[u8]) -> bool {
+        let copied = input.len().min(self.bytes.len() - self.used);
+        self.bytes[self.used..self.used + copied].copy_from_slice(&input[..copied]);
+        self.used += copied;
+        *input = &input[copied..];
+        self.used == self.bytes.len()
+    }
+
+    fn is_server_settings(&self) -> bool {
+        // RFC 9113: the server preface starts with a SETTINGS frame on stream zero, without ACK.
+        let [_, _, _, frame_type, flags, a, b, c, d] = self.bytes;
+        let stream = u32::from_be_bytes([a, b, c, d]) & 0x7fff_ffff;
+        frame_type == 0x04 && flags & 0x01 == 0 && stream == 0
+    }
+
+    fn payload_len(&self) -> usize {
+        u32::from_be_bytes([0, self.bytes[0], self.bytes[1], self.bytes[2]]) as usize
+    }
+}
+
+struct ClientSettingsAck {
+    header: Http2FrameHeader,
+    skip: usize,
+    written: bool,
+}
+
+impl ClientSettingsAck {
+    fn new() -> Self {
+        Self {
+            header: Http2FrameHeader::default(),
+            skip: HTTP2_CLIENT_PREFACE.len(),
+            written: false,
+        }
+    }
+
+    fn observe(&mut self, mut bytes: &[u8]) {
+        while !self.written && !bytes.is_empty() {
+            // Skip the client preface and frame payloads. ACK must be its own frame.
+            let skipped = bytes.len().min(self.skip);
+            self.skip -= skipped;
+            bytes = &bytes[skipped..];
+            if self.header.read_from(&mut bytes) {
+                self.written = self.header.bytes == [0, 0, 0, 0x04, 0x01, 0, 0, 0, 0];
+                self.skip = self.header.payload_len();
+                self.header = Http2FrameHeader::default();
+            }
+        }
+    }
+}
+
+impl ServerPrefaceIo {
+    fn finish_preface(&mut self, result: io::Result<()>) {
+        if let Some(preface) = self.preface.take() {
+            let _ = preface.ready.send(result);
+        }
+    }
+}
+
+impl AsyncRead for ServerPrefaceIo {
+    fn poll_read(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &mut ReadBuf<'_>,
+    ) -> Poll<io::Result<()>> {
+        let filled = buf.filled().len();
+        let result = Pin::new(&mut self.stream).poll_read(cx, buf);
+        if let (Poll::Ready(Ok(())), Some(preface)) = (&result, &mut self.preface) {
+            let mut bytes = &buf.filled()[filled..];
+            if preface.server_header.read_from(&mut bytes)
+                && !preface.server_header.is_server_settings()
+            {
+                self.finish_preface(Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "expected a server HTTP/2 SETTINGS frame",
+                )));
+            }
+        }
+        result
+    }
+}
+
+impl AsyncWrite for ServerPrefaceIo {
+    fn poll_write(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &[u8],
+    ) -> Poll<io::Result<usize>> {
+        let result = Pin::new(&mut self.stream).poll_write(cx, buf);
+        if let (Poll::Ready(Ok(written)), Some(preface)) = (&result, &mut self.preface) {
+            preface.client_ack.observe(&buf[..*written]);
+        }
+        result
+    }
+
+    fn poll_write_vectored(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        bufs: &[io::IoSlice<'_>],
+    ) -> Poll<io::Result<usize>> {
+        let result = Pin::new(&mut self.stream).poll_write_vectored(cx, bufs);
+        if let (Poll::Ready(Ok(written)), Some(preface)) = (&result, &mut self.preface) {
+            let mut remaining = *written;
+            for buf in bufs {
+                if remaining == 0 || preface.client_ack.written {
+                    break;
+                }
+                let observed = buf.len().min(remaining);
+                preface.client_ack.observe(&buf[..observed]);
+                remaining -= observed;
+            }
+        }
+        result
+    }
+
+    fn is_write_vectored(&self) -> bool {
+        self.stream.is_write_vectored()
+    }
+
+    fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        let result = Pin::new(&mut self.stream).poll_flush(cx);
+        if matches!(result, Poll::Ready(Ok(())))
+            && self.preface.as_ref().is_some_and(|p| p.client_ack.written)
+        {
+            self.finish_preface(Ok(()));
+        }
+        result
+    }
+
+    fn poll_shutdown(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        Pin::new(&mut self.stream).poll_shutdown(cx)
+    }
+}
+
 /// Open a gRPC channel to the gateway over TLS, pinning the certificate fingerprint from the
 /// handover.
 
@@ -250,6 +415,29 @@ pub fn gateway_dial_error(endpoint: &str, error: anyhow::Error) -> anyhow::Error
 /// The returned error carries the failing step as a [`DialStageError`] in its chain; a caller that
 /// reports it to an operator turns it into the structured form with [`gateway_dial_error`].
 pub async fn connect_pinned(endpoint: &str, fingerprint: &str) -> Result<Channel> {
+    connect_pinned_with_tcp(
+        endpoint,
+        fingerprint,
+        Some(BUYER_GATEWAY_DIAL_TIMEOUT),
+        TcpStream::connect,
+    )
+    .await
+}
+
+/// The seller's readiness probe owns its deadline across the dial and the gRPC challenge.
+pub(crate) async fn connect_pinned_for_probe(endpoint: &str, fingerprint: &str) -> Result<Channel> {
+    connect_pinned_with_tcp(endpoint, fingerprint, None, TcpStream::connect).await
+}
+
+async fn connect_pinned_with_tcp<F>(
+    endpoint: &str,
+    fingerprint: &str,
+    timeout: Option<Duration>,
+    connect_tcp: impl Fn(String) -> F + Send + 'static,
+) -> Result<Channel>
+where
+    F: Future<Output = std::io::Result<TcpStream>> + Send,
+{
     crate::seller::tls::ensure_crypto_provider();
     let provider = Arc::new(tokio_rustls::rustls::crypto::ring::default_provider());
 
@@ -280,58 +468,134 @@ pub async fn connect_pinned(endpoint: &str, fingerprint: &str) -> Result<Channel
         .path_and_query("/")
         .build()?;
     let endpoint_cfg = Endpoint::from(inner_uri);
-    let channel = endpoint_cfg
-        .connect_with_connector(service_fn(move |uri: Uri| {
-            let tls = tls.clone();
-            async move {
-                let host_port = format!(
-                    "{}:{}",
-                    uri.host().unwrap_or("127.0.0.1"),
-                    uri.port_u16().unwrap_or(443)
-                );
-                // tag each step, so a failure keeps the stage that tonic's `transport error`
-                // erases. The tag is added on the error path only; a successful dial is untouched.
-                let tcp = tokio::net::TcpStream::connect(host_port)
-                    .await
-                    .map_err(|e| DialStageError::new("tcp_connect", e))?;
-                // The gateway certificate's SAN is fixed (`dexdo`) -- trust comes from fingerprint
-                // pinning, not the name, so the handshake name is free to be whatever travels best.
+    let stage = Arc::new(Mutex::new("tcp_connect"));
+    let connector_stage = stage.clone();
+    let buyer_dial = timeout.is_some();
+    let (mut preface, ready) = if buyer_dial {
+        let (ready, received) = oneshot::channel();
+        (
+            Some(ServerPreface {
+                server_header: Http2FrameHeader::default(),
+                client_ack: ClientSettingsAck::new(),
+                ready,
+            }),
+            Some(received),
+        )
+    } else {
+        (None, None)
+    };
+    let dial = endpoint_cfg.connect_with_connector(service_fn(move |uri: Uri| {
+        let tls = tls.clone();
+        let stage = connector_stage.clone();
+        let preface = preface.take();
+        // A buyer Channel gets one socket. Any new dial belongs to the buyer's retry policy.
+        let tcp = (!buyer_dial || preface.is_some()).then(|| {
+            connect_tcp(format!(
+                "{}:{}",
+                uri.host().unwrap_or("127.0.0.1"),
+                uri.port_u16().unwrap_or(443)
+            ))
+        });
+        async move {
+            let tcp = tcp.ok_or_else(|| {
+                DialStageError::new(
+                    "tcp_connect",
+                    io::Error::new(io::ErrorKind::NotConnected, "buyer gateway channel closed"),
+                )
+            })?;
+            // Tag failures before tonic wraps them, and record the active stage for the
+            // deadline around the whole dial.
+            *stage.lock().unwrap() = "tcp_connect";
+            let tcp = tcp
+                .await
+                .map_err(|e| DialStageError::new("tcp_connect", e))?;
+            *stage.lock().unwrap() = "tls_handshake";
+            // The gateway certificate's SAN is fixed (`dexdo`) -- trust comes from fingerprint
+            // pinning, not the name, so the handshake name is free to be whatever travels best.
 
-                // A handover endpoint is an ADDRESS far more often than a domain, and RFC 6066
-                // forbids sending a literal address in SNI. Sending `dexdo` for such an endpoint is
-                // both off-spec and load-bearing in the wrong direction: middleboxes that route or
-                // filter on SNI -- VPN proxies above all -- see a name that resolves nowhere and drop
-                // the connection. The buyer then reports a bare `transport error` for a gateway that
-                // is up and reachable: `openssl s_client` to the same address completes the handshake
-                // without SNI and is dropped with `-servername dexdo`.
+            // A handover endpoint is an ADDRESS far more often than a domain, and RFC 6066
+            // forbids sending a literal address in SNI. Sending `dexdo` for such an endpoint is
+            // both off-spec and load-bearing in the wrong direction: middleboxes that route or
+            // filter on SNI -- VPN proxies above all -- see a name that resolves nowhere and drop
+            // the connection. The buyer then reports a bare `transport error` for a gateway that
+            // is up and reachable: `openssl s_client` to the same address completes the handshake
+            // without SNI and is dropped with `-servername dexdo`.
 
-                // So: an address endpoint dials with `ServerName::IpAddress`, which rustls sends
-                // WITHOUT an SNI extension; a real hostname keeps its own name. Pinning is unchanged --
-                // the verifier ignores the name and compares the certificate fingerprint.
-                // The name presented in the ClientHello. Trust is the pinned fingerprint --
-                // `PinnedFingerprintVerifier` ignores the name outright -- so the name has one job:
-                // to travel. RFC 6066 forbids a literal address in SNI, and a name that resolves
-                // nowhere is what SNI-routing middleboxes (VPN proxies above all) drop, which reaches
-                // the operator as a bare `transport error` for a gateway that is up and listening.
+            // So: an address endpoint dials with `ServerName::IpAddress`, which rustls sends
+            // WITHOUT an SNI extension; a real hostname keeps its own name. Pinning is unchanged --
+            // the verifier ignores the name and compares the certificate fingerprint.
+            // The name presented in the ClientHello. Trust is the pinned fingerprint --
+            // `PinnedFingerprintVerifier` ignores the name outright -- so the name has one job:
+            // to travel. RFC 6066 forbids a literal address in SNI, and a name that resolves
+            // nowhere is what SNI-routing middleboxes (VPN proxies above all) drop, which reaches
+            // the operator as a bare `transport error` for a gateway that is up and listening.
 
-                // Taken from the socket we JUST connected on, not from the endpoint spelling: the
-                // address is the one fact that is always available and always well-formed by then.
-                // That leaves no unparseable case to handle -- no bracketed IPv6, no short-form IPv4
-                // the system resolver accepts and `IpAddr` rejects, no fallback name -- and rustls
-                // sends `IpAddress` WITHOUT the extension, so no SNI ever leaves this client.
-                let peer = tcp
-                    .peer_addr()
-                    .map_err(|e| DialStageError::new("tls_handshake", e))?;
-                let dns = ServerName::IpAddress(peer.ip().into());
-                let stream = tls
-                    .connect(dns, tcp)
-                    .await
-                    .map_err(|e| DialStageError::new("tls_handshake", e))?;
-                Ok::<_, DialStageError>(TokioIo::new(stream))
-            }
-        }))
-        .await?;
+            // Taken from the socket we JUST connected on, not from the endpoint spelling: the
+            // address is the one fact that is always available and always well-formed by then.
+            // That leaves no unparseable case to handle -- no bracketed IPv6, no short-form IPv4
+            // the system resolver accepts and `IpAddr` rejects, no fallback name -- and rustls
+            // sends `IpAddress` WITHOUT the extension, so no SNI ever leaves this client.
+            let peer = tcp
+                .peer_addr()
+                .map_err(|e| DialStageError::new("tls_handshake", e))?;
+            let dns = ServerName::IpAddress(peer.ip().into());
+            let stream = tls
+                .connect(dns, tcp)
+                .await
+                .map_err(|e| DialStageError::new("tls_handshake", e))?;
+            *stage.lock().unwrap() = "http2_handshake";
+            Ok::<_, DialStageError>(TokioIo::new(ServerPrefaceIo { stream, preface }))
+        }
+    }));
+    let dial = async {
+        let channel = dial.await?;
+        if let Some(ready) = ready {
+            ready
+                .await
+                .map_err(|error| DialStageError::new("http2_handshake", error))?
+                .map_err(|error| DialStageError::new("http2_handshake", error))?;
+        }
+        Ok::<_, anyhow::Error>(channel)
+    };
+    // Bound the whole dial, including the peer's HTTP/2 preface.
+    let channel = match timeout {
+        Some(timeout) => tokio::time::timeout(timeout, dial)
+            .await
+            .map_err(|elapsed| DialStageError::new(*stage.lock().unwrap(), elapsed))??,
+        None => dial.await?,
+    };
     Ok(channel)
+}
+
+#[cfg(test)]
+pub(super) fn test_tls_acceptor(tls: &crate::seller::tls::GatewayTls) -> tokio_rustls::TlsAcceptor {
+    use tokio_rustls::rustls::{pki_types::pem::PemObject, pki_types::PrivateKeyDer, ServerConfig};
+
+    crate::seller::tls::ensure_crypto_provider();
+    let cert = CertificateDer::from_pem_slice(tls.cert_pem.as_bytes()).unwrap();
+    let key = PrivateKeyDer::from_pem_slice(tls.key_pem.as_bytes()).unwrap();
+    let mut config = ServerConfig::builder()
+        .with_no_client_auth()
+        .with_single_cert(vec![cert], key)
+        .unwrap();
+    config.alpn_protocols = vec![b"h2".to_vec()];
+    tokio_rustls::TlsAcceptor::from(Arc::new(config))
+}
+
+#[cfg(test)]
+pub(super) const EMPTY_SERVER_SETTINGS: [u8; 9] = [0, 0, 0, 4, 0, 0, 0, 0, 0];
+
+#[cfg(test)]
+pub(super) async fn wait_for_client_settings_ack(stream: &mut (impl AsyncRead + Unpin)) {
+    use tokio::io::AsyncReadExt;
+
+    let mut ack = ClientSettingsAck::new();
+    let mut bytes = [0; 64];
+    while !ack.written {
+        let read = stream.read(&mut bytes).await.unwrap();
+        assert_ne!(read, 0, "the client closed before sending SETTINGS ACK");
+        ack.observe(&bytes[..read]);
+    }
 }
 
 #[cfg(test)]
@@ -339,6 +603,174 @@ mod tests {
     use super::*;
     use crate::seller::{start_gateway_with_note, UpstreamConfig};
     use dexdo_core::LocalNote;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    #[tokio::test(start_paused = true)]
+    async fn issue_2275_stalled_tcp_dial_times_out_at_tcp_connect() {
+        let endpoint = "https://127.0.0.1:1";
+        let started = tokio::time::Instant::now();
+        let raw = tokio::time::timeout(
+            BUYER_GATEWAY_DIAL_TIMEOUT + BUYER_GATEWAY_DIAL_TIMEOUT / 10,
+            connect_pinned_with_tcp(
+                endpoint,
+                &"00".repeat(32),
+                Some(BUYER_GATEWAY_DIAL_TIMEOUT),
+                |_| std::future::pending(),
+            ),
+        )
+        .await
+        .expect("the buyer must time out a pending TCP connection")
+        .expect_err("TCP never finished");
+        assert!(started.elapsed() >= BUYER_GATEWAY_DIAL_TIMEOUT);
+        let structured = gateway_dial_error(endpoint, raw);
+        let error = structured.downcast_ref::<dexdo_core::DexdoError>().unwrap();
+        assert_eq!(error.code(), "E_GATEWAY_UNREACHABLE");
+        assert_eq!(error.stage(), Some("tcp_connect"));
+    }
+
+    #[tokio::test]
+    async fn issue_2275_stalled_tls_uses_the_remaining_dial_time() {
+        let silent = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let endpoint = format!("https://{}", silent.local_addr().unwrap());
+        let tcp_delay = BUYER_GATEWAY_DIAL_TIMEOUT / 2;
+        let started = tokio::time::Instant::now();
+        let raw = tokio::time::timeout(
+            BUYER_GATEWAY_DIAL_TIMEOUT + tcp_delay / 2,
+            connect_pinned_with_tcp(
+                &endpoint,
+                &"00".repeat(32),
+                Some(BUYER_GATEWAY_DIAL_TIMEOUT),
+                move |address| async move {
+                    tokio::time::sleep(tcp_delay).await;
+                    TcpStream::connect(address).await
+                },
+            ),
+        )
+        .await
+        .expect("TLS must use the remaining deadline")
+        .expect_err("the listener never answers the TLS hello");
+        assert!(started.elapsed() >= BUYER_GATEWAY_DIAL_TIMEOUT);
+        let structured = gateway_dial_error(&endpoint, raw);
+        let error = structured.downcast_ref::<dexdo_core::DexdoError>().unwrap();
+        assert_eq!(error.code(), "E_GATEWAY_UNREACHABLE");
+        assert_eq!(error.stage(), Some("tls_handshake"));
+    }
+
+    #[tokio::test]
+    async fn issue_2275_incomplete_server_settings_uses_the_remaining_dial_time() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let endpoint = format!("https://{}", listener.local_addr().unwrap());
+        let tls = crate::seller::tls::GatewayTls::generate().unwrap();
+        let acceptor = test_tls_acceptor(&tls);
+        let tls_delay = BUYER_GATEWAY_DIAL_TIMEOUT / 2;
+        let peer = async {
+            let (tcp, _) = listener.accept().await.unwrap();
+            tokio::time::sleep(tls_delay).await;
+            let mut stream = acceptor.accept(tcp).await.unwrap();
+            assert_eq!(stream.get_ref().1.alpn_protocol(), Some(b"h2".as_slice()));
+            let mut preface = [0; HTTP2_CLIENT_PREFACE.len()];
+            stream.read_exact(&mut preface).await.unwrap();
+            assert_eq!(&preface, HTTP2_CLIENT_PREFACE);
+            // Advertise a six-byte SETTINGS payload and leave it incomplete.
+            let mut settings = EMPTY_SERVER_SETTINGS;
+            settings[2] = 6;
+            stream.write_all(&settings).await.unwrap();
+            stream.flush().await.unwrap();
+            stream
+        };
+        let started = tokio::time::Instant::now();
+        let (dial, _peer) =
+            tokio::time::timeout(BUYER_GATEWAY_DIAL_TIMEOUT + tls_delay / 2, async {
+                tokio::join!(connect_pinned(&endpoint, &tls.fingerprint), peer)
+            })
+            .await
+            .expect("server SETTINGS must use the remaining deadline");
+        let raw = dial.expect_err("incomplete SETTINGS cannot open the channel");
+        assert!(started.elapsed() >= BUYER_GATEWAY_DIAL_TIMEOUT);
+        let structured = gateway_dial_error(&endpoint, raw);
+        let error = structured.downcast_ref::<dexdo_core::DexdoError>().unwrap();
+        assert_eq!(error.code(), "E_GATEWAY_UNREACHABLE");
+        assert_eq!(error.stage(), Some("http2_handshake"));
+    }
+
+    #[tokio::test]
+    async fn issue_2275_invalid_server_settings_fail_the_dial() {
+        let tls = crate::seller::tls::GatewayTls::generate().unwrap();
+        let acceptor = test_tls_acceptor(&tls);
+        // A partial setting entry and a complete SETTINGS_MAX_FRAME_SIZE=0 entry.
+        for payload in [&[0][..], &[0, 5, 0, 0, 0, 0][..]] {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let endpoint = format!("https://{}", listener.local_addr().unwrap());
+            let peer = async {
+                let (tcp, _) = listener.accept().await.unwrap();
+                let mut stream = acceptor.accept(tcp).await.unwrap();
+                assert_eq!(stream.get_ref().1.alpn_protocol(), Some(b"h2".as_slice()));
+                let mut header = EMPTY_SERVER_SETTINGS;
+                header[2] = u8::try_from(payload.len()).unwrap();
+                stream.write_all(&header).await.unwrap();
+                stream.write_all(payload).await.unwrap();
+                stream.flush().await.unwrap();
+                stream
+            };
+            let (dial, _peer) = tokio::join!(connect_pinned(&endpoint, &tls.fingerprint), peer);
+            let raw = dial.expect_err("invalid server SETTINGS must fail the dial");
+            assert!(
+                !raw.chain()
+                    .any(|error| error.is::<tokio::time::error::Elapsed>()),
+                "h2 must reject the frame before the deadline: {raw:#}"
+            );
+            let structured = gateway_dial_error(&endpoint, raw);
+            let error = structured.downcast_ref::<dexdo_core::DexdoError>().unwrap();
+            assert_eq!(error.code(), "E_GATEWAY_UNREACHABLE");
+            assert_eq!(error.stage(), Some("http2_handshake"));
+        }
+    }
+
+    #[tokio::test]
+    async fn issue_2275_closed_channel_cannot_redial_before_rpc() {
+        use dexdo_proto::{ChallengeRequest, GatewayClient};
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let endpoint = format!("https://{}", listener.local_addr().unwrap());
+        let tls = crate::seller::tls::GatewayTls::generate().unwrap();
+        let acceptor = test_tls_acceptor(&tls);
+        let calls = Arc::new(AtomicUsize::new(0));
+        let connect_calls = calls.clone();
+        let dial = connect_pinned_with_tcp(
+            &endpoint,
+            &tls.fingerprint,
+            Some(BUYER_GATEWAY_DIAL_TIMEOUT),
+            move |address| {
+                connect_calls.fetch_add(1, Ordering::Relaxed);
+                TcpStream::connect(address)
+            },
+        );
+        let (channel, mut peer) = tokio::join!(dial, async {
+            let (tcp, _) = listener.accept().await.unwrap();
+            let mut stream = acceptor.accept(tcp).await.unwrap();
+            stream.write_all(&EMPTY_SERVER_SETTINGS).await.unwrap();
+            stream.flush().await.unwrap();
+            stream
+        });
+        let mut client = GatewayClient::new(channel.unwrap());
+        peer.shutdown().await.unwrap();
+        // Read to EOF before issuing any RPC so Tonic has already noticed the closed socket.
+        let _ = tokio::time::timeout(
+            BUYER_GATEWAY_DIAL_TIMEOUT,
+            peer.read_to_end(&mut Vec::new()),
+        )
+        .await
+        .expect("the h2 connection closes");
+        let failure = tokio::time::timeout(
+            BUYER_GATEWAY_DIAL_TIMEOUT,
+            client.get_challenge(ChallengeRequest::default()),
+        )
+        .await
+        .expect("the RPC must fail without hanging on another connection");
+        assert!(failure.is_err());
+        assert_eq!(calls.load(Ordering::Relaxed), 1);
+    }
 
     /// An endpoint spelling that the system resolver accepts and `IpAddr::from_str` rejects must
     /// still dial, because the handshake name is taken from the connected socket rather than from

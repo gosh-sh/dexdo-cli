@@ -11,6 +11,77 @@ fn bm_error() -> anyhow::Error {
 }
 
 #[tokio::test(start_paused = true)]
+async fn issue_2282_closed_pool_exhaustion_preserves_read_recovery_and_submit_policy() {
+    let closed_pool = || {
+        anyhow!(
+            "GraphQL errors: {}",
+            json!([{"message": "attempted to acquire a connection on a closed pool",
+                "path": ["blockchain", "account", "messages"]}])
+        )
+    };
+    let calls = AtomicUsize::new(0);
+    let error = retry_transient_read(|| async {
+        calls.fetch_add(1, Ordering::SeqCst);
+        Err::<(), _>(closed_pool())
+    })
+    .await
+    .unwrap_err();
+    assert_eq!(calls.load(Ordering::SeqCst), TRANSIENT_READ_ATTEMPTS);
+    let mapped = map_read_err(error.context("seller note ext-out"));
+    assert!(matches!(mapped, ChainError::Transport(_)), "{mapped}");
+    for mapped in [
+        map_err(closed_pool()),
+        map_claim_submit_err(closed_pool()),
+        map_sell_offer_submit_err(closed_pool()),
+    ] {
+        assert!(matches!(mapped, ChainError::Chain(_)), "{mapped}");
+    }
+}
+
+pub(super) fn bk_error() -> anyhow::Error {
+    anyhow!(
+        "GraphQL errors: {}",
+        json!([{"message": "failed to get account d446d4b942523bfb20509f4c8450c65dc6e21957f9d626ca7d34cebf2ce3a2ab: Invalid server response: All BK API endpoints failed; traceparent: 00-00000000000000000000000038f4ca33-0000000038f4ca33-01"}])
+    )
+}
+
+#[tokio::test(start_paused = true)]
+async fn issue_2206_bk_outage_survives_read_exhaustion_without_enabling_submit_retry() {
+    let calls = AtomicUsize::new(0);
+    let error = retry_transient_read(|| async {
+        calls.fetch_add(1, Ordering::SeqCst);
+        Err::<(), _>(bk_error())
+    })
+    .await
+    .unwrap_err();
+    assert_eq!(calls.load(Ordering::SeqCst), TRANSIENT_READ_ATTEMPTS);
+    let mapped = map_read_err(error.context("TokenContract coherent snapshot"));
+    assert!(matches!(mapped, ChainError::Transport(_)), "{mapped}");
+    assert!(matches!(map_err(bk_error()), ChainError::Chain(_)));
+    assert!(matches!(
+        map_claim_submit_err(bk_error()),
+        ChainError::Chain(_)
+    ));
+    assert!(matches!(
+        map_sell_offer_submit_err(bk_error()),
+        ChainError::Chain(_)
+    ));
+
+    calls.store(0, Ordering::SeqCst);
+    let order_id = retry_seller_read("same resting SELL", || async {
+        if calls.fetch_add(1, Ordering::SeqCst) == 0 {
+            Err(map_read_err(bk_error()))
+        } else {
+            Ok(257_u128)
+        }
+    })
+    .await
+    .unwrap();
+    assert_eq!(order_id, 257);
+    assert_eq!(calls.load(Ordering::SeqCst), 2);
+}
+
+#[tokio::test(start_paused = true)]
 async fn issue_2122_exhausting_read_retries_still_leaves_seller_recovery_possible() {
     let calls = AtomicUsize::new(0);
     let error = retry_transient_read(|| async {

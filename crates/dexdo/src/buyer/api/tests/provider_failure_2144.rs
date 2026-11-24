@@ -4,9 +4,11 @@ use axum::{response::IntoResponse, routing::post, Router};
 use std::sync::atomic::AtomicU8;
 use tower::ServiceExt;
 
+const SUBSTITUTE_BODY: &str = r#"{"model":"wrong-model","status":"completed","output":[{"type":"message","content":[{"type":"output_text","text":"wrong answer"}]}],"usage":{"input_tokens":1,"output_tokens":1,"total_tokens":2}}"#;
+
 /// The provider's answer in `mode`: 3 answers, 0 and 4 fail before any output, 1 stops after
 /// partial text without usage, 2 stops after partial reasoning without usage, 5 sends partial text
-/// and then an oversized frame.
+/// and then an oversized frame. Mode 6 returns a complete answer from a substitute model.
 fn provider_answer(mode: u8, path: &str, stream: bool) -> axum::response::Response {
     let sse = |frames: &[&str]| {
         let body: String = frames.iter().map(|frame| format!("{frame}\n\n")).collect();
@@ -40,6 +42,7 @@ fn provider_answer(mode: u8, path: &str, stream: bool) -> axum::response::Respon
             "event: response.output_text.delta\ndata: {\"type\":\"response.output_text.delta\",\"delta\":\"OK\"}",
             "event: response.completed\ndata: {\"type\":\"response.completed\",\"response\":{\"status\":\"completed\",\"usage\":{\"input_tokens\":1,\"output_tokens\":1,\"total_tokens\":2}}}",
         ]),
+        ("/responses", false, 6) => json(SUBSTITUTE_BODY),
         ("/responses", false, 1) => json(
             r#"{"status":"completed","output":[{"type":"message","content":[{"type":"output_text","text":"partial"}]}]}"#,
         ),
@@ -176,14 +179,39 @@ async fn ask(
     path: &str,
     stream: bool,
 ) -> (http::StatusCode, String) {
+    ask_with_prompt(harness, store, path, stream, "question").await
+}
+
+async fn ask_with_prompt(
+    harness: &WeeklyRouteHarness,
+    store: &Arc<UsageStore>,
+    path: &str,
+    stream: bool,
+    prompt: &str,
+) -> (http::StatusCode, String) {
+    let response = open_consumer_response(harness, store, path, stream, prompt).await;
+    let status = response.status();
+    let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    (status, String::from_utf8(bytes.to_vec()).unwrap())
+}
+
+async fn open_consumer_response(
+    harness: &WeeklyRouteHarness,
+    store: &Arc<UsageStore>,
+    path: &str,
+    stream: bool,
+    prompt: &str,
+) -> axum::response::Response {
     let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
     let state = direct_state_with_deliveries(harness, tx).with_usage(store.clone());
     let body = if path == "/v1/responses" {
-        serde_json::json!({"model":"dexdo-mock","input":"question","max_output_tokens":4,"stream":stream})
+        serde_json::json!({"model":"dexdo-mock","input":prompt,"max_output_tokens":4,"stream":stream})
     } else {
-        serde_json::json!({"model":"dexdo-mock","messages":[{"role":"user","content":"question"}],"max_tokens":4,"stream":stream})
+        serde_json::json!({"model":"dexdo-mock","messages":[{"role":"user","content":prompt}],"max_tokens":4,"stream":stream})
     };
-    let response = router(state)
+    router(state)
         .oneshot(
             http::Request::post(path)
                 .header(http::header::CONTENT_TYPE, "application/json")
@@ -191,12 +219,7 @@ async fn ask(
                 .unwrap(),
         )
         .await
-        .unwrap();
-    let status = response.status();
-    let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
-        .await
-        .unwrap();
-    (status, String::from_utf8(bytes.to_vec()).unwrap())
+        .unwrap()
 }
 
 #[tokio::test]
@@ -269,11 +292,9 @@ async fn issue_2144_provider_error_preserves_prior_usage_and_concurrent_requests
     }
 }
 
-/// Streamed output the client already holds, with no usage record behind it, leaves the bill
-/// uncertain: every path pauses and no implicit STOP may land. A whole answer that arrives without
-/// usage never reaches the buyer, so it stays a request-scoped failure.
+/// A provider can interrupt visible output or reasoning on any served API.
 #[tokio::test]
-async fn issue_2144_partial_output_without_usage_blocks_every_api_and_implicit_stop() {
+async fn issue_2266_interrupted_answer_does_not_block_the_next_request() {
     for native in [false, true] {
         for stream in [false, true] {
             for failure in [1, 2] {
@@ -285,6 +306,7 @@ async fn issue_2144_partial_output_without_usage_blocks_every_api_and_implicit_s
                     UsageStore::open(dir.path().join("usage.sqlite3"), "test-network").unwrap(),
                 );
                 let deal = harness.deals.current().await.unwrap();
+                let tc = &deal.route.token_contract;
                 let paths = served_paths(native);
                 let path = paths[paths.len() - 1];
                 assert_eq!(
@@ -293,47 +315,25 @@ async fn issue_2144_partial_output_without_usage_blocks_every_api_and_implicit_s
                 );
                 mode.store(failure, Ordering::SeqCst);
                 let (status, body) = ask(&harness, &store, path, stream).await;
-                assert_eq!(
-                    status,
-                    if stream {
-                        http::StatusCode::OK
-                    } else {
-                        http::StatusCode::BAD_GATEWAY
-                    },
-                    "{body}"
-                );
-                assert!(
-                    !deal.session.is_closed(),
-                    "uncertain usage is not terminal: {body}"
-                );
+                if stream {
+                    assert_eq!(status, http::StatusCode::OK, "{body}");
+                    assert!(body.contains("upstream_retryable"), "{body}");
+                } else {
+                    assert_eq!(status, http::StatusCode::BAD_GATEWAY, "{body}");
+                }
+                assert!(!deal.session.is_closed(), "{body}");
                 assert_eq!(deal.session.terminal_action(), None);
                 assert_eq!(deal.billable_tokens(), 2);
-                assert_eq!(harness.chain.foreign_money_calls(), 0);
                 mode.store(3, Ordering::SeqCst);
-                let calls = harness.seller.calls();
                 for path in paths {
                     let (status, body) = ask(&harness, &store, path, false).await;
-                    if stream {
-                        assert_eq!(
-                            status,
-                            http::StatusCode::SERVICE_UNAVAILABLE,
-                            "{path}: {body}"
-                        );
-                        assert!(body.contains("upstream_usage_unresolved"), "{body}");
-                        assert!(body.contains("read_only_reconciliation"), "{body}");
-                    } else {
-                        assert_eq!(status, http::StatusCode::OK, "{path}: {body}");
-                    }
+                    assert_eq!(status, http::StatusCode::OK, "{path}: {body}");
                 }
-                if stream {
-                    assert_eq!(
-                        harness.seller.calls(),
-                        calls,
-                        "paused requests must not reach the gateway"
-                    );
-                    assert!(!deal.session.settle_on_exit("test-shutdown").await.unwrap());
-                    assert_eq!(harness.chain.foreign_money_calls(), 0);
-                }
+                assert_eq!(
+                    harness.deals.current().await.unwrap().route.token_contract,
+                    *tc
+                );
+                assert_eq!(harness.chain.foreign_money_calls(), 0);
                 harness.shutdown().await;
                 task.abort();
             }
@@ -342,97 +342,193 @@ async fn issue_2144_partial_output_without_usage_blocks_every_api_and_implicit_s
 }
 
 #[tokio::test]
-async fn issue_2144_unresolved_usage_survives_restart_and_only_exact_usage_can_reconcile_it() {
-    let mode = Arc::new(AtomicU8::new(1));
-    let (upstream, task) = provider(mode, false).await;
-    let harness = harness(upstream, SessionLifetimePolicy::SettleOnExit).await;
-    let deal = harness.deals.current().await.unwrap();
+async fn issue_2269_gateway_transport_drops_only_unconfirmed_billing() {
+    for streamed in [false, true] {
+        for point in [
+            "AT_OPEN",
+            "BEFORE_HEAD",
+            "BEFORE_HEAD_UNKNOWN",
+            "AFTER_ERROR_HEAD",
+            "AFTER_OUTPUT",
+            "BEFORE_BILLING",
+            "BEFORE_EOF",
+        ] {
+            let (upstream, task) = provider(Arc::new(AtomicU8::new(3)), false).await;
+            let harness = weekly_route_harness_gated_with_policy(WeeklyRouteScenario {
+                claimed: 0,
+                subscription: false,
+                expires_in: SUB_WEEK_LEN.as_secs(),
+                upstream_tokens: UNCONSTRAINED_UPSTREAM,
+                content_gate: ContentGate::skip(),
+                upstream,
+                failure_policy: BuyerApiFailurePolicy {
+                    dead_gateway: DeadGatewayAction::RetryThenReclaim,
+                    ..BuyerApiFailurePolicy::default()
+                },
+                lifetime: SessionLifetimePolicy::SettleOnExit,
+            })
+            .await;
+            let dir = tempfile::tempdir().unwrap();
+            let store = Arc::new(
+                UsageStore::open(dir.path().join("usage.sqlite3"), "test-network").unwrap(),
+            );
+            let deal = harness.deals.current().await.unwrap();
+            let tc = &deal.route.token_contract;
+            let (status, body) = ask_with_prompt(
+                &harness,
+                &store,
+                "/v1/responses",
+                streamed,
+                &format!("DEXDO_FIXTURE_CUT_{point}"),
+            )
+            .await;
+            if !streamed
+                || matches!(
+                    point,
+                    "AT_OPEN" | "BEFORE_HEAD" | "BEFORE_HEAD_UNKNOWN" | "AFTER_ERROR_HEAD"
+                )
+            {
+                assert_eq!(status, http::StatusCode::BAD_GATEWAY, "{point}: {body}");
+            } else {
+                assert_eq!(status, http::StatusCode::OK, "{point}: {body}");
+                assert!(body.contains("response.failed"), "{point}: {body}");
+            }
+            assert_eq!(deal.billable_tokens(), 0);
+            assert_eq!(store.accepted_tokens(tc).unwrap(), 0);
+            let connection = rusqlite::Connection::open(dir.path().join("usage.sqlite3")).unwrap();
+            let (outcome, stage): (String, String) = connection
+                .query_row("SELECT outcome, failure_stage FROM requests", [], |row| {
+                    Ok((row.get(0)?, row.get(1)?))
+                })
+                .unwrap();
+            assert_eq!(outcome, "failed");
+            assert_eq!(
+                stage,
+                if point == "AT_OPEN" {
+                    "upstream_open"
+                } else {
+                    "upstream_stream"
+                }
+            );
+            assert_eq!(
+                ask(&harness, &store, "/v1/responses", false).await.0,
+                http::StatusCode::OK
+            );
+            assert_eq!(deal.billable_tokens(), 2);
+            assert_eq!(
+                &harness.deals.current().await.unwrap().route.token_contract,
+                tc
+            );
+            assert_eq!(harness.chain.foreign_money_calls(), 0);
+            harness.shutdown().await;
+            task.abort();
+        }
+    }
+}
+
+#[tokio::test]
+async fn issue_2269_accepts_legacy_seller_billing_without_optional_fields() {
+    let (upstream, task) = provider(Arc::new(AtomicU8::new(3)), false).await;
+    let harness = weekly_route_harness_gated_with_policy(WeeklyRouteScenario {
+        claimed: PROBE_CLAIM,
+        subscription: true,
+        expires_in: SUB_WEEK_LEN.as_secs(),
+        upstream_tokens: UNCONSTRAINED_UPSTREAM,
+        content_gate: ContentGate::skip(),
+        upstream,
+        failure_policy: BuyerApiFailurePolicy::default(),
+        lifetime: SessionLifetimePolicy::Preserve,
+    })
+    .await;
     let dir = tempfile::tempdir().unwrap();
-    let path = dir.path().join("usage.sqlite3");
-    let store = Arc::new(UsageStore::open(&path, "test-network").unwrap());
-    let (_, body) = ask(&harness, &store, "/v1/responses", true).await;
-    assert!(
-        body.contains("partial"),
-        "the failed request delivered client-visible output"
-    );
-    assert!(store
-        .has_unresolved_output_usage(&deal.route.token_contract)
-        .unwrap());
-    let reopened = Arc::new(UsageStore::open(&path, "test-network").unwrap());
-    reopened.recover_interrupted_requests().unwrap();
-    let resumed = SessionSettle::new(
-        harness.chain.clone(),
-        deal.route.token_contract.clone(),
-        deal.session.note.clone(),
-    );
-    resumed.usage_quota.set(reopened.clone()).unwrap();
-    assert_eq!(
-        resumed.ensure_open_for_serving().await.unwrap_err().code,
-        ConsumerErrorCode::UpstreamUsageUnresolved
-    );
-    assert!(!resumed.is_closed());
-    assert!(!resumed
-        .settle_on_exit("restarted-paused-session")
-        .await
-        .unwrap());
-    // A later successful concurrent request or a different network cannot erase this request.
-    reopened
-        .start_request("other", "dexdo-mock", "openai", false)
-        .unwrap();
-    reopened
-        .link_deal("other", &deal.route.token_contract)
-        .unwrap();
-    reopened
-        .record_call_usage(
-            "other",
-            "answer",
-            "answer",
-            BillingUsage::new(1, 1, None).unwrap(),
-            true,
+    let store =
+        Arc::new(UsageStore::open(dir.path().join("usage.sqlite3"), "test-network").unwrap());
+    for streamed in [false, true] {
+        let (status, body) = ask_with_prompt(
+            &harness,
+            &store,
+            "/v1/responses",
+            streamed,
+            "DEXDO_FIXTURE_OMIT_CHARGED_TOKENS DEXDO_FIXTURE_OMIT_CUMULATIVE_TOKENS",
         )
-        .unwrap();
-    assert!(reopened
-        .has_unresolved_output_usage(&deal.route.token_contract)
-        .unwrap());
-    assert!(!UsageStore::open(&path, "other-network")
+        .await;
+        assert_eq!(status, http::StatusCode::OK, "{body}");
+        assert!(body.contains("OK"), "{body}");
+    }
+    let deal = harness.deals.current().await.unwrap();
+    assert_eq!(
+        store.accepted_tokens(&deal.route.token_contract).unwrap(),
+        4
+    );
+    assert_eq!(deal.billable_tokens(), 4);
+    assert_eq!(harness.seller.recovery_calls(), 0);
+    let (status, _) = ask_with_prompt(
+        &harness,
+        &store,
+        "/v1/responses",
+        false,
+        "DEXDO_FIXTURE_CUT_BEFORE_BILLING",
+    )
+    .await;
+    assert_eq!(status, http::StatusCode::BAD_GATEWAY);
+    assert_eq!(harness.seller.recovery_calls(), 0);
+    let before = deal.remaining_tokens();
+    drop(store);
+    let reopened =
+        Arc::new(UsageStore::open(dir.path().join("usage.sqlite3"), "test-network").unwrap());
+    let chain_snapshot = deal
+        .session
+        .chain
+        .deal_snapshot(&deal.route.token_contract)
+        .await
         .unwrap()
-        .has_unresolved_output_usage(&deal.route.token_contract)
-        .unwrap());
-    // Reconciliation needs this exact request's validated and accepted terminal usage.
-    let connection = rusqlite::Connection::open(&path).unwrap();
-    let request: String = connection.query_row("SELECT request_id FROM request_usage WHERE phase='answer' AND call_id='in_progress' AND accepted=0", [], |row| row.get(0)).unwrap();
-    let malformed = BillingUsage {
-        total_tokens: 99,
-        ..BillingUsage::new(1, 1, None).unwrap()
-    };
-    assert!(reopened
-        .record_call_usage(&request, "answer", "answer", malformed, true)
-        .is_err());
-    assert!(reopened
-        .has_unresolved_output_usage(&deal.route.token_contract)
-        .unwrap());
-    let valid = BillingUsage::new(1, 1, None).unwrap();
-    reopened
-        .record_call_usage(&request, "answer", "answer", valid, false)
         .unwrap();
-    assert!(reopened
-        .has_unresolved_output_usage(&deal.route.token_contract)
-        .unwrap());
-    reopened
-        .record_call_usage(&request, "answer", "answer", valid, true)
-        .unwrap();
-    assert!(!reopened
-        .has_unresolved_output_usage(&deal.route.token_contract)
-        .unwrap());
-    let reconciled = SessionSettle::new(
+    assert_eq!(chain_snapshot.state.tokens_pending, PROBE_CLAIM);
+    let session = Arc::new(SessionSettle::new_with_failure_policy_and_lifetime(
         harness.chain.clone(),
         deal.route.token_contract.clone(),
-        deal.session.note.clone(),
+        harness.buyer.note.clone(),
+        BuyerApiFailurePolicy::default(),
+        SessionLifetimePolicy::Preserve,
+    ));
+    let resumed = ApiDeal::new(deal.route.clone(), session, deal.content_gate.clone())
+        .with_weekly_budget(Arc::new(SubscriptionWeeklyBudget::new(
+            harness.chain.clone(),
+            deal.route.token_contract.clone(),
+            &chain_snapshot.state,
+            &chain_snapshot.subscription,
+        )));
+    resumed
+        .observe_deal_state(&Ok(Some(chain_snapshot.state)))
+        .await;
+    super::super::usage::persist_deal_quota(&resumed, &reopened)
+        .await
+        .unwrap();
+    assert_eq!(resumed.remaining_tokens(), before);
+    assert_eq!(resumed.billable_tokens(), 4);
+    assert_eq!(
+        reopened
+            .confirmed_usage_above(&deal.route.token_contract, PROBE_CLAIM + 2)
+            .unwrap(),
+        2
     );
-    reconciled.usage_quota.set(reopened).unwrap();
-    assert!(reconciled.ensure_open_for_serving().await.is_ok());
-    reconciled.disable_drop_backup();
-    assert_eq!(harness.chain.foreign_money_calls(), 0);
+    *harness.deals.active.write().await = Some(resumed);
+    assert_eq!(
+        ask(&harness, &reopened, "/v1/responses", false).await.0,
+        http::StatusCode::OK
+    );
+    assert_eq!(
+        reopened
+            .accepted_tokens(&deal.route.token_contract)
+            .unwrap(),
+        6
+    );
+    // The retired acknowledgement window contained 256 results.
+    for _ in 0..257 {
+        let (status, body) = ask(&harness, &reopened, "/v1/responses", false).await;
+        assert_eq!(status, http::StatusCode::OK, "{body}");
+    }
+    assert_eq!(harness.seller.recovery_calls(), 0);
     harness.shutdown().await;
     task.abort();
 }
@@ -452,190 +548,14 @@ proptest::proptest! {
         proptest::prop_assert_eq!(dexdo_proto::is_retryable_upstream(&status), retryable);
         let error = if typed { stream::StreamError::Upstream(status) } else { stream::StreamError::Local("dexdo-upstream-output: none".into()) };
         let expected = if typed {
-            if started || received > 0 { StreamErrorPolicyAction::ReconcileUsage } else { StreamErrorPolicyAction::RequestScoped }
+            StreamErrorPolicyAction::RequestScoped
         } else if received == 0 { StreamErrorPolicyAction::DeadGateway } else { StreamErrorPolicyAction::SellerStallsMidStream };
         proptest::prop_assert_eq!(error.policy_action(received), expected);
     }
 }
 
 #[tokio::test]
-async fn issue_2144_uncertain_usage_cancels_an_automatic_stop_already_in_preflight() {
-    let deal = heartbeat_test_deal();
-    let guard = deal.accepted_output_guard();
-    assert!(guard.unchanged());
-    deal.session
-        .unresolved_output_usage
-        .store(true, Ordering::SeqCst);
-    assert!(
-        !guard.unchanged(),
-        "the final pre-submit guard must see the accounting veto without new output"
-    );
-    assert!(
-        !deal
-            .session
-            .settle_dead_gateway("concurrent-gateway-failure", &guard)
-            .await
-    );
-    assert!(!deal.session.is_closed());
-    assert_eq!(deal.session.terminal_action(), None);
-}
-
-#[tokio::test]
-async fn review_2146_failed_pause_write_survives_restart() {
-    for fail_fallback in [false, true] {
-        let mode = Arc::new(AtomicU8::new(3));
-        let (upstream, task) = provider(mode.clone(), false).await;
-        let harness = harness(upstream, SessionLifetimePolicy::SettleOnExit).await;
-        let deal = harness.deals.current().await.unwrap();
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("usage.sqlite3");
-        let store = Arc::new(UsageStore::open(&path, "test-network").unwrap());
-        assert_eq!(
-            ask(&harness, &store, "/v1/responses", false).await.0,
-            http::StatusCode::OK
-        );
-        let connection = rusqlite::Connection::open(&path).unwrap();
-        connection.execute_batch("CREATE TRIGGER lose_pause BEFORE INSERT ON request_usage WHEN NEW.phase='answer' AND NEW.call_id='in_progress' BEGIN SELECT RAISE(FAIL,'pause write failed'); END;").unwrap();
-        if fail_fallback {
-            connection.execute_batch("CREATE TRIGGER lose_fallback BEFORE UPDATE OF history_complete ON requests WHEN NEW.history_complete=0 BEGIN SELECT RAISE(FAIL,'fallback write failed'); END;").unwrap();
-        }
-        mode.store(1, Ordering::SeqCst);
-        let (_, body) = ask(&harness, &store, "/v1/responses", true).await;
-        assert!(body.contains("partial"));
-        assert!(deal.session.unresolved_usage_rejection().is_some());
-        let (complete, finished): (bool, Option<i64>) = connection.query_row(
-            "SELECT history_complete,finished_at FROM requests WHERE deal_id=?1 ORDER BY started_at DESC,rowid DESC LIMIT 1",
-            [&deal.route.token_contract], |row| Ok((row.get(0)?,row.get(1)?)),
-        ).unwrap();
-        if fail_fallback {
-            assert!(finished.is_none());
-        } else {
-            assert!(!complete);
-        }
-        connection
-            .execute_batch("DROP TRIGGER lose_pause; DROP TRIGGER IF EXISTS lose_fallback;")
-            .unwrap();
-        let reopened = Arc::new(UsageStore::open(&path, "test-network").unwrap());
-        reopened.recover_interrupted_requests().unwrap();
-        let resumed = Arc::new(SessionSettle::new(
-            harness.chain.clone(),
-            deal.route.token_contract.clone(),
-            deal.session.note.clone(),
-        ));
-        resumed.usage_quota.set(reopened.clone()).unwrap();
-        let result = resumed.ensure_open_for_serving().await;
-        assert!(
-            matches!(result, Err(ref error) if error.code == ConsumerErrorCode::UpstreamUsageUnresolved),
-            "lost pause write allowed resumed serving: {result:?}"
-        );
-        *harness.deals.active.write().await = Some(ApiDeal::new(
-            deal.route.clone(),
-            resumed.clone(),
-            deal.content_gate.clone(),
-        ));
-        let calls = harness.seller.calls();
-        mode.store(3, Ordering::SeqCst);
-        assert_eq!(
-            ask(&harness, &reopened, "/v1/chat/completions", false)
-                .await
-                .0,
-            http::StatusCode::SERVICE_UNAVAILABLE
-        );
-        assert_eq!(harness.seller.calls(), calls);
-        assert!(!resumed.settle_on_exit("shutdown").await.unwrap());
-        assert_eq!(harness.chain.foreign_money_calls(), 0);
-        assert!(!resumed.is_closed());
-        harness.shutdown().await;
-        task.abort();
-    }
-}
-
-#[tokio::test]
-async fn review_2146_continuity_swap_respects_usage_pause() {
-    let mode = Arc::new(AtomicU8::new(3));
-    let (upstream, task) = provider(mode.clone(), false).await;
-    let harness = harness(upstream, SessionLifetimePolicy::SettleOnExit).await;
-    let deal = harness.deals.current().await.unwrap();
-    let dir = tempfile::tempdir().unwrap();
-    let store =
-        Arc::new(UsageStore::open(dir.path().join("usage.sqlite3"), "test-network").unwrap());
-    assert_eq!(
-        ask(&harness, &store, "/v1/responses", false).await.0,
-        http::StatusCode::OK
-    );
-    mode.store(1, Ordering::SeqCst);
-    let (_, body) = ask(&harness, &store, "/v1/responses", true).await;
-    assert!(body.contains("partial"));
-    assert!(deal.session.unresolved_usage_rejection().is_some());
-    let result = harness
-        .deals
-        .replace_active(
-            || panic!("paused route must stay active"),
-            "continuity-renewal",
-        )
-        .await;
-    assert!(result.is_err());
-    assert_eq!(
-        harness.deals.current().await.unwrap().route.token_contract,
-        deal.route.token_contract
-    );
-    assert_eq!(harness.chain.foreign_money_calls(), 0);
-    assert!(!deal.session.is_closed());
-    // An operator's explicit STOP still uses the unguarded path.
-    assert!(deal.session.settle("explicit-user-stop").await.unwrap());
-    assert_eq!(harness.chain.foreign_money_calls(), 1);
-    harness.shutdown().await;
-    task.abort();
-}
-
-#[tokio::test]
-async fn review_2146_continuity_pause_during_stop_preflight_keeps_previous_route() {
-    let chain = Arc::new(RecordingSettleChain::default());
-    let prototype = heartbeat_test_deal();
-    let session = Arc::new(SessionSettle::new(
-        chain.clone(),
-        prototype.route.token_contract.clone(),
-        prototype.session.note.clone(),
-    ));
-    let deal = ApiDeal::new(
-        prototype.route.clone(),
-        session.clone(),
-        Arc::new(ContentGate::skip()),
-    );
-    let routes = Arc::new(RouteManager::new(deal));
-    deliver_one_request(&routes, 1).await;
-    let (started, ready) = tokio::sync::oneshot::channel();
-    let release = Arc::new(tokio::sync::Notify::new());
-    *chain.stop_gate.lock().unwrap() = Some((started, release.clone()));
-    let swap = {
-        let routes = routes.clone();
-        tokio::spawn(async move {
-            routes
-                .replace_active(
-                    || panic!("veto must retain the old route"),
-                    "continuity-renewal",
-                )
-                .await
-        })
-    };
-    ready.await.unwrap();
-    session
-        .unresolved_output_usage
-        .store(true, Ordering::SeqCst);
-    release.notify_one();
-    assert!(swap.await.unwrap().is_err());
-    assert!(Arc::ptr_eq(
-        &routes.current().await.unwrap().session,
-        &session
-    ));
-    assert_eq!(chain.stop_calls.load(Ordering::SeqCst), 0);
-    assert_eq!(chain.recovery_stop_calls.load(Ordering::SeqCst), 0);
-    assert!(!session.is_closed());
-    assert!(!session.is_settled());
-}
-
-#[tokio::test]
-async fn review_2146_upstream_resource_exhausted_after_output_must_pause() {
+async fn issue_2266_upstream_resource_exhausted_after_output_keeps_the_deal() {
     // A whole answer is forwarded only once it is complete, so only a stream can stop after output.
     for path in ["/v1/chat/completions", "/v1/responses"] {
         let mode = Arc::new(AtomicU8::new(3));
@@ -656,14 +576,13 @@ async fn review_2146_upstream_resource_exhausted_after_output_must_pause() {
             "must render before oversized frame: {body}"
         );
         assert!(body.contains("error") || body.contains("response.failed"));
-        assert!(deal.session.unresolved_usage_rejection().is_some());
         assert!(!body.contains("\"capacity\""), "{body}");
         let calls = harness.seller.calls();
         mode.store(3, Ordering::SeqCst);
         let (status, body) = ask(&harness, &store, path, true).await;
-        assert_eq!(status, http::StatusCode::SERVICE_UNAVAILABLE, "{body}");
-        assert!(body.contains("upstream_usage_unresolved"));
-        assert_eq!(harness.seller.calls(), calls);
+        assert_eq!(status, http::StatusCode::OK, "{body}");
+        assert!(body.contains("OK"), "{body}");
+        assert!(harness.seller.calls() > calls);
         assert_eq!(harness.chain.foreign_money_calls(), 0);
         assert!(!deal.session.is_closed());
         harness.shutdown().await;
@@ -674,333 +593,6 @@ async fn review_2146_upstream_resource_exhausted_after_output_must_pause() {
         capacity.is_capacity(),
         "genuine seller capacity remains request scoped"
     );
-}
-
-#[tokio::test]
-async fn review_2146_remaining_exit_pause_race() {
-    let chain = Arc::new(RecordingSettleChain::default());
-    let prototype = heartbeat_test_deal();
-    let session = Arc::new(SessionSettle::new(
-        chain.clone(),
-        prototype.route.token_contract.clone(),
-        prototype.session.note.clone(),
-    ));
-    let deal = ApiDeal::new(
-        prototype.route.clone(),
-        session.clone(),
-        Arc::new(ContentGate::skip()),
-    );
-    let routes = RouteManager::new(deal);
-    deliver_one_request(&routes, 1).await;
-    let lock = session.settle_lock.lock().await;
-    let mut exit = Box::pin(session.settle_on_exit("shutdown"));
-    assert!(matches!(
-        futures::poll!(exit.as_mut()),
-        std::task::Poll::Pending
-    ));
-    session
-        .unresolved_output_usage
-        .store(true, Ordering::SeqCst);
-    drop(lock);
-    let settled = exit.await.unwrap();
-    assert!(
-        !settled,
-        "shutdown STOP landed after unresolved pause: stop_calls={}",
-        chain.stop_calls.load(Ordering::SeqCst)
-    );
-    assert_eq!(chain.stop_calls.load(Ordering::SeqCst), 0);
-    assert!(!session.is_closed());
-}
-
-#[tokio::test]
-async fn review_2146_remaining_verification_bail_pause_race() {
-    let chain = Arc::new(RecordingSettleChain::default());
-    let prototype = heartbeat_test_deal();
-    let session = Arc::new(SessionSettle::new(
-        chain.clone(),
-        prototype.route.token_contract.clone(),
-        prototype.session.note.clone(),
-    ));
-    let lock = session.settle_lock.lock().await;
-    let mut bail = Box::pin(session.settle_verification_bail("verify-bail"));
-    assert!(matches!(
-        futures::poll!(bail.as_mut()),
-        std::task::Poll::Pending
-    ));
-    session
-        .unresolved_output_usage
-        .store(true, Ordering::SeqCst);
-    drop(lock);
-    let settled = bail.await;
-    assert!(
-        !settled,
-        "verification bail STOP landed after unresolved pause: stop_calls={}",
-        chain.stop_calls.load(Ordering::SeqCst)
-    );
-    assert_eq!(chain.stop_calls.load(Ordering::SeqCst), 0);
-    assert!(
-        session.is_closed(),
-        "known verification bail must still block admission"
-    );
-    assert!(!session.is_settled());
-    assert_eq!(session.terminal_action(), None);
-}
-
-#[tokio::test]
-async fn review_2146_remaining_automatic_stop_preflight_and_control() {
-    for verification in [false, true] {
-        for pause in [false, true] {
-            let chain = Arc::new(RecordingSettleChain::default());
-            let prototype = heartbeat_test_deal();
-            let session = Arc::new(SessionSettle::new(
-                chain.clone(),
-                prototype.route.token_contract.clone(),
-                prototype.session.note.clone(),
-            ));
-            let deal = ApiDeal::new(
-                prototype.route.clone(),
-                session.clone(),
-                Arc::new(ContentGate::skip()),
-            );
-            let routes = RouteManager::new(deal);
-            deliver_one_request(&routes, 1).await;
-            let dir = tempfile::tempdir().unwrap();
-            let path = dir.path().join("usage.sqlite3");
-            let store = Arc::new(UsageStore::open(&path, "test-network").unwrap());
-            store
-                .open_deal_quota(&session.token_contract, 3, 1)
-                .unwrap();
-            session.usage_quota.set(store).unwrap();
-            let (started, mut ready) = tokio::sync::oneshot::channel();
-            let release = Arc::new(tokio::sync::Notify::new());
-            *chain.stop_gate.lock().unwrap() = Some((started, release.clone()));
-            let mut stop = Box::pin(async {
-                if verification {
-                    session.settle_verification_bail("verification-bail").await
-                } else {
-                    session.settle_on_exit("shutdown").await.unwrap()
-                }
-            });
-            assert!(matches!(
-                futures::poll!(stop.as_mut()),
-                std::task::Poll::Pending
-            ));
-            ready
-                .try_recv()
-                .expect("automatic STOP entered transaction preflight");
-            session
-                .unresolved_output_usage
-                .store(pause, Ordering::SeqCst);
-            release.notify_one();
-            assert_eq!(stop.await, !pause);
-            assert_eq!(
-                chain.stop_calls.load(Ordering::SeqCst)
-                    + chain.recovery_stop_calls.load(Ordering::SeqCst),
-                usize::from(!pause)
-            );
-            assert_eq!(session.is_closed(), verification || !pause);
-            assert_eq!(session.is_settled(), !pause);
-            if pause {
-                assert_eq!(session.terminal_action(), None);
-                assert_eq!(session.recovery_episode(), None);
-                let closed: bool = rusqlite::Connection::open(&path)
-                    .unwrap()
-                    .query_row(
-                        "SELECT closed FROM deal_quota WHERE deal_id=?1",
-                        [&session.token_contract],
-                        |row| row.get(0),
-                    )
-                    .unwrap();
-                assert!(!closed, "a veto must preserve the durable quota");
-            }
-        }
-    }
-}
-
-#[tokio::test]
-async fn review_2146_remaining_binding_failure_rejects_before_paid_work() {
-    for verification in [false, true] {
-        for (endpoint, native) in [
-            ("/v1/chat/completions", false),
-            ("/v1/responses", false),
-            ("/v1/messages", true),
-        ] {
-            let mode = Arc::new(AtomicU8::new(1));
-            let (upstream, task) = provider(mode, native).await;
-            let harness = if verification {
-                weekly_route_harness_gated(
-                    0,
-                    true,
-                    SUB_WEEK_LEN.as_secs(),
-                    UNCONSTRAINED_UPSTREAM,
-                    ContentGate::probe(
-                        "dexdo-mock".into(),
-                        probe_models(
-                            "identity probe",
-                            "http://127.0.0.1:1/v1",
-                            "DEXDO_2144_UNUSED_REFERENCE",
-                        ),
-                    ),
-                    upstream,
-                )
-                .await
-            } else {
-                harness(upstream, SessionLifetimePolicy::SettleOnExit).await
-            };
-            let deal = harness.deals.current().await.unwrap();
-            let dir = tempfile::tempdir().unwrap();
-            let path = dir.path().join("usage.sqlite3");
-            let store = Arc::new(UsageStore::open(&path, "test-network").unwrap());
-            let connection = rusqlite::Connection::open(&path).unwrap();
-            connection.execute_batch("CREATE TRIGGER lose_binding BEFORE UPDATE OF deal_id ON requests BEGIN SELECT RAISE(FAIL,'binding write failed'); END;").unwrap();
-            let (status, body) = ask(&harness, &store, endpoint, true).await;
-            assert_eq!(status, http::StatusCode::SERVICE_UNAVAILABLE, "{body}");
-            assert!(body.contains("usage_unavailable"), "{body}");
-            assert_eq!(
-                harness.seller.calls(),
-                0,
-                "binding must precede paid verification and answer"
-            );
-            assert_eq!(deal.billable_tokens(), 0);
-            assert_eq!(harness.chain.foreign_money_calls(), 0);
-            assert!(!deal.session.is_closed());
-            let (bound, finished, complete): (Option<String>, Option<i64>, bool) = connection
-                .query_row(
-                    "SELECT deal_id,finished_at,history_complete FROM requests",
-                    [],
-                    |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
-                )
-                .unwrap();
-            assert!(bound.is_none());
-            assert!(
-                finished.is_some(),
-                "rejected admission has no uncertain work"
-            );
-            assert!(complete);
-            let reopened = Arc::new(UsageStore::open(&path, "test-network").unwrap());
-            reopened.recover_interrupted_requests().unwrap();
-            assert!(!reopened
-                .has_unresolved_output_usage(&deal.route.token_contract)
-                .unwrap());
-            // A real restart binds the resumed session to the reopened store's runtime.
-            let resumed = Arc::new(SessionSettle::new(
-                harness.chain.clone(),
-                deal.route.token_contract.clone(),
-                deal.session.note.clone(),
-            ));
-            resumed.usage_quota.set(reopened.clone()).unwrap();
-            *harness.deals.active.write().await = Some(ApiDeal::new(
-                deal.route.clone(),
-                resumed,
-                deal.content_gate.clone(),
-            ));
-            // Successful binding restores admission, and partial work is now visible after restart.
-            connection
-                .execute_batch("DROP TRIGGER lose_binding;")
-                .unwrap();
-            let (status, body) = ask(&harness, &reopened, endpoint, true).await;
-            if verification {
-                assert_eq!(status, http::StatusCode::BAD_GATEWAY, "{body}");
-                assert!(
-                    body.contains("model identity verification failed"),
-                    "{body}"
-                );
-            } else {
-                assert!(body.contains("partial"), "{body}");
-            }
-            assert!(harness.seller.calls() > 0);
-            let recovered = Arc::new(UsageStore::open(&path, "test-network").unwrap());
-            recovered.recover_interrupted_requests().unwrap();
-            // The probe is a whole request, and the seller withholds a whole answer without usage:
-            // the failed verification delivered nothing, so nothing is left unresolved.
-            assert_eq!(
-                recovered
-                    .has_unresolved_output_usage(&deal.route.token_contract)
-                    .unwrap(),
-                !verification,
-                "{endpoint}"
-            );
-            if verification {
-                harness.shutdown().await;
-                task.abort();
-                continue;
-            }
-            let resumed = Arc::new(SessionSettle::new(
-                harness.chain.clone(),
-                deal.route.token_contract.clone(),
-                deal.session.note.clone(),
-            ));
-            resumed.usage_quota.set(recovered.clone()).unwrap();
-            *harness.deals.active.write().await = Some(ApiDeal::new(
-                deal.route.clone(),
-                resumed.clone(),
-                deal.content_gate.clone(),
-            ));
-            let calls = harness.seller.calls();
-            assert_eq!(
-                ask(&harness, &recovered, endpoint, false).await.0,
-                http::StatusCode::SERVICE_UNAVAILABLE
-            );
-            assert_eq!(harness.seller.calls(), calls);
-            assert!(!resumed.settle_on_exit("shutdown").await.unwrap());
-            assert!(!resumed.settle_verification_bail("verification-bail").await);
-            assert_eq!(harness.chain.foreign_money_calls(), 0);
-            assert!(!resumed.is_closed());
-            harness.shutdown().await;
-            task.abort();
-        }
-    }
-}
-
-#[tokio::test]
-async fn review_2146_remaining_automatic_terminal_lock_waits_recheck_pause() {
-    for kind in 0..4 {
-        let chain = Arc::new(RecordingSettleChain::default());
-        let session = SessionSettle::new_with_verification_bail_action(
-            chain.clone(),
-            "tc-automatic".into(),
-            Arc::new(dexdo_core::LocalNote::generate()),
-            VerificationBailAction::Dispute,
-        );
-        let lock = session.settle_lock.lock().await;
-        let heartbeat = unchanged_heartbeat();
-        let mut terminal = Box::pin(async {
-            match kind {
-                0 => session
-                    .recover_cleanup_unopened(true)
-                    .await
-                    .unwrap()
-                    .is_some(),
-                1 => session
-                    .recover_reclaim_opened(&heartbeat, true)
-                    .await
-                    .unwrap()
-                    .is_some(),
-                2 => {
-                    session
-                        .policy_dispute("seller_stalls_mid_stream", "dispute", "test")
-                        .await
-                }
-                _ => session.settle_verification_bail("test").await,
-            }
-        });
-        assert!(matches!(
-            futures::poll!(terminal.as_mut()),
-            std::task::Poll::Pending
-        ));
-        session
-            .unresolved_output_usage
-            .store(true, Ordering::SeqCst);
-        drop(lock);
-        assert!(!terminal.await);
-        assert_eq!(chain.stop_calls.load(Ordering::SeqCst), 0);
-        assert_eq!(chain.recovery_stop_calls.load(Ordering::SeqCst), 0);
-        assert_eq!(chain.dispute_calls.load(Ordering::SeqCst), 0);
-        assert_eq!(chain.cleanup_unopened_calls.load(Ordering::SeqCst), 0);
-        assert_eq!(session.is_closed(), kind == 3);
-        assert!(!session.is_settled());
-        assert_eq!(session.recovery_episode(), None);
-    }
 }
 
 #[tokio::test]
@@ -1057,8 +649,6 @@ async fn review_2146_verification_admission_across_lock_preflight_and_result() {
         ("lock", "stop", false),
         ("preflight", "stop", false),
         ("result", "stop", false),
-        ("lock", "pause", false),
-        ("preflight", "pause", true),
         ("preflight", "failure", false),
         ("preflight", "ambiguous", false),
         ("preflight", "cancel", false),
@@ -1139,11 +729,7 @@ async fn review_2146_verification_admission_across_lock_preflight_and_result() {
         assert_eq!(harness.seller.calls(), before_calls);
         assert_eq!(deal.billable_tokens(), before_paid);
         assert!(!session.is_settled());
-        if outcome == "pause" {
-            // Same production pause setter, modelling uncertainty from already admitted work.
-            let mut running = deal.begin_request(unix_now_secs());
-            running.pause_unresolved_usage();
-        } else if outcome == "stop" {
+        if outcome == "stop" {
             // New accepted output alone must not cancel a known verification verdict.
             deal.record_accepted_output(unix_now_secs());
         }
@@ -1158,7 +744,7 @@ async fn review_2146_verification_admission_across_lock_preflight_and_result() {
         assert_eq!(settled, outcome == "stop");
         assert_eq!(
             chain.recovery_stop_calls.load(Ordering::SeqCst),
-            usize::from(!matches!(outcome, "pause" | "cancel"))
+            usize::from(outcome != "cancel")
         );
         assert_eq!(chain.stop_calls.load(Ordering::SeqCst), 0);
         assert_eq!(session.is_settled(), settled);
@@ -1178,19 +764,7 @@ async fn review_2146_verification_admission_across_lock_preflight_and_result() {
         for stream in [false, true] {
             for endpoint in ["/v1/chat/completions", "/v1/responses", "/v1/messages"] {
                 let (status, body) = ask(&harness, &store, endpoint, stream).await;
-                assert_eq!(
-                    status,
-                    if outcome == "pause" {
-                        http::StatusCode::SERVICE_UNAVAILABLE
-                    } else {
-                        http::StatusCode::GONE
-                    },
-                    "{body}"
-                );
-                if outcome == "pause" {
-                    assert!(body.contains("upstream_usage_unresolved"));
-                    assert!(body.contains("read_only_reconciliation"));
-                }
+                assert_eq!(status, http::StatusCode::GONE, "{body}");
             }
         }
         assert_eq!(harness.seller.calls(), before_calls);
@@ -1219,122 +793,102 @@ async fn review_2146_verification_admission_across_lock_preflight_and_result() {
 
 #[tokio::test]
 async fn review_2146_admitted_verification_waiters_recheck_before_paid_work() {
-    for pause in [false, true] {
-        for cached_pass in [false, true] {
-            let (upstream, task) = provider(Arc::new(AtomicU8::new(3)), false).await;
-            let harness = harness(upstream, SessionLifetimePolicy::SettleOnExit).await;
-            let original = harness.deals.current().await.unwrap();
-            let chain = Arc::new(RecordingSettleChain::default());
-            chain.set_deal_state(opened_deal_state(3_000_000_000, 0));
-            *chain.purchase_terms.lock().unwrap() = Some((3, 1_000_000_000));
-            let session = Arc::new(SessionSettle::new(
-                chain.clone(),
-                original.route.token_contract.clone(),
-                original.session.note.clone(),
-            ));
-            let mut deal = ApiDeal::new(
-                original.route.clone(),
-                session.clone(),
-                Arc::new(ContentGate::skip()),
-            );
-            *harness.deals.active.write().await = Some(deal.clone());
-            let dir = tempfile::tempdir().unwrap();
-            let store = Arc::new(
-                UsageStore::open(dir.path().join("usage.sqlite3"), "test-network").unwrap(),
-            );
-            assert_eq!(
-                ask(&harness, &store, "/v1/chat/completions", false).await.0,
-                http::StatusCode::OK
-            );
-            let gate = Arc::new(ContentGate::probe(
-                "dexdo-mock".into(),
-                probe_models_expecting(
-                    "probe",
-                    "OK",
-                    "http://127.0.0.1:1/v1",
-                    "DEXDO_2144_NO_REFERENCE",
-                ),
-            ));
-            deal.content_gate = gate.clone();
-            *harness.deals.active.write().await = Some(deal.clone());
-            let before_calls = harness.seller.calls();
-            let before_paid = deal.billable_tokens();
-            // Hold the initializer permit so the real HTTP request is admitted but cannot start B8.
-            let (initialize, completed) = tokio::sync::oneshot::channel::<()>();
-            let mut initializer = Box::pin(gate.verdict.get_or_try_init(|| async {
-                completed.await.unwrap();
-                Ok::<Result<(), String>, String>(Ok(()))
-            }));
-            assert!(matches!(
-                futures::poll!(initializer.as_mut()),
-                std::task::Poll::Pending
-            ));
-            let (sender, _receiver) = tokio::sync::mpsc::unbounded_channel();
-            let state = direct_state_with_deliveries(&harness, sender).with_usage(store.clone());
-            let mut waiter = Box::pin(router(state).oneshot(http::Request::post("/v1/chat/completions")
+    for cached_pass in [false, true] {
+        let (upstream, task) = provider(Arc::new(AtomicU8::new(3)), false).await;
+        let harness = harness(upstream, SessionLifetimePolicy::SettleOnExit).await;
+        let original = harness.deals.current().await.unwrap();
+        let chain = Arc::new(RecordingSettleChain::default());
+        chain.set_deal_state(opened_deal_state(3_000_000_000, 0));
+        *chain.purchase_terms.lock().unwrap() = Some((3, 1_000_000_000));
+        let session = Arc::new(SessionSettle::new(
+            chain.clone(),
+            original.route.token_contract.clone(),
+            original.session.note.clone(),
+        ));
+        let mut deal = ApiDeal::new(
+            original.route.clone(),
+            session.clone(),
+            Arc::new(ContentGate::skip()),
+        );
+        *harness.deals.active.write().await = Some(deal.clone());
+        let dir = tempfile::tempdir().unwrap();
+        let store =
+            Arc::new(UsageStore::open(dir.path().join("usage.sqlite3"), "test-network").unwrap());
+        assert_eq!(
+            ask(&harness, &store, "/v1/chat/completions", false).await.0,
+            http::StatusCode::OK
+        );
+        let gate = Arc::new(ContentGate::probe(
+            "dexdo-mock".into(),
+            probe_models_expecting(
+                "probe",
+                "OK",
+                "http://127.0.0.1:1/v1",
+                "DEXDO_2144_NO_REFERENCE",
+            ),
+        ));
+        deal.content_gate = gate.clone();
+        *harness.deals.active.write().await = Some(deal.clone());
+        let before_calls = harness.seller.calls();
+        let before_paid = deal.billable_tokens();
+        // Hold the initializer permit so the real HTTP request is admitted but cannot start B8.
+        let (initialize, completed) = tokio::sync::oneshot::channel::<()>();
+        let mut initializer = Box::pin(gate.verdict.get_or_try_init(|| async {
+            completed.await.unwrap();
+            Ok::<Result<(), String>, String>(Ok(()))
+        }));
+        assert!(matches!(
+            futures::poll!(initializer.as_mut()),
+            std::task::Poll::Pending
+        ));
+        let (sender, _receiver) = tokio::sync::mpsc::unbounded_channel();
+        let state = direct_state_with_deliveries(&harness, sender).with_usage(store.clone());
+        let mut waiter = Box::pin(router(state).oneshot(http::Request::post("/v1/chat/completions")
                 .header(http::header::CONTENT_TYPE, "application/json")
                 .body(Body::from(serde_json::json!({"model":"dexdo-mock","messages":[{"role":"user","content":"question"}],"max_tokens":4}).to_string())).unwrap()));
-            assert!(matches!(
-                futures::poll!(waiter.as_mut()),
-                std::task::Poll::Pending
-            ));
-            assert_eq!(deal.active_requests.load(Ordering::SeqCst), 1);
-            assert_eq!(harness.seller.calls(), before_calls);
-            let release = Arc::new(tokio::sync::Notify::new());
-            let (started, mut ready) = tokio::sync::oneshot::channel();
-            *chain.stop_gate.lock().unwrap() = Some((started, release.clone()));
-            let mut bail = Box::pin(session.settle_verification_bail("verify-bail"));
-            if pause {
-                let mut running = deal.begin_request(unix_now_secs());
-                running.pause_unresolved_usage();
-            } else {
-                assert!(matches!(
-                    futures::poll!(bail.as_mut()),
-                    std::task::Poll::Pending
-                ));
-                ready
-                    .try_recv()
-                    .expect("verification STOP is held in preflight");
-            }
-            if cached_pass {
-                initialize.send(()).unwrap();
-                assert!(initializer.await.unwrap().is_ok());
-            } else {
-                drop(initializer);
-                drop(initialize);
-            }
-            let response = tokio::time::timeout(Duration::from_secs(5), waiter)
-                .await
-                .expect("waiter must reject without upstream/settlement waits")
-                .unwrap();
-            let status = response.status();
-            let body = axum::body::to_bytes(response.into_body(), usize::MAX)
-                .await
-                .unwrap();
-            let body = String::from_utf8(body.to_vec()).unwrap();
-            assert_eq!(
-                status,
-                if pause {
-                    http::StatusCode::SERVICE_UNAVAILABLE
-                } else {
-                    http::StatusCode::GONE
-                },
-                "{body}"
-            );
-            if pause {
-                assert!(body.contains("upstream_usage_unresolved"), "{body}");
-            }
-            assert_eq!(harness.seller.calls(), before_calls);
-            assert_eq!(deal.billable_tokens(), before_paid);
-            if pause {
-                drop(bail);
-            } else {
-                release.notify_one();
-                assert!(bail.await);
-            }
-            harness.shutdown().await;
-            task.abort();
+        assert!(matches!(
+            futures::poll!(waiter.as_mut()),
+            std::task::Poll::Pending
+        ));
+        assert_eq!(deal.active_requests.load(Ordering::SeqCst), 1);
+        assert_eq!(harness.seller.calls(), before_calls);
+        let release = Arc::new(tokio::sync::Notify::new());
+        let (started, mut ready) = tokio::sync::oneshot::channel();
+        *chain.stop_gate.lock().unwrap() = Some((started, release.clone()));
+        let mut bail = Box::pin(session.settle_verification_bail("verify-bail"));
+
+        assert!(matches!(
+            futures::poll!(bail.as_mut()),
+            std::task::Poll::Pending
+        ));
+        ready
+            .try_recv()
+            .expect("verification STOP is held in preflight");
+        if cached_pass {
+            initialize.send(()).unwrap();
+            assert!(initializer.await.unwrap().is_ok());
+        } else {
+            drop(initializer);
+            drop(initialize);
         }
+        let response = tokio::time::timeout(Duration::from_secs(5), waiter)
+            .await
+            .expect("waiter must reject without upstream/settlement waits")
+            .unwrap();
+        let status = response.status();
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let body = String::from_utf8(body.to_vec()).unwrap();
+        assert_eq!(status, http::StatusCode::GONE, "{body}");
+
+        assert_eq!(harness.seller.calls(), before_calls);
+        assert_eq!(deal.billable_tokens(), before_paid);
+
+        release.notify_one();
+        assert!(bail.await);
+        harness.shutdown().await;
+        task.abort();
     }
 }
 

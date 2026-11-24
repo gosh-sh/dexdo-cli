@@ -139,6 +139,7 @@ async fn producer_429_retries_identical_signed_provision_message() {
             &boc,
             false,
             Some(crate::address::DEXDO_DAPP_ID),
+            SubmitKind::Ordinary,
             &mut possibly_dispatched,
         )
         .await;
@@ -256,6 +257,7 @@ async fn producer_429_retries_stop_at_the_existing_attempt_budget() {
             &boc,
             false,
             Some(crate::address::DEXDO_DAPP_ID),
+            SubmitKind::Ordinary,
             &mut possibly_dispatched,
         )
         .await;

@@ -102,11 +102,8 @@ async fn issue_1773_signalled_watcher_returns_instead_of_hanging() {
     );
 
     match outcome.expect("a stopped watch reports an outcome rather than an error") {
-        dexdo::seller::liveness::RestingSellerOutcome::Stopped { reason, .. } => assert!(
-            matches!(
-                reason,
-                dexdo::seller::liveness::RestingStopReason::Shutdown
-            ),
+        PoolWatchOutcome::Stopped { reason, .. } => assert!(
+            matches!(reason, dexdo::seller::liveness::RestingStopReason::Shutdown),
             "a watcher stopped by the pool's signal must say so: {reason:?}"
         ),
         other => panic!("expected a Stopped outcome for a fired stop, got {other:?}"),

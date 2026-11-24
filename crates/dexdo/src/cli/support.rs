@@ -248,7 +248,7 @@ pub(crate) fn note_owner_secret_for(
     owner_secret_from_pool(note_addr, pool, command, what, KeyFlag::Available)
 }
 
-/// The same lookup for a command that has NO key flag at all.
+/// Look up a note that must use its recorded key from the pool.
 
 /// `deploy-market` names its note by address and by nothing else, so every refusal on this
 /// path must stop offering `--note-key` -- following that advice there gives `unexpected argument`.
@@ -260,10 +260,11 @@ pub(crate) fn note_owner_secret_for(
 /// the function that takes one and get the wrong refusal, because there is nothing to pass.
 pub(crate) fn note_owner_secret_from_pool_only(
     note_addr: &str,
+    pool: Option<&std::path::Path>,
     command: &str,
     what: &str,
 ) -> Result<zeroize::Zeroizing<String>> {
-    owner_secret_from_pool(note_addr, None, command, what, KeyFlag::None)
+    owner_secret_from_pool(note_addr, pool, command, what, KeyFlag::None)
 }
 
 /// Whether the calling command exposes a key flag, which is what its refusals may point at.
@@ -1502,11 +1503,11 @@ pub(crate) fn read_secret_hex(path: &std::path::Path, what: &str) -> Result<Stri
     Ok(s)
 }
 
-/// Real seller backend + the seller's `RealNote`: from the `--note-key` seed + `--note-addr` (the
-/// mint-specific address of the provisioned note) and `model_hash` from `--model`. Directive: the note
-/// self-funds deploy gas from ECC[2] and its bond from the balance record -- no operator wallet.
+/// Real seller backend and signer for the note that owns this deal.
 pub(crate) fn seller_real_backend_with_deal_gas_overhead(
     args: &SellerArgs,
+    note_addr: &str,
+    note_secret: &str,
     market_frame_model: Option<&str>,
     market_nonce: Option<u64>,
     registry_frame_model: Option<&str>,
@@ -1553,23 +1554,6 @@ pub(crate) fn seller_real_backend_with_deal_gas_overhead(
     };
     let frame_model = &require_model_name(frame_model, source, fix)?;
     check_market_model_match(market_frame_model, frame_model, name)?;
-    let note_addr = require_note_addr(
-        &args.identity,
-        "a real chain seller",
-        "the note it sells from",
-    )?;
-    // From `--note-key` where it was passed, and otherwise from the pool entry for THIS note --
-    // the one settled a line above. Re-resolving would offer the pool a second time, and a key from
-    // one note under the address of another is a signature that cannot verify.
-    let note_secret = note_owner_secret_for(
-        args.identity.note_key.as_deref(),
-        &note_addr,
-        // The seller takes no `--pool`: the pool is the one the data directory names, which is
-        // where `note deploy` wrote this note in the first place.
-        None,
-        "a real chain seller",
-        "note owner key",
-    )?;
     // The manifest path comes from the environment now. The flag it used to
     // come from is gone, and with it the case where an operator typed something
     // unprintable -- what is left is a path this process was handed, which still has
@@ -1594,16 +1578,21 @@ pub(crate) fn seller_real_backend_with_deal_gas_overhead(
     })?;
     let (backend, rn) = dexdo_core::RealSellerBackend::from_provisioned_with_deal_gas_overhead(
         manifest,
-        &note_addr,
-        &note_secret,
+        note_addr,
+        note_secret,
         frame_model,
         nonce,
         deal_gas_overhead_raw,
     )?;
-    let chain: Arc<dyn ChainBackend> = Arc::new(backend.with_offer_journal_dir(
-        crate::cli::deals::resolve_deals_dir(args.deals_dir.as_deref())?.join("seller-watch"),
-    ));
     let note: Arc<dyn Note> = Arc::new(rn);
+    let chain: Arc<dyn ChainBackend> = Arc::new(
+        backend
+            .with_signing_note(note.clone())
+            .with_offer_journal_dir(
+                crate::cli::deals::resolve_deals_dir(args.deals_dir.as_deref())?
+                    .join("seller-watch"),
+            ),
+    );
     Ok((chain, note))
 }
 
@@ -1708,6 +1697,7 @@ where
 
 pub(crate) async fn provision_replacement_seller_with_deal_gas_overhead(
     args: &SellerArgs,
+    (note_addr, secret): (&str, &str),
     frame_model: &str,
     nonce: u64,
     price_per_tick: u64,
@@ -1716,19 +1706,6 @@ pub(crate) async fn provision_replacement_seller_with_deal_gas_overhead(
 ) -> Result<(dexdo_core::MarketManifest, Arc<dyn ChainBackend>)> {
     use dexdo_core::{KeyPair, RealChainBackend, RealSellerBackend, TICK_SIZE};
 
-    let note_addr = require_note_addr(
-        &args.identity,
-        "a real chain residual provisioning",
-        "the note",
-    )?;
-    let note_addr = note_addr.as_str();
-    let secret = note_owner_secret_for(
-        args.identity.note_key.as_deref(),
-        note_addr,
-        None,
-        "a real chain residual provisioning",
-        "note owner key",
-    )?;
     // The manifest path comes from the environment now. The flag it used to
     // come from is gone, and with it the case where an operator typed something
     // unprintable -- what is left is a path this process was handed, which still has
@@ -1748,6 +1725,7 @@ pub(crate) async fn provision_replacement_seller_with_deal_gas_overhead(
         supplied_deal_gas_overhead_raw,
     )
     .map_err(anyhow::Error::msg)?;
+    let signing_note = Arc::new(dexdo_core::RealNote::from_secret_hex(secret)?);
     let keys = KeyPair::from_secret_hex(secret.trim())
         .map_err(|e| anyhow::anyhow!("--note-key (SDK secret hex): {e:?}"))?;
     let note = dexdo_core::address::parse_chain_address(note_addr)
@@ -1787,6 +1765,7 @@ pub(crate) async fn provision_replacement_seller_with_deal_gas_overhead(
     )
     .await?;
     let per_deploy = prepare_fresh_provision_deposit(target_active, || async {
+        chain.assert_note_can_post_sell_offer(&note).await?;
         let deposit_shells = if supplied_deal_gas_overhead_raw.is_none() {
             default_deposit_shells(max_ticks)
         } else {
@@ -1937,6 +1916,7 @@ pub(crate) async fn provision_replacement_seller_with_deal_gas_overhead(
             TICK_SIZE,
             supplied_deal_gas_overhead_raw,
         )
+        .with_signing_note(signing_note)
         .with_offer_journal_dir(
             crate::cli::deals::resolve_deals_dir(args.deals_dir.as_deref())?.join("seller-watch"),
         ),
@@ -2225,7 +2205,7 @@ pub(crate) fn resolve_market_fields(
 
 /// The same rule the models config follows -- a file the operator produced is looked for where they
 /// produced it, rather than demanded on the command line.
-fn market_manifest_lying_about() -> Option<std::path::PathBuf> {
+pub(crate) fn market_manifest_lying_about() -> Option<std::path::PathBuf> {
     let name = dexdo_core::params::DEFAULT_MARKET_MANIFEST_OUTPUT_PATH;
     crate::cli::data_dir::explicit()
         .map(|root| root.join(name))

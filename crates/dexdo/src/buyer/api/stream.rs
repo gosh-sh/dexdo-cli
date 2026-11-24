@@ -10,25 +10,29 @@ use tokio_stream::StreamExt;
 
 pub(super) enum StreamError {
     Upstream(tonic::Status),
+    Interrupted(tonic::Status),
+    AnswerInterrupted(tonic::Status),
     Local(String),
 }
 
 impl StreamError {
+    pub(super) fn protocol_error(message: impl Into<String>) -> Self {
+        Self::Interrupted(tonic::Status::data_loss(message))
+    }
+
     pub(super) fn policy_action(&self, received: u64) -> super::StreamErrorPolicyAction {
-        if let Self::Upstream(status) = self {
-            if let Some(started) = dexdo_proto::upstream_output_started(status) {
-                return if started || received > 0 {
-                    super::StreamErrorPolicyAction::ReconcileUsage
-                } else {
-                    super::StreamErrorPolicyAction::RequestScoped
-                };
-            }
-        }
-        if received == 0 && self.is_retryable_upstream() {
+        if matches!(self, Self::Interrupted(_) | Self::AnswerInterrupted(_))
+            || matches!(self, Self::Upstream(status) if dexdo_proto::upstream_output_started(status).is_some())
+            || received == 0 && self.is_retryable_upstream()
+        {
             super::StreamErrorPolicyAction::RequestScoped
         } else {
             super::stream_error_policy_action(self.policy_message(), received)
         }
+    }
+
+    pub(super) fn answer_interrupted(&self) -> bool {
+        matches!(self, Self::AnswerInterrupted(_))
     }
 
     pub(super) fn is_retryable_upstream(&self) -> bool {
@@ -49,7 +53,9 @@ impl StreamError {
 
     pub(super) fn policy_message(&self) -> &str {
         match self {
-            Self::Upstream(status) => status.message(),
+            Self::Upstream(status)
+            | Self::Interrupted(status)
+            | Self::AnswerInterrupted(status) => status.message(),
             Self::Local(message) => message,
         }
     }
@@ -64,7 +70,9 @@ impl From<String> for StreamError {
 impl std::fmt::Display for StreamError {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::Upstream(status) => status.fmt(formatter),
+            Self::Upstream(status)
+            | Self::Interrupted(status)
+            | Self::AnswerInterrupted(status) => status.fmt(formatter),
             Self::Local(message) => formatter.write_str(message),
         }
     }
@@ -158,33 +166,50 @@ impl FrameDriver {
                 self.upstream.next().await
             }
         };
-        next.transpose().map_err(StreamError::Upstream)
+        next.transpose().map_err(|status| {
+            let output_started = dexdo_proto::upstream_output_started(&status);
+            if self.head_status.is_some() && !self.success() {
+                StreamError::AnswerInterrupted(status)
+            } else if self.saw_usage || !self.held.is_empty() {
+                StreamError::Interrupted(status)
+            } else if output_started == Some(true)
+                || (self.head_status.is_none() && super::super::open_stream_interrupted(&status))
+                || (self.success()
+                    && output_started.is_none()
+                    && status.code() != tonic::Code::ResourceExhausted)
+            {
+                StreamError::AnswerInterrupted(status)
+            } else {
+                StreamError::Upstream(status)
+            }
+        })
     }
 
     /// The provider's response head, which the seller sends first.
     #[allow(clippy::result_large_err)]
     pub(super) async fn head(&mut self) -> Result<ResponseHead, StreamError> {
-        match self.recv().await? {
+        let invalid = match self.recv().await? {
             Some(StreamFrame {
-                head: Some(head), ..
-            }) if (200..=299).contains(&head.status) || (400..=599).contains(&head.status) => {
-                self.head_status = Some(head.status);
-                Ok(head)
+                head: Some(head),
+                data,
+                usage,
+            }) => {
+                if !data.is_empty() || usage.is_some() {
+                    "the seller sent content with the response head".to_string()
+                } else if (200..=299).contains(&head.status) || (400..=599).contains(&head.status) {
+                    self.head_status = Some(head.status);
+                    return Ok(head);
+                } else {
+                    format!(
+                        "the seller stated response status {}, which is not an answer or an error",
+                        head.status
+                    )
+                }
             }
-            Some(StreamFrame {
-                head: Some(head), ..
-            }) => Err(format!(
-                "the seller stated response status {}, which is not an answer or an error",
-                head.status
-            )
-            .into()),
-            Some(_) => Err("the seller sent content before the response head"
-                .to_string()
-                .into()),
-            None => Err("the seller's stream ended before the response head"
-                .to_string()
-                .into()),
-        }
+            Some(_) => "the seller sent content before the response head".to_string(),
+            None => "the seller's stream ended before the response head".to_string(),
+        };
+        Err(StreamError::protocol_error(invalid))
     }
 
     fn success(&self) -> bool {
@@ -197,55 +222,47 @@ impl FrameDriver {
             Ok(Some(frame)) => frame,
             Ok(None) if self.saw_usage || !self.success() => return FrameNext::End,
             Ok(None) => {
-                return FrameNext::Errored(
-                    "response stream ended without terminal billing usage"
-                        .to_string()
-                        .into(),
-                )
+                return FrameNext::Errored(StreamError::protocol_error(
+                    "response stream ended without terminal billing usage",
+                ))
             }
             Err(error) => return FrameNext::Errored(error),
         };
         if self.saw_usage {
-            return FrameNext::Errored(
-                "response content followed terminal billing usage"
-                    .to_string()
-                    .into(),
-            );
+            return FrameNext::Errored(StreamError::protocol_error(
+                "response content followed terminal billing usage",
+            ));
         }
         if frame.head.is_some() {
-            return FrameNext::Errored(
-                "the seller stated a second response head"
-                    .to_string()
-                    .into(),
-            );
+            return FrameNext::Errored(StreamError::protocol_error(
+                "the seller stated a second response head",
+            ));
         }
         if let Some(usage) = frame.usage {
+            if !frame.data.is_empty() {
+                return FrameNext::Errored(StreamError::protocol_error(
+                    "the seller sent content with terminal billing usage",
+                ));
+            }
             if let Err(error) = usage.validate() {
-                return FrameNext::Errored(error.to_string().into());
+                return FrameNext::Errored(StreamError::protocol_error(error));
             }
             if !self.success() {
-                return FrameNext::Errored(
-                    "terminal billing usage follows no successful response"
-                        .to_string()
-                        .into(),
-                );
+                return FrameNext::Errored(StreamError::protocol_error(
+                    "terminal billing usage follows no successful response",
+                ));
             }
             if usage.billable_tokens() > self.billing_grant {
-                return FrameNext::Errored(
-                    format!(
-                        "terminal billable usage {} exceeds billing grant {}",
-                        usage.billable_tokens(),
-                        self.billing_grant
-                    )
-                    .into(),
-                );
+                return FrameNext::Errored(StreamError::protocol_error(format!(
+                    "terminal billable usage {} exceeds billing grant {}",
+                    usage.billable_tokens(),
+                    self.billing_grant
+                )));
             }
             if usage.output_tokens == 0 {
-                return FrameNext::Errored(
-                    "terminal billing usage has no preceding delivered output"
-                        .to_string()
-                        .into(),
-                );
+                return FrameNext::Errored(StreamError::protocol_error(
+                    "terminal billing usage has no preceding delivered output",
+                ));
             }
             self.saw_usage = true;
             return FrameNext::Usage(usage);
@@ -259,14 +276,16 @@ impl FrameDriver {
         }
         let complete = match self.frames.push(&frame.data) {
             Ok(complete) => complete,
-            Err(error) => return FrameNext::Errored(error.to_string().into()),
+            Err(error) => {
+                return FrameNext::Errored(StreamError::protocol_error(error.to_string()))
+            }
         };
         let (mut output, mut text) = (0, 0);
         let mut terminal = !self.held.is_empty();
         for complete in complete {
             let parsed = match parse_frame(self.format, &complete.text) {
                 Ok(parsed) => parsed,
-                Err(error) => return FrameNext::Errored(error.into()),
+                Err(error) => return FrameNext::Errored(StreamError::protocol_error(error)),
             };
             terminal |= matches!(parsed, Frame::Done);
             let Frame::Event { value, facts } = parsed else {
@@ -284,11 +303,9 @@ impl FrameDriver {
         }
         if terminal {
             if self.held.len() + frame.data.len() > UPSTREAM_RESPONSE_BODY_MAX_BYTES {
-                return FrameNext::Errored(
-                    "the provider's terminal frames exceed the buyer's response size limit"
-                        .to_string()
-                        .into(),
-                );
+                return FrameNext::Errored(StreamError::protocol_error(
+                    "the provider's terminal frames exceed the buyer's response size limit",
+                ));
             }
             self.held.extend_from_slice(&frame.data);
             return FrameNext::Data {

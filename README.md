@@ -169,7 +169,6 @@ This matters most for the seller. Its readiness components are `info` records:
 ```text
 component="gateway_task" status="pass"
 component="advertised_gateway" status="pass"
-component="upstream_authentication_and_model" status="pass"
 ```
 
 A healthy seller prints none of them, so their absence is not a fault. Set
@@ -201,10 +200,17 @@ addresses, keys, prompts or per-deal identifiers.
 | `OTEL_SERVICE_NAME` | `dexdo-seller` | `service.name` resource attribute. |
 | `OTEL_RESOURCE_ATTRIBUTES` | none | Extra resource attributes as `key=value` pairs. Give every seller a unique, stable `service.instance.id`. `role`, `network` and `service.name` set here are ignored. |
 
+A seller is identified the way a buyer is (see Buyer metrics below): the service
+that starts sellers sets `service.namespace`, one value for all of them, and
+`service.instance.id`, a value of its own for each seller. Through a Collector's
+Prometheus exporter they usually become `job` (`<service.namespace>/<service.name>`)
+and `instance`. The Ansible role sets the namespace to the inventory host name
+and the instance to the supervisord program name.
+
 ```sh
 export OTEL_METRICS_EXPORTER=otlp
 export OTEL_EXPORTER_OTLP_METRICS_ENDPOINT=http://127.0.0.1:4317
-export OTEL_RESOURCE_ATTRIBUTES=service.instance.id=seller-west
+export OTEL_RESOURCE_ATTRIBUTES=service.namespace=west,service.instance.id=seller-west
 dexdo seller ...
 ```
 
@@ -220,18 +226,18 @@ Metric names below are OTLP instrument names. A Prometheus exporter in the
 Collector usually rewrites them, for example `dexdo_seller_heartbeat_seconds`
 and `dexdo_seller_upstream_requests_total`; check the exposed names before
 writing alerts. Counters are cumulative. Every metric except
-`heartbeat` and `telemetry.export_failures` carries a `model` label; the label
-table below the metrics says what each label value means.
+`heartbeat`, `note.balance` and `telemetry.export_failures` carries a `model`
+label; the label table below the metrics says what each label value means.
 
 | Metric | Type | Value | Collected at |
 |---|---|---|---|
 | `dexdo.seller.heartbeat` | observable gauge, f64, `s` | Unix time of the collection; no `model` label. | On every export (every `OTEL_METRIC_EXPORT_INTERVAL`, 15 s by default). If it stops advancing, the seller is down, hung, or cannot reach the collector. |
-| `dexdo.seller.health.checks` | counter, u64 | Completed readiness checks. Labels `model`, `component` (`gateway_task`, `advertised_gateway`, `upstream_authentication_and_model`), `outcome` (`pass`, `fail`, `timeout`). | On every readiness check: every 20 s for each watched deal, once per component. |
-| `dexdo.seller.health.duration` | histogram, f64, `s` | Time one readiness check took. Same labels as `health.checks`. Not recorded for `gateway_task`, which is a status flag read with no duration. | On every `advertised_gateway` and `upstream_authentication_and_model` check, every 20 s per watched deal. |
+| `dexdo.seller.health.checks` | counter, u64 | Completed readiness checks. Labels `model`, `component` (`gateway_task`, `advertised_gateway`), `outcome` (`pass`, `fail`, `timeout`). | On every readiness check: every 20 s for each watched deal, once per component. |
+| `dexdo.seller.health.duration` | histogram, f64, `s` | Time one readiness check took. Same labels as `health.checks`. Not recorded for `gateway_task`, which is a status flag read with no duration. | On every `advertised_gateway` check, every 20 s per watched deal. |
 | `dexdo.seller.health.last_check` | observable gauge, f64, `s` | Unix time of the oldest latest check across the watched deals of a `model` and `component`. | From the latest readiness checks, on every export. |
 | `dexdo.seller.health.last_success` | observable gauge, f64, `s` | Unix time of the oldest latest success across those deals; `0` while any of them has never passed. | From the latest readiness checks, on every export. |
 | `dexdo.seller.health.status` | observable gauge, u64 | `1` on the current `state` (`pass`, `fail`, `unknown`), `0` on the other two. `unknown` when a check of a watched deal is older than 120 s; `fail` when any latest outcome is not `pass`. Once the last watched deal of a model has ended, its last result stays. | From the latest readiness checks, on every export. |
-| `dexdo.seller.uptime.status` | observable gauge, u64 | `1` on the current `state` (`pass`, `fail`, `timeout`, `throttled`, `unknown`), `0` on the others. Labels `model`, `component` (`gateway`, `upstream`); independent of whether a deal is active. The advertised gateway self-probe remains in `health.status` (`component=advertised_gateway`). | Gateway task status is sampled on gateway polling; an independent upstream readiness probe runs every 30 s. Stale observations become `unknown`. |
+| `dexdo.seller.uptime.status` | observable gauge, u64 | `1` on the current `state` (`pass`, `fail`, `timeout`, `throttled`, `unknown`), `0` on the others. Labels `model`, `component` (`gateway`, `upstream`); independent of whether a deal is active. The advertised gateway self-probe remains in `health.status` (`component=advertised_gateway`). | Gateway task status is sampled on gateway polling; an independent upstream probe runs per model every five minutes. Stale observations become `unknown`. |
 | `dexdo.seller.uptime.last_check` | observable gauge, f64, `s` | Unix timestamp of the latest uptime check. Labels `model`, `component` (`gateway`, `upstream`). | On every export. |
 | `dexdo.seller.uptime.last_success` | observable gauge, f64, `s` | Unix timestamp of the latest successful uptime check; remains `0` until the component succeeds. Labels `model`, `component`. | On every export. |
 | `dexdo.seller.offer.executable` | observable gauge, f64, `1` | Seller asks seen live on the order book (deadline still ahead) within the last 120 s. `NaN` while any ask of the `model` is unknown. | From the seller's reads of its own asks on the order book, on every export. |
@@ -241,7 +247,7 @@ table below the metrics says what each label value means.
 | `dexdo.seller.offer.recovery_age` | observable gauge, f64, `s` | Seconds since the oldest unresolved offer recovery started; `0` when none. | From the moment an offer post fails until a live ask is seen again, on every export. |
 | `dexdo.seller.offer.isolated` | observable gauge, f64, `1` | Local deal watchers isolated after an error. | When a deal watcher stops on an error or its listener is removed. |
 | `dexdo.seller.offer.events` | counter, u64 | Offer lifecycle transitions. Label `outcome`: `matched`, `expired`, `relisted`, `recovering`, `isolated`. | On each transition of a seller ask. |
-| `dexdo.seller.upstream.requests` | counter, u64 | Logical upstream requests, counted once at the end. Labels `model`, `purpose` (`inference`, `probe`), `backend` (`mock`, `openai`, `anthropic`), `outcome` (`success`, `error`, `cancelled`), `error_class` (`none`, `timeout`, `authentication`, `rate_limit`, `stream_protocol`, `unavailable`, `configuration`, `other`). | When an upstream call ends: buyer inference and readiness probes alike. |
+| `dexdo.seller.upstream.requests` | counter, u64 | Logical upstream requests, counted once at the end. Labels `model`, `purpose` (`inference`, `probe`), `backend` (`mock`, `openai`, `anthropic`), `outcome` (`success`, `error`, `cancelled`), `error_class` (`none`, `timeout`, `authentication`, `rate_limit`, `stream_protocol`, `unavailable`, `configuration`, `other`). | When an upstream call ends: buyer inference and background uptime probes. |
 | `dexdo.seller.upstream.requests.active` | observable gauge, u64 | Number of active upstream requests. Labels `model`, `purpose` (`inference`, `probe`). | While a request is running, on every export. |
 | `dexdo.seller.upstream.duration` | histogram, f64, `s` | Duration of one logical request. Same labels as `upstream.requests`. | When an upstream call ends. |
 | `dexdo.seller.upstream.attempts` | counter, u64 | HTTP attempts started, retries included. Labels `model`, `purpose`, `backend`, `status_class=started`. | On every HTTP attempt to the provider; the mock backend counts one per request. |
@@ -252,6 +258,8 @@ table below the metrics says what each label value means.
 | `dexdo.seller.upstream.output_tokens` | counter, u64 | Output tokens reported for completed inference usage. Labels `model`, `purpose=inference`, `backend`. | When usage is reported by the upstream adapter. |
 | `dexdo.seller.billable_ticks` | counter, f64, no OTLP unit (value is ticks) | Cumulative inference usage accepted by gateway billing (`charged_tokens / TICK_SIZE`), after grant and shared-budget limits. Labels `model`, `purpose=inference`, `backend`. | Once authoritative billing succeeds. |
 | `dexdo.seller.deals.in_progress` | observable gauge, u64 | Number of matched seller deals not yet confirmed terminal. Label `model`; cleared only after an authoritative terminal settlement fact. | On every export. |
+| `dexdo.seller.contract.call.errors` | counter, u64 | Failed calls to contracts. Labels `model`, `error.type`, `contract`, `method`; see Contract call errors below. | When a call fails, once per call. |
+| `dexdo.seller.note.balance` | observable gauge, f64, `{SHELL}` | SHELL on each note that has a deal this seller is working now: an ask it watches or a matched deal not yet settled. The note is the one the deal's record in `<data-dir>/deals/` names. Labels `note`, `pocket`; no `model` label. `NaN` when the read failed, and from the moment the note's last active deal is gone. A note with no active deal is not written. | Read every 60 s, exported on every export. |
 | `dexdo.seller.telemetry.export_failures` | observable counter, u64 | Failed exports to the collector, cumulative; visible after the next successful export. | On each failed export; visible after the next successful one. |
 
 | Label | Values | Meaning |
@@ -259,8 +267,7 @@ table below the metrics says what each label value means.
 | `model` | the market's model name | The model this seller sells, as configured in `models.json` for the market; `mock` for the mock backend. Never taken from a buyer request. |
 | `component` | `gateway_task` | The seller's gateway task inside the process is still running. |
 | | `advertised_gateway` | The seller reaches its own gateway at the address it advertised to buyers, the way a buyer would. |
-| | `upstream_authentication_and_model` | A small real request to the model provider succeeds with the configured key, and the model that answers is the one being sold. |
-| `outcome` on `health.*` | `pass`, `fail`, `timeout` | `fail`: the check got an answer and it was wrong (an error, a refused connection, a different model). `timeout`: no answer within 20 s. |
+| `outcome` on `health.*` | `pass`, `fail`, `timeout` | `fail`: the check got an answer and it was wrong (an error, a refused connection, or the wrong gateway identity). `timeout`: no answer within 20 s. |
 | `state` on `health.status` | `pass`, `fail`, `unknown` | `unknown`: no check of a watched deal in the last 120 s. |
 | `outcome` on `offer.events` | `matched` | A buyer bought the ask. |
 | | `expired` | The ask reached its deadline unsold. |
@@ -283,6 +290,9 @@ table below the metrics says what each label value means.
 | | `other` | Any other failure. |
 | `status_class` | `started` | On `upstream.attempts`: an HTTP attempt began. |
 | | `2xx`, `4xx`, `5xx`, `other` | On `upstream.responses`: the class of the provider's HTTP status; `status_code` carries the exact code. |
+| `note` | `0`, `1`, ... | On `note.balance`: the note's position in the note pool (`DEXDO_PN_POOL`, `pn_pool.json`), counted from 0. Never its address. |
+| `pocket` | `trading` | On `note.balance`: the note's trading balance, the SHELL it buys and sells with (`getDetails`, currency 2). |
+| | `gas` | On `note.balance`: the note account's own ECC[2] SHELL, which pays for its calls. |
 
 A failed or stale chain read is reported as unknown, never as zero: while
 `offer.unknown` is nonzero for a model, `offer.executable` and
@@ -290,6 +300,31 @@ A failed or stale chain read is reported as unknown, never as zero: while
 the last watched deal of a model is sold, its offer series show `0` and its
 health series keep their last result instead of turning `unknown`. A watcher
 that stops does not mean the offer was cancelled.
+
+#### Contract call errors
+
+`dexdo seller` counts every failed call to a contract in
+`dexdo.seller.contract.call.errors`, and `dexdo buyer` in
+`dexdo.buyer.contract.call.errors`. A call is a getter run or a signed message
+sent to a contract; reading an account's balance or its event history is not a
+call. A call is counted once, when it fails: a read the client repeats on its
+own counts once, by its last failure, and a call answered after a repeat is not
+counted. The exit code is not a label, its type is, and no label carries an
+address.
+
+| Label | Values | Meaning |
+|---|---|---|
+| `error.type` | `transport` | The node was not reached or the connection broke: DNS, TCP, TLS, HTTP 5xx. |
+| | `timeout` | The node did not answer a read in time, 20 s per attempt. |
+| | `node_rejected` | The node answered with an error: a GraphQL error, an HTTP 4xx, or a message it refused before executing it. |
+| | `tvm_compute` | The transaction aborted or its compute phase exited non-zero; a getter failed in the TVM. |
+| | `tvm_action` | The action phase returned a non-zero result code, for example no funds for an outbound send. |
+| | `unconfirmed` | The message may have reached the chain, and no result for it was observed in time. |
+| | `decode` | The answer arrived and did not decode: not the JSON or the ABI shape the call expects. |
+| | `client` | The client refused the call before sending it: the message did not encode by its ABI, or the machine clock disagrees with the chain. |
+| `contract` | `TokenContract`, `PrivateNote`, `InferenceOrderBook`, `RootPN`, `RootModel`, `SuperRoot`, `UpdateCustodianMultisigWallet_v2` | The contract called, by its ABI name. `unknown` for a message whose function the client cannot name. |
+| `method` | a function or getter name | For example `getState`, `claimTokens`, `postSellOffer`. `unknown` with `contract=unknown`. |
+| `model` | the model name | Buyer: the model it buys. Seller: the model of the deal whose TokenContract was called; any other call carries the model the seller was started for. |
 
 ### Buyer metrics (OpenTelemetry)
 
@@ -321,8 +356,8 @@ Then start `dexdo buyer` in the same environment as usual.
 
 Names and labels follow the OpenTelemetry semantic conventions:
 `http.server.request.duration` and `rpc.client.call.duration` appear with the
-`dexdo.buyer.` prefix, and each error counter carries the labels of its
-histogram. Every metric also carries `model`, the model this buyer buys, as the
+`dexdo.buyer.` prefix, and each error counter of the local API and of the
+gateway calls carries the labels of its histogram. Every metric also carries `model`, the model this buyer buys, as the
 seller's metrics do. Every retry is its own connection and its own calls.
 
 | Metric | Type | Value | Recorded |
@@ -333,6 +368,7 @@ seller's metrics do. Every retry is its own connection and its own calls.
 | `dexdo.buyer.rpc.client.connect.duration` | histogram, f64, `s` | Time from the start of the TCP connection to a ready HTTP/2 channel, or to the failure. | On every connection, failed or not. |
 | `dexdo.buyer.rpc.client.call.duration` | histogram, f64, `s` | Time of one `GetChallenge` or `OpenStream` call; `OpenStream` is timed to the end of its response stream. | When the call ends. A connection that failed makes no call. |
 | `dexdo.buyer.rpc.client.errors` | counter, u64 | Calls that ended with a gRPC status other than `OK`. | When such a call ends. |
+| `dexdo.buyer.contract.call.errors` | counter, u64 | Failed calls to contracts. Labels `model`, `error.type`, `contract`, `method`, the same as on the seller; see Contract call errors above. | When a call fails, once per call. |
 
 | Label | Metrics | Values |
 |---|---|---|
@@ -347,7 +383,7 @@ seller's metrics do. Every retry is its own connection and its own calls.
 | `tls.alert` | `rpc.client.connect.*` | The TLS alert the gateway sent, by its registry name, for example `handshake_failure`; `_OTHER` for an unassigned code. Only when an alert arrived. |
 | `rpc.system.name` | `rpc.client.call.duration`, `rpc.client.errors` | `grpc`. |
 | `rpc.method` | `rpc.client.call.duration`, `rpc.client.errors` | `dexdo.v1.Gateway/GetChallenge` or `dexdo.v1.Gateway/OpenStream`. |
-| `rpc.response.status_code` | `rpc.client.call.duration`, `rpc.client.errors` | The gRPC status name, `OK`, `CANCELLED`, `INVALID_ARGUMENT`, `RESOURCE_EXHAUSTED`, `UNAVAILABLE`, `DATA_LOSS` and so on, sent by the seller or set by the client. |
+| `rpc.status_code` | `rpc.client.call.duration`, `rpc.client.errors` | The gRPC status name, `OK`, `CANCELLED`, `INVALID_ARGUMENT`, `RESOURCE_EXHAUSTED`, `UNAVAILABLE`, `DATA_LOSS` and so on, sent by the seller or set by the client. |
 | `error.type` | `rpc.client.call.duration`, `rpc.client.errors` | The same status name when it is not `OK`. |
 | `purpose` | `GetChallenge` calls only | `authorize`: the nonce that signs a request; `capabilities`: the once-per-deal query of the paths the seller serves. |
 

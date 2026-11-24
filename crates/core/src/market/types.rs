@@ -810,6 +810,19 @@ pub enum ChainError {
         "claim high-water advanced on-chain to {on_chain}, beyond attempted cumulative {attempted}"
     )]
     ClaimHighWaterResync { attempted: u128, on_chain: u128 },
+    /// The claim was conclusively refused by the contract's settlement window check.
+    #[error("{0}")]
+    ClaimWindowRefused(String),
+    /// TVM refused the claim message's timestamp. Even a confirmed cursor needs a full seller snapshot.
+    #[error("{message}")]
+    ClaimReplayRecovery {
+        message: String,
+        observed: Option<u128>,
+        read_failure: Option<Box<ChainError>>,
+    },
+    /// A decoded claim pipeline contradicts the contract's cumulative accounting invariant.
+    #[error("{0}")]
+    UnsafeClaimState(String),
 }
 
 /// Snapshot of the stream's state in the mock (for e2e acceptance).
@@ -878,6 +891,20 @@ pub struct DealChainState {
     pub dispute_time: u64,
 }
 
+#[derive(Debug, thiserror::Error)]
+pub(crate) enum DealStateDecodeError {
+    #[error("{0}")]
+    Malformed(String),
+    #[error("getState() claim pipeline is not monotonic: tokensFinal={finalized} tokensPending={pending}")]
+    NonMonotonic { finalized: u128, pending: u128 },
+}
+
+impl From<String> for DealStateDecodeError {
+    fn from(message: String) -> Self {
+        Self::Malformed(message)
+    }
+}
+
 impl DealChainState {
     /// The exact `TokenContract.getState()` output field list this decoder is written for, in the
     /// order the compiled ABI declares it. Named once so the shape pin
@@ -901,6 +928,10 @@ impl DealChainState {
 
     /// Strictly decode the exact 13-field `TokenContract.getState()` ABI.
     pub fn decode_getter(value: &Value) -> Result<Self, String> {
+        Self::decode_getter_checked(value).map_err(|error| error.to_string())
+    }
+
+    pub(crate) fn decode_getter_checked(value: &Value) -> Result<Self, DealStateDecodeError> {
         const GETTER: &str = "getState()";
         getter_exact_object(value, GETTER, Self::GET_STATE_FIELDS)?;
 
@@ -922,10 +953,10 @@ impl DealChainState {
         };
 
         if decoded.tokens_final > decoded.tokens_pending {
-            return Err(format!(
-                "{GETTER} claim pipeline is not monotonic: tokensFinal={} tokensPending={}",
-                decoded.tokens_final, decoded.tokens_pending
-            ));
+            return Err(DealStateDecodeError::NonMonotonic {
+                finalized: decoded.tokens_final,
+                pending: decoded.tokens_pending,
+            });
         }
         Ok(decoded)
     }

@@ -23,9 +23,10 @@
 //! Bounds are read per-deal from `TokenContract.getConfig()` so a redeployed contract cannot desync the
 //! driver from what the chain will accept; tests inject short bounds.
 
+use super::gateway::ChainUnavailableAction;
 use dexdo_core::params::{
-    MAX_CLAIM_DELTA, PROBE_SEED_TOKENS, SELLER_TERMINAL_RECEIPT_POLL_INTERVAL,
-    SELLER_TERMINAL_RECEIPT_TIMEOUT,
+    ClaimConfirmationParams, MAX_CLAIM_DELTA, PROBE_SEED_TOKENS,
+    SELLER_TERMINAL_RECEIPT_POLL_INTERVAL,
 };
 use dexdo_core::{
     ChainBackend, ChainError, ClaimBounds, DealChainState, Note, TokenContract,
@@ -112,6 +113,11 @@ impl ClaimDeliveryMeasurement {
 }
 
 pub trait ClaimStateObserver: Send + Sync {
+    /// Wake an idle claim driver after the gateway publishes billable usage or drains a request.
+    fn delivery_changed(&self) -> Option<&tokio::sync::Notify> {
+        None
+    }
+
     /// Publish a retry hint from this driver's actual schedule, without changing admission or writes.
     fn observe_retry_after(&self, _token_contract: &TokenContract, _delay: Duration) {}
 
@@ -139,8 +145,14 @@ pub trait ClaimStateObserver: Send + Sync {
         Ok(())
     }
 
-    /// One-way notification that a required claim-state read exhausted the existing transient-read policy.
-    fn observe_chain_unavailable(&self, _token_contract: &TokenContract, _error: &ChainError) {}
+    /// Report an exhausted chain read and return the configured seller action.
+    fn observe_chain_unavailable(
+        &self,
+        _token_contract: &TokenContract,
+        _error: &ChainError,
+    ) -> ChainUnavailableAction {
+        ChainUnavailableAction::Stop
+    }
 
     /// Read-only event hook at the fresh probe decision. It is deliberately infallible: losing an operator
     /// output sink must never move, suppress, or duplicate a money-path action.
@@ -260,9 +272,9 @@ fn claim_target(delivered: u64, token_budget: u128) -> u128 {
 /// the contract rejects an over-rate claim outright -- an unclamped driver would lose the whole batch
 /// instead of claiming the permitted part of it.
 
-/// The loop ends on a clean external close (buyer STOP / self-destruct), on the deal's ceiling
-/// (`ChainError::Limit`), or once the usage stream is complete and all accepted usage has been claimed and
-/// promoted. Any other failure is a genuine fault and MUST propagate -- never report success.
+/// The loop ends on a clean external close (buyer STOP / self-destruct), or once the usage stream
+/// is complete and all accepted usage has been claimed and promoted. Failed claims retry against
+/// authoritative state, using the same delivery, cap and rate bounds as the first attempt.
 
 /// Seller-only: `seller_note` authorizes the on-chain `claimTokens()`.
 
@@ -419,7 +431,10 @@ pub async fn drive_advance_with_observer(
 
     let claim_state = required_claim_state(chain, token_contract, observer).await?;
     let mut claimed = validated_claim_high_water(token_contract, claim_state, token_budget)?;
+    let mut last_claim_time = claim_state.last_claim_time;
+    let mut offline_claim_started = tokio::time::Instant::now();
     let mut needs_finalize = claim_state.tokens_pending > claim_state.tokens_final;
+    let mut claim_retry_pending = false;
     if claimed > TICK_SIZE {
         tracing::info!(
             event = "seller_claim_high_water_resynced",
@@ -458,24 +473,46 @@ pub async fn drive_advance_with_observer(
                     );
                     waiting_event_emitted = true;
                 }
-                // Newly delivered backlog waits for this idle poll and then the ordinary claim sleep.
-                observer
-                    .observe_retry_after(token_contract, windows.claim_interval.saturating_mul(2));
-                if wait_claim_or_closed(chain, token_contract, windows.claim_interval).await {
+                let delay = if observer.delivery_changed().is_some() {
+                    Duration::ZERO
+                } else {
+                    windows.claim_interval
+                };
+                observer.observe_retry_after(token_contract, delay);
+                if wait_for_delivery_or_close(
+                    chain,
+                    token_contract,
+                    observer,
+                    windows.claim_interval,
+                )
+                .await?
+                {
                     break;
                 }
                 continue;
             }
         }
 
-        // Wait out the minimum interval, which is also what accrues the rate allowance.
-        observer.observe_retry_after(token_contract, windows.claim_interval);
-        tokio::time::sleep(windows.claim_interval).await;
+        tokio::select! {
+            biased;
+            () = wait_for_claim_close(chain, token_contract) => {
+                observer.observe_terminal(token_contract)?;
+                return Ok(claimed);
+            }
+            result = wait_for_claim_interval(
+                chain,
+                token_contract,
+                observer,
+                windows.claim_interval,
+                last_claim_time,
+                offline_claim_started,
+                claim_retry_pending,
+            ) => result?,
+        }
         let deal_delivery_count = delivered.load(Ordering::Acquire);
         let target = claim_target(deal_delivery_count, token_budget);
-        // Claim as much of the delivered backlog as BOTH the elapsed-time rate and hard per-call cap permit.
-        // Anything above the combined allowance stays for the next round rather than being asserted and
-        // rejected.
+        // The observed block can belong to another thread. Base the size on the contract's minimum
+        // interval, which it enforces on the execution block, even when the observed clock is ahead.
 
         // A zero interval is the deterministic test seam: it bypasses only the elapsed-time rate calculation,
         // never the contract's hard one-tick-per-call bound.
@@ -485,12 +522,20 @@ pub async fn drive_advance_with_observer(
             windows.max_claim_delta(windows.claim_interval)
         };
         let next = target.min(claimed.saturating_add(allowance));
-        if next <= claimed {
-            continue;
-        }
         // A final claim can be finalized permissionlessly and destroy the contract.
         // Keep that exhausting claim local until every admitted request has terminated.
-        if next == token_budget && observer.active_requests(token_contract) > 0 {
+        if next <= claimed || (next == token_budget && observer.active_requests(token_contract) > 0)
+        {
+            if wait_for_delivery_or_close(
+                chain,
+                token_contract,
+                observer,
+                SELLER_TERMINAL_RECEIPT_POLL_INTERVAL,
+            )
+            .await?
+            {
+                break;
+            }
             continue;
         }
         let claim_result = chain.claim_tokens(token_contract, seller_note, next).await;
@@ -502,17 +547,13 @@ pub async fn drive_advance_with_observer(
                 cumulative_tokens: Some(next),
             },
         );
-        let submitted_claim = match claim_result {
+        let floor = match claim_result {
             Ok(()) => next,
             Err(ChainError::ClaimHighWaterResync {
                 attempted,
                 on_chain,
             }) => {
-                if attempted != next
-                    || on_chain <= next
-                    || on_chain > target
-                    || on_chain > token_budget
-                {
+                if attempted != next || on_chain <= next || on_chain > target {
                     return Err(ChainError::Chain(format!(
                         "TokenContract {token_contract_display}: invalid claim resync \
                          (attempted={attempted}, expected={next}, onChain={on_chain}, \
@@ -528,42 +569,76 @@ pub async fn drive_advance_with_observer(
                 );
                 on_chain
             }
-            Err(ChainError::Limit(_)) => break, // deal ceiling -- expected exhaustion
-            Err(e) => {
-                // A close can race the claim (buyer STOP between the snapshot and the call); re-check
-                // before surfacing. Otherwise propagate the real error -- do NOT claim success.
-                if deal_closed_observed(chain, token_contract, observer).await? {
-                    break;
-                }
-                return Err(e);
-            }
-        };
-
-        // A successful backend call is confirmed by an authoritative tokensPending read, but that internal
-        // confirmation is not visible to the ordinary-capacity observer. Re-read through the shared state
-        // seam before accepting another request so the just-claimed delivery debt is released locally.
-        let post_claim_state = match required_claim_state(chain, token_contract, observer).await {
-            Ok(state) => state,
             Err(error) => {
-                if deal_closed_observed(chain, token_contract, observer).await?
-                    || buyer_stop_receipt_observed(chain, token_contract, observer).await?
-                {
-                    return Ok(submitted_claim);
+                crate::telemetry::seller_claim_failed(token_contract, next, &error);
+                match error {
+                    ChainError::ClaimReplayRecovery { observed, .. } => {
+                        claimed.max(observed.unwrap_or(claimed))
+                    }
+                    _ => claimed,
                 }
-                return Err(error);
             }
         };
-        let reconciled =
-            validated_claim_high_water(token_contract, post_claim_state, token_budget)?;
-        if reconciled < submitted_claim || reconciled > target {
+        if floor > target {
             return Err(ChainError::Chain(format!(
-                "TokenContract {token_contract_display}: invalid post-claim reconciliation \
-                 (submitted={submitted_claim}, onChain={reconciled}, \
-                 deliveryTarget={target}, budget={token_budget})"
+                "TokenContract {token_contract_display}: invalid claim refusal recovery \
+                 (onChain={floor}, deliveryTarget={target})"
             )));
         }
-        claimed = reconciled;
-        needs_finalize = true;
+
+        // A confirmed submit is a floor, not permission to release capacity from a stale
+        // snapshot. While waiting, keep the route registered and send no further claim.
+        let poll = ClaimConfirmationParams::canonical().poll_interval;
+        let confirmed_claimed = if floor >= next { floor } else { claimed };
+        let (state, on_chain) = loop {
+            match chain.deal_state(token_contract).await {
+                Ok(Some(state)) if state.is_stopped() => {
+                    observer.observe_terminal(token_contract)?;
+                    return Ok(confirmed_claimed);
+                }
+                Ok(Some(state)) => {
+                    let on_chain = validated_claim_high_water(token_contract, state, token_budget)?;
+                    if on_chain > target || (floor < next && on_chain < claimed) {
+                        return Err(ChainError::Chain(format!(
+                            "TokenContract {token_contract_display}: invalid claim reconciliation \
+                             (previous={claimed}, onChain={on_chain}, deliveryTarget={target})"
+                        )));
+                    }
+                    if on_chain >= floor {
+                        break (state, on_chain);
+                    }
+                }
+                Err(error @ ChainError::UnsafeClaimState(_)) => return Err(error),
+                _ => {}
+            }
+            if deal_closed_observed(chain, token_contract, observer).await? {
+                return Ok(confirmed_claimed);
+            }
+            if floor >= next
+                && matches!(
+                    chain.buyer_stop_settlement(token_contract).await,
+                    Ok(Some(_))
+                )
+            {
+                observer.observe_terminal(token_contract)?;
+                return Ok(confirmed_claimed);
+            }
+            observer.observe_retry_after(token_contract, poll);
+            tokio::time::sleep(poll).await;
+        };
+        observer.observe(token_contract, state)?;
+        if on_chain == claimed {
+            observer.observe_retry_after(token_contract, poll);
+            if wait_claim_or_closed(chain, token_contract, poll).await {
+                observer.observe_terminal(token_contract)?;
+                return Ok(claimed);
+            }
+        }
+        claim_retry_pending = on_chain < next;
+        claimed = on_chain;
+        last_claim_time = state.last_claim_time;
+        offline_claim_started = tokio::time::Instant::now();
+        needs_finalize = state.tokens_pending > state.tokens_final;
     }
 
     // The newest claim is still contestable and nothing will supersede it, so without this the last batch
@@ -586,6 +661,87 @@ pub async fn drive_advance_with_observer(
         }
     }
     Ok(claimed)
+}
+
+async fn wait_for_claim_interval(
+    chain: &dyn ChainBackend,
+    token_contract: &TokenContract,
+    observer: &dyn ClaimStateObserver,
+    interval: Duration,
+    last_claim_time: u64,
+    offline_claim_started: tokio::time::Instant,
+    claim_retry_pending: bool,
+) -> Result<(), ChainError> {
+    if interval.is_zero() {
+        return Ok(());
+    }
+    let anchor = Duration::from_secs(last_claim_time);
+    loop {
+        let delay = match chain.observed_chain_timestamp().await {
+            Ok(Some(now)) => {
+                if anchor.is_zero() {
+                    return Err(ChainError::UnsafeClaimState(format!(
+                        "TokenContract {}: accepted probe has no last claim timestamp",
+                        display_token_contract(token_contract)
+                    )));
+                }
+                anchor
+                    .saturating_add(interval)
+                    .saturating_sub(Duration::from_secs(now))
+            }
+            Ok(None) => {
+                let remaining = interval.saturating_sub(offline_claim_started.elapsed());
+                if !remaining.is_zero() {
+                    observer.observe_retry_after(token_contract, remaining);
+                    tokio::time::sleep(remaining).await;
+                }
+                return Ok(());
+            }
+            // A pending claim waits for a usable clock without triggering gateway shutdown.
+            Err(_) if claim_retry_pending => ClaimConfirmationParams::canonical().poll_interval,
+            Err(error) if exhausted_transient_read(&error) => {
+                if observer.observe_chain_unavailable(token_contract, &error)
+                    == ChainUnavailableAction::Stop
+                {
+                    return Err(error);
+                }
+                ClaimConfirmationParams::canonical().poll_interval
+            }
+            Err(error) => return Err(error),
+        };
+        if delay.is_zero() {
+            return Ok(());
+        }
+        observer.observe_retry_after(token_contract, delay);
+        // Recheck the network after sleeping: the local timer does not prove a block has arrived.
+        tokio::time::sleep(delay).await;
+    }
+}
+
+async fn wait_for_claim_close(chain: &dyn ChainBackend, token_contract: &TokenContract) {
+    while !wait_claim_or_closed(chain, token_contract, SELLER_TERMINAL_RECEIPT_POLL_INTERVAL).await
+    {
+    }
+}
+
+async fn wait_for_delivery_or_close(
+    chain: &dyn ChainBackend,
+    token_contract: &TokenContract,
+    observer: &dyn ClaimStateObserver,
+    window: Duration,
+) -> Result<bool, ChainError> {
+    let closed = if let Some(changed) = observer.delivery_changed() {
+        tokio::select! {
+            () = changed.notified() => false,
+            closed = wait_claim_or_closed(chain, token_contract, window) => closed,
+        }
+    } else {
+        wait_claim_or_closed(chain, token_contract, window).await
+    };
+    if closed {
+        observer.observe_terminal(token_contract)?;
+    }
+    Ok(closed)
 }
 
 async fn wait_claim_or_closed(
@@ -630,37 +786,17 @@ async fn deal_closed_observed(
     Ok(closed)
 }
 
-/// Observe the immutable buyer-owned `StreamStopped` receipt that survives a real TokenContract
-/// self-destruct. Account disappearance and receipt indexing are separate reads, so the canonical
-/// terminal-receipt policy retries empty and transient-error reads for its bounded deadline. This fallback
-/// is intentionally separate from getter-based close detection: a missing getter/snapshot without this
-/// exact receipt is not terminal proof and must remain fail-closed.
-async fn buyer_stop_receipt_observed(
-    chain: &dyn ChainBackend,
-    token_contract: &TokenContract,
-    observer: &dyn ClaimStateObserver,
-) -> Result<bool, ChainError> {
-    let stopped = tokio::time::timeout(SELLER_TERMINAL_RECEIPT_TIMEOUT, async {
-        loop {
-            if let Ok(Some(_)) = chain.buyer_stop_settlement(token_contract).await {
-                return true;
-            }
-            tokio::time::sleep(SELLER_TERMINAL_RECEIPT_POLL_INTERVAL).await;
-        }
-    })
-    .await
-    .unwrap_or(false);
-    if stopped {
-        observer.observe_terminal(token_contract)?;
-    }
-    Ok(stopped)
-}
+#[cfg(test)]
+pub(crate) use tests::exercise_claim_retry_metrics;
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use dexdo_core::params::SELLER_TERMINAL_RECEIPT_TIMEOUT;
     use dexdo_core::{
         LocalNote, Match, OfferListing, SellOffer, Settlement, StreamSnapshot, TICK_SIZE,
     };
+    use std::collections::VecDeque;
 
     fn claim_state(
         probe_accepted: bool,
@@ -750,91 +886,79 @@ mod tests {
         }
     }
 
-    /// A fake backend whose `claim_tokens` fails with a **real** chain error (not a terminal condition),
-    /// used to prove `drive_advance` propagates it instead of reporting a successful loop ( money-path
-    /// safety). The stream reports no snapshot, so the failure cannot be mistaken for a close.
-    struct ExplodingBackend;
-
-    #[async_trait::async_trait]
-    impl ChainBackend for ExplodingBackend {
-        async fn discover_offers(&self) -> Result<Vec<OfferListing>, ChainError> {
-            unimplemented!()
-        }
-        async fn post_offer(&self, _: SellOffer, _: &dyn Note) -> Result<(), ChainError> {
-            unimplemented!()
-        }
-        async fn place_buy(&self, _: &TokenContract, _: &dyn Note) -> Result<(), ChainError> {
-            unimplemented!()
-        }
-        async fn read_match(&self, _: &TokenContract) -> Result<Match, ChainError> {
-            unimplemented!()
-        }
-        async fn open_stream(
-            &self,
-            _: &TokenContract,
-            _: Vec<u8>,
-            _: &dyn Note,
-        ) -> Result<(), ChainError> {
-            unimplemented!()
-        }
-        async fn read_handover(&self, _: &TokenContract) -> Result<Option<Vec<u8>>, ChainError> {
-            unimplemented!()
-        }
-        async fn accept_probe(&self, _: &TokenContract) -> Result<(), ChainError> {
-            Ok(())
-        }
-
-        async fn claim_tokens(
-            &self,
-            _: &TokenContract,
-            _: &dyn Note,
-            _: u128,
-        ) -> Result<(), ChainError> {
-            Err(ChainError::Chain("boom".to_string()))
-        }
-        async fn deal_state(
-            &self,
-            _: &TokenContract,
-        ) -> Result<Option<DealChainState>, ChainError> {
-            Ok(Some(claim_state(true, TICK_SIZE, TICK_SIZE)))
-        }
-        async fn stop(&self, _: &TokenContract, _: &dyn Note) -> Result<Settlement, ChainError> {
-            unimplemented!()
-        }
-        async fn snapshot(&self, _: &TokenContract) -> Option<StreamSnapshot> {
-            None
-        }
-    }
-
-    /// A real `claim_tokens` failure must propagate -- NOT be swallowed as a clean terminal condition.
-    /// Otherwise the seller path would report claimed consumption that the chain never recorded.
-    #[tokio::test]
-    async fn drive_advance_propagates_real_claim_error() {
-        let backend = ExplodingBackend;
+    #[tokio::test(start_paused = true)]
+    async fn issue_2266_retries_failed_claims_on_the_same_open_deal() {
+        let backend = RecordingBackend::resumed(TICK_SIZE, TICK_SIZE);
+        let windows = AdvanceWindows::canonical();
+        let chain_unavailable =
+            || ChainError::Transport(CHAIN_READ_EXHAUSTED_MESSAGE_PREFIX.into());
+        backend.claim_failures.lock().unwrap().extend([
+            ChainError::Chain("claim not confirmed".into()),
+            ChainError::AmbiguousSubmit("producer response lost".into()),
+            ChainError::Transport("producer unavailable".into()),
+        ]);
+        backend.clock_reads.lock().unwrap().extend([
+            Ok(Some(1 + windows.claim_interval.as_secs())),
+            Err(chain_unavailable()),
+        ]);
+        backend
+            .replay_reads
+            .lock()
+            .unwrap()
+            .push_back(Err(chain_unavailable()));
         let note = LocalNote::generate();
-        let res = drive_advance(
+        let observer = RecordingStateObserver::default();
+        let delivered = TICK_SIZE + 4;
+        let claimed = drive_advance_with_observer(
             &backend,
-            &"tc-boom".to_string(),
+            &"tc-retry".to_string(),
             &note,
-            instant(),
+            windows,
             4,
             TICK_SIZE as u64,
             true,
-            // The deal's whole usage: four tokens past the tick the chain already holds.
-            Arc::new(AtomicU64::new(TICK_SIZE as u64 + 4)),
-            Arc::new(AtomicBool::new(false)),
+            Arc::new(AtomicU64::new(delivered as u64)),
+            Arc::new(AtomicBool::new(true)),
+            &observer,
         )
-        .await;
-        match res {
-            Err(ChainError::Chain(msg)) => assert_eq!(msg, "boom"),
-            other => panic!("expected propagated Chain(\"boom\"), got {other:?}"),
-        }
+        .await
+        .unwrap();
+        assert_eq!(claimed, delivered);
+        assert_eq!(*backend.attempts.lock().unwrap(), [delivered; 4]);
+        assert_eq!(*backend.claims.lock().unwrap(), [delivered]);
+        assert_eq!(observer.unavailable.load(Ordering::Relaxed), 0);
+    }
+
+    pub(crate) async fn exercise_claim_retry_metrics(tc: &str) {
+        let backend = RecordingBackend::resumed(TICK_SIZE, TICK_SIZE);
+        backend.claim_failures.lock().unwrap().extend([
+            ChainError::Transport("producer offline".into()),
+            ChainError::AmbiguousSubmit("response lost".into()),
+        ]);
+        let delivered = TICK_SIZE + 4;
+        let claimed = drive_advance(
+            &backend,
+            &tc.to_owned(),
+            &LocalNote::generate(),
+            instant(),
+            3,
+            TICK_SIZE as u64,
+            true,
+            Arc::new(AtomicU64::new(delivered as u64)),
+            Arc::new(AtomicBool::new(true)),
+        )
+        .await
+        .unwrap();
+        assert_eq!(claimed, delivered);
+        assert_eq!(backend.attempts(), [delivered; 3]);
+        assert_eq!(backend.claims(), [delivered]);
     }
 
     /// A backend that records every claimed total and succeeds -- used to prove the driver never claims more
     /// than was delivered, and that what it claims is CUMULATIVE.
     struct RecordingBackend {
         attempts: std::sync::Mutex<Vec<u128>>,
+        claim_failures: std::sync::Mutex<VecDeque<ChainError>>,
         claims: std::sync::Mutex<Vec<u128>>,
         finalized: AtomicU64,
         fail_finalize: AtomicBool,
@@ -847,11 +971,17 @@ mod tests {
         closed: AtomicBool,
         state: std::sync::Mutex<DealChainState>,
         resync_to: std::sync::Mutex<Option<u128>>,
+        replay_refusal: std::sync::Mutex<Option<u128>>,
+        replay_reads: std::sync::Mutex<VecDeque<Result<Option<DealChainState>, ChainError>>>,
+        chain_started: Option<tokio::time::Instant>,
+        clock_reads: std::sync::Mutex<VecDeque<Result<Option<u64>, ChainError>>>,
+        confirmation_delay: Duration,
     }
     impl RecordingBackend {
         fn new() -> Self {
             Self {
                 attempts: std::sync::Mutex::new(Vec::new()),
+                claim_failures: std::sync::Mutex::new(VecDeque::new()),
                 claims: std::sync::Mutex::new(Vec::new()),
                 finalized: AtomicU64::new(0),
                 fail_finalize: AtomicBool::new(false),
@@ -864,11 +994,17 @@ mod tests {
                 closed: AtomicBool::new(false),
                 state: std::sync::Mutex::new(claim_state(false, 0, 0)),
                 resync_to: std::sync::Mutex::new(None),
+                replay_refusal: std::sync::Mutex::new(None),
+                replay_reads: std::sync::Mutex::default(),
+                chain_started: None,
+                clock_reads: std::sync::Mutex::default(),
+                confirmation_delay: Duration::ZERO,
             }
         }
         fn resumed(tokens_final: u128, tokens_pending: u128) -> Self {
             Self {
                 attempts: std::sync::Mutex::new(Vec::new()),
+                claim_failures: std::sync::Mutex::new(VecDeque::new()),
                 claims: std::sync::Mutex::new(Vec::new()),
                 finalized: AtomicU64::new(0),
                 fail_finalize: AtomicBool::new(false),
@@ -881,6 +1017,11 @@ mod tests {
                 closed: AtomicBool::new(false),
                 state: std::sync::Mutex::new(claim_state(true, tokens_final, tokens_pending)),
                 resync_to: std::sync::Mutex::new(None),
+                replay_refusal: std::sync::Mutex::new(None),
+                replay_reads: std::sync::Mutex::default(),
+                chain_started: None,
+                clock_reads: std::sync::Mutex::default(),
+                confirmation_delay: Duration::ZERO,
             }
         }
         fn resyncing(on_chain: u128) -> Self {
@@ -974,6 +1115,15 @@ mod tests {
             Ok(())
         }
 
+        async fn observed_chain_timestamp(&self) -> Result<Option<u64>, ChainError> {
+            if let Some(read) = self.clock_reads.lock().unwrap().pop_front() {
+                return read;
+            }
+            Ok(self
+                .chain_started
+                .map(|start| 1 + start.elapsed().as_secs()))
+        }
+
         async fn claim_tokens(
             &self,
             _: &TokenContract,
@@ -981,6 +1131,19 @@ mod tests {
             cumulative: u128,
         ) -> Result<(), ChainError> {
             self.attempts.lock().unwrap().push(cumulative);
+            if let Some(error) = self.claim_failures.lock().unwrap().pop_front() {
+                return Err(error);
+            }
+            if let Some(observed) = self.replay_refusal.lock().unwrap().take() {
+                if self.close_after_claim.load(Ordering::Relaxed) {
+                    self.closed.store(true, Ordering::Release);
+                }
+                return Err(ChainError::ClaimReplayRecovery {
+                    message: "TVM_ERROR exit_code=52".into(),
+                    observed: Some(observed),
+                    read_failure: None,
+                });
+            }
             if let Some(on_chain) = self.resync_to.lock().unwrap().take() {
                 self.state.lock().unwrap().tokens_pending = on_chain;
                 return Err(ChainError::ClaimHighWaterResync {
@@ -988,8 +1151,24 @@ mod tests {
                     on_chain,
                 });
             }
+            {
+                let mut state = self.state.lock().unwrap();
+                if let Some(started) = self.chain_started {
+                    let now = 1 + started.elapsed().as_secs();
+                    let interval = AdvanceWindows::canonical().claim_interval.as_secs();
+                    if now < state.last_claim_time + interval {
+                        return Err(ChainError::ClaimWindowRefused(
+                            "TC window still open".into(),
+                        ));
+                    }
+                    state.last_claim_time = now;
+                }
+                state.tokens_pending = cumulative;
+            }
             self.claims.lock().unwrap().push(cumulative);
-            self.state.lock().unwrap().tokens_pending = cumulative;
+            if !self.confirmation_delay.is_zero() {
+                tokio::time::sleep(self.confirmation_delay).await;
+            }
             if self.close_after_claim.load(Ordering::Relaxed) {
                 self.closed.store(true, Ordering::Release);
             }
@@ -1013,6 +1192,14 @@ mod tests {
         ) -> Result<Option<DealChainState>, ChainError> {
             if self.closed.load(Ordering::Acquire) {
                 return Ok(None);
+            }
+            if !self.attempts.lock().unwrap().is_empty() {
+                if let Some(read) = self.replay_reads.lock().unwrap().pop_front() {
+                    if let Ok(Some(state)) = &read {
+                        *self.state.lock().unwrap() = *state;
+                    }
+                    return read;
+                }
             }
             Ok(Some(*self.state.lock().unwrap()))
         }
@@ -1256,9 +1443,16 @@ mod tests {
         retry_delays: std::sync::Mutex<Vec<Duration>>,
         states: std::sync::Mutex<Vec<DealChainState>>,
         terminals: AtomicU64,
+        delivery: Option<super::super::gateway::DealDelivery>,
+        gateway: Option<Arc<super::super::gateway::GatewayState>>,
+        unavailable: AtomicU64,
     }
 
     impl ClaimStateObserver for RecordingStateObserver {
+        fn delivery_changed(&self) -> Option<&tokio::sync::Notify> {
+            self.delivery.as_ref().map(|delivery| delivery.changed())
+        }
+
         fn observe_retry_after(&self, _: &TokenContract, delay: Duration) {
             self.retry_delays.lock().unwrap().push(delay);
         }
@@ -1268,6 +1462,19 @@ mod tests {
             Ok(())
         }
 
+        fn observe_chain_unavailable(
+            &self,
+            token_contract: &TokenContract,
+            _: &ChainError,
+        ) -> ChainUnavailableAction {
+            self.unavailable.fetch_add(1, Ordering::Relaxed);
+            self.gateway
+                .as_ref()
+                .map_or(ChainUnavailableAction::Stop, |gateway| {
+                    gateway.report_chain_unavailable(token_contract)
+                })
+        }
+
         fn observe_terminal(&self, _: &TokenContract) -> Result<(), ChainError> {
             self.terminals.fetch_add(1, Ordering::Relaxed);
             Ok(())
@@ -1275,7 +1482,120 @@ mod tests {
     }
 
     #[tokio::test(start_paused = true)]
-    async fn retry_after_2231_follows_the_probe_idle_poll_and_claim_sleeps() {
+    async fn claim_replay_recovery_waits_for_state_before_the_next_claim() {
+        let windows = AdvanceWindows::canonical();
+        let poll = ClaimConfirmationParams::canonical().poll_interval;
+        for on_chain in [TICK_SIZE, 2 * TICK_SIZE] {
+            let backend = RecordingBackend::resumed(TICK_SIZE, TICK_SIZE);
+            *backend.replay_refusal.lock().unwrap() = Some(on_chain);
+            backend.replay_reads.lock().unwrap().extend([
+                Err(ChainError::Transport("getter unavailable".into())),
+                Ok(None),
+                Ok(Some(claim_state(true, TICK_SIZE, on_chain))),
+            ]);
+            let observer = RecordingStateObserver::default();
+            let started = tokio::time::Instant::now();
+            let delivered = 2 * TICK_SIZE;
+            let claimed = drive_advance_with_observer(
+                &backend,
+                &"tc".into(),
+                &LocalNote::generate(),
+                windows,
+                4,
+                TICK_SIZE as u64,
+                false,
+                Arc::new(AtomicU64::new(delivered as u64)),
+                Arc::new(AtomicBool::new(true)),
+                &observer,
+            )
+            .await
+            .expect("same deal keeps advancing");
+
+            assert_eq!(claimed, delivered);
+            let mut attempts = vec![delivered];
+            let mut delays = vec![windows.claim_interval, poll, poll];
+            let mut states = vec![TICK_SIZE, TICK_SIZE];
+            if on_chain < delivered {
+                attempts.push(delivered);
+                delays.push(poll);
+                delays.push(windows.claim_interval);
+                states.push(TICK_SIZE);
+                assert_eq!(backend.claims(), vec![delivered]);
+            } else {
+                assert!(backend.claims().is_empty());
+            }
+            states.push(delivered);
+            assert_eq!(backend.attempts(), attempts);
+            assert_eq!(started.elapsed(), delays.iter().sum::<Duration>());
+            assert_eq!(*observer.retry_delays.lock().unwrap(), delays);
+            assert_eq!(
+                observer
+                    .states
+                    .lock()
+                    .unwrap()
+                    .iter()
+                    .map(|s| s.tokens_pending)
+                    .collect::<Vec<_>>(),
+                states
+            );
+            assert_eq!(observer.terminals.load(Ordering::Relaxed), 0);
+        }
+    }
+
+    #[tokio::test]
+    async fn claim_replay_recovery_stops_for_unsafe_or_terminal_state() {
+        for state in [
+            Ok(Some(claim_state(true, TICK_SIZE, TICK_SIZE))),
+            Ok(Some(claim_state(true, TICK_SIZE, 4 * TICK_SIZE))),
+            Err(ChainError::UnsafeClaimState(
+                "non-monotonic pipeline".into(),
+            )),
+            Ok(None),
+        ] {
+            let backend = RecordingBackend::resumed(TICK_SIZE, 2 * TICK_SIZE);
+            *backend.replay_refusal.lock().unwrap() = Some(2 * TICK_SIZE);
+            let terminal = matches!(state, Ok(None));
+            if !terminal {
+                backend.replay_reads.lock().unwrap().push_back(state);
+            } else {
+                backend.close_after_claim.store(true, Ordering::Relaxed);
+                backend
+                    .buyer_stop_receipt_after_reads
+                    .store(1, Ordering::Relaxed);
+            }
+            let observer = RecordingStateObserver::default();
+            let result = drive_advance_with_observer(
+                &backend,
+                &"tc".into(),
+                &LocalNote::generate(),
+                instant(),
+                4,
+                TICK_SIZE as u64,
+                true,
+                Arc::new(AtomicU64::new((3 * TICK_SIZE) as u64)),
+                Arc::new(AtomicBool::new(true)),
+                &observer,
+            )
+            .await;
+
+            if terminal {
+                assert_eq!(result.unwrap(), 2 * TICK_SIZE);
+                assert_eq!(observer.terminals.load(Ordering::Relaxed), 1);
+            } else {
+                assert!(matches!(
+                    result,
+                    Err(ChainError::UnsafeClaimState(_)) | Err(ChainError::Chain(_))
+                ));
+                assert_eq!(observer.terminals.load(Ordering::Relaxed), 0);
+            }
+            assert_eq!(backend.attempts(), vec![3 * TICK_SIZE]);
+            assert!(backend.claims().is_empty());
+            assert_eq!(backend.finalized.load(Ordering::Relaxed), 0);
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn retry_after_2231_follows_the_probe_and_idle_poll() {
         let backend = RecordingBackend::new();
         let observer = RecordingStateObserver::default();
         let windows = AdvanceWindows::canonical();
@@ -1306,12 +1626,247 @@ mod tests {
         assert_eq!(claimed, 2 * TICK_SIZE);
         assert_eq!(
             *observer.retry_delays.lock().unwrap(),
-            vec![
-                windows.probe,
-                windows.claim_interval * 2,
-                windows.claim_interval,
-            ]
+            vec![windows.probe, windows.claim_interval]
         );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn claim_2262_uses_block_time_under_continuous_load() {
+        let windows = AdvanceWindows::canonical();
+        let mut backend = RecordingBackend::resumed(TICK_SIZE, TICK_SIZE);
+        let started = tokio::time::Instant::now();
+        backend.chain_started = Some(started);
+        backend.confirmation_delay = Duration::from_secs(10);
+        let observer = RecordingStateObserver::default();
+        let claimed = drive_advance_with_observer(
+            &backend,
+            &"tc".into(),
+            &LocalNote::generate(),
+            windows,
+            4,
+            TICK_SIZE as u64,
+            false,
+            Arc::new(AtomicU64::new((3 * TICK_SIZE) as u64)),
+            Arc::new(AtomicBool::new(true)),
+            &observer,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(claimed, 3 * TICK_SIZE);
+        assert_eq!(backend.attempts(), vec![2 * TICK_SIZE, 3 * TICK_SIZE]);
+        let interval = windows.claim_interval.as_secs();
+        let states = observer.states.lock().unwrap();
+        assert_eq!(states[2].last_claim_time, 1 + interval);
+        assert_eq!(states[3].last_claim_time, 1 + 2 * interval);
+        assert_eq!(
+            started.elapsed(),
+            2 * windows.claim_interval + backend.confirmation_delay
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn claim_2262_wakes_on_delivery_after_the_interval() {
+        use super::super::gateway::{
+            AuthoritativeDeliveryEvent, AuthoritativeDeliveryRecorder, DealDelivery,
+        };
+        use std::num::NonZeroU64;
+
+        let windows = AdvanceWindows::canonical();
+        let mut backend = RecordingBackend::resumed(TICK_SIZE, TICK_SIZE);
+        let started = tokio::time::Instant::now();
+        backend.chain_started = Some(started);
+        let delivery = DealDelivery::default();
+        delivery.count.store(TICK_SIZE as u64, Ordering::Release);
+        let observer = RecordingStateObserver {
+            delivery: Some(delivery.clone()),
+            ..Default::default()
+        };
+        let idle = windows.claim_interval + Duration::from_secs(5);
+        let token_contract = "tc".to_string();
+        let note = LocalNote::generate();
+        let drive = drive_advance_with_observer(
+            &backend,
+            &token_contract,
+            &note,
+            windows,
+            2,
+            TICK_SIZE as u64,
+            false,
+            delivery.count.clone(),
+            delivery.done.clone(),
+            &observer,
+        );
+        let deliver = async {
+            tokio::time::sleep(idle).await;
+            assert!(backend.attempts().is_empty());
+            delivery
+                .record_authoritative_delivery(AuthoritativeDeliveryEvent::Completed(
+                    NonZeroU64::new(TICK_SIZE as u64).unwrap(),
+                ))
+                .unwrap();
+        };
+        let (claimed, ()) = tokio::join!(drive, deliver);
+
+        assert_eq!(claimed.unwrap(), 2 * TICK_SIZE);
+        assert_eq!(backend.attempts(), vec![2 * TICK_SIZE]);
+        assert_eq!(started.elapsed(), idle);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn claim_2262_rereads_the_same_deal_after_ahead_clock_refusal() {
+        let windows = AdvanceWindows::canonical();
+        let poll = ClaimConfirmationParams::canonical().poll_interval;
+        let started = tokio::time::Instant::now();
+        let mut backend = RecordingBackend::resumed(TICK_SIZE, TICK_SIZE);
+        backend.chain_started = Some(started);
+        backend.clock_reads.lock().unwrap().extend([
+            Ok(Some(1 + poll.as_secs())),
+            Ok(Some(1 + windows.claim_interval.as_secs())),
+        ]);
+        let observer = RecordingStateObserver::default();
+        let claimed = drive_advance_with_observer(
+            &backend,
+            &"tc".into(),
+            &LocalNote::generate(),
+            windows,
+            3,
+            TICK_SIZE as u64,
+            false,
+            Arc::new(AtomicU64::new((2 * TICK_SIZE) as u64)),
+            Arc::new(AtomicBool::new(true)),
+            &observer,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(claimed, 2 * TICK_SIZE);
+        assert_eq!(backend.attempts(), vec![2 * TICK_SIZE, 2 * TICK_SIZE]);
+        assert_eq!(backend.claims(), vec![2 * TICK_SIZE]);
+        let states = observer.states.lock().unwrap();
+        assert_eq!(states[2].tokens_pending, TICK_SIZE, "reread after refusal");
+        assert_eq!(
+            states[3].last_claim_time,
+            1 + windows.claim_interval.as_secs()
+        );
+        assert_eq!(started.elapsed(), windows.claim_interval);
+        assert_eq!(observer.terminals.load(Ordering::Relaxed), 0);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn claim_2262_pending_backlog_stops_on_receipt_while_clock_is_stale() {
+        let windows = AdvanceWindows::canonical();
+        let backend = RecordingBackend::resumed(TICK_SIZE, TICK_SIZE);
+        backend
+            .clock_reads
+            .lock()
+            .unwrap()
+            .extend([Ok(Some(1)), Ok(Some(1))]);
+        backend.close_after_claim.store(true, Ordering::Release);
+        backend
+            .buyer_stop_receipt_after_reads
+            .store(1, Ordering::Release);
+        let observer = RecordingStateObserver::default();
+        let tc = "tc".to_owned();
+        let note = LocalNote::generate();
+        let drive = drive_advance_with_observer(
+            &backend,
+            &tc,
+            &note,
+            windows,
+            3,
+            TICK_SIZE as u64,
+            true,
+            Arc::new(AtomicU64::new((2 * TICK_SIZE) as u64)),
+            Arc::new(AtomicBool::new(false)),
+            &observer,
+        );
+        let stop = async {
+            tokio::time::sleep(SELLER_TERMINAL_RECEIPT_POLL_INTERVAL / 2).await;
+            backend.closed.store(true, Ordering::Release);
+        };
+        let (claimed, ()) = tokio::join!(tokio::time::timeout(windows.claim_interval, drive), stop);
+        assert_eq!(
+            claimed
+                .expect("retire before the stale clock wakes")
+                .unwrap(),
+            TICK_SIZE
+        );
+        assert!(backend.attempts().is_empty());
+        assert_eq!(observer.terminals.load(Ordering::Relaxed), 1);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn claim_2262_keep_serving_waits_for_clock_read_recovery_on_same_route() {
+        use super::super::gateway::GatewayState;
+        let windows = AdvanceWindows::canonical();
+        let poll = ClaimConfirmationParams::canonical().poll_interval;
+        let started = tokio::time::Instant::now();
+        let mut backend = RecordingBackend::resumed(TICK_SIZE, TICK_SIZE);
+        backend.chain_started = Some(started);
+        backend
+            .clock_reads
+            .lock()
+            .unwrap()
+            .push_back(Err(ChainError::Transport(
+                CHAIN_READ_EXHAUSTED_MESSAGE_PREFIX.into(),
+            )));
+        let gateway = Arc::new(GatewayState::new());
+        gateway.set_chain_unavailable_action(ChainUnavailableAction::KeepServing);
+        let tc = "tc-clock-recovery".to_owned();
+        let note = LocalNote::generate();
+        gateway
+            .register_stream(
+                &tc,
+                note.pubkey(),
+                1,
+                claim_state(true, TICK_SIZE, TICK_SIZE),
+                dexdo_core::DealSubscription {
+                    deal_flags: 0,
+                    sub_weeks: 0,
+                    week_index: 0,
+                    tokens_per_week: 3 * TICK_SIZE,
+                    funded_tokens: 3 * TICK_SIZE,
+                    tokens_paid: 0,
+                    period_start: 0,
+                    week_base_tokens: 0,
+                },
+            )
+            .unwrap();
+        let capacity = gateway.capacity_snapshot(&tc).unwrap().unwrap();
+        let delivery = gateway.delivery(&tc);
+        delivery
+            .count
+            .store((2 * TICK_SIZE) as u64, Ordering::Release);
+        delivery.done.store(true, Ordering::Release);
+        let observer = RecordingStateObserver {
+            gateway: Some(gateway.clone()),
+            ..Default::default()
+        };
+        let drive = drive_advance_with_observer(
+            &backend,
+            &tc,
+            &note,
+            windows,
+            3,
+            TICK_SIZE as u64,
+            false,
+            delivery.count,
+            delivery.done,
+            &observer,
+        );
+        tokio::pin!(drive);
+        tokio::select! {
+            result = &mut drive => panic!("the active deal was isolated: {result:?}"),
+            () = tokio::time::sleep(poll / 2) => {}
+        }
+        assert_eq!(observer.unavailable.load(Ordering::Relaxed), 1);
+        assert!(backend.attempts().is_empty());
+        assert_eq!(gateway.capacity_snapshot(&tc).unwrap(), Some(capacity));
+
+        assert_eq!(drive.await.unwrap(), 2 * TICK_SIZE);
+        assert_eq!(backend.attempts(), vec![2 * TICK_SIZE]);
+        assert_eq!(started.elapsed(), windows.claim_interval);
     }
 
     #[tokio::test]
@@ -1446,13 +2001,13 @@ mod tests {
         }
         assert!(
             !driver.is_finished(),
-            "one empty receipt read must remain inside the canonical bounded wait"
+            "one empty receipt read must remain inside the coherent readback wait"
         );
-        tokio::time::advance(SELLER_TERMINAL_RECEIPT_POLL_INTERVAL).await;
+        tokio::time::advance(ClaimConfirmationParams::canonical().poll_interval).await;
         tokio::task::yield_now().await;
 
         assert_eq!(driver.await.unwrap().unwrap(), 2 * TICK_SIZE);
-        assert_eq!(backend.buyer_stop_receipt_reads.load(Ordering::Acquire), 3);
+        assert!(backend.buyer_stop_receipt_reads.load(Ordering::Acquire) >= 2);
         assert_eq!(observer.terminals.load(Ordering::Relaxed), 1);
         assert_eq!(backend.finalized.load(Ordering::Relaxed), 0);
     }
@@ -1485,29 +2040,27 @@ mod tests {
         }
         assert!(
             !driver.is_finished(),
-            "a transient receipt read error must remain inside the canonical bounded wait"
+            "a transient receipt read error must remain inside the coherent readback wait"
         );
-        tokio::time::advance(SELLER_TERMINAL_RECEIPT_POLL_INTERVAL).await;
+        tokio::time::advance(ClaimConfirmationParams::canonical().poll_interval).await;
         tokio::task::yield_now().await;
 
         assert_eq!(driver.await.unwrap().unwrap(), 2 * TICK_SIZE);
-        assert_eq!(backend.buyer_stop_receipt_reads.load(Ordering::Acquire), 3);
+        assert!(backend.buyer_stop_receipt_reads.load(Ordering::Acquire) >= 2);
         assert_eq!(observer.terminals.load(Ordering::Relaxed), 1);
         assert_eq!(backend.finalized.load(Ordering::Relaxed), 0);
     }
 
     #[tokio::test(start_paused = true)]
-    async fn missing_post_claim_state_without_terminal_receipt_fails_closed() {
+    async fn issue_2266_post_claim_waits_for_a_delayed_stop_receipt() {
         let backend = Arc::new(RecordingBackend::disappearing_after_claim_without_receipt());
         let observer = Arc::new(RecordingStateObserver::default());
-        let token_contract = "tc-missing-after-claim".to_string();
         let driver_backend = backend.clone();
         let driver_observer = observer.clone();
-        let driver_token_contract = token_contract.clone();
         let driver = tokio::spawn(async move {
             drive_advance_with_observer(
                 driver_backend.as_ref(),
-                &driver_token_contract,
+                &"tc-missing-after-claim".to_string(),
                 &LocalNote::generate(),
                 instant(),
                 2,
@@ -1519,45 +2072,83 @@ mod tests {
             )
             .await
         });
-
         while backend.buyer_stop_receipt_reads.load(Ordering::Acquire) == 0 {
             tokio::task::yield_now().await;
         }
-        assert!(
-            !driver.is_finished(),
-            "a missing receipt must not fail before the canonical bounded wait"
-        );
-        tokio::time::advance(
-            SELLER_TERMINAL_RECEIPT_TIMEOUT - SELLER_TERMINAL_RECEIPT_POLL_INTERVAL,
-        )
-        .await;
-        tokio::task::yield_now().await;
-        assert!(
-            !driver.is_finished(),
-            "a missing receipt must keep polling before the canonical deadline"
-        );
-        tokio::time::advance(SELLER_TERMINAL_RECEIPT_POLL_INTERVAL).await;
-        tokio::task::yield_now().await;
-
-        let error = driver
-            .await
-            .unwrap()
-            .expect_err("missing state without an exact StreamStopped receipt must fail closed");
-
-        assert!(
-            error.to_string().contains("getState returned no data"),
-            "{error}"
-        );
-        assert_eq!(backend.claims(), vec![2 * TICK_SIZE]);
-        assert!(backend.deal_state(&token_contract).await.unwrap().is_none());
-        assert!(backend.snapshot(&token_contract).await.is_none());
-        assert!(backend
-            .buyer_stop_settlement(&token_contract)
-            .await
-            .unwrap()
-            .is_none());
+        let poll = ClaimConfirmationParams::canonical().poll_interval;
+        tokio::time::advance(poll).await;
+        assert!(!driver.is_finished());
+        assert_eq!(backend.attempts(), vec![2 * TICK_SIZE]);
         assert_eq!(observer.terminals.load(Ordering::Relaxed), 0);
+
+        backend
+            .buyer_stop_receipt_after_reads
+            .store(1, Ordering::Release);
+        tokio::time::advance(poll).await;
+        assert_eq!(driver.await.unwrap().unwrap(), 2 * TICK_SIZE);
+        assert_eq!(backend.attempts(), vec![2 * TICK_SIZE]);
+        assert_eq!(observer.terminals.load(Ordering::Relaxed), 1);
         assert_eq!(backend.finalized.load(Ordering::Relaxed), 0);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn issue_2266_confirmed_claim_waits_for_coherent_capacity_without_resubmission() {
+        let backend = RecordingBackend::resumed(TICK_SIZE, TICK_SIZE);
+        let windows = AdvanceWindows::canonical();
+        let poll = ClaimConfirmationParams::canonical().poll_interval;
+        let observer = RecordingStateObserver::default();
+        let stale = claim_state(true, TICK_SIZE, TICK_SIZE);
+        let current = claim_state(true, TICK_SIZE, 2 * TICK_SIZE);
+        backend.replay_reads.lock().unwrap().extend([
+            Err(ChainError::Transport(
+                CHAIN_READ_EXHAUSTED_MESSAGE_PREFIX.into(),
+            )),
+            Ok(Some(stale)),
+            Ok(Some(current)),
+        ]);
+
+        let tc = "tc-readback".to_string();
+        let note = LocalNote::generate();
+        let drive = drive_advance_with_observer(
+            &backend,
+            &tc,
+            &note,
+            windows,
+            4,
+            TICK_SIZE as u64,
+            true,
+            Arc::new(AtomicU64::new((3 * TICK_SIZE) as u64)),
+            Arc::new(AtomicBool::new(true)),
+            &observer,
+        );
+        let check = async {
+            tokio::time::sleep(windows.claim_interval + poll).await;
+            assert_eq!(backend.attempts(), vec![2 * TICK_SIZE]);
+            assert!(observer
+                .states
+                .lock()
+                .unwrap()
+                .iter()
+                .all(|state| state.tokens_pending == TICK_SIZE));
+            assert_eq!(observer.unavailable.load(Ordering::Relaxed), 0);
+        };
+        let (claimed, ()) = tokio::join!(drive, check);
+        assert_eq!(claimed.unwrap(), 3 * TICK_SIZE);
+        assert_eq!(backend.attempts(), vec![2 * TICK_SIZE, 3 * TICK_SIZE]);
+        assert_eq!(
+            *observer.retry_delays.lock().unwrap(),
+            [windows.claim_interval, poll, poll, windows.claim_interval]
+        );
+        assert_eq!(
+            observer
+                .states
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|state| state.tokens_pending == 2 * TICK_SIZE)
+                .count(),
+            1
+        );
     }
 
     struct RejectingStateObserver;
@@ -2247,44 +2838,34 @@ mod tests {
         );
     }
 
-    /// A concurrent/stale on-chain cursor is not delivery evidence for this process. Even when it stays
-    /// within the funded budget, a cursor beyond the current authoritative delivery target must fail closed
-    /// and must never reach finalization.
+    /// A higher cursor beyond accepted delivery or the funded volume must fail before finalization.
     #[tokio::test]
-    async fn higher_claim_readback_beyond_delivery_target_fails_closed() {
-        let b = RecordingBackend::resyncing(3 * TICK_SIZE);
-        let error = drive_advance(
-            &b,
-            &"tc".to_string(),
-            &LocalNote::generate(),
-            instant(),
-            4,
-            TICK_SIZE as u64,
-            true,
-            Arc::new(AtomicU64::new((2 * TICK_SIZE) as u64)),
-            Arc::new(AtomicBool::new(true)),
-        )
-        .await
-        .expect_err("an on-chain cursor beyond accepted billable usage must fail closed");
+    async fn higher_claim_readback_beyond_deal_bounds_fails_closed() {
+        let funded_ticks = 4;
+        for on_chain in [3 * TICK_SIZE, (funded_ticks + 1) * TICK_SIZE] {
+            let b = RecordingBackend::resyncing(on_chain);
+            let error = drive_advance(
+                &b,
+                &"tc".to_string(),
+                &LocalNote::generate(),
+                instant(),
+                funded_ticks,
+                TICK_SIZE as u64,
+                true,
+                Arc::new(AtomicU64::new((2 * TICK_SIZE) as u64)),
+                Arc::new(AtomicBool::new(true)),
+            )
+            .await
+            .expect_err("an on-chain cursor beyond the deal bounds must fail closed");
 
-        assert!(
-            error.to_string().contains("invalid claim resync"),
-            "{error}"
-        );
-        assert!(
-            b.claims().is_empty(),
-            "the stale lower claim was not recorded"
-        );
-        assert_eq!(
-            b.attempts(),
-            vec![2 * TICK_SIZE],
-            "the rejected resync still originated from a one-tick submitted delta"
-        );
-        assert_eq!(
-            b.finalized.load(Ordering::Relaxed),
-            0,
-            "an unproven high-water must never be finalized"
-        );
+            assert!(
+                error.to_string().contains("invalid claim resync"),
+                "{error}"
+            );
+            assert!(b.claims().is_empty());
+            assert_eq!(b.attempts(), vec![2 * TICK_SIZE]);
+            assert_eq!(b.finalized.load(Ordering::Relaxed), 0);
+        }
     }
 
     /// Boundary timing: a ready backlog is not submitted before the configured interval, while equality at

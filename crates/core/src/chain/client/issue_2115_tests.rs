@@ -1,6 +1,6 @@
 fn issue_2115_post() -> SellerPlacement {
     SellerPlacement::new("shellnet", &issue_2115_address('a'), &issue_2115_address('c'),
-        &issue_2115_address('b'), "1".repeat(64), 10)
+        &issue_2115_address('b'), "1".repeat(64), 10, None)
 }
 
 fn issue_2115_address(c: char) -> Address {
@@ -203,7 +203,20 @@ async fn issue_2115_journals_the_exact_signed_message_before_post() {
             let is_post = request.starts_with("POST /v2/messages ");
             let response = if is_post {
                 let saved = SellerPlacement::load(&inspect).unwrap().unwrap();
-                assert_eq!(saved.message_id, external_message_hash(body[0]["body"].as_str().unwrap()).unwrap());
+                let boc = body[0]["body"].as_str().unwrap();
+                assert_eq!(saved.message_id, external_message_hash(boc).unwrap());
+                let signed = tvm_client::abi::decode_message(
+                    local_context().unwrap(),
+                    tvm_client::abi::ParamsOfDecodeMessage {
+                        abi: tvm_client::abi::Abi::Json(PRIVATENOTE_ABI.into()),
+                        message: boc.to_string(),
+                        allow_partial: false,
+                        function_name: Some("postSellOffer".into()),
+                        data_layout: None,
+                    },
+                ).unwrap();
+                assert_eq!(saved.expire_at_unix, signed.header.unwrap().expire);
+                assert!(saved.expire_at_unix.is_some());
                 json!({"result":{}})
             } else {
                 json!({"data":{"blockchain":{"blocks":{"edges":[{"node":{"gen_utime":local_unix_secs().unwrap()}}]}}}})
@@ -212,9 +225,10 @@ async fn issue_2115_journals_the_exact_signed_message_before_post() {
             if is_post { break; }
         }
     });
-    let mut journal = |hash| {
+    let mut journal = |hash, expire| {
         let mut post = issue_2115_post();
         post.message_id = hash;
+        post.expire_at_unix = Some(expire);
         post.save(Some(&path))
     };
     issue_2030_backend(&endpoint).post_sell_offer_with_identity(
@@ -234,7 +248,7 @@ async fn issue_2115_a_journal_write_failure_prevents_posting() {
     let error = issue_2030_backend(&endpoint).post_sell_offer_with_identity(
         &issue_2115_address('a'), &KeyPair::from_secret_hex(&"3a".repeat(32)).unwrap(),
         0, 1, crate::params::MAX_SELL_TTL.as_secs(),
-        &mut |_| Err(anyhow!("journal write failed")),
+        &mut |_, _| Err(anyhow!("journal write failed")),
     ).await.unwrap_err();
     assert!(error.to_string().contains("journal write failed"));
     server.await.unwrap();

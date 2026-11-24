@@ -53,6 +53,10 @@ pub(super) use seller_placement::SellerPlacement;
 mod client_issue_1120_tests;
 
 #[cfg(test)]
+#[path = "client_issue_2245_tests.rs"]
+mod client_issue_2245_tests;
+
+#[cfg(test)]
 #[path = "client_https_refusal_tests.rs"]
 mod client_https_refusal_tests;
 
@@ -87,6 +91,14 @@ mod client_issue_1998_tests;
 #[cfg(test)]
 #[path = "client_issue_2122_tests.rs"]
 mod client_issue_2122_tests;
+
+#[cfg(test)]
+#[path = "client_issue_2206_tests.rs"]
+mod client_issue_2206_tests;
+
+#[cfg(test)]
+#[path = "client_issue_2282_tests.rs"]
+mod client_issue_2282_tests;
 
 #[cfg(test)]
 #[path = "client_producer_rate_limit_tests.rs"]
@@ -305,6 +317,15 @@ pub(super) struct MessagePostResponseDecodeError {
     source: reqwest::Error,
 }
 
+/// A request failed while sending the message POST, before a response was available.
+/// This marker lets claims reconcile without classifying preflight reads as ambiguous submits.
+#[derive(Debug, thiserror::Error)]
+#[error("message POST ended without a response: {source}")]
+pub(super) struct MessagePostRequestError {
+    #[source]
+    source: reqwest::Error,
+}
+
 impl MoneySubmitError {
     pub fn is_ambiguous(&self) -> bool {
         matches!(self, Self::Ambiguous { .. })
@@ -518,6 +539,20 @@ fn getter_u128(v: &Value, key: &str) -> Option<u128> {
     } else {
         s.parse::<u128>().ok()
     }
+}
+
+fn decode_deal_terms(value: &Value) -> Option<(u128, u128, u128)> {
+    Some((
+        getter_u128(value, "tickSize")?,
+        getter_u128(value, "pricePerTick")?,
+        getter_u128(value, "maxTicks")?,
+    ))
+}
+
+pub(super) struct MatchedBuyReserveSnapshot {
+    pub terms: (u128, u128, u128),
+    pub ecc_balance: u128,
+    pub seller_bond_funded: bool,
 }
 
 fn subscription_order_is_active_for_owner(
@@ -946,6 +981,12 @@ fn skipped_check(name: &str, message: &str) -> ChainDoctorCheck {
     }
 }
 
+/// A signed write refused before it was sent because the machine clock and the chain disagree.
+/// The text is the clock check's own message.
+#[derive(Debug, thiserror::Error)]
+#[error("{0}")]
+pub(super) struct ClockSkewRefusal(pub(super) String);
+
 fn clock_skew_check(local_unix: u64, chain_unix: u64) -> ChainDoctorCheck {
     let (skew_secs, direction, permitted_secs) = if local_unix >= chain_unix {
         (local_unix - chain_unix, "ahead of", MAX_CLOCK_AHEAD_SECS)
@@ -1029,18 +1070,24 @@ impl GraphQlBodyError {
     fn is_transient_read(&self) -> bool {
         self.messages.iter().any(|message| {
             message.to_ascii_lowercase().contains("pool timed out")
+                || message == "attempted to acquire a connection on a closed pool"
                 || block_manager_account_read_unavailable(message)
         })
     }
 }
 
-// GraphQL can answer HTTP 200 while its own account read cannot connect to the Block Manager.
+// GraphQL can answer HTTP 200 while its own account-read backend is unavailable.
 // This describes a read that got no chain answer, never a contract result or a money POST.
 fn block_manager_account_read_unavailable(message: &str) -> bool {
     message.starts_with("failed to get account ")
-        && message.contains("error sending request to ")
-        && message.contains("/v2/account?")
-        && message.contains("client error (Connect): tcp connect error: Connection refused")
+        && ((message.contains("error sending request to ")
+            && message.contains("/v2/account?")
+            && message.contains("client error (Connect): tcp connect error: Connection refused"))
+            || message.split_once(": ").is_some_and(|(_, cause)| {
+                cause.starts_with(
+                    "Invalid server response: All BK API endpoints failed; traceparent: ",
+                )
+            }))
 }
 
 impl std::fmt::Display for GraphQlBodyError {
@@ -2826,16 +2873,34 @@ impl std::error::Error for ProvisionAccountReadError {
 
 /// Retrying a read is safe because it is a read: nothing was submitted, so nothing can be submitted
 /// twice. That is why this wraps reads and not the calls that move money.
-pub async fn retry_transient_read<T, F, Fut>(mut call: F) -> Result<T>
+pub async fn retry_transient_read<T, F, Fut>(call: F) -> Result<T>
+where
+    F: FnMut() -> Fut,
+    Fut: std::future::Future<Output = Result<T>>,
+{
+    retry_chain_read(None, call).await
+}
+
+/// Local admission is backpressure, not a failed network attempt.
+pub(super) async fn retry_chain_read<T, F, Fut>(
+    gate: Option<&RequestGate>,
+    mut call: F,
+) -> Result<T>
 where
     F: FnMut() -> Fut,
     Fut: std::future::Future<Output = Result<T>>,
 {
     let started = tokio::time::Instant::now();
+    let mut admission_wait = std::time::Duration::ZERO;
     let budget = crate::params::TRANSIENT_READ_TOTAL_BUDGET;
     let mut delay = crate::params::TRANSIENT_READ_INITIAL_BACKOFF;
 
     for attempt in 1..=crate::params::TRANSIENT_READ_ATTEMPTS {
+        if let Some(gate) = gate {
+            let queued = tokio::time::Instant::now();
+            gate.admit().await;
+            admission_wait += queued.elapsed();
+        }
         let attempt_result =
             tokio::time::timeout(crate::params::TRANSIENT_READ_ATTEMPT_TIMEOUT, call()).await;
         let error = match attempt_result {
@@ -2853,7 +2918,7 @@ where
         };
 
         let wait = retry_after_delay(&error).unwrap_or(delay);
-        let spent = started.elapsed();
+        let spent = started.elapsed().saturating_sub(admission_wait);
         if attempt == crate::params::TRANSIENT_READ_ATTEMPTS || spent + wait >= budget {
             return Err(error.context(format!(
                 "{}{attempt} attempt(s) in {spent:?}",
@@ -2945,26 +3010,26 @@ impl RequestGate {
         };
         let ceiling = usize::try_from(ceiling.max(1)).unwrap_or(1);
         let window = std::time::Duration::from_secs(1);
+        // Tokio's mutex queues waiters in FIFO order. Keep the turn while waiting
+        // for the window, so a fresh poll cannot take an older read's slot.
+        let mut granted = self.granted.lock().await;
         loop {
-            let wait = {
-                let mut granted = self.granted.lock().await;
-                let now = tokio::time::Instant::now();
-                while granted
-                    .front()
-                    .is_some_and(|at| now.saturating_duration_since(*at) >= window)
-                {
-                    granted.pop_front();
-                }
-                if granted.len() < ceiling {
-                    granted.push_back(now);
-                    return;
-                }
-                // The oldest admission in the window decides when a slot frees.
-                let oldest = *granted
-                    .front()
-                    .expect("the window is full, so it is not empty");
-                window.saturating_sub(now.saturating_duration_since(oldest))
-            };
+            let now = tokio::time::Instant::now();
+            while granted
+                .front()
+                .is_some_and(|at| now.saturating_duration_since(*at) >= window)
+            {
+                granted.pop_front();
+            }
+            if granted.len() < ceiling {
+                granted.push_back(now);
+                return;
+            }
+            // The oldest admission in the window decides when a slot frees.
+            let oldest = *granted
+                .front()
+                .expect("the window is full, so it is not empty");
+            let wait = window.saturating_sub(now.saturating_duration_since(oldest));
             tokio::time::sleep(wait.max(std::time::Duration::from_millis(1))).await;
         }
     }
@@ -3045,6 +3110,20 @@ impl LimitedChainClient {
         method: &str,
         args: serde_json::Value,
     ) -> Result<Option<serde_json::Value>> {
+        self.run_getter_unreported(address, abi, method, args)
+            .await
+            .inspect_err(|error| super::call_errors::call_failed(address, abi, method, error))
+    }
+
+    /// One admitted getter run, reported by the caller: a retried read reports once, after its
+    /// last attempt.
+    async fn run_getter_unreported(
+        &self,
+        address: &Address,
+        abi: &str,
+        method: &str,
+        args: serde_json::Value,
+    ) -> Result<Option<serde_json::Value>> {
         self.gate.admit().await;
         run_contract_getter(&self.inner, address, abi, method, args).await
     }
@@ -3118,7 +3197,9 @@ impl RetryingReads for ChainClient {
         method: &str,
         args: serde_json::Value,
     ) -> Result<Option<serde_json::Value>> {
-        retry_transient_read(|| run_contract_getter(self, address, abi, method, args.clone())).await
+        retry_transient_read(|| run_contract_getter(self, address, abi, method, args.clone()))
+            .await
+            .inspect_err(|error| super::call_errors::call_failed(address, abi, method, error))
     }
 
     async fn get_account_retrying(&self, address: &Address) -> Result<Option<Account>> {
@@ -3143,20 +3224,27 @@ impl RetryingReads for LimitedChainClient {
         method: &str,
         args: serde_json::Value,
     ) -> Result<Option<serde_json::Value>> {
-        retry_transient_read(|| self.run_getter(address, abi, method, args.clone())).await
+        retry_chain_read(Some(&self.gate), || {
+            run_contract_getter(&self.inner, address, abi, method, args.clone())
+        })
+        .await
+        .inspect_err(|error| super::call_errors::call_failed(address, abi, method, error))
     }
 
     async fn get_account_retrying(&self, address: &Address) -> Result<Option<Account>> {
-        retry_transient_read(|| self.get_account(address)).await
+        retry_chain_read(Some(&self.gate), || self.inner.get_account(address)).await
     }
 
     async fn get_system_account_retrying(&self, address: &Address) -> Result<Option<Account>> {
         let dapp = Address::parse(&format!("0:{}", crate::address::DEXDO_DAPP_ID))?;
-        retry_transient_read(|| self.get_account_in_dapp(address, &dapp)).await
+        retry_chain_read(Some(&self.gate), || {
+            self.inner.get_account_in_dapp(address, &dapp)
+        })
+        .await
     }
 
     async fn chain_liveness_retrying(&self) -> Result<ChainLiveness> {
-        retry_transient_read(|| self.chain_liveness()).await
+        retry_chain_read(Some(&self.gate), || self.inner.chain_liveness()).await
     }
 }
 
@@ -3262,16 +3350,30 @@ impl DealSnapshotSource for LiveDealSnapshotSource<'_> {
     }
 }
 
+pub(super) fn is_non_monotonic_deal_state(error: &anyhow::Error) -> bool {
+    matches!(
+        error.downcast_ref::<crate::market::DealStateDecodeError>(),
+        Some(crate::market::DealStateDecodeError::NonMonotonic { .. })
+    )
+}
+
 async fn read_deal_snapshot_round<S: DealSnapshotSource + Send>(
     source: &mut S,
 ) -> Result<Option<DealChainSnapshot>> {
     let Some(before) = source.account_identity().await? else {
         return Ok(None);
     };
-    let state = source.state().await?;
-    let subscription = source.subscription().await?;
-    let seller_bond = source.seller_bond().await?;
-    let buyer_bond = source.buyer_bond().await?;
+    let getters = match source.state().await {
+        Ok(state) => Ok((
+            state,
+            source.subscription().await?,
+            source.seller_bond().await?,
+            source.buyer_bond().await?,
+        )),
+        // A contradictory cursor can stop the seller only after the BOC bracket agrees.
+        Err(error) if is_non_monotonic_deal_state(&error) => Err(error),
+        Err(error) => return Err(error),
+    };
     let after = source.account_identity().await?;
 
     if after.as_ref() != Some(&before) {
@@ -3280,6 +3382,7 @@ async fn read_deal_snapshot_round<S: DealSnapshotSource + Send>(
         ));
     }
 
+    let (state, subscription, seller_bond, buyer_bond) = getters?;
     let state =
         state.ok_or_else(|| anyhow!("getState() returned no data for an active contract"))?;
     let subscription = subscription
@@ -3309,6 +3412,7 @@ async fn read_coherent_deal_snapshot<S: DealSnapshotSource + Send>(
     for attempt in 1..=DEAL_SNAPSHOT_MAX_ATTEMPTS {
         match read_deal_snapshot_round(source).await {
             Ok(snapshot) => return Ok(snapshot),
+            Err(error) if is_non_monotonic_deal_state(&error) => return Err(error),
             Err(error) => {
                 last_error = error.context(format!("attempt {attempt}: bracketed read failed"));
             }
@@ -3328,9 +3432,11 @@ mod coherent_deal_snapshot_tests {
     enum Script {
         Stable,
         SubscriptionTimeout,
+        BkAccountUnavailable,
         DestroyAfter(usize),
         MutateAfter(usize),
         MutateEveryRound,
+        NonMonotonicThenMutate,
     }
 
     struct ScriptSource {
@@ -3346,10 +3452,13 @@ mod coherent_deal_snapshot_tests {
         fn observe(&mut self) -> (bool, u64) {
             self.calls += 1;
             match self.script {
-                Script::Stable | Script::SubscriptionTimeout => (true, 0),
+                Script::Stable | Script::SubscriptionTimeout | Script::BkAccountUnavailable => {
+                    (true, 0)
+                }
                 Script::DestroyAfter(last_alive) => (self.calls <= last_alive, 0),
                 Script::MutateAfter(last_old) => (true, u64::from(self.calls > last_old)),
                 Script::MutateEveryRound => (true, ((self.calls - 1) / 5) as u64),
+                Script::NonMonotonicThenMutate => (true, u64::from(self.calls > 2)),
             }
         }
 
@@ -3390,6 +3499,11 @@ mod coherent_deal_snapshot_tests {
     impl DealSnapshotSource for ScriptSource {
         async fn account_identity(&mut self) -> Result<Option<DealAccountIdentity>> {
             let (alive, generation) = self.observe();
+            if matches!(self.script, Script::BkAccountUnavailable) {
+                return Err(client_issue_2206_tests::sdk_error(
+                    &client_issue_2206_tests::bk_unavailable(&"a".repeat(64)),
+                ));
+            }
             Ok(alive.then(|| DealAccountIdentity {
                 code_hash: "code".to_string(),
                 boc_hash: format!("boc-{generation}"),
@@ -3398,6 +3512,13 @@ mod coherent_deal_snapshot_tests {
 
         async fn state(&mut self) -> Result<Option<DealChainState>> {
             let (alive, generation) = self.observe();
+            if matches!(self.script, Script::NonMonotonicThenMutate) && generation == 0 {
+                return Err(crate::market::DealStateDecodeError::NonMonotonic {
+                    finalized: 2 * TICK_SIZE,
+                    pending: TICK_SIZE,
+                }
+                .into());
+            }
             Ok(alive.then(|| Self::state(generation)))
         }
 
@@ -3498,6 +3619,18 @@ mod coherent_deal_snapshot_tests {
         assert_eq!(snapshot.buyer_locked().unwrap(), 102);
     }
 
+    #[tokio::test]
+    async fn coherent_snapshot_retries_non_monotonic_state_if_revision_changed() {
+        let mut source = ScriptSource::new(Script::NonMonotonicThenMutate);
+        let snapshot = read_coherent_deal_snapshot(&mut source)
+            .await
+            .expect("changed revision must retry instead of reporting an unsafe claim state")
+            .expect("the same contract remains active");
+        assert_eq!(source.calls, 3 + 6);
+        assert_eq!(snapshot.account_boc_hash, "boc-1");
+        assert_eq!(snapshot.state, ScriptSource::state(1));
+    }
+
     #[tokio::test(start_paused = true)]
     async fn coherent_snapshot_2129_preserves_a_single_getter_timeout_then_recovers() {
         let mut source = ScriptSource::new(Script::SubscriptionTimeout);
@@ -3514,6 +3647,23 @@ mod coherent_deal_snapshot_tests {
             3 * DEAL_SNAPSHOT_MAX_ATTEMPTS,
             "only subscription fails; account and state reads remain healthy"
         );
+        source.script = Script::Stable;
+        assert!(read_coherent_deal_snapshot(&mut source)
+            .await
+            .unwrap()
+            .is_some());
+    }
+
+    #[tokio::test]
+    async fn issue_2206_coherent_snapshot_preserves_bk_failure_then_recovers() {
+        let mut source = ScriptSource::new(Script::BkAccountUnavailable);
+        let error = read_coherent_deal_snapshot(&mut source)
+            .await
+            .unwrap_err()
+            .context("TokenContract snapshot");
+        assert!(is_transient_read_failure(&error), "{error:#}");
+        assert!(!is_transient_submit_failure(&error));
+        assert_eq!(source.calls, DEAL_SNAPSHOT_MAX_ATTEMPTS);
         source.script = Script::Stable;
         assert!(read_coherent_deal_snapshot(&mut source)
             .await
@@ -4055,8 +4205,15 @@ async fn send_message_checked(
         &account_id,
         &dapp_id,
         None,
+        SubmitKind::Ordinary,
     )
     .await
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(super) enum SubmitKind {
+    Ordinary,
+    Claim,
 }
 
 pub(super) async fn send_message_routed_checked(
@@ -4065,17 +4222,17 @@ pub(super) async fn send_message_routed_checked(
     boc_base64: &str,
     account_id: &str,
     dapp_id: &str,
-    thread_id: Option<&str>,
+    request_id: Option<&str>,
+    kind: SubmitKind,
 ) -> Result<Value> {
+    let account_id = bare_hex(account_id);
+    let account_id_len = account_id.len();
     let mut item = json!({
-        "id": submit_message_id(),
+        "id": request_id.map_or_else(submit_message_id, str::to_owned),
         "body": boc_base64,
-        "account_id": bare_hex(account_id),
+        "account_id": account_id,
         "dapp_id": bare_hex(dapp_id),
     });
-    if let Some(thread_id) = thread_id {
-        item["thread_id"] = json!(bare_hex(thread_id));
-    }
     let mut target = endpoint.to_string();
     for hop in 0..=crate::params::PRODUCER_REDIRECT_MAX_HOPS {
         let response = http
@@ -4083,7 +4240,14 @@ pub(super) async fn send_message_routed_checked(
             .header("Content-Type", "application/json")
             .json(&json!([item.clone()]))
             .send()
-            .await?;
+            .await
+            .map_err(|source| {
+                if source.is_request() && !source.is_connect() {
+                    anyhow::Error::new(MessagePostRequestError { source })
+                } else {
+                    source.into()
+                }
+            })?;
         if response.status().is_redirection() {
             return Err(anyhow!(
                 "chain submit refused HTTP redirect {}",
@@ -4103,11 +4267,15 @@ pub(super) async fn send_message_routed_checked(
             .json::<Value>()
             .await
             .map_err(|source| MessagePostResponseDecodeError { status, source })?;
-        if hop < crate::params::PRODUCER_REDIRECT_MAX_HOPS {
+        if hop < crate::params::PRODUCER_REDIRECT_MAX_HOPS
+            && !is_duplicate_message_response(&resp)
+            && !(kind == SubmitKind::Claim
+                && (is_replay_protection_response(&resp) || is_claim_window_response(&resp)))
+        {
             if let Some(data) = producer_redirect_data(&resp) {
                 target = producer_redirect_endpoint(endpoint, &data)?;
                 if let Some(thread) = data["thread_id"].as_str() {
-                    if thread.len() != bare_hex(account_id).len()
+                    if thread.len() != account_id_len
                         || !thread.bytes().all(|byte| byte.is_ascii_hexdigit())
                     {
                         return Err(anyhow!("producer redirect has invalid thread_id"));
@@ -4124,6 +4292,30 @@ pub(super) async fn send_message_routed_checked(
         return Ok(result);
     }
     unreachable!("the final hop returns its checked response")
+}
+
+fn is_duplicate_message_response(response: &Value) -> bool {
+    response["error"]["code"] == "DUPLICATE_MESSAGE"
+}
+
+fn is_replay_protection_response(response: &Value) -> bool {
+    let refusal = &response["error"];
+    // Solidity's external-message timestamp check runs before claimTokens.
+    refusal["code"] == "TVM_ERROR" && refusal["data"]["exit_code"].as_i64() == Some(52)
+}
+
+fn is_claim_window_response(response: &Value) -> bool {
+    const ERR_SETTLE_WINDOW_OPEN: i64 = 323; // airegistry/modifiers/errors.sol
+    let refusal = &response["error"];
+    if !refusal.is_null() {
+        return refusal["code"] == "TVM_ERROR"
+            && refusal["data"]["exit_code"].as_i64() == Some(ERR_SETTLE_WINDOW_OPEN);
+    }
+    response
+        .pointer("/result/compute/exit_code")
+        .or_else(|| response.pointer("/result/exit_code"))
+        .and_then(Value::as_i64)
+        == Some(ERR_SETTLE_WINDOW_OPEN)
 }
 
 fn producer_redirect_data(response: &Value) -> Option<Value> {
@@ -4245,13 +4437,16 @@ async fn send_message_routed_money_once(
 pub(super) fn is_block_producer_forwarding_timeout(error: &anyhow::Error) -> bool {
     error
         .downcast_ref::<crate::onchain_diagnostics::OnchainSubmitError>()
-        .is_some_and(|error| {
-            let response = &error.sanitized_payload()["error"];
-            response["code"] == "INTERNAL_ERROR"
-                && response["message"].as_str().is_some_and(|message| {
-                    message.starts_with("The message redirection to the Block Producer has failed:")
-                        && message.contains("(source: operation timed out)")
-                })
+        .is_some_and(forwarding_timed_out)
+}
+
+/// The node accepted the message and timed out forwarding it to the block producer.
+pub(super) fn forwarding_timed_out(error: &OnchainSubmitError) -> bool {
+    let response = &error.sanitized_payload()["error"];
+    response["code"] == "INTERNAL_ERROR"
+        && response["message"].as_str().is_some_and(|message| {
+            message.starts_with("The message redirection to the Block Producer has failed:")
+                && message.contains("(source: operation timed out)")
         })
 }
 
@@ -4262,7 +4457,7 @@ fn is_queue_overflow_submit(error: &anyhow::Error) -> bool {
         || message.contains("message queue is full")
 }
 
-fn is_producer_rate_limit_submit(error: &anyhow::Error) -> bool {
+pub(super) fn is_producer_rate_limit_submit(error: &anyhow::Error) -> bool {
     // The manager reports only its final producer HTTP 429, without forwarding history.
     // Money submissions treat it as ambiguous; replay-protected provisioning may retry
     // the same signed BOC. Arbitrary error text or a lost response does not match.
@@ -4286,7 +4481,30 @@ fn is_transient_submit_failure(error: &anyhow::Error) -> bool {
         || is_transient_transport_failure(error)
 }
 
-fn conclusive_sell_refusal(error: &anyhow::Error) -> bool {
+pub(super) fn is_duplicate_message_submit(error: &anyhow::Error) -> bool {
+    error
+        .downcast_ref::<OnchainSubmitError>()
+        .is_some_and(|error| is_duplicate_message_response(error.sanitized_payload()))
+}
+
+pub(super) fn is_claim_replay_refusal(error: &anyhow::Error) -> bool {
+    error
+        .downcast_ref::<OnchainSubmitError>()
+        .is_some_and(|error| is_replay_protection_response(error.sanitized_payload()))
+}
+
+pub(super) fn is_claim_window_refusal(error: &anyhow::Error) -> bool {
+    error
+        .downcast_ref::<OnchainSubmitError>()
+        .is_some_and(|error| is_claim_window_response(error.sanitized_payload()))
+}
+
+pub(super) fn is_transient_claim_submit_failure(error: &anyhow::Error) -> bool {
+    // A later window refusal must not hide an earlier POST that may have landed.
+    conclusive_before_dispatch_refusal(error) && is_transient_submit_failure(error)
+}
+
+fn conclusive_before_dispatch_refusal(error: &anyhow::Error) -> bool {
     if error
         .downcast_ref::<reqwest::Error>()
         .is_some_and(|error| error.is_builder() || error.is_connect())
@@ -4297,12 +4515,23 @@ fn conclusive_sell_refusal(error: &anyhow::Error) -> bool {
         .downcast_ref::<OnchainSubmitError>()
         .is_some_and(|error| {
             let refusal = &error.sanitized_payload()["error"];
-            matches!(
-                refusal["code"].as_str(),
-                Some("INVALID_ARGUMENT" | "QUEUE_OVERFLOW")
-            ) || refusal
-                .as_str()
-                .is_some_and(|text| text.starts_with("QUEUE_OVERFLOW:"))
+            refusal["code"] == "INVALID_ARGUMENT" || queue_overflow_refusal(refusal)
+        })
+}
+
+fn queue_overflow_refusal(refusal: &Value) -> bool {
+    refusal["code"] == "QUEUE_OVERFLOW"
+        || refusal
+            .as_str()
+            .is_some_and(|text| text.starts_with("QUEUE_OVERFLOW:"))
+}
+
+fn is_seller_funding_queue_refusal(error: &anyhow::Error) -> bool {
+    error
+        .downcast_ref::<OnchainSubmitError>()
+        .is_some_and(|error| {
+            error.refusal() == crate::onchain_diagnostics::SubmitRefusal::Node
+                && queue_overflow_refusal(&error.sanitized_payload()["error"])
         })
 }
 
@@ -4321,12 +4550,28 @@ async fn retry_buyer_money_submit(
     account_id: &str,
     dapp_id: &str,
 ) -> Result<Value> {
+    retry_rejected_money_submit(
+        boc_base64,
+        || send_message_routed_money_once(http, endpoint, boc_base64, account_id, dapp_id),
+        is_decoded_transient_money_rejection,
+    )
+    .await
+}
+
+async fn retry_rejected_money_submit<Submit, Fut>(
+    boc_base64: &str,
+    mut submit: Submit,
+    retryable_refusal: fn(&anyhow::Error) -> bool,
+) -> Result<Value>
+where
+    Submit: FnMut() -> Fut,
+    Fut: std::future::Future<Output = Result<Value>>,
+{
     let mut delay = crate::params::TRANSIENT_SUBMIT_INITIAL_BACKOFF;
     for attempt in 1..=crate::params::TRANSIENT_SUBMIT_RETRIES_BEFORE_FINAL {
-        match send_message_routed_money_once(http, endpoint, boc_base64, account_id, dapp_id).await
-        {
+        match submit().await {
             Ok(value) => return Ok(value),
-            Err(error) if is_decoded_transient_money_rejection(&error) => {
+            Err(error) if retryable_refusal(&error) => {
                 eprintln!(
                     "chain transient submit error (attempt {attempt}): {error}; waiting {delay:?} then retrying"
                 );
@@ -4334,10 +4579,15 @@ async fn retry_buyer_money_submit(
                 delay = (delay * crate::params::TRANSIENT_SUBMIT_BACKOFF_MULTIPLIER)
                     .min(crate::params::TRANSIENT_SUBMIT_MAX_BACKOFF);
             }
-            Err(error) => return Err(error),
+            Err(error) => {
+                super::call_errors::message_failed(boc_base64, &error);
+                return Err(error);
+            }
         }
     }
-    send_message_routed_money_once(http, endpoint, boc_base64, account_id, dapp_id).await
+    submit()
+        .await
+        .inspect_err(|error| super::call_errors::message_failed(boc_base64, error))
 }
 
 /// Submit an explicit buyer STOP exactly once. A decoded queue-overflow response is still
@@ -4349,14 +4599,17 @@ async fn send_explicit_stop_money_once(
     account_id: &str,
     dapp_id: &str,
 ) -> Result<Value> {
-    match send_message_routed_money_once(http, endpoint, boc_base64, account_id, dapp_id).await {
+    let sent = match send_message_routed_money_once(http, endpoint, boc_base64, account_id, dapp_id)
+        .await
+    {
         Err(error) if is_queue_overflow_submit(&error) => {
             Err(anyhow::Error::new(MoneySubmitError::Ambiguous {
                 source: error,
             }))
         }
         result => result,
-    }
+    };
+    sent.inspect_err(|error| super::call_errors::message_failed(boc_base64, error))
 }
 
 #[cfg(test)]
@@ -5397,9 +5650,9 @@ pub(super) async fn fetch_ext_out_page(
     // batch 1: this pager is the half of the live path that stayed unmetered. It dials through
     // our own reqwest client, so no amount of `.client()` conversion reaches it -- the gate has to be
     // handed in. One page, one admission.
-    gate.admit().await;
-    let gql = format!("{}/graphql", endpoint.trim_end_matches('/'));
-    let query = r#"
+    retry_chain_read(Some(gate), || async {
+        let gql = format!("{}/graphql", endpoint.trim_end_matches('/'));
+        let query = r#"
         query($accountId: String!, $dappId: String!, $last: Int!, $before: String) {
           blockchain {
             account(account_id: $accountId, dapp_id: $dappId) {
@@ -5412,88 +5665,92 @@ pub(super) async fn fetch_ext_out_page(
           }
         }
     "#;
-    let response = http
-        .post(&gql)
-        .json(&json!({
-            "query": query,
-            "variables": {
-                "accountId": bare_hex(account_id),
-                "dappId": bare_hex(dapp_id),
-                "last": page_size,
-                "before": before,
-            },
-        }))
-        .send()
-        .await?;
-    let response: Value = chain_response_for_status(response).await?.json().await?;
-    if let Some(errors) = response.get("errors") {
-        // typed, so the READ predicate can recognise a pool timeout here too. This is the
-        // reader that stopped the live mainnet run: mainnet answered HTTP 200 with
-        // `pool timed out... path:["blockchain","account","messages"]`, and the flattened string
-        // was additionally reported as "GraphQL shape changed" -- a transient named as a schema
-        // drift, which sends the next reader hunting for an ABI change that does not exist.
-        return Err(anyhow::Error::new(GraphQlBodyError::from_errors(errors))
-            .context(format!("account {account_id} ext-out GraphQL errors")));
-    }
-    let account = response
-        .pointer("/data/blockchain/account")
-        .ok_or_else(|| anyhow!("account {account_id} ext-out GraphQL shape changed: {response}"))?;
-    if account.is_null() {
-        return Err(anyhow::Error::new(ExtOutAccountAbsent {
-            account_id: account_id.to_string(),
-        }));
-    }
-    let info = account
-        .get("info")
-        .ok_or_else(|| anyhow!("account {account_id} ext-out GraphQL shape changed: {response}"))?;
-    let page = account
-        .get("messages")
-        .ok_or_else(|| anyhow!("account {account_id} ext-out GraphQL shape changed: {response}"))?;
-    let edges = page["edges"]
-        .as_array()
-        .ok_or_else(|| anyhow!("account {account_id} ext-out GraphQL edges missing: {response}"))?;
-    let previous_cursor =
-        previous_page_cursor(&format!("account {account_id} ext-out"), page, before)?;
-    // Shellnet represents a fresh routed address as an account projection with no current info and
-    // an empty message connection, rather than `account: null`. Only the first page can establish
-    // that the complete history is empty. A destroyed account also has `info: null`, but its ext-out
-    // edges are the immutable history this reader must preserve.
-    if before.is_none() && info.is_null() && edges.is_empty() && previous_cursor.is_none() {
-        return Err(anyhow::Error::new(ExtOutAccountAbsent {
-            account_id: account_id.to_string(),
-        }));
-    }
-    let mut messages = Vec::with_capacity(edges.len());
-    for edge in edges {
-        let cursor = edge["cursor"]
-            .as_str()
-            .ok_or_else(|| anyhow!("account {account_id} ext-out event has no cursor"))?;
-        let node = &edge["node"];
-        let id = node["id"].as_str().ok_or_else(|| {
-            anyhow!("account {account_id} ext-out event at cursor {cursor} has no message id")
+        let response = http
+            .post(&gql)
+            .json(&json!({
+                "query": query,
+                "variables": {
+                    "accountId": bare_hex(account_id),
+                    "dappId": bare_hex(dapp_id),
+                    "last": page_size,
+                    "before": before,
+                },
+            }))
+            .send()
+            .await?;
+        let response: Value = chain_response_for_status(response).await?.json().await?;
+        if let Some(errors) = response.get("errors") {
+            // typed, so the READ predicate can recognise a pool timeout here too. This is the
+            // reader that stopped the live mainnet run: mainnet answered HTTP 200 with
+            // `pool timed out... path:["blockchain","account","messages"]`, and the flattened string
+            // was additionally reported as "GraphQL shape changed" -- a transient named as a schema
+            // drift, which sends the next reader hunting for an ABI change that does not exist.
+            return Err(anyhow::Error::new(GraphQlBodyError::from_errors(errors))
+                .context(format!("account {account_id} ext-out GraphQL errors")));
+        }
+        let account = response
+            .pointer("/data/blockchain/account")
+            .ok_or_else(|| {
+                anyhow!("account {account_id} ext-out GraphQL shape changed: {response}")
+            })?;
+        if account.is_null() {
+            return Err(anyhow::Error::new(ExtOutAccountAbsent {
+                account_id: account_id.to_string(),
+            }));
+        }
+        let info = account.get("info").ok_or_else(|| {
+            anyhow!("account {account_id} ext-out GraphQL shape changed: {response}")
         })?;
-        let body = node["body"]
-            .as_str()
-            .ok_or_else(|| anyhow!("account {account_id} ext-out event {id} has no body"))?;
-        let created_at = node["created_at"]
-            .as_u64()
-            .or_else(|| {
-                node["created_at"]
-                    .as_str()
-                    .and_then(|value| value.parse().ok())
-            })
-            .ok_or_else(|| anyhow!("account {account_id} ext-out event has no created_at"))?;
-        messages.push(ExtOutMessage {
-            id: id.to_string(),
-            created_at,
-            cursor: cursor.to_string(),
-            body: body.to_string(),
-        });
-    }
-    Ok(ExtOutPage {
-        messages,
-        previous_cursor,
+        let page = account.get("messages").ok_or_else(|| {
+            anyhow!("account {account_id} ext-out GraphQL shape changed: {response}")
+        })?;
+        let edges = page["edges"].as_array().ok_or_else(|| {
+            anyhow!("account {account_id} ext-out GraphQL edges missing: {response}")
+        })?;
+        let previous_cursor =
+            previous_page_cursor(&format!("account {account_id} ext-out"), page, before)?;
+        // Shellnet represents a fresh routed address as an account projection with no current info and
+        // an empty message connection, rather than `account: null`. Only the first page can establish
+        // that the complete history is empty. A destroyed account also has `info: null`, but its ext-out
+        // edges are the immutable history this reader must preserve.
+        if before.is_none() && info.is_null() && edges.is_empty() && previous_cursor.is_none() {
+            return Err(anyhow::Error::new(ExtOutAccountAbsent {
+                account_id: account_id.to_string(),
+            }));
+        }
+        let mut messages = Vec::with_capacity(edges.len());
+        for edge in edges {
+            let cursor = edge["cursor"]
+                .as_str()
+                .ok_or_else(|| anyhow!("account {account_id} ext-out event has no cursor"))?;
+            let node = &edge["node"];
+            let id = node["id"].as_str().ok_or_else(|| {
+                anyhow!("account {account_id} ext-out event at cursor {cursor} has no message id")
+            })?;
+            let body = node["body"]
+                .as_str()
+                .ok_or_else(|| anyhow!("account {account_id} ext-out event {id} has no body"))?;
+            let created_at = node["created_at"]
+                .as_u64()
+                .or_else(|| {
+                    node["created_at"]
+                        .as_str()
+                        .and_then(|value| value.parse().ok())
+                })
+                .ok_or_else(|| anyhow!("account {account_id} ext-out event has no created_at"))?;
+            messages.push(ExtOutMessage {
+                id: id.to_string(),
+                created_at,
+                cursor: cursor.to_string(),
+                body: body.to_string(),
+            });
+        }
+        Ok(ExtOutPage {
+            messages,
+            previous_cursor,
+        })
     })
+    .await
 }
 
 pub(super) async fn fetch_all_ext_out_messages<T, F>(
@@ -5507,8 +5764,8 @@ where
     F: FnMut(ExtOutMessage) -> Result<Option<T>>,
 {
     // The dapp-id lookup is a request of its own, so it takes a slot of its own.
-    gate.admit().await;
-    let dapp_id = fetch_dapp_id(http, endpoint, account_id).await?;
+    let dapp_id =
+        retry_chain_read(Some(gate), || fetch_dapp_id(http, endpoint, account_id)).await?;
     fetch_all_ext_out_messages_routed(gate, http, endpoint, account_id, &dapp_id, filter_map).await
 }
 
@@ -5530,17 +5787,15 @@ where
     loop {
         // Bound/retry each page, retaining earlier pages while a later read retries.
         // A valid lifetime history may take longer than one read-attempt timeout.
-        let page = retry_transient_read(|| {
-            fetch_ext_out_page(
-                gate,
-                http,
-                endpoint,
-                account_id,
-                dapp_id,
-                crate::params::EXT_OUT_PAGE_SIZE,
-                before.as_deref(),
-            )
-        })
+        let page = fetch_ext_out_page(
+            gate,
+            http,
+            endpoint,
+            account_id,
+            dapp_id,
+            crate::params::EXT_OUT_PAGE_SIZE,
+            before.as_deref(),
+        )
         .await?;
         pages.push(page.messages);
         let Some(next) = page.previous_cursor else {
@@ -7337,15 +7592,13 @@ impl RealChainBackend {
         order_book: &str,
         previous: BookEventFold,
     ) -> Result<BookEventFold> {
-        retry_transient_read(|| {
-            read_book_event_fold(
-                self.client.gate(),
-                &self.http,
-                self.client.endpoint(),
-                order_book,
-                previous.clone(),
-            )
-        })
+        read_book_event_fold(
+            self.client.gate(),
+            &self.http,
+            self.client.endpoint(),
+            order_book,
+            previous.clone(),
+        )
         .await
     }
 
@@ -7367,15 +7620,13 @@ impl RealChainBackend {
     ) -> Result<BookFillCandidateReport> {
         let account_id = order_book.bare().to_string();
         let buyer_note = normalize_addr(&buyer_note.with_workchain())?;
-        let candidates = retry_transient_read(|| {
-            read_book_fill_candidates(
-                self.client.gate(),
-                &self.http,
-                self.client.endpoint(),
-                &account_id,
-                &buyer_note,
-            )
-        })
+        let candidates = read_book_fill_candidates(
+            self.client.gate(),
+            &self.http,
+            self.client.endpoint(),
+            &account_id,
+            &buyer_note,
+        )
         .await?;
         let mut report = BookFillCandidateReport::default();
         for candidate in candidates {
@@ -7422,8 +7673,7 @@ impl RealChainBackend {
     /// Both a found account and the exact shard-state absence settle the pending flag.
     /// Every other response is inconclusive and uses the existing bounded read retry policy.
     pub async fn provision_account_exists(&self, token_contract: &Address) -> Result<bool> {
-        retry_transient_read(|| async {
-            self.client.gate().admit().await;
+        retry_chain_read(Some(self.client.gate()), || async {
             let response = self
                 .http
                 .get(format!("{}/v2/account", self.client.endpoint()))
@@ -7561,7 +7811,7 @@ impl RealChainBackend {
         .await?;
         let check = clock_skew_check(local_unix, chain_unix);
         if check.status == ChainDoctorStatus::Fail {
-            return Err(anyhow!(check.message));
+            return Err(anyhow::Error::new(ClockSkewRefusal(check.message)));
         }
         Ok(())
     }
@@ -8312,16 +8562,7 @@ impl RealChainBackend {
         else {
             return Ok(None);
         };
-        let Some(tick_size) = getter_u128(&v, "tickSize") else {
-            return Ok(None);
-        };
-        let Some(price_per_tick) = getter_u128(&v, "pricePerTick") else {
-            return Ok(None);
-        };
-        let Some(max_ticks) = getter_u128(&v, "maxTicks") else {
-            return Ok(None);
-        };
-        Ok(Some((tick_size, price_per_tick, max_ticks)))
+        Ok(decode_deal_terms(&v))
     }
 
     /// The funded purchase volume and execution price, independent of remaining escrow.
@@ -8560,17 +8801,21 @@ impl RealChainBackend {
         args: Value,
         keys: &KeyPair,
     ) -> Result<String> {
-        let ctx = local_context()?;
-        encode_external_call(
-            &ctx,
-            abi_json,
-            &addr.with_workchain(),
-            method,
-            args,
-            keys.public_hex(),
-            keys.secret_hex(),
-        )
-        .await
+        let encoded = async {
+            let ctx = local_context()?;
+            encode_external_call(
+                &ctx,
+                abi_json,
+                &addr.with_workchain(),
+                method,
+                args,
+                keys.public_hex(),
+                keys.secret_hex(),
+            )
+            .await
+        }
+        .await;
+        encoded.inspect_err(|_| super::call_errors::refused_before_send(addr, abi_json, method))
     }
 
     async fn submit(
@@ -8583,8 +8828,13 @@ impl RealChainBackend {
     ) -> Result<Value> {
         let boc = Self::encode_signed_call_boc(addr, abi_json, method, args, keys).await?;
         if abi_json == TOKENCONTRACT_ABI || abi_json == PRIVATENOTE_ABI {
+            let kind = if abi_json == TOKENCONTRACT_ABI && method == "claimTokens" {
+                SubmitKind::Claim
+            } else {
+                SubmitKind::Ordinary
+            };
             match self
-                .retry_submit(&boc, false, Some(crate::address::DEXDO_DAPP_ID))
+                .retry_submit(&boc, false, Some(crate::address::DEXDO_DAPP_ID), kind)
                 .await
             {
                 Err(error) if abi_json == TOKENCONTRACT_ABI => Err(self
@@ -8654,21 +8904,23 @@ impl RealChainBackend {
         args: Value,
         keys: &KeyPair,
     ) -> Result<(String, String, String, String)> {
-        self.clock_skew_preflight()
-            .await
-            .map_err(|source| anyhow::Error::new(MoneySubmitError::Preparation { source }))?;
+        // A failed encode reports itself; the clock check and the DApp lookup report here.
+        let failed = |source: anyhow::Error| {
+            super::call_errors::call_failed(addr, abi_json, method, &source);
+            anyhow::Error::new(MoneySubmitError::Preparation { source })
+        };
+        self.clock_skew_preflight().await.map_err(failed)?;
         let boc = Self::encode_signed_call_boc(addr, abi_json, method, args, keys)
             .await
             .map_err(|source| anyhow::Error::new(MoneySubmitError::Preparation { source }))?;
         let endpoint = self.client.endpoint().to_string();
-        let account_id = dest_account_id_hex(&boc)
-            .map_err(|source| anyhow::Error::new(MoneySubmitError::Preparation { source }))?;
+        let account_id = dest_account_id_hex(&boc).map_err(failed)?;
         let dapp_id = if abi_json == TOKENCONTRACT_ABI || abi_json == PRIVATENOTE_ABI {
             crate::address::DEXDO_DAPP_ID.to_string()
         } else {
             fetch_dapp_id(&self.http, &endpoint, &account_id)
                 .await
-                .map_err(|source| anyhow::Error::new(MoneySubmitError::Preparation { source }))?
+                .map_err(failed)?
         };
         Ok((endpoint, boc, account_id, dapp_id))
     }
@@ -8692,6 +8944,7 @@ impl RealChainBackend {
             &dapp_id,
         )
         .await
+        .inspect_err(|error| super::call_errors::message_failed(&boc, error))
     }
 
     /// Submit `boc` to `/v2/messages`. Known PrivateNote/TokenContract calls supply system `dapp`.
@@ -8705,7 +8958,13 @@ impl RealChainBackend {
     /// instead of dying on the first attempt and forcing a cumulative re-funded retry.
     /// Only deploy/fund sites pass `deploy = true`. Without an explicit dapp, any non-uninit
     /// `/v2/account` error still propagates.
-    async fn submit_once(&self, boc: &str, deploy: bool, dapp: Option<&str>) -> Result<Value> {
+    async fn submit_once(
+        &self,
+        boc: &str,
+        deploy: bool,
+        dapp: Option<&str>,
+        kind: SubmitKind,
+    ) -> Result<Value> {
         let endpoint = self.client.endpoint();
         if let Some(dapp) = dapp {
             let account_id = dest_account_id_hex(boc)?;
@@ -8716,6 +8975,7 @@ impl RealChainBackend {
                 &account_id,
                 dapp,
                 None,
+                kind,
             )
             .await;
         }
@@ -8735,6 +8995,7 @@ impl RealChainBackend {
             &account_id,
             &dapp_id,
             None,
+            SubmitKind::Ordinary,
         )
         .await
     }
@@ -8742,9 +9003,17 @@ impl RealChainBackend {
     /// Submit a message to the chain with retry on the shared transient transport classification or
     /// the block manager's explicit `QUEUE_OVERFLOW` answer. `deploy` is threaded to [`submit_once`]
     /// so only deploy-message sends get the funded-uninit `/v2/account` 404 tolerance.
-    async fn retry_submit(&self, boc: &str, deploy: bool, dapp: Option<&str>) -> Result<Value> {
-        self.clock_skew_preflight().await?;
-        self.retry_submit_preflighted(boc, deploy, dapp, &mut false)
+    async fn retry_submit(
+        &self,
+        boc: &str,
+        deploy: bool,
+        dapp: Option<&str>,
+        kind: SubmitKind,
+    ) -> Result<Value> {
+        self.clock_skew_preflight()
+            .await
+            .inspect_err(|error| super::call_errors::message_failed(boc, error))?;
+        self.retry_submit_preflighted(boc, deploy, dapp, kind, &mut false)
             .await
     }
 
@@ -8754,15 +9023,22 @@ impl RealChainBackend {
         boc: &str,
         deploy: bool,
         dapp: Option<&str>,
+        kind: SubmitKind,
         possibly_dispatched: &mut bool,
     ) -> Result<Value> {
+        let should_retry: fn(&anyhow::Error) -> bool = match kind {
+            SubmitKind::Ordinary => is_transient_submit_failure,
+            SubmitKind::Claim => is_transient_claim_submit_failure,
+        };
         let mut delay = crate::params::TRANSIENT_SUBMIT_INITIAL_BACKOFF;
         for attempt in 1..=crate::params::TRANSIENT_SUBMIT_RETRIES_BEFORE_FINAL {
-            let result = self.submit_once(boc, deploy, dapp).await;
-            *possibly_dispatched |= !result.as_ref().is_err_and(conclusive_sell_refusal);
+            let result = self.submit_once(boc, deploy, dapp, kind).await;
+            *possibly_dispatched |= !result
+                .as_ref()
+                .is_err_and(conclusive_before_dispatch_refusal);
             match result {
                 Ok(v) => return Ok(v),
-                Err(e) if is_transient_submit_failure(&e) => {
+                Err(e) if should_retry(&e) => {
                     eprintln!(
                         "chain transient submit error (attempt {attempt}): {e}; waiting {delay:?} then retrying"
                     );
@@ -8770,24 +9046,31 @@ impl RealChainBackend {
                     delay = (delay * crate::params::TRANSIENT_SUBMIT_BACKOFF_MULTIPLIER)
                         .min(crate::params::TRANSIENT_SUBMIT_MAX_BACKOFF);
                 }
-                Err(e) => return Err(e),
+                Err(e) => {
+                    super::call_errors::message_failed(boc, &e);
+                    return Err(e);
+                }
             }
         }
         // Final attempt -- pass the result through as-is (Ok or the final error).
-        let result = self.submit_once(boc, deploy, dapp).await;
-        *possibly_dispatched |= !result.as_ref().is_err_and(conclusive_sell_refusal);
-        result
+        let result = self.submit_once(boc, deploy, dapp, kind).await;
+        *possibly_dispatched |= !result
+            .as_ref()
+            .is_err_and(conclusive_before_dispatch_refusal);
+        result.inspect_err(|error| super::call_errors::message_failed(boc, error))
     }
 
     /// Regular write without a known system-contract ABI: discover the destination dapp.
     pub(super) async fn send_with_retry(&self, boc: &str) -> Result<Value> {
-        self.retry_submit(boc, false, None).await
+        self.retry_submit(boc, false, None, SubmitKind::Ordinary)
+            .await
     }
 
     /// A **deploy-message** send (its destination is a not-yet-deployed self-dapp address): tolerates
     /// the funded-uninit `/v2/account` 404 via self-dapp routing. Use ONLY for deploy submits.
     async fn send_deploy_with_retry(&self, boc: &str) -> Result<Value> {
-        self.retry_submit(boc, true, None).await
+        self.retry_submit(boc, true, None, SubmitKind::Ordinary)
+            .await
     }
 
     /// The owner note deploys `InferenceOrderBook` (`deployInferenceOrderBook(code, modelHash,
@@ -8927,8 +9210,7 @@ impl RealChainBackend {
         "#;
         // this reader queries the ext-out surface with its own inline GraphQL, so it never
         // reached the pager's gate. One request, one admission.
-        let response: Value = retry_transient_read(|| async {
-            self.client.gate().admit().await;
+        let response: Value = retry_chain_read(Some(self.client.gate()), || async {
             let response = self
                 .http
                 .post(&gql)
@@ -9001,15 +9283,13 @@ impl RealChainBackend {
         let want_ob = Address::parse(&order_book.with_workchain())
             .map(|a| a.with_workchain())
             .unwrap_or_else(|_| order_book.with_workchain());
-        let messages = retry_transient_read(|| {
-            fetch_all_ext_out_messages(
-                self.client.gate(),
-                &self.http,
-                self.client.endpoint(),
-                &account_id,
-                |message| Ok(Some(message)),
-            )
-        })
+        let messages = fetch_all_ext_out_messages(
+            self.client.gate(),
+            &self.http,
+            self.client.endpoint(),
+            &account_id,
+            |message| Ok(Some(message)),
+        )
         .await?;
         let mut matches = Vec::<(i64, u128, MatchedFill)>::new();
         for message in messages {
@@ -9142,15 +9422,13 @@ impl RealChainBackend {
         ticks: u128,
     ) -> Result<Vec<InferenceSubscriptionPlacement>> {
         let account_id = ob.bare().to_string();
-        let messages = retry_transient_read(|| {
-            fetch_all_ext_out_messages(
-                self.client.gate(),
-                &self.http,
-                self.client.endpoint(),
-                &account_id,
-                |message| Ok(Some(message)),
-            )
-        })
+        let messages = fetch_all_ext_out_messages(
+            self.client.gate(),
+            &self.http,
+            self.client.endpoint(),
+            &account_id,
+            |message| Ok(Some(message)),
+        )
         .await?;
         let buyer_note = buyer_note.with_workchain();
         let mut placements = Vec::new();
@@ -9198,15 +9476,13 @@ impl RealChainBackend {
         buyer_note: &Address,
     ) -> Result<Vec<BuyerOrderFact>> {
         let account_id = ob.bare().to_string();
-        let messages = retry_transient_read(|| {
-            fetch_all_ext_out_messages(
-                self.client.gate(),
-                &self.http,
-                self.client.endpoint(),
-                &account_id,
-                |message| Ok(Some(message)),
-            )
-        })
+        let messages = fetch_all_ext_out_messages(
+            self.client.gate(),
+            &self.http,
+            self.client.endpoint(),
+            &account_id,
+            |message| Ok(Some(message)),
+        )
         .await?;
         let buyer_note = buyer_note.with_workchain();
         let mut facts = Vec::new();
@@ -9395,7 +9671,7 @@ impl RealChainBackend {
         flags: u8,
         nonce: u64,
         ttl: u64,
-        before_post: &mut (dyn FnMut(String) -> Result<()> + Send),
+        before_post: &mut (dyn FnMut(String, u32) -> Result<()> + Send),
     ) -> Result<Value> {
         let (_, boc, _, _) = self
             .prepare_money_post(
@@ -9406,12 +9682,27 @@ impl RealChainBackend {
                 owner_keys,
             )
             .await?;
-        before_post(external_message_hash(&boc)?)?;
+        let expire = tvm_client::abi::decode_message(
+            local_context()?,
+            tvm_client::abi::ParamsOfDecodeMessage {
+                abi: tvm_client::abi::Abi::Json(PRIVATENOTE_ABI.into()),
+                message: boc.clone(),
+                allow_partial: false,
+                function_name: Some("postSellOffer".into()),
+                data_layout: None,
+            },
+        )
+        .map_err(|error| anyhow!("decode signed SELL expiry: {error}"))?
+        .header
+        .and_then(|header| header.expire)
+        .ok_or_else(|| anyhow!("signed SELL message is missing its expiry"))?;
+        before_post(external_message_hash(&boc)?, expire)?;
         let mut possibly_dispatched = false;
         self.retry_submit_preflighted(
             &boc,
             false,
             Some(crate::address::DEXDO_DAPP_ID),
+            SubmitKind::Ordinary,
             &mut possibly_dispatched,
         )
         .await
@@ -9609,6 +9900,15 @@ impl RealChainBackend {
                     source: anyhow!("getStats returned no valid nextOrderId: {stats}"),
                 })
             })?;
+        if flags & crate::market::flags::SUBSCRIPTION != 0 {
+            let orders = self
+                .inference_orderbook_live_orders(order_book)
+                .await
+                .map_err(|source| anyhow::Error::new(MoneySubmitError::Preparation { source }))?;
+            self.check_resting_buy_cross(&orders, ticks, max_price_per_tick, true)
+                .await
+                .map_err(|source| anyhow::Error::new(MoneySubmitError::Preparation { source }))?;
+        }
         let pre_post_fills = self
             .poll_inference_attributed_fills(note, order_book, fill_cursor)
             .await
@@ -9698,9 +9998,12 @@ impl RealChainBackend {
         let Some(value) = self.token_contract_state(tc).await? else {
             return Ok(None);
         };
-        DealChainState::decode_getter(&value)
+        DealChainState::decode_getter_checked(&value)
             .map(Some)
-            .map_err(|reason| anyhow!("TokenContract {}: {reason}", display_token_contract(tc)))
+            .map_err(|error| {
+                anyhow::Error::new(error)
+                    .context(format!("TokenContract {}", display_token_contract(tc)))
+            })
     }
 
     /// The raw `getSellerBond` getter of the deal. Production lifecycle consumers must use
@@ -9854,8 +10157,7 @@ impl RealChainBackend {
         loop {
             // this reader queries the ext-out surface with its own inline GraphQL, so it never
             // reached the pager's gate. One request, one admission.
-            let response: Value = retry_transient_read(|| async {
-                self.client.gate().admit().await;
+            let response: Value = retry_chain_read(Some(self.client.gate()), || async {
                 let response = self
                     .http
                     .post(&gql)
@@ -10171,8 +10473,7 @@ impl RealChainBackend {
         loop {
             // this reader queries the ext-out surface with its own inline GraphQL, so it never
             // reached the pager's gate. One request, one admission.
-            let response: Value = retry_transient_read(|| async {
-                self.client.gate().admit().await;
+            let response: Value = retry_chain_read(Some(self.client.gate()), || async {
                 let response = self
                     .http
                     .post(&gql)
@@ -10373,8 +10674,7 @@ impl RealChainBackend {
         loop {
             // this reader queries the ext-out surface with its own inline GraphQL, so it never
             // reached the pager's gate. One request, one admission.
-            let response: Value = retry_transient_read(|| async {
-                self.client.gate().admit().await;
+            let response: Value = retry_chain_read(Some(self.client.gate()), || async {
                 let response = self
                     .http
                     .post(&gql)
@@ -10499,16 +10799,14 @@ impl RealChainBackend {
     ) -> Result<TokenContractSettlementReceipts> {
         let account_id = token_contract.bare().to_string();
         let dapp_id = crate::address::DEXDO_DAPP_ID;
-        let messages = retry_transient_read(|| {
-            fetch_all_ext_out_messages_routed(
-                self.client.gate(),
-                &self.http,
-                self.client.endpoint(),
-                &account_id,
-                dapp_id,
-                |message| Ok(Some(message)),
-            )
-        })
+        let messages = fetch_all_ext_out_messages_routed(
+            self.client.gate(),
+            &self.http,
+            self.client.endpoint(),
+            &account_id,
+            dapp_id,
+            |message| Ok(Some(message)),
+        )
         .await?;
         decode_token_contract_settlement_receipts(messages)
     }
@@ -10637,15 +10935,13 @@ impl RealChainBackend {
             .to_string();
         let want = token_contract.with_workchain();
         let note_display = note.to_string();
-        let messages = retry_transient_read(|| {
-            fetch_all_ext_out_messages(
-                self.client.gate(),
-                &self.http,
-                self.client.endpoint(),
-                &account_id,
-                |message| Ok(Some(message)),
-            )
-        })
+        let messages = fetch_all_ext_out_messages(
+            self.client.gate(),
+            &self.http,
+            self.client.endpoint(),
+            &account_id,
+            |message| Ok(Some(message)),
+        )
         .await?;
         let mut credits = Vec::new();
         for message in messages {
@@ -10869,6 +11165,7 @@ impl RealChainBackend {
                         &dapp_id,
                     )
                     .await
+                    .inspect_err(|error| super::call_errors::message_failed(&boc, error))
                 };
                 match submitted {
                     Err(error) if account_id == token_contract.bare() => {
@@ -10991,7 +11288,10 @@ impl RealChainBackend {
         let endpoint = self.client.endpoint();
         let account_id = dest_account_id_hex(&boc)?;
         let dapp_id = crate::address::DEXDO_DAPP_ID;
-        match self.retry_submit(&boc, false, Some(dapp_id)).await {
+        match self
+            .retry_submit(&boc, false, Some(dapp_id), SubmitKind::Ordinary)
+            .await
+        {
             Ok(value) => Ok(value),
             Err(error) => {
                 let aborted = error
@@ -11064,7 +11364,7 @@ impl RealChainBackend {
         .await
     }
 
-    pub(super) async fn active_deal_reserve_ecc(&self, addr: &Address) -> Result<u128> {
+    async fn active_deal_reserve_account(&self, addr: &Address) -> Result<Account> {
         let account = self
             .client
             .get_system_account_retrying(addr)
@@ -11076,7 +11376,36 @@ impl RealChainBackend {
                 account.status
             ));
         }
+        Ok(account)
+    }
+
+    pub(super) async fn active_deal_reserve_ecc(&self, addr: &Address) -> Result<u128> {
+        let account = self.active_deal_reserve_account(addr).await?;
         Ok(account.ecc_balance(crate::params::SHELL_CURRENCY_ID))
+    }
+
+    /// Read the balance and run both getters against the BOC from the same account read.
+    /// Funding the seller bond changes both ECC[2] and the bond flag in one transaction.
+    pub(super) async fn matched_buy_reserve_snapshot(
+        &self,
+        tc: &Address,
+    ) -> Result<MatchedBuyReserveSnapshot> {
+        let account = self.active_deal_reserve_account(tc).await?;
+        let boc = account
+            .boc
+            .as_deref()
+            .context("active TokenContract has no account BOC")?;
+        let runner = gosh_ackinacki::airegistry::run::GetterRunner::new()?;
+        let address = tc.with_workchain();
+        let get = |method| runner.run_getter(TOKENCONTRACT_ABI, &address, boc, method, json!({}));
+        let terms = decode_deal_terms(&get("getDeal").await?).context("unreadable getDeal")?;
+        let bond = DealSellerBond::decode_getter(&get("getSellerBond").await?)
+            .map_err(anyhow::Error::msg)?;
+        Ok(MatchedBuyReserveSnapshot {
+            terms,
+            ecc_balance: account.ecc_balance(crate::params::SHELL_CURRENCY_ID),
+            seller_bond_funded: bond.bond_funded,
+        })
     }
 
     async fn account_snapshot(&self, addr: &Address, system_dapp: bool) -> String {
@@ -11144,9 +11473,14 @@ impl RealChainBackend {
         gas_shell: u128,
         amount: u128,
     ) -> Result<Value> {
-        self.note_fund_deal_with_identity(note, owner_keys, nonce, gas_shell, amount)
-            .await
-            .map(|(response, _)| response)
+        self.submit(
+            note,
+            PRIVATENOTE_ABI,
+            NOTE_FUND_DEAL_METHOD,
+            note_fund_deal_params(nonce, gas_shell, amount),
+            owner_keys,
+        )
+        .await
     }
 
     pub(super) async fn note_fund_deal_with_identity(
@@ -11157,18 +11491,51 @@ impl RealChainBackend {
         gas_shell: u128,
         amount: u128,
     ) -> Result<(Value, String)> {
-        let boc = Self::encode_signed_call_boc(
-            note,
-            PRIVATENOTE_ABI,
-            NOTE_FUND_DEAL_METHOD,
-            note_fund_deal_params(nonce, gas_shell, amount),
-            owner_keys,
-        )
-        .await?;
-        let message_hash = external_message_hash(&boc)?;
-        let response = self
-            .retry_submit(&boc, false, Some(crate::address::DEXDO_DAPP_ID))
+        let (endpoint, boc, account_id, dapp_id) = self
+            .prepare_money_post(
+                note,
+                PRIVATENOTE_ABI,
+                NOTE_FUND_DEAL_METHOD,
+                note_fund_deal_params(nonce, gas_shell, amount),
+                owner_keys,
+            )
             .await?;
+        let message_hash = external_message_hash(&boc)
+            .map_err(|source| MoneySubmitError::Preparation { source })?;
+        // A validated producer refusal can move or repeat this message, but only with the
+        // original signed BOC and request ID. An unreadable reply cannot authorize a retry.
+        let request_id = submit_message_id();
+        let response = retry_rejected_money_submit(
+            &boc,
+            || {
+                send_message_routed_checked(
+                    &self.money_post_http,
+                    &endpoint,
+                    &boc,
+                    &account_id,
+                    &dapp_id,
+                    Some(&request_id),
+                    SubmitKind::Ordinary,
+                )
+            },
+            is_seller_funding_queue_refusal,
+        )
+        .await
+        .map_err(|source| {
+            if source
+                .downcast_ref::<reqwest::Error>()
+                .is_some_and(|error| error.is_builder() || error.is_connect())
+            {
+                MoneySubmitError::Preparation { source }
+            } else if source.is::<OnchainSubmitError>()
+                && !is_block_producer_forwarding_timeout(&source)
+                && !is_producer_rate_limit_submit(&source)
+            {
+                MoneySubmitError::Rejected { source }
+            } else {
+                MoneySubmitError::Ambiguous { source }
+            }
+        })?;
         Ok((response, message_hash))
     }
 
@@ -11796,6 +12163,18 @@ impl RealChainBackend {
             Some(buyer_note),
         )
         .await?;
+        let required = crate::params::DEAL_BURN_TERMINAL_RAW;
+        match self.active_deal_reserve_ecc(tc).await {
+            Ok(have) if have < required => eprintln!(
+                "Warning: dispute resolution for {} needs {required} raw ECC[2], but the TokenContract has {have} raw ECC[2]. Funds may remain locked until it is topped up.",
+                display_token_contract(tc)
+            ),
+            Err(error) => eprintln!(
+                "Warning: could not read the reserve for {} ({error:#}). Dispute resolution may require a top-up.",
+                display_token_contract(tc)
+            ),
+            _ => {}
+        }
         let prepared = self
             .prepare_money_post(
                 buyer_note,
@@ -15998,7 +16377,7 @@ mod tests {
         for chain_offset in [60, -300] {
             let (backend, posts, _, task) = skew_fixture_backend(chain_offset).await;
             let regular = backend
-                .retry_submit("not-posted", false, None)
+                .retry_submit("not-posted", false, None, SubmitKind::Ordinary)
                 .await
                 .unwrap_err();
             assert!(format!("{regular:#}").contains("CLOCK_SKEW"));
@@ -19409,6 +19788,7 @@ mod tests {
             "0:11",
             "0:22",
             None,
+            SubmitKind::Ordinary,
         )
         .await
         .expect_err("307 must fail instead of replaying the signed BOC");
@@ -19549,6 +19929,7 @@ mod tests {
             "0:11",
             "0:22",
             None,
+            SubmitKind::Ordinary,
         )
         .await;
         let money_ua = sent_user_agent(&captured.await.expect("capture task"))
@@ -20033,8 +20414,15 @@ mod tests {
     include!("client/issue_2030_tests.rs");
     include!("client/issue_2108_tests.rs");
     include!("client/issue_2115_tests.rs");
+    include!("client/issue_2281_tests.rs");
     include!("client/issue_2199_tests.rs");
     include!("client/issue_2220_tests.rs");
     include!("client/issue_2230_tests.rs");
+    include!("client/issue_2242_tests.rs");
+    include!("client/issue_2206_funding_tests.rs");
     include!("client/issue_2192_tests.rs");
 }
+
+#[cfg(test)]
+#[path = "client_issue_2284_tests.rs"]
+mod client_issue_2284_tests;

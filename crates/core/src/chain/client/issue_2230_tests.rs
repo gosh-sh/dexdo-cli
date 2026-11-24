@@ -207,6 +207,9 @@ async fn issue_2230_backend() -> (
                         }
                         reply
                     }
+                } else if input["query"].as_str().unwrap().contains("transactions(last: 1)") {
+                    assert!(state.unknown, "preparing a successor must not read history");
+                    json!({"data":{"blockchain":{"account":{"transactions":{"edges":[]}}}}})
                 } else if input["query"].as_str().unwrap().contains("blocks") {
                     state.clock_reads += 1;
                     let mut reply = issue_2115_clock_reply();
@@ -218,15 +221,7 @@ async fn issue_2230_backend() -> (
                 } else {
                     let query = input["query"].as_str().unwrap();
                     let info = if query.contains(note.bare()) {
-                        issue_2115_account_fixture(
-                            &note,
-                            PRIVATENOTE_ABI,
-                            PRIVATENOTE_TVC,
-                            json!({
-                                "_constructorFlag":true,"_ephemeralPubkey":format!("0x{}", KeyPair::from_secret_hex(&"3a".repeat(32)).unwrap().public_hex()),
-                                "_inferenceOrderBookCode":RealChainBackend::inference_orderbook_code_b64().unwrap()
-                            }),
-                        )
+                        issue_2115_seller_note_fixture(&note)
                     } else if query.contains(tc.bare()) {
                         let mut info = issue_2115_account_fixture(
                             &tc,
@@ -287,7 +282,7 @@ async fn issue_2230_backend() -> (
                 .unwrap();
         }
     });
-    let chain = issue_2030_backend(&endpoint);
+    let chain = issue_2115_seller_chain(&endpoint);
     let mut post = serde_json::to_value(issue_2115_post()).unwrap();
     post["network"] = json!(chain.network());
     post["message_id"] = json!(saved_root_hash);
@@ -315,7 +310,7 @@ fn issue_2230_restarted(
     directory: &Path,
 ) -> super::super::backends::RealSellerBackend {
     super::super::backends::RealSellerBackend::new(
-        issue_2030_backend(endpoint),
+        issue_2115_seller_chain(endpoint),
         issue_2115_address('a'),
         KeyPair::from_secret_hex(&"3a".repeat(32)).unwrap(),
         model_hash_for("fixture--model--v1"),

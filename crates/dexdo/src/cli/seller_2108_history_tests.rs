@@ -43,7 +43,7 @@ async fn issue_2108_check_pool_history_latency(delay: std::time::Duration) {
     let shutdown = tokio::time::sleep(DEFAULT_MATCH_POLL_INTERVAL * 5).fuse();
     tokio::pin!(shutdown);
     let mut provisions = 0;
-    let mut provision = |_: String, _: u64, _: u64, _: u64| {
+    let mut provision = |_: String, _: String, _: u64, _: u64, _: u64| {
         provisions += 1;
         futures::future::ready(Err(anyhow::anyhow!("no residual for a full match")))
     };
@@ -79,7 +79,9 @@ async fn issue_2108_check_pool_history_latency(delay: std::time::Duration) {
     assert!(shutdown_requested);
     assert_eq!(opens, 1, "serve the funded match exactly once");
     assert!(
-        (3..=8).contains(&polls),
+        // Independent readers can start one last interval read concurrently with STOP.
+        // The initial audit, match recovery and periodic scans still have a finite bound.
+        (3..=9).contains(&polls),
         "exercise repeated scans without a busy loop: {polls}"
     );
     assert_eq!(provisions, 0);

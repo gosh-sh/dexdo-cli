@@ -308,6 +308,7 @@ fn test_seller() -> dexdo::seller::RunningSeller {
         note: Arc::new(dexdo_core::LocalNote::generate()),
         server_task: tokio::spawn(async {}),
         listen_addr: "127.0.0.1:0".parse().expect("a placeholder listen address"),
+        migrated_routes: Default::default(),
         tls_fingerprint: "00".repeat(32),
     }
 }
@@ -838,7 +839,7 @@ async fn issue_2115_pool_start_and_residual_start_preserve_pending_mode() {
     assert!(identity.is_none());
     assert!(matches!(
         result.unwrap(),
-        dexdo::seller::liveness::RestingSellerOutcome::Stopped {
+        super::PoolWatchOutcome::Stopped {
             reason: RestingStopReason::Shutdown,
             disposition: CancellationDisposition::UnknownFailure { .. }
         }
@@ -893,9 +894,11 @@ async fn issue_2115_all_pool_startup_entries_keep_pending_before_getter_errors()
     let backend = |market: &dexdo_core::MarketManifest| -> anyhow::Result<Arc<dyn ChainBackend>> {
         Ok(backends[&super::deals::normalize_addr(&market.token_contract)].clone())
     };
-    let retained = sweep_seller_startup_offers(&context, &deals[0].chain, UNPROVEN_TC, backend)
-        .await
-        .unwrap();
+    let records = super::seller_market_handle_records(context.deals_dir, OWNER_NOTE).unwrap();
+    let retained =
+        sweep_seller_startup_offers(&context, &deals[0].chain, UNPROVEN_TC, &records, backend)
+            .await
+            .unwrap();
     assert_eq!(retained.len(), 2);
     let capacity = seller_deal_capacity(context.deals_dir, OWNER_NOTE, backend)
         .await
@@ -906,6 +909,8 @@ async fn issue_2115_all_pool_startup_entries_keep_pending_before_getter_errors()
         deals.remove(0),
         0,
         Some(&retained),
+        records,
+        (OWNER_NOTE, false),
         |market| Ok((backend(market)?, dexdo::seller::UpstreamConfig::Mock)),
     )
     .await
@@ -928,7 +933,7 @@ async fn issue_2115_all_pool_startup_entries_keep_pending_before_getter_errors()
     let mut observed_stop = false;
     let provisions = AtomicUsize::new(0);
     let counter = &provisions;
-    let mut no_provision = move |_: String, _: u64, _: u64, _: u64| async move {
+    let mut no_provision = move |_: String, _: String, _: u64, _: u64, _: u64| async move {
         counter.fetch_add(1, Ordering::SeqCst);
         Err(anyhow::anyhow!("unexpected provision"))
     };

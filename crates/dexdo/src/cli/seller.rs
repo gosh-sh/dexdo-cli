@@ -12,15 +12,17 @@ use crate::cli::commands::{
 use crate::cli::deals;
 use crate::cli::policy;
 use crate::cli::seller_policy::{
-    apply_seller_dispute_policy, apply_seller_terminal_policy, classify_by_fact_advance_failure,
-    classify_terminal_settlement, is_err_not_open, AdvanceFailureDisposition,
+    apply_confirmed_seller_dispute, apply_seller_dispute_policy, apply_seller_terminal_policy,
+    classify_by_fact_advance_failure, classify_terminal_settlement, is_err_not_open,
+    AdvanceFailureDisposition,
 };
 use crate::cli::support::*;
 use anyhow::{bail, Context as _, Result};
 use dexdo::registry::{BuyerMissingBookPolicy, RegistryRole};
+use dexdo::seller::{plan_opened_deal, OpenedDealPlan, SellerGatewayRoute};
 use dexdo_core::params::{
     SellerLivenessParams, DEFAULT_MATCH_POLL_INTERVAL, SELLER_TERMINAL_RECEIPT_POLL_INTERVAL,
-    SELLER_TERMINAL_RECEIPT_TIMEOUT, SELLER_UPTIME_PROBE_INTERVAL,
+    SELLER_TERMINAL_RECEIPT_TIMEOUT,
 };
 use dexdo_core::{DobParams, MatchWatchCursor, SellOfferOutcome};
 use futures::{stream::FuturesUnordered, FutureExt as _, StreamExt as _};
@@ -51,6 +53,10 @@ struct OrdinaryCapacityObserver {
 }
 
 impl dexdo::seller::ClaimStateObserver for OrdinaryCapacityObserver {
+    fn delivery_changed(&self) -> Option<&tokio::sync::Notify> {
+        Some(self.delivery.changed())
+    }
+
     fn observe_retry_after(
         &self,
         token_contract: &dexdo_core::TokenContract,
@@ -112,8 +118,8 @@ impl dexdo::seller::ClaimStateObserver for OrdinaryCapacityObserver {
         &self,
         token_contract: &dexdo_core::TokenContract,
         _error: &dexdo_core::ChainError,
-    ) {
-        self.gateway.report_chain_unavailable(token_contract);
+    ) -> dexdo::seller::gateway::ChainUnavailableAction {
+        self.gateway.report_chain_unavailable(token_contract)
     }
 
     fn observe_probe_decision(
@@ -152,6 +158,10 @@ struct ClaimMeasurementObserver {
 }
 
 impl dexdo::seller::ClaimStateObserver for ClaimMeasurementObserver {
+    fn delivery_changed(&self) -> Option<&tokio::sync::Notify> {
+        Some(self.delivery.changed())
+    }
+
     fn observe_retry_after(
         &self,
         token_contract: &dexdo_core::TokenContract,
@@ -191,8 +201,8 @@ impl dexdo::seller::ClaimStateObserver for ClaimMeasurementObserver {
         &self,
         token_contract: &dexdo_core::TokenContract,
         _error: &dexdo_core::ChainError,
-    ) {
-        self.gateway.report_chain_unavailable(token_contract);
+    ) -> dexdo::seller::gateway::ChainUnavailableAction {
+        self.gateway.report_chain_unavailable(token_contract)
     }
 
     fn observe_probe_decision(
@@ -238,50 +248,6 @@ fn funded_tick_budget(token_contract: &str, funded_tokens: u128, tick_size: u64)
         );
     }
     Ok(funded_tokens / tick_size)
-}
-
-/// What the pool must do with a deal whose stream has just opened.
-
-/// Generation 4.0.33 made every terminal path of the TokenContract end in `_payOwedAndDie()` ->
-/// `_die()` -> `selfdestruct` (`contracts/airegistry/TokenContract.sol`: `stop()`:1402 and, via
-/// `_closeClean`:1326,:1408; `sellerStop()`:1433; `finalize()`:1090; `settleWeek()`:1231;
-/// the dispute resolutions:1743 -- all funnelling into:415/:426). A settled deal therefore leaves
-/// NO account behind: the buyer's `stop()` is the LAST message the contract ever processes.
-
-/// The SDK reads that fact as `Ok(None)`. `read_getter` returns `None` only when the account
-/// snapshot is missing or not Active; transport failures and ABI decode failures both come back as
-/// `Err`. So `None` from a TokenContract getter is not "unreadable" -- it is the settled-and-gone
-/// fact, and reading it a moment after `seller_match_opened` means the buyer stopped inside the
-/// window between the match and the settlement driver's first read.
-#[derive(Debug)]
-enum OpenedDealPlan {
-    /// The strict coherent snapshot read back; start the settlement driver from it.
-    Drive(Box<dexdo_core::DealChainSnapshot>),
-    /// The TokenContract is already gone. Retire this deal and keep serving the rest of the pool:
-    /// `_payOwedAndDie()` paid `_finalizedOwed` to `_sellerNote` before the destruct, so there is
-    /// nothing left for a settlement driver to claim and nothing lost by not starting one.
-    RetireSettled,
-}
-
-/// Read the strict coherent deal snapshot for a deal whose stream just opened.
-
-/// Unreadable stays fatal -- the settlement driver must never be started from a guessed deal shape.
-/// Only the account-is-gone answer is reclassified, and only into a retirement.
-async fn plan_opened_deal(
-    chain: &dyn dexdo_core::ChainBackend,
-    token_contract: &dexdo_core::TokenContract,
-) -> Result<OpenedDealPlan> {
-    let token_contract_display = display_token_contract(token_contract);
-    let snapshot = chain.deal_snapshot(token_contract).await.map_err(|error| {
-        anyhow::anyhow!(
-            "--token-contract {token_contract_display}: strict coherent deal snapshot is unreadable, \
-                 refusing to choose the settlement driver from guessed deal shape: {error}"
-        )
-    })?;
-    Ok(match snapshot {
-        Some(snapshot) => OpenedDealPlan::Drive(Box::new(snapshot)),
-        None => OpenedDealPlan::RetireSettled,
-    })
 }
 
 #[async_trait::async_trait]
@@ -898,19 +864,246 @@ pub(crate) fn seller_pool_dir(
 /// the one the rest of this repository uses, which admits any owner-only mode rather than `0600`
 /// alone: `0400` on a key is stricter than what was demanded, and refusing it was refusing the
 /// operator who was more careful than required.
-fn load_or_create_gateway_tls(
+fn load_or_migrate_gateway_tls(
     pool_dir: &std::path::Path,
+    legacy_dirs: &[std::path::PathBuf],
 ) -> Result<dexdo::seller::tls::GatewayTls> {
     let store = crate::cli::secret_store::SecretStore::open()?;
     let name = crate::cli::secret_store::SecretName::at(pool_dir.join("gateway.pem"));
+    let parse = |bundle: &str, file: &std::path::Path| {
+        dexdo::seller::tls::GatewayTls::from_pem_bundle(bundle.to_owned())
+            .with_context(|| format!("load seller gateway TLS {}", file.display()))
+    };
     if let Some(bundle) = store.read(&name)? {
-        return dexdo::seller::tls::GatewayTls::from_pem_bundle(bundle.to_string()).map_err(
-            |error| anyhow::anyhow!("load seller gateway TLS {}: {error}", name.file().display()),
-        );
+        return parse(&bundle, name.file());
+    }
+    for dir in legacy_dirs {
+        let legacy = crate::cli::secret_store::SecretName::at(dir.join("gateway.pem"));
+        if let Some(bundle) = store.read(&legacy)? {
+            let tls = parse(&bundle, legacy.file())?;
+            store.write(&name, &bundle)?;
+            return Ok(tls);
+        }
     }
     let tls = dexdo::seller::tls::GatewayTls::generate()?;
     store.write(&name, &tls.pem_bundle())?;
     Ok(tls)
+}
+
+const GATEWAY_MIGRATION_FILE: &str = "gateway-migration.json";
+
+#[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct GatewayMigration {
+    token_contract: String,
+    endpoint: String,
+    listen: std::net::SocketAddr,
+    tls_fingerprint: String,
+}
+
+fn read_gateway_migrations(
+    path: &std::path::Path,
+) -> Result<std::collections::HashMap<String, GatewayMigration>> {
+    let bytes = match std::fs::read(path) {
+        Ok(bytes) => bytes,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Default::default()),
+        Err(error) => return Err(error).with_context(|| format!("read {}", path.display())),
+    };
+    let entries: Vec<GatewayMigration> =
+        serde_json::from_slice(&bytes).with_context(|| format!("parse {}", path.display()))?;
+    let mut migrations = std::collections::HashMap::new();
+    for entry in entries {
+        dexdo_core::address::parse_chain_address(&entry.token_contract)?;
+        let authority = entry
+            .endpoint
+            .strip_prefix("https://")
+            .context("gateway migration endpoint must start with https://")?
+            .parse::<crate::cli::args::GatewayAdvertiseAddr>()
+            .map_err(anyhow::Error::msg)?;
+        if entry.listen.port() == 0 || authority.port() == 0 {
+            bail!("gateway migration endpoints and listeners must use a fixed port");
+        }
+        if migrations
+            .insert(deals::normalize_addr(&entry.token_contract), entry)
+            .is_some()
+        {
+            bail!("duplicate TokenContract in {}", path.display());
+        }
+    }
+    Ok(migrations)
+}
+
+type GatewayTls = dexdo::seller::tls::GatewayTls;
+
+struct SellerGatewayTls {
+    primary: GatewayTls,
+    additional: Vec<(std::net::SocketAddr, GatewayTls)>,
+    migrated_routes: std::collections::HashMap<String, SellerGatewayRoute>,
+}
+
+/// Serve the original TLS identity using a saved handover or an explicit operator mapping.
+/// A legacy deal handle may have been rewritten after the buyer received its handover.
+async fn seller_gateway_tls_for_startup(
+    deals_dir: Option<&std::path::Path>,
+    gateway_listen: std::net::SocketAddr,
+    gateway_advertise: &str,
+    legacy_dirs: &[std::path::PathBuf],
+    records: &std::collections::HashMap<String, SellerMarketHandle>,
+    mut read_open_handover: impl AsyncFnMut(&str) -> Result<Option<Vec<u8>>>,
+) -> Result<SellerGatewayTls> {
+    let gateway_dir = deals::resolve_deals_dir(deals_dir)?.join("seller-pool");
+    let migration_path = gateway_dir.join(GATEWAY_MIGRATION_FILE);
+    let migrations = read_gateway_migrations(&migration_path)?;
+    let store = crate::cli::secret_store::SecretStore::open()?;
+    let read_tls = |dir: &std::path::Path| -> Result<Option<GatewayTls>> {
+        let name = crate::cli::secret_store::SecretName::at(dir.join("gateway.pem"));
+        store
+            .read(&name)?
+            .map(|bundle| {
+                GatewayTls::from_pem_bundle(bundle.to_string())
+                    .with_context(|| format!("load seller gateway TLS {}", name.file().display()))
+            })
+            .transpose()
+    };
+    let shared = read_tls(&gateway_dir)?;
+    let mut listeners = std::collections::BTreeMap::<_, (GatewayTls, String)>::new();
+    let mut migrated_routes = std::collections::HashMap::new();
+    let mut primary_source = None;
+    let primary_endpoint = format!("https://{gateway_advertise}");
+    for (key, record) in records {
+        // Provision records have no endpoint until the seller takes responsibility for the TC.
+        if record
+            .handle
+            .endpoint
+            .as_ref()
+            .is_none_or(|endpoint| endpoint.kind != "gateway")
+        {
+            continue;
+        }
+        let tc = &record.handle.token_contract;
+        let Some(ciphertext) = read_open_handover(tc).await? else {
+            continue;
+        };
+        let migrate = || {
+            format!(
+                "preserve the open handover for TokenContract {} using {}",
+                display_token_contract(tc),
+                migration_path.display()
+            )
+        };
+        let cursor = seller_watch_cursor_path(deals_dir, tc)?;
+        let confirmed = dexdo::seller::tls::read_handover(&cursor, &ciphertext)?;
+        let (listen, pin) = if let Some(entry) = migrations.get(key) {
+            if confirmed.as_ref().is_some_and(|handover| {
+                handover.endpoint != entry.endpoint
+                    || handover.tls_fingerprint != entry.tls_fingerprint
+            }) {
+                bail!(
+                    "gateway migration disagrees with the on-chain handover evidence: {}",
+                    migrate()
+                );
+            }
+            migrated_routes.insert(
+                key.clone(),
+                SellerGatewayRoute {
+                    advertise: entry.endpoint.trim_start_matches("https://").to_string(),
+                    listen: entry.listen,
+                },
+            );
+            (entry.listen, entry.tls_fingerprint.as_str())
+        } else if let Some(handover) = confirmed.as_ref() {
+            if handover.endpoint != primary_endpoint {
+                bail!("configured gateway has a different endpoint: {}", migrate());
+            }
+            (gateway_listen, handover.tls_fingerprint.as_str())
+        } else {
+            bail!(
+                "legacy handover requires confirmation of the original endpoint and TLS pin: {}",
+                migrate()
+            );
+        };
+        let (tls, source) = if let Some(tls) = shared.as_ref().filter(|tls| tls.fingerprint == pin)
+        {
+            (tls.clone(), None)
+        } else {
+            let mut found = None;
+            for dir in legacy_dirs {
+                if let Some(tls) = read_tls(dir)?.filter(|tls| tls.fingerprint == pin) {
+                    found = Some((tls, Some(dir)));
+                    break;
+                }
+            }
+            found.with_context(|| {
+                format!(
+                    "original TLS certificate and key are missing: {}",
+                    migrate()
+                )
+            })?
+        };
+        if let Some((existing, other)) = listeners.get(&listen) {
+            if existing.fingerprint != tls.fingerprint {
+                bail!(
+                    "listener {listen} has a different pin for TokenContract {other}: {}",
+                    migrate()
+                );
+            }
+        } else {
+            if listen == gateway_listen {
+                if shared
+                    .as_ref()
+                    .is_some_and(|shared| shared.fingerprint != tls.fingerprint)
+                {
+                    bail!(
+                        "the primary listener {listen} already has a different TLS identity: {}",
+                        migrate()
+                    );
+                }
+                primary_source = source.cloned();
+            }
+            listeners.insert(listen, (tls, display_token_contract(tc)));
+        }
+    }
+    listeners.remove(&gateway_listen);
+    let additional = listeners
+        .into_iter()
+        .map(|(listen, (tls, _))| (listen, tls))
+        .collect();
+    let primary = if let Some(tls) = shared {
+        tls
+    } else if let Some(source) = primary_source {
+        load_or_migrate_gateway_tls(&gateway_dir, &[source])?
+    } else {
+        load_or_migrate_gateway_tls(&gateway_dir, legacy_dirs)?
+    };
+    Ok(SellerGatewayTls {
+        primary,
+        additional,
+        migrated_routes,
+    })
+}
+
+async fn read_open_seller_handover(
+    tc: &str,
+    mut read_state: impl AsyncFnMut() -> Result<Option<dexdo_core::DealChainState>>,
+    read_handover: impl AsyncFnOnce() -> Result<Option<Vec<u8>>>,
+) -> Result<Option<Vec<u8>>> {
+    if !read_state()
+        .await?
+        .is_some_and(|state| state.funded && state.opened && !state.is_stopped())
+    {
+        return Ok(None);
+    }
+    if let Some(ciphertext) = read_handover().await? {
+        return Ok(Some(ciphertext));
+    }
+    // STOP may have removed the account between getState and getEndpointCipher.
+    if read_state().await?.is_none_or(|state| state.is_stopped()) {
+        return Ok(None);
+    }
+    bail!(
+        "open seller deal {} has no readable handover",
+        display_token_contract(tc)
+    );
 }
 
 pub(crate) struct SellerPoolLock {
@@ -962,6 +1155,9 @@ pub(crate) fn acquire_seller_pool_lock(pool_dir: &std::path::Path) -> Result<Sel
 #[cfg(test)]
 #[path = "seller_1416_stale_ask_race_tests.rs"]
 mod seller_1416_stale_ask_race_tests;
+
+#[path = "seller_2246_replenish.rs"]
+mod seller_replenish;
 
 #[derive(Clone)]
 struct SellerPoolDeal {
@@ -1556,6 +1752,7 @@ async fn record_advance_result(
     }
 }
 
+#[derive(Clone, Copy)]
 struct SellerPoolContext<'a> {
     deals_dir: Option<&'a std::path::Path>,
     contracts: &'a std::path::Path,
@@ -1564,6 +1761,18 @@ struct SellerPoolContext<'a> {
     gateway_advertise: &'a str,
     /// how a failed `advertised_gateway` self-probe is treated.
     advertise_probe: dexdo::seller::liveness::AdvertiseProbePolicy,
+}
+
+impl<'a> SellerPoolContext<'a> {
+    fn for_deal<'b>(&'b self, deal: &'b SellerPoolDeal) -> SellerPoolContext<'b> {
+        SellerPoolContext {
+            note_addr: deal
+                .market
+                .as_ref()
+                .map_or(self.note_addr, |market| &market.seller_note),
+            ..*self
+        }
+    }
 }
 
 fn save_pool_deal_handle(context: &SellerPoolContext<'_>, deal: &SellerPoolDeal) -> Result<()> {
@@ -1576,7 +1785,7 @@ fn save_pool_deal_handle(context: &SellerPoolContext<'_>, deal: &SellerPoolDeal)
                 role: deals::DealHandleRole::Seller,
                 deals_dir: context.deals_dir,
                 token_contract: &deal.cfg.token_contract,
-                note_addr: context.note_addr,
+                note_addr: &market.seller_note,
                 frame_model: &market.frame_model,
                 market: Some(market),
                 market_path: None,
@@ -1603,12 +1812,8 @@ fn save_pool_deal_handle(context: &SellerPoolContext<'_>, deal: &SellerPoolDeal)
 /// refuses to start. It adopts this run's address instead, and rewrites the record so the next start
 /// sees the truth.
 
-/// Adopting is also what keeps the BUYER reachable rather than what strands it. Nothing else in the
-/// client ever reads this field; the buyer learns the gateway from the on-chain handover ciphertext,
-/// which `open_stream` writes from this same `gateway_advertise` on every open (`seller/mod.rs`,
-/// `Handover { endpoint: format!("https://{}", cfg.gateway_advertise) }`). Pinning the record could
-/// never have re-pointed a buyer at the dead address; it only stopped the deal being served from the
-/// live one.
+/// The buyer learns the gateway from the on-chain handover ciphertext. Updating the handle records
+/// this run's address but leaves any previously issued handover unchanged.
 
 /// What the pin incidentally gave - two seller services must not fight over one deal - is held
 /// properly by `acquire_seller_pool_lock`: an exclusive flock on `<seller pool dir>/seller.lock`,
@@ -1663,16 +1868,26 @@ fn seller_market_handle_records(
     deals_dir: Option<&std::path::Path>,
     note_addr: &str,
 ) -> Result<std::collections::HashMap<String, SellerMarketHandle>> {
+    let owner = deals::normalize_addr(note_addr);
+    seller_market_handle_records_matching(deals_dir, None, |note| note == owner)
+}
+
+fn seller_market_handle_records_matching(
+    deals_dir: Option<&std::path::Path>,
+    network: Option<&str>,
+    includes_note: impl Fn(&str) -> bool,
+) -> Result<std::collections::HashMap<String, SellerMarketHandle>> {
     let mut records: std::collections::HashMap<String, SellerMarketHandle> =
         std::collections::HashMap::new();
     let dir = deals::resolve_deals_dir(deals_dir)?;
     for (path, handle) in deals::list_deal_handles(&dir)? {
-        let provision_pending = deals::load_deal_record(&path)?.provision_pending;
         if handle.role != deals::DealHandleRole::Seller
-            || deals::normalize_addr(&handle.note_addr) != deals::normalize_addr(note_addr)
+            || network.is_some_and(|network| handle.network != network)
+            || !includes_note(&deals::normalize_addr(&handle.note_addr))
         {
             continue;
         }
+        let provision_pending = deals::load_deal_record(&path)?.provision_pending;
         {
             let market = handle.market.as_ref().ok_or_else(|| {
                 anyhow::anyhow!(
@@ -1681,7 +1896,7 @@ fn seller_market_handle_records(
                     display_token_contract(&handle.token_contract)
                 )
             })?;
-            assert_market_seller_note(&market.seller_note, note_addr)?;
+            assert_market_seller_note(&market.seller_note, &handle.note_addr)?;
         }
         let market = handle
             .market
@@ -1715,22 +1930,19 @@ fn seller_market_handle_records(
 /// Read all outcomes first: an exhausted network read leaves every pending file untouched.
 async fn reconcile_seller_pending_provisions(
     deals_dir: Option<&std::path::Path>,
-    note_addr: &str,
-    contracts: &std::path::Path,
+    chain: &dexdo_core::RealChainBackend,
+    has_note_lock: impl Fn(&str) -> bool,
 ) -> Result<()> {
     let mut pending = Vec::new();
     for (path, handle) in deals::list_deal_handles(&deals::resolve_deals_dir(deals_dir)?)? {
         if handle.role == deals::DealHandleRole::Seller
-            && deals::normalize_addr(&handle.note_addr) == deals::normalize_addr(note_addr)
+            && handle.network == chain.network()
+            && has_note_lock(&deals::normalize_addr(&handle.note_addr))
             && deals::load_deal_record(&path)?.provision_pending
         {
             pending.push((path, handle.token_contract));
         }
     }
-    if pending.is_empty() {
-        return Ok(());
-    }
-    let chain = dexdo_core::RealChainBackend::connect(contracts)?;
     for (path, token_contract) in &pending {
         let context = || {
             format!(
@@ -1828,14 +2040,23 @@ where
 async fn seller_pool_occupied_capacity(
     deals_dir: Option<&std::path::Path>,
     note_addr: &str,
-    known_deals: &std::collections::HashMap<String, (String, Arc<dyn dexdo_core::ChainBackend>)>,
+    default_owner: &str,
+    known_deals: &std::collections::HashMap<String, SellerPoolDeal>,
 ) -> Result<usize> {
     let mut occupied = seller_market_handle_records(deals_dir, note_addr)?
         .into_iter()
         .filter_map(|(key, record)| record.provision_pending.then_some(key))
         .collect::<std::collections::HashSet<_>>();
-    for (key, (token_contract, chain)) in known_deals {
-        match chain.sell_offer_terms(token_contract).await {
+    for (key, deal) in known_deals {
+        let owner = deal
+            .market
+            .as_ref()
+            .map_or(default_owner, |market| &market.seller_note);
+        if deals::normalize_addr(owner) != deals::normalize_addr(note_addr) {
+            continue;
+        }
+        let token_contract = &deal.cfg.token_contract;
+        match deal.chain.sell_offer_terms(token_contract).await {
             Ok(Some(_)) => {
                 occupied.insert(key.clone());
             }
@@ -1935,6 +2156,7 @@ fn ensure_residual_market_identity(
 /// guessing which paid TokenContract carries the residual.
 fn reconcile_seller_replacement_link(
     deals_dir: Option<&std::path::Path>,
+    markets: &std::collections::HashMap<String, dexdo_core::MarketManifest>,
     note_addr: &str,
     parent_token_contract: &dexdo_core::TokenContract,
     expected_frame_model: Option<&str>,
@@ -1946,8 +2168,8 @@ fn reconcile_seller_replacement_link(
     let Some(replacement_nonce) = fill.replacement_nonce else {
         return Ok(None);
     };
-    let mut candidates = seller_market_manifests(deals_dir, note_addr)?
-        .into_values()
+    let mut candidates = markets
+        .values()
         .filter(|market| market.nonce == replacement_nonce);
     let Some(candidate) = candidates.next() else {
         return Ok(None);
@@ -1961,7 +2183,7 @@ fn reconcile_seller_replacement_link(
     }
     if let Some(expected_frame_model) = expected_frame_model {
         ensure_residual_market_identity(
-            &candidate,
+            candidate,
             expected_frame_model,
             note_addr,
             replacement_nonce,
@@ -1990,7 +2212,7 @@ fn reconcile_seller_replacement_link(
         replacement_nonce,
         Some(&candidate.token_contract),
     )?;
-    Ok(Some(candidate.token_contract))
+    Ok(Some(candidate.token_contract.clone()))
 }
 
 async fn sweep_expired_seller_offer(
@@ -2325,12 +2547,12 @@ async fn sweep_seller_startup_offers<F>(
     context: &SellerPoolContext<'_>,
     initial_chain: &Arc<dyn dexdo_core::ChainBackend>,
     initial_token_contract: &str,
+    records: &std::collections::HashMap<String, SellerMarketHandle>,
     mut chain_for_market: F,
 ) -> Result<std::collections::HashSet<String>>
 where
     F: FnMut(&dexdo_core::MarketManifest) -> Result<Arc<dyn dexdo_core::ChainBackend>>,
 {
-    let records = seller_market_handle_records(context.deals_dir, context.note_addr)?;
     let initial_key = deals::normalize_addr(initial_token_contract);
     let initial_model = records
         .get(&initial_key)
@@ -2350,20 +2572,20 @@ where
     }
 
     for (key, record) in records {
-        if key == initial_key {
+        if key == &initial_key {
             continue;
         }
         let chain = chain_for_market(&record.market)?;
         sweep_expired_seller_offer(
             chain.as_ref(),
             &record.market.token_contract,
-            context.note_addr,
+            &record.market.seller_note,
             &record.market.frame_model,
         )
         .await?;
         if seller_startup_deal_is_serviceable(chain.as_ref(), &record.market.token_contract).await?
         {
-            retained.insert(key);
+            retained.insert(key.clone());
         }
     }
     Ok(retained)
@@ -2393,6 +2615,73 @@ async fn seller_startup_deal_is_serviceable(
         .is_some())
 }
 
+/// Restore the shape of this exact TC. An unmatched deployed TC has no on-chain SELL mode yet.
+async fn recorded_seller_offer_mode(
+    chain: &dyn dexdo_core::ChainBackend,
+    tc: &str,
+    cursor: &std::path::Path,
+    configured: Option<bool>,
+) -> Result<Option<bool>> {
+    let tc = tc.to_owned();
+    let rows = chain.raw_resting_sell_orders_for_tc(&tc).await?;
+    // Read the funded state after the book so a match that consumed the row takes precedence.
+    if let Some(snapshot) = chain.deal_snapshot(&tc).await? {
+        if snapshot.state.funded && !snapshot.state.is_stopped() {
+            return Ok(Some(snapshot.subscription.is_subscription()));
+        }
+    }
+    if let Some(row) = rows.first() {
+        // inspect_seller_offer still validates the entire row, including uniqueness and flags.
+        return Ok(Some(row.flags & dexdo_core::order_flags::SUBSCRIPTION != 0));
+    }
+    Ok(dexdo::seller::read_seller_offer_mode(cursor, &tc)?.or(configured))
+}
+
+/// A stale launcher manifest can name a completed TC. Prefer a paid deal already in the
+/// locked pool, then a resting SELL or one whose durable submission is still pending.
+async fn working_seller_startup_market<F, B>(
+    records: &std::collections::HashMap<String, SellerMarketHandle>,
+    excluded: &str,
+    mut backend: F,
+) -> Result<Option<dexdo_core::MarketManifest>>
+where
+    F: FnMut(&dexdo_core::MarketManifest) -> Result<(Arc<dyn dexdo_core::ChainBackend>, B)>,
+{
+    let excluded = deals::normalize_addr(excluded);
+    let mut records = records
+        .iter()
+        .filter(|(key, _)| **key != excluded)
+        .collect::<Vec<_>>();
+    records.sort_by_key(|(key, _)| *key);
+    let mut resting = None;
+    let mut pending = None;
+    for (_, record) in records {
+        let market = &record.market;
+        let (chain, _) = backend(market)?;
+        let tc = &market.token_contract;
+        if chain.has_pending_sell_offer(tc).await? {
+            pending.get_or_insert_with(|| market.clone());
+            continue;
+        }
+        if chain.read_openable_match_now(tc).await?.is_some() {
+            return Ok(Some(market.clone()));
+        }
+        if resting.is_none() && !chain.raw_resting_sell_orders_for_tc(tc).await?.is_empty() {
+            resting = Some(market.clone());
+        }
+    }
+    Ok(resting.or(pending))
+}
+
+async fn seller_has_startup_obligation(
+    chain: &dyn dexdo_core::ChainBackend,
+    tc: &dexdo_core::TokenContract,
+) -> Result<bool> {
+    Ok(chain.has_pending_sell_offer(tc).await?
+        || chain.read_openable_match_now(tc).await?.is_some()
+        || !chain.raw_resting_sell_orders_for_tc(tc).await?.is_empty())
+}
+
 #[cfg(test)]
 async fn load_seller_pool_deals<F>(
     context: &SellerPoolContext<'_>,
@@ -2408,11 +2697,14 @@ where
         dexdo::seller::UpstreamConfig,
     )>,
 {
+    let configured = (context.note_addr, initial.cfg.subscription);
     Ok(load_seller_pool_deals_with_scope(
         context,
         initial,
         mock_token_count,
         None,
+        seller_market_handle_records(context.deals_dir, context.note_addr)?,
+        configured,
         backend_for_market,
     )
     .await?
@@ -2421,7 +2713,7 @@ where
 
 struct LoadedSellerPoolDeals {
     deals: Vec<SellerPoolDeal>,
-    pending_provisions: usize,
+    pending_provisions: std::collections::HashMap<String, String>,
 }
 
 async fn load_seller_pool_deals_with_scope<F>(
@@ -2429,6 +2721,8 @@ async fn load_seller_pool_deals_with_scope<F>(
     mut initial: SellerPoolDeal,
     mock_token_count: u64,
     retained_deals: Option<&std::collections::HashSet<String>>,
+    mut records: std::collections::HashMap<String, SellerMarketHandle>,
+    configured: (&str, bool),
     mut backend_for_market: F,
 ) -> Result<LoadedSellerPoolDeals>
 where
@@ -2440,15 +2734,15 @@ where
     )>,
 {
     let deals_dir = deals::resolve_deals_dir(context.deals_dir)?;
-    let mut records = seller_market_handle_records(context.deals_dir, context.note_addr)?;
     let explicit_initial_market = initial.market.take();
 
     let initial_key = deals::normalize_addr(&initial.cfg.token_contract);
     let mut initial_record = records.remove(&initial_key);
     let mut pending_provisions = records
         .iter()
-        .filter_map(|(key, record)| record.provision_pending.then_some(key.clone()))
-        .collect::<std::collections::HashSet<_>>();
+        .filter(|(_, record)| record.provision_pending)
+        .map(|(key, record)| (key.clone(), deals::normalize_addr(&record.handle.note_addr)))
+        .collect::<std::collections::HashMap<_, _>>();
     let initial_market = explicit_initial_market
         .or_else(|| initial_record.as_ref().map(|record| record.market.clone()));
     if retained_deals.is_some()
@@ -2496,7 +2790,7 @@ where
             deals::save_deal_handle(&deals_dir, &record.handle)?;
         }
     }
-    let subscription = initial.cfg.subscription;
+    let initial_subscription = initial.cfg.subscription;
     let mut pool = vec![initial];
 
     for (key, mut record) in records {
@@ -2520,16 +2814,6 @@ where
                     "seller startup retained a readable deployed deal from another model"
                 );
             }
-        }
-        if let Some(previous) = adopt_run_gateway(&mut record.handle, context.gateway_advertise) {
-            tracing::warn!(
-                deal_handle = %record.path.display(),
-                token_contract = %display_token_contract(&record.handle.token_contract),
-                previous_gateway = %previous,
-                gateway = %context.gateway_advertise,
-                "seller deal handle re-bound to this service's gateway address"
-            );
-            deals::save_deal_handle(&deals_dir, &record.handle)?;
         }
         let price_per_tick = u64::try_from(market.price_per_tick).map_err(|_| {
             anyhow::anyhow!(
@@ -2560,6 +2844,8 @@ where
         {
             continue;
         }
+        let cursor_path = seller_watch_cursor_path(context.deals_dir, &market.token_contract)?;
+        let mut terminal_residual = false;
         let terms = match if pending {
             Ok(Some((price_per_tick, max_ticks)))
         } else {
@@ -2567,10 +2853,8 @@ where
         } {
             Ok(Some(terms)) => terms,
             unavailable => {
-                let fill = dexdo::seller::read_seller_fill_lineage(
-                    &seller_watch_cursor_path(context.deals_dir, &market.token_contract)?,
-                    &market.token_contract,
-                )?;
+                let fill =
+                    dexdo::seller::read_seller_fill_lineage(&cursor_path, &market.token_contract)?;
                 if fill
                     .as_ref()
                     .and_then(|fill| fill.replacement_token_contract.as_ref())
@@ -2607,6 +2891,7 @@ where
                         // The terminal parent is retained only long enough for `run_seller_pool` to
                         // put it on PR1055's existing residual queue. The handle terms are checked
                         // against the validated lineage again at the provision boundary.
+                        terminal_residual = true;
                         (price_per_tick, max_ticks)
                     }
                     // the handle outlived its TokenContract. A TC that answers no `getDeal`
@@ -2615,10 +2900,7 @@ where
                     // residue left in this deals directory by an earlier run. There is nothing to
                     // serve and nothing at risk, so the deal is dropped from the pool exactly as a
                     // handle with a recorded replacement is dropped above. Refusing to start over
-                    // it made ordinary residue an outage for every OTHER deal in the directory,
-                    // including the one this run was invoked for - the pool loader runs before any
-                    // of them is served. Only this run's own deal is a hard requirement, and it is
-                    // never reached here: it was removed from `markets` before this loop.
+                    // it made ordinary residue an outage for every other deal in the directory.
                     Ok(None) => {
                         tracing::warn!(
                             token_contract = %display_token_contract(&market.token_contract),
@@ -2640,6 +2922,40 @@ where
                 terms.1
             );
         }
+        let subscription = if market.network == "mock" {
+            initial_subscription
+        } else if terminal_residual {
+            // A subscription SELL is all-or-none and cannot produce a partial residual.
+            false
+        } else {
+            let same_note =
+                deals::normalize_addr(&market.seller_note) == deals::normalize_addr(configured.0);
+            let Some(mode) = recorded_seller_offer_mode(
+                chain.as_ref(),
+                &market.token_contract,
+                &cursor_path,
+                same_note.then_some(configured.1),
+            )
+            .await?
+            else {
+                tracing::warn!(
+                    token_contract = %display_token_contract(&market.token_contract),
+                    "seller skipped deal with no known SELL mode; select its market explicitly to set its mode"
+                );
+                continue;
+            };
+            mode
+        };
+        if let Some(previous) = adopt_run_gateway(&mut record.handle, context.gateway_advertise) {
+            tracing::warn!(
+                deal_handle = %record.path.display(),
+                token_contract = %display_token_contract(&record.handle.token_contract),
+                previous_gateway = %previous,
+                gateway = %context.gateway_advertise,
+                "seller deal handle re-bound to this service's gateway address"
+            );
+            deals::save_deal_handle(&deals_dir, &record.handle)?;
+        }
         let cfg = dexdo::seller::SellerConfig {
             token_contract: market.token_contract.clone(),
             price_per_tick,
@@ -2651,7 +2967,7 @@ where
         };
         pool.push(SellerPoolDeal {
             watch: dexdo::seller::SellerMatchWatchConfig {
-                cursor_path: seller_watch_cursor_path(context.deals_dir, &market.token_contract)?,
+                cursor_path,
                 poll_interval: DEFAULT_MATCH_POLL_INTERVAL,
             },
             chain,
@@ -2664,7 +2980,7 @@ where
     }
     Ok(LoadedSellerPoolDeals {
         deals: pool,
-        pending_provisions: pending_provisions.len(),
+        pending_provisions,
     })
 }
 
@@ -2692,12 +3008,14 @@ async fn admit_seller_startup_deals(
     context: &SellerPoolContext<'_>,
     seller_policy: &policy::SellerRuntimePolicy,
 ) -> Result<Vec<SellerPoolDeal>> {
-    let mut capacity = SellerDealCapacity {
-        pending: loaded.pending_provisions,
-        ..SellerDealCapacity::default()
-    };
+    let mut capacities = std::collections::BTreeMap::<String, SellerDealCapacity>::new();
+    for owner in loaded.pending_provisions.into_values() {
+        capacities.entry(owner).or_default().pending += 1;
+    }
     let deals = loaded.deals;
     for deal in &deals {
+        let owner = context.for_deal(deal).note_addr;
+        let capacity = capacities.entry(deals::normalize_addr(owner)).or_default();
         if deal
             .chain
             .has_pending_sell_offer(&deal.cfg.token_contract)
@@ -2712,32 +3030,34 @@ async fn admit_seller_startup_deals(
             &deal.cfg.token_contract,
         )?
         .is_some();
-        let inspection = dexdo::seller::inspect_seller_offer(
-            deal.chain.as_ref(),
-            &deal.cfg,
-            Some(context.note_addr),
-        )
-        .await?;
+        let inspection =
+            dexdo::seller::inspect_seller_offer(deal.chain.as_ref(), &deal.cfg, Some(owner))
+                .await?;
         if fill_observed || !matches!(inspection, dexdo::seller::SellerOfferInspection::Vacant) {
             capacity.working += 1;
         } else {
             capacity.candidates += 1;
         }
     }
-    if u64::try_from(capacity.total()).unwrap_or(u64::MAX) > seller_policy.max_open_deals {
+    for (owner, capacity) in capacities {
+        if u64::try_from(capacity.total()).unwrap_or(u64::MAX) <= seller_policy.max_open_deals {
+            continue;
+        }
         tracing::warn!(
+            note = %dexdo_core::address::display(&owner),
             working_deals = capacity.working,
             candidates = capacity.candidates,
             max_open_deals = seller_policy.max_open_deals,
             "seller startup is above max_open_deals and will serve every deployed deal"
         );
         eprintln!(
-            "{}",
+            "{} (note {})",
             render_seller_capacity_warning(
                 capacity,
                 seller_policy.max_open_deals,
                 crate::cli::style::Palette::stderr(),
-            )
+            ),
+            dexdo_core::address::display(&owner),
         );
     }
     Ok(deals)
@@ -2823,6 +3143,7 @@ fn plan_unproven_start(
 }
 
 /// Residual startup carries pending ownership as well as any exact resting identity.
+#[cfg(test)]
 async fn prepare_pool_deal<S>(
     seller: &dexdo::seller::RunningSeller,
     deal: &SellerPoolDeal,
@@ -2892,11 +3213,46 @@ fn record_pool_offer_startup_state(
     authoritatively_absent
 }
 
+#[cfg(test)]
 async fn prepare_pool_deal_reporting_identity<S>(
     seller: &dexdo::seller::RunningSeller,
     deal: &SellerPoolDeal,
     context: &SellerPoolContext<'_>,
     match_was_observed: bool,
+    shutdown: Pin<&mut S>,
+    shutdown_requested: &mut bool,
+) -> Result<PoolDealStart>
+where
+    S: futures::future::FusedFuture<Output = ()> + ?Sized,
+{
+    prepare_pool_deal_from_inspection(
+        seller,
+        deal,
+        context,
+        if match_was_observed {
+            PoolStartupOffer::Matched
+        } else {
+            PoolStartupOffer::Inspect
+        },
+        shutdown,
+        shutdown_requested,
+    )
+    .await
+}
+
+#[derive(Clone, Copy)]
+enum PoolStartupOffer {
+    Inspect,
+    Pending,
+    Matched,
+    Resting(u128),
+}
+
+async fn prepare_pool_deal_from_inspection<S>(
+    seller: &dexdo::seller::RunningSeller,
+    deal: &SellerPoolDeal,
+    context: &SellerPoolContext<'_>,
+    offer: PoolStartupOffer,
     mut shutdown: Pin<&mut S>,
     shutdown_requested: &mut bool,
 ) -> Result<PoolDealStart>
@@ -2918,7 +3274,7 @@ where
     seller
         .state
         .route_stream(&deal.cfg.token_contract, deal.upstream.clone());
-    if match_was_observed {
+    if matches!(offer, PoolStartupOffer::Matched) {
         let pending_offer = deal
             .chain
             .has_pending_sell_offer(&deal.cfg.token_contract)
@@ -2933,11 +3289,12 @@ where
         );
         return Ok(PoolDealStart::Watching(None));
     }
-    if deal
-        .chain
-        .has_pending_sell_offer(&deal.cfg.token_contract)
-        .await
-        .unwrap_or(true)
+    if matches!(offer, PoolStartupOffer::Pending)
+        || deal
+            .chain
+            .has_pending_sell_offer(&deal.cfg.token_contract)
+            .await
+            .unwrap_or(true)
     {
         // Do not run cold readiness or chain inspection before seating this durable obligation.
         // Its independent watcher keeps the rest of the pool's startup bounded.
@@ -2963,12 +3320,27 @@ where
             display_token_contract(&deal.cfg.token_contract)
         );
     }
-    let inspection = dexdo::seller::inspect_seller_offer(
-        deal.chain.as_ref(),
-        &deal.cfg,
-        Some(context.note_addr),
-    )
-    .await?;
+    let inspection = match offer {
+        PoolStartupOffer::Resting(order_id) => {
+            dexdo::seller::SellerOfferInspection::Resting { order_id }
+        }
+        _ => {
+            dexdo::seller::inspect_seller_offer(
+                deal.chain.as_ref(),
+                &deal.cfg,
+                Some(context.note_addr),
+            )
+            .await?
+        }
+    };
+    if deal.market.is_some() && !matches!(inspection, dexdo::seller::SellerOfferInspection::Funded)
+    {
+        dexdo::seller::persist_seller_offer_mode(
+            &deal.watch.cursor_path,
+            &deal.cfg.token_contract,
+            deal.cfg.subscription,
+        )?;
+    }
     record_pool_offer_startup_state(
         &deal.cfg.token_contract,
         metric_model,
@@ -3105,6 +3477,30 @@ where
     Ok(PoolDealStart::Watching(identity))
 }
 
+#[derive(Debug)]
+enum PoolWatchOutcome {
+    Matched(dexdo_core::Match, OpenedDealPlan),
+    Stopped {
+        reason: dexdo::seller::liveness::RestingStopReason,
+        disposition: dexdo::seller::liveness::CancellationDisposition,
+    },
+}
+
+impl From<PoolWatchOutcome> for dexdo::seller::liveness::RestingSellerOutcome {
+    fn from(outcome: PoolWatchOutcome) -> Self {
+        match outcome {
+            PoolWatchOutcome::Matched(matched, _) => Self::Matched(matched),
+            PoolWatchOutcome::Stopped {
+                reason,
+                disposition,
+            } => Self::Stopped {
+                reason,
+                disposition,
+            },
+        }
+    }
+}
+
 async fn watch_pool_deal(
     seller: &dexdo::seller::RunningSeller,
     deal: SellerPoolDeal,
@@ -3130,7 +3526,7 @@ async fn watch_pool_deal(
     // the original would make the sweep prove the absence of a consumed predecessor while the
     // successor rests on unserved.
     Option<dexdo::seller::liveness::RestingOfferIdentity>,
-    Result<dexdo::seller::liveness::RestingSellerOutcome>,
+    Result<PoolWatchOutcome>,
 ) {
     let mut identity = identity;
     let result = async {
@@ -3167,7 +3563,7 @@ async fn watch_pool_deal(
                     disposition,
                 } => {
                     identity = stopped_identity;
-                    return Ok(dexdo::seller::liveness::RestingSellerOutcome::Stopped {
+                    return Ok(PoolWatchOutcome::Stopped {
                         reason,
                         disposition,
                     });
@@ -3197,8 +3593,14 @@ async fn watch_pool_deal(
             .await?
             {
                 dexdo::seller::liveness::RestingSellerOutcome::Matched(matched) => matched,
-                stopped @ dexdo::seller::liveness::RestingSellerOutcome::Stopped { .. } => {
-                    return Ok(stopped);
+                dexdo::seller::liveness::RestingSellerOutcome::Stopped {
+                    reason,
+                    disposition,
+                } => {
+                    return Ok(PoolWatchOutcome::Stopped {
+                        reason,
+                        disposition,
+                    });
                 }
             },
             None => {
@@ -3225,15 +3627,16 @@ async fn watch_pool_deal(
                 display_token_contract(&deal.cfg.token_contract)
             )
         })?;
-        dexdo::seller::serve_watched_match(
+        let matched = dexdo::seller::serve_watched_match(
             seller,
             deal.chain.as_ref(),
             &deal.cfg,
             &deal.watch,
             matched,
         )
-        .await
-        .map(dexdo::seller::liveness::RestingSellerOutcome::Matched)
+        .await?;
+        let plan = plan_opened_deal(seller, deal.chain.as_ref(), &deal.cfg.token_contract).await?;
+        Ok(PoolWatchOutcome::Matched(matched, plan))
     }
     .await;
     (deal, identity, result)
@@ -3329,6 +3732,10 @@ trait SellerPoolPolicyView {
     fn startup_max_open_deals(&self) -> u64 {
         self.runtime_policy().max_open_deals
     }
+
+    fn owns_gateway(&self) -> bool {
+        true
+    }
 }
 
 impl SellerPoolPolicyView for policy::SellerRuntimePolicy {
@@ -3340,6 +3747,7 @@ impl SellerPoolPolicyView for policy::SellerRuntimePolicy {
 struct SellerStartupPolicy<'a> {
     runtime: &'a policy::SellerRuntimePolicy,
     retained_deals: usize,
+    owns_gateway: bool,
 }
 
 impl SellerPoolPolicyView for SellerStartupPolicy<'_> {
@@ -3351,6 +3759,10 @@ impl SellerPoolPolicyView for SellerStartupPolicy<'_> {
         self.runtime
             .max_open_deals
             .max(u64::try_from(self.retained_deals).unwrap_or(u64::MAX))
+    }
+
+    fn owns_gateway(&self) -> bool {
+        self.owns_gateway
     }
 }
 
@@ -3386,6 +3798,99 @@ async fn select_seller_replacement_nonce(
     Ok(nonce)
 }
 
+// One admission at a time keeps the note's SELL writes ordered. The pool polls
+// it alongside its existing watchers so a lost acknowledgement cannot delay handover.
+async fn admit_pool_deal(
+    seller: &dexdo::seller::RunningSeller,
+    context: SellerPoolContext<'_>,
+    deal: SellerPoolDeal,
+    offer: PoolStartupOffer,
+    parent: Option<SellerPoolDeal>,
+    mut stop: tokio::sync::watch::Receiver<bool>,
+) -> (
+    SellerPoolDeal,
+    Option<SellerPoolDeal>,
+    Result<PoolDealStart>,
+) {
+    let outcome = async {
+        let context = context.for_deal(&deal);
+        save_pool_deal_handle(&context, &deal)?;
+        let shutdown = async {
+            let _ = stop.wait_for(|stopped| *stopped).await;
+        }
+        .fuse();
+        tokio::pin!(shutdown);
+        prepare_pool_deal_from_inspection(
+            seller,
+            &deal,
+            &context,
+            offer,
+            shutdown.as_mut(),
+            &mut false,
+        )
+        .await
+    }
+    .await;
+    (deal, parent, outcome)
+}
+
+fn residual_recovery_is_durable(
+    error: &anyhow::Error,
+    current: &SellerPoolDeal,
+    context: &SellerPoolContext<'_>,
+) -> bool {
+    let permanent_identity_mismatch = error.chain().any(|cause| {
+        cause
+            .downcast_ref::<dexdo_core::MarketIdentityMismatch>()
+            .is_some()
+    });
+    let reserved_nonce = dexdo::seller::read_seller_fill_lineage(
+        &current.watch.cursor_path,
+        &current.cfg.token_contract,
+    )
+    .ok()
+    .flatten()
+    .and_then(|fill| fill.replacement_nonce);
+    let durable_reservation = reserved_nonce.is_some_and(|nonce| {
+        seller_market_handle_records(context.deals_dir, context.note_addr).is_ok_and(|records| {
+            records
+                .into_values()
+                .any(|record| record.provision_pending && record.market.nonce == nonce)
+        })
+    });
+    durable_reservation && !permanent_identity_mismatch
+}
+
+/// Drive borrowed pool tasks independently of control-loop chain reads. Closing the
+/// output receiver cancels pending tasks; closing only the input drains existing tasks.
+async fn drive_pool_tasks<F>(
+    mut incoming: tokio::sync::mpsc::UnboundedReceiver<F>,
+    outgoing: tokio::sync::mpsc::UnboundedSender<F::Output>,
+) where
+    F: Future,
+{
+    let mut tasks = FuturesUnordered::new();
+    let mut closed = false;
+    loop {
+        if closed && tasks.is_empty() {
+            break;
+        }
+        tokio::select! {
+            biased;
+            _ = outgoing.closed() => break,
+            task = incoming.recv(), if !closed => match task {
+                Some(task) => tasks.push(task),
+                None => closed = true,
+            },
+            result = tasks.next(), if !tasks.is_empty() => {
+                if outgoing.send(result.expect("a pool task was in flight")).is_err() {
+                    break;
+                }
+            }
+        }
+    }
+}
+
 async fn run_seller_pool<S, F, Fut, P>(
     seller: &dexdo::seller::RunningSeller,
     deals: Vec<SellerPoolDeal>,
@@ -3397,7 +3902,7 @@ async fn run_seller_pool<S, F, Fut, P>(
 ) -> Result<()>
 where
     S: futures::future::FusedFuture<Output = ()> + ?Sized,
-    F: FnMut(String, u64, u64, u64) -> Fut,
+    F: FnMut(String, String, u64, u64, u64) -> Fut,
     Fut: Future<
         Output = Result<(
             dexdo_core::MarketManifest,
@@ -3412,12 +3917,13 @@ where
     let (stop_tx, stop_rx) = tokio::sync::watch::channel(false);
     let startup_max_open_deals =
         usize::try_from(seller_policy.startup_max_open_deals()).unwrap_or(usize::MAX);
+    let owns_gateway = seller_policy.owns_gateway();
     let seller_policy = seller_policy.runtime_policy();
     let max_open_deals = usize::try_from(seller_policy.max_open_deals).unwrap_or(usize::MAX);
     if max_open_deals == 0 {
         bail!("seller.max_open_deals must be at least 1");
     }
-    let mut model_upstreams = std::collections::HashMap::new();
+    let mut uptime_models = std::collections::HashSet::new();
     for deal in &deals {
         let model = deal
             .market
@@ -3425,21 +3931,18 @@ where
             .map(|market| market.frame_model.as_str())
             .unwrap_or(context.frame_model);
         dexdo::telemetry::register(&deal.cfg.token_contract, model);
-        model_upstreams
-            .entry(model.to_owned())
-            .or_insert_with(|| deal.upstream.clone());
+        if uptime_models.insert(model.to_owned()) {
+            seller.state.watch_model_uptime(model, &deal.upstream);
+        }
     }
-    let uptime_models: Vec<_> = model_upstreams.keys().cloned().collect();
-    let mut uptime_probes = JoinSet::<()>::new();
-    let uptime_timeout = SellerLivenessParams::canonical().health_check_timeout;
-    let (owner_fill_chain, primary_token_contract) = deals
+
+    let primary_token_contract = deals
         .first()
-        .map(|deal| (deal.chain.clone(), deal.cfg.token_contract.clone()))
+        .map(|deal| deal.cfg.token_contract.clone())
         .ok_or_else(|| anyhow::anyhow!("seller pool has no deals to supervise"))?;
-    let mut owner_fill_cursor = MatchWatchCursor::new(0);
+    let mut owner_books = std::collections::HashMap::new();
     let mut active = JoinSet::<SellerAdvanceResult>::new();
     let mut terminal_receipts = JoinSet::<SellerTerminalReceiptResult>::new();
-    let mut watched = FuturesUnordered::new();
     let (fill_tx, mut fill_rx) = tokio::sync::mpsc::unbounded_channel();
     let (claim_delivery_tx, mut claim_delivery_rx) =
         tokio::sync::mpsc::unbounded_channel::<ClaimDeliveryRuntimeEvent>();
@@ -3447,7 +3950,8 @@ where
     let mut pending = std::collections::VecDeque::<SellerPoolDeal>::new();
     let mut reconciliation_pending = std::collections::VecDeque::<SellerPoolDeal>::new();
     let mut known_tcs = std::collections::HashSet::new();
-    let mut known_nonces = std::collections::HashMap::new();
+    let mut known_nonces =
+        std::collections::HashMap::<String, std::collections::HashMap<u64, SellerPoolDeal>>::new();
     let mut service_started_tcs = std::collections::HashSet::new();
     let mut capacity_deals = std::collections::HashMap::new();
     let mut first_error = None;
@@ -3455,6 +3959,7 @@ where
     // race; they are attached to whatever the primary error turns out to be.
     let mut cascade_notes: Vec<dexdo_core::DexdoError> = Vec::new();
     let mut noted_owner_fills = std::collections::HashSet::new();
+    let mut recoveries = Vec::new();
     let mut candidates = Vec::new();
 
     for deal in deals {
@@ -3471,11 +3976,16 @@ where
                 display_token_contract(&deal.cfg.token_contract)
             );
         }
-        capacity_deals.insert(
-            normalized,
-            (deal.cfg.token_contract.clone(), deal.chain.clone()),
-        );
-        if let Some(known) = known_nonces.insert(deal.nonce, deal.clone()) {
+        let owner = deals::normalize_addr(context.for_deal(&deal).note_addr);
+        owner_books
+            .entry((owner.clone(), metric_model.to_owned()))
+            .or_insert_with(|| deal.chain.clone());
+        capacity_deals.insert(normalized, deal.clone());
+        if let Some(known) = known_nonces
+            .entry(owner)
+            .or_default()
+            .insert(deal.nonce, deal.clone())
+        {
             bail!(
                 "seller pool nonce {} maps to both TokenContract {} ({},{ticks}) and {} ({},{})",
                 deal.nonce,
@@ -3509,7 +4019,12 @@ where
             .await
             .unwrap_or(true)
         {
-            candidates.push((deal, observed));
+            let offer = if observed {
+                PoolStartupOffer::Matched
+            } else {
+                PoolStartupOffer::Pending
+            };
+            recoveries.push((deal, offer));
             continue;
         }
         let state = match deal.chain.deal_state(&deal.cfg.token_contract).await {
@@ -3572,261 +4087,210 @@ where
             let _ = std::io::stdout().flush();
             continue;
         }
-        candidates.push((deal, observed));
-    }
-    if candidates.len() > startup_max_open_deals {
-        bail!(
-            "seller pool has {} active/resting deals, exceeding policy seller.max_open_deals={max_open_deals}",
-            candidates.len()
-        );
-    }
-    match owner_fill_chain
-        .poll_seller_fills(seller.note.as_ref(), &mut owner_fill_cursor)
-        .await
-    {
-        Ok(fills) => {
-            for fill in fills {
-                if known_tcs.contains(&deals::normalize_addr(&fill.token_contract))
-                    || !noted_owner_fills.insert(deals::normalize_addr(&fill.token_contract))
-                {
-                    continue;
-                }
-                if let Some(note) =
-                    unaccounted_owner_fill_note(owner_fill_chain.as_ref(), &fill.token_contract)
-                        .await
-                {
-                    cascade_notes.push(note);
-                    break;
-                }
-            }
-        }
-        Err(error) => {
-            tracing::warn!(%error, "seller owner fill discovery failed; retrying");
-            first_error.get_or_insert_with(|| {
-                anyhow::anyhow!("seller owner fill discovery failed: {error}")
-            });
-        }
-    }
-    for (deal, observed) in candidates {
-        if let Err(error) = save_pool_deal_handle(&context, &deal) {
-            first_error.get_or_insert(error);
+        if observed || state.is_some_and(|state| state.funded) {
+            recoveries.push((deal, PoolStartupOffer::Matched));
             continue;
         }
-        let identity = match prepare_pool_deal_reporting_identity(
-            seller,
-            &deal,
-            &context,
-            observed,
-            shutdown.as_mut(),
-            shutdown_requested,
+        let context = context.for_deal(&deal);
+        match dexdo::seller::read_resting_seller_order(
+            deal.chain.as_ref(),
+            &deal.cfg,
+            Some(context.note_addr),
         )
         .await
         {
-            Ok(PoolDealStart::Watching(identity)) => identity,
-            // finding 3: the start stopped and the ask is NOT proven off the book. Retiring
-            // here is what left an executable ask with nobody watching it and nothing in `resting`
-            // for the sweep to find. The error is still reported; the deal is still answered for.
-            Ok(PoolDealStart::StoppedUnproven {
-                identity,
-                reason,
-                disposition,
-                error,
-            }) => {
-                // r4, point 1: ask the SAME question the running path asks, and act on the
-                // same answer. Keeping the bookkeeping and the gateway route was never enough --
-                // with no watcher, a buyer who crosses this still-live ask is unserved whatever the
-                // sweep later concludes. `should_rearm_watcher` exists so these two paths cannot
-                // hold different opinions; until now only one of them consulted it.
-                let action = plan_unproven_start(identity.as_ref(), &reason, &disposition);
-                if !matches!(action, UnprovenStartAction::WatchPending) {
-                    first_error.get_or_insert(error);
-                }
-                tracing::error!(
-                    token_contract = %display_token_contract(&deal.cfg.token_contract),
-                    ?reason,
-                    %disposition,
-                    action = ?action,
-                    "seller pool start stopped without proving its ask off the book"
-                );
-                match (action, identity) {
-                    (UnprovenStartAction::WatchPending, None) => {
-                        watched.push(watch_pool_deal(
-                            seller,
-                            deal.clone(),
-                            None,
-                            Some(context.note_addr.to_string()),
-                            fill_tx.clone(),
-                            context.advertise_probe,
-                            stop_rx.clone(),
-                        ));
-                        service_started_tcs.insert(deals::normalize_addr(&deal.cfg.token_contract));
-                    }
-                    (UnprovenStartAction::Keep { rearm }, Some(identity)) => {
-                        resting.insert(
-                            deal.cfg.token_contract.clone(),
-                            (deal.clone(), identity.clone()),
-                        );
-                        if rearm {
-                            let service_key = deals::normalize_addr(&deal.cfg.token_contract);
-                            watched.push(watch_pool_deal(
-                                seller,
-                                deal.clone(),
-                                Some(identity),
-                                None,
-                                fill_tx.clone(),
-                                context.advertise_probe,
-                                stop_rx.clone(),
-                            ));
-                            service_started_tcs.insert(service_key);
-                        }
-                    }
-                    _ => {
-                        seller.state.unregister_stream(&deal.cfg.token_contract);
-                    }
-                }
-                continue;
-            }
+            Ok(Some(order_id)) => recoveries.push((deal, PoolStartupOffer::Resting(order_id))),
+            Ok(None) => candidates.push((deal, PoolStartupOffer::Inspect)),
             Err(error) => {
-                dexdo::telemetry::register(
-                    &deal.cfg.token_contract,
-                    deal.market
-                        .as_ref()
-                        .map(|market| market.frame_model.as_str())
-                        .unwrap_or("mock"),
-                );
-                dexdo::telemetry::offer_event(&deal.cfg.token_contract, "isolated");
-                tracing::error!(
-                    token_contract = %display_token_contract(&deal.cfg.token_contract),
-                    %error,
-                    "seller pool isolated deal startup failure"
-                );
-                seller.state.unregister_stream(&deal.cfg.token_contract);
+                tracing::error!(token_contract = %display_token_contract(&deal.cfg.token_contract),
+                    %error, "seller pool could not inspect startup offer");
                 first_error.get_or_insert(error);
-                continue;
             }
-        };
-        if let Some(identity) = identity.as_ref() {
-            resting.insert(
-                deal.cfg.token_contract.clone(),
-                (deal.clone(), identity.clone()),
-            );
         }
-        let service_key = deals::normalize_addr(&deal.cfg.token_contract);
-        watched.push(watch_pool_deal(
-            seller,
-            deal,
-            identity,
-            None,
-            fill_tx.clone(),
-            context.advertise_probe,
-            stop_rx.clone(),
-        ));
-        service_started_tcs.insert(service_key);
     }
-
-    // Startup/restoration readiness already probes the exact upstream. Start the independent
-    // uptime cadence only after those checks have recorded their result, so its immediate first
-    // tick does not duplicate provider traffic. Restored deals with no recent result are probed.
-    if dexdo::telemetry::enabled() {
-        for (model, upstream) in model_upstreams {
-            uptime_probes.spawn(async move {
-                let mut cadence = tokio::time::interval(SELLER_UPTIME_PROBE_INTERVAL);
-                cadence.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-                loop {
-                    cadence.tick().await;
-                    if !dexdo::telemetry::uptime_probe_due(
-                        &model,
-                        "upstream",
-                        SELLER_UPTIME_PROBE_INTERVAL,
-                    ) {
+    let candidate_count = recoveries.len() + candidates.len();
+    if candidate_count > startup_max_open_deals {
+        bail!(
+            "seller pool has {candidate_count} active/resting deals, exceeding policy seller.max_open_deals={max_open_deals}",
+        );
+    }
+    let mut owner_fill_reads = futures::stream::SelectAll::new();
+    for owner_fill_chain in owner_books.into_values() {
+        let mut cursor = MatchWatchCursor::new(0);
+        match owner_fill_chain
+            .poll_seller_fills(seller.signing_note(owner_fill_chain.as_ref()), &mut cursor)
+            .await
+        {
+            Ok(fills) => {
+                for fill in fills {
+                    if known_tcs.contains(&deals::normalize_addr(&fill.token_contract))
+                        || !noted_owner_fills.insert(deals::normalize_addr(&fill.token_contract))
+                    {
                         continue;
                     }
-                    let outcome = match tokio::time::timeout(
-                        uptime_timeout,
-                        upstream.check_market_readiness(),
-                    )
-                    .await
+                    if let Some(note) =
+                        unaccounted_owner_fill_note(owner_fill_chain.as_ref(), &fill.token_contract)
+                            .await
                     {
-                        Ok(Ok(())) => "pass",
-                        Ok(Err(error)) => dexdo::seller::liveness::upstream_uptime_outcome(&error),
-                        Err(_) => "timeout",
-                    };
-                    dexdo::telemetry::uptime(&model, "upstream", outcome);
+                        cascade_notes.push(note);
+                        break;
+                    }
                 }
-            });
+            }
+            Err(error) => {
+                tracing::warn!(%error, "seller owner fill discovery failed; retrying");
+                first_error.get_or_insert_with(|| {
+                    anyhow::anyhow!("seller owner fill discovery failed: {error}")
+                });
+            }
         }
+        let mut timer = tokio::time::interval(DEFAULT_MATCH_POLL_INTERVAL);
+        timer.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        owner_fill_reads.push(Box::pin(futures::stream::unfold(
+            (owner_fill_chain, cursor, timer),
+            |(chain, mut cursor, mut timer)| async move {
+                timer.tick().await;
+                let result = chain
+                    .poll_seller_fills(seller.signing_note(chain.as_ref()), &mut cursor)
+                    .await;
+                Some(((chain.clone(), result), (chain, cursor, timer)))
+            },
+        )));
     }
-
-    let mut gateway_poll =
-        tokio::time::interval(SellerLivenessParams::canonical().gateway_task_poll);
-    gateway_poll.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-    let mut owner_fill_poll = tokio::time::interval(DEFAULT_MATCH_POLL_INTERVAL);
-    owner_fill_poll.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-    let owner_fill_backend = owner_fill_chain.as_ref();
-    let owner_note = seller.note.as_ref();
-    // Keep one scan alive across select iterations so discovery cannot block deal watches or stop.
-    let mut owner_fill_reads = Box::pin(futures::stream::unfold(
-        (owner_fill_cursor, owner_fill_poll),
-        |(mut cursor, mut timer)| async move {
-            timer.tick().await;
-            let result = owner_fill_backend
-                .poll_seller_fills(owner_note, &mut cursor)
-                .await;
-            Some((result, (cursor, timer)))
-        },
-    ));
-    let mut stop_error = None;
-    let mut stopped_by_operator = false;
-
-    'pool: loop {
-        // the recorded disposition, not the signal. A shutdown consumed by a deal startup
-        // above leaves the `Fuse` permanently `Pending`, so the `select!` arm below can never fire
-        // again and a `poll!` here could never tell that apart from "no signal yet". The record can:
-        // it is why this loop still stops, and it is read before the provisioning block so no
-        // successor TokenContract is deployed after the operator asked the seller to stop.
-        if *shutdown_requested {
-            stopped_by_operator = true;
-            break 'pool;
-        }
+    // Read futures must keep running while the control loop awaits capacity or settlement.
+    // Otherwise an older FIFO admission can be owned by a watcher the loop is not polling.
+    let (watch_tx, watch_inputs) = tokio::sync::mpsc::unbounded_channel();
+    let (watch_outputs, watch_rx) = tokio::sync::mpsc::unbounded_channel::<(
+        SellerPoolDeal,
+        Option<dexdo::seller::liveness::RestingOfferIdentity>,
+        Result<PoolWatchOutcome>,
+    )>();
+    let mut watched = tokio_stream::wrappers::UnboundedReceiverStream::new(watch_rx);
+    let (admission_tx, admission_inputs) = tokio::sync::mpsc::unbounded_channel();
+    let (admission_outputs, admission_rx) = tokio::sync::mpsc::unbounded_channel::<(
+        SellerPoolDeal,
+        Option<SellerPoolDeal>,
+        Result<PoolDealStart>,
+    )>();
+    let mut admissions = tokio_stream::wrappers::UnboundedReceiverStream::new(admission_rx);
+    let (owner_outputs, mut owner_results) = tokio::sync::mpsc::unbounded_channel();
+    let has_owner_reads = !owner_fill_reads.is_empty();
+    let mut owner_stop = stop_rx.clone();
+    let owner_driver = async move {
         loop {
-            let reconciling = !reconciliation_pending.is_empty();
-            if !reconciling && pending.is_empty() {
-                break;
+            tokio::select! {
+                biased;
+                _ = owner_outputs.closed() => break,
+                _ = owner_stop.wait_for(|stopped| *stopped) => break,
+                fills = owner_fill_reads.next() => {
+                    let Some(fills) = fills else { break; };
+                    if owner_outputs.send(fills).is_err() { break; }
+                }
             }
-            if !reconciling
-                && seller_pool_occupied_capacity(
-                    context.deals_dir,
-                    context.note_addr,
-                    &capacity_deals,
-                )
-                .await?
-                    >= max_open_deals
-            {
-                break;
+        }
+    };
+    let control = async move {
+        // Restore known service obligations before the first fresh POST can hold the admission slot.
+        let mut candidates = recoveries.into_iter().chain(candidates);
+        let mut admission_count = 0usize;
+        let mut watch_count = 0usize;
+        let mut gateway_poll =
+            tokio::time::interval(SellerLivenessParams::canonical().gateway_task_poll);
+        gateway_poll.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        let mut stop_error = None;
+        let mut stopped_by_operator = false;
+        let mut admission_stop_deadline = None;
+
+        'pool: loop {
+            let stopping = *shutdown_requested || stop_error.is_some();
+            if stopping {
+                stopped_by_operator |= *shutdown_requested;
+                if admission_count == 0 {
+                    break 'pool;
+                }
+                stop_tx.send_replace(true);
+                admission_stop_deadline.get_or_insert_with(|| {
+                    tokio::time::Instant::now() + dexdo_core::params::MATCH_OPEN_TIMEOUT
+                });
+            } else if admission_count == 0 {
+                if let Some((deal, offer)) = candidates.next() {
+                    admission_count += 1;
+                    admission_tx
+                        .send(admit_pool_deal(
+                            seller,
+                            context,
+                            deal,
+                            offer,
+                            None,
+                            stop_rx.clone(),
+                        ))
+                        .expect("seller read driver is live");
+                }
             }
-            // provisioning deploys and funds a fresh TokenContract. Honor the recorded
-            // shutdown or observe a newly-ready signal before taking the residual from `pending`
-            // and before any durable lineage write, so an operator stop cannot spend money on a
-            // successor the process will not use.
-            if *shutdown_requested || futures::poll!(shutdown.as_mut()).is_ready() {
-                *shutdown_requested = true;
-                stopped_by_operator = true;
-                tracing::warn!(
-                    pending_residuals = pending.len() + reconciliation_pending.len(),
-                    reason = "operator_shutdown",
-                    "seller pool left residuals unprovisioned because shutdown was requested"
-                );
-                break 'pool;
-            }
-            let current = if reconciling {
-                reconciliation_pending.pop_front()
-            } else {
-                pending.pop_front()
-            };
-            let Some(current) = current else {
-                break;
-            };
-            let replacement_result: Result<()> = async {
+            while !stopping && admission_count == 0 {
+                let reconciling = !reconciliation_pending.is_empty();
+                if !reconciling && pending.is_empty() {
+                    break;
+                }
+                let mut ready = None;
+                if !reconciling {
+                    let mut checked_notes = std::collections::HashSet::new();
+                    for (index, deal) in pending.iter().enumerate() {
+                        let owner = context.for_deal(deal).note_addr;
+                        if !checked_notes.insert(deals::normalize_addr(owner)) {
+                            continue;
+                        }
+                        let occupied = tokio::select! {
+                            biased;
+                            _ = shutdown.as_mut() => {
+                                *shutdown_requested = true;
+                                stopped_by_operator = true;
+                                break 'pool;
+                            }
+                            occupied = seller_pool_occupied_capacity(
+                                context.deals_dir,
+                                owner,
+                                context.note_addr,
+                                &capacity_deals,
+                            ) => occupied?,
+                        };
+                        if occupied < max_open_deals {
+                            ready = Some(index);
+                            break;
+                        }
+                    }
+                    if ready.is_none() {
+                        break;
+                    }
+                }
+                // provisioning deploys and funds a fresh TokenContract. Honor the recorded
+                // shutdown or observe a newly-ready signal before taking the residual from `pending`
+                // and before any durable lineage write, so an operator stop cannot spend money on a
+                // successor the process will not use.
+                if *shutdown_requested || futures::poll!(shutdown.as_mut()).is_ready() {
+                    *shutdown_requested = true;
+                    stopped_by_operator = true;
+                    tracing::warn!(
+                        pending_residuals = pending.len() + reconciliation_pending.len(),
+                        reason = "operator_shutdown",
+                        "seller pool left residuals unprovisioned because shutdown was requested"
+                    );
+                    break 'pool;
+                }
+                let current = if reconciling {
+                    reconciliation_pending.pop_front()
+                } else {
+                    pending.remove(ready.expect("an eligible residual was found"))
+                };
+                let Some(current) = current else {
+                    break;
+                };
+                let pool_context = context;
+                let context = pool_context.for_deal(&current);
+                let known_nonces = known_nonces
+                    .entry(deals::normalize_addr(context.note_addr))
+                    .or_default();
+                let replacement_result: Result<()> = async {
                 if dexdo::seller::seller_unsold_is_retired(&current.watch.cursor_path, &current.cfg.token_contract)? {
                     return Ok(());
                 }
@@ -3862,11 +4326,15 @@ where
                 // local check it duplicated -- the handle this deal was loaded from must agree with
                 // the lineage -- and the terms still come only from facts proven while the parent
                 // answered. Anything that does not agree publishes nothing.
-                match current
-                    .chain
-                    .sell_offer_terms(&current.cfg.token_contract)
-                    .await?
-                {
+                let terms = tokio::select! {
+                    biased;
+                    _ = shutdown.as_mut() => {
+                        *shutdown_requested = true;
+                        return Ok(());
+                    }
+                    terms = current.chain.sell_offer_terms(&current.cfg.token_contract) => terms?,
+                };
+                match terms {
                     Some(terms) => {
                         if terms != (fill.price_per_tick, fill.offered_ticks) {
                             return Err(dexdo_core::MarketIdentityMismatch::new(format!(
@@ -3908,9 +4376,16 @@ where
                         let _ = std::io::stdout().flush();
                     }
                 }
-                let next_nonce = select_seller_replacement_nonce(
-                    &current, &fill, &known_nonces, &context,
-                ).await?;
+                let next_nonce = tokio::select! {
+                    biased;
+                    _ = shutdown.as_mut() => {
+                        *shutdown_requested = true;
+                        return Ok(());
+                    }
+                    nonce = select_seller_replacement_nonce(
+                        &current, &fill, known_nonces, &context,
+                    ) => nonce?,
+                };
                 // The chain reads above may have taken time. Recheck shutdown before reserving or
                 // submitting a successor, just as at the pending-queue boundary.
                 if *shutdown_requested || futures::poll!(shutdown.as_mut()).is_ready() {
@@ -3936,7 +4411,12 @@ where
                     .as_ref()
                     .map(|market| market.frame_model.clone())
                     .unwrap_or_else(|| context.frame_model.to_string());
-                if let Some(known) = known_nonces.get(&next_nonce).cloned() {
+                let known = known_nonces.get(&next_nonce).or_else(|| {
+                    fill.replacement_token_contract.as_ref().and_then(|linked| {
+                        capacity_deals.get(&deals::normalize_addr(linked))
+                    })
+                });
+                if let Some(known) = known.cloned() {
                     let market = known.market.as_ref().ok_or_else(|| {
                         dexdo_core::MarketIdentityMismatch::new(format!(
                             "seller residual nonce {next_nonce} is occupied by {} without a durable market identity",
@@ -3970,45 +4450,22 @@ where
                     }
                     let service_key = deals::normalize_addr(&known.cfg.token_contract);
                     if !service_started_tcs.contains(&service_key) {
-                        save_pool_deal_handle(&context, &known)?;
                         let observed = dexdo::seller::read_seller_fill_lineage(
-                            &known.watch.cursor_path,
-                            &known.cfg.token_contract,
-                        )?
-                        .is_some();
-                        let (identity, pending_owner) = prepare_pool_deal(
-                            seller,
-                            &known,
-                            &context,
-                            observed,
-                            shutdown.as_mut(),
-                            shutdown_requested,
-                        )
-                        .await?;
-                        if let Some(identity) = identity.as_ref() {
-                            resting.insert(
-                                known.cfg.token_contract.clone(),
-                                (known.clone(), identity.clone()),
-                            );
-                        }
-                        watched.push(watch_pool_deal(
-                            seller,
-                            known.clone(),
-                            identity,
-                            pending_owner,
-                            fill_tx.clone(),
-                            context.advertise_probe,
-                            stop_rx.clone(),
-                        ));
-                        service_started_tcs.insert(service_key);
+                            &known.watch.cursor_path, &known.cfg.token_contract,
+                        )?.is_some();
+                        admission_count += 1;
+                        admission_tx.send(admit_pool_deal(
+                            seller, pool_context, known,
+                            if observed { PoolStartupOffer::Matched } else { PoolStartupOffer::Inspect },
+                            Some(current.clone()), stop_rx.clone(),
+                        )).expect("seller read driver is live");
+                    } else {
+                        super::support::clear_provision_pending_if_present(context.deals_dir, market)?;
                     }
-                    super::support::clear_provision_pending_if_present(
-                        context.deals_dir,
-                        market,
-                    )?;
                     return Ok(());
                 }
                 let (market, chain) = provisioner(
+                    context.note_addr.to_string(),
                     frame_model.clone(),
                     next_nonce,
                     current.cfg.price_per_tick,
@@ -4039,8 +4496,18 @@ where
                     next_nonce,
                     Some(&market.token_contract),
                 )?;
+                // The provision and exact successor link above are durable. Record an already
+                // ready read before STOP; cancel a pending read and retain the recovery journal.
+                let terms = tokio::select! {
+                    biased;
+                    terms = chain.sell_offer_terms(&market.token_contract) => terms?,
+                    _ = shutdown.as_mut() => {
+                        *shutdown_requested = true;
+                        return Ok(());
+                    }
+                };
                 let (authoritative_price, authoritative_ticks) =
-                    match chain.sell_offer_terms(&market.token_contract).await? {
+                    match terms {
                         Some(terms) => terms,
                         None if market.network == "mock" => {
                             (current.cfg.price_per_tick, fill.residual_ticks)
@@ -4074,7 +4541,6 @@ where
                     gateway_advertise: current.cfg.gateway_advertise.clone(),
                     mock_token_count: current.cfg.mock_token_count,
                 };
-                let adopted_market = market.clone();
                 let replacement = SellerPoolDeal {
                     watch: dexdo::seller::SellerMatchWatchConfig {
                         cursor_path: seller_watch_cursor_path(
@@ -4097,553 +4563,563 @@ where
                     ))
                     .into());
                 }
-                capacity_deals.insert(
-                    normalized.clone(),
-                    (
-                        replacement.cfg.token_contract.clone(),
-                        replacement.chain.clone(),
-                    ),
-                );
+                capacity_deals.insert(normalized.clone(), replacement.clone());
                 known_nonces.insert(next_nonce, replacement.clone());
-                save_pool_deal_handle(&context, &replacement)?;
-                let (identity, pending_owner) = prepare_pool_deal(
-                    seller,
-                    &replacement,
-                    &context,
-                    false,
-                    shutdown.as_mut(),
-                    shutdown_requested,
-                )
-                .await?;
-                if let Some(identity) = identity.as_ref() {
-                    resting.insert(
-                        replacement.cfg.token_contract.clone(),
-                        (replacement.clone(), identity.clone()),
-                    );
-                }
-                watched.push(watch_pool_deal(
-                    seller,
-                    replacement,
-                    identity,
-                    pending_owner,
-                    fill_tx.clone(),
-                    context.advertise_probe,
-                    stop_rx.clone(),
-                ));
-                service_started_tcs.insert(normalized);
-                super::support::clear_provision_pending_if_present(
-                    context.deals_dir,
-                    &adopted_market,
-                )?;
+                admission_count += 1;
+                admission_tx.send(admit_pool_deal(
+                    seller, pool_context, replacement, PoolStartupOffer::Inspect, Some(current.clone()), stop_rx.clone(),
+                )).expect("seller read driver is live");
                 Ok(())
             }
             .await;
-            if let Err(error) = replacement_result {
-                let ambiguous = error
-                    .chain()
-                    .find_map(|cause| cause.downcast_ref::<dexdo_core::MoneySubmitError>())
-                    .is_some_and(dexdo_core::MoneySubmitError::is_ambiguous);
-                let permanent_identity_mismatch = error.chain().any(|cause| {
-                    cause
-                        .downcast_ref::<dexdo_core::MarketIdentityMismatch>()
-                        .is_some()
-                });
-                let reserved_nonce = dexdo::seller::read_seller_fill_lineage(
-                    &current.watch.cursor_path,
-                    &current.cfg.token_contract,
-                )
-                .ok()
-                .flatten()
-                .and_then(|fill| fill.replacement_nonce);
-                let durable_reservation = reserved_nonce.is_some_and(|nonce| {
-                    seller_market_handle_records(context.deals_dir, context.note_addr).is_ok_and(
-                        |records| {
-                            records.into_values().any(|record| {
-                                record.provision_pending && record.market.nonce == nonce
-                            })
-                        },
-                    )
-                });
-                if durable_reservation && !permanent_identity_mismatch {
-                    tracing::warn!(
+                if let Err(error) = replacement_result {
+                    if residual_recovery_is_durable(&error, &current, &context) {
+                        tracing::warn!(
+                            token_contract = %display_token_contract(&current.cfg.token_contract),
+                            %error,
+                            "seller pool retained durable residual recovery without resubmitting"
+                        );
+                        reconciliation_pending.push_back(current);
+                        break;
+                    }
+                    tracing::error!(
                         token_contract = %display_token_contract(&current.cfg.token_contract),
-                        ambiguous,
                         %error,
-                        "seller pool retained durable residual recovery without resubmitting"
+                        "seller pool isolated residual provision failure"
                     );
-                    reconciliation_pending.push_back(current);
-                    break;
+                    first_error.get_or_insert(error);
                 }
-                tracing::error!(
-                    token_contract = %display_token_contract(&current.cfg.token_contract),
-                    permanent_identity_mismatch,
-                    %error,
-                    "seller pool isolated residual provision failure"
-                );
-                first_error.get_or_insert(error);
+                if *shutdown_requested {
+                    stopped_by_operator = true;
+                    let _ = stop_tx.send(true);
+                    break 'pool;
+                }
             }
-            if *shutdown_requested {
-                stopped_by_operator = true;
-                let _ = stop_tx.send(true);
-                break 'pool;
-            }
-        }
 
-        if watched.is_empty()
-            && active.is_empty()
-            && terminal_receipts.is_empty()
-            && pending.is_empty()
-            && reconciliation_pending.is_empty()
-        {
-            break;
-        }
-        tokio::select! {
-            biased;
-            _ = shutdown.as_mut() => {
-                *shutdown_requested = true;
-                stopped_by_operator = true;
-                // tell the watchers BEFORE breaking, so the unconditional drain below can
-                // finish. Dropping them instead would lose the identity a relist advanced to
-                // so the drain stays and the watchers are given a way out.
-                let _ = stop_tx.send(true);
-                break 'pool;
+            if admission_count == 0
+                && watch_count == 0
+                && active.is_empty()
+                && terminal_receipts.is_empty()
+                && pending.is_empty()
+                && reconciliation_pending.is_empty()
+            {
+                break;
             }
-            fills = owner_fill_reads.next() => {
-                match fills.expect("owner discovery stream does not end") {
-                    Ok(fills) => {
-                        for fill in fills {
-                            if known_tcs.contains(&deals::normalize_addr(&fill.token_contract))
-                                || !noted_owner_fills
-                                    .insert(deals::normalize_addr(&fill.token_contract))
-                            {
-                                continue;
-                            }
-                            if let Some(note) = unaccounted_owner_fill_note(
-                                owner_fill_chain.as_ref(),
-                                &fill.token_contract,
-                            )
-                            .await
-                            {
-                                tracing::error!(
-                                    error = %note,
-                                    "seller pool isolated unknown owner fill"
-                                );
-                                cascade_notes.push(note);
-                                break;
+            tokio::select! {
+                biased;
+                admitted = admissions.next(), if admission_count != 0 => {
+                    let (deal, parent, outcome) = admitted.expect("admission in flight");
+                    admission_count -= 1;
+                    let deal_context = context.for_deal(&deal);
+                    let (identity, pending_owner, rearm) = match outcome {
+                        Ok(PoolDealStart::Watching(identity)) => (identity, None, true),
+                        Ok(PoolDealStart::StoppedUnproven { identity, reason, disposition, error }) => {
+                            let action = plan_unproven_start(identity.as_ref(), &reason, &disposition);
+                            tracing::warn!(
+                                token_contract = %display_token_contract(&deal.cfg.token_contract),
+                                ?reason, %disposition, ?action,
+                                "seller pool admission still owes service"
+                            );
+                            match action {
+                                UnprovenStartAction::WatchPending => (None, Some(deal_context.note_addr.to_string()), true),
+                                UnprovenStartAction::Keep { rearm } => {
+                                    first_error.get_or_insert(error);
+                                    (identity, None, rearm)
+                                }
+                                UnprovenStartAction::Release => {
+                                    seller.state.unregister_stream(&deal.cfg.token_contract);
+                                    first_error.get_or_insert(error);
+                                    continue;
+                                }
                             }
                         }
+                        Err(error) => {
+                            seller.state.unregister_stream(&deal.cfg.token_contract);
+                            if let Some(parent) = parent {
+                                if !stopping && residual_recovery_is_durable(&error, &parent, &deal_context) {
+                                    reconciliation_pending.push_back(parent);
+                                    continue;
+                                }
+                            }
+                            dexdo::telemetry::offer_event(&deal.cfg.token_contract, "isolated");
+                            tracing::error!(token_contract = %display_token_contract(&deal.cfg.token_contract),
+                                %error, "seller pool isolated deal startup failure");
+                            first_error.get_or_insert(error);
+                            continue;
+                        }
+                    };
+                    if let Some(identity) = identity.as_ref() {
+                        resting.insert(deal.cfg.token_contract.clone(), (deal.clone(), identity.clone()));
                     }
-                    Err(error) => {
-                        tracing::warn!(%error, "seller owner fill discovery failed; retrying");
-                        first_error.get_or_insert_with(|| {
-                            anyhow::anyhow!("seller owner fill discovery failed: {error}")
-                        });
-                    }
-                }
-            }
-            filled = fill_rx.recv() => {
-                let Some(deal) = filled else {
-                    continue;
-                };
-                match dexdo::seller::read_seller_fill_lineage(
-                    &deal.watch.cursor_path,
-                    &deal.cfg.token_contract,
-                ) {
-                    Ok(Some(fill)) if fill.residual_ticks >= 2 => pending.push_back(deal),
-                    Ok(Some(fill)) if fill.residual_ticks == 1 => {
-                        println!(
-                            "seller_residual_not_posted token_contract={} offered_ticks={} matched_ticks={} residual_ticks=1 reason=below_contract_minimum",
-                            display_token_contract(&deal.cfg.token_contract),
-                            fill.offered_ticks,
-                            fill.matched_ticks
-                        );
-                    }
-                    Ok(Some(_)) => {}
-                    Ok(None) => {
-                        first_error.get_or_insert_with(|| anyhow::anyhow!(
-                            "seller match for {} has no authoritative owner fill lineage; refusing to guess residual capacity",
-                            display_token_contract(&deal.cfg.token_contract)
-                        ));
-                    }
-                    Err(error) => {
-                        tracing::error!(
-                            token_contract = %display_token_contract(&deal.cfg.token_contract),
-                            %error,
-                            "seller pool rejected corrupt fill lineage"
-                        );
-                        first_error.get_or_insert(error);
+                    if rearm {
+                        if let Some(market) = deal.market.as_ref().filter(|_| parent.is_some()) {
+                            if let Err(error) = super::support::clear_provision_pending_if_present(deal_context.deals_dir, market) {
+                                first_error.get_or_insert(error);
+                            }
+                        }
+                        service_started_tcs.insert(deals::normalize_addr(&deal.cfg.token_contract));
+                        watch_count += 1;
+                        watch_tx.send(watch_pool_deal(
+                            seller, deal, identity, pending_owner, fill_tx.clone(),
+                            context.advertise_probe, stop_rx.clone(),
+                        )).expect("seller read driver is live");
                     }
                 }
-            }
-            watched_result = watched.next(), if !watched.is_empty() => {
-                let (deal, current_identity, outcome) =
-                    watched_result.expect("watched branch is disabled when empty");
-                // TAKEN, not discarded. Whether this deal may leave the resting set depends
-                // on an outcome that has not been read yet, and dropping it here is what made the
-                // shutdown sweep blind to the one case it exists for.
-                let resting_entry = resting.remove(&deal.cfg.token_contract).or_else(|| {
-                    current_identity.clone().map(|id| (deal.clone(), id))
-                });
-                let outcome = match outcome {
-                    Ok(outcome) => outcome,
-                    Err(error) => {
-                        dexdo::telemetry::register(&deal.cfg.token_contract, deal.market.as_ref().map(|market|market.frame_model.as_str()).unwrap_or("mock"));
-                        dexdo::telemetry::offer_event(&deal.cfg.token_contract, "isolated");
-                        tracing::error!(
-                            token_contract = %display_token_contract(&deal.cfg.token_contract),
-                            %error,
-                            "seller pool isolated deal watch/open failure"
-                        );
-                        seller.state.unregister_stream(&deal.cfg.token_contract);
-                        first_error.get_or_insert(error);
+                // An admission result records work completed before this stop was observed.
+                _ = shutdown.as_mut(), if !stopping => {
+                    *shutdown_requested = true;
+                }
+                _ = tokio::time::sleep_until(admission_stop_deadline.unwrap_or_else(tokio::time::Instant::now)),
+                    if stopping => {
+                    first_error.get_or_insert_with(|| anyhow::anyhow!(
+                        "seller pool shutdown could not reconcile an in-flight SELL admission"
+                    ));
+                    break 'pool;
+                }
+                fills = owner_results.recv(), if !stopping && has_owner_reads => {
+                    let (owner_fill_chain, result) = fills.expect("owner discovery streams do not end");
+                    match result {
+                        Ok(fills) => {
+                            for fill in fills {
+                                if known_tcs.contains(&deals::normalize_addr(&fill.token_contract))
+                                    || !noted_owner_fills
+                                        .insert(deals::normalize_addr(&fill.token_contract))
+                                {
+                                    continue;
+                                }
+                                let note = tokio::select! {
+                                    biased;
+                                    _ = shutdown.as_mut() => {
+                                        *shutdown_requested = true;
+                                        stopped_by_operator = true;
+                                        // Reconcile an in-flight admission before the bounded drain.
+                                        continue 'pool;
+                                    }
+                                    note = unaccounted_owner_fill_note(
+                                        owner_fill_chain.as_ref(),
+                                        &fill.token_contract,
+                                    ) => note,
+                                };
+                                if let Some(note) = note {
+                                    tracing::error!(
+                                        error = %note,
+                                        "seller pool isolated unknown owner fill"
+                                    );
+                                    cascade_notes.push(note);
+                                    break;
+                                }
+                            }
+                        }
+                        Err(error) => {
+                            tracing::warn!(%error, "seller owner fill discovery failed; retrying");
+                            first_error.get_or_insert_with(|| {
+                                anyhow::anyhow!("seller owner fill discovery failed: {error}")
+                            });
+                        }
+                    }
+                }
+                filled = fill_rx.recv(), if !stopping => {
+                    let Some(deal) = filled else {
                         continue;
+                    };
+                    match dexdo::seller::read_seller_fill_lineage(
+                        &deal.watch.cursor_path,
+                        &deal.cfg.token_contract,
+                    ) {
+                        Ok(Some(fill)) if fill.residual_ticks >= 2 => pending.push_back(deal),
+                        Ok(Some(fill)) if fill.residual_ticks == 1 => {
+                            println!(
+                                "seller_residual_not_posted token_contract={} offered_ticks={} matched_ticks={} residual_ticks=1 reason=below_contract_minimum",
+                                display_token_contract(&deal.cfg.token_contract),
+                                fill.offered_ticks,
+                                fill.matched_ticks
+                            );
+                        }
+                        Ok(Some(_)) => {}
+                        Ok(None) => {
+                            first_error.get_or_insert_with(|| anyhow::anyhow!(
+                                "seller match for {} has no authoritative owner fill lineage; refusing to guess residual capacity",
+                                display_token_contract(&deal.cfg.token_contract)
+                            ));
+                        }
+                        Err(error) => {
+                            tracing::error!(
+                                token_contract = %display_token_contract(&deal.cfg.token_contract),
+                                %error,
+                                "seller pool rejected corrupt fill lineage"
+                            );
+                            first_error.get_or_insert(error);
+                        }
                     }
-                };
-                match outcome {
-                    dexdo::seller::liveness::RestingSellerOutcome::Matched(matched) => {
-                        let metric_model = deal
-                            .market
-                            .as_ref()
-                            .map(|market| market.frame_model.as_str())
-                            .unwrap_or(context.frame_model);
-                        dexdo::telemetry::deal_in_progress(
-                            &deal.cfg.token_contract,
-                            metric_model,
-                        );
-                        println!(
-                            "seller_match_opened token_contract={} gateway={} gateway_listen={} cursor={}",
-                            dexdo_core::address::display_self_dapp(&matched.token_contract),
-                            context.gateway_advertise,
-                            seller.listen_addr,
-                            deal.watch.cursor_path.display()
-                        );
-                        let _ = std::io::stdout().flush();
-                        if let Err(error) = save_pool_deal_handle(&context, &deal) {
+                }
+                watched_result = watched.next(), if !stopping && watch_count != 0 => {
+                    let (deal, current_identity, outcome) =
+                        watched_result.expect("watched branch is disabled when empty");
+                    watch_count -= 1;
+                    // TAKEN, not discarded. Whether this deal may leave the resting set depends
+                    // on an outcome that has not been read yet, and dropping it here is what made the
+                    // shutdown sweep blind to the one case it exists for.
+                    let resting_entry = resting.remove(&deal.cfg.token_contract).or_else(|| {
+                        current_identity.clone().map(|id| (deal.clone(), id))
+                    });
+                    let outcome = match outcome {
+                        Ok(outcome) => outcome,
+                        Err(error) => {
+                            dexdo::telemetry::register(&deal.cfg.token_contract, deal.market.as_ref().map(|market|market.frame_model.as_str()).unwrap_or("mock"));
+                            dexdo::telemetry::offer_event(&deal.cfg.token_contract, "isolated");
+                            tracing::error!(
+                                token_contract = %display_token_contract(&deal.cfg.token_contract),
+                                %error,
+                                "seller pool isolated deal watch/open failure"
+                            );
                             seller.state.unregister_stream(&deal.cfg.token_contract);
                             first_error.get_or_insert(error);
                             continue;
                         }
-                        match apply_seller_dispute_policy(
-                            deal.chain.as_ref(),
-                            &deal.cfg.token_contract,
-                            seller_policy,
-                            "pre-advance",
-                        ).await {
-                            Ok(false) => {
-                              let spawn_result: Result<bool> = async {
-                                  let bounds = deal
-                                      .chain
-                                      .deal_claim_bounds(&deal.cfg.token_contract)
-                                      .await
-                                      .map_err(|error| {
-                                          anyhow::anyhow!(
-                                              "--token-contract {}: getConfig() claim bounds are \
-                                               unreadable, refusing to start by-fact claiming on a \
-                                               guessed cadence: {error}",
-                                              display_token_contract(&deal.cfg.token_contract)
-                                          )
-                                      })?;
-                                  let snapshot = match plan_opened_deal(
-                                      deal.chain.as_ref(),
-                                      &deal.cfg.token_contract,
-                                  )
-                                  .await?
-                                  {
-                                      OpenedDealPlan::Drive(snapshot) => *snapshot,
-                                      OpenedDealPlan::RetireSettled => {
-                                          dexdo::telemetry::deal_settled(
-                                              &deal.cfg.token_contract,
-                                          );
-                                          return Ok(false);
-                                      }
-                                  };
-                                  let run_subscription_keeper =
-                                      snapshot.subscription.is_subscription();
-                                  let windows =
-                                      dexdo::seller::AdvanceWindows::from_bounds(bounds);
-                                  let note = seller.note.clone();
-                                  let delivery = seller.state.delivery(&deal.cfg.token_contract);
-                                  let token_contract = deal.cfg.token_contract.clone();
-                                  let chain = deal.chain.clone();
-                                  let gateway = seller.state.clone();
-                                  let tick_size = dexdo_core::DobParams::canonical().tick_size;
-                                  let tick_budget = if run_subscription_keeper {
-                                      u128::from(deal.cfg.max_ticks)
-                                  } else {
-                                      funded_tick_budget(
-                                          &deal.cfg.token_contract,
-                                          snapshot.subscription.funded_tokens,
-                                          tick_size,
-                                      )?
-                                  };
-                                  let claim_delivery_tx = claim_delivery_tx.clone();
-                                  active.spawn(async move {
-                                      let result = if !run_subscription_keeper {
-                                          let observer = OrdinaryCapacityObserver {
-                                              gateway,
-                                              delivery: delivery.clone(),
-                                              events: claim_delivery_tx.clone(),
-                                          };
-                                          dexdo::seller::drive_advance_with_observer(
-                                              chain.as_ref(),
-                                              &token_contract,
-                                              note.as_ref(),
-                                              windows,
-                                              tick_budget,
-                                              tick_size,
-                                              true,
-                                              delivery.count.clone(),
-                                              delivery.done.clone(),
-                                              &observer,
-                                          )
-                                          .await
-                                      } else {
-                                          let advance_observer = ClaimMeasurementObserver {
-                                              gateway: gateway.clone(),
-                                              delivery: delivery.clone(),
-                                              events: claim_delivery_tx,
-                                          };
-                                          let advance = dexdo::seller::drive_advance_with_observer(
-                                              chain.as_ref(),
-                                              &token_contract,
-                                              note.as_ref(),
-                                              windows,
-                                              tick_budget,
-                                              tick_size,
-                                              false,
-                                              delivery.count.clone(),
-                                              delivery.done.clone(),
-                                              &advance_observer,
-                                          );
-                                          let observer =
-                                              SubscriptionCapacityObserver { gateway };
-                                          let keeper =
-                                              dexdo::seller::drive_subscription_keeper_with_observer(
-                                                  chain.as_ref(),
-                                                  &token_contract,
-                                                  bounds,
-                                                  &observer,
-                                          );
-                                          tokio::pin!(advance);
-                                          tokio::pin!(keeper);
-                                          async {
-                                              tokio::select! {
-                                                  finalized = &mut keeper => finalized,
-                                                  claimed = &mut advance => {
-                                                      let claimed = claimed?;
-                                                      let finalized = keeper.await?;
-                                                      Ok(claimed.max(finalized))
-                                                  }
-                                              }
-                                          }
-                                          .await
-                                      };
-                                      (
-                                          token_contract,
-                                          chain,
-                                          delivery,
-                                          !run_subscription_keeper,
-                                          result,
-                                      )
-                                  });
-                                  Ok(true)
-                              }
-                              .await;
-                              match spawn_result {
-                                  Ok(true) => {}
-                                  Ok(false) => {
-                                      // The buyer settled inside the match->drive window and the
-                                      // TokenContract selfdestructed with the settlement. One
-                                      // finished deal must not take the rest of the pool with it.
-                                      seller.state.unregister_stream(&deal.cfg.token_contract);
-                                      tracing::warn!(
-                                          token_contract = %display_token_contract(&deal.cfg.token_contract),
-                                          "seller pool retired one deal that settled and selfdestructed before its settlement driver started"
-                                      );
-                                  }
-                                  Err(error) => {
-                                      seller.state.unregister_stream(&deal.cfg.token_contract);
-                                      first_error.get_or_insert(error);
-                                  }
-                              }
-                            }
-                            Ok(true) => {
-                                seller.state.unregister_stream(&deal.cfg.token_contract);
-                            }
-                            Err(error) => {
+                    };
+                    match outcome {
+                        PoolWatchOutcome::Matched(matched, plan) => {
+                            let metric_model = deal
+                                .market
+                                .as_ref()
+                                .map(|market| market.frame_model.as_str())
+                                .unwrap_or(context.frame_model);
+                            dexdo::telemetry::deal_in_progress(
+                                &deal.cfg.token_contract,
+                                metric_model,
+                            );
+                            let (gateway, listen) = seller.migrated_routes
+                                .get(&deals::normalize_addr(&deal.cfg.token_contract))
+                                .map_or((context.gateway_advertise, seller.listen_addr), |route| {
+                                    (route.advertise.as_str(), route.listen)
+                                });
+                            println!(
+                                "seller_match_opened token_contract={} gateway={} gateway_listen={} cursor={}",
+                                dexdo_core::address::display_self_dapp(&matched.token_contract),
+                                gateway,
+                                listen,
+                                deal.watch.cursor_path.display()
+                            );
+                            let _ = std::io::stdout().flush();
+                            let deal_context = SellerPoolContext { gateway_advertise: gateway, ..context };
+                            if let Err(error) = save_pool_deal_handle(&deal_context, &deal) {
                                 seller.state.unregister_stream(&deal.cfg.token_contract);
                                 first_error.get_or_insert(error);
+                                continue;
+                            }
+                            match plan {
+                                OpenedDealPlan::Disputed => {
+                                    if let Err(error) = apply_confirmed_seller_dispute(
+                                        deal.chain.as_ref(),
+                                        &deal.cfg.token_contract,
+                                        seller_policy,
+                                        "pre-advance",
+                                    ).await {
+                                        first_error.get_or_insert(error);
+                                    }
+                                    seller.state.unregister_stream(&deal.cfg.token_contract);
+                                }
+                                OpenedDealPlan::RetireSettled => {
+                                    dexdo::telemetry::deal_settled(&deal.cfg.token_contract);
+                                    seller.state.unregister_stream(&deal.cfg.token_contract);
+                                    tracing::warn!(
+                                        token_contract = %display_token_contract(&deal.cfg.token_contract),
+                                        "seller pool retired one deal that settled and selfdestructed before its settlement driver started"
+                                    );
+                                }
+                                OpenedDealPlan::Drive { bounds, snapshot } => {
+                                    let spawn_result: Result<()> = (|| {
+                                        let run_subscription_keeper =
+                                            snapshot.subscription.is_subscription();
+                                        let windows =
+                                            dexdo::seller::AdvanceWindows::from_bounds(bounds);
+                                        let note = seller.signing_note_handle(deal.chain.as_ref()).clone();
+                                        let delivery = seller.state.delivery(&deal.cfg.token_contract);
+                                        let token_contract = deal.cfg.token_contract.clone();
+                                        let chain = deal.chain.clone();
+                                        let gateway = seller.state.clone();
+                                        let tick_size = dexdo_core::DobParams::canonical().tick_size;
+                                        let tick_budget = if run_subscription_keeper {
+                                            u128::from(deal.cfg.max_ticks)
+                                        } else {
+                                            funded_tick_budget(
+                                                &deal.cfg.token_contract,
+                                                snapshot.subscription.funded_tokens,
+                                                tick_size,
+                                            )?
+                                        };
+                                        let claim_delivery_tx = claim_delivery_tx.clone();
+                                        active.spawn(async move {
+                                            let result = if !run_subscription_keeper {
+                                                let observer = OrdinaryCapacityObserver {
+                                                    gateway,
+                                                    delivery: delivery.clone(),
+                                                    events: claim_delivery_tx.clone(),
+                                                };
+                                                dexdo::seller::drive_advance_with_observer(
+                                                    chain.as_ref(),
+                                                    &token_contract,
+                                                    note.as_ref(),
+                                                    windows,
+                                                    tick_budget,
+                                                    tick_size,
+                                                    true,
+                                                    delivery.count.clone(),
+                                                    delivery.done.clone(),
+                                                    &observer,
+                                                )
+                                                .await
+                                            } else {
+                                                let advance_observer = ClaimMeasurementObserver {
+                                                    gateway: gateway.clone(),
+                                                    delivery: delivery.clone(),
+                                                    events: claim_delivery_tx,
+                                                };
+                                                let advance = dexdo::seller::drive_advance_with_observer(
+                                                    chain.as_ref(),
+                                                    &token_contract,
+                                                    note.as_ref(),
+                                                    windows,
+                                                    tick_budget,
+                                                    tick_size,
+                                                    false,
+                                                    delivery.count.clone(),
+                                                    delivery.done.clone(),
+                                                    &advance_observer,
+                                                );
+                                                let observer =
+                                                    SubscriptionCapacityObserver { gateway };
+                                                let keeper =
+                                                    dexdo::seller::drive_subscription_keeper_with_observer(
+                                                        chain.as_ref(),
+                                                        &token_contract,
+                                                        bounds,
+                                                        &observer,
+                                                );
+                                                tokio::pin!(advance);
+                                                tokio::pin!(keeper);
+                                                async {
+                                                    tokio::select! {
+                                                        finalized = &mut keeper => finalized,
+                                                        claimed = &mut advance => {
+                                                            let claimed = claimed?;
+                                                            let finalized = keeper.await?;
+                                                            Ok(claimed.max(finalized))
+                                                        }
+                                                    }
+                                                }
+                                                .await
+                                            };
+                                            (
+                                                token_contract,
+                                                chain,
+                                                delivery,
+                                                !run_subscription_keeper,
+                                                result,
+                                            )
+                                        });
+                                        Ok(())
+                                    })();
+                                    if let Err(error) = spawn_result {
+                                        seller.state.unregister_stream(&deal.cfg.token_contract);
+                                        first_error.get_or_insert(error);
+                                    } else {
+                                        println!(
+                                            "seller_funded_ready token_contract={} gateway={} gateway_listen={}",
+                                            display_token_contract(&deal.cfg.token_contract),
+                                            gateway,
+                                            listen
+                                        );
+                                        let _ = std::io::stdout().flush();
+                                    }
+                                }
                             }
                         }
-                    }
-                    dexdo::seller::liveness::RestingSellerOutcome::Stopped { reason, disposition } => {
-                        // two named decisions, no inline policy. `decide_after_stop` answers
-                        // what is OWED; `should_rearm_watcher` answers who watches next.
-                        let decision = decide_after_stop(&disposition);
-                        match decision {
-                            AfterStop::Retire => {
-                                seller.state.unregister_stream(&deal.cfg.token_contract);
+                        PoolWatchOutcome::Stopped { reason, disposition } => {
+                            // two named decisions, no inline policy. `decide_after_stop` answers
+                            // what is OWED; `should_rearm_watcher` answers who watches next.
+                            let decision = decide_after_stop(&disposition);
+                            match decision {
+                                AfterStop::Retire => {
+                                    seller.state.unregister_stream(&deal.cfg.token_contract);
+                                }
+                                AfterStop::ServeMatch(_) => {}
+                                AfterStop::Retain => {
+                                    // Re-seat on the identity the WATCH reported: a relist advances it,
+                                    // and the captured copy names a generation the book has consumed.
+                                    reseat_resting_after_stop(
+                                        &deal.cfg.token_contract,
+                                        current_identity.clone(),
+                                        resting_entry,
+                                        &mut resting,
+                                    );
+                                }
                             }
-                            AfterStop::ServeMatch(_) => {}
-                            AfterStop::Retain => {
-                                // Re-seat on the identity the WATCH reported: a relist advances it,
-                                // and the captured copy names a generation the book has consumed.
-                                reseat_resting_after_stop(
-                                    &deal.cfg.token_contract,
+                            let rearmed = should_rearm_watcher(&decision, &reason);
+                            tracing::warn!(
+                                token_contract = %display_token_contract(&deal.cfg.token_contract),
+                                ?reason,
+                                %disposition,
+                                decision = ?decision,
+                                rearmed,
+                                "seller pool decided what a stopped resting deal still owes"
+                            );
+                            if rearmed {
+                                watch_count += 1;
+                                watch_tx.send(watch_pool_deal(
+                                    seller,
+                                    deal.clone(),
                                     current_identity.clone(),
-                                    resting_entry,
-                                    &mut resting,
-                                );
+                                    current_identity.is_none().then(|| context.for_deal(&deal).note_addr.to_string()),
+                                    fill_tx.clone(),
+                                    context.advertise_probe,
+                                    stop_rx.clone(),
+                                )).expect("seller read driver is live");
                             }
-                        }
-                        let rearmed = should_rearm_watcher(&decision, &reason);
-                        tracing::warn!(
-                            token_contract = %display_token_contract(&deal.cfg.token_contract),
-                            ?reason,
-                            %disposition,
-                            decision = ?decision,
-                            rearmed,
-                            "seller pool decided what a stopped resting deal still owes"
-                        );
-                        if rearmed {
-                            watched.push(watch_pool_deal(
-                                seller,
-                                deal.clone(),
-                                current_identity.clone(),
-                                current_identity.is_none().then(|| context.note_addr.to_string()),
-                                fill_tx.clone(),
-                                context.advertise_probe,
-                                stop_rx.clone(),
-                            ));
                         }
                     }
                 }
-            }
-            failure = seller.state.recv_upstream_failure() => {
-                if let Some(failure) = failure {
-                    emit_upstream_failure(failure);
+                failure = seller.state.recv_upstream_failure(), if !stopping => {
+                    if let Some(failure) = failure {
+                        emit_upstream_failure(failure);
+                    }
                 }
-            }
-            measurement = claim_delivery_rx.recv() => {
-                if let Some(measurement) = measurement {
-                    emit_claim_delivery_measurement(measurement);
+                measurement = claim_delivery_rx.recv(), if !stopping => {
+                    if let Some(measurement) = measurement {
+                        emit_claim_delivery_measurement(measurement);
+                    }
                 }
-            }
-            joined = active.join_next(), if !active.is_empty() => {
-                if let Some(joined) = joined {
-                    let _ = record_advance_result(
-                        seller,
-                        joined,
-                        &mut terminal_receipts,
-                        seller_policy,
-                        &mut first_error,
-                    ).await;
+                joined = active.join_next(), if !stopping && !active.is_empty() => {
+                    if let Some(joined) = joined {
+                        let _ = record_advance_result(
+                            seller,
+                            joined,
+                            &mut terminal_receipts,
+                            seller_policy,
+                            &mut first_error,
+                        ).await;
+                    }
                 }
-            }
-            joined = terminal_receipts.join_next(), if !terminal_receipts.is_empty() => {
-                if let Some(joined) = joined {
-                    let _ = record_terminal_receipt_result(joined, &mut first_error);
+                joined = terminal_receipts.join_next(), if !stopping && !terminal_receipts.is_empty() => {
+                    if let Some(joined) = joined {
+                        let _ = record_terminal_receipt_result(joined, &mut first_error);
+                    }
                 }
-            }
-            _ = gateway_poll.tick() => {
-                let outcome = if seller.server_task.is_finished() { "fail" } else { "pass" };
-                for model in &uptime_models {
-                    dexdo::telemetry::uptime(model, "gateway", outcome);
-                }
-                if outcome == "fail" {
-                    stop_error = Some(anyhow::anyhow!(
-                        "seller gateway stopped while pool deals were active"
-                    ));
-                    break 'pool;
+                _ = gateway_poll.tick(), if !stopping => {
+                    let outcome = if seller.server_task.is_finished() { "fail" } else { "pass" };
+                    for model in &uptime_models {
+                        dexdo::telemetry::uptime(model, "gateway", outcome);
+                    }
+                    if outcome == "fail" {
+                        stop_error = Some(anyhow::anyhow!(
+                            "seller gateway stopped while pool deals were active"
+                        ));
+                    }
                 }
             }
         }
-    }
 
-    // Cancel an unfinished discovery read before draining the existing deal watchers.
-    drop(owner_fill_reads);
-    while let Ok(measurement) = claim_delivery_rx.try_recv() {
-        emit_claim_delivery_measurement(measurement);
-    }
-    // re-review, finding 2: DRAIN, never drop. A dropped watcher takes the identity it
-    // advanced with it, and the sweep then proves the absence of a generation nobody cares about.
-
-    // point 2: the drain now has a BOUND on its own completion. Delivering the stop signal
-    // (point 1) makes every watcher observable; it does not make any of them finish. Without a
-    // bound the operator's signal is honoured and the process still never exits, which is the
-    // failure this loop was measured doing: the shutdown arm fired and 591 further lines of chain
-    // traffic followed.
-
-    // The bound is `MATCH_OPEN_TIMEOUT`, and it is a DOMAIN fact rather than a smaller number: it is
-    // the contract's own funded-but-unopened window (`params.rs`, spec 2.1). After it, a deal that
-    // never opened is cleanable BY THE CHAIN, so no watcher can still be doing legitimate work on
-    // one. It is also exactly the bound on the second road into this same hang, described at the
-    // `identity: None` branch above: that arm can only call `wait_for_match`, which takes no stop
-    // selector at all, and its whole risk is "an order that never landed" -- which is the condition
-    // `MATCH_OPEN_TIMEOUT` measures. One bound closes both roads.
-
-    // is not traded away for it. Timing out must not hand the sweep a stale generation, so the
-    // deals whose watcher never reported back are REMOVED from `resting` before the sweep rather
-    // than swept on a predecessor that may already be consumed -- and they are named in the refusal
-    // instead. Ground the drain could not establish is reported, not guessed at.
-    let expected: std::collections::BTreeSet<String> = resting.keys().cloned().collect();
-    let undrained = drain_watchers_within(
-        &mut watched,
-        dexdo_core::params::MATCH_OPEN_TIMEOUT,
-        &expected,
-        |(deal, _, _)| deal.cfg.token_contract.clone(),
-        async |(deal, current_identity, outcome)| {
-            apply_drained_outcome(
-                seller,
-                deal,
-                current_identity,
-                outcome,
-                &mut resting,
-                &mut first_error,
-            )
-            .await;
-        },
-    )
-    .await;
-    if let Some((outstanding, refusal)) = undrained {
-        for token_contract in &outstanding {
-            resting.remove(token_contract);
+        stop_tx.send_replace(true);
+        drop(admission_tx);
+        drop(admissions);
+        // Dropping the result receiver cancels discovery, including an admission wait.
+        drop(owner_results);
+        // Existing watchers drain to their final identities before the sweep.
+        drop(watch_tx);
+        while let Ok(measurement) = claim_delivery_rx.try_recv() {
+            emit_claim_delivery_measurement(measurement);
         }
-        first_error.get_or_insert(refusal);
-    }
-    // point 2, second half: the sweep is the drain's twin and was unbounded for the same
-    // reason. It proves absence on chain, so it is bounded by the same chain fact -- past
-    // `MATCH_OPEN_TIMEOUT` there is nothing left to prove about a deal that never opened.
-    let sweep = sweep_unconfirmed_resting_offers(seller, resting.into_values().collect());
-    match tokio::time::timeout(dexdo_core::params::MATCH_OPEN_TIMEOUT, sweep).await {
-        Ok(Some(error)) => {
-            first_error.get_or_insert(error);
-        }
-        Ok(None) => {}
-        Err(_) => {
-            first_error.get_or_insert_with(|| {
-                anyhow::anyhow!(
-                    "seller pool shutdown: the resting-offer sweep did not finish within \
-                     MATCH_OPEN_TIMEOUT ({}s); the offers it was proving absent were left unproven",
-                    dexdo_core::params::MATCH_OPEN_TIMEOUT.as_secs()
+        // re-review, finding 2: DRAIN, never drop. A dropped watcher takes the identity it
+        // advanced with it, and the sweep then proves the absence of a generation nobody cares about.
+
+        // point 2: the drain now has a BOUND on its own completion. Delivering the stop signal
+        // (point 1) makes every watcher observable; it does not make any of them finish. Without a
+        // bound the operator's signal is honoured and the process still never exits, which is the
+        // failure this loop was measured doing: the shutdown arm fired and 591 further lines of chain
+        // traffic followed.
+
+        // The bound is `MATCH_OPEN_TIMEOUT`, and it is a DOMAIN fact rather than a smaller number: it is
+        // the contract's own funded-but-unopened window (`params.rs`, spec 2.1). After it, a deal that
+        // never opened is cleanable BY THE CHAIN, so no watcher can still be doing legitimate work on
+        // one. It is also exactly the bound on the second road into this same hang, described at the
+        // `identity: None` branch above: that arm can only call `wait_for_match`, which takes no stop
+        // selector at all, and its whole risk is "an order that never landed" -- which is the condition
+        // `MATCH_OPEN_TIMEOUT` measures. One bound closes both roads.
+
+        // is not traded away for it. Timing out must not hand the sweep a stale generation, so the
+        // deals whose watcher never reported back are REMOVED from `resting` before the sweep rather
+        // than swept on a predecessor that may already be consumed -- and they are named in the refusal
+        // instead. Ground the drain could not establish is reported, not guessed at.
+        let expected: std::collections::BTreeSet<String> = resting.keys().cloned().collect();
+        let undrained = drain_watchers_within(
+            &mut watched,
+            dexdo_core::params::MATCH_OPEN_TIMEOUT,
+            &expected,
+            |(deal, _, _)| deal.cfg.token_contract.clone(),
+            async |(deal, current_identity, outcome)| {
+                apply_drained_outcome(
+                    seller,
+                    deal,
+                    current_identity,
+                    outcome.map(Into::into),
+                    &mut resting,
+                    &mut first_error,
                 )
-            });
+                .await;
+            },
+        )
+        .await;
+        // A bounded drain cancels any remaining watcher before the final sweep.
+        drop(watched);
+        if let Some((outstanding, refusal)) = undrained {
+            for token_contract in &outstanding {
+                resting.remove(token_contract);
+            }
+            first_error.get_or_insert(refusal);
         }
-    }
-    seller.server_task.abort();
-    if stopped_by_operator && first_error.is_none() && cascade_notes.is_empty() {
-        emit_seller_shutdown_event(&primary_token_contract);
-        return Ok(());
-    }
-    // the primary failure is the process error. A cascade note only becomes the process error
-    // when it is the ONLY thing that went wrong; otherwise it hangs off the primary as `secondary`.
-    match stop_error.or(first_error) {
-        Some(error) => Err(attach_cascade_notes(error, cascade_notes)),
-        None => match cascade_notes.into_iter().next() {
-            Some(note) => Err(anyhow::Error::new(note)),
-            None => Ok(()),
-        },
-    }
+        // point 2, second half: the sweep is the drain's twin and was unbounded for the same
+        // reason. It proves absence on chain, so it is bounded by the same chain fact -- past
+        // `MATCH_OPEN_TIMEOUT` there is nothing left to prove about a deal that never opened.
+        let sweep = sweep_unconfirmed_resting_offers(seller, resting.into_values().collect());
+        match tokio::time::timeout(dexdo_core::params::MATCH_OPEN_TIMEOUT, sweep).await {
+            Ok(Some(error)) => {
+                first_error.get_or_insert(error);
+            }
+            Ok(None) => {}
+            Err(_) => {
+                first_error.get_or_insert_with(|| {
+                    anyhow::anyhow!(
+                        "seller pool shutdown: the resting-offer sweep did not finish within \
+                     MATCH_OPEN_TIMEOUT ({}s); the offers it was proving absent were left unproven",
+                        dexdo_core::params::MATCH_OPEN_TIMEOUT.as_secs()
+                    )
+                });
+            }
+        }
+        if owns_gateway {
+            seller.server_task.abort();
+        }
+        if stopped_by_operator && first_error.is_none() && cascade_notes.is_empty() {
+            emit_seller_shutdown_event(&primary_token_contract);
+            return Ok(());
+        }
+        // the primary failure is the process error. A cascade note only becomes the process error
+        // when it is the ONLY thing that went wrong; otherwise it hangs off the primary as `secondary`.
+        match stop_error.or(first_error) {
+            Some(error) => Err(attach_cascade_notes(error, cascade_notes)),
+            None => match cascade_notes.into_iter().next() {
+                Some(note) => Err(anyhow::Error::new(note)),
+                None => Ok(()),
+            },
+        }
+    };
+    let (result, (), (), ()) = tokio::join!(
+        control,
+        drive_pool_tasks(watch_inputs, watch_outputs),
+        drive_pool_tasks(admission_inputs, admission_outputs),
+        owner_driver,
+    );
+    result
 }
 
 /// Nobody named a model, said in the terms of the path the operator is on.
@@ -4699,16 +5175,27 @@ pub(crate) async fn run_seller(args: SellerArgs) -> Result<()> {
 }
 
 pub(crate) async fn run_seller_with_deal_gas_overhead(
-    // `mut` only where something mutates it: the note the picker settles is written back into
-    // `args.identity`, and that picker exists under the chain build. The default build warned on a `mut`
-    // it could not see a use for, and a warning nobody can act on is one everybody learns to skip.
-    mut args: SellerArgs,
+    args: SellerArgs,
     deal_gas_overhead_raw: Option<u128>,
+) -> Result<()> {
+    let pool = crate::cli::commands::note_pool_path(None);
+    run_seller_from_pool(args, deal_gas_overhead_raw, pool.as_deref()).await
+}
+
+async fn run_seller_from_pool(
+    args: SellerArgs,
+    deal_gas_overhead_raw: Option<u128>,
+    pool: Option<&std::path::Path>,
 ) -> Result<()> {
     // the advertised gateway is what a REMOTE buyer dials out of the handover. Validate it at
     // the command boundary -- before any file, chain or order-book work -- so a non-routable address
     // can never reach `postSellOffer` and leave a resting ask no buyer can connect to.
     let gateway_advertise = args.checked_gateway_advertise_addr()?;
+    let replenish_handoff = if !args.mock.mock_chain && args.market.is_some() {
+        std::env::var_os(seller_replenish::HANDOFF_VAR)
+    } else {
+        None
+    };
     // The live line below announces network work, and a refusal the arguments have ALREADY earned
     // has to come before it: a run that cannot start says why, and says nothing else first. Nobody
     // naming a model is knowable right here -- no chain, no note, no manifest -- yet it used to be
@@ -4732,30 +5219,39 @@ pub(crate) async fn run_seller_with_deal_gas_overhead(
     {
         return Err(no_model_named(&args));
     }
-    // Which note, settled ONCE -- but only after the argument checks above, the model's name among
-    // them. Those refuse a bad price, an unroutable gateway or a nameless model before any file is
-    // touched, and asking the operator to choose a note in front of a refusal their arguments had
-    // already earned is a question they should never see.
-
-    // Settled here rather than in each of the three places that need it -- the pool lock, the
-    // gateway's own directory, the backend -- so the operator is asked once. On a terminal the
-    // pool's notes are offered; anywhere else this is the refusal that names `--note-addr`.
-    if args.identity.note_addr.is_none() && !args.mock.mock_chain {
-        args.identity.note_addr = Some(
-            // The endpoint is the manifest's: it names the network this run is on, and a second
-            // source for it here would be a second answer to the same question.
-            crate::cli::note_pick::ask_which_note(&crate::cli::commands::manifest_path()?, None)
-                .await?,
-        );
+    let market_path = args.market.clone().or_else(|| {
+        args.token_contract
+            .is_none()
+            .then(super::support::market_manifest_lying_about)
+            .flatten()
+    });
+    let mut startup_market = market_path.as_deref().map(load_market).transpose()?;
+    let (mut token_contract, mut market_frame_model, market_nonce) = match &startup_market {
+        Some(market) => {
+            if args.token_contract.is_some() {
+                bail!("--market and --token-contract are mutually exclusive -- pass only one");
+            }
+            (
+                market.token_contract.clone(),
+                Some(market.frame_model.clone()),
+                Some(market.nonce),
+            )
+        }
+        None => resolve_market_fields(None, args.token_contract.as_deref(), None)?,
+    };
+    let held_tc = replenish_handoff
+        .as_ref()
+        .and_then(|_| std::env::var_os(seller_replenish::HELD_TC_VAR))
+        .filter(|tc| !tc.is_empty());
+    let hold_initial_market = held_tc.is_some();
+    if let Some(held) = held_tc {
+        let held = held
+            .to_str()
+            .context("replenishment held TC must be valid text")?;
+        if deals::normalize_addr(held) != deals::normalize_addr(&token_contract) {
+            bail!("replenishment held TC disagrees with the installed market");
+        }
     }
-    // Issue: the deal token_contract comes from `--market` (a provision manifest) or `--token-contract`.
-    // The manifest's frame_model (if any) is validated against `--model` inside `seller_real_backend`.
-    let (mut token_contract, mut market_frame_model, market_nonce) =
-        resolve_market_fields(args.market.as_deref(), args.token_contract.as_deref(), None)?;
-    let mut startup_market = args.market.as_deref().map(load_market).transpose()?;
-    // Review: the deal nonce comes from `--market` (the manifest) or the explicit `--nonce` flag --
-    // never both (the manifest is the single source of truth). The real-chain seller path requires
-    // it (see `seller_real_backend`); the mock path ignores it.
     if args.market.is_some() && args.nonce.is_some() {
         bail!("--market and --nonce are mutually exclusive -- the nonce comes from the manifest");
     }
@@ -4817,49 +5313,150 @@ pub(crate) async fn run_seller_with_deal_gas_overhead(
         ?chain_unavailable_action,
         "seller policy loaded"
     );
-    let (_seller_pool_lock, mut persistent_gateway_tls) = if args.mock.mock_chain {
-        (None, None)
-    } else {
-        let note_addr = args.identity.note_addr.as_deref().ok_or_else(|| {
-            anyhow::anyhow!(format!(
-                "real {}: --note-addr is required for seller pool locking",
-                dexdo_core::params::current_network()
-            ))
-        })?;
-        let pool_dir = seller_pool_dir(args.deals_dir.as_deref(), note_addr)?;
-        (
-            Some(acquire_seller_pool_lock(&pool_dir)?),
-            Some(load_or_create_gateway_tls(&pool_dir)?),
+    let mut keys = std::collections::BTreeMap::new();
+    let mut pool_locks = std::collections::BTreeMap::new();
+    let mut selected_note = None;
+    let mut persistent_gateway_tls = None;
+    let mut locked_records = None;
+    let contracts = crate::cli::commands::manifest_path()?;
+    if !args.mock.mock_chain {
+        let real_chain = dexdo_core::RealChainBackend::connect(&contracts)?;
+        let records = seller_market_handle_records_matching(
+            args.deals_dir.as_deref(),
+            Some(real_chain.network()),
+            |_| true,
+        )?;
+        let selected_record = records.get(&deals::normalize_addr(&token_contract));
+        let note_addr = match (selected_record, startup_market.as_ref()) {
+            (Some(record), explicit) => {
+                if let Some(market) = explicit {
+                    assert_market_seller_note(&market.seller_note, &record.handle.note_addr)?;
+                }
+                record.handle.note_addr.clone()
+            }
+            (None, Some(market)) => market.seller_note.clone(),
+            (None, None) => {
+                let address = dexdo_core::address::parse_chain_address(&token_contract)
+                    .map_err(|error| anyhow::anyhow!("invalid seller TokenContract: {error}"))?;
+                real_chain
+                    .token_contract_seller_note(&address.into_chain())
+                    .await?
+                    .with_context(|| {
+                        format!(
+                            "no seller note for TokenContract {}",
+                            display_token_contract(&token_contract)
+                        )
+                    })?
+            }
+        };
+        let primary_owner = deals::normalize_addr(&note_addr);
+        let mut owners = records
+            .values()
+            .map(|record| {
+                (
+                    deals::normalize_addr(&record.handle.note_addr),
+                    record.handle.token_contract.as_str(),
+                )
+            })
+            .collect::<std::collections::BTreeMap<_, _>>();
+        let primary_has_records = owners.contains_key(&primary_owner);
+        owners
+            .entry(primary_owner.clone())
+            .or_insert(&token_contract);
+        let mut legacy_tls_dirs = Vec::new();
+        for owner in owners.keys() {
+            let pool_dir = seller_pool_dir(args.deals_dir.as_deref(), owner)?;
+            pool_locks.insert(owner.clone(), acquire_seller_pool_lock(&pool_dir)?);
+            legacy_tls_dirs.push(pool_dir);
+        }
+        for (owner, deal) in &owners {
+            let key = match args.identity.note_key.as_deref() {
+                Some(key) if owner == &primary_owner && !primary_has_records => {
+                    note_owner_secret_for(Some(key), owner, pool, "seller", "note owner key")
+                }
+                _ => note_owner_secret_from_pool_only(owner, pool, "seller", "note owner key"),
+            };
+            let key = key.with_context(|| {
+                format!(
+                    "seller deal {} requires the key for note {} in DEXDO_PN_POOL",
+                    display_token_contract(deal),
+                    dexdo_core::address::display(owner),
+                )
+            })?;
+            keys.insert(owner.clone(), key);
+        }
+        if !shutdown_requested {
+            let reconciliation = reconcile_seller_pending_provisions(
+                args.deals_dir.as_deref(),
+                &real_chain,
+                |owner| keys.contains_key(owner),
+            );
+            tokio::pin!(reconciliation);
+            tokio::select! {
+                biased;
+                _ = shutdown.as_mut() => shutdown_requested = true,
+                result = &mut reconciliation => result?,
+            }
+        }
+        let records = seller_market_handle_records_matching(
+            args.deals_dir.as_deref(),
+            Some(real_chain.network()),
+            |owner| keys.contains_key(owner),
+        )?;
+        // Keep the TLS identity at the gateway level so changing the startup note never rotates it.
+        let primary_dir = seller_pool_dir(args.deals_dir.as_deref(), &note_addr)?;
+        legacy_tls_dirs.sort_by_key(|dir| dir != &primary_dir);
+        persistent_gateway_tls = Some(
+            seller_gateway_tls_for_startup(
+                args.deals_dir.as_deref(),
+                args.gateway_listen,
+                &gateway_advertise,
+                &legacy_tls_dirs,
+                &records,
+                async |tc| {
+                    let address = dexdo_core::address::parse_chain_address(tc)?.into_chain();
+                    read_open_seller_handover(
+                        tc,
+                        async || real_chain.token_contract_deal_state(&address).await,
+                        async || real_chain.read_handover(&address).await,
+                    )
+                    .await
+                },
+            )
+            .await?,
+        );
+        locked_records = Some(records);
+        selected_note = Some(note_addr);
+    }
+    let key_for = |owner: &str| {
+        keys.get(&deals::normalize_addr(owner))
+            .map(|key| key.as_str())
+            .with_context(|| {
+                format!(
+                    "no seller key loaded for note {}",
+                    dexdo_core::address::display(owner)
+                )
+            })
+    };
+    let selected_identity = || -> Result<(&str, &str)> {
+        let owner = selected_note
+            .as_deref()
+            .context("real seller note was not resolved")?;
+        Ok((owner, key_for(owner)?))
+    };
+    let real_backend_for_market = |market: &dexdo_core::MarketManifest| {
+        seller_real_backend_with_deal_gas_overhead(
+            &args,
+            &market.seller_note,
+            key_for(&market.seller_note)?,
+            Some(&market.frame_model),
+            Some(market.nonce),
+            Some(&market.frame_model),
+            deal_gas_overhead_raw,
         )
     };
-    // on the real path, the --market manifest's seller_note must be this seller's --note-addr -- else the
-    // offer posts a non-canonical TC the InferenceOrderBook won't rest, and the seller never matches.
-    if !args.mock.mock_chain {
-        if let (Some(manifest), Some(note_addr)) =
-            (startup_market.as_ref(), args.identity.note_addr.as_deref())
-        {
-            assert_market_seller_note(&manifest.seller_note, note_addr)?;
-        }
-    }
-    if !args.mock.mock_chain && !shutdown_requested {
-        let manifest = crate::cli::commands::manifest_path()?;
-        let reconciliation = reconcile_seller_pending_provisions(
-            args.deals_dir.as_deref(),
-            args.identity
-                .note_addr
-                .as_deref()
-                .expect("real seller note was resolved"),
-            &manifest,
-        );
-        tokio::pin!(reconciliation);
-        tokio::select! {
-            biased;
-            _ = shutdown.as_mut() => shutdown_requested = true,
-            result = &mut reconciliation => result?,
-        }
-    }
     let mut deal_nonce = market_nonce.or(args.nonce);
-    let recovery_frame_model = if args.mock.mock_chain {
+    let mut recovery_frame_model = if args.mock.mock_chain {
         None
     } else {
         let name = args
@@ -4874,6 +5471,18 @@ pub(crate) async fn run_seller_with_deal_gas_overhead(
                 .frame_model
                 .clone(),
         })
+    };
+    if let Some(frame_model) = recovery_frame_model.as_deref() {
+        dexdo::telemetry::set_model(frame_model);
+    }
+    // read for as long as this command runs; dropped with it.
+    let _note_balances = if args.mock.mock_chain {
+        None
+    } else {
+        crate::cli::seller_note_metrics::start(
+            crate::cli::commands::manifest_path()?,
+            args.deals_dir.clone(),
+        )
     };
     let registry_policy = if !args.mock.mock_chain && !shutdown_requested {
         load_enabled_model_registry_policy(
@@ -4907,10 +5516,20 @@ pub(crate) async fn run_seller_with_deal_gas_overhead(
         .then(|| resolve_endpoints_file(args.endpoints_file.clone()))
         .transpose()?;
     let (mut chain, mut note) = if let Some(endpoints_file) = mock_endpoints_file.as_ref() {
-        mock_chain_and_note(endpoints_file.clone(), &args.identity)?
+        mock_chain_and_note(
+            endpoints_file.clone(),
+            &crate::cli::args::IdentityArgs {
+                note_key: args.identity.note_key.clone(),
+                note_index: args.identity.note_index,
+                note_addr: None,
+            },
+        )?
     } else {
+        let (owner, key) = selected_identity()?;
         seller_real_backend_with_deal_gas_overhead(
             &args,
+            owner,
+            key,
             market_frame_model.as_deref(),
             deal_nonce,
             recovery_frame_model.as_deref(),
@@ -4921,7 +5540,10 @@ pub(crate) async fn run_seller_with_deal_gas_overhead(
     // reads or resume checks so the fresh-note action remains the primary error. A shutdown
     // cancels this retrying read but still continues through exact resting-offer inspection so
     // can cancel and confirm the captured identity below.
-    if !shutdown_requested {
+    let recorded_anchor = locked_records
+        .as_ref()
+        .is_some_and(|records| records.contains_key(&deals::normalize_addr(&token_contract)));
+    if !shutdown_requested && !recorded_anchor && !hold_initial_market {
         let note_post_eligibility = async {
             #[cfg(test)]
             if std::env::var_os("DEXDO_TEST_335_PENDING_EARLY_WITHDRAWN_READ").is_some() {
@@ -4940,7 +5562,7 @@ pub(crate) async fn run_seller_with_deal_gas_overhead(
             result = &mut note_post_eligibility => result?,
         }
     }
-    let seller_owner = args.identity.note_addr.clone().unwrap_or_else(|| {
+    let mut seller_owner = selected_note.clone().unwrap_or_else(|| {
         format!(
             "0:{}",
             note.pubkey()
@@ -4950,14 +5572,15 @@ pub(crate) async fn run_seller_with_deal_gas_overhead(
                 .collect::<String>()
         )
     });
+    let configured_owner = seller_owner.clone();
     let mut resumed_descendant = false;
-    if seller_unsold_is_retired_and_unfunded(
+    let selected_retired = seller_unsold_is_retired_and_unfunded(
         args.deals_dir.as_deref(),
         &token_contract,
         chain.as_ref(),
     )
-    .await?
-    {
+    .await?;
+    if selected_retired && !recorded_anchor {
         bail!(
             "selected market {} has retired unsold capacity; select the replacement market",
             display_token_contract(&token_contract)
@@ -4965,9 +5588,32 @@ pub(crate) async fn run_seller_with_deal_gas_overhead(
     }
     // Terms come from the selected TC. If that lineage is already terminal, its persisted link or
     // reserved nonce may redirect startup to the exact same-note replacement handle.
-    let mut terms = chain.sell_offer_terms(&token_contract).await;
+    let selected_stopped = recorded_anchor
+        && chain
+            .deal_state(&token_contract)
+            .await?
+            .is_some_and(|state| state.is_stopped());
+    let mut terms = if selected_retired || selected_stopped {
+        Ok(None)
+    } else {
+        chain.sell_offer_terms(&token_contract).await
+    };
     let mut unavailable_consumed = false;
-    if !matches!(&terms, Ok(Some(_))) {
+    if !hold_initial_market
+        && !selected_retired
+        && !selected_stopped
+        && !matches!(&terms, Ok(Some(_)))
+    {
+        let markets = if let Some(records) = &locked_records {
+            let owner = deals::normalize_addr(&seller_owner);
+            records
+                .iter()
+                .filter(|(_, record)| deals::normalize_addr(&record.handle.note_addr) == owner)
+                .map(|(key, record)| (key.clone(), record.market.clone()))
+                .collect()
+        } else {
+            seller_market_manifests(args.deals_dir.as_deref(), &seller_owner)?
+        };
         let initial_fill = dexdo::seller::read_seller_fill_lineage(
             &seller_watch_cursor_path(args.deals_dir.as_deref(), &token_contract)?,
             &token_contract,
@@ -4977,6 +5623,7 @@ pub(crate) async fn run_seller_with_deal_gas_overhead(
             .map(|fill| {
                 reconcile_seller_replacement_link(
                     args.deals_dir.as_deref(),
+                    &markets,
                     &seller_owner,
                     &token_contract,
                     startup_market
@@ -4989,7 +5636,6 @@ pub(crate) async fn run_seller_with_deal_gas_overhead(
             .transpose()?
             .flatten();
         if let Some(mut linked) = linked {
-            let markets = seller_market_manifests(args.deals_dir.as_deref(), &seller_owner)?;
             let mut ancestor = token_contract.clone();
             let mut visited = std::collections::HashSet::new();
             loop {
@@ -5019,13 +5665,7 @@ pub(crate) async fn run_seller_with_deal_gas_overhead(
                             ));
                         (chain, note.clone())
                     } else {
-                        seller_real_backend_with_deal_gas_overhead(
-                            &args,
-                            Some(&market.frame_model),
-                            Some(market.nonce),
-                            Some(&market.frame_model),
-                            deal_gas_overhead_raw,
-                        )?
+                        real_backend_for_market(&market)?
                     };
                 let descendant_terms = descendant_chain.sell_offer_terms(&linked).await;
                 if matches!(&descendant_terms, Ok(Some(_))) {
@@ -5047,6 +5687,7 @@ pub(crate) async fn run_seller_with_deal_gas_overhead(
                     .map(|fill| {
                         reconcile_seller_replacement_link(
                             args.deals_dir.as_deref(),
+                            &markets,
                             &seller_owner,
                             &linked,
                             Some(&market.frame_model),
@@ -5098,6 +5739,52 @@ pub(crate) async fn run_seller_with_deal_gas_overhead(
             unavailable_consumed = initial_fill.is_some();
         }
     }
+    if hold_initial_market
+        && !seller_has_startup_obligation(chain.as_ref(), &token_contract).await?
+    {
+        terms = Ok(None);
+    }
+    let mut resumed_other_deal = false;
+    if (recorded_anchor || hold_initial_market) && matches!(&terms, Ok(None)) {
+        let records = locked_records
+            .as_ref()
+            .expect("replenishment or a recorded anchor has locked records");
+        if let Some(market) =
+            working_seller_startup_market(records, &token_contract, real_backend_for_market).await?
+        {
+            let (next_chain, next_note) = real_backend_for_market(&market)?;
+            terms = if next_chain
+                .has_pending_sell_offer(&market.token_contract)
+                .await?
+            {
+                Ok(Some((
+                    market.price_per_tick.try_into()?,
+                    market.max_ticks.try_into()?,
+                )))
+            } else {
+                next_chain.sell_offer_terms(&market.token_contract).await
+            };
+            tracing::info!(
+                selected = %display_token_contract(&token_contract),
+                serving = %display_token_contract(&market.token_contract),
+                "selected market is no longer serviceable; resuming the recorded seller pool"
+            );
+            token_contract = market.token_contract.clone();
+            seller_owner = market.seller_note.clone();
+            market_frame_model = Some(market.frame_model.clone());
+            recovery_frame_model = market_frame_model.clone();
+            deal_nonce = Some(market.nonce);
+            startup_market = Some(market);
+            chain = next_chain;
+            note = next_note;
+            resumed_other_deal = true;
+        }
+    }
+    let startup_model = if resumed_other_deal {
+        market_frame_model.as_deref()
+    } else {
+        args.model.as_deref()
+    };
     let (price, ticks) = match terms? {
         Some(terms) => terms,
         // A mock-only TokenContract-less demo has no chain getter. Its non-production stand-in is
@@ -5107,6 +5794,11 @@ pub(crate) async fn run_seller_with_deal_gas_overhead(
             u64::try_from(dexdo_core::PRICE_STEP).expect("PRICE_STEP fits seller offer price"),
             1024,
         ),
+        // There is nothing to serve yet. The launcher still has to prove settlement before
+        // provisioning, and will start the seller again once the successor is installed.
+        None if (recorded_anchor || hold_initial_market) && replenish_handoff.is_some() => {
+            return Ok(())
+        }
         None => {
             bail!(
                 "seller requires a deployed per-deal TokenContract; selected {} is unavailable \
@@ -5149,6 +5841,22 @@ pub(crate) async fn run_seller_with_deal_gas_overhead(
         gateway_advertise: gateway_advertise.clone(),
         mock_token_count: args.mock_token_count,
     };
+    if recorded_anchor || resumed_other_deal {
+        let cursor = seller_watch_cursor_path(args.deals_dir.as_deref(), &token_contract)?;
+        cfg.subscription = recorded_seller_offer_mode(
+            chain.as_ref(),
+            &token_contract,
+            &cursor,
+            (!resumed_other_deal).then_some(args.subscription),
+        )
+        .await?
+        .with_context(|| {
+            format!(
+                "seller cannot establish the SELL mode for {}",
+                display_token_contract(&token_contract)
+            )
+        })?;
+    }
     let inspection =
         dexdo::seller::inspect_seller_offer(chain.as_ref(), &cfg, Some(&seller_owner)).await?;
     let mut inspected_identity = match inspection {
@@ -5177,7 +5885,7 @@ pub(crate) async fn run_seller_with_deal_gas_overhead(
             if !args.mock.mock_chain {
                 chain_doctor_preflight(
                     &crate::cli::commands::manifest_path()?,
-                    (!resumed_descendant)
+                    (!resumed_descendant && !resumed_other_deal)
                         .then_some(args.market.as_deref())
                         .flatten(),
                 )
@@ -5209,48 +5917,31 @@ pub(crate) async fn run_seller_with_deal_gas_overhead(
                 // and cancel it before it dies of a missing credential, and reading `models.json`
                 // earlier would leave that ask resting with nobody behind it. Nothing above this
                 // line writes to the chain -- the first write is the offer post, far below.
-                {
-                    let name = args
-                        .model
-                        .as_deref()
+                let name = startup_model
                         .filter(|s| !s.is_empty())
                         .ok_or_else(|| {
                             anyhow::anyhow!(
                                 format!("real {}: set --model <name from config> (needed for model registry validation)", dexdo_core::params::current_network())
                             )
                         })?;
-                    let listed_frame_model = dexdo::seller::ModelsConfig::load(&args.models)?
-                        .get(name)?
-                        .frame_model
-                        .clone();
-                    let listed_frame_model = crate::cli::support::require_model_name(
-                        &listed_frame_model,
-                        "the `frame_model` field of this model's entry in models.json",
-                        "Fix that field in the models config.",
-                    )?;
-                    crate::cli::admin::ensure_model_resolves(
-                        crate::cli::admin::ModelResolutionCaller::Seller,
-                        &crate::cli::commands::manifest_path()?,
-                        None,
-                        &listed_frame_model,
-                        args.allow_unverified_model,
-                    )
-                    .await?;
-                }
+                let configured_frame_model = dexdo::seller::ModelsConfig::load(&args.models)?
+                    .get(name)?
+                    .frame_model
+                    .clone();
+                let listed_frame_model = crate::cli::support::require_model_name(
+                    &configured_frame_model,
+                    "the `frame_model` field of this model's entry in models.json",
+                    "Fix that field in the models config.",
+                )?;
+                crate::cli::admin::ensure_model_resolves(
+                    crate::cli::admin::ModelResolutionCaller::Seller,
+                    &crate::cli::commands::manifest_path()?,
+                    None,
+                    &listed_frame_model,
+                    args.allow_unverified_model,
+                )
+                .await?;
                 if let Some(policy) = registry_policy.as_ref() {
-                    let name = args
-                        .model
-                        .as_deref()
-                        .filter(|s| !s.is_empty())
-                        .ok_or_else(|| {
-                            anyhow::anyhow!(
-                                format!("real {}: set --model <name from config> (needed for model registry validation)", dexdo_core::params::current_network())
-                            )
-                        })?;
-                    let configured_frame_model = dexdo::seller::ModelsConfig::load(&args.models)?
-                        .get(name)?
-                        .frame_model
-                        .clone();
                     let selected_market = startup_market.clone();
                     let target = resolve_model_registry_target(
                         RegistryRole::Seller,
@@ -5271,7 +5962,7 @@ pub(crate) async fn run_seller_with_deal_gas_overhead(
                             order_book: selected_market
                                 .as_ref()
                                 .map(|market| market.inference_order_book.clone()),
-                            note_addr: args.identity.note_addr.clone(),
+                            note_addr: Some(seller_owner.clone()),
                         },
                     )
                     .await?;
@@ -5280,15 +5971,9 @@ pub(crate) async fn run_seller_with_deal_gas_overhead(
                     let expected_order_book = if let Some(order_book) = target.order_book {
                         order_book
                     } else {
-                        let note_addr = args.identity.note_addr.as_deref().ok_or_else(|| {
-                            anyhow::anyhow!(format!(
-                                "real {}: --note-addr is required to derive the seller order book",
-                                dexdo_core::params::current_network()
-                            ))
-                        })?;
                         expected_order_book_for_note(
                             &crate::cli::commands::manifest_path()?,
-                            note_addr,
+                            &seller_owner,
                             &frame_model,
                         )
                         .await?
@@ -5323,9 +6008,13 @@ pub(crate) async fn run_seller_with_deal_gas_overhead(
 
             if registry_frame_model.as_deref() != recovery_frame_model.as_deref() {
                 if let Some(frame_model) = registry_frame_model.as_deref() {
+                    let owner = seller_owner.as_str();
+                    let key = key_for(owner)?;
                     let (resolved_chain, resolved_note) =
                         seller_real_backend_with_deal_gas_overhead(
                             &args,
+                            owner,
+                            key,
                             market_frame_model.as_deref(),
                             deal_nonce,
                             Some(frame_model),
@@ -5394,25 +6083,30 @@ pub(crate) async fn run_seller_with_deal_gas_overhead(
             if let Some(error) = preflight_error {
                 return Err(error);
             }
-            let upstream = seller_upstream(
-                &args,
-                args.model.as_deref(),
-                registry_frame_model.as_deref(),
-            )?;
+            let upstream = seller_upstream(&args, startup_model, registry_frame_model.as_deref())?;
             // these fallible note readiness reads are protected by the exact
             // restart identity above, before any new seller-chain write is possible.
-            chain.assert_note_current().await?;
-            chain.assert_note_can_post_sell_offer().await?;
+            if !recorded_anchor {
+                chain.assert_note_current().await?;
+                chain.assert_note_can_post_sell_offer().await?;
+            }
             match persistent_gateway_tls.take() {
-                Some(tls) => {
-                    dexdo::seller::start_gateway_with_note_tls_and_deals_dir(
+                Some(SellerGatewayTls {
+                    primary,
+                    additional,
+                    migrated_routes,
+                }) => {
+                    let mut seller = dexdo::seller::start_gateway_with_note_tls_listeners(
                         args.gateway_listen,
                         upstream,
                         note,
                         seller_deals_dir.clone(),
-                        tls,
+                        primary,
+                        additional,
                     )
-                    .await
+                    .await?;
+                    seller.migrated_routes = migrated_routes;
+                    Ok(seller)
                 }
                 None => {
                     dexdo::seller::start_gateway_with_note_and_deals_dir(
@@ -5532,11 +6226,11 @@ pub(crate) async fn run_seller_with_deal_gas_overhead(
         cursor_path: seller_watch_cursor_path(args.deals_dir.as_deref(), &token_contract)?,
         poll_interval: DEFAULT_MATCH_POLL_INTERVAL,
     };
-    let note_addr = args.identity.note_addr.as_deref().unwrap_or(&seller_owner);
+    let note_addr = &seller_owner;
     let frame_model = seller_frame_model_for_handle.as_deref().unwrap_or("mock");
     let context = SellerPoolContext {
         deals_dir: args.deals_dir.as_deref(),
-        contracts: &crate::cli::commands::manifest_path()?,
+        contracts: &contracts,
         note_addr,
         frame_model,
         gateway_advertise: &gateway_advertise,
@@ -5546,34 +6240,29 @@ pub(crate) async fn run_seller_with_deal_gas_overhead(
         sweep_configured_seller_model_books(&args, note_addr, context.frame_model, &token_contract)
             .await?;
     }
-    let retained_deals = sweep_seller_startup_offers(&context, &chain, &token_contract, |market| {
-        if let Some(endpoints_file) = mock_endpoints_file.as_ref() {
-            Ok(Arc::new(dexdo_core::MockChainBackend::new(
-                endpoints_file.clone(),
-                dexdo_core::ProtocolConsts::canonical(),
-                DobParams::canonical(),
-            )) as Arc<dyn dexdo_core::ChainBackend>)
-        } else {
-            let (chain, _) = seller_real_backend_with_deal_gas_overhead(
-                &args,
-                Some(&market.frame_model),
-                Some(market.nonce),
-                Some(&market.frame_model),
-                deal_gas_overhead_raw,
-            )?;
-            Ok(chain)
-        }
-    })
-    .await?;
+    let records = match locked_records {
+        Some(records) => records,
+        None => seller_market_handle_records(args.deals_dir.as_deref(), &seller_owner)?,
+    };
+    let retained_deals =
+        sweep_seller_startup_offers(&context, &chain, &token_contract, &records, |market| {
+            if let Some(endpoints_file) = mock_endpoints_file.as_ref() {
+                Ok(Arc::new(dexdo_core::MockChainBackend::new(
+                    endpoints_file.clone(),
+                    dexdo_core::ProtocolConsts::canonical(),
+                    DobParams::canonical(),
+                )) as Arc<dyn dexdo_core::ChainBackend>)
+            } else {
+                let (chain, _) = real_backend_for_market(market)?;
+                Ok(chain)
+            }
+        })
+        .await?;
     let initial = SellerPoolDeal {
         chain,
         cfg,
         watch,
-        upstream: seller_upstream(
-            &args,
-            args.model.as_deref(),
-            registry_frame_model.as_deref(),
-        )?,
+        upstream: seller_upstream(&args, startup_model, registry_frame_model.as_deref())?,
         nonce: deal_nonce.unwrap_or(0),
         market: startup_market,
     };
@@ -5582,6 +6271,8 @@ pub(crate) async fn run_seller_with_deal_gas_overhead(
         initial,
         args.mock_token_count,
         Some(&retained_deals),
+        records,
+        (&configured_owner, args.subscription),
         |market| {
             if let Some(endpoints_file) = mock_endpoints_file.as_ref() {
                 let chain: Arc<dyn dexdo_core::ChainBackend> =
@@ -5595,13 +6286,7 @@ pub(crate) async fn run_seller_with_deal_gas_overhead(
                     seller_upstream(&args, args.model.as_deref(), Some(&market.frame_model))?,
                 ))
             } else {
-                let (chain, _) = seller_real_backend_with_deal_gas_overhead(
-                    &args,
-                    Some(&market.frame_model),
-                    Some(market.nonce),
-                    Some(&market.frame_model),
-                    deal_gas_overhead_raw,
-                )?;
+                let (chain, _) = real_backend_for_market(market)?;
                 Ok((
                     chain,
                     seller_upstream(&args, Some(&market.frame_model), Some(&market.frame_model))?,
@@ -5613,53 +6298,130 @@ pub(crate) async fn run_seller_with_deal_gas_overhead(
     let pool = admit_seller_startup_deals(pool, &context, &seller_policy).await?;
     let args_ref = &args;
     let provision_endpoints = mock_endpoints_file.clone();
-    let provision_seller = seller_owner.clone();
-    let mut provisioner = |frame_model: String, nonce, price_per_tick, max_ticks| {
-        let provision_endpoints = provision_endpoints.clone();
-        let provision_seller = provision_seller.clone();
-        async move {
-            if let Some(endpoints_file) = provision_endpoints.as_ref() {
-                let identity = format!("{provision_seller}:{frame_model}:{nonce}");
-                let token_contract = format!(
-                    "0:{}",
-                    dexdo_core::model_hash_for(&identity).trim_start_matches("0x")
-                );
-                let market = dexdo_core::MarketManifest {
-                    network: "mock".to_string(),
-                    frame_model: frame_model.clone(),
-                    model_hash: dexdo_core::model_hash_for(&frame_model),
-                    inference_order_book: "mock".to_string(),
-                    root_model: "mock".to_string(),
-                    token_contract,
-                    seller_note: provision_seller.clone(),
+    let mut provisioner =
+        |provision_seller: String, frame_model: String, nonce, price_per_tick, max_ticks| {
+            let provision_endpoints = provision_endpoints.clone();
+            async move {
+                if let Some(endpoints_file) = provision_endpoints.as_ref() {
+                    let identity = format!("{provision_seller}:{frame_model}:{nonce}");
+                    let token_contract = format!(
+                        "0:{}",
+                        dexdo_core::model_hash_for(&identity).trim_start_matches("0x")
+                    );
+                    let market = dexdo_core::MarketManifest {
+                        network: "mock".to_string(),
+                        frame_model: frame_model.clone(),
+                        model_hash: dexdo_core::model_hash_for(&frame_model),
+                        inference_order_book: "mock".to_string(),
+                        root_model: "mock".to_string(),
+                        token_contract,
+                        seller_note: provision_seller.clone(),
+                        nonce,
+                        price_per_tick: u128::from(price_per_tick),
+                        max_ticks: u128::from(max_ticks),
+                        all_or_none: false,
+                    };
+                    let chain: Arc<dyn dexdo_core::ChainBackend> =
+                        Arc::new(dexdo_core::MockChainBackend::new(
+                            endpoints_file.clone(),
+                            dexdo_core::ProtocolConsts::canonical(),
+                            DobParams::canonical(),
+                        ));
+                    return Ok((market, chain));
+                }
+                provision_replacement_seller_with_deal_gas_overhead(
+                    args_ref,
+                    (&provision_seller, key_for(&provision_seller)?),
+                    &frame_model,
                     nonce,
-                    price_per_tick: u128::from(price_per_tick),
-                    max_ticks: u128::from(max_ticks),
-                    all_or_none: false,
-                };
-                let chain: Arc<dyn dexdo_core::ChainBackend> =
-                    Arc::new(dexdo_core::MockChainBackend::new(
-                        endpoints_file.clone(),
-                        dexdo_core::ProtocolConsts::canonical(),
-                        DobParams::canonical(),
-                    ));
-                return Ok((market, chain));
+                    price_per_tick,
+                    max_ticks,
+                    deal_gas_overhead_raw,
+                )
+                .await
             }
-            provision_replacement_seller_with_deal_gas_overhead(
-                args_ref,
-                &frame_model,
-                nonce,
-                price_per_tick,
-                max_ticks,
-                deal_gas_overhead_raw,
-            )
-            .await
-        }
-    };
+        };
     let startup_policy = SellerStartupPolicy {
         runtime: &seller_policy,
         retained_deals: pool.len(),
+        owns_gateway: true,
     };
+    if !shutdown_requested {
+        if let (Some(market_path), Some(handoff_path)) = (args.market.as_deref(), replenish_handoff)
+        {
+            let owner = deals::normalize_addr(&configured_owner);
+            let (mut primary, others): (Vec<_>, Vec<_>) = pool
+                .iter()
+                .cloned()
+                .partition(|deal| deals::normalize_addr(context.for_deal(deal).note_addr) == owner);
+            if hold_initial_market
+                || ((resumed_other_deal || !primary.is_empty()) && !others.is_empty())
+            {
+                let market = load_market(market_path)?;
+                assert_market_seller_note(&market.seller_note, &owner)?;
+                if resumed_other_deal || hold_initial_market {
+                    // An earlier provision may already have created a vacant successor for the
+                    // terminal anchor. The launcher must reconcile its journal before it goes live.
+                    let mut obligations = Vec::new();
+                    for deal in primary {
+                        if seller_has_startup_obligation(
+                            deal.chain.as_ref(),
+                            &deal.cfg.token_contract,
+                        )
+                        .await?
+                        {
+                            obligations.push(deal);
+                        }
+                    }
+                    primary = obligations;
+                }
+                let lock = pool_locks
+                    .remove(&owner)
+                    .context("replenishment note has no seller pool lock")?;
+                let result = Box::pin(seller_replenish::run(
+                    &seller,
+                    context,
+                    &seller_policy,
+                    primary,
+                    others,
+                    provisioner,
+                    seller_replenish::Handoff {
+                        path: handoff_path.into(),
+                        market_path,
+                        market,
+                        lock,
+                        mock_token_count: args.mock_token_count,
+                        hold_initial_market,
+                    },
+                    async |market: &dexdo_core::MarketManifest| {
+                        let real_chain = dexdo_core::RealChainBackend::connect(&contracts)?;
+                        let tc = dexdo_core::address::parse_chain_address(&market.token_contract)?
+                            .into_chain();
+                        if !real_chain
+                            .exact_provision_target_is_active_and_matches(&tc, market)
+                            .await?
+                        {
+                            bail!(
+                                "replenishment TokenContract {} is not active",
+                                display_token_contract(&market.token_contract)
+                            );
+                        }
+                        let (chain, _) = real_backend_for_market(market)?;
+                        let upstream = seller_upstream(
+                            &args,
+                            args.model.as_deref(),
+                            Some(&market.frame_model),
+                        )?;
+                        Ok((chain, upstream))
+                    },
+                    shutdown.as_mut(),
+                ))
+                .await;
+                seller.server_task.abort();
+                return result;
+            }
+        }
+    }
     let result = run_seller_pool(
         &seller,
         pool,
@@ -5702,7 +6464,7 @@ mod tests {
         let root = tempfile::tempdir().unwrap();
         let note_addr = format!("0:{}", "a".repeat(64));
         let pool_dir = seller_pool_dir(Some(root.path()), &note_addr).unwrap();
-        let tls = load_or_create_gateway_tls(&pool_dir).unwrap();
+        let tls = load_or_migrate_gateway_tls(&pool_dir, &[]).unwrap();
         let fingerprint = tls.fingerprint.clone();
         let note = Arc::new(LocalNote::generate());
         let first = dexdo::seller::start_gateway_with_note_tls(
@@ -5719,7 +6481,15 @@ mod tests {
         first.server_task.abort();
         let _ = first.server_task.await;
 
-        let restored = load_or_create_gateway_tls(&pool_dir).unwrap();
+        let gateway_dir = pool_dir.parent().unwrap();
+        let restored =
+            load_or_migrate_gateway_tls(gateway_dir, std::slice::from_ref(&pool_dir)).unwrap();
+        assert_eq!(
+            load_or_migrate_gateway_tls(gateway_dir, &[])
+                .unwrap()
+                .fingerprint,
+            restored.fingerprint
+        );
         assert_eq!(restored.fingerprint, fingerprint);
         // shape C: re-binding the first gateway's exact port races whoever the kernel hands it
         // to in between (and the first gateway's own closed connections keep it in TIME_WAIT). What
@@ -5765,6 +6535,21 @@ mod tests {
         )
         .unwrap();
         let endpoints = root.path().join("must-not-be-written.json");
+        let market = dexdo_core::MarketManifest {
+            network: "shellnet".into(),
+            frame_model: "unused".into(),
+            model_hash: dexdo_core::model_hash_for("unused"),
+            inference_order_book: format!("0:{}", "c".repeat(64)),
+            root_model: format!("0:{}", "d".repeat(64)),
+            token_contract: format!("0:{}", "b".repeat(64)),
+            seller_note: note_addr,
+            nonce: 7,
+            price_per_tick: dexdo_core::PRICE_STEP,
+            max_ticks: dexdo_core::MIN_STREAM_BUY_TICKS,
+            all_or_none: false,
+        };
+        let market_path = root.path().join("market.json");
+        std::fs::write(&market_path, serde_json::to_vec(&market).unwrap()).unwrap();
         let error = super::run_seller(crate::cli::args::SellerArgs {
             max_concurrent_requests_per_deal:
                 dexdo_core::params::SELLER_MAX_CONCURRENT_REQUESTS_PER_DEAL,
@@ -5772,10 +6557,9 @@ mod tests {
                 mock_model: true,
                 mock_chain: false,
             },
-            identity: crate::cli::args::IdentityArgs {
+            identity: crate::cli::args::SellerIdentityArgs {
                 note_key: Some(root.path().join("missing-note.key")),
                 note_index: 0,
-                note_addr: Some(note_addr),
             },
             registry: crate::cli::args::ModelRegistryValidationArgs::default(),
             gateway_listen: "127.0.0.1:0".parse().unwrap(),
@@ -5785,9 +6569,9 @@ mod tests {
             require_advertise_probe: false,
             endpoints_file: Some(endpoints.clone()),
             deals_dir: Some(deals_dir),
-            token_contract: Some(format!("0:{}", "b".repeat(64))),
-            market: None,
-            nonce: Some(7),
+            token_contract: None,
+            market: Some(market_path),
+            nonce: None,
             subscription: false,
             mock_token_count: 8,
             model: Some("unused".to_string()),
@@ -6264,7 +7048,7 @@ mod tests {
             gateway_advertise: &config.gateway_advertise,
             advertise_probe: dexdo::seller::liveness::AdvertiseProbePolicy::default(),
         };
-        let mut provisioner = |_: String, _: u64, _: u64, _: u64| {
+        let mut provisioner = |_: String, _: String, _: u64, _: u64, _: u64| {
             futures::future::ready(Err::<
                 (dexdo_core::MarketManifest, Arc<dyn ChainBackend>),
                 anyhow::Error,
@@ -6898,10 +7682,9 @@ mod tests {
                 mock_model: false,
                 mock_chain: true,
             },
-            identity: crate::cli::args::IdentityArgs {
+            identity: crate::cli::args::SellerIdentityArgs {
                 note_key: Some(root.join("note.key")),
                 note_index: 0,
-                note_addr: None,
             },
             registry: crate::cli::args::ModelRegistryValidationArgs::default(),
             gateway_listen: "127.0.0.1:0".parse().unwrap(),
@@ -7058,9 +7841,21 @@ mod tests {
     }
 
     include!("seller_2108_history_tests.rs");
+    include!("seller_read_admission_2284_tests.rs");
 
     struct PoolTestBackend {
+        subscription: bool,
+        pending_sell: AtomicBool,
+        ambiguous_post_once: AtomicBool,
+        post_ack: Option<Arc<tokio::sync::Semaphore>>,
+        resting_owner: String,
+        signing_note: Option<Arc<dyn Note>>,
+        claimed: AtomicU64,
         owner_fill_delay: std::time::Duration,
+        shared_read_turn: Option<Arc<tokio::sync::Mutex<()>>>,
+        queued_read: Option<(QueuedPoolRead, Arc<tokio::sync::Notify>)>,
+        terms_after_open: AtomicU64,
+        queued_reads_completed: AtomicU64,
         owner_fill_polls: AtomicU64,
         owner_fills: Arc<Mutex<Vec<(i64, MatchedFill)>>>,
         token_contract: String,
@@ -7158,7 +7953,18 @@ mod tests {
                 ));
             }
             Self {
+                subscription: false,
+                pending_sell: AtomicBool::new(false),
+                ambiguous_post_once: AtomicBool::new(false),
+                post_ack: None,
+                resting_owner: format!("0:{}", "a".repeat(64)),
+                signing_note: None,
+                claimed: AtomicU64::new(0),
                 owner_fill_delay: std::time::Duration::ZERO,
+                shared_read_turn: None,
+                queued_read: None,
+                terms_after_open: AtomicU64::new(0),
+                queued_reads_completed: AtomicU64::new(0),
                 owner_fill_polls: AtomicU64::new(0),
                 owner_fills,
                 token_contract,
@@ -7192,6 +7998,24 @@ mod tests {
                 retired_nonces: Mutex::new(std::collections::HashSet::new()),
                 nonce_read_failure: AtomicBool::new(false),
                 nonce_read_calls: AtomicU64::new(0),
+            }
+        }
+
+        async fn wait_for_queued_pool_read(&self, stage: QueuedPoolRead) {
+            if let Some((queued_stage, started)) = &self.queued_read {
+                if *queued_stage == stage {
+                    started.notify_one();
+                    // No network work starts until this simulated admission completes.
+                    tokio::time::sleep(dexdo_core::params::MATCH_OPEN_TIMEOUT * 4).await;
+                    self.queued_reads_completed.fetch_add(1, Ordering::Relaxed);
+                }
+            }
+        }
+
+        async fn wait_for_shared_read_turn(&self) {
+            if let Some(gate) = &self.shared_read_turn {
+                let _turn = gate.lock().await;
+                tokio::time::sleep(std::time::Duration::from_millis(1)).await;
             }
         }
 
@@ -7257,7 +8081,26 @@ mod tests {
 
     #[async_trait::async_trait]
     impl ChainBackend for PoolTestBackend {
+        async fn has_pending_sell_offer(&self, _: &TokenContract) -> Result<bool, ChainError> {
+            Ok(self.pending_sell.load(Ordering::Relaxed))
+        }
+
+        fn network(&self) -> &str {
+            if self.signing_note.is_some() {
+                "shellnet"
+            } else {
+                "mock"
+            }
+        }
+
+        fn seller_signing_note(&self) -> Option<&Arc<dyn Note>> {
+            self.signing_note.as_ref()
+        }
+
         async fn seller_nonce_is_retired(&self, nonce: u64) -> Result<bool, ChainError> {
+            if self.open_calls.load(Ordering::Relaxed) > 0 {
+                self.wait_for_queued_pool_read(QueuedPoolRead::Nonce).await;
+            }
             self.nonce_read_calls.fetch_add(1, Ordering::Relaxed);
             if self.nonce_read_failure.load(Ordering::Relaxed) {
                 return Err(ChainError::Chain(
@@ -7310,14 +8153,18 @@ mod tests {
             };
             Ok(vec![dexdo_core::OrderBookOrder {
                 order_id: 1,
-                owner_note: format!("0:{}", "a".repeat(64)),
+                owner_note: self.resting_owner.clone(),
                 token_contract: Some(token_contract.to_string()),
                 is_buy: false,
                 price_per_tick: u128::from(self.price_per_tick),
                 ticks: u128::from(self.offered_ticks),
                 escrow: 0,
                 deadline,
-                flags: 0,
+                flags: if self.subscription {
+                    dexdo_core::order_flags::AON | dexdo_core::order_flags::SUBSCRIPTION
+                } else {
+                    0
+                },
                 timestamp: 0,
             }])
         }
@@ -7330,6 +8177,16 @@ mod tests {
             assert_eq!(offer.token_contract, self.token_contract);
             assert_eq!(offer.price_per_tick, self.price_per_tick);
             assert_eq!(offer.max_ticks, self.offered_ticks);
+            if self.ambiguous_post_once.swap(false, Ordering::Relaxed) {
+                self.pending_sell.store(true, Ordering::Relaxed);
+                self.post_calls.fetch_add(1, Ordering::Relaxed);
+                if let Some(ack) = &self.post_ack {
+                    ack.acquire().await.unwrap().forget();
+                }
+                return Err(ChainError::AmbiguousSubmit(
+                    "Block Manager timed out".into(),
+                ));
+            }
             assert!(!self.matched.swap(true, Ordering::Relaxed));
             self.owner_fills.lock().unwrap().push((
                 self.created_at,
@@ -7358,6 +8215,19 @@ mod tests {
             &self,
             _: &TokenContract,
         ) -> Result<Option<(u64, u64)>, ChainError> {
+            self.wait_for_shared_read_turn().await;
+            if self.open_calls.load(Ordering::Relaxed) > 0 {
+                let stage = if self.terms_after_open.fetch_add(1, Ordering::Relaxed) == 0 {
+                    QueuedPoolRead::Capacity
+                } else {
+                    QueuedPoolRead::ResidualTerms
+                };
+                if stage == QueuedPoolRead::Capacity || self.getdeal_gone.load(Ordering::Relaxed) {
+                    self.wait_for_queued_pool_read(stage).await;
+                }
+            }
+            self.wait_for_queued_pool_read(QueuedPoolRead::ProvisionedTerms)
+                .await;
             if self.terms_fail_once.swap(false, Ordering::Relaxed) {
                 return Err(ChainError::Transport(
                     "injected one-shot getDeal failure".to_string(),
@@ -7388,9 +8258,13 @@ mod tests {
 
         async fn poll_seller_fills(
             &self,
-            _: &dyn Note,
+            note: &dyn Note,
             cursor: &mut MatchWatchCursor,
         ) -> Result<Vec<MatchedFill>, ChainError> {
+            self.wait_for_shared_read_turn().await;
+            if let Some(expected) = &self.signing_note {
+                assert_eq!(note.pubkey(), expected.pubkey());
+            }
             self.owner_fill_polls.fetch_add(1, Ordering::Relaxed);
             if !self.owner_fill_delay.is_zero() {
                 tokio::time::sleep(self.owner_fill_delay).await;
@@ -7428,8 +8302,11 @@ mod tests {
             &self,
             _: &TokenContract,
             _: Vec<u8>,
-            _: &dyn Note,
+            note: &dyn Note,
         ) -> Result<(), ChainError> {
+            if let Some(expected) = &self.signing_note {
+                assert_eq!(note.pubkey(), expected.pubkey());
+            }
             self.open_calls.fetch_add(1, Ordering::Relaxed);
             if self.open_fail_once.swap(false, Ordering::Relaxed) {
                 return Err(ChainError::Transport(
@@ -7447,9 +8324,14 @@ mod tests {
         async fn claim_tokens(
             &self,
             _: &TokenContract,
-            _: &dyn Note,
-            _: u128,
+            note: &dyn Note,
+            cumulative: u128,
         ) -> Result<(), ChainError> {
+            if let Some(expected) = &self.signing_note {
+                assert_eq!(note.pubkey(), expected.pubkey());
+                self.claimed
+                    .store(cumulative.try_into().unwrap(), Ordering::Relaxed);
+            }
             Ok(())
         }
 
@@ -7479,6 +8361,10 @@ mod tests {
             &self,
             token_contract: &TokenContract,
         ) -> Result<Option<DealChainState>, ChainError> {
+            if token_contract != &self.token_contract {
+                self.wait_for_queued_pool_read(QueuedPoolRead::Discovery)
+                    .await;
+            }
             if self
                 .terminal_owner_fills
                 .lock()
@@ -7487,6 +8373,11 @@ mod tests {
             {
                 return Ok(None);
             }
+            let claimed = if self.signing_note.is_some() {
+                u128::from(self.claimed.load(Ordering::Relaxed)).max(dexdo_core::TICK_SIZE)
+            } else {
+                0
+            };
             Ok(self.exists.load(Ordering::Relaxed).then(|| DealChainState {
                 funded: self.matched.load(Ordering::Relaxed),
                 opened: self.opened.load(Ordering::Relaxed),
@@ -7498,8 +8389,8 @@ mod tests {
                     0
                 },
                 finalized_owed: 0,
-                tokens_final: 0,
-                tokens_pending: 0,
+                tokens_final: claimed,
+                tokens_pending: claimed,
                 probe_tick: 0,
                 funded_time: self.matched.load(Ordering::Relaxed).then_some(1),
                 probe_time: 0,
@@ -7512,22 +8403,32 @@ mod tests {
             &self,
             _: &TokenContract,
         ) -> Result<Option<DealChainSnapshot>, ChainError> {
+            self.wait_for_shared_read_turn().await;
             let Some(state) = self.deal_state(&self.token_contract).await? else {
                 return Ok(None);
             };
             let funded_tokens = u128::from(self.matched_ticks) * dexdo_core::TICK_SIZE;
             let bond_required = u128::from(self.price_per_tick) * 2;
+            let sub_weeks = if self.subscription {
+                dexdo_core::SUBSCRIPTION_WEEKS
+            } else {
+                0
+            };
             Ok(Some(DealChainSnapshot {
                 account_code_hash: "pool-test-code".to_string(),
                 account_boc_hash: format!("pool-test:{}", self.token_contract),
                 state,
                 subscription: DealSubscription {
-                    deal_flags: 0,
-                    sub_weeks: 0,
+                    deal_flags: if self.subscription {
+                        dexdo_core::order_flags::SUBSCRIPTION
+                    } else {
+                        0
+                    },
+                    sub_weeks,
                     week_index: 0,
-                    tokens_per_week: funded_tokens,
+                    tokens_per_week: funded_tokens / u128::from(sub_weeks.max(1)),
                     funded_tokens,
-                    tokens_paid: 0,
+                    tokens_paid: state.tokens_final,
                     period_start: 0,
                     week_base_tokens: 0,
                 },
@@ -7580,27 +8481,35 @@ mod tests {
     async fn opened_deal_that_selfdestructed_on_buyer_stop_retires_instead_of_failing_the_pool() {
         let owner_fills = Arc::new(Mutex::new(Vec::new()));
         let backend = PoolTestBackend::new(owner_fills, "0:settled".to_string(), 8, 3, true, 1);
+        let seller = dexdo::seller::start_gateway_with_note(
+            "127.0.0.1:0".parse().unwrap(),
+            dexdo::seller::UpstreamConfig::Mock,
+            Arc::new(LocalNote::generate()),
+        )
+        .await
+        .unwrap();
         backend.opened.store(true, Ordering::Relaxed);
         let token_contract = backend.token_contract.clone();
 
         // While the account is Active the snapshot drives the settlement driver as before.
-        match plan_opened_deal(&backend, &token_contract)
+        match plan_opened_deal(&seller, &backend, &token_contract)
             .await
             .expect("an active TokenContract reads back")
         {
-            OpenedDealPlan::Drive(_) => {}
+            OpenedDealPlan::Drive { .. } => {}
             other => panic!("an active TokenContract must drive settlement: {other:?}"),
         }
 
         // `stop()` selfdestructs the contract: every getter now answers "no such account".
         backend.exists.store(false, Ordering::Relaxed);
-        match plan_opened_deal(&backend, &token_contract)
+        match plan_opened_deal(&seller, &backend, &token_contract)
             .await
             .expect("a settled-and-destroyed TokenContract is not an error")
         {
             OpenedDealPlan::RetireSettled => {}
             other => panic!("a destroyed TokenContract must retire the deal: {other:?}"),
         }
+        seller.server_task.abort();
     }
 
     #[tokio::test]
@@ -8084,12 +8993,16 @@ mod tests {
             ),
             (98, matched_ticks, residual_ticks, parent_cfg.price_per_tick),
         );
-        if preloaded_successor.is_some() {
+        if let Some((_, identity)) = preloaded_successor {
+            // Nonces can repeat across notes. A cross-note lineage is a mismatch when
+            // it names the other note's exact TokenContract.
+            let linked = matches!(identity, PreloadedSuccessorIdentity::ChangedNote)
+                .then_some(successor.token_contract.as_str());
             dexdo::seller::persist_seller_replacement(
                 &parent_watch.cursor_path,
                 &parent.token_contract,
                 11,
-                None,
+                linked,
             )
             .unwrap();
         }
@@ -8115,7 +9028,7 @@ mod tests {
             let successor = successor.clone();
             let note_addr = note_addr.clone();
             let deals_dir = root.to_path_buf();
-            move |model: String, nonce: u64, price: u64, ticks: u64| {
+            move |_: String, model: String, nonce: u64, price: u64, ticks: u64| {
                 let market = dexdo_core::MarketManifest {
                     network: "net-a".to_string(),
                     model_hash: dexdo_core::model_hash_for(&model),
@@ -8187,9 +9100,10 @@ mod tests {
                 futures::future::ready(Ok((market, chain)))
             }
         };
-        // The relist run stops the moment its successor SELL is posted. A full fill has no successor
-        // to wait for, so that run spends the whole window inside the pool loop -- thousands of turns
-        // through the provisioning gate this asserts nothing happened in.
+        // Wait for the successor watcher to open the match, after the pool has consumed admission
+        // and checked the pending residual. A POST and a preloaded parent link can both be visible
+        // before that check; stopping there races the changed-note identity refusal.
+        // A full fill has no successor, so it spends the whole window inside the pool loop.
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
         let shutdown = {
             let successor = successor.clone();
@@ -8197,7 +9111,7 @@ mod tests {
             let parent_token_contract = parent.token_contract.clone();
             async move {
                 while std::time::Instant::now() < deadline {
-                    let successor_ready = successor.post_calls.load(Ordering::Relaxed) > 0;
+                    let successor_ready = successor.opened.load(Ordering::Relaxed);
                     let parent_linked = preloaded_successor.is_some()
                         && dexdo::seller::read_seller_fill_lineage(
                             &parent_cursor_path,
@@ -8577,7 +9491,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_reserved_successor_with_changed_model_or_note_is_not_linked() {
+    async fn a_successor_with_changed_model_or_linked_to_another_note_is_refused() {
         for identity in [
             PreloadedSuccessorIdentity::ChangedModel,
             PreloadedSuccessorIdentity::ChangedNote,
@@ -8609,8 +9523,8 @@ mod tests {
             }
             assert!(refused.provisions.is_empty());
             assert_eq!(refused.money_submits, 0);
-            assert_eq!(refused.replacement, (Some(11), None));
             if matches!(identity, PreloadedSuccessorIdentity::ChangedModel) {
+                assert_eq!(refused.replacement, (Some(11), None));
                 assert_eq!(
                     refused.pending_reservations, 1,
                     "a same-note permanent mismatch remains countable but is not retried"
@@ -8996,7 +9910,7 @@ mod tests {
         }
         .fuse();
         tokio::pin!(shutdown);
-        let mut provision = |_: String, _: u64, _: u64, _: u64| {
+        let mut provision = |_: String, _: String, _: u64, _: u64, _: u64| {
             futures::future::ready(Err(anyhow::anyhow!(
                 "a full match must not provision residual capacity"
             )))
@@ -9725,7 +10639,7 @@ mod tests {
         .fuse();
         tokio::pin!(shutdown);
         let mut shutdown_requested = false;
-        let mut provision = |_: String, _: u64, _: u64, _: u64| {
+        let mut provision = |_: String, _: String, _: u64, _: u64, _: u64| {
             futures::future::ready(Err(anyhow::anyhow!(
                 "no residual is provisioned in this test"
             )))
@@ -9927,7 +10841,7 @@ mod tests {
         let boundary_writes = Arc::new(AtomicU64::new(0));
         let mut boundary_provision = {
             let boundary_writes = boundary_writes.clone();
-            move |_: String, _: u64, _: u64, _: u64| {
+            move |_: String, _: String, _: u64, _: u64, _: u64| {
                 boundary_writes.fetch_add(1, Ordering::Relaxed);
                 futures::future::ready(Err(anyhow::anyhow!(
                     "max_open_deals must reject before provision"
@@ -9991,7 +10905,7 @@ mod tests {
         tokio::pin!(unknown_shutdown);
         let unknown_policy = pool_test_policy(2);
         let unknown_error = {
-            let mut provision = |model: String, nonce, price, ticks| {
+            let mut provision = |_: String, model: String, nonce, price, ticks| {
                 assert_eq!(model, frame_model);
                 futures::future::ready(provisioner.provision(nonce, price, ticks))
             };
@@ -10055,7 +10969,7 @@ mod tests {
         .fuse();
         tokio::pin!(interrupted);
         let error = {
-            let mut provision = |model: String, nonce, price, ticks| {
+            let mut provision = |_: String, model: String, nonce, price, ticks| {
                 assert_eq!(model, frame_model);
                 futures::future::ready(provisioner.provision(nonce, price, ticks))
             };
@@ -10095,7 +11009,7 @@ mod tests {
         let corrupt_shutdown = std::future::ready(()).fuse();
         tokio::pin!(corrupt_shutdown);
         let corrupt_error = {
-            let mut provision = |model: String, nonce, price, ticks| {
+            let mut provision = |_: String, model: String, nonce, price, ticks| {
                 assert_eq!(model, frame_model);
                 futures::future::ready(provisioner.provision(nonce, price, ticks))
             };
@@ -10173,7 +11087,7 @@ mod tests {
         }
         .fuse();
         tokio::pin!(shutdown);
-        let mut provision = |model: String, nonce, price, ticks| {
+        let mut provision = |_: String, model: String, nonce, price, ticks| {
             assert_eq!(model, frame_model);
             futures::future::ready(provisioner.provision(nonce, price, ticks))
         };
@@ -10333,7 +11247,7 @@ mod tests {
                 price_per_tick: 1_000_000_000,
             },
         ));
-        let mut provision = |_: String, _: u64, _: u64, _: u64| {
+        let mut provision = |_: String, _: String, _: u64, _: u64, _: u64| {
             futures::future::ready(Err(anyhow::anyhow!("no residual provision in this test")))
         };
         let shutdown = futures::future::pending::<()>().fuse();
@@ -10430,10 +11344,9 @@ mod tests {
                 mock_model: true,
                 mock_chain: true,
             },
-            identity: crate::cli::args::IdentityArgs {
+            identity: crate::cli::args::SellerIdentityArgs {
                 note_key: Some(root.path().join("seller.key")),
                 note_index: 0,
-                note_addr: None,
             },
             registry: crate::cli::args::ModelRegistryValidationArgs::default(),
             // The live shape: an ephemeral listen port, and no explicit advertise to inherit from.
@@ -10628,10 +11541,9 @@ mod tests {
                 mock_model: true,
                 mock_chain: true,
             },
-            identity: crate::cli::args::IdentityArgs {
+            identity: crate::cli::args::SellerIdentityArgs {
                 note_key: Some(root.path().join("seller.key")),
                 note_index: 0,
-                note_addr: None,
             },
             registry: crate::cli::args::ModelRegistryValidationArgs::default(),
             gateway_listen: "127.0.0.1:0".parse().unwrap(),
@@ -10723,8 +11635,6 @@ mod tests {
         let mut argv = vec![
             "dexdo",
             "seller",
-            "--note-addr",
-            "0:note",
             "--token-contract",
             "0:tc",
             "--model",
@@ -10833,7 +11743,7 @@ mod tests {
             &advertise,
             root.path().join("no-optin.cursor.json"),
         );
-        let mut provision = |_: String, _: u64, _: u64, _: u64| {
+        let mut provision = |_: String, _: String, _: u64, _: u64, _: u64| {
             futures::future::ready(Err(anyhow::anyhow!("no residual provision in this test")))
         };
         let shutdown = futures::future::pending::<()>().fuse();
@@ -10939,7 +11849,7 @@ mod tests {
             &advertise,
             root.path().join("foreign.cursor.json"),
         );
-        let mut provision = |_: String, _: u64, _: u64, _: u64| {
+        let mut provision = |_: String, _: String, _: u64, _: u64, _: u64| {
             futures::future::ready(Err(anyhow::anyhow!("no residual provision in this test")))
         };
         let shutdown = futures::future::pending::<()>().fuse();
@@ -10989,10 +11899,9 @@ mod tests {
                 mock_model: true,
                 mock_chain: true,
             },
-            identity: crate::cli::args::IdentityArgs {
+            identity: crate::cli::args::SellerIdentityArgs {
                 note_key: Some(root.join("seller.key")),
                 note_index: 0,
-                note_addr: None,
             },
             registry: crate::cli::args::ModelRegistryValidationArgs::default(),
             gateway_listen,
@@ -11423,6 +12332,7 @@ mod tests {
 
     include!("seller_1057_shutdown_tests.rs");
     include!("seller_2047_nonce_tests.rs");
+    include!("seller_2246_multi_note_tests.rs");
 
     include!("seller_1773_shutdown_drain_tests.rs");
 
@@ -11436,7 +12346,7 @@ mod tests {
         let provision_calls = Arc::new(AtomicU64::new(0));
         let mut provision = {
             let provision_calls = provision_calls.clone();
-            move |_: String, _: u64, _: u64, _: u64| {
+            move |_: String, _: String, _: u64, _: u64, _: u64| {
                 provision_calls.fetch_add(1, Ordering::Relaxed);
                 futures::future::ready(Err::<
                     (dexdo_core::MarketManifest, Arc<dyn ChainBackend>),

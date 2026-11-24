@@ -266,6 +266,43 @@ Check the address without any money in play: `dexdo gateway-check --endpoint <AD
 
 ---
 
+### Upgrading with open deals
+
+Stop the seller process and start the upgraded binary with the same data directory,
+note keys, public gateway address and TLS certificate and key. Remove `--note-addr`
+from the seller command. The seller resumes deals with a saved handover proof on
+their original endpoint and TLS identity.
+
+For each open deal from a legacy seller that has no saved handover proof, confirm
+its original route by adding an entry to
+`<data-dir>/deals/seller-pool/gateway-migration.json`. Use the full TokenContract
+address and the endpoint and lowercase SHA-256 TLS pin from the original handover.
+If the original endpoint and PEM stayed the same, use the current primary listen
+socket in the entry. Also add an entry for any open deal that needs a different
+listener.
+Keep the original PEM bundles in their existing locations or restore them from
+backup. The migration file contains public connection details only.
+
+```json
+[
+  {
+    "token_contract": "<TOKEN_CONTRACT>",
+    "endpoint": "https://seller.example.com:8444",
+    "listen": "0.0.0.0:8444",
+    "tls_fingerprint": "<LOWERCASE_SHA256_PIN>"
+  }
+]
+```
+
+Route the buyer's original endpoint to the entry's local `listen` address.
+Different certificates need separate listen sockets. If buyers pinned different
+certificates at the same public host and port, use separate ingress routes to
+those sockets. Routing by buyer source network works only where ingress can
+distinguish those buyers before TLS. The legacy buyer sends no deal identifier
+during the handshake. Keep the routes and migration file while those deals are open.
+The same seller process serves those listeners and uses the primary gateway for
+new handovers.
+
 ## 9. Several sellers on one host
 
 Give each one its own, all of them:
@@ -403,8 +440,9 @@ that explicit and makes the failure readable: instead of a hang, the run stops a
 that carries the answer. Two answers have to be supplied that way, because on a terminal they are
 asked for rather than typed:
 
-- **the note** -- `--note-addr`, on `provision` and `seller`. Read it out of the state directory's
-  `pn_pool.json`. The owner key is not one of them: it comes from the pool entry for that address;
+- **the note to provision with** -- pass `--note-addr` to `provision`. Read it out of the state
+  directory's `pn_pool.json`. At startup, `seller` uses each recorded deal's note and its key from
+  that pool;
 - **the rules of engagement** (`policy.json`) -- there is no flag for these. They are asked once,
   as situations in words, on the first `dexdo seller` run that has a terminal. Answer them by hand on
   the machine before the service unit ever starts, or copy in a file that already carries them; a

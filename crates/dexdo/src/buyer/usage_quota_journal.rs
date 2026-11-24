@@ -83,36 +83,7 @@ impl UsageStore {
 
     // Callers hold the store mutex; production also holds the existing buyer instance lock.
     pub(super) fn write_quota_journal(&self, record: &QuotaJournal) -> Result<()> {
-        let path = self.quota_journal.as_ref();
-        let temporary = path.with_extension(format!("{}.tmp", self.runtime_id));
-        let mut options = std::fs::OpenOptions::new();
-        options.write(true).create_new(true);
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::OpenOptionsExt;
-            options.mode(0o600);
-        }
-        let result = (|| -> Result<()> {
-            let mut file = options
-                .open(&temporary)
-                .context("create purchase quota journal")?;
-            file.write_all(&serde_json::to_vec(record)?)?;
-            file.sync_all()?;
-            drop(file);
-            std::fs::rename(&temporary, path).context("publish purchase quota journal")?;
-            #[cfg(unix)]
-            std::fs::File::open(
-                path.parent()
-                    .filter(|p| !p.as_os_str().is_empty())
-                    .unwrap_or_else(|| Path::new(".")),
-            )?
-            .sync_all()?;
-            Ok(())
-        })();
-        if result.is_err() {
-            let _ = std::fs::remove_file(temporary);
-        }
-        result
+        write_usage_journal(self.quota_journal.as_ref(), record)
     }
 
     pub(super) fn quota_row(&self, connection: &Connection) -> Result<Option<QuotaJournal>> {
@@ -177,4 +148,36 @@ impl UsageStore {
         )?;
         Ok(())
     }
+}
+
+pub(super) fn write_usage_journal(path: &Path, record: &impl serde::Serialize) -> Result<()> {
+    let temporary = path.with_extension(format!("{:032x}.tmp", rand::random::<u128>()));
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    let result = (|| -> Result<()> {
+        let mut file = options
+            .open(&temporary)
+            .context("create buyer usage journal")?;
+        file.write_all(&serde_json::to_vec(record)?)?;
+        file.sync_all()?;
+        drop(file);
+        std::fs::rename(&temporary, path).context("publish buyer usage journal")?;
+        #[cfg(unix)]
+        std::fs::File::open(
+            path.parent()
+                .filter(|p| !p.as_os_str().is_empty())
+                .unwrap_or_else(|| Path::new(".")),
+        )?
+        .sync_all()?;
+        Ok(())
+    })();
+    if result.is_err() {
+        let _ = std::fs::remove_file(temporary);
+    }
+    result
 }

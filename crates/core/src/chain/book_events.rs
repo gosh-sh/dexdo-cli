@@ -12,10 +12,7 @@ use tvm_abi::token::TokenValue;
 use tvm_abi::{Contract, Event};
 use tvm_types::SliceData;
 
-use super::client::{
-    fetch_all_ext_out_messages, fetch_ext_out_page, is_transient_transport_failure, ExtOutPage,
-    RequestGate,
-};
+use super::client::{fetch_all_ext_out_messages, fetch_ext_out_page, ExtOutPage, RequestGate};
 use super::contracts_provision::INFERENCE_ORDERBOOK_ABI;
 use crate::market::{BuyerOrderFact, BuyerOrderFactKind};
 
@@ -343,30 +340,12 @@ pub(super) async fn read_book_event_fold(
     // review finding 1: this dapp-id lookup is a REQUEST and it was going out ungated -- and
     // invisibly so, because it is neither a `.client()` site nor a new `http: &reqwest::Client`
     // signature, so neither ratchet counter would ever have shown it.
-    gate.admit().await;
-    let dapp_id = fetch_dapp_id(http, endpoint, account_id).await?;
+    let dapp_id =
+        super::client::retry_chain_read(Some(gate), || fetch_dapp_id(http, endpoint, account_id))
+            .await?;
     fold_book_event_pages(fold, |before| {
         let dapp_id = dapp_id.clone();
         async move {
-            for delay in crate::params::BOOK_EVENT_READ_BACKOFFS {
-                match fetch_ext_out_page(
-                    gate,
-                    http,
-                    endpoint,
-                    account_id,
-                    &dapp_id,
-                    crate::params::BOOK_EVENT_PAGE_SIZE,
-                    before.as_deref(),
-                )
-                .await
-                {
-                    Ok(page) => return Ok(book_event_page(page)),
-                    Err(error) if is_transient_transport_failure(&error) => {
-                        tokio::time::sleep(delay).await;
-                    }
-                    Err(error) => return Err(error),
-                }
-            }
             fetch_ext_out_page(
                 gate,
                 http,

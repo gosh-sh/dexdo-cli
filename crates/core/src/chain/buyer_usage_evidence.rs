@@ -274,8 +274,7 @@ impl RealChainBackend {
         }"#;
         let mut before: Option<String> = None;
         loop {
-            let response: Value = retry_transient_read(|| async {
-                self.client.gate().admit().await;
+            let response: Value = retry_chain_read(Some(self.client.gate()), || async {
                 let response = self
                     .http
                     .post(&gql)
@@ -390,8 +389,7 @@ impl RealChainBackend {
         let mut seen = BTreeSet::new();
         let mut before: Option<String> = None;
         loop {
-            let response: Value = retry_transient_read(|| async {
-                self.client.gate().admit().await;
+            let response: Value = retry_chain_read(Some(self.client.gate()), || async {
                 let response = self
                     .http
                     .post(&gql)

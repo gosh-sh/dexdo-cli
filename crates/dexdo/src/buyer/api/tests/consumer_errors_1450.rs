@@ -371,7 +371,39 @@ async fn ask_router(state: ApiState, path: &str) -> (http::StatusCode, String) {
     (status, String::from_utf8(bytes.to_vec()).unwrap())
 }
 
-async fn trial_ceiling_refusal_then_readmission(subscription: bool) {
+async fn assert_trial_limit(harness: &WeeklyRouteHarness, path: &str) {
+    let chain_calls = (harness.chain.settle_calls(), harness.chain.reads());
+    let seller_calls = harness.seller.calls();
+    let response = tokio::time::timeout(
+        Duration::from_secs(5),
+        harness.send_full(path, 1, "", false),
+    )
+    .await
+    .expect("a spent trial must reply without waiting for reconciliation");
+    assert_eq!(response.headers()["dexdo-limit"], "onchain_deal_limit");
+    let delay = dexdo_core::params::CAPACITY_RETRY_DEFAULT.as_millis();
+    assert_eq!(response.headers()["retry-after-ms"], delay.to_string());
+    assert_eq!(
+        response.headers()["retry-after"],
+        delay.div_ceil(1000).max(1).to_string()
+    );
+    let status = response.status();
+    let body = response.text().await.unwrap();
+    assert_eq!(status, reqwest::StatusCode::TOO_MANY_REQUESTS, "{body}");
+    assert_refusal(
+        &body,
+        "onchain_deal_limit",
+        "retry_after_reconciliation",
+        path,
+    );
+    assert_eq!(
+        (harness.chain.settle_calls(), harness.chain.reads()),
+        chain_calls
+    );
+    assert_eq!(harness.seller.calls(), seller_calls);
+}
+
+async fn trial_ceiling_refusal_then_readmission(subscription: bool, hold_refresh: bool) {
     let trial = u64::try_from(dexdo_core::TICK_SIZE).unwrap();
     for path in ["/v1/chat/completions", "/v1/responses", "/v1/messages"] {
         let harness = weekly_route_harness(0, subscription).await;
@@ -389,18 +421,28 @@ async fn trial_ceiling_refusal_then_readmission(subscription: bool) {
             .record_billing(&deal, BillingUsage::new(0, trial, None).unwrap())
             .unwrap();
         drop(request);
-        let (status, body) = harness.ask_full(path, 1, "", false).await;
-        assert_eq!(status, reqwest::StatusCode::SERVICE_UNAVAILABLE, "{body}");
-        assert_refusal(
-            &body,
-            "deal_capacity_unavailable",
-            "retry_after_reconciliation",
-            path,
-        );
+        let refresh_in_progress = if hold_refresh {
+            Some(deal.weekly.as_ref().unwrap().refresh_lock.lock().await)
+        } else {
+            None
+        };
+        harness
+            .chain
+            .block_snapshot_reads
+            .store(subscription && !hold_refresh, Ordering::SeqCst);
+        assert_trial_limit(&harness, path).await;
+        harness
+            .chain
+            .block_snapshot_reads
+            .store(false, Ordering::SeqCst);
         assert_eq!(deal.billable_tokens(), trial);
         assert!(!deal.session.is_closed());
         harness.chain.accepts_probe();
         observe_deal(&harness.deals).await;
+        if hold_refresh {
+            assert_trial_limit(&harness, path).await;
+        }
+        drop(refresh_in_progress);
         let (status, body) = harness.ask_full(path, 1, "", false).await;
         assert_eq!(status, reqwest::StatusCode::OK, "{body}");
         assert!(deal.billable_tokens() > trial);
@@ -417,12 +459,17 @@ async fn trial_ceiling_refusal_then_readmission(subscription: bool) {
 
 #[tokio::test]
 async fn ordinary_trial_ceiling_waits_for_acceptance_without_new_purchase() {
-    trial_ceiling_refusal_then_readmission(false).await;
+    trial_ceiling_refusal_then_readmission(false, false).await;
 }
 
 #[tokio::test]
 async fn weekly_trial_ceiling_waits_for_acceptance_without_new_week() {
-    trial_ceiling_refusal_then_readmission(true).await;
+    trial_ceiling_refusal_then_readmission(true, true).await;
+}
+
+#[tokio::test]
+async fn spent_weekly_trial_with_free_refresh_lock_rejects_before_rpc() {
+    trial_ceiling_refusal_then_readmission(true, false).await;
 }
 
 #[tokio::test]

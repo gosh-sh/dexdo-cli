@@ -12,6 +12,7 @@
 
 mod backends;
 mod book_events;
+pub mod call_errors;
 mod client;
 mod contracts_provision;
 #[cfg(test)]

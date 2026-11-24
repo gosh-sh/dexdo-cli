@@ -84,14 +84,30 @@ use dexdo_core::{
 use serde_json::{json, Map, Value};
 use std::sync::Arc;
 
+#[cfg(test)]
+tokio::task_local! {
+    static BUYER_USAGE_PATH_FOR_TEST: std::path::PathBuf;
+}
+
+fn buyer_usage_path(create_dir: bool) -> Result<std::path::PathBuf> {
+    #[cfg(test)]
+    if let Ok(path) = BUYER_USAGE_PATH_FOR_TEST.try_with(Clone::clone) {
+        return Ok(path);
+    }
+    let file = dexdo_core::params::BUYER_USAGE_DATABASE_FILE;
+    if create_dir {
+        crate::cli::data_dir::automatic_private_file(file)
+    } else {
+        crate::cli::data_dir::automatic(file)
+    }
+}
+
 fn open_buyer_usage(
     network: &str,
     args: &BuyerArgs,
 ) -> Result<Arc<dexdo::buyer::usage::UsageStore>> {
-    let path = crate::cli::data_dir::automatic_private_file(
-        dexdo_core::params::BUYER_USAGE_DATABASE_FILE,
-    )?;
-    let store = Arc::new(dexdo::buyer::usage::UsageStore::open(path, network)?);
+    let store = dexdo::buyer::usage::UsageStore::open(buyer_usage_path(true)?, network)?;
+    let store = Arc::new(store);
     // main holds the buyer instance lock for every real-chain run and every explicit data-dir.
     // Legacy mock runs with custom mutable paths may share the default root without that lock.
     if !args.mock.mock_chain || crate::cli::data_dir::explicit().is_some() {
@@ -2118,16 +2134,23 @@ impl SubscriptionOrderOps for dexdo_core::RealChainBackend {
         before_post: &mut (dyn FnMut(String, u128, MatchWatchCursor, Vec<(u128, MatchedFill)>) -> Result<()>
                   + Send),
     ) -> Result<Value> {
-        if order_flags != subscription_order_flags() {
-            bail!(
-                "subscription submit requires exact flags 0x{:02x}, got 0x{order_flags:02x}",
-                subscription_order_flags()
-            );
+        let order_book = async {
+            if order_flags != subscription_order_flags() {
+                bail!(
+                    "subscription submit requires exact flags 0x{:02x}, got 0x{order_flags:02x}",
+                    subscription_order_flags()
+                );
+            }
+            check_subscription_buy_reserve(escrow, ticks, max_price_per_tick)
+                .map_err(|error| anyhow::anyhow!("subscription submit preflight: {error}"))?;
+            let order_book = dexdo_core::Address::parse(order_book)
+                .map_err(|error| anyhow::anyhow!("subscription order_book: {error}"))?;
+            Ok(order_book)
         }
-        check_subscription_buy_reserve(escrow, ticks, max_price_per_tick)
-            .map_err(|error| anyhow::anyhow!("subscription submit preflight: {error}"))?;
-        let order_book = dexdo_core::Address::parse(order_book)
-            .map_err(|error| anyhow::anyhow!("subscription order_book: {error}"))?;
+        .await
+        .map_err(|source| {
+            anyhow::Error::new(dexdo_core::MoneySubmitError::Preparation { source })
+        })?;
         self.place_inference_buy_with_identity_and_cursors(
             note,
             keys,
@@ -4977,18 +5000,17 @@ fn buyer_executable_reference_model<'a>(
 /// `content_identity_model` is resolved by the caller and handed in, not read again here:
 /// the name check now runs on every money path, and one resolution per run is the point -- the
 /// registry rate-limits above three requests a second from one address.
-async fn build_buyer_content_policy(
+fn build_buyer_content_policy(
     args: &BuyerArgs,
     frame_model: &str,
-    content_identity_model: Option<String>,
+    content_identity_model: Option<&str>,
 ) -> Result<(
     dexdo::buyer::api::ContentCheck,
     Arc<dexdo::seller::ModelsConfig>,
 )> {
-    let content_identity_model_ref = content_identity_model.as_deref();
     let models_cfg = Arc::new(dexdo::seller::ModelsConfig::load_or_empty(&args.models)?);
     let executable_reference_model =
-        buyer_executable_reference_model(frame_model, content_identity_model_ref, &models_cfg);
+        buyer_executable_reference_model(frame_model, content_identity_model, &models_cfg);
     if !args.mock.mock_model && !args.allow_unverified_model && executable_reference_model.is_none()
     {
         // Named by the FILE and the models in it, because that is the whole of what went wrong and
@@ -5005,7 +5027,7 @@ async fn build_buyer_content_policy(
             models_reference_missing_refusal(frame_model, &args.models, &known).into_error(),
         );
     }
-    let policy_model = executable_reference_model.or(content_identity_model_ref);
+    let policy_model = executable_reference_model.or(content_identity_model);
     let content_check = dexdo::buyer::api::content_check_policy(
         frame_model,
         policy_model,
@@ -7833,7 +7855,10 @@ fn spawn_buyer_deal_end_watch(
             };
             let token_contract = active.route.token_contract.clone();
             let chain_state = match chain.deal_state(&token_contract).await {
-                Ok(None) => return BuyerRunEnd::DealEnded { token_contract },
+                Ok(None) => {
+                    active.observe_deal_state(&Ok(None)).await;
+                    return BuyerRunEnd::DealEnded { token_contract };
+                }
                 Ok(state) => state,
                 Err(error) => {
                     tracing::warn!(
@@ -7844,6 +7869,9 @@ fn spawn_buyer_deal_end_watch(
                     None
                 }
             };
+            if chain_state.is_some_and(|state| state.is_stopped()) {
+                active.observe_deal_state(&Ok(chain_state)).await;
+            }
             let facts = buyer_monitor_current_facts(
                 token_contract.clone(),
                 active.remaining_tokens(),
@@ -7968,7 +7996,7 @@ fn buyer_api_shutdown_before_drain(
     operator: BuyerShutdownSignal,
     deals: Arc<dexdo::buyer::api::RouteManager>,
     chain: Arc<dyn ChainBackend>,
-    args: Arc<BuyerArgs>,
+    cancel_resting_buy: Option<Arc<BuyerArgs>>,
 ) -> (
     BuyerShutdownSignal,
     tokio::sync::oneshot::Receiver<Result<()>>,
@@ -7978,7 +8006,10 @@ fn buyer_api_shutdown_before_drain(
     let shutdown = Box::pin(async move {
         stopped.await;
         deals.stop_purchases().await;
-        let outcome = cancel_resting_buyer_order_at_stop(chain.as_ref(), args.as_ref()).await;
+        let outcome = match cancel_resting_buy {
+            Some(args) => cancel_resting_buyer_order_at_stop(chain.as_ref(), args.as_ref()).await,
+            None => Ok(()),
+        };
         let _ = finished.send(outcome);
     });
     (shutdown, result)
@@ -9103,6 +9134,7 @@ impl BuyerSubscriptionResumeCandidate {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn resolve_buyer_subscription_resume(
     chain: &dyn ChainBackend,
     note_addr: &str,
@@ -9211,6 +9243,11 @@ async fn resolve_buyer_subscription_resume(
                 && record.model_hash.eq_ignore_ascii_case(&model_hash)
                 && record.order_book.eq_ignore_ascii_case(&order_book)
                 && record.phase == BuyerSubscriptionPhase::Matched
+                && expected_token_contract.is_none_or(|expected| {
+                    record.matched.as_ref().is_some_and(|matched| {
+                        matched.token_contract.eq_ignore_ascii_case(expected)
+                    })
+                })
         })
         .map(|record| record.order_id)
         .collect::<Vec<_>>();
@@ -9222,9 +9259,7 @@ async fn resolve_buyer_subscription_resume(
             note_addr,
             &order_book,
             order_id,
-            // This path is about to SERVE the subscription: booking a due week is the point here,
-            // not a side effect of looking.
-            true,
+            false,
         )
         .await?;
         refreshed_matches.insert(order_id, refreshed);
@@ -9294,11 +9329,26 @@ async fn resolve_buyer_subscription_resume(
     } else {
         return Ok(None);
     };
-    // The resume path acts on the refreshed facts; whether the refresh also booked a due week is a
-    // report-only fact that only `dexdo subscription status` surfaces, in its `--json` output.
-    let (record, facts, quota, _booked_week) = refreshed_matches
+    let (mut record, mut facts, mut quota, _) = refreshed_matches
         .remove(&candidate.order_id)
         .expect("every matched candidate was authoritatively refreshed");
+    let selected = record
+        .matched
+        .as_ref()
+        .expect("selected subscription has a match");
+    if subscription_boundary_is_due(&facts) {
+        ops.book_subscription_week(&selected.token_contract).await;
+        (record, facts, quota, _) = refresh_subscription_match(
+            &ops,
+            &money_lock.subscriptions_path,
+            note_addr,
+            &order_book,
+            candidate.order_id,
+            false,
+        )
+        .await?;
+        quota.remaining_current_week = subscription_authorized_remaining(&facts, &quota);
+    }
     if record.phase != BuyerSubscriptionPhase::Matched {
         bail!(
             "subscription {} is not live and cannot be resumed",
@@ -12569,7 +12619,6 @@ async fn run_buyer_on_demand_local_api(
         .ok_or_else(|| anyhow::anyhow!("on-demand local API requires --local-listen"))?;
     let continuation_budget =
         buyer_fresh_buy_budget(args.ticks, args.max_price_per_tick, args.escrow);
-    let recover_terminal_model_deal = continuation_budget.is_some();
     let buyer = Arc::new(buyer);
     let args = Arc::new(args);
     let pre_adopted_deal = if args.resume {
@@ -12594,6 +12643,7 @@ async fn run_buyer_on_demand_local_api(
     } else {
         None
     };
+    let recover_terminal_model_deal = continuation_budget.is_some();
     let endpoint_token_contract = pre_adopted_deal
         .as_ref()
         .map(|deal| deal.route.token_contract.as_str())
@@ -12642,7 +12692,8 @@ async fn run_buyer_on_demand_local_api(
         Box::pin(async move {
             tokio::select! {
                 () = shutdown => {}
-                _ = stopped.wait_for(Option::is_some) => {}
+                // A preserved deal has no lazy initializer to hold the sender.
+                Ok(_) = stopped.wait_for(Option::is_some) => {}
             }
         })
     };
@@ -12693,7 +12744,7 @@ async fn run_buyer_on_demand_local_api(
         shutdown,
         deals.clone(),
         chain.clone(),
-        args.clone(),
+        Some(args.clone()),
     );
     mark_buyer_serving();
     let (addr, task) = match api::serve(bind, state, shutdown).await {
@@ -13022,6 +13073,13 @@ fn refuse_wait_for_seller_without_a_buy(args: &BuyerArgs) -> Result<()> {
     Ok(())
 }
 
+fn default_buyer_local_listen() -> Result<std::net::SocketAddr> {
+    let endpoint = dexdo_core::params::DEFAULT_BUYER_LOCAL_LISTEN;
+    endpoint
+        .parse()
+        .with_context(|| format!("invalid canonical buyer endpoint {endpoint}"))
+}
+
 /// A model-book purchase still verifies the network and registry/book binding, but does not
 /// require the market file's original deal to remain alive. Only an immediate explicit buy does.
 fn buyer_preflight_market<'a>(
@@ -13063,24 +13121,8 @@ async fn run_buyer_inner(
              exits, so it has no deal to hand to a restarted process and must settle what it received"
         );
     }
-    // The endpoint a real buy was typing every time -- and ONLY a run that has nowhere else to send
-    // its prompts. Where the one-shot path is still reachable, the absence of an endpoint is an
-    // answer rather than an omission and nothing may fill it in: `--mock-chain` selects that path on
-    // the practice market, and `--mock-model` is the one real-chain shape that can take it (
-    // refuses a promptless one-shot against a real provider, which is what a default would hide).
     if args.local_listen.is_none() && !args.mock.mock_chain && !args.mock.mock_model {
-        // Parsed rather than `expect`ed: the money path takes no panics, and a canonical parameter
-        // that stops being an address is a refusal like any other.
-        args.local_listen = Some(
-            dexdo_core::params::DEFAULT_BUYER_LOCAL_LISTEN
-                .parse()
-                .map_err(|error| {
-                    anyhow::anyhow!(
-                        "the canonical buyer endpoint {} is not a socket address: {error}",
-                        dexdo_core::params::DEFAULT_BUYER_LOCAL_LISTEN
-                    )
-                })?,
-        );
+        args.local_listen = Some(default_buyer_local_listen()?);
     }
     // this CLI path submits a limit BUY, so its max price must be a positive
     // whole multiple of PRICE_STEP (1 SHELL), rejected before any submit/escrow. The contract's
@@ -13154,7 +13196,9 @@ async fn run_buyer_inner(
             fm.ok_or_else(|| anyhow::anyhow!("provide --frame-model or --market <manifest>"))?;
         (Some(tc), fm)
     };
-    let registry_policy = if !args.mock.mock_chain && chain_preflight.should_run() {
+    let registry_policy = if !args.mock.mock_chain
+        && (chain_preflight.should_run() || args.registry.model_registry_validation.is_some())
+    {
         load_enabled_model_registry_policy(
             RegistryRole::Buyer,
             &args.registry,
@@ -13176,17 +13220,22 @@ async fn run_buyer_inner(
             let _ = preload_default_model_registry(&crate::cli::commands::manifest_path()?).await;
         }
     }
-    let frame_model = if let Some(policy) = registry_policy.as_ref() {
-        chain_doctor_preflight(
-            &crate::cli::commands::manifest_path()?,
-            buyer_preflight_market(&args, explicit_tc.as_deref()),
-        )
-        .await?;
+    if registry_policy.is_some() {
         reject_buyer_raw_token_contract_without_registry_book_proof(
             args.market.as_deref(),
             args.token_contract.as_deref(),
             &requested_frame_model,
         )?;
+    }
+    let frame_model = if let Some(policy) = registry_policy
+        .as_ref()
+        .filter(|_| chain_preflight.should_run())
+    {
+        chain_doctor_preflight(
+            &crate::cli::commands::manifest_path()?,
+            buyer_preflight_market(&args, explicit_tc.as_deref()),
+        )
+        .await?;
         let selected_market = match args.market.as_deref() {
             Some(market) => Some(load_market(market)?),
             None => None,
@@ -13332,7 +13381,7 @@ async fn run_buyer_inner(
     // resolved name. The check is hoisted here and its answer handed down, so the resolution still
     // happens once: the registry answers 403 above three requests a second from one address, and a
     // second walk for the same name would be a second chance to be rate-limited.
-    let content_identity_model = if args.mock.mock_chain {
+    let content_identity_model = if args.mock.mock_chain || !chain_preflight.should_run() {
         None
     } else {
         match resolve_buyer_content_identity_model(
@@ -13362,17 +13411,16 @@ async fn run_buyer_inner(
     let spelling_diverged = content_identity_model
         .as_deref()
         .is_some_and(|registry_model| registry_model != frame_model);
-    let buyer_content_policy = if args.local_listen.is_some() {
-        match build_buyer_content_policy(&args, &frame_model, content_identity_model.clone()).await
-        {
-            Ok(policy) => Some(policy),
-            Err(err) => {
-                machine_context.failure_class = Some("content_identity_preflight".to_string());
-                machine_context.missing_or_unset =
+    let preflight_listener_content = |args: &BuyerArgs, context: &mut BuyerMachineErrorContext| {
+        build_buyer_content_policy(args, &frame_model, content_identity_model.as_deref())
+            .inspect_err(|_| {
+                context.failure_class = Some("content_identity_preflight".to_string());
+                context.missing_or_unset =
                     Some("allow_unverified_model_or_models_data".to_string());
-                return Err(err);
-            }
-        }
+            })
+    };
+    let buyer_content_policy = if args.local_listen.is_some() {
+        Some(preflight_listener_content(&args, machine_context)?)
     } else {
         None
     };
@@ -13404,6 +13452,18 @@ async fn run_buyer_inner(
         .local_listen
         .map(|_| open_buyer_usage(&runtime_network, &args))
         .transpose()?;
+    // One-shot resumes can share the database of a former listener. The instance lock
+    // lets them close old phases even though they do not start an HTTP usage service.
+    if usage_store.is_none()
+        && args.resume
+        && (!args.mock.mock_chain || crate::cli::data_dir::explicit().is_some())
+    {
+        let history = buyer_usage_path(false)?;
+        if history.try_exists()? {
+            dexdo::buyer::usage::UsageStore::open(history, &runtime_network)?
+                .recover_interrupted_requests()?;
+        }
+    }
     // The chain is selected by a flag: `--mock-chain` -> mock (as in D1, also requires `--mock-model`), otherwise
     // a real chain (per-role buyer backend behind a cargo feature that no longer exists; without the feature -> explicit failure).
     let (chain, note) = if let Some(backend) = backend {
@@ -14113,8 +14173,8 @@ async fn run_buyer_inner(
                 .await?;
         }
     }
-    // (E2E-PROBE-08): same fail-closed pre-flight on the non-`--local-listen` resume path.
     if args.resume && !args.mock.mock_chain {
+        // (E2E-PROBE-08): fail closed even on the non-local-listen resume path.
         refuse_resume_on_unopened_deal(chain.as_ref(), &token_contract).await?;
     }
     record_buyer_token_contract_after_money_move(&args, &token_contract);
@@ -14330,8 +14390,9 @@ async fn run_buyer_inner(
     // the consumer (OpenAI- and Anthropic-compatible paths, forwarded as sent) and serve requests.
     if let Some(bind) = args.local_listen {
         use dexdo::buyer::api::{self, ApiState, Route};
+        let continuity_mode = args.continuity_mode;
         tracing::info!(
-            continuity_mode = args.continuity_mode.as_str(),
+            continuity_mode = continuity_mode.as_str(),
             "buyer continuity mode selected"
         );
         let buyer = Arc::new(buyer);
@@ -14390,12 +14451,12 @@ async fn run_buyer_inner(
         state.usage = Some(usage_store.clone());
         let deals = state.deals.clone();
         let fresh_continuation_enabled =
-            continuation_terms.is_some() && args.continuity_mode != ContinuityModeArg::Off;
+            continuation_terms.is_some() && continuity_mode != ContinuityModeArg::Off;
         state.renewal_enabled = fresh_continuation_enabled;
         // one watcher per mode, the same for every buy method. `off` ends the run when the
         // deal ends; the other two buy a replacement at `continuation_terms`.
         let continuity = BuyerContinuityTask::new(spawn_buyer_continuity(
-            args.continuity_mode,
+            continuity_mode,
             continuation_terms,
             chain.clone(),
             state.buyer.clone(),
@@ -14417,7 +14478,7 @@ async fn run_buyer_inner(
             shutdown,
             deals.clone(),
             chain.clone(),
-            Arc::new(args.clone()),
+            Some(Arc::new(args.clone())),
         );
         // SIGINT/SIGTERM drains in-flight responses and closes the listener. Ordinary deals retain the awaited
         // STOP; a durable subscription performs no chain write and remains resumable.
@@ -17097,7 +17158,7 @@ mod tests {
             .expect("buyer content preflight present");
         let body = &source[start..];
         let preflight = body
-            .find("build_buyer_content_policy")
+            .find("preflight_listener_content(&args, machine_context)")
             .expect("content policy helper called");
         let backend = body
             .find("buyer_real_backend")
@@ -22117,6 +22178,7 @@ mod tests {
 
     struct FakeSubscriptionOps {
         calls: std::sync::Mutex<Vec<SubscriptionSubmitCall>>,
+        preparation_error: std::sync::Mutex<Option<dexdo_core::MoneySubmitError>>,
         placements: std::sync::Mutex<Vec<dexdo_core::InferenceSubscriptionPlacement>>,
         fills: std::sync::Mutex<Vec<(u128, dexdo_core::MatchedFill)>>,
         facts_override: std::sync::Mutex<Option<super::SubscriptionDealFacts>>,
@@ -22131,6 +22193,7 @@ mod tests {
         fn new(order_id_floor: u128) -> Self {
             Self {
                 calls: std::sync::Mutex::new(Vec::new()),
+                preparation_error: std::sync::Mutex::new(None),
                 placements: std::sync::Mutex::new(Vec::new()),
                 fills: std::sync::Mutex::new(Vec::new()),
                 facts_override: std::sync::Mutex::new(None),
@@ -22164,6 +22227,9 @@ mod tests {
             ) -> anyhow::Result<()>
                       + Send),
         ) -> anyhow::Result<serde_json::Value> {
+            if let Some(error) = self.preparation_error.lock().unwrap().take() {
+                return Err(error.into());
+            }
             *fill_cursor = dexdo_core::MatchWatchCursor::new(1_000);
             before_post(
                 format!("boc-sha256:{}", "a".repeat(64)),
@@ -23933,6 +23999,46 @@ mod tests {
         );
         assert_eq!(ops.calls.lock().unwrap().len(), 1);
         assert!(!journal_path.exists());
+    }
+
+    #[tokio::test]
+    async fn issue_2242_subscription_preparation_refusal_reaches_the_operator() {
+        let (dir, _cleanup) = buyer_journal_test_dir("subscription-reserve-refusal");
+        let journal_path = dir.join("submit.json");
+        let state_path = dir.join("state.json");
+        let note = dexdo_core::Address::parse(&subscription_test_note()).unwrap();
+        let keys = dexdo_core::KeyPair::from_secret_hex(&"22".repeat(32)).unwrap();
+        let ticks = u128::from(dexdo_core::SUBSCRIPTION_WEEKS);
+        let price = dexdo_core::PRICE_STEP;
+        let reserve = dexdo_core::params::matched_buy_reserve_raw(ticks, false, true);
+        let model = "Qwen3-32B";
+        let reason = format!("order  tokenContract {}: {ticks}-tick fill needs {reserve} raw ECC[2], observed {} raw ECC[2]",
+            subscription_test_tc('3'), reserve - 1);
+        let ops = FakeSubscriptionOps::new(104);
+        *ops.preparation_error.lock().unwrap() = Some(dexdo_core::MoneySubmitError::Preparation {
+            source: anyhow::anyhow!(reason.clone()),
+        });
+        let error = super::submit_subscription_with_journal(
+            &ops,
+            &note,
+            &keys,
+            &subscription_test_book(),
+            model,
+            &dexdo_core::model_hash_for(model),
+            price,
+            ticks,
+            subscription_test_reserve(ticks, price).total_escrow,
+            super::buy_order_deadline().unwrap(),
+            &journal_path,
+            &state_path,
+            std::time::Duration::ZERO,
+            &persist_subscription_test_handle,
+        )
+        .await
+        .unwrap_err();
+        assert!(format!("{error:#}").contains(&reason), "{error:#}");
+        assert!(!journal_path.exists());
+        assert!(ops.calls.lock().unwrap().is_empty());
     }
 
     #[tokio::test]
@@ -27348,6 +27454,8 @@ mod tests {
         placement: dexdo_core::InferenceSubscriptionPlacement,
         fill: dexdo_core::MatchedFill,
         snapshot: dexdo_core::DealChainSnapshot,
+        other_deal: Option<(String, dexdo_core::DealChainSnapshot)>,
+        settle_week_count: std::sync::atomic::AtomicUsize,
         handover: Vec<u8>,
         money_posts: std::sync::atomic::AtomicUsize,
         placement_reads: std::sync::atomic::AtomicUsize,
@@ -27360,8 +27468,31 @@ mod tests {
         deal_state_count: std::sync::atomic::AtomicUsize,
     }
 
+    impl SubscriptionResumeCommandChain {
+        fn snapshot_for(&self, tc: &str) -> &dexdo_core::DealChainSnapshot {
+            match &self.other_deal {
+                Some((other, snapshot)) if tc == other => snapshot,
+                _ => {
+                    assert_eq!(tc, self.fill.token_contract);
+                    &self.snapshot
+                }
+            }
+        }
+    }
+
     #[async_trait::async_trait]
     impl dexdo_core::ChainBackend for SubscriptionResumeCommandChain {
+        async fn settle_week(
+            &self,
+            _token_contract: &dexdo_core::TokenContract,
+        ) -> Result<(), dexdo_core::ChainError> {
+            self.settle_week_count
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Err(dexdo_core::ChainError::Chain(
+                "fixture refuses settleWeek".into(),
+            ))
+        }
+
         async fn deal_purchase_terms(
             &self,
             token_contract: &dexdo_core::TokenContract,
@@ -27505,7 +27636,7 @@ mod tests {
             &self,
             token_contract: &dexdo_core::TokenContract,
         ) -> Result<(), dexdo_core::ChainError> {
-            assert_eq!(token_contract, &self.fill.token_contract);
+            self.snapshot_for(token_contract);
             self.target_checks
                 .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             Ok(())
@@ -27515,8 +27646,7 @@ mod tests {
             &self,
             token_contract: &dexdo_core::TokenContract,
         ) -> Result<Option<dexdo_core::DealChainSnapshot>, dexdo_core::ChainError> {
-            assert_eq!(token_contract, &self.fill.token_contract);
-            Ok(Some(self.snapshot.clone()))
+            Ok(Some(self.snapshot_for(token_contract).clone()))
         }
 
         async fn read_match(
@@ -27588,10 +27718,9 @@ mod tests {
             &self,
             token_contract: &dexdo_core::TokenContract,
         ) -> Result<Option<dexdo_core::DealChainState>, dexdo_core::ChainError> {
-            assert_eq!(token_contract, &self.fill.token_contract);
             self.deal_state_count
                 .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-            Ok(Some(self.snapshot.state))
+            Ok(Some(self.snapshot_for(token_contract).state))
         }
 
         async fn deal_subscription(
@@ -28935,6 +29064,8 @@ mod tests {
             placement,
             fill: fill.clone(),
             snapshot,
+            other_deal: None,
+            settle_week_count: Default::default(),
             handover: encrypted_handover,
             money_posts: std::sync::atomic::AtomicUsize::new(0),
             placement_reads: std::sync::atomic::AtomicUsize::new(0),
@@ -31082,9 +31213,10 @@ mod tests {
             std::fs::read_to_string(&sentinel).unwrap().trim() == std::process::id().to_string(),
             "a refusal must leave the sentinel exactly as it found it"
         );
+        std::fs::remove_file(&sentinel).unwrap();
 
-        // Unparseable and empty sentinels are the same answer, for the same reason: nothing to
-        // corroborate the absent lock with.
+        // Each case needs a new file: a child forked by another test can briefly retain the
+        // preceding recovery probe's advisory lock even after the probe closes its descriptor.
         for content in ["", "not-a-pid\n", "0\n"] {
             std::fs::write(&sentinel, content).unwrap();
             let refused = super::BuyerMoneyLock::open(&note_addr)
@@ -31095,6 +31227,7 @@ mod tests {
                 refused.to_string().contains("cannot establish"),
                 "{content:?}: {refused:#}"
             );
+            std::fs::remove_file(&sentinel).unwrap();
         }
 
         // The probe itself, both ways round, so the fixture above cannot be passing by accident.
@@ -31121,8 +31254,6 @@ mod tests {
             None,
             "0 selects a process group, not a process, and is not a question this can answer"
         );
-
-        let _ = std::fs::remove_file(&sentinel);
     }
 
     /// the other half: reclaiming is not forgetting.
@@ -31375,23 +31506,26 @@ mod tests {
         let command_note: std::sync::Arc<dyn dexdo_core::Note> = buyer_note;
         let (machine_writer, captured_machine_events) =
             crate::cli::machine::BuyerEventWriter::capturing();
-        let command = tokio::spawn(async move {
-            let mut machine_events = Some(machine_writer);
-            let mut machine_context = super::BuyerMachineErrorContext::default();
-            super::run_buyer_inner(
-                args,
-                &mut machine_events,
-                &mut machine_context,
-                super::BuyerCommandRuntime {
-                    backend: Some((command_chain, command_note)),
-                    chain_preflight: super::BuyerChainPreflight::OfflineTest,
-                    shutdown: Box::pin(async move {
-                        let _ = shutdown_rx.await;
-                    }),
-                },
-            )
-            .await
-        });
+        let command = tokio::spawn(super::BUYER_USAGE_PATH_FOR_TEST.scope(
+            dir.join("usage.sqlite3"),
+            async move {
+                let mut machine_events = Some(machine_writer);
+                let mut machine_context = super::BuyerMachineErrorContext::default();
+                super::run_buyer_inner(
+                    args,
+                    &mut machine_events,
+                    &mut machine_context,
+                    super::BuyerCommandRuntime {
+                        backend: Some((command_chain, command_note)),
+                        chain_preflight: super::BuyerChainPreflight::OfflineTest,
+                        shutdown: Box::pin(async move {
+                            let _ = shutdown_rx.await;
+                        }),
+                    },
+                )
+                .await
+            },
+        ));
         // Long enough to outlast a wedged acquire's own POOL_LOCK_TIMEOUT_SECS, so that removing the
         // fix reports the refusal rather than an unexplained hang.
         let mut bound = None;
@@ -32606,6 +32740,7 @@ mod tests {
     }
 
     include!("buyer/issue_2064_test.rs");
+    include!("buyer/issue_2269_test.rs");
     include!("buyer/keep_open_2148_test.rs");
     include!("buyer/issue_2163_test.rs");
 }

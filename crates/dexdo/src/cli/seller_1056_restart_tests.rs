@@ -146,10 +146,9 @@ fn issue_1056_seller_args(
             mock_model: true,
             mock_chain: true,
         },
-        identity: crate::cli::args::IdentityArgs {
+        identity: crate::cli::args::SellerIdentityArgs {
             note_key: Some(root.join("seller.key")),
             note_index: 0,
-            note_addr: None,
         },
         registry: crate::cli::args::ModelRegistryValidationArgs::default(),
         gateway_listen: "127.0.0.1:0"

@@ -74,17 +74,16 @@ async fn issue_2108_exhausted_pool_reads_remain_recoverable_but_schema_errors_do
         let gate = RequestGate::new(ChainRequestCeiling::Unlimited);
         let http = reqwest::Client::new();
         let account_id = "a".repeat(64);
-        let error = retry_transient_read(|| {
-            fetch_ext_out_page(
-                &gate,
-                &http,
-                &endpoint,
-                &account_id,
-                crate::address::DEXDO_DAPP_ID,
-                EXT_OUT_PAGE_SIZE,
-                None,
-            )
-        })
+        // The shared page reader owns its admitted network retry boundary.
+        let error = fetch_ext_out_page(
+            &gate,
+            &http,
+            &endpoint,
+            &account_id,
+            crate::address::DEXDO_DAPP_ID,
+            EXT_OUT_PAGE_SIZE,
+            None,
+        )
         .await
         .unwrap_err();
         assert_eq!(calls.load(Ordering::Relaxed), attempts);

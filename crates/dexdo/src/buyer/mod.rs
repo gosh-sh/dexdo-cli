@@ -22,12 +22,61 @@ use dexdo_proto::{
     BillingUsage, ChallengeRequest, GatewayClient, Header, StreamFrame, StreamRequest,
 };
 use std::collections::HashMap;
+use std::pin::Pin;
 use std::sync::{Arc, Mutex};
+use std::task::{Context, Poll};
 use tokio_stream::StreamExt;
 use tonic::transport::Channel;
 
 /// The seller gateway's answer to one `OpenStream` call.
-pub type GatewayStream = crate::telemetry::buyer::CallStream<tonic::Streaming<StreamFrame>>;
+pub struct GatewayStream {
+    stream: crate::telemetry::buyer::CallStream<tonic::Streaming<StreamFrame>>,
+}
+
+#[derive(Debug)]
+pub(super) struct OpenStreamInterrupted(tonic::Status);
+
+impl std::fmt::Display for OpenStreamInterrupted {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "seller interrupted the stream open: {}", self.0)
+    }
+}
+
+impl std::error::Error for OpenStreamInterrupted {}
+
+fn gateway_temporarily_unavailable(status: &tonic::Status) -> bool {
+    matches!(
+        status.code(),
+        tonic::Code::Unavailable | tonic::Code::DeadlineExceeded
+    )
+}
+
+fn open_stream_interrupted(status: &tonic::Status) -> bool {
+    matches!(
+        status.code(),
+        tonic::Code::Cancelled
+            | tonic::Code::Unknown
+            | tonic::Code::DeadlineExceeded
+            | tonic::Code::Internal
+            | tonic::Code::Unavailable
+            | tonic::Code::DataLoss
+    )
+}
+
+impl GatewayStream {
+    #[allow(clippy::result_large_err)]
+    pub async fn message(&mut self) -> Result<Option<StreamFrame>, tonic::Status> {
+        self.next().await.transpose()
+    }
+}
+
+impl tokio_stream::Stream for GatewayStream {
+    type Item = Result<StreamFrame, tonic::Status>;
+
+    fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        Pin::new(&mut self.stream).poll_next(cx)
+    }
+}
 
 /// Outcome of the buyer receiving a whole response.
 #[derive(Debug)]
@@ -225,8 +274,15 @@ impl Buyer {
         // one) and, failing that, once before its usage is accepted.
         let mut whole_frames = 0usize;
         let mut whole_inspected = false;
+        let mut interruption = None;
         while let Some(item) = stream.next().await {
-            let frame: StreamFrame = item?;
+            let frame = match item {
+                Ok(frame) => frame,
+                Err(status) => {
+                    interruption = Some(status);
+                    break;
+                }
+            };
             if terminal_usage.is_some() {
                 anyhow::bail!("response content followed terminal billing usage");
             }
@@ -300,6 +356,12 @@ impl Buyer {
                 received += 1;
             }
         }
+        if !streamed && !whole_inspected && head_status.is_some_and(|s| (200..300).contains(&s)) {
+            let _ = whole_output(format, &whole);
+        }
+        if let Some(status) = interruption {
+            return Err(status.into());
+        }
         if let Some(status) = head_status.filter(|status| !(200..300).contains(status)) {
             anyhow::bail!(
                 "the provider answered HTTP {status}: {}",
@@ -308,6 +370,7 @@ impl Buyer {
         }
         let usage = terminal_usage
             .ok_or_else(|| anyhow!("response stream ended without terminal billing usage"))?;
+        drop(stream);
         if let Some(charge) = account_tokens.as_mut() {
             (*charge)(usage).map_err(anyhow::Error::msg)?;
         }
@@ -344,9 +407,14 @@ impl Buyer {
             .await?;
         let call = crate::telemetry::buyer::Call::open_stream();
         match client.open_stream(signed).await {
-            Ok(response) => Ok(call.watch(response.into_inner())),
+            Ok(response) => Ok(GatewayStream {
+                stream: call.watch(response.into_inner()),
+            }),
             Err(status) => {
                 call.refused(&status);
+                if open_stream_interrupted(&status) {
+                    return Err(OpenStreamInterrupted(status).into());
+                }
                 Err(status.into())
             }
         }
@@ -633,7 +701,8 @@ fn check_api_path(path: &str, served: &[String]) -> Result<(), SellerApiMismatch
 /// output.
 fn whole_output(format: ApiFormat, body: &[u8]) -> Option<crate::api_format::ResponseFacts> {
     let value = serde_json::from_slice::<serde_json::Value>(body).ok()?;
-    Some(inspect_body(format, &value)).filter(|stated| stated.has_output())
+    let facts = inspect_body(format, &value);
+    Some(facts).filter(|stated| stated.has_output())
 }
 
 fn push_output(

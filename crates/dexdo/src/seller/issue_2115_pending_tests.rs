@@ -67,54 +67,6 @@ async fn issue_2115_getter_outage_must_not_end_pending_mode_as_unknown_watcher()
 }
 
 #[tokio::test]
-async fn issue_2115_upstream_retry_must_not_ignore_a_live_pending_ask() {
-    let (url, probes, upstream) = scripted_http_server(vec![(
-        "200 OK",
-        "data: {\"error\":{\"message\":\"temporary upstream failure\"}}\n\n".to_string(),
-        Duration::ZERO,
-    )]);
-    let backend = issue_2096_backend(100);
-    backend.posts.store(1, Ordering::SeqCst);
-    backend.pending_submission.store(true, Ordering::SeqCst);
-    for rows in [&backend.rows, &backend.postings] {
-        rows.lock().unwrap()[0].deadline =
-            unix_timestamp() + dexdo_core::params::MAX_SELL_TTL.as_secs();
-    }
-    let seller = issue_2077_seller(url).await;
-    wait_for_gateway_ready(&seller).await;
-    let cfg = issue_2096_cfg(&backend, &seller);
-    let recovery = prepare_pending_offer_with_timing(
-        &seller,
-        &backend,
-        &cfg,
-        &backend.owner,
-        None,
-        std::future::pending(),
-        issue_2115_timing(),
-    );
-    tokio::pin!(recovery);
-    tokio::select! {
-        result = &mut recovery => panic!("unexpected early recovery result: {result:?}"),
-        _ = async {
-            while probes.load(Ordering::SeqCst) < 3 {
-                tokio::time::sleep(Duration::from_millis(1)).await;
-            }
-        } => {},
-        _ = tokio::time::sleep(Duration::from_secs(5)) => panic!("fixture must reach repeated upstream failures"),
-    }
-    let rows = backend.live_rows();
-    let cancelled = backend.cancelled();
-    eprintln!(
-        "upstream failed {} probes; still_live_rows={}; cancelled={cancelled:?}",
-        probes.load(Ordering::SeqCst),
-        rows.len()
-    );
-    seller.server_task.abort();
-    upstream.abort();
-    assert!(rows.is_empty(), "pending state must be inspected and the live ask withdrawn before indefinitely retrying readiness");
-}
-
-#[tokio::test]
 async fn issue_2115_pending_failures_reconcile_resting_funded_and_unknown_fates() {
     for failure in ["cover", "advertise", "gateway"] {
         for fate in ["resting", "funded", "unknown"] {
@@ -222,7 +174,7 @@ async fn issue_2115_pending_cover_failure_preserves_a_concurrent_match() {
         unix_timestamp() + dexdo_core::params::MAX_SELL_TTL.as_secs();
     let seller = relist_seller().await;
     wait_for_gateway_ready(&seller).await;
-    let result = prepare_pending_offer_with_timing(
+    let result = tokio::time::timeout(Duration::from_secs(5), prepare_pending_offer_with_timing(
         &seller,
         &backend,
         &issue_2096_cfg(&backend, &seller),
@@ -230,8 +182,9 @@ async fn issue_2115_pending_cover_failure_preserves_a_concurrent_match() {
         None,
         std::future::pending(),
         issue_2115_timing(),
-    )
+    ))
     .await
+    .expect("pending recovery must keep the concurrent match")
     .unwrap();
     assert!(
         matches!(
@@ -243,54 +196,6 @@ async fn issue_2115_pending_cover_failure_preserves_a_concurrent_match() {
     assert_eq!(backend.posts.load(Ordering::SeqCst), 1);
     assert!(!seller.server_task.is_finished());
     seller.server_task.abort();
-}
-
-#[tokio::test]
-async fn issue_2115_funded_buyer_wins_during_repeated_upstream_failure() {
-    let (url, probes, upstream) = scripted_http_server(vec![(
-        "200 OK",
-        "data: {\"error\":{\"message\":\"temporary upstream failure\"}}\n\n".to_string(),
-        Duration::ZERO,
-    )]);
-    let backend = issue_2096_backend(100);
-    backend.posts.store(1, Ordering::SeqCst);
-    backend.pending_submission.store(true, Ordering::SeqCst);
-    backend.rows.lock().unwrap().clear();
-    let seller = issue_2077_seller(url).await;
-    wait_for_gateway_ready(&seller).await;
-    let cfg = issue_2096_cfg(&backend, &seller);
-    let recovery = prepare_pending_offer_with_timing(
-        &seller,
-        &backend,
-        &cfg,
-        &backend.owner,
-        None,
-        std::future::pending(),
-        issue_2115_timing(),
-    );
-    let buyer = async {
-        while probes.load(Ordering::SeqCst) < 2 {
-            tokio::time::sleep(Duration::from_millis(1)).await;
-        }
-        backend.state.lock().unwrap().funded = true;
-        *backend.matched.lock().unwrap() = Some(Match {
-            price_per_tick: dexdo_core::params::PRICE_STEP.try_into().unwrap(),
-            ..sample_match(&backend.token_contract)
-        });
-    };
-    let (result, ()) = tokio::time::timeout(Duration::from_secs(5), async {
-        tokio::join!(recovery, buyer)
-    })
-    .await
-    .unwrap();
-    assert!(matches!(
-        result.unwrap(),
-        SellerStartupOutcome::Ready(SellerOfferStartup::ResumedFunded)
-    ));
-    assert_eq!(backend.posts.load(Ordering::SeqCst), 1);
-    assert!(!seller.server_task.is_finished());
-    seller.server_task.abort();
-    upstream.abort();
 }
 
 #[tokio::test]
@@ -338,5 +243,51 @@ async fn issue_2115_removing_a_visible_ask_does_not_release_an_unknown_submissio
     assert!(backend.pending_submission.load(Ordering::SeqCst));
     assert_eq!(backend.posts.load(Ordering::SeqCst), 1);
     assert!(!seller.server_task.is_finished());
+    seller.server_task.abort();
+}
+
+
+#[tokio::test]
+async fn issue_2264_fresh_timeout_yields_to_other_sales_and_adopts_late_order() {
+    let mut backend = issue_2096_backend(100);
+    backend.failed_post_lands = false;
+    backend.rows.lock().unwrap().clear();
+    *backend.offer_posted.lock().unwrap() = false;
+    backend.post_failures.store(1, Ordering::SeqCst);
+    let seller = relist_seller().await;
+    wait_for_gateway_ready(&seller).await;
+    let cfg = issue_2096_cfg(&backend, &seller);
+    let outcome = prepare_seller_offer_with_timing(
+        &seller, &backend, &cfg, &backend.owner, None, std::future::pending(),
+        issue_2115_timing(),
+    ).await.unwrap();
+    assert!(matches!(outcome, SellerStartupOutcome::Stopped {
+        identity: None,
+        reason: RestingStopReason::OfferPost(_),
+        disposition: CancellationDisposition::UnknownFailure { .. },
+    }));
+    assert!(backend.pending_submission.load(Ordering::SeqCst));
+
+    let other_tc = address('7');
+    let other = CancelBackend::new(Vec::new(), backend.owner.clone(), 2264, CancelBehavior::Remove);
+    let other_cfg = cfg_for_seller(&other_tc, &seller);
+    let other_outcome = prepare_seller_offer_with_timing(
+        &seller, &other, &other_cfg, &backend.owner, None, std::future::pending(),
+        issue_2115_timing(),
+    ).await.unwrap();
+    assert!(matches!(other_outcome, SellerStartupOutcome::Ready(_)));
+    assert_eq!(other.order_ids(), vec![2264]);
+    assert!(backend.pending_submission.load(Ordering::SeqCst));
+
+    backend.rest_offer(unix_timestamp() + dexdo_core::params::MAX_SELL_TTL.as_secs(), 100);
+    let order_id = backend.resting_order_id().unwrap();
+    let recovered = prepare_pending_offer_with_timing(
+        &seller, &backend, &cfg, &backend.owner, None, std::future::pending(),
+        issue_2115_timing(),
+    ).await.unwrap();
+    assert!(matches!(recovered, SellerStartupOutcome::Ready(
+        SellerOfferStartup::ResumedResting { order_id: observed }) if observed == order_id));
+    assert!(backend.cancelled().is_empty());
+    assert_eq!(backend.posts.load(Ordering::SeqCst), 1);
     seller.server_task.abort();
 }
