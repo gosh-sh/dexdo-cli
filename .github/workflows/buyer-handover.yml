@@ -1,0 +1,127 @@
+name: Buyer funded handover regressions
+
+on:
+  push:
+    branches: [fix/buyer-funded-handover-185, ci/buyer-funded-handover-185-v09]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: buyer-handover-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  offline-regressions:
+    if: github.repository == 'h2so4nackl-code/dexdo-cli'
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    env:
+      CARGO_BUILD_JOBS: 2
+      CARGO_PROFILE_DEV_DEBUG: 0
+      CARGO_PROFILE_TEST_DEBUG: 0
+      PROPTEST_CASES: 64
+      PROPTEST_RNG_SEED: 185
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+          fetch-depth: 0
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: buyer-handover-185
+          cache-on-failure: true
+      - name: Check added test formatting and whitespace
+        run: |
+          rustfmt --check --edition 2021 crates/dexdo/src/cli/buyer/issue_185_test.rs
+          git diff --check 7dd507d4770996079c8f501945d2120defdb84b8 HEAD
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends clang cmake nasm perl pkg-config libssl-dev
+      - name: Compile test binaries without running tests
+        run: |
+          set -o pipefail
+          mkdir -p test-results
+          git rev-parse HEAD | tee test-results/commit.txt
+          cargo test --locked -p dexdo --bin dexdo --lib --no-run 2>&1 | tee test-results/build.log
+      - name: Run regressions with loopback-only networking
+        shell: bash
+        run: |
+          set -euo pipefail
+          export CARGO_NET_OFFLINE=true
+          runner_uid=$(id -u)
+          runner_gid=$(id -g)
+          cargo_bin=$(command -v cargo)
+          for spec in 'bin:issue_185' 'bin:on_demand' 'bin:keep_open_2148' 'bin:buyer_journal' 'bin:buyer_submit' 'bin:journal_closure_1474' 'lib:on_demand'; do
+            target=${spec%%:*}
+            filter=${spec#*:}
+            if [ "$target" = bin ]; then
+              target_arg=--bin
+              target_name=dexdo
+            else
+              target_arg=--lib
+              target_name=
+            fi
+            sudo --preserve-env=PATH,CARGO_HOME,RUSTUP_HOME,CARGO_BUILD_JOBS,CARGO_PROFILE_DEV_DEBUG,CARGO_PROFILE_TEST_DEBUG,PROPTEST_CASES,PROPTEST_RNG_SEED,CARGO_NET_OFFLINE \
+              unshare --net -- bash -c '
+                set -euo pipefail
+                ip link set lo up
+                uid=$1; gid=$2; cargo_bin=$3; target_arg=$4; target_name=$5; filter=$6
+                args=(test --offline --locked -p dexdo "$target_arg")
+                if [ -n "$target_name" ]; then args+=("$target_name"); fi
+                exec runuser -u "$(id -nu "$uid")" -- \
+                  "$cargo_bin" "${args[@]}" "$filter" -- --test-threads=1
+              ' _ "$runner_uid" "$runner_gid" "$cargo_bin" "$target_arg" "$target_name" "$filter" \
+              2>&1 | tee "test-results/$target-$filter.log"
+            if ! grep -Eq 'test result: ok\. [1-9][0-9]* passed;' "test-results/$target-$filter.log"; then
+              echo "No passing tests matched $spec" >&2
+              exit 1
+            fi
+          done
+      - name: Confirm the repeated-request regression fails on v0.9.0 production
+        shell: bash
+        run: |
+          set -euo pipefail
+          source_file=crates/dexdo/src/cli/buyer.rs
+          cp "$source_file" test-results/patched-buyer.rs
+          trap 'cp test-results/patched-buyer.rs "$source_file"' EXIT
+          python3 - <<'PY'
+          import pathlib, subprocess
+          path = pathlib.Path("crates/dexdo/src/cli/buyer.rs")
+          marker = "#[cfg(test)]\nmod tests {"
+          original = subprocess.check_output(
+              ["git", "show", "7dd507d4770996079c8f501945d2120defdb84b8:" + str(path)],
+              text=True,
+          )
+          patched = path.read_text()
+          assert original.count(marker) == patched.count(marker) == 1
+          # Keep the regression fixtures, but use the exact v0.9.0 production prefix.
+          path.write_text(original.split(marker)[0] + marker + patched.split(marker)[1])
+          PY
+          export CARGO_NET_OFFLINE=true
+          runner_uid=$(id -u)
+          cargo_bin=$(command -v cargo)
+          set +e
+          sudo --preserve-env=PATH,CARGO_HOME,RUSTUP_HOME,CARGO_BUILD_JOBS,CARGO_PROFILE_DEV_DEBUG,CARGO_PROFILE_TEST_DEBUG,PROPTEST_CASES,PROPTEST_RNG_SEED,CARGO_NET_OFFLINE \
+            unshare --net -- bash -c '
+              set -euo pipefail
+              ip link set lo up
+              exec runuser -u "$(id -nu "$1")" -- "$2" test --offline --locked -p dexdo --bin dexdo \
+                issue_185_repeated_requests_and_restart_keep_one_funded_deal -- --test-threads=1
+            ' _ "$runner_uid" "$cargo_bin" 2>&1 | tee test-results/v09-negative-control.log
+          result=${PIPESTATUS[0]}
+          set -e
+          test "$result" = 101
+          grep -F "a second BUY would fund a distinct deal" test-results/v09-negative-control.log
+          grep -F "left: 2" test-results/v09-negative-control.log
+          echo "Negative control reproduced two simulated BUY POSTs on v0.9.0 production."
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: buyer-handover-test-results
+          path: test-results/
